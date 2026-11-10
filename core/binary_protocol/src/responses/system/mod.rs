@@ -18,6 +18,7 @@
 pub mod describe_options;
 pub mod get_cluster_metadata;
 pub mod get_me;
+pub mod get_metadata_changes;
 pub mod get_snapshot;
 pub mod get_stats;
 mod ping;
@@ -27,6 +28,9 @@ pub use super::EmptyResponse;
 pub use describe_options::{DescribeOptionsResponse, OptionDescriptor};
 pub use get_cluster_metadata::{ClusterMetadataResponse, ClusterNodeResponse};
 pub use get_me::GetMeResponse;
+pub use get_metadata_changes::{
+    GetMetadataChangesResponse, WireMetadataChangeRecord, WireMetadataItem,
+};
 pub use get_snapshot::GetSnapshotResponse;
 pub use get_stats::StatsResponse;
 pub use ping::PingResponse;

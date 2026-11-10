@@ -236,6 +236,8 @@ pub(in crate::boot) async fn await_bootstrap_complete(
 mod tests {
     use super::*;
     use crate::shell::ServerMuxStateMachine;
+    use iggy_binary_protocol::PrepareHeader;
+    use metadata::change_log::{ChangeLog, ChangeLogCapacities, MetadataChangeLog};
 
     const TEST_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -246,10 +248,14 @@ mod tests {
         let (bundle_tx, _bundle_rx) = crossfire::mpmc::bounded_async::<ServerMetadataBundle>(0);
         let flag = Arc::new(AtomicBool::new(false));
         let mux = ServerMuxStateMachine::default();
+        let change_log = MetadataChangeLog::new(ChangeLogCapacities::default());
         broadcast_metadata_bundle(
             0,
             &bundle_tx,
-            mux.factory_bundle(),
+            ServerMetadataBundle {
+                states: mux.factory_bundle(),
+                change_log: change_log.factory(),
+            },
             0,
             &flag,
             TEST_POLL_INTERVAL,
@@ -262,15 +268,19 @@ mod tests {
     async fn metadata_bundle_round_trips_through_channel() {
         // End-to-end: shard 0 mints a bundle, a peer receives it on
         // another runtime, and `from_factory_bundle` constructs a
-        // reader-mode mux that observes shard 0's writes via the same
-        // LeftRight pair.
+        // reader-mode mux and change log that observe shard 0's writes via
+        // the same LeftRight pairs.
         let peers = 1u16;
         let (bundle_tx, bundle_rx) =
             crossfire::mpmc::bounded_async::<ServerMetadataBundle>(usize::from(peers));
         let flag = Arc::new(AtomicBool::new(false));
 
         let owner = ServerMuxStateMachine::default();
-        let bundle = owner.factory_bundle();
+        let owner_log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        let bundle = ServerMetadataBundle {
+            states: owner.factory_bundle(),
+            change_log: owner_log.factory(),
+        };
         broadcast_metadata_bundle(0, &bundle_tx, bundle, peers, &flag, TEST_POLL_INTERVAL)
             .await
             .expect("broadcast must succeed with one peer drained");
@@ -278,7 +288,19 @@ mod tests {
         let received = await_metadata_bundle(1, &bundle_rx, &flag, TEST_POLL_INTERVAL)
             .await
             .expect("peer must receive the broadcast bundle");
-        let _peer_mux = ServerMuxStateMachine::from_factory_bundle(received);
+        let _peer_mux = ServerMuxStateMachine::from_factory_bundle(received.states);
+        let peer_log = MetadataChangeLog::from_factory(received.change_log);
+        owner_log
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: 0x5eed,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .expect("shard 0 owns the write side");
+        assert_eq!(peer_log.read(ChangeLog::log_id), Some(Some(0x5eed)));
     }
 
     #[compio::test]
@@ -291,11 +313,15 @@ mod tests {
         drop(bundle_rx);
         let flag = Arc::new(AtomicBool::new(false));
         let mux = ServerMuxStateMachine::default();
+        let change_log = MetadataChangeLog::new(ChangeLogCapacities::default());
 
         let err = broadcast_metadata_bundle(
             0,
             &bundle_tx,
-            mux.factory_bundle(),
+            ServerMetadataBundle {
+                states: mux.factory_bundle(),
+                change_log: change_log.factory(),
+            },
             3,
             &flag,
             TEST_POLL_INTERVAL,

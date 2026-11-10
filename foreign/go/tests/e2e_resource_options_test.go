@@ -60,6 +60,7 @@ func TestE2E_StreamKeyProjection(t *testing.T) {
 		}
 		assert.Equal(t, created.EncryptionKekFingerprints(), fetched.EncryptionKekFingerprints())
 	})
+	t.Run("given_keyed_stream_when_following_its_creation_should_expose_fingerprints_and_no_key", checkKeyedStreamChange)
 }
 
 func TestE2E_KeylessStream(t *testing.T) {
@@ -119,8 +120,8 @@ func TestE2E_StreamRename(t *testing.T) {
 		assert.Equal(t, created.EncryptionKekFingerprints(), renamed.EncryptionKekFingerprints())
 
 		partitionId := uint32(0)
-		polled, err := connected.PollMessages(ctx, streamId, topicId,
-			iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), 1, false, &partitionId)
+		polled, err := connected.PollMessages(ctx, streamId, topicId, partitionId,
+			iggcon.DefaultConsumer(), iggcon.OffsetPollingStrategy(0), countOptions(1, false))
 		require.NoError(t, err)
 		require.Len(t, polled.Messages, 1)
 		assert.Equal(t, payload, polled.Messages[0].Payload)

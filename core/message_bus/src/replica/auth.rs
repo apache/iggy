@@ -30,8 +30,10 @@
 //!    `mac_a` when the status is `Ok` (a nonzero status is a reject, no nonce/MAC);
 //! 3. `ReplicaFinish`    dialer -> acceptor: `mac_d` (dialer direction).
 //!
-//! Each MAC is `keyed_hash(key, DOMAIN_TAG || cluster_id || dialer_id ||
-//! acceptor_id || nonce_d || nonce_a || mode || tls_exporter || dir)`.
+//! Each MAC is `keyed_hash(key, DOMAIN_TAG || binary_identity || placement ||
+//! cluster_id || dialer_id || acceptor_id || nonce_d || nonce_a || mode ||
+//! tls_exporter || dir)`, where `placement` is the link count and link index
+//! the hello carries ([`LinkPlacement`]).
 //! Binding both nonces, the ordered peer pair, and a direction byte
 //! defeats replay and reflection. The MAC key is a subkey derived from
 //! the configured shared secret, so the raw secret never reaches the
@@ -49,6 +51,7 @@ use blake3::Hash;
 use iggy_binary_protocol::RESERVED_COMMAND_LEN;
 use iggy_common::IggyError;
 use ring::rand::{SecureRandom, SystemRandom};
+use std::mem::size_of;
 use zeroize::Zeroizing;
 
 /// Length of each handshake nonce, in bytes.
@@ -68,6 +71,11 @@ pub const EXPORTER_LABEL: &[u8] = b"iggy replica psk binding";
 pub const STATUS_OFFSET: usize = NONCE_LEN + MAC_LEN;
 pub const IDENTITY_OFFSET: usize = STATUS_OFFSET + 1;
 pub const IDENTITY_LEN: usize = 32;
+/// Offset of the [`LinkPlacement`] fields in a `ReplicaHello` frame's
+/// `reserved_command`, right past the build identity.
+pub const PLACEMENT_OFFSET: usize = IDENTITY_OFFSET + IDENTITY_LEN;
+pub const PLACEMENT_LEN: usize = 2 * size_of::<u16>();
+const _: () = assert!(PLACEMENT_OFFSET + PLACEMENT_LEN <= RESERVED_COMMAND_LEN);
 
 /// Domain separation tag mixed into every MAC transcript.
 const DOMAIN_TAG: &[u8] = b"apache-iggy replica-auth v1";
@@ -129,6 +137,50 @@ pub fn has_nonce(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> bool {
     reserved_command[..NONCE_LEN] != [0u8; NONCE_LEN]
 }
 
+/// Placement fields of a `ReplicaHello`: the dialer's link count and the
+/// index of the link the connection carries.
+///
+/// The acceptor refuses a hello whose link count differs from its own,
+/// because the node with more links would wait for a link that never forms,
+/// and a link other than the one its preamble named. Shard counts may
+/// differ: each node places links on its own shards. With auth on, the
+/// fields are part of the MAC transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkPlacement {
+    pub links: u16,
+    pub link: u16,
+}
+
+impl LinkPlacement {
+    /// Read the fields from `reserved_command[PLACEMENT_OFFSET..]`.
+    #[must_use]
+    pub fn read(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> Self {
+        let field = |index: usize| {
+            let at = PLACEMENT_OFFSET + index * size_of::<u16>();
+            u16::from_le_bytes([reserved_command[at], reserved_command[at + 1]])
+        };
+        Self {
+            links: field(0),
+            link: field(1),
+        }
+    }
+
+    /// Write the fields to `reserved_command[PLACEMENT_OFFSET..]`.
+    pub fn write(self, reserved_command: &mut [u8; RESERVED_COMMAND_LEN]) {
+        reserved_command[PLACEMENT_OFFSET..PLACEMENT_OFFSET + PLACEMENT_LEN]
+            .copy_from_slice(&self.to_le_bytes());
+    }
+
+    fn to_le_bytes(self) -> [u8; PLACEMENT_LEN] {
+        let mut bytes = [0u8; PLACEMENT_LEN];
+        let (fields, _) = bytes.as_chunks_mut::<{ size_of::<u16>() }>();
+        for (chunk, field) in fields.iter_mut().zip([self.links, self.link]) {
+            *chunk = field.to_le_bytes();
+        }
+        bytes
+    }
+}
+
 /// Outcome of a replica handshake, carried as the `status` byte of a
 /// `ReplicaChallenge` frame at [`STATUS_OFFSET`].
 ///
@@ -156,6 +208,10 @@ pub enum HandshakeStatus {
     /// The dialer's finish MAC did not verify (log-only).
     MacMismatch = 5,
     IncompatibleBuild = 6,
+    /// The hello names a link count other than the acceptor's.
+    LinkCountMismatch = 7,
+    /// The hello names a peer or a link other than its placement preamble.
+    PlacementMismatch = 8,
 }
 
 impl HandshakeStatus {
@@ -170,13 +226,15 @@ impl HandshakeStatus {
             Self::AuthRequired => "auth_required",
             Self::MacMismatch => "mac_mismatch",
             Self::IncompatibleBuild => "incompatible_build",
+            Self::LinkCountMismatch => "link_count_mismatch",
+            Self::PlacementMismatch => "placement_mismatch",
         }
     }
 }
 
 /// Decode the `status` byte of a `ReplicaChallenge` response frame.
 ///
-/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=6` map to their reason; any
+/// Total: byte `0` is [`HandshakeStatus::Ok`]; `1..=8` map to their reason; any
 /// other (garbage) byte is treated as [`HandshakeStatus::UnknownCommand`] so the
 /// dialer rejects rather than mistaking it for success. Discriminants must stay
 /// in sync with [`HandshakeStatus`]; the `status_round_trips` test enforces it.
@@ -189,6 +247,8 @@ pub const fn read_status(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> Hands
         4 => HandshakeStatus::AuthRequired,
         5 => HandshakeStatus::MacMismatch,
         6 => HandshakeStatus::IncompatibleBuild,
+        7 => HandshakeStatus::LinkCountMismatch,
+        8 => HandshakeStatus::PlacementMismatch,
         // 1 and every unrecognised byte: a reject the dialer must not read as Ok.
         _ => HandshakeStatus::UnknownCommand,
     }
@@ -229,6 +289,7 @@ impl ChannelBinding {
 /// The fields bound into a handshake MAC. Identical on both peers.
 pub struct Transcript {
     pub binary_identity: [u8; IDENTITY_LEN],
+    pub placement: LinkPlacement,
     pub cluster_id: u128,
     pub dialer_id: u8,
     pub acceptor_id: u8,
@@ -328,6 +389,7 @@ impl ReplicaAuth {
         let mut hasher = blake3::Hasher::new_keyed(key);
         hasher.update(DOMAIN_TAG);
         hasher.update(&transcript.binary_identity);
+        hasher.update(&transcript.placement.to_le_bytes());
         hasher.update(&transcript.cluster_id.to_le_bytes());
         hasher.update(&[transcript.dialer_id, transcript.acceptor_id]);
         hasher.update(&transcript.nonce_d);
@@ -348,6 +410,7 @@ mod tests {
     fn transcript() -> Transcript {
         Transcript {
             binary_identity: [0x5a; IDENTITY_LEN],
+            placement: LinkPlacement { links: 2, link: 1 },
             cluster_id: 0xDEAD_BEEF,
             dialer_id: 3,
             acceptor_id: 1,
@@ -446,6 +509,50 @@ mod tests {
     }
 
     #[test]
+    fn changed_placement_is_rejected_in_both_directions() {
+        let auth = ReplicaAuth::new(SECRET);
+        let original = transcript();
+        for placement in [
+            LinkPlacement {
+                links: 4,
+                ..original.placement
+            },
+            LinkPlacement {
+                link: 0,
+                ..original.placement
+            },
+        ] {
+            let changed = Transcript {
+                placement,
+                ..transcript()
+            };
+            assert!(!auth.verify_dialer_mac(&changed, &auth.dialer_mac(&original)));
+            assert!(!auth.verify_acceptor_mac(&changed, &auth.acceptor_mac(&original)));
+        }
+    }
+
+    #[test]
+    fn placement_round_trips_through_the_hello_tail() {
+        let placement = LinkPlacement {
+            links: 0x0102,
+            link: 0x0304,
+        };
+        let mut reserved = [0u8; RESERVED_COMMAND_LEN];
+        placement.write(&mut reserved);
+        assert_eq!(LinkPlacement::read(&reserved), placement);
+        assert_eq!(
+            reserved[PLACEMENT_OFFSET..PLACEMENT_OFFSET + PLACEMENT_LEN],
+            [0x02, 0x01, 0x04, 0x03]
+        );
+        assert!(
+            reserved[IDENTITY_OFFSET..PLACEMENT_OFFSET]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the placement must not overlap the build identity"
+        );
+    }
+
+    #[test]
     fn changed_nonce_is_rejected() {
         // A captured MAC cannot be replayed against a fresh nonce.
         let auth = ReplicaAuth::new(SECRET);
@@ -522,7 +629,7 @@ mod tests {
 
     #[test]
     fn status_round_trips() {
-        const ALL: [HandshakeStatus; 7] = [
+        const ALL: [HandshakeStatus; 9] = [
             HandshakeStatus::Ok,
             HandshakeStatus::UnknownCommand,
             HandshakeStatus::ClusterMismatch,
@@ -530,6 +637,8 @@ mod tests {
             HandshakeStatus::AuthRequired,
             HandshakeStatus::MacMismatch,
             HandshakeStatus::IncompatibleBuild,
+            HandshakeStatus::LinkCountMismatch,
+            HandshakeStatus::PlacementMismatch,
         ];
         for status in ALL {
             let mut reserved = [0u8; RESERVED_COMMAND_LEN];

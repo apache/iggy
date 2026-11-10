@@ -16,7 +16,8 @@
 # under the License.
 
 # Auto-publish: detects pre-release crate/SDK versions without tags
-# and publishes them to crates.io, Docker Hub, PyPI, npm, Maven, NuGet.
+# and publishes them to crates.io, Docker Hub, PyPI, npm, Maven, NuGet,
+# or as git tags for Go and Swift.
 # Runs on every push to master.
 
 name: Post-merge
@@ -63,7 +64,7 @@ jobs:
       - name: Plan affected edge images
         id: rail
         continue-on-error: true
-        uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
+        uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
 
       - name: Check all components
         id: check
@@ -138,7 +139,7 @@ jobs:
 
           # Check SDKs for pre-release versions without tags
           SDKS_TO_PUBLISH=""
-          for sdk in sdk-python sdk-node sdk-java sdk-csharp sdk-go; do
+          for sdk in sdk-python sdk-node sdk-java sdk-csharp sdk-go sdk-swift; do
             VERSION=$(scripts/extract-version.sh "$sdk")
             TAG=$(scripts/extract-version.sh "$sdk" --tag)
 

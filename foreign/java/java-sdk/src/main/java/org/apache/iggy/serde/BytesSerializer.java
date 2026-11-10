@@ -38,6 +38,11 @@ import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.MetadataChangeCursor;
+import org.apache.iggy.system.MetadataChangeGroup;
+import org.apache.iggy.system.MetadataChangeStart;
+import org.apache.iggy.system.MetadataChangesQuery;
+import org.apache.iggy.system.MetadataCurrentPageToken;
 import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.topic.TopicUpdate;
 import org.apache.iggy.user.GlobalPermissions;
@@ -274,6 +279,36 @@ public final class BytesSerializer {
     public static ByteBuf toCreateStream(String name, Map<String, HeaderValue> options) {
         var payload = toBytes(name, "name");
         writeAndRelease(payload, toOptionsBlock(options));
+        return payload;
+    }
+
+    /**
+     * {@code GetMetadataChanges}: {@code [start:u8][cursor:44][has_since:u8][since:u64]?[has_until:u8][until:u64]?}
+     * {@code [limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]}. The cursor is all zero unless the query
+     * starts after one, and groups keep the caller's order. Validate the query first.
+     */
+    public static ByteBuf toGetMetadataChanges(MetadataChangesQuery query) {
+        var start = query.start();
+        byte[] cursor = start instanceof MetadataChangeStart.After after
+                ? after.cursor().toBytes()
+                : new byte[MetadataChangeCursor.SIZE];
+        byte[] token = start instanceof MetadataChangeStart.Current current
+                ? current.pageToken().map(MetadataCurrentPageToken::payload).orElse(new byte[0])
+                : new byte[0];
+        List<MetadataChangeGroup> groups =
+                query.groups().size() > 255 ? query.groups().stream().distinct().toList() : query.groups();
+        var payload = Unpooled.buffer(1 + MetadataChangeCursor.SIZE + 9 + 9 + 4 + 1 + groups.size() + 2 + token.length);
+        payload.writeByte(start.asCode());
+        payload.writeBytes(cursor);
+        for (Optional<BigInteger> bound : List.of(query.since(), query.until())) {
+            payload.writeByte(bound.isPresent() ? 1 : 0);
+            bound.ifPresent(value -> writeAndRelease(payload, toBytesAsU64(value)));
+        }
+        payload.writeIntLE((int) query.limit());
+        payload.writeByte(groups.size());
+        groups.forEach(group -> payload.writeByte(group.asCode()));
+        payload.writeShortLE(token.length);
+        payload.writeBytes(token);
         return payload;
     }
 

@@ -46,7 +46,7 @@ impl CliCommand for GetStreamCmd {
         format!("get stream with ID: {}", self.stream_id)
     }
 
-    fn machine_readable_output(&self) -> bool {
+    fn stdout_is_data(&self) -> bool {
         matches!(self.output, GetStreamOutput::Json)
     }
 
@@ -57,14 +57,14 @@ impl CliCommand for GetStreamCmd {
             .with_context(|| format!("Problem getting stream with ID: {}", self.stream_id))?;
 
         let Some(stream) = stream else {
-            if self.machine_readable_output() {
+            if self.stdout_is_data() {
                 bail!("Stream with ID: {} was not found", self.stream_id);
             }
             event!(target: PRINT_TARGET, Level::INFO, "Stream with ID: {} was not found", self.stream_id);
             return Ok(());
         };
 
-        if self.machine_readable_output() {
+        if self.stdout_is_data() {
             return print_json(&stream);
         }
 

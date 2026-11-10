@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Deliberately broken sink: `poll_interval` cannot be parsed as a duration.
+# Deliberately broken sink: `enabled` of the transform is not a boolean.
 # Used to assert that the runtime stays alive and reports this connector
 # with `ConnectorStatus::Error` instead of aborting startup.
 
@@ -32,8 +32,10 @@ stream = "test_stream"
 topics = ["test_topic"]
 schema = "json"
 batch_length = 100
-poll_interval = "not-a-valid-duration"
 consumer_group = "stdout_invalid_sink_connector"
 
 [plugin_config]
 print_payload = true
+
+[transforms.add_fields]
+enabled = "yes"

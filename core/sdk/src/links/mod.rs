@@ -20,13 +20,21 @@
 use crate::session_owner::SessionOwner;
 use crate::vsr::{decode_reply, encode_request_header};
 use bytes::Bytes;
+use iggy_binary_protocol::MAX_RECORD_SIZE;
+use iggy_binary_protocol::WireDecode;
+use iggy_binary_protocol::codes::{FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE};
 use iggy_binary_protocol::consensus::{HEADER_SIZE, RequestHeader};
+use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, FetchMessagesRequest};
+use iggy_binary_protocol::responses::messages::FetchMessagesResponse;
+use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
 #[cfg(test)]
 use iggy_common::DiagnosticEvent;
 use iggy_common::IggyError;
 use mux::MuxLink;
 use quic::QuicLink;
+use std::future::pending;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
 pub(crate) mod connect;
@@ -52,6 +60,33 @@ pub(crate) const OPERATION_TIMEOUT: Duration = iggy_common::BINARY_OPERATION_TIM
 /// cap, see [`backoff`].
 pub(crate) const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
 pub(crate) const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Takes the one reply of a cancelled committing request, or the error that ended its link.
+pub(crate) type LateReply = Box<dyn FnOnce(Result<Reply, IggyError>) + Send>;
+
+tokio::task_local! {
+    /// Turns true when the reader of the committing reads of this task closes. A committing
+    /// deferred request then sends its cancel and still takes its one reply, which tells whether
+    /// the server stored.
+    pub(crate) static CANCEL_COMMITTING: watch::Receiver<bool>;
+}
+
+/// Resolves once the committing reads of this task are to cancel. Never without the signal.
+pub(crate) async fn committing_cancelled() {
+    let Ok(mut cancel) = CANCEL_COMMITTING.try_with(Clone::clone) else {
+        return pending().await;
+    };
+    if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
+        pending::<()>().await;
+    }
+}
+
+/// Whether the committing reads of this task are to cancel.
+pub(crate) fn committing_cancel_requested() -> bool {
+    CANCEL_COMMITTING
+        .try_with(|cancel| *cancel.borrow())
+        .unwrap_or(false)
+}
 
 /// A connection to one replica.
 #[derive(Debug)]
@@ -80,12 +115,25 @@ impl Link {
         deadline: Instant,
         sent: &mut bool,
     ) -> Result<Reply, IggyError> {
+        self.send_settled(frame, deadline, sent, None).await
+    }
+
+    /// [`Self::send`] of a committing deferred request. When its caller leaves after the send,
+    /// the link cancels it, and the one reply that the server sends for the cancel goes to
+    /// `late`, or the error that ends the link first.
+    pub(crate) async fn send_settled(
+        &self,
+        frame: Frame,
+        deadline: Instant,
+        sent: &mut bool,
+        late: Option<LateReply>,
+    ) -> Result<Reply, IggyError> {
         if Instant::now() >= deadline {
             return Err(IggyError::NotConnected);
         }
         let result = match self {
-            Self::Mux(link) => link.send(frame, deadline, sent).await,
-            Self::Quic(link) => link.send(frame, deadline, sent).await,
+            Self::Mux(link) => link.send(frame, deadline, sent, late).await,
+            Self::Quic(link) => link.send(frame, deadline, sent, late).await,
         };
         result.map_err(|error| match error {
             IggyError::StaleClient => IggyError::Disconnected,
@@ -185,6 +233,29 @@ pub(crate) async fn pause_before_retry(retry: u32, deadline: Instant, draw: f64)
 pub(crate) struct Frame {
     pub(crate) header: RequestHeader,
     pub(crate) body: Bytes,
+}
+
+impl Frame {
+    pub(crate) fn response_body_limit(&self) -> Option<usize> {
+        let code = u32::from_le_bytes(self.header.reserved[..size_of::<u32>()].try_into().ok()?);
+        match code {
+            // The server returns a first record above `max_bytes` alone.
+            POLL_MESSAGES_DEFERRED_CODE => DeferredPollMessagesRequest::decode_from(&self.body)
+                .ok()
+                .map(|request| {
+                    (request.max_bytes as usize).max(POLL_RESPONSE_HEADER_SIZE + MAX_RECORD_SIZE)
+                }),
+            FETCH_MESSAGES_CODE => {
+                FetchMessagesRequest::decode_from(&self.body)
+                    .ok()
+                    .map(|request| {
+                        FetchMessagesResponse::head_size(request.targets.len())
+                            + (request.max_bytes as usize).max(MAX_RECORD_SIZE)
+                    })
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -23,6 +23,7 @@
 //! trace and the determinism baseline (`workload_replay_is_deterministic`)
 //! unchanged.
 
+use crate::workload::change_log_oracle::check_change_log_head;
 use crate::workload::state_checker::StateChecker;
 use crate::workload::{CLIENT_REQUEST_QUEUE_MAX, Workload};
 use crate::{CommitHoldKind, CommitPrefixHole, Simulator};
@@ -83,6 +84,9 @@ pub struct Invariants {
     /// Cross-replica committed-log agreement. Runs every tick like the rest, so a
     /// divergence is reported where it appears rather than at the next quiesce.
     state_checker: StateChecker,
+    /// Metadata incarnation and newest change record op each replica held at
+    /// the last check.
+    change_log_heads: HashMap<u8, (u128, u64)>,
 }
 
 impl Invariants {
@@ -133,6 +137,7 @@ impl Invariants {
             }
             self.check_recovery_barrier(sim, seed, replica_idx);
             check_applied_log_contradictions(sim, seed, replica_idx);
+            check_change_log_head(sim, replica_idx, &mut self.change_log_heads, seed);
             let incarnation = sim.replicas[usize::from(replica_idx)].metadata_incarnation;
             if self
                 .replica_incarnation

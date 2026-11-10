@@ -58,7 +58,7 @@ impl CliCommand for GetStreamsCmd {
         format!("list streams in {mode} mode")
     }
 
-    fn machine_readable_output(&self) -> bool {
+    fn stdout_is_data(&self) -> bool {
         matches!(self.output, GetStreamsOutput::Json)
     }
 
@@ -68,7 +68,7 @@ impl CliCommand for GetStreamsCmd {
             .await
             .with_context(|| String::from("Problem getting list of streams"))?;
 
-        if streams.is_empty() && !self.machine_readable_output() {
+        if streams.is_empty() && !self.stdout_is_data() {
             event!(target: PRINT_TARGET, Level::INFO, "No streams found!");
             return Ok(());
         }

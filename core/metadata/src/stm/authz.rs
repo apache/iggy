@@ -34,6 +34,7 @@
 //! table through `reject_stale_session` before this permission gate.
 
 use crate::MuxStateMachine;
+use crate::change_log::{AppliedChange, change_actor};
 use crate::impls::metadata::StreamsFrontend;
 use crate::permissioner::Permissioner;
 use crate::stm::consumer_group::{JoinConsumerGroupRequest, LeaveConsumerGroupRequest};
@@ -42,6 +43,7 @@ use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::Users;
 use crate::stm::{ApplyContext, StateMachine};
 use consensus::ClientTable;
+use iggy_binary_protocol::primitives::metadata_changes::WireUserKey;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
@@ -49,6 +51,7 @@ use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
 use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamResolvedRequest};
+use iggy_binary_protocol::requests::system::RetirementDebt;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicResolvedRequest,
 };
@@ -93,11 +96,20 @@ where
     let header = prepare.header();
     let timestamp = IggyTimestamp::from(header.timestamp);
     let context = ApplyContext::from(header);
-    let reply = mux.update(prepare)?;
+    let mut reply = mux.update(prepare)?;
     if let Some(deleted) = reply.deleted_resource {
+        // Pruning is part of the delete, so its records name the delete's
+        // actor: the requester of a two-phase delete, not the completing server.
+        let actor = reply
+            .changes
+            .first()
+            .map_or_else(|| change_actor(&context), |deletion| deletion.actor_user_id);
         // Publish the pruned grants before a later op can reuse the resource ID.
         // Peer shards may see the deletion first, but cannot see its replacement yet.
-        mux.users().remove_grants(deleted, timestamp, context);
+        let pruned = mux
+            .users()
+            .remove_grants(deleted, timestamp, context, actor);
+        reply.changes.extend(pruned);
     }
     Ok(reply)
 }
@@ -137,12 +149,70 @@ pub trait GatedApply:
     /// Partition-set revision used to validate retirement coverage during WAL replay.
     fn namespace_revision(&self) -> u64;
 
+    /// Records the retirement debt a replayed `FinalizeSession` carried.
+    fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64);
+
     fn is_active_account(&self, user_id: u32, created_at: u64) -> bool;
+
+    /// Rebinds the consumer group memberships of the client a replayed
+    /// Register committed to `session`, returning the handover records.
+    fn refresh_session(
+        &self,
+        header: &PrepareHeader,
+        session: u64,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange>;
+
+    /// Ends the consumer group memberships of `client_ids` as the replayed
+    /// op did, returning the records of the removals in canonical order.
+    fn end_memberships(
+        &self,
+        client_ids: &[u128],
+        header: &PrepareHeader,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange>;
+
+    /// The identity a session record gives `user_id`, `None` for no such user.
+    fn user_key(&self, user_id: u32) -> Option<WireUserKey>;
 }
 
 impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
     fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
         self.users().is_active_account(user_id, created_at)
+    }
+
+    fn refresh_session(
+        &self,
+        header: &PrepareHeader,
+        session: u64,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        self.streams().refresh_consumer_group_session(
+            header.client,
+            session,
+            header.op,
+            IggyTimestamp::from(header.timestamp),
+            actor_user_id,
+        )
+    }
+
+    fn end_memberships(
+        &self,
+        client_ids: &[u128],
+        header: &PrepareHeader,
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        self.streams().remove_consumer_group_members(
+            client_ids,
+            IggyTimestamp::from(header.timestamp),
+            header.op,
+            actor_user_id,
+        )
+    }
+
+    fn user_key(&self, user_id: u32) -> Option<WireUserKey> {
+        self.users()
+            .read(|users| users.items.get(user_id as usize).map(WireUserKey::from))
     }
 
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
@@ -151,6 +221,10 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
 
     fn namespace_revision(&self) -> u64 {
         self.streams().read(|inner| inner.namespace_revision)
+    }
+
+    fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64) {
+        self.streams().record_retirement_debt(debts, metadata_op);
     }
 }
 
@@ -378,7 +452,8 @@ pub(crate) fn authorize(
         | Operation::RewrapStreamKeys
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
-        | Operation::RetireConsumerGroupOwners => None,
+        | Operation::RetireConsumerGroupOwners
+        | Operation::StateMachineCommand => None,
     }
 }
 
@@ -532,6 +607,32 @@ impl GatedApply for MuxStateMachine<()> {
         true
     }
 
+    fn refresh_session(
+        &self,
+        _header: &PrepareHeader,
+        _session: u64,
+        _actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        Vec::new()
+    }
+
+    fn end_memberships(
+        &self,
+        _client_ids: &[u128],
+        _header: &PrepareHeader,
+        _actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        Vec::new()
+    }
+
+    /// Every account exists here, as [`Self::is_active_account`] says.
+    fn user_key(&self, user_id: u32) -> Option<WireUserKey> {
+        Some(WireUserKey {
+            user_id,
+            user_created_at: 0,
+        })
+    }
+
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         self.update(prepare)
     }
@@ -539,6 +640,8 @@ impl GatedApply for MuxStateMachine<()> {
     fn namespace_revision(&self) -> u64 {
         0
     }
+
+    fn record_retirement_debt(&self, _debts: &[RetirementDebt], _metadata_op: u64) {}
 }
 
 #[cfg(test)]
@@ -644,6 +747,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         }
         .to_bytes()

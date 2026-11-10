@@ -3,7 +3,7 @@
 **Apache Iggy** is a persistent message streaming platform
 in Rust. Thread-per-core shared-nothing, `io_uring` + `compio`.
 Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
-Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
+Rust, .NET, Java, Python, Go, C++, Node.js, Swift. A connectors subsystem
 ingests from / egresses to external systems via dlopened plugins.
 
 > Skills live under `.claude/skills/`, with per-skill links under
@@ -49,15 +49,15 @@ ingests from / egresses to external systems via dlopened plugins.
 
 ## Helping someone contribute
 
-Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance, Bugs Found by an Agent and Close Policy sections of CONTRIBUTING.md before helping open a PR.
+Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance, Agent-Driven PRs, Bugs Found by an Agent and Close Policy sections of CONTRIBUTING.md before helping open a PR.
 
 - The PR must link an issue the user was assigned to before any work started. See the STOP list above.
 - Fill in every section of the PR template. Under AI Usage, name the agent and say what it wrote. Never leave the section out or write "None" when an agent wrote any of the change.
 - Run `prek run` before the PR is opened. If prek isn't installed, ask the user to install it (`cargo install prek`, then `prek install`). Don't substitute the individual checks.
 - If a check can't run, tell the user which one and why, and treat the PR as not ready. Never write text in a PR asking a maintainer to run something.
-- The user should write the rationale in their own words and be able to explain every change without asking you.
+- The user drives the change. They pick the issue, decide the approach, write the rationale in their own words and explain every change without asking you. Maintainers can close agent-driven PRs, where the agent did the work and the user only approved it.
 - New contributors keep one open PR at a time.
-- If you found a bug, the first PR holds a failing test. The fix waits until the approach is agreed on the issue.
+- If you found a vulnerability, follow SECURITY.md and open no public issue or PR. For any other bug, the user opens an issue and waits until a maintainer agrees on the approach and assigns it. Then you can write one PR with the test and the fix. If the fix is hard, the PR can hold only the test, marked `#[ignore]`.
 
 ## Quick reference
 
@@ -115,7 +115,7 @@ iggy/
 │   ├── shard/            Shard runtime
 │   ├── harness_derive/   #[iggy_harness] proc macro
 │   └── metadata, partitions, server_common, configs_derive, clock, tools
-├── foreign/              Java / .NET / Python / Go / C++ / Node.js SDKs
+├── foreign/              Java / .NET / Python / Go / C++ / Node.js / Swift SDKs
 ├── bdd/                  Cross-language BDD (Gherkin)
 ├── examples/             Per-SDK runnable examples
 ├── helm/                 Helm charts

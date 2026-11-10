@@ -33,12 +33,14 @@ import pytest
 
 from apache_iggy import (
     AutoCommit,
-    AutoCommitAfter,
-    AutoCommitWhen,
     AutoLogin,
+    CommitAfter,
+    CommitEvery,
+    CommitPolicy,
     IggyClient,
     IggyExpiry,
     PendingOperationsConfig,
+    PollOptions,
     QuicConfig,
     TcpConfig,
     TcpReconnectionConfig,
@@ -344,50 +346,64 @@ class TestClientConstruction:
                 **interval_kwargs,
             )
 
+    def test_arguments_after_topic_are_keyword_only(self):
+        """Test that a positional argument after topic fails.
+
+        The removed partition_id was the fourth argument. A positional None
+        written for it would otherwise pass as polling_strategy.
+        """
+        client = IggyClient()
+
+        with pytest.raises(TypeError, match="positional arguments"):
+            client.consumer_group(
+                "group",
+                "stream",
+                "topic",
+                # pyrefly: ignore  # bad-argument-count
+                None,
+            )
+
+
+@pytest.mark.unit
+class TestCommitPolicy:
+    """Test when reads store their offsets."""
+
+    def test_default_options_store_nothing(self):
+        """Test that the default commit policy leaves every store to the caller."""
+        assert PollOptions().commit == CommitPolicy.Manual()
+
+    def test_auto_commit_default_stores_every_10000_messages_or_5_seconds(self):
+        """Test the default of an automatic commit and that options keep it."""
+        auto = AutoCommit.default()
+        options = PollOptions(commit=CommitPolicy.Auto(auto))
+
+        assert auto == AutoCommit(
+            interval=timedelta(seconds=5),
+            every=CommitEvery.Messages(10_000),
+            after=CommitAfter.Processing,
+        )
+        assert options.commit == CommitPolicy.Auto(auto)
+        assert repr(options.commit) == repr(CommitPolicy.Auto(auto))
+        assert (
+            "CommitPolicy.Auto(AutoCommit(interval=datetime.timedelta(seconds=5)"
+            in (repr(options))
+        )
+
     @pytest.mark.parametrize(
-        "auto_commit",
+        ("interval", "every", "message"),
         [
-            AutoCommit.Interval(timedelta(0)),
-            AutoCommit.IntervalOrWhen(timedelta(0), AutoCommitWhen.PollingMessages()),
-            AutoCommit.IntervalOrAfter(
-                timedelta(0), AutoCommitAfter.ConsumingEachMessage()
-            ),
+            (timedelta(0), None, "zero"),
+            (None, CommitEvery.Messages(0), "above zero"),
+            (None, None, "'interval' or an 'every'"),
         ],
-        ids=["interval", "interval_or_when", "interval_or_after"],
+        ids=["zero_interval", "zero_messages", "neither"],
     )
-    def test_zero_auto_commit_interval_is_rejected(self, auto_commit: AutoCommit):
-        """Test that a zero auto-commit interval fails at the call.
-
-        Zero there stores the offsets in a busy loop. Committing on every poll
-        is spelled AutoCommit.When or AutoCommit.After instead.
-        """
-        client = IggyClient()
-
-        with pytest.raises(ValueError, match="zero"):
-            client.consumer_group(
-                name="group",
-                stream="stream",
-                topic="topic",
-                auto_commit=auto_commit,
-            )
-
-    def test_zero_poll_interval_is_allowed(self):
-        """Test that a zero poll interval passes validation.
-
-        Zero there means "do not wait before polling" and is short-circuited
-        before the sleep, unlike the retry intervals. Reaching the awaitable is
-        what proves it: building one without a running loop is the next failure,
-        and a rejected value would have raised ValueError first.
-        """
-        client = IggyClient()
-
-        with pytest.raises(RuntimeError):
-            client.consumer_group(
-                name="group",
-                stream="stream",
-                topic="topic",
-                poll_interval=timedelta(0),
-            )
+    def test_auto_commit_that_never_stores_is_rejected(
+        self, interval: timedelta | None, every: CommitEvery | None, message: str
+    ):
+        """Test that an automatic commit storing only on close fails at once."""
+        with pytest.raises(ValueError, match=message):
+            AutoCommit(interval=interval, every=every)
 
 
 @pytest.mark.integration

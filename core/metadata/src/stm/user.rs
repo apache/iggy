@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::change_log::{AppliedChange, change_actor, user_body};
 use crate::permissioner::Permissioner;
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
@@ -32,6 +33,10 @@ use bytes::{BufMut, BytesMut};
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::WireOptions;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
+use iggy_binary_protocol::primitives::metadata_changes::{
+    WireMetadataChange, WirePermissionsUpdatedReason, WireTokenBody, WireTokenDeletedBody,
+    WireTokenDeletedReason, WireUserIdentityBody, WireUserKey, WireUserPermissionsBody,
+};
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
 use iggy_binary_protocol::requests::users::{
@@ -42,7 +47,7 @@ use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::defaults::{DEFAULT_ROOT_USER_ID, MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
-use iggy_common::wire_conversions::resource_options_from_wire;
+use iggy_common::wire_conversions::{permissions_to_wire, resource_options_from_wire};
 use iggy_common::{
     GlobalPermissions, IggyError, IggyExpiry, IggyTimestamp, OptionsScope, Permissions,
     PersonalAccessToken, ResourceOptions, StreamPermissions, UserId, UserStatus,
@@ -121,6 +126,9 @@ define_state! {
         // is deterministic across replicas), which lets the PAT cleaner find
         // expired tokens in O(log n) per tick instead of scanning every token.
         pub(crate) personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)>,
+        // `(user_id, name)` of every token, ordered, so current state pages
+        // seek by key instead of sorting the per-user maps. Never persisted.
+        pub(crate) personal_access_token_name_index: BTreeSet<(UserId, Arc<str>)>,
         pub(crate) permissioner: Permissioner,
     }
 }
@@ -314,6 +322,8 @@ impl UsersInner {
         // cannot make replicas diverge.
         for pat in tokens.values() {
             self.personal_access_token_index.remove(&pat.token);
+            self.personal_access_token_name_index
+                .remove(&(user_id, Arc::clone(&pat.name)));
             if let Some(expiry_at) = pat.expiry_at {
                 self.personal_access_token_expiry_index.remove(&(
                     expiry_at.as_micros(),
@@ -357,16 +367,27 @@ impl Users {
     /// Drop every grant on a stream or topic that a committed delete removed.
     /// Applied through the writer as a deterministic side effect of that delete
     /// on each replica (not a separate replicated op), so WAL replay repeats it.
+    /// Returns a record per pruned user, ascending by user id.
     pub(crate) fn remove_grants(
         &self,
         deleted: DeletedResource,
         timestamp: IggyTimestamp,
         context: ApplyContext,
-    ) {
-        let cmd = UsersCommand::RemoveGrants(RemoveGrantsRequest { deleted }, timestamp, context);
+        actor_user_id: Option<u32>,
+    ) -> Vec<AppliedChange> {
+        let cmd = UsersCommand::RemoveGrants(
+            RemoveGrantsRequest {
+                deleted,
+                actor_user_id,
+            },
+            timestamp,
+            context,
+        );
         if let Err(error) = self.inner.try_apply(cmd) {
             tracing::error!(?deleted, %error, "remove_grants dispatched to reader-only Users STM");
+            return Vec::new();
         }
+        self.last_changes()
     }
 
     /// Insert a root fixture into an empty user set for tests and the simulator.
@@ -577,10 +598,22 @@ impl StateHandler for CreateUserRequest {
         state
             .permissioner
             .init_permissions_for_user(id as UserId, user_permissions);
+        let changes = state
+            .items
+            .get(id)
+            .and_then(user_body)
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::UserCreated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
 
         // Reply body: the SDK `create_user` decodes a `UserDetailsResponse`.
         // Serialization local to this state machine.
-        ApplyReply::ok(
+        let reply = ApplyReply::ok(
             UserDetailsResponse {
                 user: UserResponse {
                     id: id as u32,
@@ -593,7 +626,8 @@ impl StateHandler for CreateUserRequest {
                 permissions: self.permissions.clone(),
             }
             .to_bytes(),
-        )
+        );
+        ApplyReply { changes, ..reply }
     }
 }
 
@@ -645,6 +679,7 @@ impl StateHandler for UpdateUserResolvedRequest {
                     return ApplyReply::err(UpdateUserResult::OptionsBlockTooLarge);
                 }
             };
+        let before = user_body(user);
 
         let Some(user) = state.items.get_mut(user_id) else {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
@@ -658,8 +693,20 @@ impl StateHandler for UpdateUserResolvedRequest {
             user.status = new_status;
         }
         user.options = options;
+        // An equal patch commits as ok but changes nothing public.
+        let changes = user_body(user)
+            .filter(|after| before.as_ref() != Some(after))
+            .map(|body| {
+                AppliedChange::new(
+                    &WireMetadataChange::UserUpdated(body),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
         ApplyReply {
-            revoked_user: (user.status != UserStatus::Active).then_some(user_id as UserId),
+            revoked_user: (user.status != UserStatus::Active).then(|| WireUserKey::from(&*user)),
+            changes,
             ..ApplyReply::ok(Bytes::new())
         }
     }
@@ -682,8 +729,20 @@ impl StateHandler for DeleteUserRequest {
             return ApplyReply::err(DeleteUserResult::CannotDeleteUser);
         }
 
+        let mut changes = Vec::new();
+        let mut revoked_user = None;
         if let Some(user) = state.items.get(user_id) {
+            revoked_user = Some(WireUserKey::from(user));
             let username = user.username.clone();
+            changes.extend(WireName::new(username.as_ref()).ok().map(|wire_name| {
+                AppliedChange::new(
+                    &WireMetadataChange::UserDeleted(WireUserIdentityBody {
+                        key: WireUserKey::from(user),
+                        username: wire_name,
+                    }),
+                    change_actor(&state.apply_context),
+                )
+            }));
             state.items.remove(user_id);
             state.index.remove(&username);
             state.remove_personal_access_tokens(user_id as UserId);
@@ -692,7 +751,8 @@ impl StateHandler for DeleteUserRequest {
                 .delete_permissions_for_user(user_id as UserId);
         }
         ApplyReply {
-            revoked_user: Some(user_id as UserId),
+            revoked_user,
+            changes,
             ..ApplyReply::ok(Bytes::new())
         }
     }
@@ -716,10 +776,23 @@ impl StateHandler for ChangePasswordRequest {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }
 
+        let mut changes = Vec::new();
         if let Some(user) = state.items.get_mut(user_id) {
             user.password_hash = Arc::from(self.new_password.as_str());
+            changes.extend(WireName::new(user.username.as_ref()).ok().map(|username| {
+                AppliedChange::new(
+                    &WireMetadataChange::UserPasswordChanged(WireUserIdentityBody {
+                        key: WireUserKey::from(&*user),
+                        username,
+                    }),
+                    change_actor(&state.apply_context),
+                )
+            }));
         }
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -732,17 +805,37 @@ impl StateHandler for UpdatePermissionsRequest {
             Err(result) => return ApplyReply::err(result),
         };
 
+        let mut changes = Vec::new();
         if let Some(user) = state.items.get_mut(user_id) {
+            let before = user.permissions.as_deref().map(permissions_to_wire);
             user.permissions = self
                 .permissions
                 .as_ref()
                 .map(|p| Arc::new(Permissions::from(p.clone())));
+            // An equal replacement changes nothing public.
+            let after = user.permissions.as_deref().map(permissions_to_wire);
+            if after != before
+                && let Ok(username) = WireName::new(user.username.as_ref())
+            {
+                changes.push(AppliedChange::new(
+                    &WireMetadataChange::UserPermissionsUpdated(WireUserPermissionsBody {
+                        key: WireUserKey::from(&*user),
+                        username,
+                        permissions: after,
+                        reason: WirePermissionsUpdatedReason::Updated,
+                    }),
+                    change_actor(&state.apply_context),
+                ));
+            }
         }
         let user_permissions = state.permissions_of(user_id);
         state
             .permissioner
             .update_permissions_for_user(user_id as UserId, user_permissions);
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -753,11 +846,14 @@ impl StateHandler for UpdatePermissionsRequest {
 #[derive(Debug, Clone)]
 pub struct RemoveGrantsRequest {
     pub deleted: DeletedResource,
+    /// The actor of the delete, which the pruning records repeat.
+    pub actor_user_id: Option<u32>,
 }
 
 impl StateHandler for RemoveGrantsRequest {
     type State = UsersInner;
     fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        let mut changes = Vec::new();
         for (_, user) in &mut state.items {
             let Some(pruned) = user
                 .permissions
@@ -795,8 +891,22 @@ impl StateHandler for RemoveGrantsRequest {
                 }
             }
             user.permissions = Some(Arc::new(pruned));
+            if let Ok(username) = WireName::new(user.username.as_ref()) {
+                changes.push(AppliedChange::new(
+                    &WireMetadataChange::UserPermissionsUpdated(WireUserPermissionsBody {
+                        key: WireUserKey::from(&*user),
+                        username,
+                        permissions: user.permissions.as_deref().map(permissions_to_wire),
+                        reason: WirePermissionsUpdatedReason::ResourceDeleted,
+                    }),
+                    self.actor_user_id,
+                ));
+            }
         }
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -904,9 +1014,30 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             ));
         }
         state
+            .personal_access_token_name_index
+            .insert((self.user_id, Arc::clone(&name)));
+        state
             .personal_access_token_index
             .insert(token_hash, (self.user_id, name));
-        ApplyReply::ok(Bytes::new())
+        let changes = state
+            .items
+            .get(self.user_id as usize)
+            .map(|user| {
+                AppliedChange::new(
+                    &WireMetadataChange::PersonalAccessTokenCreated(WireTokenBody {
+                        user: WireUserKey::from(user),
+                        name: self.name.clone(),
+                        expiry: expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
+                    }),
+                    change_actor(&state.apply_context),
+                )
+            })
+            .into_iter()
+            .collect();
+        ApplyReply {
+            changes,
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -938,6 +1069,9 @@ impl StateHandler for DeletePersonalAccessTokenRequest {
         match user_tokens.remove(&name_arc) {
             Some(pat) => {
                 state.personal_access_token_index.remove(&pat.token);
+                state
+                    .personal_access_token_name_index
+                    .remove(&(self.user_id, Arc::clone(&name_arc)));
                 if let Some(expiry_at) = pat.expiry_at {
                     state.personal_access_token_expiry_index.remove(&(
                         expiry_at.as_micros(),
@@ -945,7 +1079,30 @@ impl StateHandler for DeletePersonalAccessTokenRequest {
                         name_arc,
                     ));
                 }
-                ApplyReply::ok(Bytes::new())
+                let reason = if self.only_if_expired {
+                    WireTokenDeletedReason::Expired
+                } else {
+                    WireTokenDeletedReason::Deleted
+                };
+                let changes = state
+                    .items
+                    .get(self.user_id as usize)
+                    .map(|user| {
+                        AppliedChange::new(
+                            &WireMetadataChange::PersonalAccessTokenDeleted(WireTokenDeletedBody {
+                                user: WireUserKey::from(user),
+                                name: self.name.clone(),
+                                reason,
+                            }),
+                            change_actor(&state.apply_context),
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                ApplyReply {
+                    changes,
+                    ..ApplyReply::ok(Bytes::new())
+                }
             }
             None => ApplyReply::err(DeletePersonalAccessTokenResult::NotFound),
         }
@@ -1117,6 +1274,7 @@ impl UsersInner {
             AHashMap::new();
         let mut personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)> =
             BTreeSet::new();
+        let mut personal_access_token_name_index: BTreeSet<(UserId, Arc<str>)> = BTreeSet::new();
         for (user_id, tokens) in snapshot.personal_access_tokens {
             let mut token_map: AHashMap<Arc<str>, PersonalAccessToken> = AHashMap::new();
             for (name, pat_snap) in tokens {
@@ -1136,6 +1294,7 @@ impl UsersInner {
                 }
                 personal_access_token_index
                     .insert(Arc::clone(&pat.token), (user_id, Arc::clone(&name)));
+                personal_access_token_name_index.insert((user_id, Arc::clone(&name)));
                 token_map.insert(name, pat);
             }
             personal_access_tokens.insert(user_id, token_map);
@@ -1151,6 +1310,7 @@ impl UsersInner {
             personal_access_tokens,
             personal_access_token_index,
             personal_access_token_expiry_index,
+            personal_access_token_name_index,
             permissioner,
             last_result: None,
             apply_context: ApplyContext::default(),
@@ -1301,6 +1461,41 @@ mod tests {
         }
         .apply(&mut users, IggyTimestamp::zero());
         assert!(users.personal_access_token_expiry_index.is_empty());
+    }
+
+    #[test]
+    fn given_token_lifecycle_when_indexing_names_should_follow_every_change_and_restore() {
+        let mut users = UsersInner::new();
+        create_user(&mut users, "alice");
+        let token = |name: &str| CreatePersonalAccessTokenRequest {
+            user_id: 0,
+            name: WireName::new(name).unwrap(),
+            expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        };
+        let names = |users: &UsersInner| {
+            users
+                .personal_access_token_name_index
+                .iter()
+                .map(|(user_id, name)| (*user_id, name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        for name in ["ci", "build"] {
+            token(name).apply(&mut users, IggyTimestamp::zero());
+        }
+        DeletePersonalAccessTokenRequest {
+            user_id: 0,
+            name: WireName::new("ci").unwrap(),
+            only_if_expired: false,
+        }
+        .apply(&mut users, IggyTimestamp::zero());
+        assert_eq!(names(&users), [(0, "build".to_owned())]);
+
+        let restored = UsersInner::inner_from_snapshot(Users::from(users.clone()).to_snapshot());
+        assert_eq!(names(&restored), names(&users));
+
+        users.remove_personal_access_tokens(0);
+        assert_eq!(names(&users), [] as [(UserId, String); 0]);
     }
 
     #[test]
@@ -1868,7 +2063,11 @@ mod tests {
             let stream_only_before = stream_only_record(&inner);
             let keeps_stream = matches!(deleted, DeletedResource::Topic { .. });
 
-            let reply = RemoveGrantsRequest { deleted }.apply(&mut inner, IggyTimestamp::now());
+            let reply = RemoveGrantsRequest {
+                deleted,
+                actor_user_id: None,
+            }
+            .apply(&mut inner, IggyTimestamp::now());
             assert_eq!(reply.code, 0);
             assert_eq!(
                 Arc::ptr_eq(&stream_only_before, &stream_only_record(&inner)),
@@ -2118,7 +2317,10 @@ mod tests {
             IggyTimestamp::now(),
         );
         assert_eq!(deactivate.code, 0);
-        assert_eq!(deactivate.revoked_user, Some(alice_id));
+        assert_eq!(
+            deactivate.revoked_user.map(|user| user.user_id),
+            Some(alice_id)
+        );
         assert_eq!(
             users.items.get(alice_id as usize).map(|user| user.status),
             Some(UserStatus::Inactive)

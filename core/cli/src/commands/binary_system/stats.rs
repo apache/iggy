@@ -63,7 +63,7 @@ impl CliCommand for GetStatsCmd {
         "stats command".to_owned()
     }
 
-    fn machine_readable_output(&self) -> bool {
+    fn stdout_is_data(&self) -> bool {
         matches!(self.output, GetStatsOutput::Json | GetStatsOutput::Toml)
     }
 
@@ -251,7 +251,7 @@ impl CliCommand for GetStatsCmd {
             GetStatsOutput::Json => serde_json::to_string_pretty(&stats)?,
         };
 
-        if self.machine_readable_output() {
+        if self.stdout_is_data() {
             writeln!(io::stdout().lock(), "{output}")?;
         } else if self.quiet_mode {
             println!("{output}");

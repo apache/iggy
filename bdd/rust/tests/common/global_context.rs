@@ -18,7 +18,15 @@
 use bytes::Bytes;
 use cucumber::World;
 use iggy::clients::client::IggyClient;
-use iggy::prelude::{IggyError, IggyMessage, OptionSpec, PolledMessages, StreamEncryptionKey};
+use iggy::prelude::{
+    IggyConsumer, IggyError, IggyMessage, MetadataChangeCursor, MetadataChangeGroup,
+    MetadataChangeRecord, MetadataCurrentItem, OptionSpec, PartitionReader, PolledMessages,
+    StreamEncryptionKey,
+};
+use std::fmt;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 #[derive(Debug, World, Default)]
 pub struct GlobalContext {
@@ -38,4 +46,29 @@ pub struct GlobalContext {
     pub last_option_specs: Vec<OptionSpec>,
     pub last_user_id: Option<u32>,
     pub last_call_result: Option<Result<(), IggyError>>,
+    pub last_change_cursor: Option<MetadataChangeCursor>,
+    pub last_change_groups: Vec<MetadataChangeGroup>,
+    pub last_changes: Vec<MetadataChangeRecord>,
+    pub last_current_items: Vec<MetadataCurrentItem>,
+    pub background_client: Option<Arc<IggyClient>>,
+    /// The client of the scenario while a deferred poll runs on it.
+    pub polling_client: Option<Arc<IggyClient>>,
+    /// The operation of a deferred poll whose outcome is unknown.
+    pub lost_operation: Option<u64>,
+    pub deferred_poll_started: Option<Instant>,
+    pub deferred_poll: Option<JoinHandle<Result<PolledMessages, IggyError>>>,
+    pub reader: Option<PartitionReader>,
+    pub consumer: Option<OpenConsumer>,
+}
+
+/// A consumer that a scenario opened, which the world prints by name only.
+pub struct OpenConsumer(pub IggyConsumer);
+
+impl fmt::Debug for OpenConsumer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("OpenConsumer")
+            .field(&self.0.name())
+            .finish()
+    }
 }

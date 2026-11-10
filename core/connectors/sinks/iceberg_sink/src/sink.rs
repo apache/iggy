@@ -18,11 +18,13 @@
 use crate::{
     IcebergSink,
     catalog::init_catalog,
-    router::{dynamic_router::DynamicRouter, static_router::StaticRouter},
+    router::{Appender, BatchOrigin, dynamic_router::DynamicRouter, static_router::StaticRouter},
 };
 use async_trait::async_trait;
 use iceberg::Catalog;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use iggy_connector_sdk::{
+    ConsumedMessage, Error, FlushPartition, MessagesMetadata, Sink, TopicMetadata,
+};
 use tracing::{debug, error, info};
 
 #[async_trait]
@@ -42,12 +44,9 @@ impl Sink for IcebergSink {
             &self.config.store_access_key_id,
             &self.config.store_secret_access_key,
         ) {
-            (Some(store_access_key_id), Some(store_secret_access_key)) => {
-                let redacted_store_key = store_access_key_id.chars().take(3).collect::<String>();
-                let redacted_store_secret =
-                    store_secret_access_key.chars().take(3).collect::<String>();
+            (Some(_), Some(_)) => {
                 info!(
-                    "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {redacted_store_key}***  store secret: {redacted_store_secret}***",
+                    "Opened Iceberg sink connector with ID: {} for URL: {} with the configured store credentials",
                     self.id, self.config.uri
                 );
             }
@@ -73,15 +72,17 @@ impl Sink for IcebergSink {
         );
 
         let catalog: Box<dyn Catalog> = init_catalog(&self.config).await?;
+        let invalid_rows = self.config.invalid_rows.unwrap_or_default();
+        let appender = Appender::new(catalog, invalid_rows, self.commit_retry);
 
         if self.config.dynamic_routing {
             self.router = Some(Box::new(DynamicRouter::new(
-                catalog,
+                appender,
                 self.config.dynamic_route_field.clone(),
             )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(catalog, &self.config.tables).await?,
+                StaticRouter::new(appender, &self.config.tables).await?,
             ));
         }
 
@@ -90,7 +91,7 @@ impl Sink for IcebergSink {
 
     async fn consume(
         &self,
-        _topic_metadata: &TopicMetadata,
+        topic_metadata: &TopicMetadata,
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
@@ -101,8 +102,18 @@ impl Sink for IcebergSink {
             messages_metadata.schema
         );
 
+        let origin = BatchOrigin {
+            connector_id: self.id,
+            stream: &topic_metadata.stream,
+            topic: &topic_metadata.topic,
+            partition_id: messages_metadata.partition_id,
+        };
         match &self.router {
-            Some(router) => router.route_data(messages_metadata, messages).await?,
+            Some(router) => {
+                router
+                    .route_data(&origin, messages_metadata.schema, messages)
+                    .await?
+            }
             None => {
                 error!("Iceberg connector has no router configured");
                 return Err(Error::InvalidConfig);
@@ -111,6 +122,28 @@ impl Sink for IcebergSink {
 
         debug!("Finished successfully");
 
+        Ok(())
+    }
+
+    /// The sink commits every batch inside `consume`, so a flush has nothing left to prove.
+    fn enable_at_least_once(&mut self) -> Result<(), Error> {
+        let Some(router) = self.router.as_mut() else {
+            return Err(Error::InvalidState);
+        };
+        router.enable_at_least_once()
+    }
+
+    /// Writes nothing, since `consume` committed every message already. It lets the router forget
+    /// what the tables hold of the flushed messages, which the runtime never hands over again.
+    async fn flush(
+        &self,
+        topic_metadata: &TopicMetadata,
+        partitions: &[FlushPartition],
+    ) -> Result<(), Error> {
+        let Some(router) = &self.router else {
+            return Err(Error::InvalidState);
+        };
+        router.flushed(topic_metadata, partitions);
         Ok(())
     }
 

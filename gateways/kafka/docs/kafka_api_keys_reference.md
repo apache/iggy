@@ -17,7 +17,7 @@
 | ❌ Reject | Internal broker / KRaft only — return `INVALID_REQUEST` with a well-formed frame; **do not close the connection** |
 | ❌ Unadvertised | Deliberately absent from `ApiVersions`, so a conforming client never sends one; an arriving request closes the connection |
 
-> This table no longer carries a per-key header-framing status column. `src/protocol/header.rs`
+> This table no longer carries a per-key header-framing status column. `core/kafka_wire/src/header.rs`
 > has no per-key table of its own to be behind or caught up on: it delegates entirely to
 > `kafka_protocol::messages::ApiKey::request_header_version` / `response_header_version`. Any key
 > that crate recognizes is framed correctly; any key it doesn't (see `header_tests.rs` for the
@@ -323,7 +323,7 @@ not duplicated here.
 
 ### Header framing for keys `kafka_protocol` doesn't recognize
 
-`src/protocol/header.rs` delegates to `kafka_protocol::messages::ApiKey`; there is no per-key
+`core/kafka_wire/src/header.rs` delegates to `kafka_protocol::messages::ApiKey`; there is no per-key
 table in this codebase to have gaps in. `header_tests.rs` documents the one case where the crate
 itself has a gap: keys 4-7 (LeaderAndIsr, StopReplica, UpdateMetadata, ControlledShutdown, Group
 14 below) are inter-broker-only APIs `kafka_protocol` 0.17 does not implement at all, so

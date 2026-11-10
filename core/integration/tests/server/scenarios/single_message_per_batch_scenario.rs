@@ -125,11 +125,13 @@ pub async fn run(harness: &TestHarness, duration_secs: u64) {
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(0),
+                0,
                 &consumer,
                 &PollingStrategy::offset(next_offset),
-                batch_size,
-                false,
+                PollOptions {
+                    count: batch_size,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();

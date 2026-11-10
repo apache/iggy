@@ -20,6 +20,7 @@ pub mod consumer_group;
 pub mod id_slab;
 pub mod lifecycle;
 pub mod mux;
+pub mod partition_directory;
 pub mod result;
 pub mod snapshot;
 pub mod stream;
@@ -412,6 +413,17 @@ macro_rules! define_state {
                     Self {
                         inner: $crate::stm::LeftRight::from_factory(factory),
                     }
+                }
+
+                /// The change records of the command applied last.
+                pub(crate) fn last_changes(&self) -> Vec<$crate::change_log::AppliedChange> {
+                    self.inner.read(|state| {
+                        state
+                            .last_result
+                            .as_ref()
+                            .map(|reply| reply.changes.clone())
+                            .unwrap_or_default()
+                    })
                 }
             }
 

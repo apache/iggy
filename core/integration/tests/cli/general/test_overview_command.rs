@@ -52,6 +52,7 @@ Commands:
   options          list the option catalog of a resource scope
   stats            get iggy server statistics
   snapshot         collect iggy server troubleshooting data
+  metadata         metadata change log operations [alias: md]
   pat              personal access token operations
   user             user operations [alias: u]
   client           client operations [alias: c]

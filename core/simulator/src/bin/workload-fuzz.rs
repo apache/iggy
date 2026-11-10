@@ -651,7 +651,8 @@ fn run_quiesce_phase(
     println!(
         "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
          evictions={}; ops_compared={} partition_ops_compared={} data_namespaces_compared={} \
-         data_records_compared={} deleted_partition_ops_compared={} replicas_compared={} namespaces_checked={} \
+         data_records_compared={} deleted_partition_ops_compared={} replicas_compared={} \
+         change_records_compared={} projection_items_compared={} namespaces_checked={} \
          owners_compared={} offsets_compared_with_shadow={} stale_owner_stores={} owner_fence_refusals={})",
         workload.evictions(),
         convergence.ops_compared,
@@ -660,6 +661,8 @@ fn run_quiesce_phase(
         convergence.data_records_compared,
         workload.deleted_partition_ops_compared(),
         convergence.replicas_compared,
+        convergence.change_records_compared,
+        convergence.projection_items_compared,
         convergence.namespaces_checked,
         convergence.owners_compared,
         convergence.offsets_compared_with_shadow,

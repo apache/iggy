@@ -33,7 +33,6 @@ stream = "application_logs"
 topics = ["api_requests", "errors"]
 schema = "json"
 batch_length = 1000
-poll_interval = "100ms"
 consumer_group = "s3_sink"
 ```
 

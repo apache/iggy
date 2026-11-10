@@ -35,6 +35,7 @@ use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
 use iggy_gateway_kafka::listener::SecurityProtocol;
 use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
+use iggy_gateway_kafka::protocol::bounds_guard::MAX_SASL_AUTH_BYTES;
 use iggy_gateway_kafka::protocol::sasl::{MAX_PRE_AUTH_API_VERSIONS, PlainCredentials};
 
 #[path = "common/codec.rs"]
@@ -56,7 +57,6 @@ const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 const ERROR_NONE: i16 = 0;
 const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
 const ERROR_ILLEGAL_SASL_STATE: i16 = 34;
-const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 const ERROR_SASL_AUTHENTICATION_FAILED: i16 = 58;
 const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 
@@ -84,6 +84,7 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
         if matches {
             Ok(AuthenticatedPrincipal {
                 username: credentials.username.clone(),
+                user: None,
                 permissions: self.permissions,
                 permissions_known: true,
             })
@@ -433,21 +434,110 @@ async fn given_an_unknown_mechanism_when_handshaking_should_report_the_supported
     assert_closed(&mut stream).await;
 }
 
-#[tokio::test]
-async fn given_handshake_v0_when_offered_should_be_refused_before_any_headerless_token() {
-    let addr = spawn_sasl_gateway().await;
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
-
-    // v0 selects the pre-KIP-152 framing, where tokens arrive with no request header at all.
+async fn handshake_v0_ok(stream: &mut TcpStream) {
     let body = send(
-        &mut stream,
+        stream,
         API_KEY_SASL_HANDSHAKE,
         0,
         1,
         &handshake_body("PLAIN"),
     )
     .await;
-    assert_eq!(error_code(&body), ERROR_UNSUPPORTED_VERSION);
+    assert_eq!(
+        error_code(&body),
+        ERROR_NONE,
+        "PLAIN must be accepted at v0"
+    );
+}
+
+/// Sends `token` as kafka-python 2.0.2 and Sarama up to 1.40.1 send it after a v0 handshake
+/// (KIP-152): in a bare length-prefixed frame, with no request header.
+async fn send_raw_token(stream: &mut TcpStream, token: &[u8]) {
+    let mut frame = BytesMut::new();
+    frame.put_i32(i32::try_from(token.len()).expect("test token fits i32"));
+    frame.extend_from_slice(token);
+    stream
+        .write_all(&frame)
+        .await
+        .expect("write the bare token");
+}
+
+#[tokio::test]
+async fn given_handshake_v0_when_a_valid_bare_token_follows_should_answer_it_and_serve_requests() {
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_v0_ok(&mut stream).await;
+
+    send_raw_token(&mut stream, &plain_token("alice", "s3cret")).await;
+    // The empty server token of PLAIN, in a length-prefixed frame. kafka-python compares these
+    // four bytes, and Sarama reads exactly four.
+    let mut answer = [0xff_u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut answer))
+        .await
+        .expect("the gateway must answer the bare token")
+        .expect("read the answer to the bare token");
+    assert_eq!(answer, [0, 0, 0, 0]);
+
+    // Requests with headers follow, as on any connection that authenticated.
+    let metadata = send(&mut stream, API_KEY_METADATA, 0, 2, &[0, 0, 0, 0]).await;
+    assert!(
+        !metadata.is_empty(),
+        "Metadata must answer once authenticated"
+    );
+}
+
+#[tokio::test]
+async fn given_handshake_v0_when_the_bare_token_is_wrong_should_close_without_an_answer() {
+    // A bare token has no answer that can carry an error code. A broker closes the connection,
+    // and kafka-python and Sarama report the close as the failure.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_v0_ok(&mut stream).await;
+
+    send_raw_token(&mut stream, &plain_token("alice", "wrong-password")).await;
+    assert_closed(&mut stream).await;
+}
+
+#[tokio::test]
+async fn given_handshake_v0_when_the_bare_token_is_oversized_should_close_before_its_body() {
+    // The token cap applies to the read itself, so an unauthenticated peer cannot make the
+    // gateway wait for, or buffer, a frame up to `max_frame_size`.
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    handshake_v0_ok(&mut stream).await;
+
+    let oversized = i32::try_from(MAX_SASL_AUTH_BYTES + 1).expect("the cap fits i32");
+    stream
+        .write_all(&oversized.to_be_bytes())
+        .await
+        .expect("write the length of the bare token");
+    // Only the length went out. A gateway that waited for the body would hold the connection
+    // until its 5 s read timeout.
+    let read = read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await;
+    assert!(
+        matches!(read, ByteRead::Closed),
+        "the gateway must close at the length, got {read:?}"
+    );
+}
+
+#[tokio::test]
+async fn given_handshake_v0_with_an_unknown_mechanism_should_report_the_supported_list() {
+    let addr = spawn_sasl_gateway().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    let body = send(
+        &mut stream,
+        API_KEY_SASL_HANDSHAKE,
+        0,
+        1,
+        &handshake_body("SCRAM-SHA-256"),
+    )
+    .await;
+    assert_eq!(error_code(&body), ERROR_UNSUPPORTED_SASL_MECHANISM);
+    assert!(
+        body.windows(5).any(|w| w == b"PLAIN"),
+        "the v0 refusal must name what is supported, as the v1 one does"
+    );
     assert_closed(&mut stream).await;
 }
 
@@ -672,11 +762,10 @@ fn parse_api_versions(body: &Bytes) -> Vec<(i16, i16, i16)> {
 
 #[tokio::test]
 async fn given_sasl_enabled_when_advertising_should_offer_handshake_from_version_zero() {
-    // Regression. Advertising SaslHandshake as v1-only is what a version firewall pinned to v1
-    // suggests, and it breaks librdkafka outright: its SASL-handshake feature detection depends on
-    // key 17 appearing at version 0, so it reports "SASL Handshake not supported by broker" and
-    // never sends one. Advertising from 0 while still refusing a v0 handshake at runtime is the
-    // same split Produce already uses. Caught by a real client, not by a stub.
+    // Regression. Advertising SaslHandshake as v1-only breaks librdkafka outright: its
+    // SASL-handshake feature detection depends on key 17 appearing at version 0, so it reports
+    // "SASL Handshake not supported by broker" and never sends one. Caught by a real client, not
+    // by a stub.
     let addr = spawn_sasl_gateway().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -691,10 +780,7 @@ async fn given_sasl_enabled_when_advertising_should_offer_handshake_from_version
         handshake.1, 0,
         "librdkafka needs SaslHandshake advertised from v0 or it sees no SASL at all"
     );
-    assert_eq!(
-        handshake.2, 1,
-        "v0 framing is refused, so v1 is the ceiling"
-    );
+    assert_eq!(handshake.2, 1, "v1 is the highest SaslHandshake version");
 
     let authenticate = rows
         .iter()
@@ -1035,6 +1121,7 @@ impl SaslAuthenticator for StallingAuthenticator {
         let _held = self.release.acquire().await;
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         })
@@ -1101,6 +1188,7 @@ impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: true,
         })
@@ -1499,6 +1587,7 @@ impl SaslAuthenticator for UnreadPermissionsAuthenticator {
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         Ok(AuthenticatedPrincipal {
             username: credentials.username.clone(),
+            user: None,
             permissions: PrincipalPermissions::default(),
             permissions_known: false,
         })

@@ -17,7 +17,8 @@
 # under the License.
 
 # Generate or remove gitignored kafka-tool wire fixtures for CI.
-# Run from the iggy workspace root.
+# Run from the iggy workspace root. KAFKA_MESSAGE_GEN may name an already built
+# kafka-message-gen binary to run instead of building one with `cargo run`.
 
 set -euo pipefail
 
@@ -39,7 +40,11 @@ generate() {
   for key in "${FIXTURE_API_KEYS[@]}"; do
     api_key_args+=(--api-key "$key")
   done
-  cargo run --locked -p kafka-message-gen -- generate \
+  local generator=(cargo run --locked -p kafka-message-gen --)
+  if [[ -n "${KAFKA_MESSAGE_GEN:-}" ]]; then
+    generator=("$KAFKA_MESSAGE_GEN")
+  fi
+  "${generator[@]}" generate \
     --output "$FIXTURES_DIR" \
     "${api_key_args[@]}"
   echo "Generated wire fixtures under ${FIXTURES_DIR}/"

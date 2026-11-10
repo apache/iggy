@@ -383,6 +383,19 @@ actor ClientCore {
         try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
     }
 
+    /// Whether the client comes back on its own: it is signed in, or a
+    /// request or the heartbeat reconnects and signs it in again. A client
+    /// that is shut down, that the caller disconnected, or that has no
+    /// reconnection or no credentials only comes back when the caller acts.
+    var canRecover: Bool {
+        switch state {
+        case .shutdown: false
+        case .authenticated: true
+        case .disconnected, .connecting, .connected, .authenticating:
+            !disconnectedByCaller && configuration.reconnection.enabled && signInCredentials() != nil
+        }
+    }
+
     /// The refusal of a call that started under `captured` once the caller
     /// signed in or out since: nothing of it may be written any more.
     func lineageRefusal(_ captured: UInt64, code: UInt32? = nil) -> IggyError? {
@@ -411,21 +424,22 @@ actor ClientCore {
     /// cancelled request, or an outage longer than the request timeout leaves
     /// the client disconnected, and with credentials to sign in again the
     /// next typed call reconnects instead of failing until ``connect()``. A
-    /// reconnect that outlasts the request timeout refuses the call as not
-    /// accepted, since nothing was sent, and one whose sign-in the server
-    /// refused ends it as unauthenticated.
+    /// reconnect that outlasts the request timeout, or `limit` of a caller
+    /// with a budget of its own, refuses the call as not accepted, since
+    /// nothing was sent, and one whose sign-in the server refused ends it as
+    /// unauthenticated.
     ///
     /// Returns the lineage the call started under, read before the reconnect
     /// can wait for a sign-in of the caller, so that no request of the call
     /// is written under the session that sign-in opens.
-    func requireAuthenticated() async throws -> UInt64 {
+    func requireAuthenticated(within limit: ContinuousClock.Instant? = nil) async throws -> UInt64 {
         let started = lineage
         switch state {
         case .disconnected, .connecting, .authenticating:
             if !disconnectedByCaller, configuration.reconnection.enabled, signInCredentials() != nil {
                 let reconnected: Void?
                 do {
-                    reconnected = try await withDeadline(ContinuousClock.now + configuration.requestTimeout) { [self] in
+                    reconnected = try await withDeadline(requestDeadline(within: limit)) { [self] in
                         try await self.connect()
                     }
                 } catch {
@@ -768,6 +782,12 @@ actor ClientCore {
                 // of the same request no longer proves it never committed.
                 let error = outcome.observe(answer, committed: VSRFrame.hasCommittedResult(header))
                 refusal = error
+                logger.debug(
+                    "The server refused the request",
+                    metadata: [
+                        "code": "\(code)", "request_id": "\(stamped.requestID)", "error": "\(answer)", "server_address": "\(currentAddress)",
+                        "metadata_watermark": "\(metadataWatermark)",
+                    ])
                 if answer.code == .notPrimary, !VSRFrame.hasCommittedResult(header) {
                     return .failure(answer)
                 }
@@ -1185,6 +1205,9 @@ actor ClientCore {
         lineage += 1
         rememberedSignIn = nil
         stopHeartbeat()
+        // A committing read parked on its own connection ends now, with an
+        // unknown outcome, before the server can answer it for the session.
+        await pollRouter.closeDeferredConnections()
         await disconnectTransport()
         resetSession()
     }

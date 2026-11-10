@@ -22,11 +22,17 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
+import org.apache.iggy.system.MetadataChangeBody;
+import org.apache.iggy.system.MetadataChangeGroup;
+import org.apache.iggy.system.MetadataChangeStart;
+import org.apache.iggy.system.MetadataChangeStatus;
+import org.apache.iggy.system.MetadataChangesQuery;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.slf4j.Logger;
@@ -37,6 +43,7 @@ import java.math.BigInteger;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -110,6 +117,40 @@ class TlsConnectionTest extends BaseIntegrationTest {
     }
 
     @Test
+    void readMetadataChangesOverTlsShouldFollowACreatedStream() {
+        var client = IggyTcpClient.builder()
+                .host(TLS_HOST)
+                .port(serverTcpPort())
+                .enableTls()
+                .tlsCertificate(CERTS_DIR.resolve("iggy_ca_cert.pem").toFile())
+                .credentials("iggy", "iggy")
+                .buildAndLogin();
+        var query = MetadataChangesQuery.builder()
+                .start(MetadataChangeStart.latest())
+                .groups(MetadataChangeGroup.STREAMS)
+                .build();
+        var latest = client.system().getMetadataChanges(query);
+        String name = "tls-changes-" + UUID.randomUUID().toString().substring(0, 8);
+        StreamDetails stream = client.streams().createStream(name);
+
+        try {
+            var page = client.system()
+                    .getMetadataChanges(query.withStart(
+                            MetadataChangeStart.after(latest.next().orElseThrow())));
+
+            assertThat(page.status()).isEqualTo(MetadataChangeStatus.OK);
+            assertThat(page.records())
+                    .anySatisfy(record -> assertThat(record.body())
+                            .isInstanceOfSatisfying(MetadataChangeBody.StreamChange.class, created -> {
+                                assertThat(created.streamId()).isEqualTo(stream.id());
+                                assertThat(created.name()).isEqualTo(name);
+                            }));
+        } finally {
+            client.streams().deleteStream(stream.id());
+        }
+    }
+
+    @Test
     void sendAndReceiveOverTlsShouldWork() {
         var client = IggyTcpClient.builder()
                 .host(TLS_HOST)
@@ -146,6 +187,52 @@ class TlsConnectionTest extends BaseIntegrationTest {
                             false);
 
             assertThat(polled.messages()).hasSize(3);
+        } finally {
+            try {
+                client.streams().deleteStream(streamId);
+            } catch (RuntimeException e) {
+                log.debug("Cleanup failed: {}", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    void deferredPollOverTlsShouldWork() {
+        var client = IggyTcpClient.builder()
+                .host(TLS_HOST)
+                .port(serverTcpPort())
+                .enableTls()
+                .tlsCertificate(CERTS_DIR.resolve("iggy_ca_cert.pem").toFile())
+                .credentials("iggy", "iggy")
+                .buildAndLogin();
+
+        String streamName = "tls-deferred-stream";
+        StreamId streamId = StreamId.of(streamName);
+        String topicName = "tls-deferred-topic";
+        TopicId topicId = TopicId.of(topicName);
+
+        try {
+            client.streams().createStream(streamName);
+            client.topics().createTopic(streamId, topicName, 1L);
+            client.messages()
+                    .sendMessages(
+                            streamId,
+                            topicId,
+                            Partitioning.partitionId(0L),
+                            List.of(Message.of("tls-deferred-1"), Message.of("tls-deferred-2")));
+
+            PolledMessages polled = client.messages()
+                    .pollMessagesDeferred(
+                            streamId,
+                            topicId,
+                            Optional.of(0L),
+                            org.apache.iggy.consumergroup.Consumer.of(0L),
+                            PollingStrategy.first(),
+                            10L,
+                            false,
+                            DeferredPollOptions.defaults().withMinCount(2));
+
+            assertThat(polled.messages()).hasSize(2);
         } finally {
             try {
                 client.streams().deleteStream(streamId);

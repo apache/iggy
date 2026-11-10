@@ -16,6 +16,7 @@
 // under the License.
 
 use super::{Command, ConsensusError, ConsensusHeader, HEADER_SIZE, Operation};
+use crate::primitives::partition_status::PartitionStatusEntry;
 use bytemuck::{CheckedBitPattern, NoUninit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
@@ -31,6 +32,9 @@ pub enum PrimaryRebalanceKind {
 }
 
 /// Same-release rebalance exchange, always routed through the metadata owner.
+///
+/// A metadata probe or reply may carry a body of [`PartitionStatusEntry`]
+/// records, covered by `checksum_body`; every other kind is header-only.
 ///
 /// `view` identifies the metadata coordinator's view, while `partition_view`
 /// belongs to the probed partition. A ready reply only supplies evidence to the
@@ -105,13 +109,20 @@ impl ConsensusHeader for PrimaryRebalanceHeader {
                 found: self.command,
             });
         }
-        if self.size as usize != HEADER_SIZE {
+        let carries_status = matches!(
+            self.kind,
+            PrimaryRebalanceKind::MetadataProbe | PrimaryRebalanceKind::MetadataReply
+        );
+        let body_len = (self.size as usize).checked_sub(HEADER_SIZE);
+        if !body_len.is_some_and(|len| {
+            len == 0 || (carries_status && len.is_multiple_of(PartitionStatusEntry::ENCODED_SIZE))
+        }) {
             return Err(ConsensusError::InvalidSize {
                 expected: HEADER_SIZE as u32,
                 found: self.size,
             });
         }
-        if self.checksum_body != 0 || self.release != 0 {
+        if (body_len == Some(0) && self.checksum_body != 0) || self.release != 0 {
             return Err(ConsensusError::InvalidField(
                 "primary rebalance body checksum and release must be zero".into(),
             ));
@@ -218,6 +229,40 @@ mod tests {
             target: u8::from(kind == PrimaryRebalanceKind::PrimaryTransfer),
             reserved: [0; 73],
         }
+    }
+
+    #[test]
+    fn given_a_status_body_when_validating_should_admit_it_only_on_metadata_exchanges() {
+        let with_body = |kind, body: usize| {
+            let mut header = header(kind);
+            header.size = u32::try_from(HEADER_SIZE + body).unwrap();
+            header.checksum_body = u128::from(body != 0);
+            header
+        };
+        let entry = PartitionStatusEntry::ENCODED_SIZE;
+        for kind in [
+            PrimaryRebalanceKind::MetadataProbe,
+            PrimaryRebalanceKind::MetadataReply,
+        ] {
+            assert!(with_body(kind, 0).validate().is_ok(), "{kind:?}");
+            assert!(with_body(kind, 3 * entry).validate().is_ok(), "{kind:?}");
+            assert!(with_body(kind, entry + 1).validate().is_err(), "{kind:?}");
+        }
+        for kind in [
+            PrimaryRebalanceKind::PartitionProbe,
+            PrimaryRebalanceKind::PartitionReply,
+            PrimaryRebalanceKind::SourceProbe,
+            PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
+        ] {
+            assert!(with_body(kind, entry).validate().is_err(), "{kind:?}");
+        }
+        let mut empty = header(PrimaryRebalanceKind::MetadataReply);
+        empty.checksum_body = 1;
+        assert!(empty.validate().is_err(), "no body, no body checksum");
+        let mut short = header(PrimaryRebalanceKind::MetadataReply);
+        short.size = u32::try_from(HEADER_SIZE - 1).unwrap();
+        assert!(short.validate().is_err());
     }
 
     #[test]

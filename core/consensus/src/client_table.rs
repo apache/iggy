@@ -527,8 +527,9 @@ pub const COMMITTED_WINDOW_BITS: u64 = 128;
 ///
 /// Metadata registration stores an immutable principal, epoch and bind
 /// verifier. Matching login retries resolve that same registration. Explicit
-/// logout or lease expiry ends it; ordered retirement in every partition group
-/// precedes removal. Capacity pressure never evicts a live registration.
+/// logout or lease expiry ends it. Removal follows its retirement in every
+/// partition group, or a retirement debt the group pays before it serves
+/// sessions again. Capacity pressure never evicts a live registration.
 ///
 /// Partition slices retain session-qualified receipts, committed windows
 /// and exact results. The first committed prepare fixes the group's capacity.
@@ -1466,6 +1467,13 @@ impl ClientTable {
             .map(|entry| entry.epoch)
     }
 
+    /// Epoch of the session `client_id` holds a slot for, ended or not.
+    #[must_use]
+    pub fn session_epoch(&self, client_id: u128) -> Option<u64> {
+        let &slot_idx = self.index.get(&client_id)?;
+        self.slots[slot_idx].as_ref().map(|entry| entry.epoch)
+    }
+
     /// Attach only after the caller has authenticated `user_id` and waited
     /// for the local metadata frontier to cover the requested session.
     /// The registered user owns the session, matching authenticated login
@@ -1526,6 +1534,16 @@ impl ClientTable {
     #[must_use]
     pub fn count(&self) -> usize {
         self.index.len()
+    }
+
+    /// Sessions not yet ended, as `(client_id, user_id, epoch)` in slot order.
+    /// Never the bind verifier or a cached reply.
+    pub fn active_sessions(&self) -> impl Iterator<Item = (u128, u32, u64)> + '_ {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|entry| entry.ended_op.is_none())
+            .map(|entry| (entry.client_id, entry.user_id, entry.epoch))
     }
 }
 
@@ -2031,6 +2049,22 @@ mod tests {
             ..ReplyHeader::default()
         };
         msg
+    }
+
+    #[test]
+    fn given_ended_and_live_sessions_when_listing_active_should_yield_only_live_identities() {
+        let mut table = ClientTable::new(8);
+        for (client, user, epoch) in [(1, 11, 10), (2, 22, 20), (3, 11, 30)] {
+            table
+                .commit_register(client, user, [0x5a; 32], make_register_reply(client, epoch))
+                .unwrap();
+        }
+        table.end_user_sessions(22, 40);
+
+        let mut active: Vec<_> = table.active_sessions().collect();
+        active.sort_unstable();
+
+        assert_eq!(active, [(1, 11, 10), (3, 11, 30)]);
     }
 
     #[test]

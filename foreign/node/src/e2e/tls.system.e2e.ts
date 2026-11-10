@@ -42,6 +42,7 @@ import { Client } from '../client/client.js';
 import type { TlsOption } from '../client/client.type.js';
 import { Partitioning, Consumer, EncryptionKeySource, PollingStrategy } from '../wire/index.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
+import { describeKeyedMetadataChanges, describeMetadataChanges } from './metadata-changes.suite.js';
 import { describeResourceOptions } from './resource-options.suite.js';
 
 const tlsEnabled = process.env.IGGY_TCP_TLS_ENABLED === 'true';
@@ -73,6 +74,14 @@ const getTlsClient = (credentials = { username: 'iggy', password: 'iggy' }) => {
 describeResourceOptions(
   'e2e -> tls resource options', 'tls-e2e-ro', getTlsClient, EncryptionKeySource.None,
   !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set'
+);
+
+describeMetadataChanges(
+  'e2e -> tls metadata changes', 'tls-e2e-mc', getTlsClient, !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set'
+);
+
+describeKeyedMetadataChanges(
+  'e2e -> tls keyed metadata changes', 'tls-e2e-mc', getTlsClient, !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set'
 );
 
 describe('e2e -> tls', { skip: !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set' }, async () => {

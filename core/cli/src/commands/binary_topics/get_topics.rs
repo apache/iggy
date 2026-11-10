@@ -62,7 +62,7 @@ impl CliCommand for GetTopicsCmd {
         )
     }
 
-    fn machine_readable_output(&self) -> bool {
+    fn stdout_is_data(&self) -> bool {
         matches!(self.output, GetTopicsOutput::Json)
     }
 

@@ -32,6 +32,8 @@ import org.apache.iggy.partition.PartitionContext;
 import java.math.BigInteger;
 import java.security.SecureRandom;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -55,9 +57,15 @@ public final class ConsensusSession {
     public static final int DEFAULT_MAX_PENDING_OPERATIONS = 256;
     public static final long DEFAULT_MAX_PENDING_OPERATION_BYTES = 64L * 1024 * 1024;
     static final int BIND_SECRET_BYTES = 32;
+    private static final long FETCH_RECOVERY_BYTES = 2L * Long.BYTES;
+    private static final long FETCH_TARGET_BYTES = 2L * Long.BYTES;
     // No lineage is negative, see signingIn().
     private static final long NO_SIGN_IN = -1;
     private static final SecureRandom RANDOM = new SecureRandom();
+    // One order for the lanes of every request, with the progress lane of a partition before its mutation lane.
+    private static final Comparator<LaneKey> ADMISSION_ORDER = Comparator.comparingLong(LaneKey::partition)
+            .thenComparingLong(LaneKey::incarnation)
+            .thenComparing(LaneKey::progress, Comparator.reverseOrder());
     private final byte[] bindSecret = new byte[BIND_SECRET_BYTES];
 
     private long clientIdLow;
@@ -82,6 +90,10 @@ public final class ConsensusSession {
     private final Map<LaneKey, Ticket> lanes = new HashMap<>();
     private final Map<LaneKey, ArrayDeque<CompletableFuture<Ticket>>> laneAdmissions = new HashMap<>();
     private final Map<Long, Ticket> retained = new HashMap<>();
+    private final Map<Long, FetchRecovery> retainedFetches = new HashMap<>();
+    private final Map<LaneKey, FetchRecovery> blockedFetchLanes = new HashMap<>();
+    private int fetchReservations;
+    private long fetchBytes;
     // The outcomes of the last maxPendingOperations proved replays, oldest first. A reset keeps them, because
     // request ids never repeat within a client.
     private final ArrayDeque<ProvedOutcome> proved = new ArrayDeque<>();
@@ -473,7 +485,7 @@ public final class ConsensusSession {
     }
 
     public synchronized void configurePendingOperations(int count, long bytes) {
-        if (count <= 0 || bytes <= 0 || pendingOperations != 0 || pendingBytes != 0) {
+        if (count <= 0 || bytes <= 0 || pendingOperations != 0 || pendingBytes != 0 || fetchReservations != 0) {
             throw new IggyInvalidArgumentException(
                     "Pending operation limits must be positive and configured before use");
         }
@@ -481,69 +493,151 @@ public final class ConsensusSession {
         maxPendingBytes = bytes;
     }
 
+    /**
+     * Admits a request to {@code lanes}. Every request takes its lanes in ascending partition order, so two requests
+     * never each wait for a lane that the other one reserved. A request joins the queue of a lane only once it heads
+     * the queue of every lane before it, and it takes all its lanes once it heads every queue and no ticket holds any
+     * of them. An offset mutation takes its progress turn before joining the partition mutation queue.
+     */
     public CompletableFuture<Ticket> acquire(
-            LaneKey lane, boolean mutation, long frameBytes, long deadline, EventExecutor executor) {
+            List<LaneKey> lanes, boolean mutation, long frameBytes, long deadline, EventExecutor executor) {
+        return acquire(lanes, mutation, frameBytes, deadline, executor, false);
+    }
+
+    public CompletableFuture<Ticket> acquire(
+            List<LaneKey> lanes,
+            boolean mutation,
+            long frameBytes,
+            long deadline,
+            EventExecutor executor,
+            boolean inspect) {
         ConsensusSession owner = owner();
         if (owner != this) {
-            return owner.acquire(lane, mutation, frameBytes, deadline, executor);
+            return owner.acquire(lanes, mutation, frameBytes, deadline, executor, inspect);
         }
         CompletableFuture<Ticket> result = new CompletableFuture<>();
+        List<LaneKey> order = admissionOrder(lanes, mutation);
         var timer = executor.schedule(
                 () -> result.completeExceptionally(
                         new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode())),
                 Math.max(0, deadline - System.nanoTime()),
                 TimeUnit.NANOSECONDS);
         synchronized (this) {
-            laneAdmissions.computeIfAbsent(lane, ignored -> new ArrayDeque<>()).addLast(result);
+            laneAdmissions
+                    .computeIfAbsent(order.get(0), ignored -> new ArrayDeque<>())
+                    .addLast(result);
         }
         result.whenComplete((ticket, error) -> {
             timer.cancel(false);
-            boolean wakeNext;
+            boolean wakeNext = false;
             synchronized (this) {
-                var waiting = laneAdmissions.get(lane);
-                wakeNext = waiting.getFirst() == result && !lanes.containsKey(lane);
-                waiting.remove(result);
-                if (waiting.isEmpty()) {
-                    laneAdmissions.remove(lane);
+                for (LaneKey lane : order) {
+                    wakeNext |= removeAdmission(lane, result);
                 }
             }
             if (wakeNext) {
                 changed();
             }
         });
-        acquireWhenAvailable(lane, mutation, frameBytes, deadline, result);
+        acquireWhenAvailable(order, mutation, frameBytes, deadline, result, 1, inspect);
         return result;
     }
 
-    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    private static List<LaneKey> admissionOrder(List<LaneKey> lanes, boolean mutation) {
+        List<LaneKey> order = new ArrayList<>(lanes.size() + 1);
+        for (LaneKey lane : lanes) {
+            order.add(lane);
+            if (mutation && lane.progress()) {
+                order.add(new LaneKey(lane.incarnation(), lane.partition()));
+            }
+        }
+        order.sort(ADMISSION_ORDER);
+        return List.copyOf(order);
+    }
+
+    private boolean removeAdmission(LaneKey lane, CompletableFuture<Ticket> result) {
+        var waiting = laneAdmissions.get(lane);
+        if (waiting == null) {
+            return false;
+        }
+        boolean wakeNext = waiting.getFirst() == result && !lanes.containsKey(lane);
+        waiting.remove(result);
+        if (waiting.isEmpty()) {
+            laneAdmissions.remove(lane);
+        }
+        return wakeNext;
+    }
+
+    /**
+     * Admits {@code result} once it heads the queue of each lane of {@code order} and no ticket holds any of them.
+     * The request is in the queues of the first {@code queued} lanes.
+     */
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void acquireWhenAvailable(
-            LaneKey lane, boolean mutation, long frameBytes, long deadline, CompletableFuture<Ticket> result) {
+            List<LaneKey> order,
+            boolean mutation,
+            long frameBytes,
+            long deadline,
+            CompletableFuture<Ticket> result,
+            int queued,
+            boolean inspect) {
         CompletableFuture<Void> changed = null;
         Ticket admitted = null;
         RuntimeException failure = null;
+        int joined = queued;
         synchronized (this) {
             if (result.isDone()) {
                 return;
             }
-            Ticket blocking = lanes.get(lane);
-            if (blocking != null && blocking.retained) {
-                failure = new IggyOperationException(IggyErrorCode.LANE_BLOCKED, blocking.operationId);
+            IggyOperationException retainedFailure = null;
+            for (LaneKey lane : order) {
+                FetchRecovery fetch = blockedFetchLanes.get(lane);
+                if (fetch != null && !inspect) {
+                    retainedFailure = new IggyOperationException(
+                            IggyErrorCode.PARTITION_LANE_BLOCKED, fetch.operationId, lane.partition());
+                    break;
+                }
+                Ticket blocking = lanes.get(lane);
+                if (blocking != null && blocking.retained) {
+                    retainedFailure = blockedLane(lane, blocking);
+                    break;
+                }
+            }
+            if (retainedFailure != null) {
+                failure = retainedFailure;
             } else if (mutation && frameBytes > maxPendingBytes) {
                 failure = new IggyInvalidArgumentException("Request exceeds the pending operation byte limit");
             } else if (deadline - System.nanoTime() <= 0) {
                 failure = new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
-            } else if (laneAdmissions.get(lane).getFirst() != result
-                    || blocking != null
-                    || (mutation
-                            && (pendingOperations >= maxPendingOperations
-                                    || frameBytes > maxPendingBytes - pendingBytes))) {
-                changed = admissionChanged;
             } else {
-                admitted = new Ticket(this, lane, mutation, frameBytes, generation);
-                lanes.put(lane, admitted);
-                if (mutation) {
-                    pendingOperations++;
-                    pendingBytes += frameBytes;
+                // A store enters the mutation queue only after its progress turn,
+                // so a parked poll cannot hold back producers through that store.
+                int headed = 0;
+                while (headed < joined
+                        && laneAdmissions.get(order.get(headed)).getFirst() == result
+                        && !lanes.containsKey(order.get(headed))) {
+                    headed++;
+                    if (headed == joined && joined < order.size()) {
+                        laneAdmissions
+                                .computeIfAbsent(order.get(joined), ignored -> new ArrayDeque<>())
+                                .addLast(result);
+                        joined++;
+                    }
+                }
+                if (headed < order.size()
+                        || (mutation
+                                && (pendingOperations >= maxPendingOperations
+                                        || frameBytes > maxPendingBytes - pendingBytes))) {
+                    changed = admissionChanged;
+                } else {
+                    admitted = new Ticket(this, order, mutation, frameBytes, generation);
+                    for (LaneKey lane : order) {
+                        lanes.put(lane, admitted);
+                    }
+                    if (mutation) {
+                        pendingOperations++;
+                        pendingBytes += frameBytes;
+                    }
                 }
             }
         }
@@ -554,18 +648,64 @@ public final class ConsensusSession {
                 admitted.complete();
             }
         } else {
-            changed.thenRun(() -> acquireWhenAvailable(lane, mutation, frameBytes, deadline, result));
+            int next = joined;
+            changed.thenRun(() -> acquireWhenAvailable(order, mutation, frameBytes, deadline, result, next, inspect));
         }
     }
 
     public void checkRetained(LaneKey lane) {
+        checkRetained(lane, false);
+    }
+
+    public void checkRetained(LaneKey lane, boolean mutation) {
+        checkRetained(lane, mutation, false);
+    }
+
+    public void checkRetained(LaneKey lane, boolean mutation, boolean inspect) {
         ConsensusSession owner = owner();
         synchronized (owner) {
+            FetchRecovery fetch = owner.blockedFetchLanes.get(lane);
+            if (fetch != null && !inspect) {
+                throw new IggyOperationException(
+                        IggyErrorCode.PARTITION_LANE_BLOCKED, fetch.operationId, lane.partition());
+            }
             Ticket ticket = owner.lanes.get(lane);
             if (ticket != null && ticket.retained) {
-                throw new IggyOperationException(IggyErrorCode.LANE_BLOCKED, ticket.operationId);
+                throw blockedLane(lane, ticket);
+            }
+            if (mutation && lane.progress()) {
+                Ticket blocking = owner.lanes.get(new LaneKey(lane.incarnation(), lane.partition()));
+                if (blocking != null && blocking.retained) {
+                    throw blockedLane(lane, blocking);
+                }
             }
         }
+    }
+
+    /** Completes once no committing read that its caller cancelled after the send still waits for its reply. */
+    public CompletableFuture<Void> cancelledReadsSettled() {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        awaitCancelledReads(result);
+        return result;
+    }
+
+    private void awaitCancelledReads(CompletableFuture<Void> result) {
+        ConsensusSession owner = owner();
+        CompletableFuture<Void> changed;
+        synchronized (owner) {
+            if (owner.lanes.values().stream().noneMatch(ticket -> ticket.blockedOnCancel)) {
+                result.complete(null);
+                return;
+            }
+            changed = owner.admissionChanged;
+        }
+        changed.whenComplete((ignored, error) -> awaitCancelledReads(result));
+    }
+
+    private static IggyOperationException blockedLane(LaneKey lane, Ticket ticket) {
+        return lane.equals(LaneKey.METADATA)
+                ? new IggyOperationException(IggyErrorCode.LANE_BLOCKED, ticket.operationId)
+                : new IggyOperationException(IggyErrorCode.LANE_BLOCKED, ticket.operationId, lane.partition());
     }
 
     /**
@@ -580,6 +720,12 @@ public final class ConsensusSession {
             return owner.resume(operationId, deadline, executor);
         }
         CompletableFuture<Ticket> result = new CompletableFuture<>();
+        synchronized (this) {
+            if (retainedFetches.containsKey(operationId)) {
+                return CompletableFuture.failedFuture(
+                        new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, operationId));
+            }
+        }
         resumeWhenIdle(operationId, null, result);
         if (result.isDone()) {
             return result;
@@ -656,6 +802,14 @@ public final class ConsensusSession {
         boolean idle;
         ConsensusSession owner = owner();
         synchronized (owner) {
+            FetchRecovery fetch = owner.retainedFetches.remove(operationId);
+            if (fetch != null) {
+                fetch.abandoned = true;
+                owner.fetchReservations--;
+                owner.fetchBytes -= fetch.bytes;
+                fetch.lanes.forEach(lane -> owner.blockedFetchLanes.remove(lane, fetch));
+                return;
+            }
             ticket = owner.retained.remove(operationId);
             if (ticket == null) {
                 throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
@@ -743,17 +897,54 @@ public final class ConsensusSession {
         } while (clientIdLow == 0 && clientIdHigh == 0);
     }
 
-    public record LaneKey(long incarnation, long partition) {
+    /** The first unresolved fetch, if any, for reporting after connection cleanup. */
+    public IggyOperationException unresolvedFetch() {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            return owner.retainedFetches.keySet().stream()
+                    .min(Long::compareUnsigned)
+                    .map(id -> new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, id))
+                    .orElse(null);
+        }
+    }
+
+    public IggyOperationException fetchRecovery(long operationId) {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            return owner.retainedFetches.containsKey(operationId)
+                    ? new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, operationId)
+                    : null;
+        }
+    }
+
+    public record LaneKey(long incarnation, long partition, boolean progress) {
         public static final LaneKey METADATA = new LaneKey(0, 0);
+
+        public LaneKey(long incarnation, long partition) {
+            this(incarnation, partition, false);
+        }
     }
 
     /** A copy of the reply body of a proved commit, or no body and the code of a proved committed rejection. */
     private record ProvedOutcome(long operationId, byte[] body, int rejection) {}
 
+    private static final class FetchRecovery {
+        private final long bytes;
+        private List<LaneKey> lanes;
+        private long operationId;
+        private boolean retained;
+        private boolean abandoned;
+
+        private FetchRecovery(List<LaneKey> lanes, long bytes) {
+            this.lanes = lanes;
+            this.bytes = bytes;
+        }
+    }
+
     /** One lane admission owns one immutable frame; writer aliases keep its bytes charged. */
     public static final class Ticket {
         private final ConsensusSession owner;
-        private final LaneKey lane;
+        private final List<LaneKey> lanes;
         private final boolean mutation;
         private final long bytes;
         private long generation;
@@ -770,10 +961,15 @@ public final class ConsensusSession {
         private boolean sent;
         private boolean bytesReleased;
         private boolean restarting;
+        private FetchRecovery fetch;
+        private boolean fetchSettled;
+        // The caller cancelled the committing read after it went out, so its lanes are blocked until its reply.
+        private boolean blockedOnCancel;
+        private CompletableFuture<Void> attemptSettled;
 
-        private Ticket(ConsensusSession owner, LaneKey lane, boolean mutation, long bytes, long generation) {
+        private Ticket(ConsensusSession owner, List<LaneKey> lanes, boolean mutation, long bytes, long generation) {
             this.owner = owner;
-            this.lane = lane;
+            this.lanes = lanes;
             this.mutation = mutation;
             this.bytes = bytes;
             this.generation = generation;
@@ -785,6 +981,9 @@ public final class ConsensusSession {
                     throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
                 }
                 operationId = VsrHeaders.readRequestId(request);
+                if (fetch != null) {
+                    fetch.operationId = operationId;
+                }
                 commandCode = command;
                 routingBody = target;
                 frame = request.retainedDuplicate();
@@ -817,10 +1016,14 @@ public final class ConsensusSession {
                     return false;
                 }
                 operationId = owner.nextRequestId();
+                if (fetch != null) {
+                    fetch.operationId = operationId;
+                }
                 attemptFrame.setLongLE(attemptFrame.readerIndex() + VsrHeaders.REQUEST_ID_OFFSET, operationId);
                 int floorOffset = attemptFrame.readerIndex() + VsrHeaders.REQUEST_METADATA_OP_OFFSET;
                 long capturedFloor = attemptFrame.getLongLE(floorOffset);
-                if (lane.equals(LaneKey.METADATA) && Long.compareUnsigned(owner.metadataWatermark, capturedFloor) > 0) {
+                if (lanes.contains(LaneKey.METADATA)
+                        && Long.compareUnsigned(owner.metadataWatermark, capturedFloor) > 0) {
                     attemptFrame.setLongLE(floorOffset, owner.metadataWatermark);
                 }
                 return true;
@@ -853,6 +1056,110 @@ public final class ConsensusSession {
 
         public long operationId() {
             return operationId;
+        }
+
+        /** Whether the committing read of this ticket ended with an unknown outcome that still blocks its lanes. */
+        public boolean fetchRetained() {
+            synchronized (owner) {
+                return fetch != null && fetch.retained && !fetch.abandoned;
+            }
+        }
+
+        /** Reserves bounded target metadata, independent of session-bound replay frames. */
+        public void reserveFetch() {
+            synchronized (owner) {
+                if (completed) {
+                    throw new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
+                }
+                if (fetch != null) {
+                    return;
+                }
+                long metadataBytes = FETCH_RECOVERY_BYTES + lanes.size() * FETCH_TARGET_BYTES;
+                if (owner.fetchReservations >= owner.maxPendingOperations
+                        || metadataBytes > owner.maxPendingBytes - owner.fetchBytes) {
+                    throw new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
+                }
+                fetch = new FetchRecovery(lanes, metadataBytes);
+                owner.fetchReservations++;
+                owner.fetchBytes += metadataBytes;
+            }
+        }
+
+        /** Whether this is a poll or fetch that stores the offsets that it reads. */
+        public boolean commitsOnRead() {
+            synchronized (owner) {
+                return fetch != null;
+            }
+        }
+
+        /** Records {@code settled}, which completes once the attempt that a writer started has its outcome. */
+        public void attemptStarted(CompletableFuture<Void> settled) {
+            synchronized (owner) {
+                attemptSettled = settled;
+            }
+        }
+
+        /** Completes once the last started attempt has its outcome, or null before any attempt. */
+        public CompletableFuture<Void> attemptSettled() {
+            synchronized (owner) {
+                return attemptSettled;
+            }
+        }
+
+        /**
+         * Blocks the lanes of a committing read whose caller cancelled it after it went out, because the server can
+         * still store until it answers the cancel. That reply lifts or narrows the block, see {@link #settleFetch}.
+         */
+        public void blockUntilSettled() {
+            synchronized (owner) {
+                if (fetch == null || !sent || fetchSettled || completed || fetch.retained) {
+                    return;
+                }
+                retainFetch(lanes);
+                blockedOnCancel = true;
+            }
+            owner.changed();
+        }
+
+        /** Settles a valid table before record decoding, retaining only uncertain target sections. */
+        public void settleFetch(List<Long> uncertainPartitions) {
+            synchronized (owner) {
+                fetchSettled = true;
+                List<LaneKey> uncertain = lanes.stream()
+                        .filter(lane -> uncertainPartitions.contains(lane.partition()))
+                        .toList();
+                if (blockedOnCancel) {
+                    narrowFetch(uncertain);
+                } else if (!uncertain.isEmpty()) {
+                    retainFetch(uncertain);
+                }
+            }
+        }
+
+        /** Keeps the block of a cancelled committing read only on {@code uncertain}, which its reply left unknown. */
+        private void narrowFetch(List<LaneKey> uncertain) {
+            blockedOnCancel = false;
+            if (fetch.abandoned) {
+                return;
+            }
+            fetch.lanes.stream()
+                    .filter(lane -> !uncertain.contains(lane))
+                    .forEach(lane -> owner.blockedFetchLanes.remove(lane, fetch));
+            fetch.lanes = uncertain;
+            if (uncertain.isEmpty()) {
+                fetch.retained = false;
+                owner.retainedFetches.remove(operationId, fetch);
+            }
+        }
+
+        private void retainFetch(List<LaneKey> affected) {
+            if (fetch.retained || fetch.abandoned || completed) {
+                return;
+            }
+            fetch.retained = true;
+            fetch.lanes = affected;
+            owner.retainedFetches.put(operationId, fetch);
+            affected.forEach(lane -> owner.blockedFetchLanes.put(lane, fetch));
         }
 
         /**
@@ -939,6 +1246,9 @@ public final class ConsensusSession {
         public void settleSent(boolean uncertain) {
             synchronized (owner) {
                 sent = uncertain;
+                if (!uncertain && blockedOnCancel) {
+                    narrowFetch(List.of());
+                }
             }
         }
 
@@ -971,15 +1281,34 @@ public final class ConsensusSession {
             }
         }
 
+        private boolean retainUnknownFetch() {
+            if (fetch == null || !sent || fetchSettled) {
+                return false;
+            }
+            retainFetch(lanes);
+            return true;
+        }
+
+        private boolean retainMutation() {
+            if (completed || abandoned || !mutation || !sent || generation != owner.generation) {
+                return false;
+            }
+            retained = true;
+            resolving = false;
+            owner.retained.put(operationId, this);
+            return true;
+        }
+
         public RuntimeException retain() {
             boolean saved;
+            boolean fetchUnknown;
             synchronized (owner) {
-                saved = !completed && !abandoned && mutation && sent && generation == owner.generation;
-                if (saved) {
-                    retained = true;
-                    resolving = false;
-                    owner.retained.put(operationId, this);
-                }
+                fetchUnknown = retainUnknownFetch();
+                saved = retainMutation();
+            }
+            if (fetchUnknown) {
+                complete();
+                return new IggyOperationException(IggyErrorCode.FETCH_PROGRESS_UNCERTAIN, operationId);
             }
             if (saved) {
                 owner.changed();
@@ -1000,8 +1329,19 @@ public final class ConsensusSession {
                 if (completed) {
                     return;
                 }
+                if (fetch != null) {
+                    if (sent && !fetchSettled) {
+                        retainFetch(lanes);
+                    }
+                    if (!fetch.retained && !fetch.abandoned) {
+                        owner.fetchReservations--;
+                        owner.fetchBytes -= fetch.bytes;
+                    }
+                }
                 completed = true;
-                owner.lanes.remove(lane, this);
+                for (LaneKey lane : lanes) {
+                    owner.lanes.remove(lane, this);
+                }
                 owner.retained.remove(operationId, this);
                 if (mutation && !abandoned) {
                     owner.pendingOperations--;

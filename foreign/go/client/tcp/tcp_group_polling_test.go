@@ -74,7 +74,7 @@ func groupConsumer(t *testing.T) (iggcon.Identifier, iggcon.Identifier, iggcon.C
 func pollOnce(t *testing.T, client *IggyTcpClient) (*iggcon.PolledMessage, error) {
 	t.Helper()
 	streamId, topicId, consumer := groupConsumer(t)
-	return client.PollMessages(context.Background(), streamId, topicId,
+	return client.pollMessages(context.Background(), streamId, topicId,
 		consumer, iggcon.NextPollingStrategy(), 1, false, nil)
 }
 

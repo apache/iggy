@@ -58,6 +58,13 @@ pub struct MergeQuorums {
     /// stay unless an explicit or conflicting-header nack quorum discards them,
     /// so the merge keeps more history, never less.
     pub absence_nacks: bool,
+    /// Empty votes the every-replica merge may take. An empty vote holds none
+    /// of the ops its sender acknowledged, so a replication quorum of them can
+    /// hide an op that only those senders acknowledged. Where a restart keeps
+    /// every acknowledged prepare, only a replica that lost its storage casts
+    /// one, and fewer than a replication quorum of them leave every committed op
+    /// in some other sender's log.
+    pub empty_votes_max: usize,
 }
 
 /// What the collected DVCs say about starting the view.
@@ -500,6 +507,9 @@ pub fn merge_view_change(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> Merg
     } else if received < quorums.replica_count {
         return MergeOutcome::AwaitingQuorum;
     }
+    if dvc_iter(quorum).filter(|dvc| dvc.is_empty_vote()).count() > quorums.empty_votes_max {
+        return MergeOutcome::AwaitingQuorum;
+    }
     merge_dvc_quorum(
         quorum,
         MergeQuorums {
@@ -678,6 +688,7 @@ mod tests {
             replica_count: 3,
             prepare_queue_ceiling: 32,
             absence_nacks: true,
+            empty_votes_max: 3,
         }
     }
 
@@ -940,6 +951,7 @@ mod tests {
             replica_count: 7,
             prepare_queue_ceiling: 32,
             absence_nacks: true,
+            empty_votes_max: 7,
         };
         let mut quorum = dvc_quorum_array_empty();
         let mut abstaining = suffix_headers(4, 5, 7);
@@ -1236,6 +1248,61 @@ mod tests {
     /// What a recovering replica barred from electing sends.
     fn empty_vote(replica: u8) -> StoredDvc {
         untrusted(dvc(replica, 0, 0, 0, DvcSuffix::empty()))
+    }
+
+    /// Every replica reported, so the merge takes every log, but an empty vote
+    /// holds none of the ops its sender acknowledged. Two of three are empty, a
+    /// replication quorum, and could be all that acknowledged op 10.
+    #[test]
+    fn given_every_replica_reporting_when_empty_votes_reach_a_replication_quorum_should_not_start()
+    {
+        let persisted = MergeQuorums {
+            empty_votes_max: 1,
+            ..quorums_r3()
+        };
+        let mut quorum = dvc_quorum_array_empty();
+        dvc_record(
+            &mut quorum,
+            dvc(0, 1, 9, 4, suffix_all_present(suffix_headers(4, 9, 1))),
+        );
+        dvc_record(&mut quorum, empty_vote(1));
+        dvc_record(&mut quorum, empty_vote(2));
+        assert_eq!(
+            merge_view_change(&quorum, persisted),
+            MergeOutcome::AwaitingQuorum
+        );
+        assert!(
+            matches!(
+                merge_view_change(&quorum, quorums_r3()),
+                MergeOutcome::Ready(_)
+            ),
+            "a durability that loses acknowledged ops on any restart takes every vote"
+        );
+    }
+
+    /// A two-member group commits on both members, so the member that kept its
+    /// storage holds every committed op, and its log alone decides the view.
+    #[test]
+    fn given_a_two_member_group_when_one_member_lost_its_storage_should_start_on_the_survivor_log()
+    {
+        let quorums = MergeQuorums {
+            view_change: 2,
+            nack_prepare: 2,
+            replica_count: 2,
+            prepare_queue_ceiling: 32,
+            absence_nacks: true,
+            empty_votes_max: 1,
+        };
+        let mut quorum = dvc_quorum_array_empty();
+        dvc_record(
+            &mut quorum,
+            dvc(0, 1, 9, 4, suffix_all_present(suffix_headers(4, 9, 1))),
+        );
+        dvc_record(&mut quorum, empty_vote(1));
+        let MergeOutcome::Ready(merged) = merge_view_change(&quorum, quorums) else {
+            panic!("one empty vote leaves every committed op in the survivor's log");
+        };
+        assert_eq!(merged.op_head, 9);
     }
 
     #[test]

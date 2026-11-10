@@ -71,6 +71,7 @@ constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
     iggy::TopicOptionKey::MessagesRequiredToSave,
     iggy::TopicOptionKey::SizeOfMessagesRequiredToSave,
     iggy::TopicOptionKey::PreallocateSegments,
+    iggy::TopicOptionKey::ReplicationFactor,
 };
 
 constexpr iggy::UserOptionKey kUserOptionKeys[] = {
@@ -272,9 +273,9 @@ class E2E_ResourceOptionsTransport : public E2ETestFixture,
             return payloads;
         }
         iggy::ffi::ErrorInfo error_info{};
-        const auto polled =
-            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
-                                  make_numeric_identifier(1), "offset", 0, 10, false, error_info);
+        const auto polled = client->poll_messages(
+            make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+            make_numeric_identifier(1), make_polling_strategy("offset", 0), make_poll_options(10), error_info);
         for (const auto &message : polled.messages) {
             payloads.emplace_back(message.payload.begin(), message.payload.end());
         }
@@ -711,9 +712,18 @@ TEST_P(E2E_ResourceOptionsTransport, GivenPublicDescribeOptionsWhenCalledShouldR
             EXPECT_EQ(spec.Key(), entry.at("key").get<std::string>());
             EXPECT_EQ(static_cast<std::uint8_t>(spec.Kind()), kind_codes.at(entry.at("kind").get<std::string>()));
             EXPECT_EQ(FlagsOf(spec), entry.at("flags").get<std::uint32_t>());
-            EXPECT_EQ(DefaultText(spec), entry.at("default").is_null()
-                                             ? std::nullopt
-                                             : std::optional<std::string>(entry.at("default").get<std::string>()));
+            const auto default_text = DefaultText(spec);
+            if (spec.Key() == iggy::to_string(iggy::TopicOptionKey::ReplicationFactor)) {
+                // The server's [cluster] default_replication_factor decides this default, so the
+                // static catalog in the fixture has none.
+                ASSERT_TRUE(default_text.has_value());
+                EXPECT_GE(std::stoul(*default_text), 1u);
+                EXPECT_LE(std::stoul(*default_text), 32u);
+            } else {
+                EXPECT_EQ(default_text, entry.at("default").is_null()
+                                            ? std::nullopt
+                                            : std::optional<std::string>(entry.at("default").get<std::string>()));
+            }
             EXPECT_FALSE(spec.Description().empty());
         }
     }

@@ -50,6 +50,15 @@ A good introduction for newcomers to Iggy:
 ./gradlew runGettingStartedConsumer
 ```
 
+### Reader Consumer
+
+Reads the messages of the getting started producer as a member of a consumer group, through a partition reader that waits on the server for new messages and stores the offset of each message once it is processed:
+
+```bash
+./gradlew runGettingStartedProducer
+./gradlew runReaderConsumer
+```
+
 ### Message Headers
 
 Shows metadata management using custom headers:
@@ -132,10 +141,10 @@ Non-blocking async consumption with advanced patterns:
 
 Shows:
 
-- Backpressure management (don't poll faster than you can process)
+- Deferred polling, so the server holds the request until messages are ready
+- An idle limit that stops the consumer after a quiet period
 - Error recovery with exponential backoff
 - Thread pool separation (Netty I/O threads vs. processing threads)
-- Offset-based polling with CompletableFuture
 
 **CRITICAL ASYNC PATTERN - Thread Pool Management:**
 

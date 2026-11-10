@@ -167,6 +167,7 @@ pub fn build_consumer_futures(
     let moving_average_window = args.moving_average_window();
     let kind = args.kind();
     let pretty = args.pretty;
+    let poll_options = args.poll_options();
     let polling_kind = if cg_count > 0 {
         PollingKind::Next
     } else {
@@ -235,6 +236,7 @@ pub fn build_consumer_futures(
                     sampling_time,
                     moving_average_window,
                     polling_kind,
+                    poll_options,
                     rate_limit,
                     origin_timestamp_latency_calculation,
                     pretty,
@@ -299,6 +301,7 @@ pub fn build_producing_consumers_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    args_clone.poll_options(),
                     origin_timestamp_latency_calculation,
                     args_clone.pretty,
                 );
@@ -402,6 +405,7 @@ pub fn build_producing_consumer_groups_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    args_clone.poll_options(),
                     origin_timestamp_latency_calculation,
                     args_clone.pretty,
                 );

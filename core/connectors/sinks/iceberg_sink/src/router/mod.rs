@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::InvalidRows;
 use crate::router::arrow_streamer::JsonArrowReader;
+use crate::router::commit::commit_data_files;
+use crate::router::redelivery::{Append, HeldMessages, snapshot_properties};
 use crate::slice_user_table;
 use arrow_array::RecordBatch;
 use arrow_json::ReaderBuilder;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use iceberg::TableIdent;
 use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
 use iceberg::io::FileIO;
 use iceberg::spec::{DataFile, PartitionKey, Struct};
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
@@ -34,10 +37,12 @@ use iceberg::{
     Catalog,
     writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
 };
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
+use iggy_connector_sdk::retry::RetryPolicy;
+use iggy_connector_sdk::{ConsumedMessage, Error, FlushPartition, Schema, TopicMetadata};
 use parquet::file::properties::WriterProperties;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -46,6 +51,28 @@ type ParquetDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 type ParquetDataFileWriter =
     DataFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+
+/// Rows decoded and written at a time, so the decoded Arrow data held in memory is one batch and
+/// not the whole run. Matches the default batch size of the Arrow JSON reader.
+const ROWS_PER_BATCH: usize = 1024;
+
+/// Where a run of messages was consumed from, named in the warning of every row the sink skips.
+pub struct BatchOrigin<'a> {
+    pub connector_id: u32,
+    pub stream: &'a str,
+    pub topic: &'a str,
+    pub partition_id: u32,
+}
+
+impl Display for BatchOrigin<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "connector ID: {}, stream: {}, topic: {}, partition: {}",
+            self.connector_id, self.stream, self.topic, self.partition_id
+        )
+    }
+}
 
 fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut chain = err.to_string();
@@ -59,7 +86,9 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
 }
 
 mod arrow_streamer;
+mod commit;
 pub mod dynamic_router;
+mod redelivery;
 pub mod static_router;
 
 pub fn is_valid_namespaced_table(input: &str) -> bool {
@@ -67,57 +96,175 @@ pub fn is_valid_namespaced_table(input: &str) -> bool {
     parts.len() >= 2 && parts.iter().all(|part| !part.is_empty())
 }
 
-async fn table_exists(route_field_val: &str, catalog: &dyn Catalog) -> Option<Table> {
-    let sliced_table = slice_user_table(route_field_val);
-    let table_ident = TableIdent::from_strs(&sliced_table).ok()?;
-
-    catalog.load_table(&table_ident).await.ok()
+async fn load_table(route_field_val: &str, catalog: &dyn Catalog) -> iceberg::Result<Table> {
+    let table_ident = TableIdent::from_strs(slice_user_table(route_field_val))?;
+    catalog.load_table(&table_ident).await
 }
 
-async fn write_data(
-    messages: &[Payload],
-    table: &Table,
-    catalog: &dyn Catalog,
-    messages_schema: Schema,
-) -> Result<(), Error> {
-    let data_files = write_data_files(messages, table, messages_schema).await?;
+/// A message that a table rejects with `invalid_rows = "fail"`. Every message of the call before
+/// it is committed, so that storing its offset, as an operator does to move past it, gives up
+/// this message alone.
+#[derive(Debug)]
+pub(crate) struct Rejection {
+    pub(crate) offset: u64,
+    pub(crate) error: Error,
+}
 
-    // Data files are kept on commit failure: the catalog may have applied the
-    // commit before the error surfaced, and deleting files referenced by a
-    // committed snapshot would corrupt the table.
-    let table_commit = Transaction::new(table);
+/// What a write of a call's messages to one table did.
+#[derive(Debug, Default)]
+pub(crate) struct Written {
+    /// The rows committed, which leaves out the rows the sink skipped.
+    pub(crate) committed_rows: u64,
+    pub(crate) rejection: Option<Rejection>,
+}
 
-    let action = table_commit.fast_append().add_data_files(data_files);
+/// Rejections of several tables stop the call at the first rejected message.
+fn first_rejection(rejection: Option<Rejection>, other: Option<Rejection>) -> Option<Rejection> {
+    match (rejection, other) {
+        (Some(rejection), Some(other)) if other.offset < rejection.offset => Some(other),
+        (rejection, other) => rejection.or(other),
+    }
+}
 
-    let tx = action.apply(table_commit).map_err(|err| {
-        let chain = format_error_chain(&err);
-        error!(
-            "Failed to apply transaction on table with UUID: {}, Error: {}",
-            table.metadata().uuid(),
-            chain
-        );
-        Error::TransactionApplyError(chain)
-    })?;
+/// The messages before `rejection`, which a call still has to deliver.
+fn before<'m>(
+    messages: &'m [ConsumedMessage],
+    rejection: Option<&Rejection>,
+) -> &'m [ConsumedMessage] {
+    match rejection {
+        Some(rejection) => {
+            &messages[..messages.partition_point(|message| message.offset < rejection.offset)]
+        }
+        None => messages,
+    }
+}
 
-    tx.commit(catalog).await.map_err(|err| {
-        let chain = format_error_chain(&err);
-        error!(
-            "Failed to commit transaction on table with UUID: {}, Error: {}",
-            table.metadata().uuid(),
-            chain
-        );
-        Error::CatalogCommitError(chain)
-    })?;
-    Ok(())
+/// What both routers need to append messages to a table.
+#[derive(Debug)]
+pub(crate) struct Appender {
+    catalog: Box<dyn Catalog>,
+    invalid_rows: InvalidRows,
+    commit_retry: RetryPolicy,
+    /// Set when the sink delivers at least once.
+    held: Option<HeldMessages>,
+}
+
+impl Appender {
+    pub(crate) fn new(
+        catalog: Box<dyn Catalog>,
+        invalid_rows: InvalidRows,
+        commit_retry: RetryPolicy,
+    ) -> Self {
+        Self {
+            catalog,
+            invalid_rows,
+            commit_retry,
+            held: None,
+        }
+    }
+
+    fn enable_at_least_once(&mut self) {
+        self.held = Some(HeldMessages::default());
+    }
+
+    fn flushed(&self, topic_metadata: &TopicMetadata, partitions: &[FlushPartition]) {
+        if let Some(held) = &self.held {
+            held.flushed(topic_metadata, partitions);
+        }
+    }
+
+    /// Writes and commits `messages` to `table`. `fresh` says that `table` was just loaded from
+    /// the catalog. At least once, the messages that `table` already holds are not appended
+    /// again, and the commit records the messages it appends.
+    async fn append(
+        &self,
+        origin: &BatchOrigin<'_>,
+        table: &Table,
+        fresh: bool,
+        messages_schema: Schema,
+        messages: &[ConsumedMessage],
+    ) -> Result<Written, Error> {
+        if messages.is_empty() {
+            return Ok(Written::default());
+        }
+        let messages = match &self.held {
+            Some(held) => {
+                held.unheld(origin, table, fresh, self.catalog.as_ref(), messages)
+                    .await?
+            }
+            None => messages,
+        };
+        if messages.is_empty() {
+            return Ok(Written::default());
+        }
+        // At most once, a failed call loses the rest of the run, so a payload without a JSON
+        // document is skipped whatever `invalid_rows` says.
+        let without_json = if self.held.is_some() {
+            self.invalid_rows
+        } else {
+            InvalidRows::Skip
+        };
+        let (data_files, rejection) = write_data_files(
+            origin,
+            messages,
+            table,
+            messages_schema,
+            self.invalid_rows,
+            without_json,
+        )
+        .await?;
+        let handled = before(messages, rejection.as_ref());
+        let (Some(first), Some(last), false) =
+            (handled.first(), handled.last(), data_files.is_empty())
+        else {
+            // Every row was skipped or rejected, and an empty append would still add a snapshot.
+            return Ok(Written {
+                committed_rows: 0,
+                rejection,
+            });
+        };
+        let committed_rows = data_files.iter().map(DataFile::record_count).sum();
+        let append = Append::new(first, last);
+        let properties = if self.held.is_some() {
+            snapshot_properties(origin, append)
+        } else {
+            HashMap::new()
+        };
+        let committed = commit_data_files(
+            table,
+            self.catalog.as_ref(),
+            data_files,
+            properties,
+            self.commit_retry,
+        )
+        .await;
+        if let Some(held) = &self.held {
+            match &committed {
+                Ok(()) => held.committed(origin, table, append),
+                Err(_) => held.forget(origin, table),
+            }
+        }
+        committed?;
+        Ok(Written {
+            committed_rows,
+            rejection,
+        })
+    }
 }
 
 /// Writes the JSON payloads as Parquet data files under the table location,
-/// laid out by the table's default partition spec. Nothing is committed here.
+/// laid out by the table's default partition spec. Nothing is committed here. With
+/// `invalid_rows = "fail"`, the first message that the table cannot take ends the write, and the
+/// data files hold the messages before it. `without_json` decides the same for a payload that
+/// holds no JSON document.
 async fn write_data_files(
-    messages: &[Payload],
+    origin: &BatchOrigin<'_>,
+    messages: &[ConsumedMessage],
     table: &Table,
     messages_schema: Schema,
-) -> Result<Vec<DataFile>, Error> {
+    invalid_rows: InvalidRows,
+    without_json: InvalidRows,
+) -> Result<(Vec<DataFile>, Option<Rejection>), Error> {
     let location = DefaultLocationGenerator::new(table.metadata()).map_err(|err| {
         error!(
             "Failed to get location on table: {}. Error: {}",
@@ -148,33 +295,38 @@ async fn write_data_files(
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
 
     // Proto text holding JSON is the descriptor-less `proto_convert` fallback
-    // and is written as the document it holds. Proto text that is not JSON is
-    // skipped like any other payload without a document.
-    let documents: Vec<Cow<'_, simd_json::OwnedValue>> = messages
-        .iter()
-        .filter_map(|payload| {
-            let document = payload.json_document();
-            if document.is_none() {
-                warn!(
-                    "Unsupported type of payload, expected JSON, got {}",
-                    messages_schema.to_string()
-                );
-            }
-            document
-        })
-        .collect();
-
-    if documents.is_empty() {
-        error!(
-            "Batch of {} messages has no JSON payloads, the Iceberg sink requires schema = json",
-            messages.len()
+    // and is written as the document it holds. Proto text that is not JSON holds
+    // no document, so it is an invalid row like any other payload without one.
+    let mut rejection = None;
+    let mut documents: Vec<(u64, Cow<'_, simd_json::OwnedValue>)> =
+        Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some(document) = message.payload.json_document() {
+            documents.push((message.offset, document));
+            continue;
+        }
+        let reason = format!(
+            "The message at offset: {} ({origin}) holds no JSON document for table: {}, and the Iceberg sink requires schema = json, got {messages_schema}",
+            message.offset,
+            table.identifier()
         );
-        return Err(Error::InvalidPayloadType);
+        if without_json == InvalidRows::Skip {
+            warn!("Skipping a row. {reason}");
+            continue;
+        }
+        error!("{reason}");
+        rejection = Some(Rejection {
+            offset: message.offset,
+            error: Error::InvalidRecordValue(reason),
+        });
+        break;
     }
 
-    let msgs: Vec<&simd_json::OwnedValue> = documents.iter().map(Cow::as_ref).collect();
-    let cursor = JsonArrowReader::new(msgs.as_slice());
-    let reader = ReaderBuilder::new(Arc::new(
+    if documents.is_empty() {
+        return Ok((Vec::new(), rejection));
+    }
+
+    let arrow_schema = Arc::new(
         schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(|err| {
             let chain = format_error_chain(&err);
             error!(
@@ -184,30 +336,32 @@ async fn write_data_files(
             );
             Error::SchemaMismatch(chain)
         })?,
-    ))
-    .build(cursor)
-    .map_err(|err| {
-        error!(
-            "Error while building Iceberg reader from message payload: {}",
-            err
-        );
-        Error::InitError(err.to_string())
-    })?;
+    );
 
+    // The table's partition spec does not change between attempts, so a writer that cannot be
+    // built fails the same way every time.
     let mut writer = TableWriter::new(table, data_file_writer_builder).map_err(|err| {
         let chain = format_error_chain(&err);
         error!("Error while constructing data file writer: {}", chain);
-        Error::InitError(chain)
+        Error::SchemaMismatch(chain)
     })?;
 
     let write_result: Result<(), Error> = async {
-        for batch in reader {
-            let batch_data = batch.map_err(|err| {
-                let chain = format_error_chain(&err);
-                error!("Error while getting record batch: {}", chain);
-                Error::InvalidRecordValue(chain)
-            })?;
-            writer.write(batch_data).await?;
+        for chunk in documents.chunks(ROWS_PER_BATCH) {
+            let (batch, rejected) = decode_rows(
+                origin,
+                table.identifier(),
+                &arrow_schema,
+                chunk,
+                invalid_rows,
+            )?;
+            if let Some(batch) = batch {
+                writer.write(batch).await?;
+            }
+            if rejected.is_some() {
+                rejection = first_rejection(rejection.take(), rejected);
+                break;
+            }
         }
         Ok(())
     }
@@ -222,7 +376,80 @@ async fn write_data_files(
         delete_uncommitted_files(table.file_io(), &data_files).await;
         return Err(err);
     }
-    Ok(data_files)
+    Ok((data_files, rejection))
+}
+
+/// Decodes the JSON documents into a record batch of `schema`. A row that does not match is
+/// logged with its offset, origin and table. `invalid_rows = "skip"` leaves it out and decodes
+/// the others. `invalid_rows = "fail"` decodes the rows before it and rejects it. The batch is
+/// `None` when no row is left.
+fn decode_rows(
+    origin: &BatchOrigin<'_>,
+    table: &TableIdent,
+    schema: &SchemaRef,
+    documents: &[(u64, Cow<'_, simd_json::OwnedValue>)],
+    invalid_rows: InvalidRows,
+) -> Result<(Option<RecordBatch>, Option<Rejection>), Error> {
+    let rows: Vec<&simd_json::OwnedValue> = documents
+        .iter()
+        .map(|(_, document)| document.as_ref())
+        .collect();
+    if let Ok(batch) = read_batch(schema, &rows) {
+        return Ok((batch, None));
+    }
+    // The batch read only says that some row does not match, so each row is read on its own.
+    let mut valid = Vec::with_capacity(rows.len());
+    let mut rejection = None;
+    for (offset, document) in documents {
+        let row_error = match read_batch(schema, &[document.as_ref()]) {
+            Ok(_) => {
+                valid.push(document.as_ref());
+                continue;
+            }
+            Err(row_error) => row_error,
+        };
+        let reason = format!(
+            "The row at offset: {offset} ({origin}) does not match the schema of table: {table}. {row_error}"
+        );
+        if invalid_rows == InvalidRows::Skip {
+            warn!("Skipping a row. {reason}");
+            continue;
+        }
+        error!("{reason}");
+        rejection = Some(Rejection {
+            offset: *offset,
+            error: Error::InvalidRecordValue(reason),
+        });
+        break;
+    }
+    if valid.is_empty() {
+        return Ok((None, rejection));
+    }
+    let batch = read_batch(schema, &valid).inspect_err(|error| {
+        error!("Error while getting record batch: {error}");
+    })?;
+    Ok((batch, rejection))
+}
+
+/// The reader allocates its buffers for a full batch, so the batch size is the row count: a row
+/// checked on its own is read without the buffers of a default-sized batch, and every row lands
+/// in the one batch the reader yields.
+fn read_batch(
+    schema: &SchemaRef,
+    rows: &[&simd_json::OwnedValue],
+) -> Result<Option<RecordBatch>, Error> {
+    let mut reader = ReaderBuilder::new(Arc::clone(schema))
+        .with_batch_size(rows.len())
+        .build(JsonArrowReader::new(rows))
+        .map_err(|err| {
+            // The reader is built from the table schema alone, so it fails the same way every time.
+            error!("Error while building Iceberg reader from message payload: {err}");
+            Error::SchemaMismatch(err.to_string())
+        })?;
+    reader
+        .next()
+        .transpose()
+        .map_err(|err| Error::InvalidRecordValue(format_error_chain(&err)))
 }
 
 /// Files finalized by a failed batch are never committed, so they are removed
@@ -365,9 +592,19 @@ fn write_failure(err: iceberg::Error) -> Error {
 pub trait Router: std::fmt::Debug + Sync + Send {
     async fn route_data(
         &self,
-        messages_metadata: MessagesMetadata,
+        origin: &BatchOrigin<'_>,
+        messages_schema: Schema,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error>;
+
+    /// From now on, fails a batch instead of dropping a message it cannot route or a table that
+    /// does not load, and appends only the messages a table does not hold yet when a batch is
+    /// delivered again. Refuses when the configuration cannot keep that promise.
+    fn enable_at_least_once(&mut self) -> Result<(), Error>;
+
+    /// A flush proved `partitions` delivered up to their offsets, so the runtime never hands those
+    /// messages over again.
+    fn flushed(&self, topic_metadata: &TopicMetadata, partitions: &[FlushPartition]);
 }
 
 #[cfg(test)]
@@ -379,10 +616,18 @@ mod tests {
         Schema as IcebergSchema, SortOrder, TableMetadataBuilder, Transform, Type,
         UnboundPartitionSpec,
     };
+    use iggy_connector_sdk::Payload;
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
     const REGION_FIELD_ID: i32 = 2;
+
+    const ORIGIN: BatchOrigin<'static> = BatchOrigin {
+        connector_id: 1,
+        stream: "stream",
+        topic: "topic",
+        partition_id: 1,
+    };
 
     // Table keeps only tokio handles, so the runtime must outlive every table.
     fn test_runtime() -> &'static tokio::runtime::Runtime {
@@ -431,10 +676,58 @@ mod tests {
             .collect()
     }
 
+    /// Messages carrying `payloads`, with offsets counting from 0.
+    fn messages(payloads: &[Payload]) -> Vec<ConsumedMessage> {
+        payloads
+            .iter()
+            .enumerate()
+            .map(|(offset, payload)| ConsumedMessage {
+                id: offset as u128,
+                offset: offset as u64,
+                checksum: 0,
+                timestamp: 0,
+                origin_timestamp: 0,
+                headers: None,
+                payload: payload.clone(),
+            })
+            .collect()
+    }
+
+    fn write_with(
+        table: &Table,
+        payloads: &[Payload],
+        invalid_rows: InvalidRows,
+    ) -> Result<(Vec<DataFile>, Option<Rejection>), Error> {
+        test_runtime().block_on(write_data_files(
+            &ORIGIN,
+            &messages(payloads),
+            table,
+            Schema::Json,
+            invalid_rows,
+            invalid_rows,
+        ))
+    }
+
     fn write(table: &Table, payloads: &[Payload]) -> Vec<DataFile> {
-        test_runtime()
-            .block_on(write_data_files(payloads, table, Schema::Json))
-            .expect("Failed to write data files")
+        let (data_files, rejection) =
+            write_with(table, payloads, InvalidRows::Fail).expect("Failed to write data files");
+        assert!(rejection.is_none(), "{rejection:?}");
+        data_files
+    }
+
+    fn rows(data_files: &[DataFile]) -> u64 {
+        data_files.iter().map(DataFile::record_count).sum()
+    }
+
+    /// Two rows that match the table and two that do not: a wrong type and a missing required
+    /// field.
+    fn rows_with_two_invalid() -> Vec<Payload> {
+        vec![
+            Payload::Json(simd_json::json!({ "id": 1, "region": "eu" })),
+            Payload::Json(simd_json::json!({ "id": "not a number", "region": "us" })),
+            Payload::Json(simd_json::json!({ "id": 3 })),
+            Payload::Json(simd_json::json!({ "id": 4, "region": "us" })),
+        ]
     }
 
     fn partition_region(data_file: &DataFile) -> String {
@@ -459,15 +752,25 @@ mod tests {
     }
 
     #[test]
-    fn given_only_proto_text_that_is_not_json_should_fail_with_invalid_payload_type() {
+    fn given_only_proto_text_that_is_not_json_when_failing_rows_should_reject_its_message() {
         let table = in_memory_table(UnboundPartitionSpec::builder().build());
         let payloads = vec![Payload::Proto("id: 1".to_owned())];
 
-        let error = test_runtime()
-            .block_on(write_data_files(&payloads, &table, Schema::Proto))
-            .expect_err("proto text that is not JSON has no document to write");
+        let (data_files, rejection) = test_runtime()
+            .block_on(write_data_files(
+                &ORIGIN,
+                &messages(&payloads),
+                &table,
+                Schema::Proto,
+                InvalidRows::Fail,
+                InvalidRows::Fail,
+            ))
+            .expect("a rejected message is not a failed write");
 
-        assert_eq!(error, Error::InvalidPayloadType);
+        assert!(data_files.is_empty());
+        let rejection = rejection.expect("proto text that is not JSON has no document to write");
+        assert_eq!(rejection.offset, 0);
+        assert!(rejection.error.is_permanent(), "{}", rejection.error);
     }
 
     #[test]
@@ -539,12 +842,96 @@ mod tests {
     }
 
     #[test]
-    fn given_batch_without_json_payloads_should_fail_with_invalid_payload_type() {
+    fn given_a_text_payload_when_skipping_rows_should_write_nothing_and_reject_nothing() {
         let table = in_memory_table(UnboundPartitionSpec::builder().build());
         let payloads = vec![Payload::Text("not json".to_string())];
 
-        let result = test_runtime().block_on(write_data_files(&payloads, &table, Schema::Text));
+        let (data_files, rejection) = test_runtime()
+            .block_on(write_data_files(
+                &ORIGIN,
+                &messages(&payloads),
+                &table,
+                Schema::Text,
+                InvalidRows::Skip,
+                InvalidRows::Skip,
+            ))
+            .expect("skipping every row is not an error");
 
-        assert!(matches!(result, Err(Error::InvalidPayloadType)));
+        assert!(data_files.is_empty());
+        assert!(rejection.is_none());
+    }
+
+    #[test]
+    fn given_rows_that_do_not_match_when_invalid_rows_fail_should_write_the_rows_before_the_first()
+    {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+
+        let (data_files, rejection) =
+            write_with(&table, &rows_with_two_invalid(), InvalidRows::Fail)
+                .expect("a rejected row is not a failed write");
+
+        assert_eq!(rows(&data_files), 1);
+        let rejection = rejection.expect("the first row that does not match is rejected");
+        assert_eq!(rejection.offset, 1);
+        assert!(
+            matches!(rejection.error, Error::InvalidRecordValue(_)),
+            "got {:?}",
+            rejection.error
+        );
+    }
+
+    #[test]
+    fn given_rows_that_do_not_match_when_invalid_rows_skip_should_write_the_other_rows() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+
+        let (data_files, rejection) =
+            write_with(&table, &rows_with_two_invalid(), InvalidRows::Skip)
+                .expect("the matching rows should be written");
+
+        assert_eq!(rows(&data_files), 2);
+        assert!(rejection.is_none());
+    }
+
+    #[test]
+    fn given_only_rows_that_do_not_match_when_invalid_rows_skip_should_write_no_data_file() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let payloads = vec![Payload::Json(
+            simd_json::json!({ "id": "not a number", "region": "eu" }),
+        )];
+
+        let (data_files, rejection) = write_with(&table, &payloads, InvalidRows::Skip)
+            .expect("skipping every row is not an error");
+
+        assert!(data_files.is_empty());
+        assert!(rejection.is_none());
+    }
+
+    #[test]
+    fn given_an_invalid_row_in_a_later_batch_when_invalid_rows_skip_should_write_the_other_rows() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let mut payloads = json_payloads(&[(1, "eu"); ROWS_PER_BATCH + 10]);
+        payloads[ROWS_PER_BATCH + 5] = Payload::Json(simd_json::json!({ "id": "not a number" }));
+
+        let (data_files, _) = write_with(&table, &payloads, InvalidRows::Skip)
+            .expect("the matching rows should be written");
+
+        assert_eq!(rows(&data_files), (ROWS_PER_BATCH + 9) as u64);
+    }
+
+    #[test]
+    fn given_an_invalid_row_in_a_later_batch_when_invalid_rows_fail_should_write_the_rows_before_it()
+     {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let mut payloads = json_payloads(&[(1, "eu"); ROWS_PER_BATCH + 10]);
+        payloads[ROWS_PER_BATCH + 5] = Payload::Json(simd_json::json!({ "id": "not a number" }));
+
+        let (data_files, rejection) = write_with(&table, &payloads, InvalidRows::Fail)
+            .expect("a rejected row is not a failed write");
+
+        assert_eq!(rows(&data_files), (ROWS_PER_BATCH + 5) as u64);
+        assert_eq!(
+            rejection.map(|rejection| rejection.offset),
+            Some((ROWS_PER_BATCH + 5) as u64)
+        );
     }
 }
