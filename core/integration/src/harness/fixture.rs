@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Only the connector tests in apache/iggy-connectors implement
+//! [`TestFixture`]. They reach this crate through a git dependency, so the
+//! trait is not dead code.
+
 use crate::harness::error::TestBinaryError;
 use crate::harness::seeds::SeedError;
 use async_trait::async_trait;

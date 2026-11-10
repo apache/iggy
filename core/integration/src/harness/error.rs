@@ -63,7 +63,6 @@ pub enum TestBinaryError {
     },
     MissingServer,
     MissingMcp,
-    MissingConnectorsRuntime,
     NotStarted,
     AlreadyStarted,
     SeedFailed(String),
@@ -149,9 +148,6 @@ impl std::fmt::Display for TestBinaryError {
             }
             TestBinaryError::MissingMcp => {
                 write!(f, "MCP server not configured in harness")
-            }
-            TestBinaryError::MissingConnectorsRuntime => {
-                write!(f, "Connectors runtime not configured in harness")
             }
             TestBinaryError::NotStarted => {
                 write!(f, "Harness not started")

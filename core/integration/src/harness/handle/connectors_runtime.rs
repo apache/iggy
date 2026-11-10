@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Starts the `iggy-connectors` binary next to a test server.
+//!
+//! No test in this repository uses this module. The connector tests live in
+//! apache/iggy-connectors and reach it through a git dependency on this
+//! crate, so it is not dead code.
+
 use super::common;
 use crate::harness::config::ConnectorsRuntimeConfig;
 use crate::harness::context::TestContext;
