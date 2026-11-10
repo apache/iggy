@@ -36,9 +36,18 @@ jobs:
       fail-fast: false
       matrix:
         partition: [1, 2, 3, 4]
-    runs-on: ubuntu-26.04
+    # RunsOn (https://runs-on.com) starts one 16 vCPU EC2 instance per shard when ASF Infra
+    # enabled this repository on the RunsOn App and the repository variable USE_RUNS_ON is
+    # 'true'. In every other case the job runs on the GitHub-hosted runner, as before. A fork
+    # pull request cannot read repository variables, so it always gets the hosted runner.
+    # The image matches ubuntu-26.04, so the test binaries from _build_ci_artifacts.yml run
+    # on either runner.
+    runs-on: ${{ vars.USE_RUNS_ON == 'true' && format('runs-on={0},family=m8a+m7a+c8a,cpu=16,image=ubuntu26-full-x64,disk=large,tag=iggy', github.run_id) || 'ubuntu-26.04' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
+      - uses: runs-on/action@13fbb6a39310a0dac9ab4716da2c4e74a3326dfc # v2.7.0
+        if: runner.environment == 'self-hosted'
+
       - uses: actions/checkout@v7.0.1
 
       - name: Download test artifacts

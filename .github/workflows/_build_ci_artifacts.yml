@@ -45,9 +45,15 @@ env:
 jobs:
   build:
     name: build
-    runs-on: ubuntu-26.04
+    # Only the test-build producer moves to RunsOn, together with the shards in
+    # _rust_tests.yml that consume it. The runtime producer stays on the GitHub-hosted
+    # runner. See _rust_tests.yml for the switch and the fork rule.
+    runs-on: ${{ vars.USE_RUNS_ON == 'true' && inputs.task == 'test-build' && format('runs-on={0},family=m8a+m7a+c8a,cpu=16,image=ubuntu26-full-x64,disk=large,tag=iggy', github.run_id) || 'ubuntu-26.04' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
+      - uses: runs-on/action@13fbb6a39310a0dac9ab4716da2c4e74a3326dfc # v2.7.0
+        if: runner.environment == 'self-hosted'
+
       - uses: actions/checkout@v7.0.1
 
       - name: Prepare artifacts
