@@ -235,7 +235,6 @@ jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 kafka-protocol = { version = "0.18.0", default-features = false, features = ["broker"] }
 keyring-core = "1.0.1"
 lapin = "4.12.3"
-lazy_static = "1.5.1"
 # Pinned exactly: `metadata::stm::stream`'s keyed stats evictions lean on
 # left-right draining the previous batch's `absorb_second` before the current
 # batch's `absorb_first`, which is an implementation detail of 0.11.8's

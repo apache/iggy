@@ -169,6 +169,9 @@ runs:
       id: meta
       uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
       with:
+        # The default context labels github.sha, the dispatch ref tip, but
+        # publish.yml builds its `commit` input. Label the checked-out commit.
+        context: git
         images: ${{ steps.config.outputs.image }}
         # Tags are only used for local builds (dry-run). Push mode always uses digest.
         tags: |
@@ -314,7 +317,6 @@ runs:
         set -euo pipefail
         args="VERSION=${{ inputs.version }}
         BUILD_DATE=${{ github.event.repository.updated_at }}
-        VCS_REF=${{ github.sha }}
         RUST_VERSION=${{ env.RUST_VERSION }}
         LIBC=${{ inputs.libc }}
         IGGY_CI_BUILD=true"
