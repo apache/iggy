@@ -102,7 +102,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - Additional features such as **server side message deduplication**
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, WebSocket, QUIC, HTTPS)
-- **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
+- **[Connectors](https://github.com/apache/iggy-connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM, server-side with a separate key per stream
 - Optional metadata support in the form of **message headers**
@@ -181,40 +181,9 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 
 ## Connectors
 
-The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
+Connectors move data between Iggy streams and external systems. A source reads data from an external system and produces messages to an Iggy stream. A sink consumes messages from an Iggy stream and writes them to an external system. Each connector is a Rust plugin, and the connectors runtime loads the plugins and runs them.
 
-```toml
-## Configure a sink or source connector, depending on your needs in its own config file.
-type = "sink"
-key = "quickwit"
-enabled = true
-version = 0
-name = "Quickwit sink"
-path = "target/release/libiggy_connector_quickwit_sink"
-plugin_config_format = "yaml"
-
-[[streams]]
-stream = "qw"
-topics = ["records"]
-schema = "json"
-batch_length = 1000
-consumer_group = "qw_sink_connector"
-
-[transforms.add_fields]
-enabled = true
-
-[[transforms.add_fields.fields]]
-key = "service_name"
-value.static = "qw_connector"
-
-[[transforms.add_fields.fields]]
-key = "timestamp"
-value.computed = "timestamp_millis"
-
-[transforms.delete_fields]
-enabled = true
-fields = ["email", "created_at"]
-```
+The runtime, the plugin SDK and all sinks and sources live in [apache/iggy-connectors](https://github.com/apache/iggy-connectors). Open connector issues and pull requests there.
 
 ---
 
