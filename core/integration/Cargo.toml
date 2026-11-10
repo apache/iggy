@@ -22,11 +22,8 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# `rust-s3`'s lib target is `s3`, so machete greps for `rust_s3`, never finds
-# it, and reports the crate unused. It is used (`use s3::{Bucket, Region}` in
-# the connector S3 fixture); removing it breaks the whole test build.
 [package.metadata.cargo-machete]
-ignored = ["cfg_aliases", "rust-s3"]
+ignored = ["cfg_aliases"]
 
 [features]
 default = ["login-session"]
@@ -59,7 +56,7 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["full", "test-util"] }
+tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -73,8 +70,6 @@ zbus-secret-service-keyring-store = { workspace = true, optional = true }
 cfg_aliases = { workspace = true }
 
 [dev-dependencies]
-apache-avro = { workspace = true }
-arrow = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytemuck = { workspace = true }
@@ -82,40 +77,22 @@ bytes = { workspace = true }
 compio = { workspace = true }
 configs_derive = { workspace = true }
 ctor = { workspace = true }
-deltalake = { workspace = true }
 dtor = { workspace = true }
 figment = { workspace = true }
 hex = { workspace = true }
 humantime = { workspace = true }
 iggy-cli = { workspace = true }
-iggy_connector_doris_sink = { workspace = true }
-iggy_connector_sdk = { workspace = true, features = ["api"] }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
-lapin = { workspace = true }
-mongodb = { workspace = true }
-parquet = { workspace = true }
-pgwire = { workspace = true }
 predicates = { workspace = true }
-reqwest-middleware = { workspace = true }
-reqwest-retry = { workspace = true }
 ring = { workspace = true }
-rumqttc-v4 = { workspace = true }
-rumqttc-v5 = { workspace = true }
-rust-s3 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serial_test = { workspace = true }
-sqlparser = { workspace = true }
-sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
-tokio-postgres = { workspace = true }
 twox-hash = { workspace = true }
-url = { workspace = true }
 zip = { workspace = true }
 
 [lints]
