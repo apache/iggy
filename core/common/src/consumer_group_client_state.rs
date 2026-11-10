@@ -324,6 +324,7 @@ impl ConsumerGroupClientState {
     }
 
     /// Publishes membership and assignment together, only for the session that requested them.
+    /// Returns whether the assignment differs from the cached one.
     #[doc(hidden)]
     pub fn apply_group_assignment(
         &self,
@@ -331,7 +332,7 @@ impl ConsumerGroupClientState {
         key: String,
         identifiers: (Identifier, Identifier, Identifier),
         assignment: Option<(u64, Vec<u32>)>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<bool, IggyError> {
         let mut groups = self.groups_mut();
         if groups.generation != generation {
             return Err(IggyError::TransientNotAccepted);
@@ -339,11 +340,14 @@ impl ConsumerGroupClientState {
         let Some((generation, partitions)) = assignment else {
             groups.assignments.remove(&key);
             groups.joined_groups.remove(&key);
-            return Ok(());
+            return Ok(false);
         };
+        let changed = groups.assignments.get(&key).is_none_or(|cached| {
+            cached.generation != generation || cached.partitions != partitions
+        });
         groups.joined_groups.insert(key.clone(), identifiers);
         groups.set_assignment(key, generation, partitions);
-        Ok(())
+        Ok(changed)
     }
 
     fn groups(&self) -> MutexGuard<'_, GroupState> {
