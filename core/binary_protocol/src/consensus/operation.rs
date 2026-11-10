@@ -117,6 +117,11 @@ pub enum Operation {
     InstallConsumerGroupOwner = 167,
     TransitionPartitionHistory = 168,
     RetireConsumerGroupOwners = 169,
+    /// Server-originated: a command for one of the partition's state
+    /// machines. Shares the partition group's op sequence with the data ops
+    /// but is stored in the partition's state-machine log, never in its
+    /// segments. The body names the command kind. No client wire code.
+    StateMachineCommand = 170,
 }
 
 impl Operation {
@@ -163,6 +168,7 @@ impl Operation {
                     | Self::InstallConsumerGroupOwner
                     | Self::TransitionPartitionHistory
                     | Self::RetireConsumerGroupOwners
+                    | Self::StateMachineCommand
             )
     }
 
@@ -297,7 +303,8 @@ impl Operation {
             | Self::RetireSession
             | Self::InstallConsumerGroupOwner
             | Self::TransitionPartitionHistory
-            | Self::RetireConsumerGroupOwners => None,
+            | Self::RetireConsumerGroupOwners
+            | Self::StateMachineCommand => None,
             Self::CreateStream
             | Self::DeleteStream
             | Self::CreateTopic

@@ -1977,13 +1977,16 @@ fn reopening_retained_segments_syncs_only_recovery_mutations() {
                 .iter()
                 .filter(|operation| **operation == StorageOperation::FileSync)
                 .count();
-            assert_eq!(file_syncs, 1 + usize::from(buffered_tail), "{trace:?}");
+            // A clean reopen under an intact frontier truncates nothing, so
+            // only the dropped buffered tail pays the file and directory
+            // barriers.
+            assert_eq!(file_syncs, 2 * usize::from(buffered_tail), "{trace:?}");
             assert_eq!(
                 trace
                     .iter()
                     .filter(|operation| **operation == StorageOperation::DirectorySync)
                     .count(),
-                3,
+                1 + usize::from(buffered_tail),
                 "retained names need no new publication barrier: {trace:?}"
             );
             let expected_head = if buffered_tail { 1 } else { 2 };
