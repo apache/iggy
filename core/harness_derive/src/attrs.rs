@@ -80,6 +80,8 @@ pub struct McpAttrs {
 }
 
 /// Connectors runtime configuration attributes.
+///
+/// Only the tests in apache/iggy-connectors use `connectors_runtime(...)`.
 #[derive(Debug, Default, Clone)]
 pub struct ConnectorsRuntimeAttrs {
     pub config_path: Option<String>,

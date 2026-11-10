@@ -51,6 +51,9 @@ pub const MCP_RUNTIME_ENV_VARS: &[&str] = &[
     MCP_ENV_PATH_ENV,
 ];
 
+// The connectors runtime in apache/iggy-connectors uses the connector
+// constants below through a git dependency on this crate, so they must stay
+// exported.
 pub const CONNECTORS_CONFIG_PATH_ENV: &str = "IGGY_CONNECTORS_CONFIG_PATH";
 pub const CONNECTORS_ENV_PATH_ENV: &str = "IGGY_CONNECTORS_ENV_PATH";
 /// Env vars `iggy-connectors --list-config-env-vars` advertises beyond the

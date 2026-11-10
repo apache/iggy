@@ -44,7 +44,7 @@ on:
         required: false
         default: ""
       publish_dockerhub:
-        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, rust-kafka-gateway, web-ui)"
+        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-kafka-gateway, web-ui)"
         type: string
         required: false
         default: ""
@@ -786,22 +786,11 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "✅ Resolved ${{ matrix.key }} -> version=$VERSION"
 
-      - name: Determine libc for component
-        id: libc
-        run: |
-          # Connectors runtime must use glibc because it dlopen()s glibc plugins
-          if [ "${{ matrix.key }}" = "rust-connectors" ]; then
-            echo "libc=glibc" >> "$GITHUB_OUTPUT"
-          else
-            echo "libc=musl" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish Docker image
         id: docker
         uses: ./.github/actions/utils/docker-buildx
         with:
           task: publish
-          libc: ${{ steps.libc.outputs.libc }}
           component: ${{ matrix.key }}
           version: ${{ steps.ver.outputs.version }}
           platform: ${{ matrix.platform }}
