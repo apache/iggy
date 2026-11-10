@@ -64,6 +64,8 @@ IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
 cargo run --bin iggy-server -- --fresh --with-default-root-credentials
 ```
 
+These certificates and default credentials are for local development only, not production.
+
 From `examples/php`, run the getting-started producer with the PHP connection
 string and the development CA certificate:
 
