@@ -11407,5 +11407,6 @@ mod tests {
         }
     }
 
+    mod object_deletes;
     mod segment_uploads;
 }

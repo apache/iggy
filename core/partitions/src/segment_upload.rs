@@ -23,8 +23,6 @@
 //! records, so a media fault on the primary fails the upload instead of
 //! reaching the store. The store then checks the bytes it receives against
 //! the recorded CRC32C, which covers the second read.
-//!
-//! Nothing schedules an upload yet.
 
 use std::io;
 

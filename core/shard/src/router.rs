@@ -1206,6 +1206,16 @@ where
             LifecycleFrame::SegmentUploadFinished(finished) => {
                 self.on_segment_upload_finished(*finished).await;
             }
+            LifecycleFrame::DeleteObjects {
+                namespace,
+                now,
+                committed_up_to,
+            } => {
+                self.on_delete_objects(namespace, now, committed_up_to);
+            }
+            LifecycleFrame::ObjectDeleteFinished(finished) => {
+                self.on_object_delete_finished(*finished);
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,

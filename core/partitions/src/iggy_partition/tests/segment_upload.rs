@@ -632,9 +632,9 @@ async fn given_an_uploaded_segment_an_advance_contradicted_when_asking_for_the_p
 }
 
 /// An executor that runs each job at once and keeps what it was asked for.
-struct Recording {
-    store: Rc<MemoryStore>,
-    requests: std::cell::RefCell<Vec<(iggy_object_store::TierJobClass, u64)>>,
+pub(super) struct Recording {
+    pub(super) store: Rc<MemoryStore>,
+    pub(super) requests: std::cell::RefCell<Vec<(iggy_object_store::TierJobClass, u64)>>,
 }
 
 impl iggy_object_store::TierExecutor for Recording {

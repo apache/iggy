@@ -126,13 +126,16 @@ pub fn stage_owned_partitions(
             // The timed pass is what retries an upload the store refused and
             // an advance that did not commit.
             shard.request_upload_segments(namespace);
+            let committed_up_to = streams
+                .with_committed_partition(namespace, |partition| partition.deleted_up_to_offset)
+                .unwrap_or_default();
+            // Staged whatever the topic's policy is: a truncation a client
+            // asked for leaves objects behind as well.
+            shard.request_delete_objects(namespace, now, committed_up_to);
             // Retention of a tiered topic covers its remote segments too, so
             // no replica expires its own: the partition primary decides, and
             // the decision reaches every replica as a committed truncation.
             if has_expiry || budget.is_some() {
-                let committed_up_to = streams
-                    .with_committed_partition(namespace, |partition| partition.deleted_up_to_offset)
-                    .unwrap_or_default();
                 shard.request_retain_partition(
                     namespace,
                     now,

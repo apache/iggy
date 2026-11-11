@@ -43,10 +43,16 @@ pub use persistence::{
 pub use repair_memory::RepairMemoryBudget;
 mod remote_segments;
 pub use remote_segments::{RemoteObjects, RemoteRange, RemoteSegments};
+mod object_delete;
 mod segment;
 pub mod segment_anchor;
 pub mod segment_chain;
 mod segment_upload;
+pub use object_delete::{
+    ExecutorDeleter, ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteWork,
+    ObjectDeleter, RETIRED_OBJECT_GRACE, delete_objects, delete_segments, list_segment_starts,
+    sweepable,
+};
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
     ExecutorUploader, SegmentUpload, SegmentUploader, UploadError, UploadOutcome, upload_segment,

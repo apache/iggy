@@ -1888,6 +1888,7 @@ mod history;
 mod materialization;
 mod materialization_io;
 mod materialization_tail;
+mod object_delete;
 mod offset_barriers;
 mod offset_lifecycle;
 mod offset_recovery;
