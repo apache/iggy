@@ -18,8 +18,9 @@
 //! Upload passes on a shard that hosts a tiered primary on disk.
 
 use super::*;
-use crate::FinishedSegmentUpload;
+use crate::{FinishedSegmentUpload, MetadataSubmit};
 use futures::future::LocalBoxFuture;
+use iggy_common::IggyExpiry;
 use iggy_object_store::{
     InlineTierExecutor, KeyLayout, MemoryStore, ObjectStoreError, TierScopeToken,
 };
@@ -446,4 +447,72 @@ async fn given_a_stored_segment_whose_advance_was_lost_when_a_timed_pass_runs_sh
         [1],
         "the stored segment is not sent again"
     );
+}
+
+/// The retention decision a pass handed to shard 0, as `(created revision,
+/// last offset)`, taken off the inbox the way the pump would.
+fn retention_truncate(owner: &IoTestShard) -> Option<(u64, u64)> {
+    match owner.inbox.try_recv() {
+        Ok(ShardFrame::Lifecycle(LifecycleFrame::MetadataSubmit(
+            MetadataSubmit::RetentionTruncate {
+                namespace: decided,
+                created_revision,
+                up_to_offset,
+            },
+        ))) if decided == namespace() => Some((created_revision, up_to_offset)),
+        Ok(_) => panic!("only a retention decision is on its way"),
+        Err(_) => None,
+    }
+}
+
+#[compio::test]
+async fn given_a_tiered_primary_over_budget_when_a_retention_pass_runs_should_hand_shard_zero_the_offset_once()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let now = IggyTimestamp::now();
+    let created_revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let last_sealed = SEALED_SEGMENTS - 1;
+    let pass = |committed_up_to| {
+        owner.on_retain_partition(
+            namespace(),
+            now,
+            IggyExpiry::NeverExpire,
+            Some(0),
+            committed_up_to,
+        );
+        retention_truncate(&owner)
+    };
+
+    assert_eq!(pass(0), Some((created_revision, last_sealed)));
+    assert_eq!(pass(last_sealed - 1), Some((created_revision, last_sealed)));
+    // The decision is committed already, so the pass sends nothing.
+    assert_eq!(pass(last_sealed), None);
+    assert_eq!(pass(last_sealed + 1), None);
+    assert_eq!(
+        locations(&owner),
+        [SegmentLocation::Local; 3],
+        "the pass itself removes nothing"
+    );
+}
+
+#[compio::test]
+async fn given_a_tiered_primary_within_its_policy_when_a_retention_pass_runs_should_send_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+
+    owner.on_retain_partition(
+        namespace(),
+        IggyTimestamp::now(),
+        IggyExpiry::NeverExpire,
+        None,
+        0,
+    );
+
+    assert_eq!(retention_truncate(&owner), None);
 }

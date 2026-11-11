@@ -272,6 +272,17 @@ pub enum MetadataSubmit {
         reply: Sender<Result<u64, IggyError>>,
     },
     ForwardedSegmentDelete(Message<SegmentDeleteHeader>),
+    /// The primary of a tiered partition decided that retention removes its
+    /// segments up to `up_to_offset`. Shard 0 commits that as a
+    /// `TruncatePartition` when this node leads the metadata group. No reply:
+    /// the next timed pass decides again.
+    RetentionTruncate {
+        namespace: IggyNamespace,
+        /// The incarnation the offset was read from. Slab ids are reused
+        /// after a delete, so the namespace alone can name a later partition.
+        created_revision: u64,
+        up_to_offset: u64,
+    },
     /// Replica-link liveness report routed to shard 0; no proposal or reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
     BindSession {
@@ -1138,6 +1149,20 @@ pub enum LifecycleFrame {
         now: IggyTimestamp,
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
+    },
+    /// Per-shard pass over a partition of a tiered topic: the primary works
+    /// out what the topic's retention removes, over local and remote segments
+    /// alike, and hands the offset to shard 0 to commit as a
+    /// `TruncatePartition`. Nothing is deleted here, and a backup does
+    /// nothing. The timer task resolves the same inputs as for
+    /// `CleanPartition`, plus the watermark already committed, so a decision
+    /// that commits nothing new is dropped on the pump.
+    RetainPartition {
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
     },
     /// Reconciler-staged enforcement of a committed `TruncatePartition`
     /// watermark: delete sealed segments up to `up_to_offset` on the pump,
@@ -3467,6 +3492,63 @@ where
                 namespace_raw = namespace.inner(),
                 "segment cleaner pass refused by own inbox: {error:?}"
             );
+        }
+    }
+
+    /// Stage a retention pass for `namespace`, a partition of a tiered topic,
+    /// on this shard's pump. `committed_up_to` is the truncation watermark
+    /// metadata already holds. A refused frame is picked up by the cleaner's
+    /// next tick.
+    pub fn request_retain_partition(
+        &self,
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::RetainPartition {
+            namespace,
+            now,
+            message_expiry,
+            max_bytes,
+            committed_up_to,
+        }));
+    }
+
+    /// Run a retention pass over `namespace` on the pump: when its partition
+    /// is a tiered primary whose retention removes segments past
+    /// `committed_up_to`, hand the offset to shard 0 to commit.
+    pub(crate) fn on_retain_partition(
+        &self,
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    ) {
+        let decision = self
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .and_then(|partition| {
+                let up_to_offset = partition.total_retention_end(now, message_expiry, max_bytes)?;
+                Some((partition.created_revision(), up_to_offset))
+            });
+        // The same decision comes back on every tick until the replicas
+        // enforce it, and committing it again would only wake every
+        // reconciler.
+        if let Some((created_revision, up_to_offset)) = decision
+            && up_to_offset > committed_up_to
+        {
+            self.forward_metadata_submit(MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset,
+            });
         }
     }
 

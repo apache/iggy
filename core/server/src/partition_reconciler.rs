@@ -2465,9 +2465,9 @@ mod tests {
     };
     use iggy_common::wire_conversions::resource_options_to_wire;
     use iggy_common::{
-        Durability, HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance,
-        ResourceOptions, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrapSet,
-        critical_keys_marker,
+        Durability, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue,
+        OptionsProvenance, ResourceOptions, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin,
+        WrapSet, critical_keys_marker,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -2492,7 +2492,7 @@ mod tests {
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::mem::size_of;
     use std::path::Path;
     use std::rc::Rc;
@@ -4912,6 +4912,120 @@ mod tests {
             assert_eq!(trims(), [(namespace, WATERMARK)]);
             assert!(ctx.pending.borrow().contains(&namespace));
         }
+    }
+
+    /// A tiered topic gets no per-replica expiry. Its retention is a pass on
+    /// the partition primary, which needs the watermark already committed to
+    /// tell a new decision from the one it made on the last tick.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_cleaner_passes_should_stage_retention_with_the_committed_watermark()
+     {
+        const WATERMARK: u64 = 10;
+        const EXPIRY_MICROS: u64 = 60_000_000;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "retained-stream");
+        seed_topic(&mux, 2, 0, "retained-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let stm = &shard.plane.metadata().mux_stm;
+        let update_options = |op, options: &[(OptionKey, HeaderValue)]| {
+            let explicit: ResourceOptions = options
+                .iter()
+                .map(|(key, value)| (HeaderKey::from(*key), OptionValue::explicit(value.clone())))
+                .collect();
+            let update = UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: None,
+                explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                    .expect("options fit the wire"),
+                derived_options: WireOptions::empty(),
+            };
+            stm.update(build_prepare(op, Operation::UpdateTopicResolved, &update))
+                .expect("UpdateTopic apply succeeds");
+        };
+        // The retention passes the cleaner staged, and how many per-replica
+        // expiry passes went with them.
+        let staged = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut retention = Vec::new();
+            let mut expiry_passes = 0;
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::RetainPartition {
+                        namespace,
+                        message_expiry,
+                        max_bytes,
+                        committed_up_to,
+                        ..
+                    }) => retention.push((namespace, message_expiry, max_bytes, committed_up_to)),
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::CleanPartition {
+                        ..
+                    }) => expiry_passes += 1,
+                    _ => {}
+                }
+            }
+            (retention, expiry_passes)
+        };
+        let tiered = (OptionKey::TieredStorage, HeaderValue::from(true));
+
+        update_options(3, std::slice::from_ref(&tiered));
+        assert_eq!(
+            staged(),
+            (Vec::new(), 0),
+            "a tiered topic without a retention policy stages no retention"
+        );
+
+        update_options(
+            4,
+            &[
+                tiered,
+                (OptionKey::MessageExpiry, HeaderValue::from(EXPIRY_MICROS)),
+            ],
+        );
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(EXPIRY_MICROS));
+        assert_eq!(staged(), (vec![(namespace, expiry, None, 0)], 0));
+
+        let created_revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        stm.update(build_prepare(
+            5,
+            Operation::TruncatePartition,
+            &TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: WATERMARK,
+                expected_history: Some(created_revision),
+            },
+        ))
+        .expect("TruncatePartition apply succeeds");
+        assert_eq!(staged(), (vec![(namespace, expiry, None, WATERMARK)], 0));
+
+        // A size cap alone is a retention policy too.
+        update_options(
+            6,
+            &[
+                (OptionKey::TieredStorage, HeaderValue::from(true)),
+                (OptionKey::MessageExpiry, HeaderValue::from(0u64)),
+                (OptionKey::MaxTopicSize, HeaderValue::from(u64::MAX / 2)),
+            ],
+        );
+        let (retention, expiry_passes) = staged();
+        assert_eq!(expiry_passes, 0);
+        assert!(matches!(
+            retention[..],
+            [(staged_namespace, IggyExpiry::NeverExpire, Some(_), WATERMARK)]
+                if staged_namespace == namespace
+        ));
     }
 
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this

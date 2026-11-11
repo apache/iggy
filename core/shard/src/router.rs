@@ -1182,6 +1182,21 @@ where
                     partition.stage_eviction(now);
                 }
             }
+            LifecycleFrame::RetainPartition {
+                namespace,
+                now,
+                message_expiry,
+                max_bytes,
+                committed_up_to,
+            } => {
+                self.on_retain_partition(
+                    namespace,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                    committed_up_to,
+                );
+            }
             LifecycleFrame::UploadSegments {
                 namespace,
                 resend_advance,

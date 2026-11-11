@@ -12795,6 +12795,45 @@ where
         self.remove_sealed_segments_up_to(up_to).await
     }
 
+    /// What the retention policy of a tiered topic removes from this
+    /// partition: the end offset of the last leading sealed segment that
+    /// expired or that pushes the SEALED bytes past `max_bytes`, held at the
+    /// consumer barrier as [`Self::remove_sealed_segments_up_to`] holds a
+    /// removal. Segments whose `.log` already left the disk count like local
+    /// ones, since the store still holds their bytes.
+    ///
+    /// Nothing is removed here. The caller commits the offset as a
+    /// truncation, which is what removes the segments on every replica.
+    ///
+    /// `None` on a partition without a chain, and on every replica but a
+    /// primary that applied the view it started: a backup's segment list can
+    /// trail the primary's, and one decision per partition is what keeps the
+    /// replicas and the store on the same front.
+    #[must_use]
+    pub fn total_retention_end(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> Option<u64> {
+        let consensus = &self.consensus;
+        if !self.is_tiered()
+            || !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || !consensus.applied_view_start()
+        {
+            return None;
+        }
+        retention_end(
+            self.log.segments(),
+            now,
+            message_expiry,
+            max_bytes,
+            self.min_committed_offset().map(|(barrier, _, _)| barrier),
+        )
+    }
+
     /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
     /// never the active segment and never past the consumer barrier (the
     /// minimum committed consumer/group offset). Unlinks the messages and
@@ -15111,6 +15150,29 @@ fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
         up_to = Some(segment.end_offset);
     }
     up_to
+}
+
+/// Highest `end_offset` retention removes from `segments`: the longer of the
+/// expired and the over-budget leading runs, cut back to the last segment that
+/// ends at or below `barrier`. `None` when retention removes nothing. The
+/// active segment (last element) is never named.
+fn retention_end(
+    segments: &[Segment],
+    now: IggyTimestamp,
+    expiry: IggyExpiry,
+    max_bytes: Option<u64>,
+    barrier: Option<u64>,
+) -> Option<u64> {
+    let expired = leading_expired_end(segments, now, expiry);
+    let oversized = max_bytes.and_then(|max_bytes| leading_oversized_end(segments, max_bytes));
+    let up_to = expired.into_iter().chain(oversized).max()?;
+    let through = barrier.map_or(up_to, |barrier| up_to.min(barrier));
+    // `up_to` ends a sealed segment, so the walk stops before the active one.
+    segments
+        .iter()
+        .take_while(|segment| segment.end_offset <= through)
+        .map(|segment| segment.end_offset)
+        .last()
 }
 
 /// `end_offset` of the `count`-th oldest sealed (non-active) segment of
