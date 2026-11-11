@@ -17,8 +17,8 @@
 
 use super::{
     Chain, ChainError, ChainRecord, HEADER_SIZE, HashSource, ObjectPrefix, RECORD_SIZE,
-    SegmentDigest, SegmentRecord, append_record, chain_path, create_chain, decode_chain,
-    hash_segment_file, read_chain,
+    SegmentDigest, SegmentHashes, SegmentRecord, append_record, chain_path, create_chain,
+    decode_chain, encode_header, hash_segment_file, read_chain,
 };
 use crate::state_transfer::ChunkHasher;
 
@@ -28,6 +28,13 @@ const PREFIX: ObjectPrefix = ObjectPrefix {
     partition_id: 7,
     created_revision: 11,
 };
+
+fn hashes_of(bytes: &[u8]) -> SegmentHashes {
+    SegmentHashes {
+        blake3: *blake3::hash(bytes).as_bytes(),
+        crc32c: crc32c::crc32c(bytes),
+    }
+}
 
 const fn segment(start_offset: u64, source: HashSource) -> SegmentRecord {
     SegmentRecord {
@@ -39,6 +46,7 @@ const fn segment(start_offset: u64, source: HashSource) -> SegmentRecord {
         size: 4096,
         incarnation: 11,
         hash: [7; 32],
+        crc32c: 0x1234_5678,
         source,
     }
 }
@@ -52,7 +60,7 @@ fn records() -> [ChainRecord; 3] {
 }
 
 fn chain_bytes(records: &[ChainRecord]) -> Vec<u8> {
-    let mut bytes = PREFIX.encode().to_vec();
+    let mut bytes = encode_header(&PREFIX).to_vec();
     for record in records {
         bytes.extend_from_slice(&record.encode());
     }
@@ -177,9 +185,9 @@ async fn given_a_segment_file_when_hashed_from_disk_should_match_its_bytes() {
     let path = path.to_string_lossy().into_owned();
 
     let whole = hash_segment_file(&path, bytes.len() as u64).await.unwrap();
-    assert_eq!(whole, *blake3::hash(&bytes).as_bytes());
+    assert_eq!(whole, hashes_of(&bytes));
     let prefix = hash_segment_file(&path, 1000).await.unwrap();
-    assert_eq!(prefix, *blake3::hash(&bytes[..1000]).as_bytes());
+    assert_eq!(prefix, hashes_of(&bytes[..1000]));
     assert!(
         hash_segment_file(&path, bytes.len() as u64 + 1)
             .await
@@ -195,8 +203,5 @@ fn given_a_digest_when_fed_in_pieces_should_cover_and_hash_the_whole_bytes() {
     assert!(digest.covers(20, 13));
     assert!(!digest.covers(20, 12));
     assert!(!digest.covers(0, 13));
-    assert_eq!(
-        digest.finalize(),
-        *blake3::hash(b"segment bytes").as_bytes()
-    );
+    assert_eq!(digest.finalize(), hashes_of(b"segment bytes"));
 }
