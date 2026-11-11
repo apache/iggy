@@ -39,13 +39,18 @@ public final class ReadException extends IggyException {
     private final transient Optional<PollingStrategy> skip;
     private final transient Optional<BigInteger> offset;
     private final byte[] record;
+    private final transient Optional<OffsetRange> lost;
 
     ReadException(OptionalLong partitionId, Throwable cause, Optional<PollingStrategy> skip) {
-        this(partitionId, cause, skip, Optional.empty(), NO_RECORD);
+        this(partitionId, cause, skip, Optional.empty(), NO_RECORD, Optional.empty());
     }
 
     ReadException(OptionalLong partitionId, DecodeFailure failure, Optional<PollingStrategy> skip) {
-        this(partitionId, failure.error(), skip, failure.offset(), failure.record());
+        this(partitionId, failure.error(), skip, failure.offset(), failure.record(), Optional.empty());
+    }
+
+    ReadException(long partitionId, Throwable cause, OffsetRange lost) {
+        this(OptionalLong.of(partitionId), cause, Optional.empty(), Optional.empty(), NO_RECORD, Optional.of(lost));
     }
 
     private ReadException(
@@ -53,7 +58,8 @@ public final class ReadException extends IggyException {
             Throwable cause,
             Optional<PollingStrategy> skip,
             Optional<BigInteger> offset,
-            byte[] record) {
+            byte[] record,
+            Optional<OffsetRange> lost) {
         super(
                 partitionId.isPresent()
                         ? "Partition " + partitionId.getAsLong() + ": " + cause.getMessage()
@@ -63,6 +69,7 @@ public final class ReadException extends IggyException {
         this.skip = skip;
         this.offset = offset;
         this.record = record;
+        this.lost = lost;
     }
 
     /** The partition of the error, or empty for an error of the whole reader. */
@@ -96,10 +103,26 @@ public final class ReadException extends IggyException {
         return record;
     }
 
+    /**
+     * For messages that a read whose reply was lost stored, and that the reader could not read again: their first and
+     * last offset. The reader reads on after them. Empty for every other error.
+     */
+    public Optional<OffsetRange> lost() {
+        return lost;
+    }
+
     /** The code of the server error behind this one, or empty for an error of the client. */
     public OptionalLong errorCode() {
         return getCause() instanceof IggyServerException server
                 ? OptionalLong.of(server.getRawErrorCode())
                 : OptionalLong.empty();
     }
+
+    /**
+     * The offsets from {@code first} to {@code last} of a partition, both included.
+     *
+     * @param first the first offset of the range
+     * @param last  the last offset of the range
+     */
+    public record OffsetRange(BigInteger first, BigInteger last) {}
 }

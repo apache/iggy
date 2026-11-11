@@ -26,12 +26,12 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3::{PyErrArguments, PyRef};
-use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ use crate::consumer::{
     ConsumerGroupDetails as PyConsumerGroupDetails, ConsumerOffsetInfo, IggyConsumer,
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
-use crate::event_loop::on_event_loop;
+use crate::event_loop::{attach_unless_exiting, future_into_py, on_event_loop};
 use crate::identifier::PyIdentifier;
 use crate::metadata_changes::{
     MetadataChangeGroup, MetadataChangeStart, MetadataChanges, validated_query,
@@ -91,7 +91,10 @@ impl From<&IggyError> for PyIggyError {
     }
 }
 
-/// An operation whose retained identity is needed to recover or release its lane.
+/// An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+/// names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+/// The client retains no operation for kind `not_retained`, and none for a group join that
+/// `reader()` abandoned.
 #[gen_stub_pyclass]
 #[pyclass(frozen, extends=PyIggyError)]
 pub struct PendingOperationError {
@@ -129,6 +132,11 @@ pub struct ReadError {
     /// of the partition reads it again.
     #[pyo3(get)]
     is_lasting_refusal: bool,
+    /// For messages that a lost read committed and that the reader could not read again: their
+    /// first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+    /// (14010). `None` for every other error.
+    #[pyo3(get)]
+    lost: Option<(u64, u64)>,
 }
 
 #[gen_stub_pymethods]
@@ -144,7 +152,8 @@ impl ReadError {
 
     /// For a message that does not decode: the continuation after it. The messages before it
     /// arrive in a batch before this error, and the reader reads the message again until
-    /// `seek()` to this continuation skips it.
+    /// `seek()` to this continuation skips it. For a lost range: the continuation after the
+    /// last offset of `lost`. `None` for every other error.
     #[gen_stub(override_return_type(type_repr = "PollingStrategy | None"))]
     #[getter]
     fn skip(&self) -> Option<PollingStrategy> {
@@ -202,6 +211,7 @@ impl PyErrArguments for ReadErrorArguments {
             offset: error.offset,
             record: error.record,
             is_lasting_refusal,
+            lost: error.lost.map(RangeInclusive::into_inner),
         };
         exception_value(
             py,
@@ -1431,8 +1441,7 @@ impl IggyClient {
             inner
                 .delete_segments(&stream_id, &topic_id, partition_id, segments_count)
                 .await
-                .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| py.None()))
+                .map_err(to_runtime_error)
         })
     }
 
@@ -2014,15 +2023,17 @@ impl IggyClient {
     /// by default. A continuation is refused, because it belongs to one partition. `options`
     /// sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
     /// reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
-    /// default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
-    /// bound the requests in flight and the queued batches.
+    /// default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+    /// and queued batches. Each effective budget holds at least 32 reads at the configured
+    /// count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+    /// queued batches; network requests have a separate per-consumer limit of 32.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
     /// `Consumer.Single` without partitions or a continuation as `start`,
     /// `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
-    /// error of the group join. A join with an unknown outcome raises `PendingOperationError`:
-    /// the client keeps it, so a new `reader()` raises `lane_blocked` until
-    /// `resolve_operation()` or `abandon_operation()` settles it.
+    /// error of the group join. A join with an unknown outcome raises `PendingOperationError`
+    /// after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+    /// that landed keeps its member in the group until the session ends.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         stream,
@@ -2091,8 +2102,11 @@ impl IggyClient {
     /// the default, stores none, so commit checkpoints after processing, or each restart reads
     /// the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
     /// each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
-    /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
-    /// the poll count by default) bound the requests in flight and the queued batches.
+    /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+    /// budgets for reads in flight and queued batches. Each effective budget holds at least
+    /// 32 reads at the configured poll count and byte limit, even if a smaller budget is
+    /// requested. Larger budgets allow more queued batches; network requests have a separate
+    /// per-consumer limit of 32.
     /// `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
     /// stores before closing the reader. It defaults to five seconds; zero skips that wait.
     /// Call `shutdown()` before dropping the consumer.
@@ -2267,7 +2281,7 @@ impl IggyClient {
                 .send_binary_request(code, Bytes::from(payload))
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+            attach_unless_exiting(|py| Ok(PyBytes::new(py, &response).unbind()))
         })
     }
 
@@ -2305,7 +2319,7 @@ impl IggyClient {
                 .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+            attach_unless_exiting(|py| Ok(PyBytes::new(py, &response).unbind()))
         })
     }
 }
@@ -2519,13 +2533,11 @@ mod tests {
         Python::attach(|py| {
             for offset in [None, Some(10)] {
                 for record in [None, Some(Bytes::from_static(&[0, 255, 17, 128]))] {
-                    let error = to_read_error(RustReadError {
-                        partition_id: Some(7),
-                        error: IggyError::CannotReadMessage,
-                        skip: Some(RustPollingStrategy::offset(11)),
-                        offset,
-                        record: record.clone(),
-                    });
+                    let mut read_error = RustReadError::new(Some(7), IggyError::CannotReadMessage);
+                    read_error.skip = Some(RustPollingStrategy::offset(11));
+                    read_error.offset = offset;
+                    read_error.record = record.clone();
+                    let error = to_read_error(read_error);
                     let value = error.value(py);
                     assert_eq!(
                         value
@@ -2559,13 +2571,8 @@ mod tests {
         Python::attach(|py| {
             let cause = IggyError::FetchProgressUncertain(OPERATION_ID);
             let code = cause.as_code();
-            let read_error = RustReadError {
-                partition_id: Some(PARTITION_ID),
-                error: cause,
-                skip: Some(RustPollingStrategy::offset(SKIP_OFFSET)),
-                offset: None,
-                record: None,
-            };
+            let mut read_error = RustReadError::new(Some(PARTITION_ID), cause);
+            read_error.skip = Some(RustPollingStrategy::offset(SKIP_OFFSET));
             let message = read_error.to_string();
 
             let error = to_read_error(read_error);
@@ -2618,13 +2625,7 @@ mod tests {
                 (None, IggyError::Unauthorized, false),
                 (Some(1), IggyError::HistoryUnavailable, false),
             ] {
-                let error = to_read_error(RustReadError {
-                    partition_id,
-                    error,
-                    skip: None,
-                    offset: None,
-                    record: None,
-                });
+                let error = to_read_error(RustReadError::new(partition_id, error));
 
                 let value = error.value(py);
                 assert_eq!(
@@ -2660,13 +2661,10 @@ mod tests {
                 TIERED_READ_FAILED_CODE
             );
 
-            let read = to_read_error(RustReadError {
-                partition_id: Some(PARTITION_ID),
-                error: IggyError::TieredReadFailed,
-                skip: None,
-                offset: None,
-                record: None,
-            });
+            let read = to_read_error(RustReadError::new(
+                Some(PARTITION_ID),
+                IggyError::TieredReadFailed,
+            ));
 
             assert!(read.is_instance_of::<ReadError>(py));
             let value = read.value(py);
@@ -2694,20 +2692,45 @@ mod tests {
     fn given_read_error_of_the_whole_reader_when_mapping_should_have_no_partition_or_skip() {
         Python::initialize();
         Python::attach(|py| {
-            let error = to_read_error(RustReadError {
-                partition_id: None,
-                error: IggyError::Disconnected,
-                skip: None,
-                offset: None,
-                record: None,
-            });
+            let error = to_read_error(RustReadError::new(None, IggyError::Disconnected));
 
             let value = error.value(py);
             assert!(value.getattr("partition_id").unwrap().is_none());
             assert!(value.getattr("skip").unwrap().is_none());
+            assert!(value.getattr("lost").unwrap().is_none());
             let cause = value.getattr("error").unwrap();
             assert!(cause.is_instance_of::<PyIggyError>());
             assert!(!cause.is_instance_of::<PendingOperationError>());
+        });
+    }
+
+    #[test]
+    fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
+        const PARTITION_ID: u32 = 7;
+        const OPERATION_ID: u64 = 42;
+        const FIRST: u64 = 4;
+        const LAST: u64 = 9;
+        Python::initialize();
+        Python::attach(|py| {
+            let mut read_error = RustReadError::new(
+                Some(PARTITION_ID),
+                IggyError::FetchProgressUncertain(OPERATION_ID),
+            );
+            read_error.skip = Some(RustPollingStrategy::offset(LAST + 1));
+            read_error.lost = Some(FIRST..=LAST);
+
+            let error = to_read_error(read_error);
+
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("lost")
+                    .unwrap()
+                    .extract::<Option<(u64, u64)>>()
+                    .unwrap(),
+                Some((FIRST, LAST))
+            );
+            assert!(value.setattr("lost", py.None()).is_err());
         });
     }
 
@@ -2723,13 +2746,7 @@ mod tests {
                 let errors = (
                     to_runtime_error(IggyError::FetchProgressUncertain(OPERATION_ID)),
                     to_runtime_error(IggyError::InvalidOptionValue("count".to_owned())),
-                    to_read_error(RustReadError {
-                        partition_id: None,
-                        error: IggyError::Disconnected,
-                        skip: None,
-                        offset: None,
-                        record: None,
-                    }),
+                    to_read_error(RustReadError::new(None, IggyError::Disconnected)),
                 );
                 let _ = built.send(errors);
             });

@@ -634,4 +634,15 @@ enum Responses {
             return PolledMessages(partitionID: partitionID, currentOffset: currentOffset, count: count, messages: messages, context: context)
         }
     }
+
+    /// The partition context of a poll reply. It comes before the messages,
+    /// so a message that does not decode leaves it readable.
+    static func polledContext(_ body: ArraySlice<UInt8>) throws -> PartitionContext {
+        try decode(body) { reader in
+            _ = try reader.readUInt32()
+            _ = try reader.readUInt64()
+            _ = try reader.readUInt32()
+            return try PartitionContext.decode(from: &reader)
+        }
+    }
 }

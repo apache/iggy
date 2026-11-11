@@ -21,11 +21,11 @@
 //! applies a request twice.
 
 use crate::links::{
-    Frame, LateReply, Link, ReplicaLinks, Reply, Target, committing_cancel_requested, lost_link,
-    pause_before_retry, read_reply,
+    Frame, LateReply, Link, ReplicaLinks, Reply, Target, committing_cancel_requested,
+    committing_cancelled, lost_link, pause_before_retry, read_reply,
 };
 use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionEpoch, SessionOwner};
-use crate::vsr::decode_reply_for;
+use crate::vsr::{decode_reply_for, reply_commit};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iggy_binary_protocol::codes::{
@@ -33,7 +33,7 @@ use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_OFFSET_CODE,
     GET_PARTITION_ROUTE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
     POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE,
-    STORE_CONSUMER_OFFSET_CODE, UPDATE_RESOURCE_CODE,
+    STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, RequestHeader, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -60,15 +60,17 @@ use iggy_common::{
     DiagnosticEvent, FetchedSection, HeaderKind, Identifier, IggyError, OptionKey,
 };
 use route_cache::RouteCache;
+use std::future::pending;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit, watch};
 use tokio::time::{Instant, timeout_at};
 use tracing::debug;
 
 mod route_cache;
 
 pub(crate) const MAX_DEFERRED_REQUESTS: usize = 64;
-pub(crate) const MAX_DEFERRED_REQUESTS_PER_CONSUMER: usize = 16;
+pub(crate) const MAX_DEFERRED_REQUESTS_PER_CONSUMER: usize = 32;
 /// Route lookups in flight while [`OperationDriver::readiness_groups`] groups
 /// the partitions of a wait. After a move, each stale partition needs one, so
 /// a primary that held 333 of 1000 partitions on 3 nodes costs 21 round trips
@@ -137,7 +139,8 @@ pub(crate) struct PartitionTarget<'a> {
     pub(crate) stream_id: &'a Identifier,
     pub(crate) topic_id: &'a Identifier,
     pub(crate) partition_id: u32,
-    /// `None` captures the route context. Retries retain the first context sent.
+    /// `None` captures the route context. Retries retain the first context sent. See
+    /// [`OperationDriver::context`] for a context without an incarnation.
     pub(crate) context: Option<PartitionContext>,
 }
 
@@ -338,8 +341,11 @@ impl OperationDriver {
     }
 
     /// One fetch on the primary of its targets. The targets of a readiness
-    /// group share it, so the call routes by the first one. The header
-    /// carries context zero, and each target its own fence.
+    /// group share it, so the call routes by the first one. The header names
+    /// only the metadata that the session saw, and each target its own fence.
+    /// That metadata covers the handovers of the synced assignment, so a
+    /// replica that has not applied them yet refuses the fetch as not
+    /// accepted, not as a partition that the member does not own.
     pub(crate) async fn fetch_messages(
         &self,
         request: &FetchMessagesRequest,
@@ -394,7 +400,7 @@ impl OperationDriver {
                     stream_id: &stream_id,
                     topic_id: &topic_id,
                     partition_id,
-                    context: Some(PartitionContext::default()),
+                    context: Some(self.read_context()),
                 }),
                 operation_deadline(),
             );
@@ -541,6 +547,24 @@ impl OperationDriver {
         self.drive(Call::new(code, payload, target, deadline)).await
     }
 
+    /// The reply body of a `SyncConsumerGroup` and the metadata commit at
+    /// which the answering replica read the assignment.
+    pub(crate) async fn sync_group(&self, payload: Bytes) -> Result<(Bytes, u64), IggyError> {
+        let call = Call::new(
+            SYNC_CONSUMER_GROUP_CODE,
+            payload,
+            RequestTarget::Metadata,
+            operation_deadline(),
+        );
+        self.drive_reply(call)
+            .await
+            .map(|reply| (reply.body, reply.commit))
+    }
+
+    pub(crate) fn observe_metadata_commit(&self, commit: u64) {
+        self.session.observe_metadata_commit(commit);
+    }
+
     /// Replays the retained operation `op` until it has an outcome or
     /// `deadline` passes. A proved outcome frees the lane. An operation that
     /// is no longer retained returns the outcome that a replay proved for it.
@@ -582,20 +606,28 @@ impl OperationDriver {
                     return Ok(CallReply {
                         body,
                         uncertain_fetch,
+                        commit: call.reply_commit,
                     });
                 }
                 Err(next) => next,
             };
             call.settle_sent();
             match next {
-                Next::Again if Instant::now() < call.deadline => {}
+                Next::Again if Instant::now() < call.attempt_deadline() => {}
                 Next::Again => return Err(call.expire()),
-                // The reader of the call closes and cancelled it, so its refusal is the answer.
-                Next::Pause if call.committing() && committing_cancel_requested() => {
+                // The reader of the call cancelled it, so its refusal is the answer.
+                Next::Pause | Next::AwaitLink(_)
+                    if call.committing() && committing_cancel_requested() =>
+                {
                     return Err(call.expire());
                 }
                 Next::Pause => {
-                    if !call.pause().await {
+                    if !call.pause(pending()).await {
+                        return Err(call.expire());
+                    }
+                }
+                Next::AwaitLink(ready_links) => {
+                    if !call.pause(link_ready(ready_links)).await {
                         return Err(call.expire());
                     }
                 }
@@ -653,6 +685,9 @@ impl OperationDriver {
             Some(error) => return Err(Next::Fail(error)),
             None => {}
         }
+        if Instant::now() >= call.attempt_deadline() {
+            return Err(Next::Again);
+        }
         if call.frame.is_some() && call.fence() != Some(self.session.fence()) {
             // A replaced session can never apply the frame. An uncertain call
             // ends with its uncertainty, any other call freezes again.
@@ -667,24 +702,9 @@ impl OperationDriver {
         let route = self.route_for(call, started.lineage).await?;
         self.fence_targets(call, started.lineage).await?;
         let context = self.context(call, route.as_ref());
-        let mut lane_context = context;
-        if lane_context.incarnation == 0
-            && (call.progress_poll
-                || matches!(
-                    call.code,
-                    GET_CONSUMER_OFFSET_CODE
-                        | STORE_CONSUMER_OFFSET_CODE
-                        | DELETE_CONSUMER_OFFSET_CODE
-                ))
-            && let Some(route) = &route
-        {
-            // Keep an explicit zero wire fence invalid while sharing local
-            // progress admission with callers that captured the route.
-            lane_context.incarnation = route.incarnation;
-        }
         // The lane comes first, so a blocked lane ends the call at once, also
         // while no link is ready.
-        let mut ticket = self.ticket(call, &lane_context).await?;
+        let mut ticket = self.ticket(call, &context).await?;
         if call.committing()
             && let Err(error) = ticket.reserve_fetch(call.deadline).await
         {
@@ -752,6 +772,7 @@ impl OperationDriver {
                         return Err(Next::Fail(IggyError::Unauthenticated));
                     }
                     self.session.observe_metadata_reply(&reply.header);
+                    call.reply_commit = reply_commit(&reply.header);
                     let bound = self.session.epoch().bound;
                     close_if_detached(&hop.link, &outcome.result, bound);
                     if outcome.committed && call.uncertain {
@@ -917,9 +938,26 @@ impl OperationDriver {
 
     /// The context that a new frame of `call` carries. Every attempt and
     /// every replay keeps the context of the first frame.
-    fn context(&self, call: &Call, route: Option<&PartitionRouteResponse>) -> PartitionContext {
-        match (&call.partition, route) {
-            (Some(partition), Some(route)) => partition.context.unwrap_or_else(|| route.context()),
+    ///
+    /// For a request that [`takes_route_incarnation`], a zero context counts
+    /// as none. A context without an incarnation takes the route incarnation
+    /// once and keeps its owner and metadata op, which the server still
+    /// checks, so a frame frozen again names the same history.
+    fn context(&self, call: &mut Call, route: Option<&PartitionRouteResponse>) -> PartitionContext {
+        let fills = takes_route_incarnation(call.code);
+        match (&mut call.partition, route) {
+            (Some(partition), Some(route)) => {
+                if fills
+                    && let Some(context) = partition.context
+                    && context.incarnation == 0
+                {
+                    partition.context = context.non_zero().map(|context| PartitionContext {
+                        incarnation: route.incarnation,
+                        ..context
+                    });
+                }
+                partition.context.unwrap_or_else(|| route.context())
+            }
             _ if operation_for_code(call.code) == Operation::NonReplicated => self.read_context(),
             _ => PartitionContext::default(),
         }
@@ -1022,9 +1060,10 @@ impl OperationDriver {
         let target = route.map_or(Target::MetadataPrimary, |route| {
             Target::Replica(route.primary_replica)
         });
-        if let Ok(link) = self.links.link(target) {
-            return Ok(Hop { link, route });
-        }
+        let ready_links = match self.links.link_or_wait(target) {
+            Ok(link) => return Ok(Hop { link, route }),
+            Err(ready_links) => ready_links,
+        };
         call.refusal = IggyError::TransientNotAccepted;
         match (&call.partition, route) {
             (Some(partition), Some(route)) => {
@@ -1033,19 +1072,20 @@ impl OperationDriver {
             }
             _ => self.find_metadata_primary(call.deadline).await,
         }
-        Err(Next::Pause)
+        Err(Next::AwaitLink(ready_links))
     }
 
     /// The link of the replica the caller chose. A replica without a ready
     /// link is waited for. One the roster does not name is looked up in a
     /// fresh roster once, and then refused.
     async fn replica_hop(&self, call: &mut Call, replica: u8) -> Result<Hop, Next> {
-        if let Ok(link) = self.links.link(Target::Replica(replica)) {
-            return Ok(Hop { link, route: None });
-        }
+        let ready_links = match self.links.link_or_wait(Target::Replica(replica)) {
+            Ok(link) => return Ok(Hop { link, route: None }),
+            Err(ready_links) => ready_links,
+        };
         call.refusal = IggyError::TransientNotAccepted;
         if self.links.has_replica(replica) {
-            return Err(Next::Pause);
+            return Err(Next::AwaitLink(ready_links));
         }
         if call.roster_read {
             return Err(Next::Fail(IggyError::InvalidIdentifier));
@@ -1319,7 +1359,8 @@ impl OperationDriver {
 
     /// Asks one ready replica at a time for the route of `key`, in id order.
     /// The first one is the replica that a refusal named, else the metadata
-    /// primary. An answer older than the cached route goes to the next one.
+    /// primary. An answer older than the cached route goes to the next one,
+    /// and so does one without an incarnation, which names no history yet.
     /// A lookup that no replica answers usably ends with 58, which the caller
     /// retries until its deadline. A client with no ready replica, no session
     /// and no credentials cannot get a route, because the server refuses it
@@ -1366,6 +1407,7 @@ impl OperationDriver {
                         .map_err(|_| IggyError::InvalidFormat)
                 });
             match answer {
+                Ok(answer) if answer.incarnation == 0 => {}
                 Ok(answer) => {
                     if let Some(route) = self.routes().merge(key, answer, fence) {
                         return Ok(route);
@@ -1483,11 +1525,14 @@ struct Call {
     /// The request of a fetch. Its targets name the progress lanes and the
     /// routes of the call, and a refusal of the fetch concerns all of them.
     fetch: Option<FetchMessagesRequest>,
+    /// The metadata commit that the last reply named.
+    reply_commit: u64,
 }
 
 struct CallReply {
     body: Bytes,
     uncertain_fetch: Option<UncertainFetch>,
+    commit: u64,
 }
 
 /// Whether a committing fetch that failed with `error` can have taken effect. The HTTP client
@@ -1539,7 +1584,8 @@ struct UncertainFetch {
 struct PartitionCall {
     key: PartitionKey,
     /// The context of the poll reply that the call continues. `None` takes
-    /// the context of the route.
+    /// the context of the route. [`OperationDriver::context`] fills an
+    /// incarnation 0 here at the first attempt.
     context: Option<PartitionContext>,
 }
 
@@ -1581,6 +1627,8 @@ impl Drop for ExplicitSignIn<'_> {
 enum Next {
     Again,
     Pause,
+    /// No link serves the target yet. The pause also ends once a link starts to serve.
+    AwaitLink(watch::Receiver<()>),
     Fail(IggyError),
     Committed(IggyError),
 }
@@ -1686,6 +1734,7 @@ impl Call {
             not_primary: false,
             restarted: false,
             fetch: None,
+            reply_commit: 0,
         }
     }
 
@@ -1727,7 +1776,13 @@ impl Call {
     ) -> Result<(Frame, &mut LaneTicket), Next> {
         let payload = self.deferred_payload();
         let ticket = self.ticket.insert(ticket);
-        let payload = payload.map_err(Next::Fail)?;
+        let payload = payload.map_err(|error| {
+            Next::Fail(if error == IggyError::TransientNotAccepted {
+                self.refusal.clone()
+            } else {
+                error
+            })
+        })?;
         let mut frame = match &self.frame {
             Some(frame) => {
                 if !ticket.revalidate(lineage).map_err(Next::Fail)? {
@@ -1844,12 +1899,36 @@ impl Call {
         }
     }
 
-    /// Sleeps before the next attempt. Returns false instead if the attempt
-    /// cannot start before the deadline.
-    async fn pause(&mut self) -> bool {
+    /// Fetches and deferred-poll retries leave time for the reply. The resend after a first
+    /// `NotPrimary` is a retry too, although it does not pause.
+    fn attempt_deadline(&self) -> Instant {
+        if self.code == FETCH_MESSAGES_CODE
+            || (self.code == POLL_MESSAGES_DEFERRED_CODE && (self.retries > 0 || self.not_primary))
+        {
+            self.deadline
+                .checked_sub(Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US))
+                .unwrap_or(self.started)
+        } else {
+            self.deadline
+        }
+    }
+
+    /// Sleeps before the next attempt, or less once `wake` resolves. Returns
+    /// false instead if the attempt cannot start before the deadline, or if
+    /// the reader of a committing call cancels it.
+    async fn pause(&mut self, wake: impl Future<Output = ()>) -> bool {
         let retry = self.retries;
         self.retries = retry.saturating_add(1);
-        pause_before_retry(retry, self.deadline, rand::random()).await
+        let deadline = self.attempt_deadline();
+        let committing = self.committing();
+        tokio::select! {
+            biased;
+            // The refusal of a cancelled call is its answer. The cancel is
+            // first, so no attempt starts after it.
+            () = committing_cancelled(), if committing => false,
+            resumed = pause_before_retry(retry, deadline, rand::random()) => resumed,
+            () = wake => Instant::now() < deadline,
+        }
     }
 
     /// Ends the call with the outcome that it proved.
@@ -1894,6 +1973,21 @@ fn patched_username(options: &WireOptions) -> Option<&str> {
 
 fn is_sign_in(code: u32) -> bool {
     matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
+}
+
+/// Whether a context without an incarnation takes the route incarnation in
+/// a request of `code`: a poll, an offset write or an offset lookup. The
+/// server refuses incarnation 0 in their header. A fetch names a history per
+/// target instead, and a send keeps the context of its caller.
+fn takes_route_incarnation(code: u32) -> bool {
+    matches!(
+        code,
+        POLL_MESSAGES_CODE
+            | POLL_MESSAGES_DEFERRED_CODE
+            | GET_CONSUMER_OFFSET_CODE
+            | STORE_CONSUMER_OFFSET_CODE
+            | DELETE_CONSUMER_OFFSET_CODE
+    )
 }
 
 /// Whether another replica, or the same one later, can answer a lookup that
@@ -1945,9 +2039,18 @@ fn close_if_detached(link: &Link, result: &Result<Bytes, IggyError>, bound: bool
     }
 }
 
+/// Resolves once a link starts to serve requests after `ready_links` was taken.
+async fn link_ready(mut ready_links: watch::Receiver<()>) {
+    if ready_links.changed().await.is_err() {
+        // The links closed, so only the backoff ends the pause.
+        pending::<()>().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::CANCEL_COMMITTING;
     use crate::links::OPERATION_TIMEOUT;
     use crate::links::RETRY_BACKOFF_MAX;
     use crate::links::fake_cluster::{
@@ -2020,6 +2123,16 @@ mod tests {
         incarnation: 8,
         metadata_op: 30,
         ..ROUTE
+    };
+    /// A caller context that names an owner and a metadata op, but no history.
+    const NO_INCARNATION: PartitionContext = PartitionContext {
+        incarnation: 0,
+        owner_generation: 9,
+        metadata_op: 100,
+    };
+    const FILLED: PartitionContext = PartitionContext {
+        incarnation: ROUTE.incarnation,
+        ..NO_INCARNATION
     };
 
     struct Fixture {
@@ -4113,12 +4226,169 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_fetch_of_1_or_1000_targets_when_sent_should_reach_their_primary_with_context_zero_and_fence_each_target()
+    async fn given_a_capacity_refused_deferred_request_when_only_the_reply_margin_remains_should_keep_the_refusal()
+     {
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+        const REPLY_MARGIN: Duration = Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        let refusal_delay = REQUEST_TIMEOUT - REPLY_MARGIN / 2;
+        for code in [FETCH_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE] {
+            for auto_commit in [false, true] {
+                let fixture = Fixture::new().await;
+                let request = FetchMessagesRequest {
+                    wait_us: 0,
+                    request_timeout_us: REQUEST_TIMEOUT.as_micros() as u64,
+                    ..fetch([PARTITION_ID], auto_commit, WirePollingStrategy::offset(0))
+                };
+                let poll = fixture.poll(auto_commit, WirePollingStrategy::offset(0));
+                let options = DeferredPollOptions {
+                    max_wait: Duration::ZERO.into(),
+                    request_timeout: REQUEST_TIMEOUT.into(),
+                    ..DeferredPollOptions::default()
+                };
+                fixture.cluster.script(
+                    &endpoint(PRIMARY),
+                    code,
+                    [Answer::Refuse(IggyError::DeferredPollCapacityExceeded)],
+                );
+                fixture.cluster.hold(code);
+                let started = Instant::now();
+                let call = async {
+                    if code == FETCH_MESSAGES_CODE {
+                        fixture.driver.fetch_messages(&request).await.map(|_| ())
+                    } else {
+                        fixture
+                            .driver
+                            .poll_with_options(&poll, None, Some(options))
+                            .await
+                            .map(|_| ())
+                    }
+                };
+
+                let (result, ()) = tokio::join!(call, async {
+                    eventually("deferred reply is held", || {
+                        fixture.cluster.count(code) == 1
+                    })
+                    .await;
+                    sleep_until(started + refusal_delay).await;
+                    fixture.cluster.release(code);
+                });
+
+                assert_eq!(
+                    result,
+                    Err(IggyError::DeferredPollCapacityExceeded),
+                    "code {code}, auto_commit {auto_commit}"
+                );
+                assert_eq!(
+                    fixture.cluster.count(code),
+                    1,
+                    "no attempt fits after the refusal"
+                );
+            }
+        }
+    }
+
+    /// A seek or a close cancels the committing read of a reader and waits for its end. A read
+    /// that the server keeps refusing spends its time in the pauses between its attempts, so
+    /// the cancel ends a pause.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_refused_committing_fetch_when_cancelled_during_its_pause_should_end_without_another_attempt()
+     {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            FETCH_MESSAGES_CODE,
+            repeat_n(Answer::Refuse(IggyError::TransientNotAccepted), ENDLESS),
+        );
+        let request = fetch([PARTITION_ID], true, WirePollingStrategy::offset(0));
+        let (cancel, cancelled) = watch::channel(false);
+        let fetched = CANCEL_COMMITTING.scope(cancelled, f.driver.fetch_sections(&request));
+        tokio::pin!(fetched);
+        // The replica refuses at once, so the call spends this time in its pauses. The sleep is
+        // polled first, so the call sends nothing between the count below and its cancel.
+        tokio::select! {
+            biased;
+            () = sleep(CALLER_TIMEOUT) => {}
+            _ = &mut fetched => panic!("the call ended before its cancel"),
+        }
+        let attempts = f.cluster.count(FETCH_MESSAGES_CODE);
+        assert_ne!(attempts, 0, "the replica refused the fetch");
+
+        cancel.send_replace(true);
+        let result = fetched.await;
+
+        assert_eq!(result.err(), Some(IggyError::TransientNotAccepted));
+        assert_eq!(
+            f.cluster.count(FETCH_MESSAGES_CODE),
+            attempts,
+            "no attempt follows the cancel"
+        );
+    }
+
+    /// A first `NotPrimary` resends a deferred poll without a pause, and that resend leaves the
+    /// reply margin as every retry does.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_deferred_poll_refused_as_not_primary_when_only_the_reply_margin_remains_should_keep_the_refusal()
+     {
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+        const REPLY_MARGIN: Duration = Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+        let refusal_delay = REQUEST_TIMEOUT - REPLY_MARGIN / 2;
+        for auto_commit in [false, true] {
+            let fixture = Fixture::new().await;
+            let poll = fixture.poll(auto_commit, WirePollingStrategy::offset(0));
+            let options = DeferredPollOptions {
+                max_wait: Duration::ZERO.into(),
+                request_timeout: REQUEST_TIMEOUT.into(),
+                ..DeferredPollOptions::default()
+            };
+            fixture.cluster.script(
+                &endpoint(PRIMARY),
+                POLL_MESSAGES_DEFERRED_CODE,
+                [Answer::Refuse(IggyError::NotPrimary)],
+            );
+            fixture.cluster.hold(POLL_MESSAGES_DEFERRED_CODE);
+            let started = Instant::now();
+
+            let (result, ()) = tokio::join!(
+                fixture.driver.poll_with_options(&poll, None, Some(options)),
+                async {
+                    eventually("deferred reply is held", || {
+                        fixture.cluster.count(POLL_MESSAGES_DEFERRED_CODE) == 1
+                    })
+                    .await;
+                    sleep_until(started + refusal_delay).await;
+                    fixture.cluster.release(POLL_MESSAGES_DEFERRED_CODE);
+                }
+            );
+
+            assert_eq!(
+                result.map(|_| ()),
+                Err(IggyError::TransientNotAccepted),
+                "auto_commit {auto_commit}"
+            );
+            assert_eq!(
+                fixture.cluster.count(POLL_MESSAGES_DEFERRED_CODE),
+                1,
+                "auto_commit {auto_commit}: no resend fits after the refusal"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_fetch_of_1_or_1000_targets_when_sent_should_reach_their_primary_with_the_session_watermark_and_fence_each_target()
      {
         const OWNER_GENERATION: u64 = 4;
         for targets in [1, MAX_PARTITIONS_PER_REQUEST] {
             for raw in [false, true] {
                 let f = Fixture::new().await;
+                f.cluster
+                    .script(&endpoint(0), CREATE_STREAM_CODE, [Answer::Commit(COMMIT)]);
+                f.call(CREATE_STREAM_CODE, RequestTarget::Metadata)
+                    .await
+                    .unwrap();
+                *f.cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+                    metadata_op: COMMIT,
+                    ..ROUTE
+                });
                 let mut request = fetch(0..targets, false, WirePollingStrategy::offset(0));
                 // The fence of the caller stays, also one of an older route.
                 request.targets[0].incarnation = RECREATED.incarnation;
@@ -4135,7 +4405,13 @@ mod tests {
                 reply.unwrap();
                 let fetches = f.cluster.received(FETCH_MESSAGES_CODE);
                 assert_eq!(endpoints(&fetches), [endpoint(PRIMARY)]);
-                assert_eq!(stamped_context(&fetches[0]), PartitionContext::default());
+                assert_eq!(
+                    stamped_context(&fetches[0]),
+                    PartitionContext {
+                        metadata_op: COMMIT,
+                        ..PartitionContext::default()
+                    }
+                );
                 let sent = FetchMessagesRequest::decode_from(&fetches[0].body).unwrap();
                 let fences: Vec<_> = sent
                     .targets
@@ -4265,19 +4541,7 @@ mod tests {
                         partition_id,
                         context,
                     });
-                    if context.is_some() {
-                        f.cluster.script(
-                            &endpoint(PRIMARY),
-                            GET_CONSUMER_OFFSET_CODE,
-                            [Answer::Refuse(IggyError::HistoryUnavailable)],
-                        );
-                        assert_eq!(
-                            f.call(GET_CONSUMER_OFFSET_CODE, target).await,
-                            Err(IggyError::HistoryUnavailable),
-                        );
-                    } else {
-                        f.call(GET_CONSUMER_OFFSET_CODE, target).await.unwrap();
-                    }
+                    f.call(GET_CONSUMER_OFFSET_CODE, target).await.unwrap();
                     for code in [STORE_CONSUMER_OFFSET_CODE, DELETE_CONSUMER_OFFSET_CODE] {
                         assert!(matches!(f.call(code, target).await,
                             Err(IggyError::PartitionLaneBlocked(partition, operation))
@@ -4328,27 +4592,16 @@ mod tests {
                 "the old server request has not finished"
             );
             f.driver.abandon(operation_id).unwrap();
-            f.cluster.script(
-                &endpoint(PRIMARY),
-                STORE_CONSUMER_OFFSET_CODE,
-                [Answer::Refuse(IggyError::HistoryUnavailable)],
-            );
+            for context in [Some(PartitionContext::default()), None] {
+                f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(context))
+                    .await
+                    .unwrap();
+            }
+            let stores = f.cluster.received(STORE_CONSUMER_OFFSET_CODE);
             assert_eq!(
-                f.call(
-                    STORE_CONSUMER_OFFSET_CODE,
-                    f.partition(Some(PartitionContext::default())),
-                )
-                .await,
-                Err(IggyError::HistoryUnavailable),
+                stores.iter().map(stamped_context).collect::<Vec<_>>(),
+                [ROUTE.context(); 2],
             );
-            assert_eq!(
-                stamped_context(&f.cluster.received(STORE_CONSUMER_OFFSET_CODE)[0]),
-                PartitionContext::default(),
-            );
-            f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
-                .await
-                .unwrap();
-            assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 2);
             assert!(
                 !completed.load(Ordering::SeqCst),
                 "abandon accepts uncertainty without stopping the old request"
@@ -4361,8 +4614,10 @@ mod tests {
         }
     }
 
+    /// A zero store names the history of the stale route, which the server refuses. The next
+    /// store looks the route up again and waits in the lane of the new history.
     #[tokio::test(start_paused = true)]
-    async fn given_a_stale_alias_route_when_a_zero_context_store_is_sent_should_preserve_its_invalid_wire_fence()
+    async fn given_a_stale_alias_route_when_a_zero_context_store_is_refused_should_block_the_next_one_in_the_new_history()
      {
         let f = Fixture::new().await;
         let alias = Identifier::from_str("same-stream-alias").unwrap();
@@ -4404,7 +4659,7 @@ mod tests {
         );
         let stores = f.cluster.received(STORE_CONSUMER_OFFSET_CODE);
         assert_eq!(stores.len(), 1);
-        assert_eq!(stamped_context(&stores[0]), PartitionContext::default());
+        assert_eq!(stamped_context(&stores[0]), ROUTE.context());
         assert!(!f.driver.session.retains_operation(stores[0].header.request));
         assert!(f.driver.session.retains_operation(operation_id));
         assert!(
@@ -4414,6 +4669,131 @@ mod tests {
         );
         assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
         assert_eq!(f.cluster.count(FETCH_MESSAGES_CODE), 1);
+    }
+
+    /// The server refuses incarnation 0 in the header of an offset write, an offset lookup and
+    /// a poll. A context without one names the route history with its own owner and op, and a
+    /// zero context names the route context, on every attempt and on the replay.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_context_without_an_incarnation_when_sent_should_name_the_route_history_on_every_attempt()
+     {
+        for (context, expected) in [
+            (NO_INCARNATION, FILLED),
+            (PartitionContext::default(), ROUTE.context()),
+        ] {
+            for code in [STORE_CONSUMER_OFFSET_CODE, DELETE_CONSUMER_OFFSET_CODE] {
+                let f = Fixture::new().await;
+                f.cluster.script(
+                    &endpoint(PRIMARY),
+                    code,
+                    [
+                        Answer::Refuse(IggyError::TransientNotCommitted),
+                        Answer::Refuse(IggyError::RequestTooOld),
+                    ],
+                );
+                let sent = f.call(code, f.partition(Some(context))).await;
+                let op = f.cluster.received(code)[0].header.request;
+                assert_eq!(sent, Err(IggyError::OperationUncertain(op)));
+
+                let replayed = f.driver.resolve(op, Instant::now() + CALLER_TIMEOUT).await;
+
+                let frames = f.cluster.received(code);
+                assert_eq!(frames.len(), 3, "two attempts and a replay of {code}");
+                for frame in &frames {
+                    assert_eq!(frame.header.request, op);
+                    assert_eq!(stamped_context(frame), expected, "{code}");
+                }
+                assert_eq!(replayed, Ok(()));
+            }
+            for (code, auto_commit) in [
+                (GET_CONSUMER_OFFSET_CODE, false),
+                (POLL_MESSAGES_CODE, false),
+                (POLL_MESSAGES_CODE, true),
+                (POLL_MESSAGES_DEFERRED_CODE, true),
+            ] {
+                let f = Fixture::new().await;
+                f.cluster.script(
+                    &endpoint(PRIMARY),
+                    code,
+                    [Answer::Refuse(IggyError::TransientNotAccepted)],
+                );
+                let poll = f.poll(auto_commit, WirePollingStrategy::offset(0));
+                let answered = match code {
+                    GET_CONSUMER_OFFSET_CODE => f.call(code, f.partition(Some(context))).await,
+                    POLL_MESSAGES_CODE => f.driver.poll(&poll, Some(context)).await,
+                    _ => {
+                        f.driver
+                            .poll_with_options(
+                                &poll,
+                                Some(context),
+                                Some(DeferredPollOptions::default()),
+                            )
+                            .await
+                    }
+                };
+
+                let frames = f.cluster.received(code);
+                assert_eq!(frames.len(), 2, "two attempts of {code}");
+                for frame in &frames {
+                    assert_eq!(stamped_context(frame), expected, "{code}");
+                }
+                answered.unwrap();
+            }
+        }
+    }
+
+    /// The fill happens once: a frame frozen again after the route moved to another history
+    /// names the first one, as the lane of the call does, and the server refuses it.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_filled_context_when_the_route_changes_should_keep_the_first_incarnation() {
+        let f = Fixture::new().await;
+        let mut call = Call::new(
+            STORE_CONSUMER_OFFSET_CODE,
+            Bytes::from_static(PAYLOAD),
+            f.partition(Some(NO_INCARNATION)),
+            Instant::now() + CALLER_TIMEOUT,
+        );
+
+        assert_eq!(f.driver.context(&mut call, Some(&ROUTE)), FILLED);
+        assert_eq!(f.driver.context(&mut call, Some(&RECREATED)), FILLED);
+    }
+
+    /// A route without an incarnation names no history yet, so the call asks for the route
+    /// again instead of taking incarnation 0 from it.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_route_without_an_incarnation_when_looked_up_should_retry_until_one_names_a_history()
+     {
+        let f = Fixture::new().await;
+        let unready = PartitionRouteResponse {
+            incarnation: 0,
+            ..ROUTE
+        };
+        for replica in 0..REPLICAS {
+            f.cluster.script(
+                &endpoint(replica),
+                GET_PARTITION_ROUTE_CODE,
+                [route_body(unready)],
+            );
+        }
+
+        let stored = f
+            .call(
+                STORE_CONSUMER_OFFSET_CODE,
+                f.partition(Some(NO_INCARNATION)),
+            )
+            .await;
+
+        let stores = f.cluster.received(STORE_CONSUMER_OFFSET_CODE);
+        assert_eq!(
+            stores.iter().map(stamped_context).collect::<Vec<_>>(),
+            [FILLED]
+        );
+        assert_eq!(
+            f.cluster.count(GET_PARTITION_ROUTE_CODE),
+            usize::from(REPLICAS) + 1,
+            "each replica answered without an incarnation once"
+        );
+        assert!(stored.is_ok(), "{stored:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -5245,6 +5625,28 @@ mod tests {
             );
             assert_eq!(f.cluster.count(code), 0, "{code}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_no_link_to_the_primary_when_its_link_comes_back_should_send_at_once() {
+        let f = Fixture::new().await;
+        let primary = endpoint(PRIMARY);
+        f.cluster.down.lock().unwrap().insert(primary.clone());
+        f.cluster.drop_connections(&primary);
+        eventually("the link to the primary is gone", || {
+            !f.driver.links.ready_replicas().contains(&PRIMARY)
+        })
+        .await;
+        f.cluster.down.lock().unwrap().clear();
+
+        f.send_messages().await.unwrap();
+
+        let redial = *f.cluster.dials_to(&primary).last().unwrap();
+        assert_eq!(
+            Instant::now(),
+            redial,
+            "the send goes out once its link is ready"
+        );
     }
 
     #[tokio::test(start_paused = true)]

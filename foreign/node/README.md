@@ -66,12 +66,21 @@ Each node answers non-replicated commands such as `GetStats` from its own state,
 Partition commands carry a context containing the partition incarnation, owner
 generation and metadata operation. Pass the context of an earlier poll reply to
 keep an offset write or continuation tied to that history. Otherwise the client
-captures the route context. Non-admission retries and uncertain-operation replay
+captures the route context. A poll, offset write or offset read with a context
+that is all zero also captures the route context. If its context names
+incarnation 0, the client fills in the incarnation of the route once. It keeps
+the owner generation and metadata operation of that context. A route of
+incarnation 0 is not ready. The client looks up such a route again until the
+request deadline. Then the call fails with error code 58. A fetch keeps a zero
+context in its header. Each fetch target follows the same rules for its own
+partition, but a target carries no metadata operation.
+Non-admission retries and uncertain-operation replay
 preserve the first captured context, request identity and payload. Route refreshes
 change the destination. Lifecycle error 88 retries with a fresh ID and the same
-context. A send without caller-supplied context can refresh history once after
-error 87. Explicit contexts return that error. A new call can capture newer
-metadata progress.
+context. A send without caller-supplied context, or with one that is all zero,
+captures the route context and can refresh history once after error 87. Other
+explicit contexts return that error. A new call can capture newer metadata
+progress.
 
 Route discovery uses command 105. Sends, polls and offset reads/writes use the
 partition primary. Other commands use the metadata primary. One logical client
@@ -233,9 +242,11 @@ const next = await client.message.poll({
 batches and keeps the position of each. It reads the partitions of one primary
 in one request, finds a moved primary by itself and gives each partition its
 turn. A partition whose last read ended before the end of the partition is read
-in a fetch of its own while the read ahead has room for another full read, up to
-16 reads in flight, so a backlog of many partitions is read as fast as one poll
-of each partition would read it. Under `CommitPolicy.OnRead` the reader starts
+in a fetch of its own while the read ahead has room for another full read, so a
+backlog of many partitions is read as fast as one poll of each partition would
+read it. At most 32 reads of one reader run at once, fetches and polls alike.
+The fetches of each primary go first, and the polls of single partitions leave
+a request for each primary. Under `CommitPolicy.OnRead` the reader starts
 those fetches only while `next()` waits, and each partition is in one committing
 read at a time.
 
@@ -264,47 +275,133 @@ try {
 
 - A consumer group reads the assignment of its member:
   `{ consumer: Consumer.Group('g') }` without `partitions` joins the group,
-  follows rebalances and leaves the group in `close()`.
+  follows rebalances and leaves the group in `close()`. The reader releases a
+  join with an unknown outcome in the client at once and joins again after
+  the retry interval. `close()` releases a leave with an unknown outcome the
+  same way. So neither blocks a later metadata write of the client. When the
+  join of `open()` has an unknown outcome, `open()` releases it in the client
+  and fails with it, so a later `open()` can join. A join that landed anyway
+  keeps its member in the group until the session ends.
 - `next()` returns one batch of one partition, never empty. A `ReadError`
   names the partition of an error, or none for an error of the whole reader,
   and the reader retries by itself. Error 87 stops a partition until `seek`
-  when its position came from an earlier read, and so do error 80, error 96
-  (the object store refuses a read of tiered data for good, so the reader
-  never sends it again) and a refusal that six retries did not change. The
-  error of each stop sets
+  when its position is tied to the history of an earlier read, and so do error
+  80, error 96 (the object store refuses a read of tiered data for good, so
+  the reader never sends it again) and a refusal other than 5009 that six
+  retries did not change. A context
+  that is all zero ties a position to no history. The error of each stop sets
   `stopsPartition`, and that of an 87 or a refusal stop also sets `resumable`:
-  a `seek` to Next reads the partition again after its stored offset.
+  a `seek` to Next reads the partition again after its stored offset. When
+  `close()` starts, a `next()` that waits fails at once because the reader is
+  closed.
 - For a message that does not decode, `ReadError` carries `skip`, `offset` and
   `record`, the record as the reply carried it: its 48-byte frame header,
   payload and user headers, so the message can be kept or inspected. When the
   framing of the reply is malformed, `offset` is undefined and `record` holds
   the remaining reply bytes from where decoding stopped.
-- With `CommitPolicy.Manual`, `commit` stores a checkpoint. With
+- With `CommitPolicy.Manual`, `commit` stores a checkpoint. When its store has
+  an unknown outcome, `commit` fails. The reader releases that request in the
+  client, so a retry of `commit` can store. With
   `CommitPolicy.OnRead` the server stores the offset of each read, the reader
   reads only while `next()` waits, and `close()` moves the offset back to the
-  last batch that the application took. A read whose reply was lost is
+  last batch that the application took. When the application took none,
+  `close()` moves the offset before the first batch that the reader held. At
+  offset 0, if the server holds an offset, `close()` deletes it. When a store
+  or delete of `close()` has an unknown outcome, `close()` fails. It first
+  releases that request in the client, so the request does not block a later
+  reader.
+  A read whose reply was lost is
   repaired: the next read finds what it stored, and the reader reads those
-  messages again by offset without a commit. Only a lost read makes the reader
-  read skipped offsets again: when the stored offset moved ahead because the
+  messages again by offset without a commit. If the partition no longer holds
+  a part of that range, for example after retention, `next()` fails once with
+  error 14010. Its `ReadError` names that part, also as `lost`, the first and
+  last offset, and the reader reads on after it. Only a lost read makes the
+  reader read skipped offsets again: when the stored offset moved ahead because the
   application or another session stored it, the reader delivers from there. A
   batch that the server stored is handed over even when its partition left the
-  assignment of the member. A `seek` to an offset above 0 first stores the
-  offset before it, so a restart resumes at the sought offset, and a refused
-  store fails the seek and moves nothing. Every other `seek` stores nothing.
-- A refusal 5009 of a group partition drops its position, so the next read
-  starts again from `start` under the new owner of the partition. A 5009 that
-  six retries did not change is reported and stops the partition until `seek`.
+  assignment of the member. If a lost read of that partition stored a range
+  that the reader did not read again, `next()` first fails with error 14010.
+  Its `ReadError` names that range, also as `lost`. `close()` does not move
+  the offset of a partition that left, so the group loses its batches that
+  `next()` did not return. A `seek` first waits for each committing read of
+  its partition in flight, also one from before a new assignment. A `seek` to
+  an offset above 0 then stores the offset before it,
+  so a restart resumes at the sought offset. If the server holds an offset, a
+  `seek` to offset 0 or First deletes it instead, because the commit of a read
+  never moves an offset back. A `seek` to a timestamp first reads the first
+  message at that time without a commit. Then it seeks to the offset of that
+  message. No read of the partition starts until the `seek` ends. A second
+  `seek` of the partition and `close()` wait for it. A refused read, store,
+  lookup or delete fails the seek and moves nothing: the partition keeps its
+  queued batches and reads on from where it was. A store or delete whose
+  outcome is unknown fails the seek too. The reader then handles it as a lost
+  read: it reads skipped messages again, and `close()` moves the offset back.
+  Before its write, a `seek` from a position without an offset looks up the
+  stored offset. A Next start before the first read, a timestamp and Last are
+  such positions. So is a start that applies because the server held no
+  offset. A `seek` of a partition that delivered no message looks it up too.
+  After a write with an unknown outcome, a Next position reads on from
+  that offset. Until a later read returns messages, `close()` restores that
+  offset, or deletes the stored offset when the server held none. If an
+  earlier read stored messages that nobody took, `close()` moves the offset
+  back before that read instead. Every other `seek` stores and deletes nothing. A `seek` after `close()`
+  fails.
+- `start` sets where a partition without a position starts, Next by default.
+  With `CommitPolicy.OnRead` it applies only to a partition without a stored
+  offset. A partition with one resumes after it, also after a new assignment.
+  A Last start reads the last `count` messages. With `CommitPolicy.OnRead`, a
+  read that stores nothing first finds the offset of a timestamp or Last
+  position. Then `close()` can move the offset back before it.
+- A refusal 5009 is not a leave. After a 5009 on a read of a group partition,
+  the partition keeps its position, its queued batches and what `close()`
+  needs to move its offset back. It reads again without an owner, and the
+  reader asks for a refresh of the assignment. Only a leave that a refresh
+  shows drops that state. So a 5009 never stops the partition. When the
+  server serves the partition again, a catch-up after a lost read goes on. The
+  wait before the next read starts at the retry interval and doubles after
+  each 5009 in a row. Each sixth 5009 in a row gives one `ReadError`, and then
+  the count and the wait start again. A read that succeeds, a `seek` or a
+  session change also starts them again.
+- If an offset store or delete of a partition that is still assigned gets 5009,
+  a read without a commit finds the installed owner. Then the write goes once
+  more under that owner. A transient refusal of that read repeats it after the
+  retry interval. If that read stops, the write fails with its refusal. The
+  read for a write of `close({ signal })` stops 10 s after the close starts.
+  If `signal` of the first call aborts earlier, the read stops at that abort.
+  Each later write of the close then goes once without that read, and the
+  close still leaves the group. During an outage `close()` can take about one
+  30 s operation budget of the client for each partition with a pending
+  store. A second `close()` call waits for the first one, and its signal does
+  not stop the close. The read for
+  `commit(checkpoint, { signal })` stops after `signal` aborts or `close()`
+  starts. The read for a seek or an automatic store stops after `close()`
+  starts. After such a stop, a reply to that read does not send the write
+  again. The reader logs a failed automatic store with the `iggy:client`
+  debug logger.
 - With `CommitPolicy.Auto({ interval, every, after })` the reader counts each
   batch when `next()` returns it (`CommitAfter.Delivery`), at the next `next()`
   or `close()` (`CommitAfter.Processing`), or on `mark` (`CommitAfter.Marked`),
   and stores the latest counted position at the interval, on the event
   (`CommitEvery.Message`, `CommitEvery.Messages(n)` or `CommitEvery.Batch`),
   and in `close()`. `DEFAULT_AUTO_COMMIT` stores every 10,000 messages or 5 s
-  after processing.
-- The reader reads ahead up to 16 MiB and 16,000 messages (`prefetchBytes`,
-  `prefetchMessages`). Without options a read waits up to 5 s. After a refused
-  read, a lost read or a failed refresh it waits `retryInterval`, 1 s by
-  default.
+  after processing. When a store has an unknown outcome, the reader releases
+  it in the client. Then it does not block the next store of the partition.
+  The reader stores again at the next interval, event or `close()`.
+- Requested read-ahead budgets default to 16 MiB and 16,000 messages
+  (`prefetchBytes`, `prefetchMessages`). Each effective budget holds at least
+  32 full batches, and larger configured budgets still apply. A budget that is
+  NaN, infinite or negative is refused with error 3 before anything is sent.
+  Without options a read waits up to 5 s. After a refused read, a lost read or
+  a failed refresh it waits `retryInterval`, 1 s by default. While a refresh
+  of the group assignment fails or gets no answer, the reader reads on under
+  its last assignment. After a new session or a lost membership, it starts no
+  read until a refresh confirmed the assignment. A `retryInterval` that is not
+  a finite number above 0 is refused with error 3 too.
+- With `CommitPolicy.OnRead` the server stores the offset of each read before
+  the application takes its batch. A crash, or a reader that stops without
+  `close()`, loses the batches that the reader held: up to the effective
+  budget, which holds at least 32 batches. `CommitPolicy.Auto` or
+  `CommitPolicy.Manual` stores offsets after delivery instead.
 
 ### Consumers
 
@@ -325,7 +422,9 @@ await consumer.shutdown();
 ```
 
 - `client.consumerGroup` creates the group when it is missing and joins it.
-  `client.consumer` reads the given `partitions` under the consumer `name`.
+  When that create has an unknown outcome, the call releases it in the client
+  and fails with it. `client.consumer` reads the given `partitions` under the
+  consumer `name`.
 - Under `CommitAfter.Processing` a message counts once the iterator is read
   again or its handler returns. A handler that throws ends `consume` with its
   error and leaves its message uncounted, and so does a shutdown while the
@@ -333,13 +432,20 @@ await consumer.shutdown();
   moves back the offsets and leaves the group. A later `shutdown()` waits for
   the first and ends as it does. `seek` drops the rest of the batch of its
   partition.
+- `commit(checkpoint, { signal })` and `shutdown({ signal })` give `signal` to
+  `commit()` and `close()` of the reader. If a store gets 5009, the read for
+  the owner stops as for the reader: 10 s after the shutdown starts, or at an
+  earlier abort of `signal`. Only the signal of the first `shutdown()` call
+  can stop the shutdown.
 - A read error that the reader retries by itself goes to `onError` and the
   consumer goes on. A stop of a partition (`stopsPartition`) ends the
   iteration with its `ReadError`, and so does a message that does not decode,
   whose `skip` passes it with `seek`. A `resumable` stop reads again after a
   `seek` to Next. A stop while a committing read that lost its reply is still
   pending reports that read as 14010 instead, since a seek to Next would skip
-  what it stored.
+  what it stored. A lost range (`lost`, error 14010) ends the iteration with
+  its `ReadError` too. The reader reads on after that range, so a new
+  iteration hands over the messages after it.
 - `toReadable()` takes the next message only when its own reader asks for it,
   and destroying it shuts the consumer down.
 

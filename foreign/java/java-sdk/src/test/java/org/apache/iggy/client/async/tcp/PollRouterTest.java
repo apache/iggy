@@ -59,6 +59,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -122,6 +123,7 @@ class PollRouterTest {
     private static final Duration QUEUED_DIAL_BUDGET = Duration.ofMillis(200);
     // Shorter than the retry interval of the router, so a failed attempt is the last one.
     private static final Duration LAST_RETRY_WINDOW = Duration.ofMillis(40);
+    private static final Duration DEFERRED_RETRY_BUDGET = DeferredPollOptions.REPLY_MARGIN.multipliedBy(2);
     private static final long LANE_FRAME_BYTES = 1;
     // The lane of partition 0, which sendMessage writes to.
     private static final ConsensusSession.LaneKey PARTITION_LANE = new ConsensusSession.LaneKey(INCARNATION, 0);
@@ -775,9 +777,101 @@ class PollRouterTest {
         }
     }
 
+    /**
+     * The owner probe of a reader is a deferred poll, and it retries only a transient refusal. So the router retries a
+     * NOT_PRIMARY of such a poll, and the deadline ends that retry as not accepted.
+     */
+    @Test
+    void shouldRetryANotPrimaryDeferredPollAndEndItAsNotAcceptedAtItsDeadline() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            primary.replies.add(CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(AsyncTcpConnection.NOT_PRIMARY, new byte[0])));
+            int deadlineIndex = timers.scheduled.size();
+            var poll = routedPoll(router, pollPayload(), true);
+            await(() -> timers.scheduled.size() == deadlineIndex + 2, "retry of NOT_PRIMARY", TIMEOUT);
+            assertThat(poll).isNotDone();
+            timers.scheduled.get(deadlineIndex).run();
+            assertServerError(poll, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void shouldReleaseThePayloadOfARoutedPollRetriedAfterARefusal(boolean deferred) throws Exception {
+    @CsvSource({"true, false", "true, true", "false, false", "false, true"})
+    void shouldStopRetryingARefusedDeferredRequestWhenOnlyTheReplyMarginRemains(
+            boolean fetch, boolean refusalAfterMargin) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            CompletableFuture<ByteBuf> refused = new CompletableFuture<>();
+            primary.replies.add(refused);
+            IggyServerException capacity = IggyServerException.fromTcpResponse(
+                    IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode(), new byte[0]);
+            ByteBuf payload = tracked(
+                    fetch
+                            ? Unpooled.wrappedBuffer(HexFormat.of().parseHex(FetchMessagesTest.GOLDEN_REQUEST))
+                            : pollPayload());
+            if (!fetch) {
+                PollRouter.writeDeferredOptions(payload, DeferredPollOptions.defaults());
+            }
+            byte[] topic = PollRouter.takeBytes(Unpooled.wrappedBuffer(
+                    BytesSerializer.toBytes(StreamId.of(1L)), BytesSerializer.toBytes(TopicId.of("orders"))));
+            long deadline = System.nanoTime() + DEFERRED_RETRY_BUDGET.toNanos();
+            var result = fetch
+                    ? router.fetchRequest(payload, topic, 1, deadline, router.startCall())
+                    : router.partitionRequest(
+                            CommandCode.Messages.POLL_DEFERRED.getValue(), payload, Optional.empty(), deadline);
+            assertThat(timers.delaysMillis.get(0))
+                    .as("an in-flight request retains the full response deadline")
+                    .isGreaterThan(DeferredPollOptions.REPLY_MARGIN.toMillis());
+            assertThat(primary.sentContexts).hasSize(1);
+            if (!refusalAfterMargin) {
+                refused.completeExceptionally(capacity);
+            }
+            await(
+                    () -> deadline - System.nanoTime() < DeferredPollOptions.REPLY_MARGIN.toNanos(),
+                    "retry budget below the reply margin",
+                    TIMEOUT);
+            assertThat(deadline - System.nanoTime())
+                    .as("time left for the reply")
+                    .isPositive();
+
+            if (refusalAfterMargin) {
+                refused.completeExceptionally(capacity);
+            } else {
+                timers.runLast();
+            }
+
+            assertThat(primary.sentContexts).hasSize(1);
+            assertThat(result).isDone();
+            assertServerError(result, capacity.getRawErrorCode());
+            assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, TRANSIENT_NOT_ACCEPTED", "true, TRANSIENT_NOT_ACCEPTED", "true, DEFERRED_POLL_CAPACITY_EXCEEDED"
+    })
+    void shouldReleaseThePayloadOfARoutedPollRetriedAfterARefusal(boolean deferred, IggyErrorCode refusal)
+            throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         ManualTimers timers = new ManualTimers();
         Coordinator coordinator = new Coordinator(group, timers);
@@ -789,7 +883,7 @@ class PollRouterTest {
                     .release();
             ByteBuf reply = tracked(emptyPoll(0));
             primary.replies.add(CompletableFuture.failedFuture(
-                    IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])));
+                    IggyServerException.fromTcpResponse(refusal.getCode(), new byte[0])));
             primary.replies.add(CompletableFuture.completedFuture(reply));
             ByteBuf payload = tracked(pollPayload());
             var polled = routedPoll(router, payload, deferred);
@@ -800,56 +894,10 @@ class PollRouterTest {
             assertThat(polled.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)).isSameAs(reply);
             reply.release();
             assertThat(primary.sentContexts).hasSize(3);
+            if (refusal == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED) {
+                assertThat(coordinator.routes).isEqualTo(1);
+            }
             assertThat(payload.refCnt()).isZero();
-        } finally {
-            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
-            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
-        }
-    }
-
-    /**
-     * A pause is a random time up to its ceiling. The ceiling of the later pauses of a call is the maximum, so one of
-     * them is longer than the first ceiling unless every draw falls in its lowest twentieth.
-     */
-    @Test
-    void shouldGrowThePauseAfterEachNotAcceptedReplyUpToTheMaximumAndStartOverInTheNextCall() throws Exception {
-        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
-        ManualTimers timers = new ManualTimers();
-        Coordinator coordinator = new Coordinator(group, timers);
-        Primary primary = new Primary(group);
-        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
-        try {
-            router.poll(pollPayload(), Optional.empty())
-                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
-                    .release();
-            int refusals = 20;
-            for (int refusal = 0; refusal < refusals; refusal++) {
-                primary.replies.add(CompletableFuture.failedFuture(
-                        IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])));
-            }
-            primary.replies.add(CompletableFuture.completedFuture(emptyPoll(0)));
-            var refused = router.poll(pollPayload(), Optional.empty());
-            List<Long> pauses = new ArrayList<>();
-            for (int refusal = 0; refusal < refusals; refusal++) {
-                pauses.add(timers.delaysMillis.get(timers.delaysMillis.size() - 1));
-                timers.runLast();
-            }
-            refused.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
-            for (int refusal = 0; refusal < refusals; refusal++) {
-                assertThat(pauses.get(refusal))
-                        .isBetween(0L, Math.min(RetryBackoff.MAX_MILLIS, RetryBackoff.BASE_MILLIS << refusal));
-            }
-            assertThat(pauses).anyMatch(pause -> pause > RetryBackoff.BASE_MILLIS);
-
-            primary.replies.add(CompletableFuture.failedFuture(
-                    IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])));
-            primary.replies.add(CompletableFuture.completedFuture(emptyPoll(0)));
-            var next = router.poll(pollPayload(), Optional.empty());
-            assertThat(timers.delaysMillis.get(timers.delaysMillis.size() - 1)).isBetween(0L, RetryBackoff.BASE_MILLIS);
-            timers.runLast();
-            next.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).release();
-            assertThat(primary.sentContexts).hasSize(1 + refusals + 1 + 2);
         } finally {
             router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);

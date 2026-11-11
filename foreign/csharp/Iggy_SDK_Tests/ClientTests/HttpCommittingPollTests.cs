@@ -106,6 +106,27 @@ public sealed class HttpCommittingPollTests
             recovery.AbandonOperationAsync(uncertain.OperationId.Value));
     }
 
+    /// <summary>
+    ///     Incarnation 0 names no partition, so the block of a committing poll under a fully zero context holds the
+    ///     same partition id of another topic no more than a block without a context does.
+    /// </summary>
+    [Fact]
+    public async Task given_a_committing_poll_of_a_fully_zero_context_with_an_unknown_outcome_when_polling_another_topic_should_go_on()
+    {
+        var server = new RoutedHandler(TimedOut);
+        var client = Client(server);
+        var token = TestContext.Current.CancellationToken;
+        var zero = PollingStrategy.Next().WithContext(default);
+
+        await Assert.ThrowsAsync<VsrFetchProgressUncertainException>(() =>
+            client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(1), zero, 10, true, token));
+        var otherTopic = await client.PollMessagesAsync(Stream, Identifier.Numeric(3), 1, Consumer.New(1), zero, 10,
+            true, token);
+
+        Assert.Single(otherTopic.Messages);
+        Assert.Equal(2, server.Polls);
+    }
+
     [Fact]
     public async Task given_a_poll_without_auto_commit_when_the_server_times_out_should_send_it_again()
     {

@@ -411,8 +411,10 @@ namespace Iggy {
          * offset, PollingStrategy::next() when null, and a continuation is refused. `options`
          * defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
          * 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
-         * `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
-         * flight and the queued batches.
+         * `prefetch_messages`, 16000 when null, set the requested budgets for requests in flight and
+         * queued batches. Each effective budget holds at least 32 full batches so primary groups can
+         * wait independently: 32 MiB and 32000 messages with the default options. Larger budgets
+         * allow more queued batches.
          *
          * @param mixed $stream
          * @param mixed $topic
@@ -670,6 +672,7 @@ namespace Iggy {
          * recreated partition fails with HistoryUnavailable (87), and one from a previous owner
          * fails with ConsumerGroupPartitionNotOwned (5009). A checkpoint that this consumer did not
          * deliver, and every commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+         * The call ends at a deadline 10 s after its start, as PartitionReader::commit() does.
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
@@ -718,6 +721,7 @@ namespace Iggy {
          * The delete uses the context of its route. It can fail once with HistoryUnavailable
          * (87), or ConsumerGroupPartitionNotOwned (5009), after another client deleted and
          * recreated the partition. The failed route is dropped, and the next call routes again.
+         * The call ends at a deadline 10 s after its start, as commit() does.
          *
          * @param int|null $partition_id
          * @return void
@@ -786,8 +790,11 @@ namespace Iggy {
         /**
          * Sets the next read position of a partition and drops the rest of its current batch. Under
          * CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before it, so
-         * a restart resumes at the new position, and a failed store fails the seek with its
-         * exception and moves nothing. Every other seek stores nothing.
+         * a restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+         * deletes the stored offset, and a seek to a timestamp stores the offset before the first
+         * message at the timestamp, if there is one. A failed read, lookup, store or delete fails
+         * the seek with its exception and moves nothing. Every other seek stores nothing. The call
+         * ends at a deadline 10 s after its start, as commit() does.
          *
          * It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
          * after a message that does not decode: seek to the `skip` of its ReadException. A
@@ -834,6 +841,8 @@ namespace Iggy {
          * and can fail once with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned
          * (5009), after another client deleted and recreated the partition. The failed route is
          * dropped, and the next call routes again.
+         *
+         * The call ends at a deadline 10 s after its start, as commit() does.
          *
          * @param int $offset
          * @param int|null $partition_id
@@ -2157,7 +2166,9 @@ namespace Iggy {
      * budget (one fetch per primary that may wait for messages, the partitions with messages left
      * behind spread over the other slots), a seek() to an offset stores the offset before it, and
      * close() moves the offset back to the last delivered message. Destroying the reader without
-     * close() stops it without waiting, moves no offset back and does not leave the group.
+     * close() stops it without waiting, moves no offset back and does not leave the group. Under
+     * onRead(), such a reader or a crash loses the batches that the server stored before the
+     * application took them, up to the effective budget, which holds at least 32 batches.
      */
     class PartitionReader {
         public function __construct() {}
@@ -2184,6 +2195,10 @@ namespace Iggy {
          * A checkpoint of an older generation of its partition, or at or below the last commit of
          * its generation, stores nothing. A checkpoint that this reader did not deliver, and every
          * commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+         *
+         * PHP cannot cancel the call, so it ends at a deadline 10 s after its start: after a
+         * refusal for an earlier owner (5009), the read of the new owner retries only until then,
+         * and the call throws the refusal.
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
@@ -2232,9 +2247,14 @@ namespace Iggy {
          *
          * Under CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before
          * it, under the history of a continuation or else of the last delivered message, so a
-         * restart resumes at the new position. A failed store fails the seek with its exception and
-         * nothing moves. Every other seek stores nothing. The new position waits for the end of the
-         * committing read in flight, whose reply the new generation drops.
+         * restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+         * deletes the stored offset under the same history when the server holds one, because the
+         * commit of a read never moves the offset back. A seek to a timestamp first reads one
+         * message at the timestamp without a commit, and then acts as a seek to the offset of that
+         * message. Without such a message it stores nothing. A failed read, lookup, store or delete
+         * fails the seek with its exception and nothing moves. Every other seek stores nothing. The
+         * new position waits for the end of the committing read in flight, whose reply the new
+         * generation drops. The call ends at a deadline 10 s after its start, as commit() does.
          *
          * A partition that the reader does not read, and a continuation of another partition,
          * fail with InvalidCommand (3). Under CommitPolicy::onRead(), a read with an unknown
@@ -2766,6 +2786,15 @@ namespace Iggy\Exception {
         public readonly bool $is_lasting_refusal;
 
         /**
+         * For messages that a lost read committed and that the reader could not read again: their
+         * first and last offset, as [first, last]. The code is then FetchProgressUncertain
+         * (14010). Null for every other error.
+         *
+         * @var array|null
+         */
+        public readonly ?array $lost;
+
+        /**
          * The partition of the error, or null for an error of the whole reader.
          *
          * @var int|null
@@ -2774,7 +2803,8 @@ namespace Iggy\Exception {
 
         /**
          * For a message that does not decode: the continuation after it. The reader reads the
-         * message again until a seek of its partition to this continuation skips it.
+         * message again until a seek of its partition to this continuation skips it. For a lost
+         * range: the continuation after the last offset of `lost`. Null for every other error.
          *
          * @var \Iggy\PollingStrategy|null
          */

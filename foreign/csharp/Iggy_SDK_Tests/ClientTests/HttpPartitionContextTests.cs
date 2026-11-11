@@ -107,6 +107,35 @@ public sealed class HttpPartitionContextTests
     }
 
     [Fact]
+    public async Task given_a_fully_zero_caller_context_when_polling_should_send_none()
+    {
+        var handler = new TopicHandler(Original);
+        var client = Client(handler);
+
+        await client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), PartitionId, Consumer.New(1),
+            PollingStrategy.Next().WithContext(default), 10, false, TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain("&context=", handler.PollQuery);
+    }
+
+    /// <summary>
+    ///     HTTP has no route to take an incarnation from, and a drop would remove the owner fence, so the server gets
+    ///     the context and refuses it with status 87.
+    /// </summary>
+    [Fact]
+    public async Task given_a_caller_context_of_incarnation_0_with_an_owner_when_polling_should_send_it_as_it_is()
+    {
+        var handler = new TopicHandler(Original);
+        var client = Client(handler);
+        var context = new PartitionContext(0, 9, 100);
+
+        await client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), PartitionId, Consumer.New(1),
+            PollingStrategy.Next().WithContext(context), 10, false, TestContext.Current.CancellationToken);
+
+        Assert.Contains($"&context={Uri.EscapeDataString(ContextJson(context))}", handler.PollQuery);
+    }
+
+    [Fact]
     public async Task given_a_strategy_per_partition_when_polling_a_partition_should_poll_with_its_strategy()
     {
         var handler = new TopicHandler(Original);
