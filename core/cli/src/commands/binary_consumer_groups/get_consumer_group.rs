@@ -180,12 +180,9 @@ impl CliCommand for GetConsumerGroupCmd {
                     )
                 }
                 Ok(None) => {
-                    // The head is the last message offset, one short of the unread count.
-                    (
-                        format!("{}", partition.current_offset),
-                        "-".to_string(),
-                        format!("{}", partition.messages_count),
-                    )
+                    // The empty reply drops the primary head. Local topic
+                    // counters stay 0 until a report, so they are not the lag.
+                    ("-".to_owned(), "-".to_owned(), "-".to_owned())
                 }
                 Err(error) => {
                     if offset_error.is_none() {
@@ -1035,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn should_use_the_message_count_as_lag_when_no_offset_is_stored() {
+    async fn should_print_dashes_when_no_offset_is_stored() {
         let mut partition = partition(0);
         partition.current_offset = 9;
         partition.messages_count = 10;
@@ -1050,8 +1047,12 @@ mod tests {
         .await;
 
         assert!(
-            output.contains("9              | -             | 10"),
-            "{output}"
+            output.contains("-              | -             | -"),
+            "local topic counters are not the lag, got {output}"
+        );
+        assert!(
+            !output.contains('9') && !output.contains("10"),
+            "local topic counters are not the lag, got {output}"
         );
     }
 
