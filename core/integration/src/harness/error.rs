@@ -63,10 +63,10 @@ pub enum TestBinaryError {
     },
     MissingServer,
     MissingMcp,
-    MissingConnectorsRuntime,
     NotStarted,
     AlreadyStarted,
     SeedFailed(String),
+    /// Only the fixtures in apache/iggy-connectors return this.
     FixtureSetup {
         fixture_type: String,
         message: String,
@@ -149,9 +149,6 @@ impl std::fmt::Display for TestBinaryError {
             }
             TestBinaryError::MissingMcp => {
                 write!(f, "MCP server not configured in harness")
-            }
-            TestBinaryError::MissingConnectorsRuntime => {
-                write!(f, "Connectors runtime not configured in harness")
             }
             TestBinaryError::NotStarted => {
                 write!(f, "Harness not started")

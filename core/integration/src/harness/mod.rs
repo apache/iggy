@@ -48,6 +48,7 @@ pub mod ext_auth_server;
 mod fixture;
 pub mod handle;
 mod helpers;
+pub mod log_capture;
 mod orchestrator;
 mod peer_relay;
 mod port_reserver;
