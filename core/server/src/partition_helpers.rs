@@ -754,6 +754,9 @@ async fn load_partition(
     };
     let segment_checkpoint = recovered_persistence.0.segment_checkpoint();
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
     partition.set_runtime_options(runtime_options);
     // The chain file comes with the partition of a tiered topic, and a chain
     // that a crash left short of a record is completed here.
@@ -1142,6 +1145,9 @@ pub async fn build_partition_fresh(
     );
 
     let mut partition = IggyPartition::new(stats, consensus);
+    partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
     partition
         .consensus()
         .set_recovery_election_allowed(first_initialization && !lost_with_storage);
