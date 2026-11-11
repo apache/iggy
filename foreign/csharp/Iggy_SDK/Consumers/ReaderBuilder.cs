@@ -70,7 +70,10 @@ public sealed class ReaderBuilder
 
     /// <summary>
     ///     Where a partition without a position starts. <see cref="PollingStrategy.Next" /> by default, the stored
-    ///     offset of the consumer.
+    ///     offset of the consumer. With <see cref="CommitPolicy.OnRead" />, the start applies only to a partition
+    ///     without a stored offset. A partition with one resumes after it. A timestamp or Last start then first finds
+    ///     its first message with a read that stores nothing. The reader reads on from that offset. A Last start
+    ///     delivers the last <see cref="PollOptions.Count" /> messages under every commit policy.
     /// </summary>
     public ReaderBuilder WithStart(PollingStrategy start)
     {
@@ -89,8 +92,13 @@ public sealed class ReaderBuilder
     }
 
     /// <summary>
-    ///     The most bytes and messages that the reader holds read ahead of the application, 16 MiB and 16,000 by
-    ///     default. With <see cref="CommitPolicy.OnRead" /> the reader reads only when the application waits.
+    ///     The requested byte and message budgets, 16 MiB and 16,000 by default. Each effective budget holds at
+    ///     least 32 full batches so primary groups can wait independently. Larger budgets allow more queued batches.
+    ///     With <see cref="CommitPolicy.OnRead" /> the reader reads only when the application waits, and the server
+    ///     stores the offset of each read before the application takes its batch. A crash, or a reader that stops
+    ///     without <see cref="PartitionReader.CloseAsync(CancellationToken)" />, loses the batches that the reader
+    ///     held: up to the effective budget, which holds at least 32 batches. <see cref="CommitPolicy.Auto" /> or
+    ///     <see cref="CommitPolicy.Manual" /> stores offsets after delivery instead.
     /// </summary>
     public ReaderBuilder WithPrefetch(uint bytes, uint messages)
     {
@@ -131,6 +139,10 @@ public sealed class ReaderBuilder
     ///     join.
     /// </exception>
     /// <exception cref="FeatureUnavailableException">A consumer group on a transport without its assignment, such as HTTP.</exception>
+    /// <exception cref="VsrRequestOutcomeUnknownException">
+    ///     The join has an unknown outcome. The reader abandons it in the client first, so the next build can join. A
+    ///     join that landed keeps the member in the group until the session ends.
+    /// </exception>
     public async Task<PartitionReader> BuildAsync(CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(_options);
@@ -165,19 +177,21 @@ public sealed class ReaderBuilder
             throw new FeatureUnavailableException();
         }
 
+        var logger = _loggerFactory.CreateLogger<PartitionReader>();
         if (group)
         {
-            await _client.JoinConsumerGroupAsync(_streamId, _topicId, _consumer.ConsumerId, token);
+            await PartitionReader.JoinGroupAsync(_client, logger, _streamId, _topicId, _consumer.ConsumerId, token);
         }
 
+        // With a commit on read a start applies only without a stored offset, where the server answers Next from 0.
+        var first = _options.Commit.Mode == CommitMode.OnRead ? PollingStrategy.Next() : PollingStrategy.Offset(0);
         var settings = new ReaderSettings(_streamId, _topicId, _consumer, _partitions,
-            _start.Kind == MessagePolling.First ? PollingStrategy.Offset(0) : _start, _options, _prefetchBytes,
+            _start.Kind == MessagePolling.First ? first : _start, _options, _prefetchBytes,
             _prefetchMessages, _retryInterval)
         {
             CountsMessages = _countsMessages
         };
-        return new PartitionReader(_client, group ? assignment : null, settings,
-            _loggerFactory.CreateLogger<PartitionReader>());
+        return new PartitionReader(_client, group ? assignment : null, settings, logger);
     }
 }
 

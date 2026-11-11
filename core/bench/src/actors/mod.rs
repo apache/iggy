@@ -20,6 +20,8 @@ use std::time::Duration;
 use iggy::prelude::IggyError;
 
 pub mod consumer;
+#[cfg(test)]
+pub mod fakes;
 pub mod producer;
 pub mod producing_consumer;
 
