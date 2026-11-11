@@ -68,6 +68,7 @@ message_bus = { workspace = true }
 papaya = { workspace = true }
 server_common = { workspace = true }
 smallvec = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

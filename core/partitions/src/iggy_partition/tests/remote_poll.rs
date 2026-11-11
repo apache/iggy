@@ -37,7 +37,7 @@ const SEALED: [u64; 2] = [0, 2];
 
 const ROOT: &str = "iggy";
 
-fn layout() -> KeyLayout {
+pub(super) fn layout() -> KeyLayout {
     KeyLayout::new(ROOT).unwrap()
 }
 
@@ -109,7 +109,9 @@ async fn polled(
     accepted(partition, result)
 }
 
-async fn polled_all(partition: &mut IggyPartition<IggyMessageBus>) -> Vec<(Option<u64>, Vec<u8>)> {
+pub(super) async fn polled_all(
+    partition: &mut IggyPartition<IggyMessageBus>,
+) -> Vec<(Option<u64>, Vec<u8>)> {
     let mut polls = Vec::new();
     for strategy in strategies() {
         polls.push(Box::pin(polled(partition, strategy)).await);
@@ -144,7 +146,10 @@ async fn uploaded_partition() -> (
     (directory, partition, store, local)
 }
 
-fn attach(partition: &mut IggyPartition<IggyMessageBus>, objects: Rc<dyn RemoteObjects>) {
+pub(super) fn attach(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    objects: Rc<dyn RemoteObjects>,
+) {
     partition.set_remote_segments(Rc::new(RemoteSegments::new(objects, layout())));
 }
 

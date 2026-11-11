@@ -238,14 +238,14 @@ impl RemoteSegments {
 
 /// Checks index entries as they arrive: offsets and positions never step
 /// back, no offset is before the segment and no position is past its bytes.
-struct IndexCheck {
+pub struct IndexCheck {
     segment_size: u64,
     last_offset: u64,
     last_position: u64,
 }
 
 impl IndexCheck {
-    const fn new(start_offset: u64, segment_size: u64) -> Self {
+    pub(crate) const fn new(start_offset: u64, segment_size: u64) -> Self {
         Self {
             segment_size,
             last_offset: start_offset,
@@ -253,7 +253,7 @@ impl IndexCheck {
         }
     }
 
-    fn accept(&mut self, entries: &[u8]) -> bool {
+    pub(crate) fn accept(&mut self, entries: &[u8]) -> bool {
         let (entries, rest) = entries.as_chunks::<IGGY_INDEX_SIZE>();
         if !rest.is_empty() {
             return false;

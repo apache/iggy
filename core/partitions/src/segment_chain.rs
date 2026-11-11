@@ -566,13 +566,13 @@ pub async fn hash_segment_file(log_path: &str, size: u64) -> io::Result<SegmentH
 
 /// Takes both hashes in one pass over a segment's bytes.
 #[derive(Clone, Default)]
-struct SegmentHasher {
+pub(crate) struct SegmentHasher {
     blake3: blake3::Hasher,
     crc32c: u32,
 }
 
 impl SegmentHasher {
-    fn finalize(&self) -> SegmentHashes {
+    pub(crate) fn finalize(&self) -> SegmentHashes {
         SegmentHashes {
             blake3: *self.blake3.finalize().as_bytes(),
             crc32c: self.crc32c,

@@ -13027,6 +13027,73 @@ where
         true
     }
 
+    /// The segment the primary uploads next: the oldest sealed one that is
+    /// still local and above the tiered floor.
+    ///
+    /// `None` when there is none, and also while that segment has no usable
+    /// record: its hash from disk is still being taken, or an advance
+    /// contradicted it. A younger segment never goes first, so a seal does not
+    /// overtake a backlog. The caller checks that this replica is the primary.
+    #[must_use]
+    pub fn next_segment_upload(&self) -> Option<crate::SegmentUpload> {
+        let chain = self.segment_chain.as_ref()?;
+        let floor = self.tiered_floor();
+        let (segment, storage) =
+            self.log
+                .segments()
+                .iter()
+                .zip(self.log.storages())
+                .find(|(segment, _)| {
+                    segment.sealed
+                        && segment.location == SegmentLocation::Local
+                        && segment.size.as_bytes_u64() > 0
+                        && floor.is_none_or(|floor| segment.end_offset > floor)
+                })?;
+        let record = self
+            .sealed_segment_record(segment.start_offset)
+            .filter(|record| {
+                // An advance that ends anywhere inside the segment and does
+                // not match it means the store holds other bytes there.
+                chain
+                    .diverged()
+                    .range(record.start_offset..=record.end_offset)
+                    .next()
+                    .is_none()
+            })?;
+        let (log_path, index_path) = storage.segment_and_index_paths();
+        Some(crate::SegmentUpload {
+            prefix: self.object_prefix()?,
+            record,
+            log_path: log_path?,
+            index_path: index_path?,
+        })
+    }
+
+    /// Account for a finished upload of the segment in `record`, and return
+    /// the advance that tells every replica the store holds it.
+    ///
+    /// The advance starts right after the floor. Uploads go oldest first, so
+    /// no local segment holds an offset between the floor and this segment.
+    pub fn note_segment_uploaded(
+        &mut self,
+        record: &crate::segment_chain::SegmentRecord,
+    ) -> crate::tiered_floor::AdvanceTieredFloor {
+        if let Some(segment) = self.log.segments_mut().iter_mut().find(|segment| {
+            segment.start_offset == record.start_offset
+                && segment.location == SegmentLocation::Local
+        }) {
+            segment.location = SegmentLocation::Uploaded;
+        }
+        let next = self
+            .tiered_floor()
+            .map_or(0, |floor| floor.saturating_add(1));
+        crate::tiered_floor::AdvanceTieredFloor {
+            start: next.min(record.start_offset),
+            up_to: record.end_offset,
+            hash: record.hash,
+        }
+    }
+
     /// Take a floor advance this replica applied. The store holds the
     /// segment, so this replica may evict its own copy, but only once it has
     /// recorded the advance and its own sealed record carries the same hash.
