@@ -12698,9 +12698,10 @@ where
     /// tick's walk has advanced, and at or under `commit_max`, so a quorum
     /// holds it and repair can serve it back.
     ///
-    /// SERIALIZATION: same argument as `reconcile_metadata_view_divergence`,
-    /// which is the other shard-side `truncate_from` caller. This runs on the
-    /// pump between frames, so no append is in flight for these ops.
+    /// SERIALIZATION: holds the journal gate, as
+    /// `reconcile_metadata_view_divergence` does, the other shard-side
+    /// `truncate_from` caller. An in-process submit appends on its caller's
+    /// task, so running on the pump does not keep an append off these ops.
     #[allow(clippy::future_not_send)]
     async fn drop_unwalkable_metadata_entry<P>(
         &self,
@@ -12723,6 +12724,7 @@ where
         let Ok(slot) = usize::try_from(stuck_op) else {
             return;
         };
+        let _journal_writes = self.plane.metadata().hold_journal_writes().await;
         let Some(header) = journal.handle().header(slot).map(|header| *header) else {
             return;
         };
@@ -12730,8 +12732,8 @@ where
         if journal.handle().entry(&header).await.is_some() {
             return;
         }
-        // The read can yield to a pipeline driver or a view change. Never
-        // truncate a suffix another driver owns, even when this body is absent.
+        // The gate and the read can yield to a pipeline driver or a view change.
+        // Never truncate a suffix another driver owns, even when this body is absent.
         if consensus.view() != view
             || consensus.view_log_unproven()
             || consensus.is_transferring()

@@ -29,6 +29,7 @@ use server_common::{Message, iobuf::Owned};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
+#[cfg(test)]
 use std::task::{Poll, Waker};
 
 /// Fixed synthetic epoch for [`SimClock`]: 2026-01-01T00:00:00Z in micros.
@@ -119,7 +120,9 @@ pub struct SimJournal<S: Storage> {
     fail_next_truncate: Cell<bool>,
     /// Appends park while set, the way a write in flight stays unfinished in a
     /// stopped process. See [`SimJournal::hold_appends`].
+    #[cfg(test)]
     append_hold: Cell<bool>,
+    #[cfg(test)]
     append_waiters: RefCell<Vec<Waker>>,
     /// Debug-only single-accessor tripwire. `entry` / `append` hold a
     /// [`JournalAccessGuard`] across their whole body, including the storage
@@ -142,7 +145,9 @@ impl<S: Storage + Default> Default for SimJournal<S> {
             slot_count: Cell::new(None),
             #[cfg(test)]
             fail_next_truncate: Cell::new(false),
+            #[cfg(test)]
             append_hold: Cell::new(false),
+            #[cfg(test)]
             append_waiters: RefCell::new(Vec::new()),
             #[cfg(debug_assertions)]
             accessing: Cell::new(false),
@@ -316,6 +321,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     }
 
     async fn append(&self, entry: Self::Entry) -> std::io::Result<()> {
+        #[cfg(test)]
         std::future::poll_fn(|context| {
             if self.append_hold.get() {
                 self.append_waiters
@@ -484,11 +490,13 @@ impl SimJournal<MemStorage> {
     /// Park every append from now on until [`Self::release_appends`]: a write
     /// that is in flight when its process is stopped, and the submits queued
     /// behind it, finish only after the process continues.
+    #[cfg(test)]
     pub fn hold_appends(&self) {
         self.append_hold.set(true);
     }
 
     /// Let the parked appends finish, in the order the executor polls them.
+    #[cfg(test)]
     pub fn release_appends(&self) {
         self.append_hold.set(false);
         for waiter in self.append_waiters.borrow_mut().drain(..) {

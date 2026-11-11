@@ -5974,6 +5974,43 @@ mod tests {
         })
     }
 
+    /// A metadata `DoViewChange` from `replica` whose log ends at `head`, the
+    /// only header it carries.
+    pub fn metadata_do_view_change(
+        cluster: u128,
+        view: u32,
+        replica: u8,
+        commit: u64,
+        head: &PrepareHeader,
+    ) -> Message<iggy_binary_protocol::DoViewChangeHeader> {
+        let header_size = size_of::<iggy_binary_protocol::DoViewChangeHeader>();
+        let mut message = Message::<iggy_binary_protocol::DoViewChangeHeader>::new(
+            header_size + size_of::<PrepareHeader>(),
+        );
+        consensus::encode_prepare_headers(
+            std::slice::from_ref(head),
+            &mut message.as_mut_slice()[header_size..],
+        );
+        let checksum_body = u128::from(iggy_common::calculate_checksum(
+            &message.as_slice()[header_size..],
+        ));
+        let total = message.as_slice().len();
+        message.transmute_header(|_, header: &mut iggy_binary_protocol::DoViewChangeHeader| {
+            header.command = Command::DoViewChange;
+            header.cluster = cluster;
+            header.group = METADATA_GROUP;
+            header.view = view;
+            header.replica = replica;
+            header.log_view = head.view;
+            header.op = head.op;
+            header.commit = commit;
+            header.present_bitset = 1;
+            header.size = u32::try_from(total).unwrap();
+            header.checksum_body = checksum_body;
+            header.seal();
+        })
+    }
+
     fn as_repair_prepare(
         prepare: &Message<PrepareHeader>,
     ) -> Message<iggy_binary_protocol::RepairPrepareHeader> {
@@ -6700,34 +6737,8 @@ mod tests {
             // A commit can arrive ahead of its body. The DVC clamps that
             // frontier to the resident head, while consensus retains it.
             consensus.advance_commit_max(prepare_header.op);
-            let header_size = size_of::<iggy_binary_protocol::DoViewChangeHeader>();
-            let mut message = Message::<iggy_binary_protocol::DoViewChangeHeader>::new(
-                header_size + size_of::<PrepareHeader>(),
-            );
-            consensus::encode_prepare_headers(
-                &[prepare_header],
-                &mut message.as_mut_slice()[header_size..],
-            );
-            let checksum_body = u128::from(iggy_common::calculate_checksum(
-                &message.as_slice()[header_size..],
-            ));
-            let total = message.as_slice().len();
-            let message = message.transmute_header(
-                |_, header: &mut iggy_binary_protocol::DoViewChangeHeader| {
-                    header.command = Command::DoViewChange;
-                    header.cluster = consensus.cluster();
-                    header.group = METADATA_GROUP;
-                    header.view = NEW_VIEW;
-                    header.replica = 0;
-                    header.log_view = prepare_header.view;
-                    header.op = prepare_header.op;
-                    header.commit = applied;
-                    header.present_bitset = 1;
-                    header.size = u32::try_from(total).unwrap();
-                    header.checksum_body = checksum_body;
-                    header.seal();
-                },
-            );
+            let message =
+                metadata_do_view_change(consensus.cluster(), NEW_VIEW, 0, applied, &prepare_header);
             candidate
                 .on_message(MessageBag::DoViewChange(message))
                 .await;
@@ -13950,7 +13961,7 @@ mod metadata_repair_driver_tests {
     use super::*;
     use consensus::{Sequencer, Status};
     use futures::FutureExt;
-    use iggy_binary_protocol::{ConsensusHeader, RequestStateTransferHeader};
+    use iggy_binary_protocol::RequestStateTransferHeader;
     use journal::Journal;
     use packet::Packet;
     use server_common::MessageBag;
@@ -14608,16 +14619,17 @@ mod metadata_repair_driver_tests {
         for _ in 0..STEPS_PER_SEND {
             sim.step();
         }
-        let stopped = &sim.replicas[usize::from(STOPPED_PRIMARY)];
-        let consensus = stopped.shards[0]
-            .plane
-            .metadata()
-            .consensus
-            .as_ref()
+        let consensus = sim
+            .metadata_consensus(usize::from(STOPPED_PRIMARY))
             .unwrap();
         assert_eq!(consensus.pipeline_len(), 2, "both submits must be parked");
         assert_eq!(consensus.sequencer().current_sequence(), stopped_at + 2);
-        assert_eq!(stopped.metadata_journal.last_op(), Some(stopped_at));
+        assert_eq!(
+            sim.replicas[usize::from(STOPPED_PRIMARY)]
+                .metadata_journal
+                .last_op(),
+            Some(stopped_at)
+        );
 
         for peer in [NEXT_PRIMARY, LAGGING] {
             sim.network.clog(
@@ -14775,11 +14787,8 @@ mod metadata_repair_driver_tests {
 
         let elect = Rc::clone(&sim.replicas[usize::from(STOPPED_PRIMARY)].shards[0]);
         let elect_state = |sim: &Simulator| {
-            let consensus = sim.replicas[usize::from(STOPPED_PRIMARY)].shards[0]
-                .plane
-                .metadata()
-                .consensus
-                .as_ref()
+            let consensus = sim
+                .metadata_consensus(usize::from(STOPPED_PRIMARY))
                 .unwrap();
             (
                 consensus.status(),
@@ -14809,39 +14818,19 @@ mod metadata_repair_driver_tests {
         );
 
         // The others moved on to a view this replica leads and report their logs.
-        let do_view_change = {
-            let consensus = elect.plane.metadata().consensus.as_ref().unwrap();
-            let committed = *sim.replicas[usize::from(STOPPED_PRIMARY)]
-                .metadata_journal
-                .header(usize::try_from(stopped_at).unwrap())
-                .expect("the committed head is journaled");
-            let header_size = size_of::<iggy_binary_protocol::DoViewChangeHeader>();
-            let mut message = Message::<iggy_binary_protocol::DoViewChangeHeader>::new(
-                header_size + size_of::<PrepareHeader>(),
-            );
-            consensus::encode_prepare_headers(
-                &[committed],
-                &mut message.as_mut_slice()[header_size..],
-            );
-            let checksum_body = u128::from(iggy_common::calculate_checksum(
-                &message.as_slice()[header_size..],
-            ));
-            let total = message.as_slice().len();
-            message.transmute_header(|_, header: &mut iggy_binary_protocol::DoViewChangeHeader| {
-                header.command = Command::DoViewChange;
-                header.cluster = consensus.cluster();
-                header.group = METADATA_GROUP;
-                header.view = ELECTED_VIEW;
-                header.replica = NEXT_PRIMARY;
-                header.log_view = committed.view;
-                header.op = stopped_at;
-                header.commit = stopped_at;
-                header.present_bitset = 1;
-                header.size = u32::try_from(total).unwrap();
-                header.checksum_body = checksum_body;
-                header.seal();
-            })
-        };
+        let committed = *sim.replicas[usize::from(STOPPED_PRIMARY)]
+            .metadata_journal
+            .header(usize::try_from(stopped_at).unwrap())
+            .expect("the committed head is journaled");
+        let do_view_change = super::tests::metadata_do_view_change(
+            sim.metadata_consensus(usize::from(STOPPED_PRIMARY))
+                .unwrap()
+                .cluster(),
+            ELECTED_VIEW,
+            NEXT_PRIMARY,
+            stopped_at,
+            &committed,
+        );
         sim.executor.spawn({
             let elect = Rc::clone(&elect);
             async move {
