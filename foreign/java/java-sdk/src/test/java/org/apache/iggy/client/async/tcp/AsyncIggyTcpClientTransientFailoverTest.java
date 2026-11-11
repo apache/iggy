@@ -111,6 +111,17 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final java.util.Map<Integer, Integer> REPLICA_IDS = new java.util.concurrent.ConcurrentHashMap<>();
 
     @Test
+    void shouldBackOffRefusalsWithIndependentCappedJitter() {
+        var state = new AsyncTcpConnection.TransientFailoverState();
+        for (long pauseMillis : new long[] {25, 50, 100, 200, 400, 500, 500}) {
+            assertThat(state.retryPauseNanos(0.5)).isEqualTo(TimeUnit.MILLISECONDS.toNanos(pauseMillis));
+        }
+        assertThat(state.retryPauseNanos(0)).isZero();
+        assertThat(new AsyncTcpConnection.TransientFailoverState().retryPauseNanos(0.5))
+                .isEqualTo(TimeUnit.MILLISECONDS.toNanos(25));
+    }
+
+    @Test
     void shouldRetainUncertainMutationOutcomeAfterLaterRefusal() throws Exception {
         for (int refusal : new int[] {
             IggyErrorCode.STALE_CLIENT.getCode(),

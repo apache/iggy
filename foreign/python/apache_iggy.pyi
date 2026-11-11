@@ -2192,15 +2192,17 @@ class IggyClient:
         by default. A continuation is refused, because it belongs to one partition. `options`
         sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
         reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
-        default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
-        bound the requests in flight and the queued batches.
+        default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+        and queued batches. Each effective budget holds at least 32 reads at the configured
+        count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+        queued batches; network requests have a separate per-consumer limit of 32.
 
         Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
         `Consumer.Single` without partitions or a continuation as `start`,
         `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
-        error of the group join. A join with an unknown outcome raises `PendingOperationError`:
-        the client keeps it, so a new `reader()` raises `lane_blocked` until
-        `resolve_operation()` or `abandon_operation()` settles it.
+        error of the group join. A join with an unknown outcome raises `PendingOperationError`
+        after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+        that landed keeps its member in the group until the session ends.
         """
     def consumer_group(
         self,
@@ -2230,8 +2232,11 @@ class IggyClient:
         the default, stores none, so commit checkpoints after processing, or each restart reads
         the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
         each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
-        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
-        the poll count by default) bound the requests in flight and the queued batches.
+        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+        budgets for reads in flight and queued batches. Each effective budget holds at least
+        32 reads at the configured poll count and byte limit, even if a smaller budget is
+        requested. Larger budgets allow more queued batches; network requests have a separate
+        per-consumer limit of 32.
         `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
         stores before closing the reader. It defaults to five seconds; zero skips that wait.
         Call `shutdown()` before dropping the consumer.
@@ -2394,7 +2399,9 @@ class IggyConsumer:
         r"""
         Sets the next read position of a partition and drops the rest of its batch that the
         consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
-        stores the offset before it, so a restart resumes at the new position. Every other seek
+        stores the offset before it, so a restart resumes at the new position. A seek to offset 0
+        or `PollingStrategy.First()` deletes the stored offset. A seek to a timestamp stores the
+        offset before the first message at the timestamp, if there is one. Every other seek
         stores nothing. It resumes a stopped partition.
         `start` is a new strategy or a continuation of the same partition, such as
         `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
@@ -2402,9 +2409,9 @@ class IggyConsumer:
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
         read and for a continuation of another partition, `PendingOperationError` under
         `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
-        (abandon its operation first), the errors of the offset store with `OnRead`, and
-        `RuntimeError` while `consume_messages()` runs, also from its callback: seek after the
-        run ends.
+        (abandon its operation first), the errors of the read, lookup, store or delete with
+        `OnRead`, and `RuntimeError` while `consume_messages()` runs, also from its callback:
+        seek after the run ends.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -3926,12 +3933,15 @@ class PartitionReader:
       while `next()` waits and then fills its budget (one fetch per primary that may wait for
       messages, the partitions with messages left behind spread over the other slots), a `seek()`
       to an offset stores the offset before it, and `close()` moves the offset back to the last
-      delivered message.
+      delivered message. A crash, or a reader dropped without `close()`, loses the batches that
+      the server stored before the application took them, up to the effective budget, which
+      holds at least 32 batches.
     - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
       (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
       partition until `IggyClient.abandon_operation()` and `seek()`.
-    - The calls on one reader run one at a time, so a call waits for a pending `next()`.
-      `next()` is cancel safe: cancel it before `close()`.
+    - The calls on one reader run one at a time, so each call waits for the pending ones, and
+      `close()` waits for all of them. `next()` is cancel safe. Cancel a pending `next()` or
+      `commit()` before `close()`.
     - Dropping the reader stops its tasks without waiting, and it moves no offset back.
     - `async for` reads its batches until `close()`, and `async with` closes it on exit.
     """
@@ -3947,6 +3957,13 @@ class PartitionReader:
         Stores the offset of a checkpoint that this reader delivered, which covers every earlier
         message of its partition. A checkpoint of an older generation of its partition, or at or
         below the last commit of its generation, stores nothing.
+
+        When the offset store gets `ConsumerGroupPartitionNotOwned` (5009) for a partition that
+        the reader still has, `commit()` reads the owner of the partition again. The server can
+        refuse that read for a short time, and `commit()` repeats it after each such refusal, with
+        no time limit. To bound `commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends
+        nothing more, but a write that it already sent can still take effect. `close()` waits for
+        a pending `commit()`, so cancel it before `close()`.
 
         Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
         checkpoint that this reader did not deliver, the errors of the offset store, and
@@ -3973,14 +3990,18 @@ class PartitionReader:
 
         With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
         it, under the history of a continuation or else of the last delivered message, so a
-        restart resumes at the new position. A failed store fails the seek and nothing moves.
-        Every other seek stores nothing. The new position waits for the end of the committing
-        read in flight, whose reply the new generation drops.
+        restart resumes at the new position. A seek to offset 0 or `PollingStrategy.First()`
+        deletes the stored offset under the same history when the server holds one, because the
+        commit of a read never moves the offset back. A seek to a timestamp first reads one
+        message at the timestamp without a commit, and then acts as a seek to the offset of that
+        message. Without such a message it stores nothing. A failed read, lookup, store or delete
+        fails the seek and nothing moves. Every other seek stores nothing. The new position waits
+        for the end of the committing read in flight, whose reply the new generation drops.
 
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
         and for a continuation of another partition, `PendingOperationError` with `OnRead` while
         a read of the partition has an unknown outcome (abandon its operation first), the errors
-        of the offset store with `OnRead`, and `RuntimeError` after `close()`.
+        of the read, lookup, store or delete with `OnRead`, and `RuntimeError` after `close()`.
         """
     def partitions(self) -> collections.abc.Awaitable[list[builtins.int]]:
         r"""
@@ -4073,7 +4094,10 @@ class Partitioning:
 @typing.final
 class PendingOperationError(IggyError):
     r"""
-    An operation whose retained identity is needed to recover or release its lane.
+    An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+    names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+    The client retains no operation for kind `not_retained`, and none for a group join that
+    `reader()` abandoned.
     """
     @property
     def operation_id(self) -> builtins.int: ...
@@ -4491,6 +4515,13 @@ class ReadError(IggyError):
         not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
         """
     @property
+    def lost(self) -> tuple[builtins.int, builtins.int] | None:
+        r"""
+        For messages that a lost read committed and that the reader could not read again: their
+        first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+        (14010). `None` for every other error.
+        """
+    @property
     def error(self) -> IggyError:
         r"""
         The error as the client raises it for any other call: an `IggyError`, or a
@@ -4501,7 +4532,8 @@ class ReadError(IggyError):
         r"""
         For a message that does not decode: the continuation after it. The messages before it
         arrive in a batch before this error, and the reader reads the message again until
-        `seek()` to this continuation skips it.
+        `seek()` to this continuation skips it. For a lost range: the continuation after the
+        last offset of `lost`. `None` for every other error.
         """
     @property
     def record(self) -> bytes | None: ...

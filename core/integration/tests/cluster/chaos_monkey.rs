@@ -259,7 +259,7 @@ use iggy::prelude::*;
 use integration::harness::handle::common::SIGTERM_TIMEOUT;
 use integration::harness::{
     GroupPoller, ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness,
-    TestServerConfig, disk, resolve_config_paths,
+    TestServerConfig, disk, log_capture, resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -386,7 +386,7 @@ type SharedLog = Arc<Mutex<ObservedLog>>;
 #[parallel]
 #[ignore = "runs for minutes against a multi-node cluster; run with --run-ignored only"]
 async fn given_cluster_when_scenario_faults_hit_should_keep_acked_messages() {
-    crate::use_saved_logs_on_failure();
+    log_capture::use_saved_logs_on_failure();
     let config = ChaosConfig::from_env();
     let mut harness = build_cluster(&config);
     let mut report =
