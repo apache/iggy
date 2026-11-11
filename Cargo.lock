@@ -13129,6 +13129,7 @@ dependencies = [
  "opentelemetry_sdk",
  "papaya",
  "partitions",
+ "passterm",
  "proc-macro2",
  "prometheus-client",
  "quote",

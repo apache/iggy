@@ -24,9 +24,9 @@ use configs::server::ServerConfig;
 use consensus::{MetadataHandle, RESERVED_CLIENT_ID};
 use futures::{FutureExt, pin_mut, select};
 use iggy_binary_protocol::PrepareHeader;
-use iggy_binary_protocol::requests::users::CreateUserRequest;
+use iggy_binary_protocol::requests::users::{ChangePasswordRequest, CreateUserRequest};
 use iggy_binary_protocol::{
-    Operation, WireGlobalPermissions, WireName, WireOptions, WirePermissions,
+    Operation, WireGlobalPermissions, WireIdentifier, WireName, WireOptions, WirePermissions,
 };
 use iggy_common::UserStatus;
 use iggy_common::defaults::{
@@ -48,10 +48,12 @@ use message_bus::transports::tls::{
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::RecoveryError;
 use metadata::impls::{METADATA_DIR, SNAPSHOT_FILE_NAME};
+use passterm::{Stream, isatty, prompt_password_tty};
 use rustls::pki_types::ServerName;
 use server_common::crypto;
 use std::collections::HashMap;
 use std::env;
+use std::io::{self, Write};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -64,8 +66,22 @@ const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
 
 const ROOT_INITIALIZATION_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+const ROOT_PASSWORD_RESET_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Initial root identity and password hash, resolved before shard startup.
 pub(in crate::boot) type RootCredentials = CreateUserRequest;
+
+/// Operator input for `--reset-root-password`, prompted before shard startup.
+///
+/// The values live in memory only: they never enter the environment, where
+/// `resolve_root_credentials` could pick a password up as a bootstrap seed
+/// before WAL replay, and they are never written to output or logs.
+pub struct RootPasswordReset {
+    /// Username the operator believes is root; rejected unless it matches.
+    pub username: String,
+    /// New plaintext password, verified against root's stored hash before use.
+    pub password: String,
+}
 
 /// Replicate root creation, waiting through promotions until it commits or shutdown starts.
 /// The caller supplies the timer so the simulator can run the same initialization loop.
@@ -172,6 +188,171 @@ where
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Replicate a root password reset, waiting through promotions until it
+/// commits or shutdown starts. A password matching root's stored hash is
+/// skipped without submitting; otherwise it is hashed once with Argon2 and
+/// sealed into a single `ChangePasswordRequest` the retries re-send verbatim.
+/// The caller supplies the timer so tests can drive the same loop.
+///
+/// # Errors
+/// Returns an error on a username mismatch or a rejected reset.
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+pub async fn reset_root_password<B, J, S, SB, Sleep>(
+    shard: &Rc<ShellShard<B, J, S, SB>>,
+    reset: &RootPasswordReset,
+    shutdown: ShutdownToken,
+    sleep: impl Fn(Duration) -> Sleep,
+) -> Result<(), ServerError>
+where
+    B: MessageBus,
+    J: JournalHandle,
+    J::Target: Journal<Entry = server_common::Message<PrepareHeader>, Header = PrepareHeader>,
+    SB: SuperblockStore,
+    Sleep: Future<Output = ()>,
+{
+    let metadata = shard.plane.metadata();
+    // `initialize_root_user` returns only once root exists, so this resolves
+    // promptly; the loop just guards the shutdown race in that window.
+    let (stored_username, stored_hash) = loop {
+        if shutdown.is_triggered() {
+            return Ok(());
+        }
+        let stored = metadata.mux_stm.users().read(|users| {
+            users
+                .items
+                .get(0)
+                .map(|root| (root.username.to_string(), root.password_hash.to_string()))
+        });
+        if let Some(stored) = stored {
+            break stored;
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    // Neither username is logged: the mismatch alone tells the operator to
+    // re-run with the root username the server actually stores.
+    if reset.username != stored_username {
+        return Err(ServerError::RootResetUsernameMismatch);
+    }
+    if crypto::verify_password(&reset.password, &stored_hash) {
+        info!(
+            "Root password reset skipped: the supplied password already matches the stored root hash."
+        );
+        return Ok(());
+    }
+    let request = ChangePasswordRequest {
+        user_id: WireIdentifier::numeric(0),
+        // Empty: the client-edge current-password check is bypassed on this
+        // internal proposal, and apply ignores the field (see `users.rs` in
+        // the metadata crate). Design point 3 of issue #4321.
+        current_password: String::new(),
+        new_password: crypto::hash_password(&reset.password),
+    };
+    let mut last_log = None;
+    let mut last_error_log = None;
+    loop {
+        if shutdown.is_triggered() {
+            return Ok(());
+        }
+        let reset_in_progress = metadata.consensus.as_ref().is_some_and(|consensus| {
+            consensus.pipeline_has_message_from_client(RESERVED_CLIENT_ID)
+        });
+        let log_due =
+            last_log.is_none_or(|last: Instant| last.elapsed() >= ROOT_PASSWORD_RESET_LOG_INTERVAL);
+        if metadata.is_caught_up_primary() && !reset_in_progress {
+            let submission = metadata
+                .submit_root_password_reset_in_process(&request)
+                .fuse();
+            let shutdown_wait = shutdown.wait().fuse();
+            pin_mut!(submission, shutdown_wait);
+            let result = loop {
+                let log_tick = sleep(ROOT_PASSWORD_RESET_LOG_INTERVAL).fuse();
+                pin_mut!(log_tick);
+                select! {
+                    result = submission => break result,
+                    () = shutdown_wait => return Ok(()),
+                    () = log_tick => {
+                        warn!("Waiting for the root password reset to commit through metadata replication.");
+                        last_log = Some(Instant::now());
+                    }
+                }
+            };
+            match result {
+                Ok((0, op)) => {
+                    info!(
+                        op,
+                        "Root password reset committed through metadata replication."
+                    );
+                    return Ok(());
+                }
+                Ok((status, _)) => {
+                    return Err(ServerError::RootPasswordResetRejected { status });
+                }
+                Err(error) => {
+                    if last_error_log.is_none_or(|last: Instant| {
+                        last.elapsed() >= ROOT_PASSWORD_RESET_LOG_INTERVAL
+                    }) {
+                        warn!(
+                            ?error,
+                            "Root password reset could not be submitted, retrying."
+                        );
+                        last_error_log = Some(Instant::now());
+                    }
+                }
+            }
+        } else if log_due {
+            info!(
+                reset_in_progress,
+                "Waiting to submit the root password reset through the metadata primary."
+            );
+            last_log = Some(Instant::now());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Prompt for `--reset-root-password` input before any shard thread spawns.
+///
+/// The username is echoed from stdin; the password is read without echo on
+/// a TTY, or as the next stdin line when stdin is piped. Values come from
+/// the terminal only - never from the environment - and are never logged.
+///
+/// # Errors
+/// Returns an error when a read fails or a value is empty.
+pub fn prompt_root_password_reset() -> Result<RootPasswordReset, ServerError> {
+    let mut stdout = io::stdout().lock();
+    let _ = write!(stdout, "Root username: ");
+    let _ = stdout.flush();
+    let username = read_prompt_line("username")?;
+    let password = if isatty(Stream::Stdin) {
+        prompt_password_tty(Some("New root password: ")).map_err(|source| {
+            ServerError::RootResetInputRead {
+                field: "password",
+                source: Box::new(source),
+            }
+        })?
+    } else {
+        read_prompt_line("password")?
+    };
+    Ok(RootPasswordReset { username, password })
+}
+
+/// Read one trimmed line from stdin; an EOF arrives as an empty value and is
+/// rejected like any other missing credential.
+fn read_prompt_line(field: &'static str) -> Result<String, ServerError> {
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|source| ServerError::RootResetInputRead {
+            field,
+            source: Box::new(source),
+        })?;
+    let line = line.trim_end_matches(['\n', '\r']).to_string();
+    if line.is_empty() {
+        return Err(ServerError::RootResetInputEmpty { field });
+    }
+    Ok(line)
 }
 
 /// Apply `--with-default-root-credentials`.

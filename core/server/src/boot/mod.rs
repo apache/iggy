@@ -34,7 +34,10 @@ mod threads;
 mod topology;
 
 pub use crate::dispatch::host::ServerHost;
-pub use credentials::{apply_default_root_credentials, initialize_root_user};
+pub use credentials::{
+    RootPasswordReset, apply_default_root_credentials, initialize_root_user,
+    prompt_root_password_reset,
+};
 pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
@@ -284,6 +287,7 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
 pub fn bootstrap(
     config: ServerConfig,
     current_replica_id: Option<u8>,
+    mut root_password_reset: Option<RootPasswordReset>,
 ) -> Result<ShardHandles, ServerError> {
     // One process-wide rustls provider, installed before any shard thread
     // exists. rustls is compiled with both `ring` and `aws-lc-rs`, so a
@@ -418,6 +422,7 @@ pub fn bootstrap(
             MetadataHandoff::Owner {
                 bundle_tx: metadata_bundle_tx.clone(),
                 root_credentials: root_credentials.take(),
+                root_password_reset: root_password_reset.take(),
             }
         } else {
             MetadataHandoff::Waiter {
@@ -582,11 +587,12 @@ async fn shard_main(
     // so the writer must first be parked in a binding that outlives the peer
     // wait armed below. A `recover()` failure inside the arm is safe for the
     // same reason -- no peer holds a handle yet.
-    let (mux_stm, change_log, pending_bundle_tx, owner_state, root_credentials) =
+    let (mux_stm, change_log, pending_bundle_tx, owner_state, root_credentials, root_reset) =
         match metadata_handoff {
             MetadataHandoff::Owner {
                 bundle_tx,
                 root_credentials,
+                root_password_reset,
             } => {
                 let recovered = recover::<ServerMuxStateMachine>(
                     data_dir,
@@ -648,6 +654,7 @@ async fn shard_main(
                         history: recovered.history,
                     }),
                     root_credentials,
+                    root_password_reset,
                 )
             }
             MetadataHandoff::Waiter { bundle_rx } => {
@@ -661,6 +668,7 @@ async fn shard_main(
                 (
                     Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle.states)),
                     Rc::new(MetadataChangeLog::from_factory(bundle.change_log)),
+                    None,
                     None,
                     None,
                     None,
@@ -1108,6 +1116,7 @@ async fn shard_main(
             &connections,
             &shard_metrics_all,
             root_credentials.as_ref(),
+            root_reset.as_ref(),
         )
         .await
         {

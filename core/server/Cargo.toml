@@ -138,6 +138,7 @@ opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 papaya = { workspace = true }
 partitions = { workspace = true }
+passterm = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 ring = { workspace = true }
