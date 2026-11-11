@@ -3318,6 +3318,27 @@ public sealed class PartitionReaderTests
     }
 
     [Fact]
+    public async Task given_a_failed_tiered_read_on_one_partition_when_reading_should_stop_it_at_the_first_refusal()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 1000 };
+        using var client = await cluster.ConnectAsync();
+        await using var reader = await Reader(client, CommitPolicy.Manual, 1, 2).BuildAsync(Token);
+        await ReadAsync(reader, 2);
+        cluster.TieredReadRefused.Add(1);
+
+        var error = await NextErrorAsync(reader);
+        var others = await ReadAsync(reader, 4);
+        // A partition that reads again does so after one retry interval.
+        await Task.Delay(RetryInterval * 6, Token);
+
+        Assert.Equal((1u, VsrError.TIERED_READ_FAILED, true, true), (error.PartitionId,
+            Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException).StatusCode, error.StopsPartition,
+            error.IsResumable));
+        Assert.All(others, batch => Assert.Equal(2u, batch.PartitionId));
+        Assert.Equal(1, cluster.TieredReadRefusals);
+    }
+
+    [Fact]
     public async Task given_a_last_start_with_an_oversized_first_message_when_reading_should_stop_the_partition_until_a_seek()
     {
         using var cluster = new ReaderCluster(1) { Limit = 4, OversizedLast = true };

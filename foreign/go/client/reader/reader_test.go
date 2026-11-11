@@ -1150,6 +1150,22 @@ func TestPartitionReader_StopsAPartitionWhoseHistoryIsGoneUntilASeek(t *testing.
 	assert.Equal(t, uint64(0), client.nextRead(t).targets[0].Strategy.Value)
 }
 
+func TestPartitionReader_StopsAPartitionAtTheFirstTieredReadFailureUntilASeek(t *testing.T) {
+	client := newFakeClient()
+	reader := standalone(t, client, waitOneSecond, 1)
+	client.nextRead(t).answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrTieredReadFailed})
+
+	_, err := reader.Next(context.Background())
+	var readError *ReadError
+	require.ErrorAs(t, err, &readError)
+	require.ErrorIs(t, err, ierror.ErrTieredReadFailed)
+	assert.Equal(t, uint32(1), *readError.PartitionID)
+	assert.True(t, client.readsNothingFor(300*time.Millisecond), "a refusal that no retry changes is not read again")
+
+	require.NoError(t, reader.Seek(context.Background(), 1, iggcon.FirstPollingStrategy()))
+	assert.Equal(t, uint64(0), client.nextRead(t).targets[0].Strategy.Value)
+}
+
 // A fully zero context names no history, so a partition at a start or a seek
 // with one reads again after a new history, as without a context.
 func TestPartitionReader_ReadsAgainAfterANewHistoryAtAStartOrSeekWithAZeroContext(t *testing.T) {

@@ -3950,6 +3950,43 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// Tiered data that the object store refuses for good stops its
+    /// partition at the first refusal: the read is not sent again after the
+    /// retry interval.
+    @Test func aReadRefusedWithTieredReadFailedStopsItsPartitionWithoutARetry() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2])
+        await serve(server, topic: topic) { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .fetchMessages:
+                guard let fetch = try? request.fetch else {
+                    return nil
+                }
+                return .ok(
+                    FakeVSRServer.fetchedBody(
+                        fetch.targets.map { FakeVSRServer.FetchedSection(partitionID: $0.partitionID, status: IggyErrorCode.tieredReadFailed.rawValue) }))
+            case .pollMessagesDeferred:
+                return .status(IggyErrorCode.tieredReadFailed.rawValue)
+            default:
+                return nil
+            }
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, start: .first)
+
+        let error = await readError(reader)
+
+        #expect(error?.partitionID == 1 && error?.error.code == .tieredReadFailed)
+        #expect(error?.stopsPartition == true)
+        // Several retry intervals of the reader pass.
+        try await Task.sleep(for: .milliseconds(400))
+        let reads = await requests(server, .fetchMessages).count + requests(server, .pollMessagesDeferred).count
+        #expect(reads == 1)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// A fetch reply takes one record past `maxBytes`. A section refused for
     /// its first message is read with a poll of its own, which returns that
     /// message alone with the same limits.

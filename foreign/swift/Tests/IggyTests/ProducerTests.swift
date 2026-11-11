@@ -501,7 +501,7 @@ struct ProducerTests {
         for code: IggyErrorCode in [.transientNotAccepted, .notConnected, .cannotEstablishConnection] {
             #expect(!ProducerCore.stopsSendRetries(IggyError(code)))
         }
-        for code: IggyErrorCode in [.transientNotCommitted, .disconnected, .requestTooOld, .historyUnavailable, .invalidCommand] {
+        for code: IggyErrorCode in [.transientNotCommitted, .disconnected, .requestTooOld, .historyUnavailable, .tieredReadFailed, .invalidCommand] {
             #expect(ProducerCore.stopsSendRetries(IggyError(code)))
         }
     }

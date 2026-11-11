@@ -259,6 +259,27 @@ mod tests {
     }
 
     #[test]
+    fn given_tiered_read_failure_when_recording_should_keep_its_code_and_kind() {
+        let mut read_error = ffi::ReadErrorInfo::default();
+
+        read_error.record(&ReadError {
+            partition_id: Some(PARTITION),
+            error: IggyError::TieredReadFailed,
+            skip: None,
+            offset: None,
+            record: None,
+        });
+
+        assert_eq!(read_error.error.code, 96);
+        assert_eq!(read_error.error.kind, "tiered_read_failed");
+        assert!(!read_error.error.has_operation_id);
+        assert!(!read_error.error.has_blocked_partition_id);
+        assert!(read_error.has_partition_id);
+        assert_eq!(read_error.partition_id, PARTITION);
+        assert!(read_error.skip.is_empty());
+    }
+
+    #[test]
     fn given_reader_shared_by_threads_when_calling_should_serve_every_call() {
         const THREADS: usize = 4;
         let reader = PartitionReader {

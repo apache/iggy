@@ -905,6 +905,39 @@ class PollRouterTest {
         }
     }
 
+    /** The object store failed for good, so the poll is not sent again. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReturnATieredReadFailureWithoutSendingThePollAgain(boolean deferred) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            routedPoll(router, pollPayload(), deferred)
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            primary.replies.add(CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(IggyErrorCode.TIERED_READ_FAILED.getCode(), new byte[0])));
+            ByteBuf payload = tracked(pollPayload());
+            int timersBefore = timers.scheduled.size();
+
+            var polled = routedPoll(router, payload, deferred);
+
+            assertServerError(polled, IggyErrorCode.TIERED_READ_FAILED.getCode());
+            assertThat(primary.sentContexts).hasSize(2);
+            assertThat(timers.delaysMillis.subList(timersBefore, timers.delaysMillis.size()))
+                    .as("only the deadline of the poll is scheduled, and no retry")
+                    .allMatch(delay -> delay > 1000L);
+            assertThat(payload.refCnt()).isZero();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     /**
      * A dead primary answers nothing, so only its lost link can move the partition. The next attempt reads the route
      * again on the replica after the dead one, which a view change makes the next primary.

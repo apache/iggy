@@ -41,7 +41,7 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use membership::Membership;
 use progress::{Progress, in_close};
 use worker::Worker;
-use worker::{lasting_refusal, probe_options};
+use worker::{lasting_refusal, permanent_refusal, probe_options};
 
 #[cfg(test)]
 mod cluster_tests;
@@ -779,9 +779,12 @@ impl ReadError {
     }
 
     /// Whether the reader stopped the partition of this error after refusals in a row that a
-    /// quick retry does not change. Only a [`seek`](PartitionReader::seek) reads it again.
+    /// quick retry does not change, or after one refusal that no retry changes. Only a
+    /// [`seek`](PartitionReader::seek) reads it again.
     pub fn is_lasting_refusal(&self) -> bool {
-        self.partition_id.is_some() && self.skip.is_none() && lasting_refusal(&self.error)
+        self.partition_id.is_some()
+            && self.skip.is_none()
+            && (lasting_refusal(&self.error) || permanent_refusal(&self.error))
     }
 }
 

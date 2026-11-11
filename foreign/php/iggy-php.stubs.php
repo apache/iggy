@@ -2778,7 +2778,8 @@ namespace Iggy\Exception {
     class ReadException extends \Iggy\Exception\IggyException {
         /**
          * Whether the reader stopped the partition after six refusals in a row that a retry does
-         * not change, such as Unauthorized (41). A seek of the partition reads it again.
+         * not change, such as Unauthorized (41), or after one TieredReadFailed (96). A seek of the
+         * partition reads it again.
          *
          * @var bool
          */

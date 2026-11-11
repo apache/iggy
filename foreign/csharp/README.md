@@ -813,9 +813,9 @@ while (true)
   read until a refresh confirmed the assignment.
 - `NextAsync` returns one batch of one partition, never empty. A canceled call leaves the batches in the
   reader. `ReadException` names the partition of an error, and the reader retries by itself. Status 87 stops a
-  partition until `SeekAsync` when its position came from an earlier read, and so do status 80 and a refusal
-  that six retries did not change. Such an error has `StopsPartition` set. `IsResumable` marks the ones that a
-  seek to `PollingStrategy.Next()` resumes after the stored offset: status 87 and the six refusals. Status 5009
+  partition until `SeekAsync` when its position came from an earlier read, and so do status 80, status 96
+  (`TieredReadFailed`) at the first one, and a refusal that six retries did not change. Such an error has `StopsPartition` set. `IsResumable` marks the ones that a
+  seek to `PollingStrategy.Next()` resumes after the stored offset: status 87, status 96 and the six refusals. Status 5009
   (`ConsumerGroupPartitionNotOwned`) alone is not a leave, and it never stops a partition. The wait before the next
   read starts at the retry interval and doubles after each 5009 in a row, up to 32 times the interval. Each sixth
   5009 in a row gives one error without `StopsPartition`, the count starts again, and the partition reads on. A new
@@ -1274,7 +1274,7 @@ A join that landed keeps the member in the group until the session ends.
 A read error that the reader retries by itself does not end the loop, it reaches `SubscribeToErrorEvents`. An error
 that stops a partition (`StopsPartition`) ends the loop with its `ReadException`, as a message that does not decode
 does, whose `Skip` passes it: six refusals in a row such as status 41 (Unauthorized), status 87 (HistoryUnavailable)
-for a position whose history is gone, and status 80 for a `Last` start whose first message is above the byte limit of
+for a position whose history is gone, status 96 (TieredReadFailed) at the first one, and status 80 for a `Last` start whose first message is above the byte limit of
 a read. The partition reads nothing until `SeekAsync`, and `IsResumable` says that a seek to `PollingStrategy.Next()`
 reads it again after its stored offset. A stop while a committing read that lost its reply is still pending reports
 that read as status 14010 instead, since a seek to Next would skip what it stored.

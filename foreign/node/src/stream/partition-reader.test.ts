@@ -57,6 +57,7 @@ const NOT_PRIMARY = 89;
 const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
 const CONSUMER_OFFSET_NOT_FOUND = 3021;
 const INVALID_OFFSET = 4100;
+const TIERED_READ_FAILED = 96;
 const CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 /** An offset reply holds the partition, its current offset and the stored offset. */
@@ -3900,6 +3901,32 @@ describe('partition reader', () => {
 
     assert.ok(error instanceof ReadError);
     assert.equal(error.partitionId, 1);
+    assert.ok(others.every(({ partitionId }) => partitionId === 3));
+    assert.equal(resumed.messages[0].headers.offset, 0n);
+  });
+
+  it('sends a read once that fails with a tiered read failure, and stops its partition until a seek', async () => {
+    const topic = new FakeTopic(1_000n);
+    topic.refused.set(1, TIERED_READ_FAILED);
+    const reader = await open(topic, [1, 3]);
+    const readsOf = (partition: number) => topic.reads.filter((read) => read.partition === partition).length;
+
+    let stopped: unknown;
+    while (!stopped) stopped = await reader.next().then(() => undefined, (failure: unknown) => failure);
+    const others = [await reader.next(), await reader.next()];
+    // Several retry intervals, in which a refusal that retries reads again.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const refusedReads = readsOf(1);
+    topic.refused.delete(1);
+    await reader.seek(1, PollingStrategy.Offset(0n));
+    let resumed = await reader.next();
+    while (resumed.partitionId !== 1) resumed = await reader.next();
+    await reader.close();
+
+    assert.ok(stopped instanceof ReadError);
+    assert.deepEqual([stopped.partitionId, (stopped.error as { errorCode: number }).errorCode,
+      stopped.stopsPartition, stopped.resumable], [1, TIERED_READ_FAILED, true, true]);
+    assert.equal(refusedReads, 1, 'the refused read went out again');
     assert.ok(others.every(({ partitionId }) => partitionId === 3));
     assert.equal(resumed.messages[0].headers.offset, 0n);
   });

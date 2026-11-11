@@ -436,6 +436,8 @@ err = partitionReader.Close(ctx)
 
 A `*reader.ReadError` names its partition. `errors.ErrHistoryUnavailable` stops a partition until `Seek` when its position came from an earlier read of a history that is gone. A section that does not decode is read again one message at a time: every good message is delivered, and a message that does not decode stops its partition with `Skip`, the continuation after it.
 
+`errors.ErrTieredReadFailed` stops a partition until `Seek` at the first refusal: the object store refused the read of tiered data for good, so the reader does not send it again.
+
 `errors.ErrConsumerGroupPartitionNotOwned` on a read is no leave,
 because a new session and a move of the partition away and back look the same.
 The partition keeps its position and what `Close` needs of it.

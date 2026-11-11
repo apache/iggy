@@ -588,6 +588,33 @@ class PartitionReaderTest {
         }
     }
 
+    /** The object store failed for good, so the first refusal stops the partition without a retry. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldStopAPartitionAtTheFirstTieredReadFailureUntilASeek(boolean wholeRequest) throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, MANUAL, 1L);
+        try {
+            Read refusedRead = transport.nextRead();
+            if (wholeRequest) {
+                refusedRead.reply().completeExceptionally(serverError(IggyErrorCode.TIERED_READ_FAILED));
+            } else {
+                refusedRead.answer(refused(1, IggyErrorCode.TIERED_READ_FAILED.getCode()));
+            }
+
+            assertThatThrownBy(() -> next(reader))
+                    .hasCauseInstanceOf(ReadException.class)
+                    .satisfies(error -> assertThat(((ReadException) error.getCause()).errorCode())
+                            .hasValue(IggyErrorCode.TIERED_READ_FAILED.getCode()));
+            assertThat(transport.readsNothingFor(QUIET)).isTrue();
+
+            reader.seek(1L, PollingStrategy.first()).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(transport.nextRead().targets()).containsKey(1L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
     /** The error of a read from before a seek leaves the new generation alone, so it reads from the seek at once. */
     @Test
     void shouldIgnoreTheErrorOfAReadFromBeforeASeek() throws Exception {
