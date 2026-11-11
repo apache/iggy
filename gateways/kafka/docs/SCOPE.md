@@ -50,7 +50,7 @@ it knows the server supports flexible encoding.
 
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
-| 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
+| 18 | ApiVersions | 0 | 5 | 0, 1, 2, 3, 4, 5 | Advertise supported ranges; flexible encoding at v3+. v5 names the cluster and the node that the client wants to reach (KIP-1242), see [Java clients](#java-clients) |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+. Each partition lists as many gateways as replicas as the replication factor of the topic ([`CONFIGS.md`](CONFIGS.md#replicas-in-metadata)). With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
@@ -98,7 +98,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 14 | SyncGroup | 0–5 | v4 |
 | 15 | DescribeGroups | 0–6 | v5 |
 | 16 | ListGroups | 0–5 | v3 |
-| 18 | ApiVersions | 0–3 | v3 |
+| 18 | ApiVersions | 0–5 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
 | 20 | DeleteTopics | 1–5 | v4 |
 | 22 | InitProducerId | 0–5 | v2 |
@@ -109,6 +109,22 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 44 | IncrementalAlterConfigs | 0–1 | v1 |
 | 47 | OffsetDelete | 0 | never |
 | 60 | DescribeCluster | 0–2 | v0 |
+
+### Java clients
+
+Java clients from Kafka 3.0 to 3.8 open ApiVersions at v3. Clients from 3.9 to 4.3 open it at
+v4, and 4.4 clients open it at v5. The gateway serves each of these versions, so no client asks
+again at a lower version (KIP-511). CI runs the Java clients of Kafka 3.9.2, 4.0.2 and 4.4.0.
+
+v5 adds the cluster and the node that the client wants to reach (KIP-1242). Java clients from
+4.4 and franz-go from 1.22.0 send them. A v5 request that names only one of the two gets
+`INVALID_REQUEST` (42), as from a Kafka 4.4 broker. If the node or the cluster is not this
+gateway's, the gateway answers `REBOOTSTRAP_REQUIRED` (129). The client then starts again from its
+bootstrap servers. Gateways without the bridge each draw their own cluster id, so when
+`IGGY_KAFKA_BROKERS` lists several of them, the gateway compares only the node.
+
+`kafka-protocol` 0.18 stops at ApiVersions v4, so `iggy_kafka_wire::api_versions` decodes the two
+v5 fields. The v5 response has no new field, so the v4 encoder writes it.
 
 ### Cluster id
 
