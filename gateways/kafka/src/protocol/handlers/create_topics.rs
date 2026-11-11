@@ -32,6 +32,7 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{
     BridgeError, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicSettings, MAX_TOPIC_PARTITIONS,
     TopicConfigSnapshot, TopicCreationOutcome,
@@ -41,7 +42,8 @@ use crate::protocol::api::{
     API_KEY_CREATE_TOPICS, ApiVersionRange, ConnectionState, ERROR_INVALID_CONFIG,
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR,
     ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::topic_config::keys::{ConfigContext, topic_entries};
@@ -63,6 +65,7 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
@@ -106,6 +109,11 @@ pub async fn handle(
             encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
             "CreateTopics",
         );
+    }
+
+    if let Some(results) = authorize(principal, &req.topics) {
+        let resp = CreateTopicsResponse::default().with_topics(results);
+        return respond_or_close(encode_message(&resp, api_version, 256), "CreateTopics");
     }
 
     let topic_names: Vec<&str> = req.topics.iter().map(|topic| topic.name.as_str()).collect();
@@ -637,6 +645,43 @@ fn assignment_replicas_are_valid(assignments: &[CreatableReplicaAssignment], nod
         .all(|assignment| assignment.broker_ids == [BrokerId(node_id)])
 }
 
+/// Denies every requested topic when `principal` is known but is not allowed to create topics,
+/// or when its permissions could not be read. `None` means SASL is off, which this gateway
+/// treats as no principal to enforce against - the same choice `DeleteTopics` and
+/// `AlterConfigs` make when authentication itself is not configured.
+fn authorize(
+    principal: Option<&AuthenticatedPrincipal>,
+    topics: &[CreatableTopic],
+) -> Option<Vec<CreatableTopicResult>> {
+    let principal = principal?;
+    if principal.permissions_known && principal.permissions.manage_topics {
+        return None;
+    }
+    if !principal.permissions_known {
+        // The permission read failed after a successful login, so this connection holds no real
+        // answer. Denying is the fail-closed choice: granting would authorize a write off a
+        // value nothing ever actually read.
+        tracing::warn!(
+            principal = %principal.username,
+            "CreateTopics asked on a connection whose permissions were never read; denying"
+        );
+    }
+    let message = StrBytes::from_static_str(
+        "the authenticated principal is not authorized to create topics",
+    );
+    Some(
+        topics
+            .iter()
+            .map(|topic| {
+                CreatableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_error_code(ERROR_TOPIC_AUTHORIZATION_FAILED)
+                    .with_error_message(Some(message.clone()))
+            })
+            .collect(),
+    )
+}
+
 /// Well-formed `CreateTopics` response with a single placeholder topic.
 ///
 /// # Errors
@@ -700,6 +745,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::TopicDefaults;
+    use crate::protocol::acl::PrincipalPermissions;
 
     /// The node id of the gateway under test.
     const NODE_ID: i32 = 1;
@@ -1029,5 +1075,60 @@ mod tests {
         ];
         let names: Vec<&str> = topics.iter().map(|topic| topic.name.as_str()).collect();
         assert!(find_duplicate_names(names).is_empty());
+    }
+
+    fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            username: "alice".to_string(),
+            user: None,
+            permissions: PrincipalPermissions {
+                manage_topics,
+                ..PrincipalPermissions::default()
+            },
+            permissions_known,
+        }
+    }
+
+    #[test]
+    fn no_principal_is_not_gated() {
+        assert!(authorize(None, &[creatable_topic(1, 1)]).is_none());
+    }
+
+    #[test]
+    fn a_principal_with_manage_topics_is_allowed() {
+        let principal = principal(true, true);
+        assert!(authorize(Some(&principal), &[creatable_topic(1, 1)]).is_none());
+    }
+
+    #[test]
+    fn a_principal_without_manage_topics_is_denied_every_topic() {
+        let principal = principal(false, true);
+        let results = authorize(
+            Some(&principal),
+            &[
+                CreatableTopic::default().with_name(topic_name("orders")),
+                CreatableTopic::default().with_name(topic_name("payments")),
+            ],
+        )
+        .expect("denied");
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert_eq!(result.error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
+            assert_eq!(
+                result.error_message.as_deref(),
+                Some("the authenticated principal is not authorized to create topics")
+            );
+        }
+    }
+
+    #[test]
+    fn a_principal_whose_permissions_were_never_read_is_denied() {
+        let principal = principal(true, false);
+        let results = authorize(Some(&principal), &[creatable_topic(1, 1)]).expect("denied");
+        assert_eq!(results[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
+        assert_eq!(
+            results[0].error_message.as_deref(),
+            Some("the authenticated principal is not authorized to create topics")
+        );
     }
 }
