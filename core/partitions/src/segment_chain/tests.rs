@@ -196,6 +196,23 @@ async fn given_a_segment_file_when_hashed_from_disk_should_match_its_bytes() {
 }
 
 #[test]
+fn given_a_floor_advance_when_encoded_should_decode_to_the_same_record() {
+    let advance = ChainRecord::Advanced(crate::tiered_floor::AdvanceTieredFloor {
+        start: 10,
+        up_to: 19,
+        hash: [5; 32],
+    });
+    let mut bytes = encode_header(&PREFIX).to_vec();
+    bytes.extend_from_slice(&advance.encode());
+    assert_eq!(decode_chain(&bytes).unwrap().records, [advance]);
+
+    // A byte this build never writes in an advance refuses the record.
+    let stray = HEADER_SIZE + 40;
+    bytes[stray] = 1;
+    assert_eq!(decode_chain(&bytes).unwrap().records, Vec::new());
+}
+
+#[test]
 fn given_a_digest_when_fed_in_pieces_should_cover_and_hash_the_whole_bytes() {
     let mut digest = SegmentDigest::new(20);
     digest.update(b"segment ");

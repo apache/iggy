@@ -182,6 +182,12 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// The floor advances this replica applied that its chain does not record
+    /// yet, oldest first.
+    pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
+    /// How much of the partition stays on local disk, as the segment cleaner
+    /// last resolved it from the topic. `None` until it has.
+    local_envelope: Option<LocalEnvelope>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -945,6 +951,8 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            pending_advances: VecDeque::new(),
+            local_envelope: None,
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -12714,12 +12722,13 @@ where
         self.log.reset_read_state(sealed_index);
         self.stamp_sealed_segment(target.segment_start);
         if let Some(chain) = self.segment_chain.as_mut() {
-            chain.sealed(target.chain_record.as_ref(), start_offset);
+            let diverged = chain.sealed(target.chain_record.as_ref(), start_offset);
             // A segment whose bytes did not all pass through the digest seals
             // without a record, so it gets one hashed from disk.
             if target.chain_record.is_none() {
                 self.maintenance.tiering = self.object_prefix();
             }
+            self.chain_settled(&diverged);
         }
         debug!(
             namespace_raw = self.namespace().inner(),
@@ -13011,9 +13020,71 @@ where
         }
         if self.next_tiering_job().is_none() {
             self.maintenance.tiering = None;
+            // Whatever is left is in the chain, or a segment settled it.
+            self.pending_advances.clear();
             return false;
         }
         true
+    }
+
+    /// Take a floor advance this replica applied. The store holds the
+    /// segment, so this replica may evict its own copy, but only once it has
+    /// recorded the advance and its own sealed record carries the same hash.
+    pub(crate) fn note_tiered_advance(&mut self, advance: crate::tiered_floor::AdvanceTieredFloor) {
+        self.pending_advances.push_back(advance);
+        if self.maintenance.tiering.is_none() {
+            self.maintenance.tiering = self.object_prefix();
+        }
+        self.notify_io();
+    }
+
+    /// Act on what the chain learned from a new record: report the advances
+    /// that this replica's segments contradict, and stage the eviction of the
+    /// segments an advance confirmed.
+    fn chain_settled(&mut self, diverged: &[u64]) {
+        for up_to in diverged {
+            error!(
+                namespace_raw = self.namespace().inner(),
+                up_to,
+                "a tiered floor advance does not match this replica's segment, which stays on disk"
+            );
+        }
+        self.stage_eviction(IggyTimestamp::now());
+    }
+
+    /// The last offsets of the floor advances that this replica's own
+    /// segments contradict. Any entry means the replica and the store
+    /// disagree about committed bytes.
+    #[must_use]
+    pub fn tiered_divergences(&self) -> Vec<u64> {
+        self.segment_chain
+            .as_ref()
+            .map(|chain| chain.diverged().iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Keep what the topic says stays on local disk, for the evictions that a
+    /// floor advance stages between two passes of the segment cleaner.
+    pub const fn set_local_envelope(&mut self, envelope: Option<LocalEnvelope>) {
+        self.local_envelope = envelope;
+    }
+
+    /// Hand the I/O lane the segments that may leave the disk now: sealed,
+    /// below the tiered floor, confirmed by an advance and outside the local
+    /// envelope.
+    pub fn stage_eviction(&mut self, now: IggyTimestamp) {
+        let (Some(envelope), Some(floor)) = (self.local_envelope, self.tiered_floor()) else {
+            return;
+        };
+        let Some(through) = self.eviction_end(now, floor, envelope) else {
+            return;
+        };
+        self.maintenance.eviction = Some(
+            self.maintenance
+                .eviction
+                .map_or(through, |previous| previous.max(through)),
+        );
+        self.notify_io();
     }
 
     /// The next step toward a complete chain, `None` when it is complete.
@@ -13031,7 +13102,14 @@ where
         if let Some(removed) = segments.first()?.start_offset.checked_sub(1)
             && let Some(append) = chain.trim(removed)
         {
-            return Some(crate::segment_chain::TieringJob::Trim(append));
+            return Some(crate::segment_chain::TieringJob::Append(append));
+        }
+        if let Some(append) = self
+            .pending_advances
+            .iter()
+            .find_map(|advance| chain.record_advance(advance))
+        {
+            return Some(crate::segment_chain::TieringJob::Append(append));
         }
         let incarnation = self.created_revision();
         segments
@@ -13058,9 +13136,11 @@ where
                 .map(|error| error.to_string()),
             crate::segment_chain::TieringResult::Opened(Err(error)) => Some(error.to_string()),
             crate::segment_chain::TieringResult::Appended(Ok(record)) => {
-                if let Some(chain) = self.segment_chain.as_mut() {
-                    chain.note_appended(&record);
-                }
+                let diverged = self
+                    .segment_chain
+                    .as_mut()
+                    .map(|chain| chain.note_appended(&record));
+                self.chain_settled(&diverged.unwrap_or_default());
                 None
             }
             crate::segment_chain::TieringResult::Appended(Err(error)) => Some(error.to_string()),
