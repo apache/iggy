@@ -5880,6 +5880,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_object_store"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "futures",
+ "hex",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ignore"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6060,6 +6071,7 @@ dependencies = [
  "ctor",
  "dtor",
  "figment",
+ "fs2",
  "futures",
  "harness_derive",
  "hex",
@@ -6082,6 +6094,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "server_common",
  "sysinfo 0.40.1",
  "tempfile",
  "test-case",
@@ -6310,7 +6323,6 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
- "nix",
  "server_common",
  "tempfile",
  "tokio",

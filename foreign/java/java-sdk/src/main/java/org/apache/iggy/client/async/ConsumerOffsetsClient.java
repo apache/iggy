@@ -80,7 +80,10 @@ public interface ConsumerOffsetsClient {
      * Stores a consumer offset fenced by the context its messages were polled with.
      * The server refuses the store once the partition incarnation or its owner has
      * changed, so an offset from an older incarnation never lands in a newer one.
-     * The client returns that refusal, 87 or 5009, and does not retry it.
+     * The client returns that refusal, 87 or 5009, and does not retry it. A context
+     * with incarnation 0 names no history, so the store takes the incarnation of the
+     * partition route once, and keeps the owner and op of the context. An empty
+     * context takes the whole context of the route: its incarnation, owner 0 and op.
      *
      * @param streamId The stream identifier
      * @param topicId The topic identifier
