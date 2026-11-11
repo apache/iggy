@@ -93,7 +93,7 @@ file under `tests/` anymore.
 | [`coordinator_cluster_tests.rs`](../tests/coordinator_cluster_tests.rs) | Three gateways beside a three-node Iggy cluster, one beside each node: the coordinating gateway stops, an Iggy node stops, and each gateway restarts in turn. The member keeps its id and generation through each, and its offsets stay | Needs `iggy-server` |
 | [`replication_factor_cluster_tests.rs`](../tests/replication_factor_cluster_tests.rs) | CreateTopics and Metadata on a three-node Iggy cluster. Iggy stores a replication factor of 2 on two nodes, and -1 takes the server default of 3. A factor of 4 gets 38 with the node count, and creates nothing. Metadata v9 lists as many replicas as the factor | Needs `iggy-server` |
 | [`cluster_failover_tests.rs`](../tests/cluster_failover_tests.rs) | Three compiled gateways with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true` run beside a three-node Iggy cluster. An idempotent Java producer and a Java consumer group of two members load them, and bootstrap from the group's coordinator alone. Each gateway restarts in turn with SIGTERM. Each node stops, the metadata primary first, then the primary of the group's coordinator partition. Each gateway stops with its node. The coordinator stops during a rebalance. The coordinator crashes with SIGKILL during a burst of Produce requests: alone, and with its node, which holds the metadata primary. Each crash checks that Iggy answers a resend of a written batch with its first offset. kcat finds every acknowledged record once, at its acknowledged offset, and no other record, and the group reads each once. Every commit succeeds, and the coordinator returns the last one, the offset after the last record read. The group does not rebalance after it settles. Two gateways answer as coordinator of one group only while it moves, for at most 2 s. Each crash checks its takeover window: 31 to 45 s with the default 36 s session timeout, and 8.6 to 14.6 s with a 9.6 s one. A crash of the metadata primary adds 10 s | No, but needs Docker and a built `iggy-server` |
-| [`cluster_id_real_bridge_tests.rs`](../tests/cluster_id_real_bridge_tests.rs) | The cluster id stored in a real, spawned `iggy-server`: one id for every bridge, the first write winning when several start at once, a persisted topic with no expiry or size cap, the id surviving an `iggy-server` SIGKILL, a stored value that is not an id refused, one id per default stream, and the compiled gateway binary reporting the same id in Metadata and DescribeCluster across a restart ([#4519](https://github.com/apache/iggy/issues/4519)) | No (needs both binaries - see Prerequisites) |
+| [`cluster_id_real_bridge_tests.rs`](../tests/cluster_id_real_bridge_tests.rs) | The cluster id stored in a real, spawned `iggy-server`: one id for every bridge, the first write winning when several start at once, a persisted topic with no expiry or size cap, the id surviving an `iggy-server` SIGKILL, a stored value that is not an id refused, one id per default stream, the compiled gateway binary reporting the same id in Metadata and DescribeCluster across a restart ([#4519](https://github.com/apache/iggy/issues/4519)), and one of several bridged gateways answering `REBOOTSTRAP_REQUIRED` to an ApiVersions v5 request that names another cluster (KIP-1242) | No (needs both binaries - see Prerequisites) |
 | [`phase1_e2e_tests.rs`](../tests/phase1_e2e_tests.rs) | [#3539](https://github.com/apache/iggy/issues/3539) acceptance: CreateTopics → Metadata → Produce → ListOffsets over real TCP against the real compiled `iggy-gateway-kafka` binary, bridged to a real spawned `iggy-server`. With `cluster_id_real_bridge_tests.rs` and `cluster_failover_tests.rs`, it is one of the three suites that spawn the gateway as a process rather than calling `KafkaGateway::run` in-process. A gateway started 16 s before its `iggy-server` waits for it and then serves | No (needs both binaries - see Prerequisites) |
 
 `tests/common/` holds shared helpers (`certs.rs`, `codec.rs`, `deployment.rs`, `docker_clients.rs`, `fixtures.rs`, `gateway_process.rs`,
@@ -111,13 +111,17 @@ already-built `iggy-server` in the same target directory, and a host JDK 17+ (`j
 consumer `offsetsForTimes` probe. Missing any of them makes it skip with a printed reason rather
 than fail, which is what lets `cargo test -p iggy-gateway-kafka` stay usable without them.
 
-Client containers run with `--pull never`, so pull the two images first. Without them the suite
-skips and names the missing one.
+Client containers run with `--pull never`, so pull the images first. Without them the suite
+skips and names the missing one. The Java tools come from Kafka 4.4.0, the newest release. One test
+runs the tools of 4.0.2, the oldest Kafka 4 release, and one runs the tools of 3.9.2, the newest
+Kafka 3 release. Clients 3.9 to 4.3 open ApiVersions at v4, and 4.4 clients open it at v5.
 
 ```bash
 cargo build --bin iggy-server
 docker pull edenhill/kcat:1.7.1
-docker pull apache/kafka:3.9.0
+docker pull apache/kafka:4.4.0
+docker pull apache/kafka:4.0.2
+docker pull apache/kafka:3.9.2
 KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test kafka_client_e2e_tests
 ```
 
@@ -134,14 +138,14 @@ because they cover cases a test does not assert, but the load-bearing ones now r
 
 ## Failover suite
 
-`cluster_failover_tests.rs` uses the same two images and `KAFKA_E2E_REQUIRED` as the real-client
-suite, and skips in the same way. It needs no JDK. Cargo builds the gateway binary for the test,
-but `iggy-server` comes from another package, so build it first:
+`cluster_failover_tests.rs` uses the kcat image, the Kafka 4.4.0 image and `KAFKA_E2E_REQUIRED`, as
+the real-client suite does. It skips in the same way. It needs no JDK. Cargo builds the gateway
+binary for the test, but `iggy-server` comes from another package, so build it first:
 
 ```bash
 cargo build --bin iggy-server
 docker pull edenhill/kcat:1.7.1
-docker pull apache/kafka:3.9.0
+docker pull apache/kafka:4.4.0
 KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test cluster_failover_tests
 ```
 
