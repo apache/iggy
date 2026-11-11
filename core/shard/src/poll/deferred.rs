@@ -1536,10 +1536,15 @@ where
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         }
-        let Some(plan) = self.plane.partitions().build_poll_snapshot(
+        let max_selected_bytes = reply_byte_limit(
+            &waiter.request.options,
+            self.deferred_polls.config.borrow().max_read_bytes,
+        );
+        let Some(plan) = self.plane.partitions().build_poll_snapshot_within(
             &waiter.namespace,
             waiter.request.consumer,
             &waiter.request.args,
+            max_selected_bytes,
         ) else {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;
@@ -1555,10 +1560,6 @@ where
             return;
         };
         let max_bytes = walk_bytes(reservation.bytes);
-        let max_selected_bytes = reply_byte_limit(
-            &waiter.request.options,
-            self.deferred_polls.config.borrow().max_read_bytes,
-        );
         let completion =
             match self
                 .poll_completions

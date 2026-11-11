@@ -557,6 +557,9 @@ async fn given_in_flight_sealed_poll_when_state_is_installed_should_wipe_its_rea
     let handle = Rc::clone(&partition.log.sealed_read_state()[0]);
     let poll = || DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -565,6 +568,7 @@ async fn given_in_flight_sealed_poll_when_state_is_installed_should_wipe_its_rea
             persisted: record_len,
             read_state: Rc::clone(&handle),
             sealed: true,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,

@@ -58,6 +58,9 @@ async fn read_disk_faults_closed_when_earlier_segment_unreadable() {
     // open exhausts retries -> the walk must fault-close before segment two.
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -67,12 +70,14 @@ async fn read_disk_faults_closed_when_earlier_segment_unreadable() {
                 persisted: 512,
                 read_state: SealedSegmentHandle::default(),
                 sealed: false,
+                source: SegmentSource::Local,
             },
             DiskSegment {
                 start_offset: 5,
                 persisted: later_len,
                 read_state: SealedSegmentHandle::default(),
                 sealed: false,
+                source: SegmentSource::Local,
             },
         ],
         start_position: 0,
@@ -134,6 +139,9 @@ async fn read_disk_serves_a_batch_wider_than_the_sized_chunk() {
     // the batch waiting at offset 0.
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: Some(1),
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -142,6 +150,7 @@ async fn read_disk_serves_a_batch_wider_than_the_sized_chunk() {
             persisted: record_len,
             read_state: SealedSegmentHandle::default(),
             sealed: false,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,
@@ -222,6 +231,9 @@ async fn read_disk_faults_closed_when_earlier_segment_corrupt() {
 
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -231,12 +243,14 @@ async fn read_disk_faults_closed_when_earlier_segment_corrupt() {
                 persisted: corrupt_len,
                 read_state: SealedSegmentHandle::default(),
                 sealed: false,
+                source: SegmentSource::Local,
             },
             DiskSegment {
                 start_offset: 5,
                 persisted: later_len,
                 read_state: SealedSegmentHandle::default(),
                 sealed: false,
+                source: SegmentSource::Local,
             },
         ],
         start_position: 0,
@@ -300,6 +314,9 @@ async fn read_disk_faults_closed_on_batch_checksum_mismatch() {
 
     let plan = |validate_checksum| DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum,
@@ -308,6 +325,7 @@ async fn read_disk_faults_closed_on_batch_checksum_mismatch() {
             persisted: record_len,
             read_state: SealedSegmentHandle::default(),
             sealed: false,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,
@@ -340,6 +358,9 @@ async fn read_disk_faults_closed_on_batch_checksum_mismatch() {
 fn file_less_plan(persisted: u64) -> DiskReadPlan {
     DiskReadPlan {
         partition_dir: PartitionDirResolution::NoFiles,
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         segments: vec![DiskSegment {
@@ -347,6 +368,7 @@ fn file_less_plan(persisted: u64) -> DiskReadPlan {
             persisted,
             read_state: SealedSegmentHandle::default(),
             sealed: false,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,
@@ -401,6 +423,9 @@ async fn read_disk_faults_closed_when_file_less_partition_flushed() {
 async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Unresolvable,
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         segments: vec![DiskSegment {
@@ -408,6 +433,7 @@ async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
             persisted: 512,
             read_state: SealedSegmentHandle::default(),
             sealed: false,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,
@@ -471,6 +497,9 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
 
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -479,6 +508,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
             persisted: record_len,
             read_state: Rc::clone(&handle),
             sealed: true,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,
@@ -506,6 +536,9 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
 
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -514,6 +547,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
             persisted: record_len,
             read_state: Rc::clone(&handle),
             sealed: true,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,
@@ -570,6 +604,9 @@ async fn read_disk_does_not_retain_fd_for_untracked_handle() {
     let handle = SealedSegmentHandle::default();
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -578,6 +615,7 @@ async fn read_disk_does_not_retain_fd_for_untracked_handle() {
             persisted: record_len,
             read_state: Rc::clone(&handle),
             sealed: true,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,
@@ -658,6 +696,9 @@ async fn read_disk_reloads_sealed_index_to_skip_scan() {
     let handle = SealedSegmentHandle::default();
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -666,6 +707,7 @@ async fn read_disk_reloads_sealed_index_to_skip_scan() {
             persisted: log_len,
             read_state: Rc::clone(&handle),
             sealed: true,
+            source: SegmentSource::Local,
         }],
         // Byte 0, exactly what disk_poll_start returns for a sealed segment
         // whose resident index was dropped.
@@ -761,6 +803,9 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
     let handle = SealedSegmentHandle::default();
     let plan = DiskReadPlan {
         partition_dir: PartitionDirResolution::Resolved(partition_dir.clone()),
+        remote: None,
+        object_prefix: None,
+        cut: false,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,
@@ -769,6 +814,7 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
             persisted: log_len,
             read_state: Rc::clone(&handle),
             sealed: true,
+            source: SegmentSource::Local,
         }],
         start_position: 0,
         start_index_offset: None,

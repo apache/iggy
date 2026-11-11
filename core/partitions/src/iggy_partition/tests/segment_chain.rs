@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::SegmentLocation;
 use crate::segment_chain::{
     ChainError, ChainRecord, HashSource, ObjectPrefix, hash_segment_file, read_chain,
 };
@@ -265,51 +264,4 @@ async fn given_a_chain_on_disk_when_a_partition_reopens_it_should_know_the_seale
         Box::pin(other.open_segment_chain(foreign)).await,
         Err(ChainError::Prefix { recorded }) if recorded == PREFIX
     ));
-}
-
-async fn polled(
-    partition: &mut IggyPartition<IggyMessageBus>,
-    strategy: iggy_common::PollingStrategy,
-) -> (Option<u64>, Vec<u8>) {
-    let args = PollingArgs::new(strategy, 10, false);
-    let plan = partition.build_poll_plan(PollingConsumer::Consumer(1, 0), &args, true);
-    let result = plan.execute().await;
-    let last_matching_offset = result.last_matching_offset;
-    let completion = partition.complete_poll(result).unwrap();
-    let bytes = completion
-        .fragments
-        .iter()
-        .flat_map(|fragment| fragment.as_slice().iter().copied())
-        .collect();
-    (last_matching_offset, bytes)
-}
-
-/// Tiered segments stay in the segment list, so a poll resolves its start by
-/// offset or timestamp the same way whatever the location says.
-#[compio::test]
-async fn given_remote_segments_when_polling_by_offset_or_timestamp_should_read_as_before() {
-    let (_directory, mut partition) =
-        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
-    let strategies = [
-        iggy_common::PollingStrategy::offset(0),
-        iggy_common::PollingStrategy::offset(3),
-        iggy_common::PollingStrategy::timestamp(iggy_common::IggyTimestamp::from(0)),
-    ];
-    let mut before = Vec::new();
-    for strategy in strategies {
-        before.push(Box::pin(polled(&mut partition, strategy)).await);
-    }
-    assert_eq!(before[0].0, Some(RECEIVER_OPS - 1));
-
-    for segment in partition
-        .log
-        .segments_mut()
-        .iter_mut()
-        .filter(|segment| segment.sealed)
-    {
-        segment.location = SegmentLocation::Remote;
-    }
-    for (strategy, expected) in strategies.into_iter().zip(before) {
-        assert_eq!(Box::pin(polled(&mut partition, strategy)).await, expected);
-    }
 }

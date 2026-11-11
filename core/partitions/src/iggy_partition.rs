@@ -29,9 +29,10 @@ use crate::persistence::{
 };
 use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
-    PollTier, ResidentTailSnapshot,
+    PollTier, ResidentTailSnapshot, SegmentSource,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
+use crate::remote_segments::RemoteRange;
 use crate::segment::{Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
@@ -81,6 +82,7 @@ use iggy_common::{
     EncryptorKind, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
     TopicRuntimeOptions,
 };
+use iggy_object_store::{SegmentKey, SegmentObject};
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
 use journal::superblock::{
@@ -178,6 +180,8 @@ where
     pub(crate) state_machines: StateMachines,
     /// The chain of a tiered partition, `None` until it opens one.
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
+    /// Where polls read segments whose `.log` left the disk.
+    remote_segments: Option<Rc<crate::RemoteSegments>>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -937,6 +941,7 @@ where
             history_transition: None,
             state_machines: StateMachines::default(),
             segment_chain: None,
+            remote_segments: None,
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -5837,12 +5842,35 @@ where
 
     /// Snapshot read resources synchronously on the partition owner.
     /// Only the owned snapshot crosses a suspension during disk I/O.
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub(crate) fn build_poll_plan(
         &mut self,
         consumer: PollingConsumer,
         args: &PollingArgs,
         validate_checksum: bool,
+    ) -> PollPlan {
+        self.build_poll_plan_within(consumer, args, validate_checksum, usize::MAX)
+    }
+
+    /// Hand polls the store that holds this partition's remote segments.
+    pub fn set_remote_segments(&mut self, remote: Rc<crate::RemoteSegments>) {
+        self.remote_segments = Some(remote);
+    }
+
+    /// [`Self::build_poll_plan`] for a poll whose reply holds at most
+    /// `byte_budget` bytes of messages.
+    ///
+    /// The snapshot ends at the segment that covers the poll's count or its
+    /// budget, whichever comes first. Remote segments make the list as long
+    /// as total retention, so a snapshot that ran to the tail would cost a
+    /// poll near the front of a long topic a clone per segment.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn build_poll_plan_within(
+        &mut self,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+        validate_checksum: bool,
+        byte_budget: usize,
     ) -> PollPlan {
         // Reads the durable commit frontier (`self.offset`, stored only on
         // commit). Also used below as the poll's high-water bound: this function
@@ -5959,7 +5987,14 @@ where
         // segment carries its shared read-state handle so the off-borrow read
         // reuses (or fills) the cached fd; only a sealed one also resolves its
         // start byte from the shared sparse index.
-        let segments = self.log.segments()[start_segment..]
+        let object_prefix = self.object_prefix();
+        let walked = walked_segments(
+            &self.log.segments()[start_segment..],
+            args.count,
+            byte_budget,
+        );
+        let cut = start_segment + walked < self.log.segments().len();
+        let segments = self.log.segments()[start_segment..start_segment + walked]
             .iter()
             .zip(self.log.sealed_read_state()[start_segment..].iter())
             .map(|(segment, read_state)| DiskSegment {
@@ -5967,11 +6002,27 @@ where
                 persisted: segment.size.as_bytes_u64(),
                 read_state: Rc::clone(read_state),
                 sealed: segment.sealed,
+                source: match object_prefix {
+                    Some(prefix) if segment.location == SegmentLocation::Remote => {
+                        SegmentSource::Remote(RemoteRange {
+                            key: SegmentKey {
+                                prefix,
+                                start_offset: segment.start_offset,
+                                object: SegmentObject::Log,
+                            },
+                            range: 0..segment.size.as_bytes_u64(),
+                        })
+                    }
+                    _ => SegmentSource::Local,
+                },
             })
             .collect();
         let disk = DiskReadPlan {
             partition_dir: self.partition_dir_resolution(),
+            remote: self.remote_segments.clone(),
+            object_prefix,
             segments,
+            cut,
             start_position,
             start_index_offset,
             namespace_raw: self.namespace().inner(),
@@ -14547,6 +14598,30 @@ fn leading_expired_end(
         up_to = Some(segment.end_offset);
     }
     up_to
+}
+
+/// How many of `segments`, a poll's starting segment and the ones after it,
+/// the poll's snapshot holds.
+///
+/// Every message after the starting segment matches the poll, so the walk
+/// cannot use a segment past the one that completes `count` messages or
+/// `byte_budget` bytes. The starting segment counts toward neither: how much
+/// of it sits before the poll's first match is unknown until it is read.
+fn walked_segments(segments: &[Segment], count: u32, byte_budget: usize) -> usize {
+    let mut messages = 0_u64;
+    let mut bytes = 0_u64;
+    for (walked, segment) in segments.iter().enumerate().skip(1) {
+        if messages >= u64::from(count) || bytes >= byte_budget as u64 {
+            return walked;
+        }
+        let size = segment.size.as_bytes_u64();
+        if size > 0 {
+            messages = messages
+                .saturating_add(segment.end_offset.saturating_sub(segment.start_offset) + 1);
+            bytes = bytes.saturating_add(size);
+        }
+    }
+    segments.len()
 }
 
 /// Highest `end_offset` to drop so the SEALED resident size falls to
