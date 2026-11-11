@@ -86,19 +86,8 @@ const fn text(value: &'static str) -> StrBytes {
     StrBytes::from_static_str(value)
 }
 
-/// A gateway with `IGGY_KAFKA_TOPIC_RETENTION_MS=-1`. A topic that it creates without
-/// `retention.ms` keeps the Iggy default, which never expires, so a describe reports -1 with
-/// `DEFAULT_CONFIG` (5). The tests here alter keys from that start.
-/// `gateway_defaults_apply_to_new_topics_and_come_back_on_a_delete` covers the 7 days default.
 async fn connected_state(server: &TestServer) -> GatewayState {
-    state_with(IggyBridgeConfig {
-        topic_defaults: TopicDefaults {
-            retention_ms: None,
-            ..TopicDefaults::default()
-        },
-        ..server.test_config()
-    })
-    .await
+    state_with(server.test_config()).await
 }
 
 async fn state_with(config: IggyBridgeConfig) -> GatewayState {

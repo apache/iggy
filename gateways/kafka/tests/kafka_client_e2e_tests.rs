@@ -38,18 +38,20 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
+use std::mem::offset_of;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use iggy::prelude::IggyTimestamp;
+use iggy_binary_protocol::consensus::{HEADER_SIZE, Operation, RequestHeader};
 use secrecy::SecretString;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -119,10 +121,14 @@ const LOST_REPLIES: usize = 3;
 /// records it sends there, as the values `0` to `DEFAULTS_RECORDS - 1`.
 const DEFAULTS_TOPIC: &str = "defaults";
 const DEFAULTS_RECORDS: u32 = 300;
-/// Produce responses that the relay holds past the producer's request timeout.
-const STALLED_REPLIES: usize = 3;
-/// The producer's request timeout there, below Kafka's 30 s, so three timeouts fit one client run.
+/// The producer's request timeout there, below Kafka's 30 s, so a stall past it fits one client
+/// run. Produce carries it, so it is also the deadline at which the gateway answers 7.
 const STALL_REQUEST_TIMEOUT_MS: u64 = 3_000;
+/// Sends that reach Iggy before the stall, so the producer has its 5 requests in flight by then.
+const SENDS_BEFORE_STALL: usize = 10;
+/// How long a connection that the gateway closed stays open after a kept send goes out on it, so
+/// that Iggy can still write that send.
+const LATE_SEND_GRACE: Duration = Duration::from_secs(10);
 
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
@@ -1706,7 +1712,7 @@ async fn given_kafka_configs_sh_when_describing_the_broker_should_report_the_gat
     for setting in [
         "auto.create.topics.enable=false",
         "min.insync.replicas=1",
-        "log.retention.ms=604800000",
+        "log.retention.ms=-1",
         "num.partitions=1",
         "default.replication.factor=1",
     ] {
@@ -3230,7 +3236,7 @@ async fn given_lost_produce_responses_when_an_idempotent_producer_retries_should
         .expect("bind the relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let gateway = start_gateway_behind(&server, (LOST_REPLY_TOPIC, 1), relay_addr).await;
-    let relay = LosingRelay::start(relay_listener, gateway.addr, LOST_REPLIES, Duration::ZERO);
+    let relay = LosingRelay::start(relay_listener, gateway.addr, LOST_REPLIES);
 
     let bootstrap = format!("bootstrap.servers={relay_addr}");
     let records = LOST_REPLY_RECORDS.to_string();
@@ -3298,11 +3304,12 @@ async fn given_lost_produce_responses_when_an_idempotent_producer_retries_should
 }
 
 /// A gateway started with only the Iggy address and password keeps the order of a default Java
-/// producer whose requests time out. Its defaults turn on the bridge and idempotent producers, so
-/// each resend after a timeout lands once, in its place. The listener settings only put the
-/// gateway behind the relay.
+/// producer while its sends to Iggy stall past the Produce deadline. The gateway answers 7 for the
+/// stalled batch and for the batches behind it, so the producer sends its requests in flight again
+/// while the first send still runs. That send lands late. The defaults turn on the bridge and
+/// idempotent producers, so each batch lands once, in its place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn given_only_the_iggy_address_and_password_when_requests_time_out_should_keep_a_default_java_producer_in_order()
+async fn given_only_the_iggy_address_and_password_when_sends_to_iggy_stall_should_keep_a_default_java_producer_in_order()
  {
     let Some(server) = ready_server() else {
         return;
@@ -3312,25 +3319,20 @@ async fn given_only_the_iggy_address_and_password_when_requests_time_out_should_
         .ensure_stream_and_topic(DEFAULTS_TOPIC, 1)
         .await
         .expect("create the topic");
-    let relay_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind the relay");
-    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    let hold = Duration::from_millis(2 * STALL_REQUEST_TIMEOUT_MS);
+    let relay = SendStallRelay::start(&server.address, SENDS_BEFORE_STALL, hold).await;
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", free_port())
         .parse()
         .expect("a socket address");
     let _gateway = GatewayProcess::start(
         &[
-            ("IGGY_KAFKA_IGGY_ADDR", &server.address),
+            ("IGGY_KAFKA_IGGY_ADDR", &relay.address),
             ("IGGY_KAFKA_IGGY_PASSWORD", ROOT_PASSWORD),
             ("IGGY_KAFKA_BIND_ADDR", &gateway_addr.to_string()),
-            ("IGGY_KAFKA_ADVERTISED_PORT", &relay_addr.port().to_string()),
         ],
         gateway_addr,
     )
     .await;
-    let hold = Duration::from_millis(2 * STALL_REQUEST_TIMEOUT_MS);
-    let relay = LosingRelay::start(relay_listener, gateway_addr, STALLED_REPLIES, hold);
 
     // The tool sets `retries=0`, which also turns the default idempotence off. The file puts
     // back the Java default, so the producer runs on Kafka's defaults but for the timeouts.
@@ -3346,13 +3348,13 @@ async fn given_only_the_iggy_address_and_password_when_requests_time_out_should_
     .expect("write the producer config");
     let properties = properties.to_str().expect("a UTF-8 path");
     let records = DEFAULTS_RECORDS.to_string();
-    let relay_bootstrap = relay_addr.to_string();
+    let bootstrap = gateway_addr.to_string();
     let output = run_client(
         KAFKA_IMAGE,
         &[
             "/opt/kafka/bin/kafka-verifiable-producer.sh",
             "--bootstrap-server",
-            &relay_bootstrap,
+            &bootstrap,
             "--topic",
             DEFAULTS_TOPIC,
             "--max-messages",
@@ -3375,17 +3377,16 @@ async fn given_only_the_iggy_address_and_password_when_requests_time_out_should_
         Some(u64::from(DEFAULTS_RECORDS)),
         "every record must be acknowledged: {output}"
     );
-    assert_eq!(
-        relay.lost(),
-        STALLED_REPLIES,
-        "the relay must hold that many responses past the timeout: {output}"
+    assert!(
+        relay.held() > 0,
+        "the relay must hold a send past the Produce deadline: {output}"
     );
 
     let read = run_client(
         KCAT_IMAGE,
         &[
             "-b",
-            &relay_bootstrap,
+            &bootstrap,
             "-C",
             "-t",
             DEFAULTS_TOPIC,
@@ -3442,6 +3443,176 @@ impl Drop for GatewayProcess {
     }
 }
 
+/// A relay between a gateway and Iggy that stalls the gateway's sends. The first send after
+/// `before` others starts a stall of `hold`. Until it ends, the relay keeps each `SendMessages`
+/// frame, and every later frame of a connection that it keeps one of. Then it sends the kept
+/// frames on, in order, also on a connection that the gateway closed. So a send that the gateway
+/// gave up on still lands, late.
+struct SendStallRelay {
+    address: String,
+    stall: Arc<SendStall>,
+}
+
+impl SendStallRelay {
+    async fn start(server: &str, before: usize, hold: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let address = listener.local_addr().expect("relay address").to_string();
+        let stall = Arc::new(SendStall {
+            before,
+            hold,
+            sends: AtomicUsize::new(0),
+            ends: OnceLock::new(),
+            held: AtomicUsize::new(0),
+        });
+        let shared = Arc::clone(&stall);
+        let upstream = server.to_string();
+        tokio::spawn(async move {
+            while let Ok((gateway, _)) = listener.accept().await {
+                let Ok(iggy) = TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                tokio::spawn(relay_iggy_connection(gateway, iggy, Arc::clone(&shared)));
+            }
+        });
+        Self { address, stall }
+    }
+
+    /// The sends that the stall kept.
+    fn held(&self) -> usize {
+        self.stall.held.load(Ordering::SeqCst)
+    }
+}
+
+/// The one stall of a [`SendStallRelay`], shared by its connections.
+struct SendStall {
+    before: usize,
+    hold: Duration,
+    sends: AtomicUsize,
+    ends: OnceLock<Instant>,
+    held: AtomicUsize,
+}
+
+impl SendStall {
+    /// Whether to keep `frame`: a send after the first `before`, while the stall runs. The first
+    /// such send starts it.
+    fn keeps(&self, frame: &[u8]) -> bool {
+        if !is_send(frame) || self.sends.fetch_add(1, Ordering::SeqCst) < self.before {
+            return false;
+        }
+        Instant::now() < *self.ends.get_or_init(|| Instant::now() + self.hold)
+    }
+
+    /// The end of the stall, once a send started it.
+    fn ends(&self) -> Option<tokio::time::Instant> {
+        self.ends.get().copied().map(tokio::time::Instant::from_std)
+    }
+}
+
+/// Whether an Iggy request frame sends messages.
+fn is_send(frame: &[u8]) -> bool {
+    frame.get(offset_of!(RequestHeader, operation)) == Some(&(Operation::SendMessages as u8))
+}
+
+/// Relays one Iggy connection of the gateway. A kept send that goes out after the gateway closed
+/// the connection gets [`LATE_SEND_GRACE`] before the relay closes its side to Iggy.
+async fn relay_iggy_connection(gateway: TcpStream, iggy: TcpStream, stall: Arc<SendStall>) {
+    let (requests, replies) = gateway.into_split();
+    let (answers, writes) = iggy.into_split();
+    let (frames, incoming) = tokio::sync::mpsc::channel(64);
+    let reader = tokio::spawn(read_iggy_frames(requests, frames));
+    let answering = tokio::spawn(pass_iggy_answers(answers, replies));
+    let (writes, late) = pass_iggy_requests(incoming, writes, &stall).await;
+    if late {
+        let _ = tokio::time::timeout(LATE_SEND_GRACE, answering).await;
+    }
+    reader.abort();
+    drop(writes);
+}
+
+/// Passes request frames on until the gateway closes its side and nothing is kept. Returns the
+/// side to Iggy, and whether a kept frame went out after the gateway closed.
+async fn pass_iggy_requests(
+    mut incoming: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut writes: OwnedWriteHalf,
+    stall: &SendStall,
+) -> (OwnedWriteHalf, bool) {
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut open = true;
+    loop {
+        let Some(ends) = stall.ends().filter(|_| !kept.is_empty()) else {
+            let Some(frame) = incoming.recv().await else {
+                return (writes, false);
+            };
+            if stall.keeps(&frame) {
+                stall.held.fetch_add(1, Ordering::SeqCst);
+                kept.push(frame);
+            } else if writes.write_all(&frame).await.is_err() {
+                return (writes, false);
+            }
+            continue;
+        };
+        tokio::select! {
+            frame = incoming.recv(), if open => match frame {
+                Some(frame) => {
+                    if is_send(&frame) {
+                        stall.held.fetch_add(1, Ordering::SeqCst);
+                    }
+                    kept.push(frame);
+                }
+                None => open = false,
+            },
+            () = tokio::time::sleep_until(ends) => {
+                for frame in std::mem::take(&mut kept) {
+                    if writes.write_all(&frame).await.is_err() {
+                        return (writes, false);
+                    }
+                }
+                if !open {
+                    return (writes, true);
+                }
+            }
+        }
+    }
+}
+
+/// Reads whole Iggy request frames into `frames` until a side closes.
+async fn read_iggy_frames(mut requests: OwnedReadHalf, frames: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    let size_at = offset_of!(RequestHeader, size);
+    loop {
+        let mut frame = vec![0; HEADER_SIZE];
+        if requests.read_exact(&mut frame).await.is_err() {
+            return;
+        }
+        let size = u32::from_le_bytes(frame[size_at..size_at + 4].try_into().expect("4 bytes"));
+        frame.resize(usize::try_from(size).expect("a frame size"), 0);
+        if requests
+            .read_exact(&mut frame[HEADER_SIZE..])
+            .await
+            .is_err()
+            || frames.send(frame).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Copies Iggy's answers back until Iggy closes, and drops them once the gateway closed its side.
+async fn pass_iggy_answers(mut answers: OwnedReadHalf, mut replies: OwnedWriteHalf) {
+    let mut chunk = vec![0; 64 * 1024];
+    let mut open = true;
+    loop {
+        let read = match answers.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        if open && replies.write_all(&chunk[..read]).await.is_err() {
+            open = false;
+        }
+    }
+}
+
 /// A bridged gateway that advertises `relay` in place of its own address, so a client that learns
 /// the brokers from Metadata stays behind the relay.
 async fn start_gateway_behind(
@@ -3474,14 +3645,13 @@ async fn start_gateway_behind(
 }
 
 /// A TCP relay to a gateway that loses its first Produce responses. It reads the Kafka frames of
-/// each connection, and drops a Produce response together with its connection after a hold. A
-/// hold past the client's request timeout makes the client time out first.
+/// each connection, and drops a Produce response together with its connection.
 struct LosingRelay {
     lost: Arc<AtomicUsize>,
 }
 
 impl LosingRelay {
-    fn start(listener: TcpListener, gateway: SocketAddr, losses: usize, hold: Duration) -> Self {
+    fn start(listener: TcpListener, gateway: SocketAddr, losses: usize) -> Self {
         let lost = Arc::new(AtomicUsize::new(0));
         let budget = Arc::new(AtomicUsize::new(losses));
         let counted = Arc::clone(&lost);
@@ -3495,7 +3665,6 @@ impl LosingRelay {
                     upstream,
                     Arc::clone(&budget),
                     Arc::clone(&counted),
-                    hold,
                 ));
             }
         });
@@ -3507,14 +3676,12 @@ impl LosingRelay {
     }
 }
 
-/// Copies frames both ways until one side closes, or until a Produce response is lost. A lost
-/// response closes its connection after `hold`.
+/// Copies frames both ways until one side closes, or until a Produce response is lost.
 async fn relay_frames(
     client: TcpStream,
     upstream: TcpStream,
     budget: Arc<AtomicUsize>,
     lost: Arc<AtomicUsize>,
-    hold: Duration,
 ) {
     const API_KEY_PRODUCE: i16 = 0;
     let (mut client_read, mut client_write) = client.into_split();
@@ -3555,7 +3722,6 @@ async fn relay_frames(
                     .is_ok()
             {
                 lost.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(hold).await;
                 return;
             }
             if client_write.write_all(&frame).await.is_err() {

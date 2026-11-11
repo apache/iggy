@@ -247,9 +247,8 @@ can pin it.
 ## More than one gateway
 
 The gateways share their groups through the coordinator log, the Iggy topic `coordinators` in the
-stream `<default stream>.meta`. The log is on by default with the bridge, also for a single
-gateway (`IGGY_KAFKA_COORDINATOR_LOG`). Only the log keeps the commit times that offset expiry
-reads. It needs `manage_servers` on the bridge's Iggy user, to follow
+stream `<default stream>.meta`. The log is on by default with `IGGY_KAFKA_BROKERS` and the bridge
+(`IGGY_KAFKA_COORDINATOR_LOG`). It needs `manage_servers` on the bridge's Iggy user, to follow
 Iggy's change log. Without it, a gateway with the log on by default runs without the log and logs
 a warning. A gateway with `IGGY_KAFKA_COORDINATOR_LOG=true` does not start. The code is in
 `src/coordinator/`.

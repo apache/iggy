@@ -104,8 +104,7 @@ it. OffsetDelete (47) deletes single keys
 
 With the coordinator log, the gateway also deletes the offsets of a group without members, 7 days
 after its last commit or after it lost its last member, whichever is later (see "More than one
-gateway"). The log is on by default with the bridge, also for a single gateway. Without the log,
-the gateway deletes nothing on its own. No gateway then knows whether another
+gateway"). Without the log, the gateway deletes nothing on its own. No gateway then knows whether another
 gateway or a standalone consumer still uses a group, and Iggy keeps no commit time.
 
 The log does not know a group that committed only before the log was on. It also does not know a
@@ -167,6 +166,12 @@ log decides each offset:
   commit stores it in Iggy again.
 - Only the coordinator answers offset requests for a group, so a commit made through another
   gateway answers `NOT_COORDINATOR`, and the client asks the coordinator.
+
+A gateway that runs without the log stores its commits in Iggy only. Two cases do that:
+`IGGY_KAFKA_COORDINATOR_LOG=false`, and a gateway that falls back to running without the log. Once
+the log is on again, it answers the older offsets that it holds for those groups. It also counts
+their retention from its own older commit times. So a group without members can lose its newer
+offsets at the next check. Do not run gateways without the log on a stream whose log holds groups.
 
 Without the coordinator log, offsets are shared, since the key depends only on the Kafka group id.
 Membership is not. With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names one gateway for every group,

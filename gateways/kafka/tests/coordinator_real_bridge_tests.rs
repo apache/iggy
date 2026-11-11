@@ -759,54 +759,6 @@ async fn given_a_group_without_commits_for_the_retention_should_delete_its_offse
     gateway.stop().await;
 }
 
-/// A gateway alone, with no `IGGY_KAFKA_BROKERS`, runs the coordinator log on its defaults
-/// (`CoordinatorLog::Preferred`, what `main.rs` sets with the bridge on). So the offsets of an idle
-/// group expire there too, and its keys stop counting against
-/// `partition.consumer_offsets_max`.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn given_a_gateway_alone_on_its_defaults_should_expire_the_offsets_of_an_idle_group() {
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let server = TestServer::spawn(data_dir.path()).await;
-    create_topic(server.test_config()).await;
-    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = socket.local_addr().expect("local addr");
-    let config = GatewayConfig {
-        coordinator_log: CoordinatorLog::Preferred,
-        coordination: CoordinationConfig {
-            offsets_retention: Some(Duration::from_secs(4)),
-            retention_check: Duration::from_millis(200),
-            ..CoordinationConfig::default()
-        },
-        ..gateway_config(1, Vec::new())
-    };
-    let gateway = start_gateway(server.test_config(), config, socket, addr).await;
-    let outside = StrBytes::default();
-    agreed_coordinator(&[&gateway], "alone").await;
-    eventually(SETTLE, "a first commit", || async {
-        (commit(addr, "alone", &outside, -1, 1, "").await == ERROR_NONE).then_some(())
-    })
-    .await;
-    let raw = raw_client(&server).await;
-    assert!(
-        offset_group_exists(&raw, "alone").await,
-        "the commit creates the Iggy group"
-    );
-
-    eventually(
-        Duration::from_secs(30),
-        "the deletion of the idle group",
-        || async {
-            let gone = !offset_group_exists(&raw, "alone").await
-                && fetch(addr, "alone").await == (ERROR_NONE, -1, String::new());
-            gone.then_some(())
-        },
-    )
-    .await;
-
-    gateway.stop().await;
-}
-
 /// A principal without a read or manage permission commits nothing, also once the group exists.
 /// Its refused commit never reaches the log, so `OffsetFetch`, which the log answers, does not
 /// return it.

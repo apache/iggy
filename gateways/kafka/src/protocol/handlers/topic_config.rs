@@ -1547,14 +1547,6 @@ mod tests {
         assert_eq!(unknown, ConfigFault::UnknownKey("no.such".to_string()));
     }
 
-    /// Defaults of a gateway with `IGGY_KAFKA_TOPIC_RETENTION_MS=-1`: no retention of its own.
-    fn without_retention() -> TopicDefaults {
-        TopicDefaults {
-            retention_ms: None,
-            ..TopicDefaults::default()
-        }
-    }
-
     #[test]
     fn given_incremental_deletes_should_go_back_to_the_iggy_default_without_a_gateway_default() {
         let unset = incremental(
@@ -1564,7 +1556,7 @@ mod tests {
                 ("no.such", 1, None),
             ],
             &topic(),
-            &without_retention(),
+            &TopicDefaults::default(),
         )
         .expect("valid");
         assert!(unset.is_empty(), "nothing was set, so nothing is written");
@@ -1579,7 +1571,7 @@ mod tests {
         let reset = incremental(
             &[(RETENTION_MS, 1, Some("")), (RETENTION_BYTES, 1, None)],
             &set,
-            &without_retention(),
+            &TopicDefaults::default(),
         )
         .expect("valid");
         assert_eq!(reset.message_expiry, Some(SettingChange::Reset));
@@ -1761,8 +1753,12 @@ mod tests {
             max_topic_size_explicit: true,
             ..topic()
         };
-        let update =
-            replace([(RETENTION_MS, Some("2000"))], &set, &without_retention()).expect("valid");
+        let update = replace(
+            [(RETENTION_MS, Some("2000"))],
+            &set,
+            &TopicDefaults::default(),
+        )
+        .expect("valid");
         assert_eq!(
             update.message_expiry,
             Some(SettingChange::Set(expiry_from_retention_ms(2_000)))
@@ -1770,7 +1766,7 @@ mod tests {
         assert_eq!(update.max_topic_size, Some(SettingChange::Reset));
 
         let everything =
-            replace(NO_CONFIGS, &set, &without_retention()).expect("an empty list resets");
+            replace(NO_CONFIGS, &set, &TopicDefaults::default()).expect("an empty list resets");
         assert_eq!(everything.message_expiry, Some(SettingChange::Reset));
         assert_eq!(everything.max_topic_size, Some(SettingChange::Reset));
         assert_eq!(everything.kept_segment_size, None, "the default size");

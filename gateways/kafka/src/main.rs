@@ -284,6 +284,13 @@ async fn connect_bridge(
         return Ok(None);
     }
     let config = IggyBridgeConfig::from_env().map_err(|e| format!("invalid bridge config: {e}"))?;
+    if env_var("IGGY_KAFKA_TOPIC_RETENTION_MS").is_none() {
+        warn!(
+            "IGGY_KAFKA_TOPIC_RETENTION_MS is unset, so each topic that the gateway creates \
+             without retention.ms keeps its records forever. Set Kafka's 7 days, 604800000, or \
+             set -1 to keep them forever without this warning"
+        );
+    }
     if !config.tls.enabled {
         warn!(
             "the bridge's connection to Iggy is unencrypted and carries IGGY_KAFKA_IGGY_PASSWORD \
@@ -409,16 +416,16 @@ fn load_config() -> Result<GatewayConfig, String> {
     Ok(config)
 }
 
-/// Whether the gateways share their groups through the coordinator log. On by default with the
-/// bridge, also for a single gateway, unless the bridge user cannot read Iggy's metadata change
-/// log. Only the log keeps commit times, so without it no offset expires. Set on, the log needs
-/// that.
+/// Whether the gateways share their groups through the coordinator log. On by default when
+/// `IGGY_KAFKA_BROKERS` lists the gateways and the bridge is on, unless the bridge user cannot
+/// read Iggy's metadata change log. Set on, the log needs that.
 fn load_coordinator_log(
     config: &GatewayConfig,
     bridge_enabled: bool,
 ) -> Result<CoordinatorLog, String> {
     let Some(raw) = env_var("IGGY_KAFKA_COORDINATOR_LOG") else {
-        return Ok(if bridge_enabled {
+        let preferred = bridge_enabled && !config.brokers.is_empty();
+        return Ok(if preferred {
             CoordinatorLog::Preferred
         } else {
             CoordinatorLog::Off
@@ -944,22 +951,24 @@ mod tests {
         }
     }
 
-    /// A gateway with nothing set talks to Iggy, and keeps the commit times of its groups in the
-    /// coordinator log, so its offsets expire. Stub mode and a gateway without the log are asked
-    /// for.
+    /// A gateway with nothing set talks to Iggy. It shares its groups through the coordinator log
+    /// only when `IGGY_KAFKA_BROKERS` lists the gateways. Stub mode and a gateway without the log
+    /// are asked for.
     #[test]
     #[serial]
-    fn given_no_bridge_or_log_vars_when_loading_config_should_bridge_and_prefer_the_log() {
-        let defaults = load_with(&[]).expect("defaults load");
+    fn given_no_bridge_or_log_vars_when_loading_config_should_bridge_and_log_only_with_brokers() {
+        let alone = load_with(&[]).expect("defaults load");
         assert_eq!(
-            defaults.coordinator_log,
-            CoordinatorLog::Preferred,
-            "one gateway uses the log too"
+            alone.coordinator_log,
+            CoordinatorLog::Off,
+            "a gateway alone runs without the log"
         );
-        assert_eq!(
-            defaults.coordination.offsets_retention, None,
-            "Kafka's 7 days"
-        );
+        let listed = load_with(&[
+            ("IGGY_KAFKA_NODE_ID", "1"),
+            ("IGGY_KAFKA_BROKERS", "1@gw-1:9093,2@gw-2:9093"),
+        ])
+        .expect("a listed gateway loads");
+        assert_eq!(listed.coordinator_log, CoordinatorLog::Preferred);
 
         let stub = load_with(&[("IGGY_KAFKA_BRIDGE_ENABLED", "false")]).expect("stub mode loads");
         assert_eq!(stub.coordinator_log, CoordinatorLog::Off);
@@ -1071,19 +1080,9 @@ mod tests {
             ]
         }
         let overflow = u64::MAX.to_string();
-        let cases: [(&[(&str, &str)], &str); 5] = [
+        let cases: [(&[(&str, &str)], &str); 4] = [
             (
-                &[
-                    ("IGGY_KAFKA_BRIDGE_ENABLED", "false"),
-                    ("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "60"),
-                ],
-                "IGGY_KAFKA_COORDINATOR_LOG=true",
-            ),
-            (
-                &[
-                    ("IGGY_KAFKA_COORDINATOR_LOG", "false"),
-                    ("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "60"),
-                ],
+                &[("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "60")],
                 "IGGY_KAFKA_COORDINATOR_LOG=true",
             ),
             (&with_log("0"), "greater than 0"),

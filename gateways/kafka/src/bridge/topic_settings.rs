@@ -132,12 +132,9 @@ impl RetentionBytes {
     }
 }
 
-/// Kafka's default `log.retention.ms`: 7 days.
-pub const KAFKA_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-
 /// Settings of the topics the gateway creates, for each one a request leaves out: Kafka's broker
 /// defaults `log.retention.ms` and `log.retention.bytes`, and the Iggy durability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopicDefaults {
     /// `IGGY_KAFKA_TOPIC_RETENTION_MS`, a positive count. `None` never expires.
     pub retention_ms: Option<u64>,
@@ -155,7 +152,8 @@ impl TopicDefaults {
         "IGGY_KAFKA_TOPIC_DURABILITY",
     ];
 
-    /// Reads the defaults from the environment. An unset variable keeps [`Self::default`].
+    /// Reads the defaults from the environment. An unset variable keeps the Iggy default: no
+    /// expiry, no size cap, and replicated durability.
     ///
     /// # Errors
     ///
@@ -184,7 +182,7 @@ impl TopicDefaults {
         durability: Option<&str>,
     ) -> Result<Self, String> {
         let retention_ms = match retention_ms {
-            None => Some(KAFKA_RETENTION_MS),
+            None => None,
             Some(raw) => match raw.trim().parse::<i64>() {
                 Ok(-1) => None,
                 Ok(millis) if millis > 0 => u64::try_from(millis).ok(),
@@ -235,18 +233,6 @@ impl TopicDefaults {
     #[must_use]
     pub fn retention(&self) -> Option<RetentionBytes> {
         self.retention_bytes.map(RetentionBytes::PerPartition)
-    }
-}
-
-impl Default for TopicDefaults {
-    /// Kafka's broker defaults: records expire after 7 days, and no size cap. Iggy's replicated
-    /// durability.
-    fn default() -> Self {
-        Self {
-            retention_ms: Some(KAFKA_RETENTION_MS),
-            retention_bytes: None,
-            durability: Durability::default(),
-        }
     }
 }
 
@@ -592,18 +578,8 @@ mod tests {
         assert_eq!(defaults.retention_bytes, Some(GIB));
         assert_eq!(defaults.durability, Durability::Persisted);
 
-        let unset = TopicDefaults::parse(None, None, None).expect("valid");
-        assert_eq!(unset, TopicDefaults::default());
-        assert_eq!(
-            unset.retention_ms,
-            Some(604_800_000),
-            "Kafka's 7 days, as log.retention.ms"
-        );
-
         let none = TopicDefaults::parse(Some("-1"), Some("-1"), None).expect("valid");
-        assert_eq!(none.retention_ms, None, "-1 never expires");
-        assert_eq!(none.retention_bytes, None);
-        assert_eq!(none.durability, Durability::Replicated);
+        assert_eq!(none, TopicDefaults::default());
 
         for (ms, bytes, durability, variable) in [
             (Some("0"), None, None, "IGGY_KAFKA_TOPIC_RETENTION_MS"),
@@ -659,11 +635,7 @@ mod tests {
         assert_eq!(named.replication_factor, Some(3));
 
         let bare = KafkaTopicSettings::default().create_options(1, &TopicDefaults::default());
-        assert_eq!(
-            bare.message_expiry,
-            Some(expiry_from_retention_ms(604_800_000)),
-            "a topic that names no retention expires after Kafka's 7 days"
-        );
+        assert_eq!(bare.message_expiry, None);
         assert_eq!(bare.max_topic_size, None);
         assert_eq!(bare.replication_factor, None);
         assert_eq!(bare.durability, Durability::Replicated);
