@@ -268,42 +268,6 @@ impl Deployment {
         routes
     }
 
-    /// When Iggy stored the message at `offset` of partition `partition_id` of `topic` in `stream`:
-    /// the clock of the partition's primary at the prepare, in microseconds since the Unix epoch.
-    /// `None` when no node answers, or the partition holds no message at `offset`.
-    pub async fn stored_at(
-        &self,
-        stream: &str,
-        topic: &str,
-        partition_id: u32,
-        offset: u64,
-    ) -> Option<u64> {
-        let client = self.client().await?;
-        let polled = async {
-            tokio::time::timeout(
-                QUERY_LIMIT,
-                client.poll_messages(
-                    &Identifier::named(stream).ok()?,
-                    &Identifier::named(topic).ok()?,
-                    partition_id,
-                    &Consumer::default(),
-                    &PollingStrategy::offset(offset),
-                    PollOptions {
-                        count: 1,
-                        ..PollOptions::default()
-                    },
-                ),
-            )
-            .await
-            .ok()?
-            .ok()
-        }
-        .await;
-        sign_out(&client).await;
-        let message = polled?.messages.into_iter().next()?;
-        (message.header.offset == offset).then_some(message.header.timestamp)
-    }
-
     /// Up to `count` messages of each partition of `from` in `topic` of `stream`, read from the
     /// offset that `from` gives that partition, as `(partition id, offset, payload)`. `None` when
     /// no node answers.
