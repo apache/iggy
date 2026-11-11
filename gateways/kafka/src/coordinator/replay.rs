@@ -52,6 +52,15 @@ pub struct GroupOffsets {
 }
 
 impl GroupOffsets {
+    /// Marks the group without members from `at_ms` on. Kafka counts the retention of such a
+    /// group from then (KIP-211), and the log from its newest commit time. So each commit time
+    /// moves up to `at_ms`, which a checkpoint keeps, as it writes only the offsets.
+    pub fn emptied_at(&mut self, at_ms: i64) {
+        for committed in self.entries.values_mut().flatten() {
+            committed.commit_timestamp_ms = committed.commit_timestamp_ms.max(at_ms);
+        }
+    }
+
     /// Drops each offset of an older incarnation of its topic than `incarnation_of` names. Iggy
     /// deleted that topic with its offsets, so the topic of that name now holds none of them.
     /// An offset whose incarnation the gateway did not know stays.
@@ -164,7 +173,11 @@ impl PartitionState {
                     self.groups.insert(group_id, snapshot);
                 }
                 None => {
-                    self.groups.remove(&group_id);
+                    if self.groups.remove(&group_id).is_some()
+                        && let Some(offsets) = self.offsets.get_mut(&group_id)
+                    {
+                        offsets.emptied_at(millis_of(stored_at));
+                    }
                 }
             },
             Body::Offset {
@@ -310,25 +323,33 @@ impl PartitionState {
         logged
     }
 
-    /// The groups whose offsets the log drops at `now_ms`: no stored state, so no members here,
-    /// and no commit in the last `retention_ms`. A group with no commit, which holds only
-    /// deletions, goes at once: Iggy deleted those offsets too.
+    /// The groups whose offsets expired at `now_ms`. See [`Self::is_expired`].
     #[must_use]
     pub fn expired_groups(&self, retention_ms: i64, now_ms: i64) -> Vec<String> {
         self.offsets
-            .iter()
-            .filter(|(group_id, offsets)| {
-                !self.groups.contains_key(*group_id)
-                    && offsets
-                        .entries
-                        .values()
-                        .flatten()
-                        .map(|committed| committed.commit_timestamp_ms)
-                        .max()
-                        .is_none_or(|last| now_ms.saturating_sub(last) >= retention_ms)
-            })
-            .map(|(group_id, _)| group_id.clone())
+            .keys()
+            .filter(|group_id| self.is_expired(group_id, retention_ms, now_ms))
+            .cloned()
             .collect()
+    }
+
+    /// Whether the offsets of `group_id` expired at `now_ms`: the log holds offsets of it, no
+    /// stored state, so no members here, and no commit in the last `retention_ms`, nor a loss of
+    /// its last member ([`GroupOffsets::emptied_at`]). A group with no commit, which holds only
+    /// deletions, expires at once: Iggy deleted those offsets too.
+    #[must_use]
+    pub fn is_expired(&self, group_id: &str, retention_ms: i64, now_ms: i64) -> bool {
+        let Some(offsets) = self.offsets.get(group_id) else {
+            return false;
+        };
+        !self.groups.contains_key(group_id)
+            && offsets
+                .entries
+                .values()
+                .flatten()
+                .map(|committed| committed.commit_timestamp_ms)
+                .max()
+                .is_none_or(|last| now_ms.saturating_sub(last) >= retention_ms)
     }
 
     /// The records a checkpoint writes, without building them.
@@ -452,6 +473,11 @@ fn deleted_with(committed: Option<&CommittedOffset>, incarnation: u64) -> bool {
             .topic_incarnation
             .is_none_or(|other| other == incarnation)
     })
+}
+
+/// `micros` since the Unix epoch, in milliseconds.
+fn millis_of(micros: u64) -> i64 {
+    i64::try_from(micros / 1_000).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -930,8 +956,71 @@ mod tests {
         assert_eq!(state.apply(5, 0, record(1, expiry)), Applied::Valid);
         assert!(
             !state.offsets.contains_key("deleted"),
-            "Iggy answers for the group again"
+            "the log no longer answers for the group"
         );
+    }
+
+    #[test]
+    fn given_a_group_expired_when_it_commits_again_should_no_longer_expire() {
+        let mut state = PartitionState::default();
+        state.apply(0, 0, record(1, commit("old", "orders", 0, 100, None)));
+        state.apply(1, 0, record(1, commit("old", "orders", 1, 200, None)));
+        assert!(
+            state.is_expired("old", 500, 700),
+            "the newest commit is 500 ms old"
+        );
+        assert!(
+            !state.is_expired("old", 500, 699),
+            "the newest commit counts, not the oldest"
+        );
+        assert!(
+            !state.is_expired("unknown", 500, 1_000),
+            "the log holds no offsets of the group"
+        );
+
+        state.apply(2, 0, record(1, commit("old", "payments", 0, 650, None)));
+
+        assert!(
+            !state.is_expired("old", 500, 1_000),
+            "a commit to another topic counts too"
+        );
+        assert_eq!(state.expired_groups(500, 1_000), Vec::<String>::new());
+    }
+
+    /// A live group can go longer than the retention without a commit. Kafka counts the
+    /// retention from when it lost its last member (KIP-211), and so does the log, also past a
+    /// checkpoint.
+    #[test]
+    fn given_a_group_that_lost_its_members_after_its_last_commit_should_expire_a_retention_later() {
+        let mut state = PartitionState::default();
+        let group_state = |snapshot| Body::Group {
+            group_id: "live".to_string(),
+            snapshot,
+        };
+        state.apply(0, 0, record(1, group_state(Some(group(1)))));
+        state.apply(1, 0, record(1, commit("live", "orders", 0, 100, None)));
+        assert!(
+            !state.is_expired("live", 500, 5_000),
+            "a group with members keeps its offsets"
+        );
+
+        state.apply(2, 3_000_000, record(1, group_state(None)));
+
+        assert!(
+            !state.is_expired("live", 500, 3_499),
+            "the retention counts from the loss of the last member at 3000 ms"
+        );
+        assert!(state.is_expired("live", 500, 3_500));
+
+        let mut loaded = PartitionState::default();
+        for (offset, body) in (0..).zip(state.checkpoint_bodies()) {
+            loaded.apply(offset, 9_000_000, record(1, body));
+        }
+        assert!(
+            !loaded.is_expired("live", 500, 3_499),
+            "a checkpoint keeps it"
+        );
+        assert!(loaded.is_expired("live", 500, 3_500));
     }
 
     /// A checkpoint goes on with a group's offsets where its last chunk ended.

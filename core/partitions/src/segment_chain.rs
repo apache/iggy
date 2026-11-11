@@ -36,6 +36,8 @@ use std::io;
 
 use compio::io::AsyncWriteAtExt;
 use consensus::state_artifact_checksum;
+pub use iggy_object_store::ObjectPrefix;
+use iggy_object_store::SEGMENT_HASH_LEN;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::fatal::NoteDescriptorExhaustion;
@@ -52,13 +54,13 @@ mod tests;
 pub const CHAIN_FILE: &str = "remote.chain";
 
 /// Bytes in a segment hash.
-pub const SEGMENT_HASH_SIZE: usize = 32;
+pub const SEGMENT_HASH_SIZE: usize = SEGMENT_HASH_LEN;
 
 /// `magic | stream_id | topic_id | partition_id | created_revision |
 /// checksum`, all `u64` little-endian.
 pub const HEADER_SIZE: usize = 48;
 
-/// `kind u8 | source u8 | 6 zero bytes | start_offset | end_offset |
+/// `kind u8 | source u8 | 2 zero bytes | crc32c u32 | start_offset | end_offset |
 /// start_timestamp | end_timestamp | max_timestamp | size | incarnation | hash
 /// | checksum`, the integers `u64` little-endian.
 pub const RECORD_SIZE: usize = 104;
@@ -75,43 +77,31 @@ const TRIM_POINT: u8 = 3;
 const COMMIT_PATH: u8 = 1;
 const DISK: u8 = 2;
 
-/// Where a partition's objects live in the store. Recorded once, so keys never
-/// depend on local ids that another reader of the bucket may not share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObjectPrefix {
-    pub stream_id: u64,
-    pub topic_id: u64,
-    pub partition_id: u64,
-    pub created_revision: u64,
+fn encode_header(prefix: &ObjectPrefix) -> [u8; HEADER_SIZE] {
+    let mut header = [0; HEADER_SIZE];
+    let mut writer = FieldWriter::new(&mut header);
+    writer.u64(HEADER_MAGIC);
+    writer.u64(prefix.stream_id);
+    writer.u64(prefix.topic_id);
+    writer.u64(prefix.partition_id);
+    writer.u64(prefix.created_revision);
+    let checksum = state_artifact_checksum(&header[..HEADER_CHECKSUM_AT]);
+    header[HEADER_CHECKSUM_AT..].copy_from_slice(&checksum.to_le_bytes());
+    header
 }
 
-impl ObjectPrefix {
-    fn encode(&self) -> [u8; HEADER_SIZE] {
-        let mut header = [0; HEADER_SIZE];
-        let mut writer = FieldWriter::new(&mut header);
-        writer.u64(HEADER_MAGIC);
-        writer.u64(self.stream_id);
-        writer.u64(self.topic_id);
-        writer.u64(self.partition_id);
-        writer.u64(self.created_revision);
-        let checksum = state_artifact_checksum(&header[..HEADER_CHECKSUM_AT]);
-        header[HEADER_CHECKSUM_AT..].copy_from_slice(&checksum.to_le_bytes());
-        header
+fn decode_header(header: &[u8; HEADER_SIZE]) -> Option<ObjectPrefix> {
+    let mut reader = FieldReader::new(header);
+    if reader.u64() != HEADER_MAGIC {
+        return None;
     }
-
-    fn decode(header: &[u8; HEADER_SIZE]) -> Option<Self> {
-        let mut reader = FieldReader::new(header);
-        if reader.u64() != HEADER_MAGIC {
-            return None;
-        }
-        let prefix = Self {
-            stream_id: reader.u64(),
-            topic_id: reader.u64(),
-            partition_id: reader.u64(),
-            created_revision: reader.u64(),
-        };
-        (reader.u64() == state_artifact_checksum(&header[..HEADER_CHECKSUM_AT])).then_some(prefix)
-    }
+    let prefix = ObjectPrefix {
+        stream_id: reader.u64(),
+        topic_id: reader.u64(),
+        partition_id: reader.u64(),
+        created_revision: reader.u64(),
+    };
+    (reader.u64() == state_artifact_checksum(&header[..HEADER_CHECKSUM_AT])).then_some(prefix)
 }
 
 /// How a segment's hash was taken.
@@ -122,6 +112,16 @@ pub enum HashSource {
     /// Read back from the segment file: a weaker guarantee, since it describes
     /// what the disk returned rather than what consensus agreed on.
     Disk,
+}
+
+/// The two hashes of a segment's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentHashes {
+    /// What a replica compares before it trusts a segment it did not write.
+    pub blake3: [u8; SEGMENT_HASH_SIZE],
+    /// What an upload hands the store, which refuses bytes that hash to
+    /// anything else and reports the value back for the object it holds.
+    pub crc32c: u32,
 }
 
 /// A sealed segment as the chain records it.
@@ -136,16 +136,17 @@ pub struct SegmentRecord {
     /// The partition incarnation that sealed the segment.
     pub incarnation: u64,
     pub hash: [u8; SEGMENT_HASH_SIZE],
+    pub crc32c: u32,
     pub source: HashSource,
 }
 
 impl SegmentRecord {
-    /// The record of `segment` sealed with `hash`.
+    /// The record of `segment` sealed with `hashes`.
     #[must_use]
     pub fn new(
         segment: &Segment,
         incarnation: u64,
-        hash: [u8; SEGMENT_HASH_SIZE],
+        hashes: SegmentHashes,
         source: HashSource,
     ) -> Self {
         Self {
@@ -156,7 +157,8 @@ impl SegmentRecord {
             max_timestamp: segment.max_timestamp,
             size: segment.size.as_bytes_u64(),
             incarnation,
-            hash,
+            hash: hashes.blake3,
+            crc32c: hashes.crc32c,
             source,
         }
     }
@@ -200,7 +202,8 @@ impl ChainRecord {
                     HashSource::CommitPath => COMMIT_PATH,
                     HashSource::Disk => DISK,
                 };
-                writer.bytes(&[kind, source, 0, 0, 0, 0, 0, 0]);
+                writer.bytes(&[kind, source, 0, 0]);
+                writer.bytes(&segment.crc32c.to_le_bytes());
                 writer.u64(segment.start_offset);
                 writer.u64(segment.end_offset);
                 writer.u64(segment.start_timestamp);
@@ -224,8 +227,9 @@ impl ChainRecord {
     /// source, padding that is not zero, or a checksum that does not match.
     fn decode(bytes: &[u8; RECORD_SIZE]) -> Option<Self> {
         let mut reader = FieldReader::new(bytes);
-        let [kind, source, padding @ ..] = reader.array::<8>();
-        if padding != [0; 6]
+        let [kind, source, padding @ ..] = reader.array::<4>();
+        let crc32c = u32::from_le_bytes(reader.array());
+        if padding != [0; 2]
             || u64::from_le_bytes(*bytes.last_chunk()?)
                 != state_artifact_checksum(&bytes[..RECORD_CHECKSUM_AT])
         {
@@ -234,7 +238,7 @@ impl ChainRecord {
         if kind == TRIM_POINT {
             let offset = reader.u64();
             let unused = &bytes[size_of::<u64>() * 2..RECORD_CHECKSUM_AT];
-            return (source == 0 && unused.iter().all(|byte| *byte == 0))
+            return (source == 0 && crc32c == 0 && unused.iter().all(|byte| *byte == 0))
                 .then_some(Self::TrimPoint(offset));
         }
         let source = match source {
@@ -251,6 +255,7 @@ impl ChainRecord {
             size: reader.u64(),
             incarnation: reader.u64(),
             hash: bytes[RECORD_HASH_AT..RECORD_CHECKSUM_AT].try_into().ok()?,
+            crc32c,
             source,
         };
         match kind {
@@ -362,7 +367,7 @@ pub fn decode_chain(bytes: &[u8]) -> Result<Chain, ChainError> {
     let (header, mut rest) = bytes
         .split_first_chunk::<HEADER_SIZE>()
         .ok_or(ChainError::Header)?;
-    let prefix = ObjectPrefix::decode(header).ok_or(ChainError::Header)?;
+    let prefix = decode_header(header).ok_or(ChainError::Header)?;
     let mut records = Vec::with_capacity(rest.len() / RECORD_SIZE);
     let mut torn_tail = false;
     while !rest.is_empty() {
@@ -411,7 +416,7 @@ pub async fn create_chain(partition_dir: &str, prefix: &ObjectPrefix) -> io::Res
     let mut file = compio::fs::File::create(&staging)
         .await
         .note_descriptor_exhaustion(|| format!("creating {staging}"))?;
-    file.write_all_at(prefix.encode(), 0).await.0?;
+    file.write_all_at(encode_header(prefix), 0).await.0?;
     file.sync_all().await?;
     compio::fs::rename(&staging, &path).await?;
     crate::state_transfer::fsync_dir(partition_dir).await
@@ -462,30 +467,47 @@ pub async fn append_record(path: &str, at: u64, record: &ChainRecord) -> io::Res
     file.sync_all().await
 }
 
-/// The BLAKE3 hash of the first `size` bytes of the segment file at
-/// `log_path`, read in chunks.
+/// The hashes of the first `size` bytes of the segment file at `log_path`,
+/// read in chunks.
 ///
 /// # Errors
 /// Any I/O failure, including a file shorter than `size`.
-pub async fn hash_segment_file(log_path: &str, size: u64) -> io::Result<[u8; SEGMENT_HASH_SIZE]> {
-    let mut hasher = blake3::Hasher::new();
+pub async fn hash_segment_file(log_path: &str, size: u64) -> io::Result<SegmentHashes> {
+    let mut hasher = SegmentHasher::default();
     hash_segment_range(log_path, 0, size, &mut hasher, None).await?;
-    Ok(*hasher.finalize().as_bytes())
+    Ok(hasher.finalize())
 }
 
-impl ChunkHasher for blake3::Hasher {
-    fn update(&mut self, bytes: &[u8]) {
-        Self::update(self, bytes);
+/// Takes both hashes in one pass over a segment's bytes.
+#[derive(Clone, Default)]
+struct SegmentHasher {
+    blake3: blake3::Hasher,
+    crc32c: u32,
+}
+
+impl SegmentHasher {
+    fn finalize(&self) -> SegmentHashes {
+        SegmentHashes {
+            blake3: *self.blake3.finalize().as_bytes(),
+            crc32c: self.crc32c,
+        }
     }
 }
 
-/// The hash of the active segment, fed its committed bytes as they are
+impl ChunkHasher for SegmentHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        self.blake3.update(bytes);
+        self.crc32c = crc32c::crc32c_append(self.crc32c, bytes);
+    }
+}
+
+/// The hashes of the active segment, fed its committed bytes as they are
 /// materialized.
 #[derive(Clone)]
 pub struct SegmentDigest {
     start_offset: u64,
     hashed_len: u64,
-    hasher: blake3::Hasher,
+    hasher: SegmentHasher,
 }
 
 impl SegmentDigest {
@@ -496,7 +518,7 @@ impl SegmentDigest {
         Self {
             start_offset,
             hashed_len: 0,
-            hasher: blake3::Hasher::new(),
+            hasher: SegmentHasher::default(),
         }
     }
 
@@ -508,8 +530,8 @@ impl SegmentDigest {
     }
 
     #[must_use]
-    pub fn finalize(&self) -> [u8; SEGMENT_HASH_SIZE] {
-        *self.hasher.finalize().as_bytes()
+    pub fn finalize(&self) -> SegmentHashes {
+        self.hasher.finalize()
     }
 }
 

@@ -83,7 +83,11 @@ async fn assert_records_hash_the_logs<B: MessageBus>(
         let on_disk = hash_segment_file(&log.to_string_lossy(), record.size)
             .await
             .unwrap();
-        assert_eq!(record.hash, on_disk, "segment {start_offset}");
+        assert_eq!(
+            (record.hash, record.crc32c),
+            (on_disk.blake3, on_disk.crc32c),
+            "segment {start_offset}"
+        );
     }
 }
 

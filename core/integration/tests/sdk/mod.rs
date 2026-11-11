@@ -29,5 +29,6 @@ mod options;
 mod producer;
 mod protocol_version;
 mod raw;
+mod reader_positions;
 mod send_confirmation;
 mod stream_builder;

@@ -495,10 +495,7 @@ fn generate_harness_setup(
     let connectors_runtime_builder_call = if let Some(ref runtime_attrs) =
         attrs.server.connectors_runtime
     {
-        let config_path = runtime_attrs
-            .config_path
-            .as_deref()
-            .unwrap_or("connectors/config.toml");
+        let config_path = &runtime_attrs.config_path;
         if has_fixtures {
             quote!(.connectors_runtime(::integration::harness::ConnectorsRuntimeConfig::builder()
                 .config_path(::std::path::PathBuf::from(#config_path))

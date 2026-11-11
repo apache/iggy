@@ -58,9 +58,11 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 consensus = { workspace = true }
+crc32c = { workspace = true }
 futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+iggy_object_store = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
 papaya = { workspace = true }
