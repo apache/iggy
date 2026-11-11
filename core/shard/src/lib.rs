@@ -8067,8 +8067,10 @@ where
         .await;
     }
 
-    // The shard pump serializes these rewrites with append. The journal's drain
-    // guard excludes concurrent compaction, but does not exclude append itself.
+    // The journal's drain guard excludes concurrent compaction, but does not
+    // exclude append itself, and an in-process submit appends on its caller's
+    // task, not the pump's. The journal gate serializes these rewrites with it:
+    // a write in flight lands first and is reconciled, and none starts during.
     #[allow(clippy::future_not_send)]
     async fn reconcile_metadata_view_divergence(&self)
     where
@@ -8081,6 +8083,7 @@ where
         let (Some(consensus), Some(journal)) = (&metadata.consensus, &metadata.journal) else {
             return;
         };
+        let _journal_writes = metadata.hold_journal_writes().await;
         while reconcile_metadata_view_log(self.id, consensus, journal.handle()).await
             == MetadataViewLogStep::PersistFirst
         {
@@ -8123,6 +8126,10 @@ where
         // Before the coverage scan, and a primary-elect's only shot at it: the repair
         // ingest skips an op it already holds a header for, so a diverging entry would
         // never be replaced. No-op when nothing diverges.
+        //
+        // It also waits for a submit admitted before the election and still in its
+        // append. Nothing awaits from here to `start_pending_view`, so the view
+        // starts on a journal no prepare of an earlier view can still land in.
         self.reconcile_metadata_view_divergence().await;
         if consensus.view_log_unproven() && consensus.view_log_repair_op().is_none() {
             return;
@@ -12691,9 +12698,10 @@ where
     /// tick's walk has advanced, and at or under `commit_max`, so a quorum
     /// holds it and repair can serve it back.
     ///
-    /// SERIALIZATION: same argument as `reconcile_metadata_view_divergence`,
-    /// which is the other shard-side `truncate_from` caller. This runs on the
-    /// pump between frames, so no append is in flight for these ops.
+    /// SERIALIZATION: holds the journal gate, as
+    /// `reconcile_metadata_view_divergence` does, the other shard-side
+    /// `truncate_from` caller. An in-process submit appends on its caller's
+    /// task, so running on the pump does not keep an append off these ops.
     #[allow(clippy::future_not_send)]
     async fn drop_unwalkable_metadata_entry<P>(
         &self,
@@ -12716,15 +12724,16 @@ where
         let Ok(slot) = usize::try_from(stuck_op) else {
             return;
         };
+        let view = consensus.view();
+        let _journal_writes = self.plane.metadata().hold_journal_writes().await;
         let Some(header) = journal.handle().header(slot).map(|header| *header) else {
             return;
         };
-        let view = consensus.view();
         if journal.handle().entry(&header).await.is_some() {
             return;
         }
-        // The read can yield to a pipeline driver or a view change. Never
-        // truncate a suffix another driver owns, even when this body is absent.
+        // The gate and the read can yield to a pipeline driver or a view change.
+        // Never truncate a suffix another driver owns, even when this body is absent.
         if consensus.view() != view
             || consensus.view_log_unproven()
             || consensus.is_transferring()

@@ -83,7 +83,7 @@ use iggy_common::{
     TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, stream_wrap_set,
     topic_option_keys, validate_topic_segment_size,
 };
-use journal::local_gate::LocalGate;
+use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
     PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
     SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT, SuperblockStore,
@@ -1241,9 +1241,11 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Serializes `on_replicate`'s journal-mutation section (forced
     /// checkpoint + WAL append) across concurrent drivers (the pump loop
-    /// and the detached per-client submit tasks). Waiters take it in arrival
-    /// order, so a primary appends in op order. Ungated they race
-    /// `SnapshotCoordinator::checkpoint`: every driver crossing the
+    /// and the detached per-client submit tasks), and with the shard's WAL
+    /// rewrites, which take it through [`Self::hold_journal_writes`]. Lock
+    /// order: `journal_gate`, `checkpoint_lock`, `superblock_lock`. Waiters
+    /// take it in arrival order, so a primary appends in op order. Ungated
+    /// they race `SnapshotCoordinator::checkpoint`: every driver crossing the
     /// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
     /// checkpoint, and the concurrent `journal.drain()` calls collide on the
     /// WAL rewrite -- shared `wal.tmp`, ENOENT for every rename that loses,
@@ -2025,16 +2027,48 @@ where
         // order, so the appends below follow the op order.
         let journal_gate = self.journal_gate.acquire().await;
 
+        // An in-process submit waits on the gate and the checkpoint below on its
+        // caller's task, not the pump's, so a later view can conclude meanwhile.
+        // That dropped the pipeline entry and reset the sequencer, and the
+        // follower path below would take this prepare for the next op of the
+        // view's log. Mid view change it still lands: the sequencer a
+        // `DoViewChange` reports already counts it, and the reconcile that ends
+        // the view change waits for the gate.
+        let view_ended = || {
+            let ended = header.view < consensus.view() && consensus.is_normal();
+            if ended {
+                warn!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    view = consensus.view(),
+                    prepare_view = header.view,
+                    op = header.op,
+                    operation = ?header.operation,
+                    "dropping prepare of a view that ended before its append"
+                );
+            }
+            ended
+        };
+        // Before the checkpoint too, or the reconcile of the view waits one out
+        // on the gate for a prepare that is then dropped.
+        if view_ended() {
+            return;
+        }
+
         // Best-effort WAL reclamation. A failed checkpoint must NOT drop the
         // prepare: `pipeline_message` already pushed the pipeline entry and
         // pre-advanced the sequencer, so bailing out here leaves a phantom op
-        // that no repair path re-prepares — the commit frontier gaps behind
+        // that no repair path re-prepares. The commit frontier gaps behind
         // it permanently and the pipeline wedges full. `CHECKPOINT_MARGIN >=
         // PIPELINE_PREPARE_QUEUE_MAX` (static assert above) guarantees the
         // append below still has room after a failed or skipped attempt; a
         // journal that truly wraps is refused by append's slot-collision
         // guard, not here.
         self.checkpoint_if_needed(consensus, journal).await;
+        if view_ended() {
+            return;
+        }
 
         // Backup: gap check against the JOURNAL head, not the sequencer.
         //
@@ -2161,8 +2195,10 @@ where
         // Backup only: advance sequencer + checksum post-append. Primary
         // already advanced in push_prepare_entry; re-setting here would
         // rewind a sibling prepare pipelined during the append await to a
-        // stale op + parent, projecting a duplicate next.
-        if is_backup {
+        // stale op + parent, projecting a duplicate next. A prepare of an earlier
+        // view was claimed by its primary too, and a view adopted during the
+        // append has its own head.
+        if is_backup && header.view == consensus.view() {
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
             consensus.observe_prepare_timestamp(header.timestamp);
@@ -3848,8 +3884,9 @@ where
         // `on_replicate` awaits: a sibling in-process submit may commit
         // (commit_min advances) or a view change may land (view advances) while
         // parked here. Both are handled downstream - a view change drops the
-        // reply_sender so `receiver` resolves `Canceled`, and loopback acks are
-        // op-routed - so no post-await view/commit invariant holds or is needed.
+        // reply_sender so `receiver` resolves `Canceled`, `on_replicate` drops a
+        // prepare whose view ended, and loopback acks are op-routed - so no
+        // post-await view/commit invariant holds or is needed.
         self.on_replicate(prepare).await;
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
@@ -4313,6 +4350,17 @@ where
     P: Pipeline<Entry = PipelineEntry>,
     SB: SuperblockStore,
 {
+    /// Wait for the journal writes in flight and keep new ones out until the
+    /// guard drops, for a shard-side caller that truncates the journal.
+    ///
+    /// An in-process submit appends on its caller's task, so it can run under
+    /// the WAL rewrite. Landing after a view's reconcile, its entry would sit
+    /// in the view's log as a prepare of an earlier one, at an op the view may
+    /// have decided differently.
+    pub const fn hold_journal_writes(&self) -> LocalGateAcquire<'_> {
+        self.journal_gate.acquire()
+    }
+
     /// Persist the current VSR state to the superblock when the view changed since
     /// the last write. The split-brain gate: callers MUST invoke this before
     /// dispatching any view-scoped VSR message, so a replica that acted in a view can
@@ -5985,7 +6033,7 @@ mod tests {
     };
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{PAT_TOKEN_HASH_BYTES, Users, UsersInner};
-    use consensus::{HistoryRecovery, LocalPipeline};
+    use consensus::{HistoryRecovery, LocalPipeline, Status};
     use iggy_binary_protocol::codes::CREATE_USER_CODE;
     use iggy_binary_protocol::primitives::metadata_changes::{
         WireMetadataChangeKind, WireMetadataChangeStatus,
@@ -5997,7 +6045,9 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
     use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
-    use iggy_binary_protocol::{RequestHeader, StartViewHeader, WireOptions};
+    use iggy_binary_protocol::{
+        RequestHeader, StartViewChangeHeader, StartViewHeader, WireOptions,
+    };
     use iggy_common::MetadataChangeGroup;
     use iggy_common::{
         HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage, OptionValueCodec,
@@ -10310,34 +10360,7 @@ mod tests {
     #[compio::test]
     async fn given_a_submit_waiting_on_the_journal_gate_when_another_submit_arrives_should_send_in_op_order()
      {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = PrepareJournal::open(&dir.path().join("journal.wal"), 0)
-            .await
-            .unwrap();
-        let consensus = VsrConsensus::new(
-            1,
-            0,
-            3,
-            server_common::sharding::METADATA_GROUP,
-            ReplicaSendSpyBus::default(),
-            LocalPipeline::new(),
-        );
-        consensus.init();
-        let metadata: Rc<IggyMetadata<_, _, (), TestMux>> = Rc::new(IggyMetadata::new(
-            Some(consensus),
-            Some(journal),
-            None,
-            None,
-            TestMux::default(),
-            None,
-        ));
-        for client in 1..=2 {
-            metadata
-                .client_table
-                .borrow_mut()
-                .commit_register(client, 0, [0x5a; 32], register_reply(client, 1))
-                .unwrap();
-        }
+        let (_dir, metadata) = primary_on_spy_bus([1, 2]).await;
         let submit = |client: u128| {
             let metadata = Rc::clone(&metadata);
             compio::runtime::spawn(async move {
@@ -10368,6 +10391,262 @@ mod tests {
                 "backup {backup} takes only the next op"
             );
         }
+    }
+
+    /// An in-process submit runs `on_replicate` on the caller's task, so it can
+    /// sit on `journal_gate` while the shard adopts a `StartView`. Granted the
+    /// gate afterwards, its prepare is the next op of the adopted journal and
+    /// the follower path would take it for one of the new view. A checkpoint it
+    /// ran first would keep the reconcile of the view waiting on the gate.
+    #[compio::test]
+    async fn given_a_submit_waiting_on_the_journal_gate_when_a_view_is_adopted_meanwhile_should_drop_the_prepare()
+     {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        metadata.set_checkpoint_margin(usize::MAX);
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        coordinator.checkpoint_pending.set(true);
+
+        let held = metadata.journal_gate.try_acquire().unwrap();
+        let waiting = compio::runtime::spawn({
+            let metadata = Rc::clone(&metadata);
+            async move {
+                metadata
+                    .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                    .await
+            }
+        });
+        yield_now().await;
+        assert_eq!(
+            consensus.pipeline_len(),
+            1,
+            "the submit claims op 1 and waits on the gate"
+        );
+        adopt_view(consensus, 1);
+        drop(held);
+        let reply = waiting.await.unwrap().unwrap();
+
+        assert_eq!(
+            iggy_binary_protocol::result_code(reply.body()),
+            Some(IggyError::TransientNotCommitted.as_code()),
+            "the caller learns the outcome is unknown and retries"
+        );
+        assert!(
+            metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .handle()
+                .header(1)
+                .is_none(),
+            "a prepare of view 0 must not enter the journal of view 1"
+        );
+        assert!(
+            coordinator.checkpoint_pending.get(),
+            "a prepare of view 0 must not run a checkpoint in view 1"
+        );
+        for backup in 1..=2 {
+            assert!(
+                sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+                "backup {backup} must not be sent a prepare of the view that ended"
+            );
+        }
+    }
+
+    /// The submit holds `journal_gate` across the forced checkpoint, and the
+    /// snapshot write yields to the shard. A `StartView` adopted meanwhile makes
+    /// this replica a backup of the new view before the prepare is appended.
+    #[compio::test]
+    async fn given_a_submit_inside_its_checkpoint_when_a_view_is_adopted_meanwhile_should_drop_the_prepare()
+     {
+        const CLIENT: u128 = 1;
+        let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        // An interrupted checkpoint stays pending, and the next prepare retries it.
+        metadata.set_checkpoint_margin(usize::MAX);
+        metadata
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .checkpoint_pending
+            .set(true);
+
+        let checkpointing = compio::runtime::spawn({
+            let metadata = Rc::clone(&metadata);
+            async move {
+                metadata
+                    .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                    .await
+            }
+        });
+        yield_now().await;
+        assert!(
+            metadata.checkpoint_lock.try_acquire().is_none(),
+            "the submit must be inside its checkpoint"
+        );
+        adopt_view(consensus, 1);
+        let reply = checkpointing.await.unwrap().unwrap();
+
+        assert_eq!(
+            iggy_binary_protocol::result_code(reply.body()),
+            Some(IggyError::TransientNotCommitted.as_code()),
+            "the caller learns the outcome is unknown and retries"
+        );
+        assert!(
+            metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .handle()
+                .header(1)
+                .is_none(),
+            "a prepare of view 0 must not enter the journal of view 1"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            0,
+            "a prepare of view 0 must not move the sequencer of view 1"
+        );
+        for backup in 1..=2 {
+            assert!(
+                sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+                "backup {backup} must not be sent a prepare of the view that ended"
+            );
+        }
+    }
+
+    /// A prepare granted the gate during a view change still lands, on the
+    /// follower path when another replica leads the next view. That view can be
+    /// adopted while the prepare appends, and its op is not one of the view's log.
+    #[compio::test]
+    async fn given_a_submit_inside_its_append_when_a_view_is_adopted_meanwhile_should_keep_the_sequencer_of_the_view()
+     {
+        const CLIENT: u128 = 1;
+        const NEXT_VIEW: u32 = 2;
+        let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+
+        let held = metadata.journal_gate.try_acquire().unwrap();
+        let appending = compio::runtime::spawn({
+            let metadata = Rc::clone(&metadata);
+            async move {
+                metadata
+                    .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                    .await
+            }
+        });
+        yield_now().await;
+        assert_eq!(
+            consensus.pipeline_len(),
+            1,
+            "the submit claims op 1 and waits on the gate"
+        );
+        // A primary joins only a vote of a replica that is two views ahead.
+        let vote = StartViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 1,
+            size: u32::try_from(size_of::<StartViewChangeHeader>()).unwrap(),
+            view: NEXT_VIEW,
+            release: 0,
+            command: Command::StartViewChange,
+            replica: 1,
+            reserved_frame: [0; 66],
+            group: server_common::sharding::METADATA_GROUP,
+            partition_incarnation: 0,
+            reserved: [0; 112],
+        };
+        consensus.handle_start_view_change(PlaneKind::Metadata, &vote);
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::ViewChange, NEXT_VIEW),
+            "the replica must be changing to view {NEXT_VIEW}"
+        );
+        drop(held);
+        yield_now().await;
+        assert!(
+            journal.handle().header(1).is_none(),
+            "the write must still be in flight"
+        );
+        adopt_view(consensus, NEXT_VIEW);
+        appending.await.unwrap().unwrap();
+
+        assert!(
+            journal.handle().header(1).is_some(),
+            "the write in flight lands, for the reconcile of the view to remove"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            0,
+            "a prepare of view 0 must not move the sequencer of view {NEXT_VIEW}"
+        );
+    }
+
+    /// The primary of a three-replica group at view 0, on a bus that records its
+    /// sends, with a session for each of `clients` and checkpoints armed.
+    #[allow(clippy::future_not_send)]
+    async fn primary_on_spy_bus(
+        clients: impl IntoIterator<Item = u128>,
+    ) -> (
+        tempfile::TempDir,
+        Rc<IggyMetadata<VsrConsensus<ReplicaSendSpyBus>, PrepareJournal, (), TestMux>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal = PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            ReplicaSendSpyBus::default(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata = Rc::new(IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            Some(dir.path().to_path_buf()),
+        ));
+        for client in clients {
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(client, 0, [0x5a; 32], register_reply(client, 1))
+                .unwrap();
+        }
+        (dir, metadata)
+    }
+
+    /// Adopts `view` from its primary with an empty log, as the shard does on a
+    /// `StartView`.
+    fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32) {
+        let start_view = StartViewHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 1,
+            size: u32::try_from(size_of::<StartViewHeader>()).unwrap(),
+            view,
+            release: 0,
+            command: Command::StartView,
+            replica: consensus.primary_index(view),
+            reserved_frame: [0; 66],
+            op: 0,
+            commit: 0,
+            group: server_common::sharding::METADATA_GROUP,
+            partition_incarnation: 0,
+            reserved: [0; 80],
+            incarnation: 0,
+        };
+        let adopted = consensus.handle_start_view(PlaneKind::Metadata, &start_view, &[]);
+        assert!(!adopted.is_empty(), "the replica adopts view {view}");
     }
 
     #[compio::test]
