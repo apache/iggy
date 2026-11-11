@@ -60,13 +60,13 @@ use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use server_common::Message;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::run_blocking;
 use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
+use server_common::{DISK_USAGE, Message};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -5646,6 +5646,7 @@ pub(crate) async fn reclaim_retry_checkpoint_files(
 /// to a live segment that the reuse scan linked. Writing through that name in
 /// place changes the live segment, so the old name goes first.
 async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()> {
+    let len = payload.len() as u64;
     remove_if_present(path).await?;
     let mut file = compio::fs::OpenOptions::new()
         .write(true)
@@ -5653,7 +5654,9 @@ async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()
         .open(path)
         .await
         .note_descriptor_exhaustion(|| format!("creating {}", path.display()))?;
+    let charge = DISK_USAGE.charge(len);
     let (result, _) = file.write_all_at(payload, 0).await.into();
+    drop(charge);
     result?;
     file.sync_data().await?;
     Ok(())

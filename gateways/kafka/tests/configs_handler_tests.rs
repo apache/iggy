@@ -17,6 +17,8 @@
 
 //! `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` with the bridge off.
 
+use std::sync::Arc;
+
 use kafka_protocol::messages::alter_configs_request::{
     AlterConfigsRequest, AlterConfigsResource, AlterableConfig,
 };
@@ -204,6 +206,7 @@ async fn incremental_alter_configs_requires_manage_topics_before_the_stub() {
             manage_topics,
             ..PrincipalPermissions::default()
         },
+        topic_reads: Arc::default(),
         permissions_known: true,
     };
 

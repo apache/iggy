@@ -35,6 +35,16 @@ internal interface IConsumerGroupAssignmentProvider
     /// <param name="groupId">The identifier of the consumer group (numeric ID or name).</param>
     /// <param name="resync">Whether to ask the coordinator even for a fresh assignment, after a fence.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
+    ///     Status 5006 (ConsumerGroupMemberNotFound) when the coordinator holds no member of this client, for example
+    ///     after the group was deleted and created again. The caller joins again.
+    /// </exception>
     Task<IReadOnlyList<uint>> GetAssignedPartitionsAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         bool resync, CancellationToken token = default);
+
+    /// <summary>
+    ///     The highest metadata commit that a reply showed. The server answers a join after its op commits, so the
+    ///     watermark is at or after the op of every join that returned.
+    /// </summary>
+    ulong MetadataWatermark { get; }
 }

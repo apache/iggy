@@ -623,6 +623,40 @@ mod tests {
         }
     }
 
+    /// Only the connectors runtime in apache/iggy-connectors calls
+    /// `with_runtime_prefix` and `deserialize_with_runtime_prefix`, through a
+    /// git dependency on this crate. This test is their only cover here.
+    #[test]
+    #[serial_test::serial]
+    fn typed_provider_deserializes_env_vars_with_runtime_prefix() {
+        let prefix = "IGGY_CONNECTORS_SINK_TEST_";
+        let value_var = format!("{prefix}VALUE");
+        // SAFETY: the race is process-wide, not per key: `set_var` is unsound
+        // against any concurrent environment access. `serial_test::serial` on
+        // this test is what prevents that.
+        unsafe { env::set_var(&value_var, "from-env") };
+
+        let data = TypedEnvProvider::<NestedConfig>::with_runtime_prefix(prefix, &[])
+            .deserialize_with_runtime_prefix();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(&value_var) };
+
+        let data = data.expect("deserialize failed");
+        let profile_data = data
+            .get(&figment::Profile::default())
+            .expect("no default profile");
+
+        assert!(
+            matches!(profile_data.get("value"), Some(FigmentValue::String(_, s)) if s == "from-env"),
+            "the prefixed variable did not reach `value`: {profile_data:?}"
+        );
+        assert!(
+            !profile_data.contains_key("flag"),
+            "an unset variable produced a value: {profile_data:?}"
+        );
+    }
+
     /// A sibling binary's path arrives here through a shared environment, or
     /// through one `.env` that every binary loads. Neither path is a config
     /// value, and a debug build refuses to boot on an unknown name, so the scan

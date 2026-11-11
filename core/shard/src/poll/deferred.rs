@@ -373,6 +373,10 @@ impl PartitionStatus {
         consumer: PollingConsumer,
         owner: impl FnOnce(u64) -> Option<ConsumerGroupOwner>,
     ) -> Result<bool, IggyError> {
+        // A reused namespace may still hold the old partition until reconciliation.
+        if !metadata.matches_partition(self.incarnation) {
+            return Err(IggyError::TransientNotAccepted);
+        }
         if self.deleted {
             return Err(IggyError::HistoryUnavailable);
         }
@@ -394,10 +398,7 @@ impl PartitionStatus {
             }
             PollingConsumer::Consumer(..) => true,
         };
-        if self.unstable
-            || (primary && (!self.view_started || !self.primary))
-            || !metadata.matches_partition(self.incarnation)
-        {
+        if self.unstable || (primary && (!self.view_started || !self.primary)) {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(installed)

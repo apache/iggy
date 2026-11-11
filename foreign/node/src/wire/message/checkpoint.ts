@@ -16,7 +16,7 @@
 // under the License.
 
 import { responseError } from '../error.utils.js';
-import { EMPTY_PARTITION_CONTEXT, type PartitionContext } from '../vsr/header.js';
+import { EMPTY_PARTITION_CONTEXT, sameContext, type PartitionContext } from '../vsr/header.js';
 import {
   PollingStrategyKind, type PollingStrategy, type PollMessagesResponse, type PollingStrategyKindValue
 } from './poll.utils.js';
@@ -66,6 +66,14 @@ export const validatePartition = (strategy: PollingStrategy, partitionId: number
       `a continuation of partition ${bound} cannot read partition ${partitionId}`);
 };
 
+/** `strategy` without its context when that context is all zero, because such a context names no history. */
+export const withoutEmptyContext = (strategy: PollingStrategy): PollingStrategy => {
+  const context = (strategy as Partial<Continuation>).context;
+  return context !== undefined && sameContext(context, EMPTY_PARTITION_CONTEXT)
+    ? { kind: strategy.kind, value: strategy.value } as PollingStrategy
+    : strategy;
+};
+
 /** A batch of one partition with its checkpoints and its continuation. */
 export type PolledBatch = PollMessagesResponse & {
   /** The position after the last message, to commit the whole batch. Undefined for an empty batch. */
@@ -79,10 +87,6 @@ export type PolledBatch = PollMessagesResponse & {
    */
   continuation(): Continuation
 };
-
-const sameContext = (left: PartitionContext, right: PartitionContext): boolean =>
-  left.incarnation === right.incarnation && left.ownerGeneration === right.ownerGeneration &&
-  left.metadataOp === right.metadataOp;
 
 /** `polled` with the checkpoints and the continuation of a read that started at `start`. */
 export const polledBatch = (polled: PollMessagesResponse, start: PollingStrategy, stamp?: ReaderStamp): PolledBatch => ({
