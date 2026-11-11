@@ -83,7 +83,7 @@ use iggy_common::{
     TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, stream_wrap_set,
     topic_option_keys, validate_topic_segment_size,
 };
-use journal::local_gate::{LocalGate, LocalGateGuard};
+use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
     PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
     SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT, SuperblockStore,
@@ -1243,9 +1243,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// checkpoint + WAL append) across concurrent drivers (the pump loop
     /// and the detached per-client submit tasks), and with the shard's WAL
     /// rewrites, which take it through [`Self::hold_journal_writes`]. Lock
-    /// order: `journal_gate`, then `superblock_lock`. Waiters take it in arrival
-    /// order, so a primary appends in op order. Ungated they race
-    /// `SnapshotCoordinator::checkpoint`: every driver crossing the
+    /// order: `journal_gate`, `checkpoint_lock`, `superblock_lock`. Waiters
+    /// take it in arrival order, so a primary appends in op order. Ungated
+    /// they race `SnapshotCoordinator::checkpoint`: every driver crossing the
     /// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
     /// checkpoint, and the concurrent `journal.drain()` calls collide on the
     /// WAL rewrite -- shared `wal.tmp`, ENOENT for every rename that loses,
@@ -2027,6 +2027,35 @@ where
         // order, so the appends below follow the op order.
         let journal_gate = self.journal_gate.acquire().await;
 
+        // An in-process submit waits on the gate and the checkpoint below on its
+        // caller's task, not the pump's, so a later view can conclude meanwhile.
+        // That dropped the pipeline entry and reset the sequencer, and the
+        // follower path below would take this prepare for the next op of the
+        // view's log. Mid view change it still lands: the sequencer a
+        // `DoViewChange` reports already counts it, and the reconcile that ends
+        // the view change waits for the gate.
+        let view_ended = || {
+            let ended = header.view < consensus.view() && consensus.is_normal();
+            if ended {
+                warn!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    view = consensus.view(),
+                    prepare_view = header.view,
+                    op = header.op,
+                    operation = ?header.operation,
+                    "dropping prepare of a view that ended before its append"
+                );
+            }
+            ended
+        };
+        // Before the checkpoint too, or the reconcile of the view waits one out
+        // on the gate for a prepare that is then dropped.
+        if view_ended() {
+            return;
+        }
+
         // Best-effort WAL reclamation. A failed checkpoint must NOT drop the
         // prepare: `pipeline_message` already pushed the pipeline entry and
         // pre-advanced the sequencer, so bailing out here leaves a phantom op
@@ -2037,25 +2066,7 @@ where
         // journal that truly wraps is refused by append's slot-collision
         // guard, not here.
         self.checkpoint_if_needed(consensus, journal).await;
-
-        // An in-process submit waits on the gate and the checkpoint above on its
-        // caller's task, not the pump's, so a later view can conclude meanwhile.
-        // That dropped the pipeline entry and reset the sequencer, and the
-        // follower path below would take this prepare for the next op of the
-        // view's log. Mid view change it still lands: the sequencer a
-        // `DoViewChange` reports already counts it, and the reconcile that ends
-        // the view change waits for the gate.
-        if header.view < consensus.view() && consensus.is_normal() {
-            warn!(
-                target: "iggy.metadata.diag",
-                plane = "metadata",
-                replica_id = consensus.replica(),
-                view = consensus.view(),
-                prepare_view = header.view,
-                op = header.op,
-                operation = ?header.operation,
-                "dropping prepare of a view that ended before its append"
-            );
+        if view_ended() {
             return;
         }
 
@@ -4346,9 +4357,8 @@ where
     /// the WAL rewrite. Landing after a view's reconcile, its entry would sit
     /// in the view's log as a prepare of an earlier one, at an op the view may
     /// have decided differently.
-    #[allow(clippy::future_not_send)]
-    pub async fn hold_journal_writes(&self) -> LocalGateGuard<'_> {
-        self.journal_gate.acquire().await
+    pub const fn hold_journal_writes(&self) -> LocalGateAcquire<'_> {
+        self.journal_gate.acquire()
     }
 
     /// Persist the current VSR state to the superblock when the view changed since
@@ -10386,13 +10396,17 @@ mod tests {
     /// An in-process submit runs `on_replicate` on the caller's task, so it can
     /// sit on `journal_gate` while the shard adopts a `StartView`. Granted the
     /// gate afterwards, its prepare is the next op of the adopted journal and
-    /// the follower path would take it for one of the new view.
+    /// the follower path would take it for one of the new view. A checkpoint it
+    /// ran first would keep the reconcile of the view waiting on the gate.
     #[compio::test]
     async fn given_a_submit_waiting_on_the_journal_gate_when_a_view_is_adopted_meanwhile_should_drop_the_prepare()
      {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
         let consensus = metadata.consensus.as_ref().unwrap();
+        metadata.set_checkpoint_margin(usize::MAX);
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        coordinator.checkpoint_pending.set(true);
 
         let held = metadata.journal_gate.try_acquire().unwrap();
         let waiting = compio::runtime::spawn({
@@ -10427,6 +10441,10 @@ mod tests {
                 .header(1)
                 .is_none(),
             "a prepare of view 0 must not enter the journal of view 1"
+        );
+        assert!(
+            coordinator.checkpoint_pending.get(),
+            "a prepare of view 0 must not run a checkpoint in view 1"
         );
         for backup in 1..=2 {
             assert!(

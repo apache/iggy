@@ -12724,11 +12724,11 @@ where
         let Ok(slot) = usize::try_from(stuck_op) else {
             return;
         };
+        let view = consensus.view();
         let _journal_writes = self.plane.metadata().hold_journal_writes().await;
         let Some(header) = journal.handle().header(slot).map(|header| *header) else {
             return;
         };
-        let view = consensus.view();
         if journal.handle().entry(&header).await.is_some() {
             return;
         }

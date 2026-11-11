@@ -14691,6 +14691,11 @@ mod metadata_repair_driver_tests {
             START_VIEW_DELIVERED.load(Ordering::Relaxed),
             "the resumed replica must receive StartView while the writes are held"
         );
+        let (_, adopted_view, _, _) = metadata_state(&sim, STOPPED_PRIMARY);
+        assert_eq!(
+            adopted_view, elected_view,
+            "the resumed replica must adopt view {elected_view} while the writes are held"
+        );
         sim.replicas[usize::from(STOPPED_PRIMARY)]
             .metadata_journal
             .release_appends();
