@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin, Client, ClusterClient, ClusterNodeRole, Consumer, Credentials, Identifier,
     IggyClient, IggyClientBuilder, MessageClient, PollOptions, PollingStrategy, UserClient,
@@ -199,6 +200,17 @@ impl Deployment {
         child.wait().expect("reap the gateway");
     }
 
+    /// Freezes gateway `node_id` with SIGSTOP. Its connections stay open, but it reads, answers and
+    /// sends nothing until [`Self::resume_gateway`]. What it sent before still reaches its peers.
+    pub fn pause_gateway(&mut self, node_id: u16) {
+        self.gateway_mut(node_id).signal(libc::SIGSTOP);
+    }
+
+    /// Lets gateway `node_id` run on after [`Self::pause_gateway`].
+    pub fn resume_gateway(&mut self, node_id: u16) {
+        self.gateway_mut(node_id).signal(libc::SIGCONT);
+    }
+
     /// Starts gateway `node_id` again on its port, and waits until it listens.
     pub async fn start_gateway(&mut self, node_id: u16) {
         let gateway = self.gateway_mut(node_id);
@@ -256,40 +268,51 @@ impl Deployment {
         routes
     }
 
-    /// When Iggy stored the message at `offset` of partition `partition_id` of `topic` in `stream`:
-    /// the clock of the partition's primary at the prepare, in microseconds since the Unix epoch.
-    /// `None` when no node answers, or the partition holds no message at `offset`.
-    pub async fn stored_at(
+    /// Up to `count` messages of each partition of `from` in `topic` of `stream`, read from the
+    /// offset that `from` gives that partition, as `(partition id, offset, payload)`. `None` when
+    /// no node answers.
+    pub async fn payloads_from(
         &self,
         stream: &str,
         topic: &str,
-        partition_id: u32,
-        offset: u64,
-    ) -> Option<u64> {
+        from: &[(u32, u64)],
+        count: u32,
+    ) -> Option<Vec<(u32, u64, Bytes)>> {
         let client = self.client().await?;
         let polled = async {
-            tokio::time::timeout(
-                QUERY_LIMIT,
-                client.poll_messages(
-                    &Identifier::named(stream).ok()?,
-                    &Identifier::named(topic).ok()?,
-                    partition_id,
-                    &Consumer::default(),
-                    &PollingStrategy::offset(offset),
-                    PollOptions {
-                        count: 1,
-                        ..PollOptions::default()
-                    },
-                ),
-            )
-            .await
-            .ok()?
-            .ok()
+            let stream_id = Identifier::named(stream).ok()?;
+            let topic_id = Identifier::named(topic).ok()?;
+            let mut payloads = Vec::new();
+            for &(partition_id, offset) in from {
+                let polled = tokio::time::timeout(
+                    QUERY_LIMIT,
+                    client.poll_messages(
+                        &stream_id,
+                        &topic_id,
+                        partition_id,
+                        &Consumer::default(),
+                        &PollingStrategy::offset(offset),
+                        PollOptions {
+                            count,
+                            ..PollOptions::default()
+                        },
+                    ),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                payloads.extend(
+                    polled
+                        .messages
+                        .into_iter()
+                        .map(|message| (partition_id, message.header.offset, message.payload)),
+                );
+            }
+            Some(payloads)
         }
         .await;
         sign_out(&client).await;
-        let message = polled?.messages.into_iter().next()?;
-        (message.header.offset == offset).then_some(message.header.timestamp)
+        polled
     }
 
     /// The last [`TAIL_LINES`] lines of the log of each gateway.
