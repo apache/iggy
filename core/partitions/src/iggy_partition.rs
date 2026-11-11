@@ -110,6 +110,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, warn};
 
@@ -192,6 +193,9 @@ where
     /// The upload in flight: the first offset of its segment, and the scope
     /// whose end stops the job.
     segment_upload: Option<(u64, iggy_object_store::TierScope)>,
+    /// Set when a sealed segment became uploadable, for the shard to turn into
+    /// an upload pass: the partition cannot send itself a frame.
+    upload_wanted: Cell<bool>,
     /// What this replica deletes from the object store while it is the
     /// primary.
     object_deletes: ObjectDeletes,
@@ -963,6 +967,7 @@ where
             pending_advances: VecDeque::new(),
             local_envelope: None,
             segment_upload: None,
+            upload_wanted: Cell::new(false),
             object_deletes: ObjectDeletes::default(),
             object_delete_jobs: 0,
             stats,
@@ -12739,6 +12744,8 @@ where
             // without a record, so it gets one hashed from disk.
             if target.chain_record.is_none() {
                 self.maintenance.tiering = self.object_prefix();
+            } else {
+                self.want_upload();
             }
             self.chain_settled(&diverged);
         }
@@ -13100,18 +13107,8 @@ where
     /// overtake a backlog. The caller checks that this replica is the primary.
     #[must_use]
     pub fn next_segment_upload(&self) -> Option<crate::SegmentUpload> {
-        let floor = self.tiered_floor();
-        let (segment, storage) =
-            self.log
-                .segments()
-                .iter()
-                .zip(self.log.storages())
-                .find(|(segment, _)| {
-                    segment.sealed
-                        && segment.location == SegmentLocation::Local
-                        && segment.size.as_bytes_u64() > 0
-                        && floor.is_none_or(|floor| segment.end_offset > floor)
-                })?;
+        let slot = self.oldest_unuploaded_segment()?;
+        let (segment, storage) = (&self.log.segments()[slot], &self.log.storages()[slot]);
         let record = self.undisputed_segment_record(segment.start_offset)?;
         let (log_path, index_path) = storage.segment_and_index_paths();
         Some(crate::SegmentUpload {
@@ -13131,6 +13128,17 @@ where
     pub fn begin_segment_upload(
         &mut self,
     ) -> Option<(crate::SegmentUpload, iggy_object_store::TierScopeToken)> {
+        self.begin_segment_upload_if(|_| true)
+    }
+
+    /// [`Self::begin_segment_upload`], unless `admit` refuses the segment's
+    /// size in bytes. `admit` is asked last, and only about an upload that
+    /// would start, so what it charges is charged to a started upload. A
+    /// refusal leaves the segment for a later call.
+    pub fn begin_segment_upload_if(
+        &mut self,
+        admit: impl FnOnce(u64) -> bool,
+    ) -> Option<(crate::SegmentUpload, iggy_object_store::TierScopeToken)> {
         if !self.consensus.is_primary() || !self.consensus.is_normal() {
             self.segment_upload = None;
             return None;
@@ -13139,6 +13147,9 @@ where
             return None;
         }
         let upload = self.next_segment_upload()?;
+        if !admit(upload.record.size) {
+            return None;
+        }
         let scope = iggy_object_store::TierScope::new();
         let token = scope.token();
         self.segment_upload = Some((upload.record.start_offset, scope));
@@ -13215,6 +13226,88 @@ where
     /// Stop the upload in flight, as a partition does on its way out.
     pub fn cancel_segment_upload(&mut self) {
         self.segment_upload = None;
+    }
+
+    /// Whether a segment became uploadable since the last call. Only a
+    /// primary asks for a pass, since only a primary uploads.
+    pub fn take_upload_wanted(&self) -> bool {
+        self.upload_wanted.take()
+    }
+
+    fn want_upload(&self) {
+        if self.consensus.is_primary() {
+            self.upload_wanted.set(true);
+        }
+    }
+
+    /// The slot of the oldest sealed segment that is still local and above
+    /// the tiered floor.
+    fn oldest_unuploaded_segment(&self) -> Option<usize> {
+        let floor = self.tiered_floor();
+        self.log.segments().iter().position(|segment| {
+            segment.sealed
+                && segment.location == SegmentLocation::Local
+                && segment.size.as_bytes_u64() > 0
+                && floor.is_none_or(|floor| segment.end_offset > floor)
+        })
+    }
+
+    /// How far this primary's uploads are behind at `now`: the age of the
+    /// newest message in the oldest segment that waits for its upload.
+    ///
+    /// `None` on a replica that uploads nothing, and when no segment waits.
+    /// A segment sealed without a known timestamp counts as no lag, as it
+    /// counts as not expired.
+    #[must_use]
+    pub fn upload_lag(&self, now: IggyTimestamp) -> Option<Duration> {
+        if !self.is_tiered() || !self.consensus.is_primary() {
+            return None;
+        }
+        let segment = &self.log.segments()[self.oldest_unuploaded_segment()?];
+        if segment.max_timestamp == 0 {
+            return None;
+        }
+        Some(Duration::from_micros(
+            now.as_micros().saturating_sub(segment.max_timestamp),
+        ))
+    }
+
+    /// Whether this primary holds a sealed segment that the local envelope
+    /// would evict at `now`, were it uploaded: the leading local segments are
+    /// outside the envelope up to one that is above the tiered floor.
+    ///
+    /// Judged against the envelope the segment cleaner last resolved, so it
+    /// is `false` until the first eviction pass.
+    #[must_use]
+    pub fn eviction_awaits_upload(&self, now: IggyTimestamp) -> bool {
+        let Some(envelope) = self.local_envelope else {
+            return false;
+        };
+        if !self.is_tiered() || !self.consensus.is_primary() {
+            return false;
+        }
+        let Some((_, sealed)) = self.log.segments().split_last() else {
+            return false;
+        };
+        let floor = self.tiered_floor();
+        let local = || {
+            sealed
+                .iter()
+                .filter(|segment| segment.location != SegmentLocation::Remote)
+        };
+        let mut local_bytes: u64 = local().map(|segment| segment.size.as_bytes_u64()).sum();
+        for segment in local() {
+            let outside = segment.is_expired(now, envelope.age)
+                || envelope.size.is_some_and(|size| local_bytes > size);
+            if !segment.sealed || !outside {
+                return false;
+            }
+            if floor.is_none_or(|floor| segment.end_offset > floor) {
+                return true;
+            }
+            local_bytes -= segment.size.as_bytes_u64();
+        }
+        false
     }
 
     /// Whether this replica is the one that deletes the partition's objects:
@@ -13599,6 +13692,11 @@ where
                     .segment_chain
                     .as_mut()
                     .map(|chain| chain.note_appended(&record));
+                // A segment that sealed without a record is uploadable only
+                // from here on.
+                if matches!(record, crate::segment_chain::ChainRecord::Sealed(_)) {
+                    self.want_upload();
+                }
                 self.chain_settled(&diverged.unwrap_or_default());
                 None
             }

@@ -21,13 +21,19 @@
 //! holds no partition reference: it sends its result back as a frame, and the
 //! pump, the single writer of partition state, settles it and commits the
 //! floor advance through the partition-submit path every other request takes.
+//!
+//! A pass comes from the cleaner's timer, from a segment that sealed, or from
+//! an upload that stored. Whether it starts an upload is up to the shard's
+//! byte budget and the partition's wait after a failure.
 
 use crate::shards_table::ShardsTable;
+use crate::upload_pacing::{LagChange, UPLOAD_LAG_ALARM};
 use crate::{
     FinishedSegmentUpload, IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel,
 };
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::{PrepareHeader, RoutedRequestHeader};
+use iggy_common::IggyTimestamp;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
@@ -36,6 +42,7 @@ use partitions::{IggyPartition, SegmentUploader};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
@@ -56,6 +63,68 @@ where
         self.stage_upload_segments(namespace, true);
     }
 
+    /// Stage the timed upload passes of `namespaces`, the tiered partitions
+    /// this shard hosts, and republish how far their uploads are behind at
+    /// `now`.
+    ///
+    /// The partitions whose local eviction waits for an upload are staged
+    /// first: the shard's byte budget goes to the passes that run first, and
+    /// those partitions hold disk they are configured to give back.
+    pub fn request_upload_passes(&self, namespaces: &[IggyNamespace], now: IggyTimestamp) {
+        let partitions = self.plane.partitions();
+        let mut pacing = self.upload_pacing.borrow_mut();
+        pacing.retain(namespaces);
+        let mut oldest = Duration::ZERO;
+        let mut unhurried = Vec::with_capacity(namespaces.len());
+        for &namespace in namespaces {
+            let Some(partition) = partitions.get_by_ns(&namespace) else {
+                unhurried.push(namespace);
+                continue;
+            };
+            let lag = partition.upload_lag(now).unwrap_or_default();
+            oldest = oldest.max(lag);
+            match pacing.observe_lag(namespace, lag) {
+                Some(LagChange::Raised) => tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    lag_secs = lag.as_secs(),
+                    alarm_secs = UPLOAD_LAG_ALARM.as_secs(),
+                    "segment uploads are behind"
+                ),
+                Some(LagChange::Recovered) => tracing::info!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    lag_secs = lag.as_secs(),
+                    "segment uploads caught up"
+                ),
+                None => {}
+            }
+            if partition.eviction_awaits_upload(now) {
+                self.request_upload_segments(namespace);
+            } else {
+                unhurried.push(namespace);
+            }
+        }
+        drop(pacing);
+        for namespace in unhurried {
+            self.request_upload_segments(namespace);
+        }
+        self.metrics.set_segment_upload_lag(oldest);
+    }
+
+    /// Stage the pass that a newly uploadable segment of `partition` asked
+    /// for, so its upload does not wait for the timer. The pass starts the
+    /// oldest segment, which is another one while a backlog stands.
+    pub(crate) fn stage_wanted_upload(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) {
+        if partition.take_upload_wanted() && self.segment_uploader.borrow().is_some() {
+            self.stage_upload_segments(namespace, false);
+        }
+    }
+
     fn stage_upload_segments(&self, namespace: IggyNamespace, resend_advance: bool) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
@@ -74,6 +143,23 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
+        self.upload_segments_at(namespace, resend_advance, Instant::now())
+            .await;
+    }
+
+    /// [`Self::on_upload_segments`] at a given time.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn upload_segments_at(
+        &self,
+        namespace: IggyNamespace,
+        resend_advance: bool,
+        now: Instant,
+    ) where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
         let Some(uploader) = self.segment_uploader.borrow().clone() else {
             return;
         };
@@ -83,7 +169,7 @@ where
         let mut advance_sent = false;
         for finished in undelivered {
             let settled = finished.namespace;
-            advance_sent |= self.settle_segment_upload(finished).await && settled == namespace;
+            advance_sent |= self.settle_segment_upload(finished, now).await && settled == namespace;
         }
 
         let partitions = self.plane.partitions();
@@ -105,10 +191,17 @@ where
         let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
             return;
         };
-        let Some((upload, scope)) = partition.begin_segment_upload() else {
+        let created_revision = partition.created_revision();
+        // A refusal starts nothing and stages nothing: the next pass asks
+        // again, so an empty budget or a failing store is not polled.
+        let admit = |bytes| {
+            self.upload_pacing
+                .borrow_mut()
+                .admit(namespace, created_revision, bytes, now)
+        };
+        let Some((upload, scope)) = partition.begin_segment_upload_if(admit) else {
             return;
         };
-        let created_revision = partition.created_revision();
         let record = upload.record;
         let undelivered = Rc::clone(&self.undelivered_segment_uploads);
         // Through the bus, not the runtime directly: the simulator supplies
@@ -142,9 +235,25 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
+        self.segment_upload_finished_at(finished, Instant::now())
+            .await;
+    }
+
+    /// [`Self::on_segment_upload_finished`] at a given time.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn segment_upload_finished_at(
+        &self,
+        finished: FinishedSegmentUpload,
+        now: Instant,
+    ) where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
         let namespace = finished.namespace;
         let stored = matches!(finished.outcome, Ok(Ok(())));
-        self.settle_segment_upload(finished).await;
+        self.settle_segment_upload(finished, now).await;
         // A backlog drains without waiting for the timer. A failure waits for
         // it, so a store that refuses every upload is not asked in a loop.
         if stored {
@@ -154,8 +263,12 @@ where
 
     /// Hand `finished` to the partition that started it, and send the floor
     /// advance it yields. Returns whether an advance was sent.
+    ///
+    /// The outcome also sets how long the partition waits before its next
+    /// attempt, counted from `now`. A cancelled upload says nothing about the
+    /// store, so it changes no wait.
     #[allow(clippy::future_not_send)]
-    async fn settle_segment_upload(&self, finished: FinishedSegmentUpload) -> bool
+    async fn settle_segment_upload(&self, finished: FinishedSegmentUpload, now: Instant) -> bool
     where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
@@ -168,6 +281,18 @@ where
             .get_mut_by_ns(&finished.namespace)
             .filter(|partition| partition.created_revision() == finished.created_revision)
             .and_then(|partition| {
+                let mut pacing = self.upload_pacing.borrow_mut();
+                match &finished.outcome {
+                    Ok(Ok(())) => pacing.upload_stored(finished.namespace),
+                    Ok(Err(failure)) => pacing.upload_failed(
+                        finished.namespace,
+                        finished.created_revision,
+                        failure.is_transient(),
+                        now,
+                    ),
+                    Err(_) => {}
+                }
+                drop(pacing);
                 let advance =
                     partition.finish_segment_upload(&finished.record, &finished.outcome)?;
                 self.floor_advance_request(finished.namespace, partition, &advance)

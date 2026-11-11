@@ -4981,6 +4981,19 @@ mod tests {
             (Vec::new(), 0),
             "a tiered topic without a retention policy stages no retention"
         );
+        // Uploads do not depend on a retention policy.
+        crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+        let mut upload_passes = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
+                namespace,
+                resend_advance: true,
+            }) = frame
+            {
+                upload_passes.push(namespace);
+            }
+        }
+        assert_eq!(upload_passes, [namespace]);
 
         update_options(
             4,

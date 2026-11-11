@@ -22,11 +22,16 @@ use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::tiered_floor::AdvanceTieredFloor;
-use crate::{SegmentLocation, SegmentUpload, SegmentUploader, UploadError, upload_segment};
+use crate::{
+    LocalEnvelope, SegmentLocation, SegmentUpload, SegmentUploader, UploadError, upload_segment,
+};
+use iggy_common::{IggyExpiry, IggyTimestamp};
 use iggy_object_store::{
     InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PutBody, PutOptions,
     SegmentKey, SegmentMetadata, SegmentObject,
 };
+use std::cell::Cell;
+use std::time::Duration;
 
 fn key(start_offset: u64, object: SegmentObject) -> String {
     layout().segment_key(&SegmentKey {
@@ -681,4 +686,218 @@ async fn given_an_upload_when_submitted_should_name_the_upload_class_and_the_seg
         uploader.executor().requests.take(),
         [(iggy_object_store::TierJobClass::Upload, size)]
     );
+}
+
+#[compio::test]
+async fn given_an_admission_that_refuses_when_beginning_an_upload_should_start_none_and_ask_its_size()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let size = partition.next_segment_upload().unwrap().record.size;
+    let asked = Cell::new(None);
+
+    let refused = partition.begin_segment_upload_if(|bytes| {
+        asked.set(Some(bytes));
+        false
+    });
+
+    assert!(refused.is_none());
+    assert_eq!(asked.get(), Some(size));
+    let (first, _scope) = partition
+        .begin_segment_upload()
+        .expect("a refusal leaves no upload in flight");
+    assert_eq!(first.record.start_offset, 0);
+}
+
+/// What the admission charges is charged to an upload that starts, so it is
+/// not asked about one that cannot.
+#[compio::test]
+async fn given_an_upload_that_cannot_start_when_beginning_should_not_ask_the_admission() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let _in_flight = partition.begin_segment_upload().unwrap();
+
+    assert!(
+        partition
+            .begin_segment_upload_if(|_| panic!("an upload is in flight"))
+            .is_none()
+    );
+
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(
+        partition
+            .begin_segment_upload_if(|_| panic!("a backup uploads nothing"))
+            .is_none()
+    );
+}
+
+#[compio::test]
+async fn given_a_primary_whose_segments_sealed_when_asked_should_want_an_upload_once() {
+    let (_directory, partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+
+    assert!(partition.take_upload_wanted());
+    assert!(!partition.take_upload_wanted());
+}
+
+#[compio::test]
+async fn given_a_backup_when_a_segment_becomes_uploadable_should_want_no_upload() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    partition.take_upload_wanted();
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+
+    partition.want_upload();
+
+    assert!(!partition.take_upload_wanted());
+}
+
+#[compio::test]
+async fn given_segments_that_wait_when_measuring_the_upload_lag_should_age_the_oldest_until_it_is_stored()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let (first_sent, second_sent) = {
+        let segments = partition.log.segments_mut();
+        segments[0].max_timestamp = 1_000_000;
+        segments[1].max_timestamp = 3_000_000;
+        (segments[0].max_timestamp, segments[1].max_timestamp)
+    };
+    let now = IggyTimestamp::from(second_sent + 4_000_000);
+    let lag = |sent| Some(Duration::from_micros(now.as_micros() - sent));
+
+    assert_eq!(partition.upload_lag(now), lag(first_sent));
+    assert_eq!(
+        partition.upload_lag(IggyTimestamp::from(first_sent - 1)),
+        Some(Duration::ZERO),
+        "a clock behind the segment is no lag"
+    );
+
+    let first = partition.next_segment_upload().unwrap().record;
+    partition.note_segment_uploaded(&first);
+    assert_eq!(partition.upload_lag(now), lag(second_sent));
+
+    let second = partition.next_segment_upload().unwrap().record;
+    partition.note_segment_uploaded(&second);
+    assert_eq!(partition.upload_lag(now), None);
+}
+
+#[compio::test]
+async fn given_a_backup_or_an_unknown_timestamp_when_measuring_the_upload_lag_should_have_none() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let now = IggyTimestamp::from(u64::MAX);
+    assert!(partition.upload_lag(now).is_some());
+
+    let sent = std::mem::take(&mut partition.log.segments_mut()[0].max_timestamp);
+    assert_eq!(partition.upload_lag(now), None);
+    partition.log.segments_mut()[0].max_timestamp = sent;
+
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert_eq!(partition.upload_lag(now), None);
+}
+
+#[compio::test]
+async fn given_a_segment_outside_the_envelope_when_it_is_not_uploaded_should_have_eviction_await_it()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let now = IggyTimestamp::now();
+    assert!(
+        !partition.eviction_awaits_upload(now),
+        "no envelope is resolved yet"
+    );
+
+    partition.set_local_envelope(Some(KEEP_NOTHING));
+    assert!(partition.eviction_awaits_upload(now));
+
+    let keep_everything = LocalEnvelope {
+        age: IggyExpiry::NeverExpire,
+        size: None,
+    };
+    partition.set_local_envelope(Some(keep_everything));
+    assert!(!partition.eviction_awaits_upload(now));
+
+    // Both sealed segments together are over a budget of one byte less, and
+    // the second alone is within it.
+    let sealed_bytes: u64 = partition.log.segments()[..2]
+        .iter()
+        .map(|segment| segment.size.as_bytes_u64())
+        .sum();
+    let over_by_the_first = LocalEnvelope {
+        age: IggyExpiry::NeverExpire,
+        size: Some(sealed_bytes - 1),
+    };
+    partition.set_local_envelope(Some(over_by_the_first));
+    assert!(partition.eviction_awaits_upload(now));
+
+    let first = partition.next_segment_upload().unwrap().record;
+    let advance = partition.note_segment_uploaded(&first);
+    assert!(
+        partition.eviction_awaits_upload(now),
+        "a stored segment still waits for its floor advance"
+    );
+    // Without an envelope the advance evicts nothing, so the first segment
+    // stays on disk below the floor.
+    partition.set_local_envelope(None);
+    Box::pin(apply(&mut partition, 100, advance)).await;
+    partition.set_local_envelope(Some(over_by_the_first));
+    assert_eq!(
+        partition.log.segments()[0].location,
+        SegmentLocation::Uploaded
+    );
+    assert!(
+        !partition.eviction_awaits_upload(now),
+        "the segment outside the envelope is below the floor, and the next one is inside"
+    );
+
+    partition.set_local_envelope(Some(KEEP_NOTHING));
+    assert!(partition.eviction_awaits_upload(now));
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(
+        !partition.eviction_awaits_upload(now),
+        "a backup uploads nothing"
+    );
+}
+
+/// A segment that sealed before the chain existed has no record until its
+/// `.log` is hashed, so that is when it becomes uploadable.
+#[compio::test]
+async fn given_segments_sealed_before_tiering_when_their_records_are_hashed_should_want_an_upload()
+{
+    let config = repair_config();
+    let (_directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
+    let batch_len = build_segment_record(partition.namespace(), 0).len() as u64;
+    let segment_size = IggyByteSize::from(BATCHES_PER_SEGMENT * batch_len);
+    partition.runtime_options.segment_size = Some(segment_size);
+    partition.log.active_segment_mut().max_size = segment_size;
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    Box::pin(commit_records(
+        &mut partition,
+        1,
+        &segment_records(RECEIVER_OPS),
+    ))
+    .await;
+    partition.set_local_envelope(Some(KEEP_NOTHING));
+    let now = IggyTimestamp::from(u64::MAX);
+    assert!(
+        !partition.take_upload_wanted(),
+        "a partition without a chain uploads nothing"
+    );
+    assert_eq!(partition.upload_lag(now), None);
+    assert!(!partition.eviction_awaits_upload(now));
+
+    partition.enable_tiering(PREFIX);
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    assert!(partition.take_upload_wanted());
+    assert!(partition.upload_lag(now).is_some());
+    assert!(partition.eviction_awaits_upload(now));
 }

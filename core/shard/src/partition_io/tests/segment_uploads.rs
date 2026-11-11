@@ -18,15 +18,18 @@
 //! Upload passes on a shard that hosts a tiered primary on disk.
 
 use super::*;
+use crate::upload_pacing::{TokenBucket, UPLOAD_LAG_ALARM, UPLOAD_RETRY_BASE, UPLOAD_RETRY_CAP};
 use crate::{FinishedSegmentUpload, MetadataSubmit};
 use futures::future::LocalBoxFuture;
 use iggy_common::IggyExpiry;
 use iggy_object_store::{
-    InlineTierExecutor, KeyLayout, MemoryStore, ObjectStoreError, TierScopeToken,
+    InlineTierExecutor, KeyLayout, MemoryStore, ObjectStoreError, TierJobCancelled, TierScopeToken,
 };
 use partitions::{
-    ExecutorUploader, SegmentLocation, SegmentUpload, SegmentUploader, UploadError, UploadOutcome,
+    ExecutorUploader, LocalEnvelope, SegmentLocation, SegmentUpload, SegmentUploader, UploadError,
+    UploadOutcome,
 };
+use std::time::Instant;
 
 /// Sealed segments the fixture's primary holds, of one message each.
 pub(super) const SEALED_SEGMENTS: u64 = 3;
@@ -41,6 +44,8 @@ pub(super) fn namespace() -> IggyNamespace {
 enum Store {
     Stores,
     Refuses,
+    /// Fails in a way that no retry changes.
+    Faults,
     /// Never answers, so the upload stays in flight.
     Hangs,
 }
@@ -82,6 +87,10 @@ impl SegmentUploader for RecordingUploader {
             Store::Refuses => Box::pin(std::future::ready(Ok(Err(UploadError::Store(
                 ObjectStoreError::Unavailable("503".to_owned()),
             ))))),
+            Store::Faults => Box::pin(std::future::ready(Ok(Err(UploadError::MediaFault {
+                start_offset: upload.record.start_offset,
+                reason: "its bytes hash to something else",
+            })))),
             Store::Hangs => Box::pin(std::future::pending()),
         }
     }
@@ -269,24 +278,352 @@ async fn given_no_uploader_when_an_upload_pass_runs_should_start_no_upload() {
 }
 
 #[compio::test]
-async fn given_a_store_that_refuses_when_an_upload_finishes_should_leave_the_retry_to_the_next_pass()
- {
+async fn given_a_store_that_refuses_when_passes_follow_should_retry_only_after_the_backoff() {
     let directory = tempfile::tempdir().unwrap();
     let owner = Box::pin(sealed_owner(directory.path())).await;
     let uploader = RecordingUploader::new(Store::Refuses);
     owner.set_segment_uploader(Some(uploader.clone()));
+    let failed_at = Instant::now();
 
-    owner.on_upload_segments(namespace(), true).await;
+    owner.upload_segments_at(namespace(), true, failed_at).await;
     let finished = finished_upload(&owner).await;
-    owner.on_segment_upload_finished(finished).await;
+    owner.segment_upload_finished_at(finished, failed_at).await;
 
     assert!(
         owner.inbox.try_recv().is_err(),
         "a failure stages no pass of its own"
     );
     assert_eq!(locations(&owner), [SegmentLocation::Local; 3]);
-    owner.on_upload_segments(namespace(), true).await;
+    let too_early = failed_at + UPLOAD_RETRY_BASE.saturating_sub(Duration::from_millis(1));
+    owner.upload_segments_at(namespace(), true, too_early).await;
+    assert_eq!(uploader.started(), [0]);
+    assert!(!upload_in_flight(&owner));
+
+    owner
+        .upload_segments_at(namespace(), true, failed_at + UPLOAD_RETRY_BASE)
+        .await;
     until(&owner, |_| uploader.started() == [0, 0]).await;
+}
+
+#[compio::test]
+async fn given_a_failed_upload_when_a_later_one_is_stored_should_not_hold_back_the_next_pass() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let uploader = RecordingUploader::new(Store::Refuses);
+    owner.set_segment_uploader(Some(uploader.clone()));
+    let failed_at = Instant::now();
+    owner.upload_segments_at(namespace(), true, failed_at).await;
+    let finished = finished_upload(&owner).await;
+    owner.segment_upload_finished_at(finished, failed_at).await;
+
+    uploader.store.set(Store::Stores);
+    let stored_at = failed_at + UPLOAD_RETRY_BASE;
+    owner.upload_segments_at(namespace(), true, stored_at).await;
+    let finished = finished_upload(&owner).await;
+    owner.segment_upload_finished_at(finished, stored_at).await;
+    uploader.store.set(Store::Refuses);
+    let _staged = owner.inbox.try_recv();
+    owner
+        .upload_segments_at(namespace(), false, stored_at)
+        .await;
+    let finished = finished_upload(&owner).await;
+    owner.segment_upload_finished_at(finished, stored_at).await;
+
+    // The wait after the second failure is the base again, not its double.
+    owner
+        .upload_segments_at(namespace(), true, stored_at + UPLOAD_RETRY_BASE)
+        .await;
+    until(&owner, |_| uploader.started() == [0, 0, 1, 1]).await;
+}
+
+#[compio::test]
+async fn given_an_upload_that_cannot_succeed_when_passes_follow_should_retry_only_after_the_longest_wait()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let uploader = RecordingUploader::new(Store::Faults);
+    owner.set_segment_uploader(Some(uploader.clone()));
+    let failed_at = Instant::now();
+    owner.upload_segments_at(namespace(), true, failed_at).await;
+    let finished = finished_upload(&owner).await;
+    owner.segment_upload_finished_at(finished, failed_at).await;
+
+    let too_early = failed_at + UPLOAD_RETRY_CAP.saturating_sub(Duration::from_millis(1));
+    owner.upload_segments_at(namespace(), true, too_early).await;
+    assert_eq!(uploader.started(), [0]);
+    assert!(!upload_in_flight(&owner));
+
+    owner
+        .upload_segments_at(namespace(), true, failed_at + UPLOAD_RETRY_CAP)
+        .await;
+    until(&owner, |_| uploader.started() == [0, 0]).await;
+}
+
+/// A cancelled upload says nothing about the store.
+#[compio::test]
+async fn given_a_cancelled_upload_when_the_next_pass_runs_should_not_make_it_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let uploader = RecordingUploader::new(Store::Hangs);
+    owner.set_segment_uploader(Some(uploader.clone()));
+    let cancelled_at = Instant::now();
+    owner
+        .upload_segments_at(namespace(), true, cancelled_at)
+        .await;
+    until(&owner, |_| uploader.started() == [0]).await;
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+
+    owner
+        .segment_upload_finished_at(
+            FinishedSegmentUpload {
+                namespace: namespace(),
+                created_revision: partition.created_revision(),
+                record: partition.sealed_segment_record(0).unwrap(),
+                outcome: Err(TierJobCancelled),
+            },
+            cancelled_at,
+        )
+        .await;
+
+    owner
+        .upload_segments_at(namespace(), true, cancelled_at)
+        .await;
+    until(&owner, |_| uploader.started() == [0, 0]).await;
+}
+
+/// The wait is kept on the shard, so it has to go when the partition does.
+#[compio::test]
+async fn given_a_failed_partition_when_a_timed_pass_no_longer_names_it_should_forget_its_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let uploader = RecordingUploader::new(Store::Refuses);
+    owner.set_segment_uploader(Some(uploader.clone()));
+    let failed_at = Instant::now();
+    owner.upload_segments_at(namespace(), true, failed_at).await;
+    let finished = finished_upload(&owner).await;
+    owner.segment_upload_finished_at(finished, failed_at).await;
+
+    owner.request_upload_passes(&[], IggyTimestamp::now());
+
+    owner.upload_segments_at(namespace(), true, failed_at).await;
+    until(&owner, |_| uploader.started() == [0, 0]).await;
+}
+
+#[compio::test]
+async fn given_a_segment_that_seals_when_no_timed_pass_runs_should_upload_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = tiered_owner(directory.path()).await;
+    let uploader = RecordingUploader::new(Store::Stores);
+    owner.set_segment_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        seal_segments(&owner).await;
+        until(&owner, |owner| floor(owner) == Some(SEALED_SEGMENTS - 1)).await;
+    })
+    .await;
+
+    assert_eq!(uploader.started(), [0, 1, 2], "oldest first, each once");
+}
+
+#[compio::test]
+async fn given_an_upload_in_flight_when_later_segments_seal_should_not_start_theirs() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = tiered_owner(directory.path()).await;
+    let uploader = RecordingUploader::new(Store::Hangs);
+    owner.set_segment_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        seal_segments(&owner).await;
+        until(&owner, |owner| owner.inbox_len() == 0).await;
+    })
+    .await;
+
+    assert_eq!(uploader.started(), [0]);
+    assert!(upload_in_flight(&owner));
+}
+
+/// The oldest segment failed, so it is the backlog: the seals behind it ask
+/// for passes, and none of them may start a younger segment.
+#[compio::test]
+async fn given_a_backlog_that_failed_when_later_segments_seal_should_not_overtake_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = tiered_owner(directory.path()).await;
+    let uploader = RecordingUploader::new(Store::Refuses);
+    owner.set_segment_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        seal_segments(&owner).await;
+        until(&owner, |owner| owner.inbox_len() == 0).await;
+    })
+    .await;
+
+    let started = uploader.started();
+    assert!(!started.is_empty(), "the first seal started its upload");
+    assert!(started.iter().all(|start_offset| *start_offset == 0));
+    assert_eq!(locations(&owner), [SegmentLocation::Local; 3]);
+}
+
+#[compio::test]
+async fn given_an_empty_byte_budget_when_a_pass_runs_should_start_nothing_until_it_refills() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let uploader = RecordingUploader::new(Store::Hangs);
+    owner.set_segment_uploader(Some(uploader.clone()));
+    let size = owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace())
+        .unwrap()
+        .next_segment_upload()
+        .unwrap()
+        .record
+        .size;
+    let emptied_at = Instant::now();
+    // One byte a second, and room for the segment many times over.
+    let mut bucket = TokenBucket::full(1, size * 10, emptied_at);
+    assert!(bucket.try_take(size * 10, emptied_at));
+    owner.upload_pacing.borrow_mut().bucket = bucket;
+
+    owner
+        .upload_segments_at(namespace(), true, emptied_at)
+        .await;
+    let short = emptied_at + Duration::from_secs(size - 1);
+    owner.upload_segments_at(namespace(), true, short).await;
+    assert_eq!(uploader.started(), [] as [u64; 0]);
+    assert!(!upload_in_flight(&owner));
+    assert!(
+        owner.inbox.try_recv().is_err(),
+        "a refused pass stages no other"
+    );
+
+    let refilled = emptied_at + Duration::from_secs(size);
+    owner.upload_segments_at(namespace(), true, refilled).await;
+    until(&owner, |_| uploader.started() == [0]).await;
+    assert_eq!(
+        owner.upload_pacing.borrow_mut().bucket.tokens(refilled),
+        0,
+        "the upload paid for its bytes"
+    );
+}
+
+/// A time `lag` after the newest message of the fixture's oldest segment.
+fn after_oldest_segment(owner: &IoTestShard, lag: Duration) -> IggyTimestamp {
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    let sent = partition.log.segments()[0].max_timestamp;
+    IggyTimestamp::from(sent + u64::try_from(lag.as_micros()).unwrap())
+}
+
+/// The namespaces of the upload passes waiting in the inbox, in order.
+fn staged_passes(owner: &IoTestShard) -> Vec<IggyNamespace> {
+    std::iter::from_fn(|| match owner.inbox.try_recv() {
+        Ok(ShardFrame::Lifecycle(LifecycleFrame::UploadSegments {
+            namespace,
+            resend_advance: true,
+        })) => Some(namespace),
+        Ok(_) => panic!("only timed upload passes are on their way"),
+        Err(_) => None,
+    })
+    .collect()
+}
+
+#[compio::test]
+async fn given_a_sealed_segment_when_timed_passes_run_should_report_its_age_until_it_is_uploaded() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = tiered_owner(directory.path()).await;
+    let uploader = RecordingUploader::new(Store::Stores);
+
+    pumped(&owner, async {
+        seal_segments(&owner).await;
+        let now = after_oldest_segment(&owner, Duration::from_secs(5));
+        owner.request_upload_passes(&[namespace()], now);
+        assert_eq!(owner.metrics().segment_upload_lag_seconds_value(), 5);
+
+        owner.set_segment_uploader(Some(uploader.clone()));
+        owner.request_upload_segments(namespace());
+        until(&owner, |owner| floor(owner) == Some(SEALED_SEGMENTS - 1)).await;
+        owner.request_upload_passes(&[namespace()], now);
+        assert_eq!(owner.metrics().segment_upload_lag_seconds_value(), 0);
+    })
+    .await;
+}
+
+#[compio::test]
+async fn given_a_lag_over_the_alarm_line_when_timed_passes_run_should_hold_the_alarm_until_it_recovers()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    // The partition without a backlog comes last, and must not hide the lag
+    // of the one before it.
+    let passes = [namespace(), IggyNamespace::new(0, 0, 1)];
+    let lagging = |owner: &IoTestShard| owner.upload_pacing.borrow().is_lagging(namespace());
+    let under = after_oldest_segment(
+        &owner,
+        UPLOAD_LAG_ALARM.saturating_sub(Duration::from_secs(1)),
+    );
+    let over = after_oldest_segment(&owner, UPLOAD_LAG_ALARM);
+
+    owner.request_upload_passes(&[namespace()], under);
+    assert!(!lagging(&owner));
+    owner.request_upload_passes(&passes, over);
+    assert!(lagging(&owner));
+    let alarm_secs = i64::try_from(UPLOAD_LAG_ALARM.as_secs()).unwrap();
+    assert_eq!(
+        owner.metrics().segment_upload_lag_seconds_value(),
+        alarm_secs
+    );
+
+    let partition = owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap();
+    while let Some(upload) = partition.next_segment_upload() {
+        partition.note_segment_uploaded(&upload.record);
+    }
+    owner.request_upload_passes(&passes, over);
+    assert!(!lagging(&owner));
+    assert_eq!(owner.metrics().segment_upload_lag_seconds_value(), 0);
+}
+
+#[compio::test]
+async fn given_a_partition_whose_eviction_waits_when_timed_passes_are_staged_should_put_it_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let other = IggyNamespace::new(0, 0, 1);
+    assert!(owner.plane.partitions().get_by_ns(&other).is_some());
+    let now = IggyTimestamp::now();
+
+    owner.request_upload_passes(&[other, namespace()], now);
+    assert_eq!(
+        staged_passes(&owner),
+        [other, namespace()],
+        "nothing waits, so the order stands"
+    );
+
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_local_envelope(Some(LocalEnvelope {
+            age: IggyExpiry::NeverExpire,
+            size: Some(0),
+        }));
+    owner.request_upload_passes(&[other, namespace()], now);
+    assert_eq!(staged_passes(&owner), [namespace(), other]);
+}
+
+/// A pass settles the results the inbox refused, whatever partition it is
+/// for, so one is staged for a partition that is gone as well.
+#[compio::test]
+async fn given_a_partition_that_is_gone_when_timed_passes_are_staged_should_still_stage_its_pass() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(sealed_owner(directory.path())).await;
+    let absent = IggyNamespace::new(9, 9, 9);
+
+    owner.request_upload_passes(&[absent, namespace()], IggyTimestamp::now());
+
+    assert_eq!(staged_passes(&owner), [absent, namespace()]);
 }
 
 #[compio::test]
@@ -413,10 +750,11 @@ async fn given_a_stored_segment_whose_advance_was_lost_when_a_timed_pass_runs_sh
     let directory = tempfile::tempdir().unwrap();
     let owner = tiered_owner(directory.path()).await;
     let uploader = RecordingUploader::new(Store::Hangs);
-    owner.set_segment_uploader(Some(uploader.clone()));
 
     pumped(&owner, async {
         seal_segments(&owner).await;
+        // Set after the seals, each of which would have started an upload.
+        owner.set_segment_uploader(Some(uploader.clone()));
         let partition = owner
             .plane
             .partitions()

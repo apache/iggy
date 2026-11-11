@@ -31,6 +31,7 @@ mod served_reads;
 pub mod shards_table;
 #[cfg(test)]
 mod test_support;
+mod upload_pacing;
 
 pub use config::CoordinatorConfig;
 pub use host::{NoopHost, ShardHost};
@@ -1185,8 +1186,9 @@ pub enum LifecycleFrame {
     },
     /// Per-shard pass over a partition of a tiered topic: start the upload of
     /// its oldest sealed segment the store does not hold, when this replica
-    /// is the primary and no upload is in flight. Does nothing on a shard
-    /// without an uploader.
+    /// is the primary, no upload is in flight, the shard's byte budget covers
+    /// the segment and the partition is not waiting out a failed upload. Does
+    /// nothing on a shard without an uploader.
     UploadSegments {
         namespace: IggyNamespace,
         /// Whether the pass also sends the floor advance that a stored
@@ -2003,6 +2005,10 @@ where
     /// upload pass takes them from here.
     undelivered_segment_uploads: Rc<RefCell<Vec<FinishedSegmentUpload>>>,
 
+    /// What holds an upload back on this shard: the byte budget every upload
+    /// draws from, and the wait of each partition whose upload failed.
+    upload_pacing: RefCell<upload_pacing::UploadPacing>,
+
     /// Late-bound deleter of the objects of removed segments. `None` on a
     /// shard without an object store, where every delete pass is a no-op. No
     /// boot path sets it, so deletes run only where a caller of
@@ -2354,6 +2360,7 @@ where
             metadata_tick_handler: RefCell::new(None),
             segment_uploader: RefCell::new(None),
             undelivered_segment_uploads: Rc::default(),
+            upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
             floor_advance_requests: Cell::new(0),
@@ -3320,6 +3327,7 @@ where
             metadata_tick_handler: RefCell::new(None),
             segment_uploader: RefCell::new(None),
             undelivered_segment_uploads: Rc::default(),
+            upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
             floor_advance_requests: Cell::new(0),
