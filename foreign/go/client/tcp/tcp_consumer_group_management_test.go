@@ -22,8 +22,11 @@ import (
 	"encoding/binary"
 	"strings"
 	"testing"
+	"time"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -136,4 +139,48 @@ func TestSyncConsumerGroup_KeepsAMemberWithoutPartitionsNonNil(t *testing.T) {
 	require.NotNil(t, assignment, "membership and emptiness are different states")
 	assert.Equal(t, uint64(6), assignment.Generation)
 	assert.Empty(t, assignment.Partitions)
+}
+
+// A sync that changes the assignment raises the metadata watermark to the
+// commit of its reply, so a fetch of a partition it added names that commit. A
+// sync that keeps the assignment raises nothing.
+func TestSyncConsumerGroup_RaisesTheWatermarkOnlyWhenTheAssignmentChanges(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	// The join installs no owner, so the first sync lists no partition.
+	commit, partitions := uint64(10), []uint32{}
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+		if read.code() != uint32(command.SyncGroupCode) {
+			return replyFrame(vsr.OperationNonReplicated, fetchBody(fetchSection{partition: 1, next: 1}))
+		}
+		answer := replyFrame(vsr.OperationNonReplicated, assignmentBody(7, partitions...))
+		binary.LittleEndian.PutUint64(answer[testMetadataCommitOffset:], commit)
+		return answer
+	})
+	streamId, topicId, consumer := groupConsumer(t)
+	syncAssignment := func() {
+		_, err := client.SyncConsumerGroup(context.Background(), streamId, topicId, consumer.Id)
+		require.NoError(t, err)
+	}
+	fetchPartition := func() {
+		_, err := client.FetchMessages(context.Background(), streamId, topicId, consumer,
+			[]iggcon.FetchMessagesTarget{{PartitionId: 1, Strategy: iggcon.NextPollingStrategy()}},
+			1, false, deferredOptions(0, 2*time.Second))
+		require.NoError(t, err)
+	}
+
+	syncAssignment()
+	commit, partitions = 20, []uint32{1}
+	syncAssignment()
+	fetchPartition()
+	commit = 30
+	syncAssignment()
+	fetchPartition()
+
+	var floors []uint64
+	for _, read := range server.recorded() {
+		if read.code() == uint32(command.FetchMessagesCode) {
+			floors = append(floors, stampedContext(t, read).MetadataOp)
+		}
+	}
+	assert.Equal(t, []uint64{20, 20}, floors, "a fetch names the commit of the sync that added its partition")
 }

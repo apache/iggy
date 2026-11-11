@@ -263,25 +263,46 @@ func (s *fakeServer) recorded() []request {
 	return append([]request(nil), s.requests...)
 }
 
+// The partition history and the metadata op that servePartitionOperations routes to.
+const (
+	routedIncarnation = 17
+	routedMetadataOp  = 100
+)
+
+// servePartitionOperations routes each partition to replica 0 and answers the
+// other requests with handler. As the server does, it refuses a poll, an
+// offset write or a lookup that names no history.
 func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index int, read request) []byte, partitionsCount ...uint32) *fakeServer {
 	t.Helper()
 	return serve(conn, func(index int, read request) []byte {
-		switch read.code() {
-		case uint32(command.GetPartitionRouteCode):
-			body := binary.LittleEndian.AppendUint64(nil, 17)
-			body = binary.LittleEndian.AppendUint64(body, 100)
-			body = binary.LittleEndian.AppendUint32(body, 0)
+		// Only a request that is not replicated carries its command code.
+		code, operation := command.Code(read.code()), read.operation()
+		fenced := code == command.PollMessagesCode || code == command.PollMessagesDeferredCode || code == command.GetOffsetCode ||
+			operation == vsr.OperationStoreConsumerOffset || operation == vsr.OperationDeleteConsumerOffset
+		switch {
+		case fenced && read.incarnation() == 0:
+			return statusReplyFrame(operation, uint32(ierror.HistoryUnavailableCode), nil)
+		case code == command.GetPartitionRouteCode:
 			count := uint32(1)
 			if len(partitionsCount) != 0 {
 				count = partitionsCount[0]
 			}
-			body = binary.LittleEndian.AppendUint32(body, count)
-			body = append(body, 0)
-			return replyFrame(vsr.OperationNonReplicated, body)
+			return partitionRouteFrame(routedIncarnation, count)
 		default:
 			return handler(index, read)
 		}
 	})
+}
+
+// partitionRouteFrame answers a route lookup with the partition history
+// incarnation at routedMetadataOp, on replica 0.
+func partitionRouteFrame(incarnation uint64, partitionsCount uint32) []byte {
+	body := binary.LittleEndian.AppendUint64(nil, incarnation)
+	body = binary.LittleEndian.AppendUint64(body, routedMetadataOp)
+	body = binary.LittleEndian.AppendUint32(body, 0)
+	body = binary.LittleEndian.AppendUint32(body, partitionsCount)
+	body = append(body, 0)
+	return replyFrame(vsr.OperationNonReplicated, body)
 }
 
 // newPipeClient builds a client wired to one end of an in-memory pipe, with a

@@ -22,38 +22,44 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::time::Duration;
 
+use bytes::Bytes;
 use iggy_binary_protocol::codes::{
-    CREATE_CONSUMER_GROUP_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_PARTITION_ROUTE_CODE, JOIN_CONSUMER_GROUP_CODE, LOGIN_REGISTER_CODE,
+    CREATE_CONSUMER_GROUP_CODE, DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE,
+    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE, GET_STREAMS_CODE,
+    JOIN_CONSUMER_GROUP_CODE, LEAVE_CONSUMER_GROUP_CODE, LOGIN_REGISTER_CODE,
     POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::consensus::EvictionReason;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffsetRequest, GetConsumerOffsetRequest,
+};
 use iggy_binary_protocol::requests::messages::{DeferredPollMessagesRequest, FetchMessagesRequest};
 use iggy_binary_protocol::responses::consumer_groups::{
     ConsumerGroupDetailsResponse, ConsumerGroupResponse, SyncConsumerGroupResponse,
 };
-use iggy_binary_protocol::responses::messages::{
-    FetchMessagesResponse, PartitionRouteResponse, PollMessagesResponseHeader,
-};
+use iggy_binary_protocol::responses::messages::{FetchMessagesResponse, PartitionRouteResponse};
 use iggy_binary_protocol::{WireDecode, WireEncode, WireName};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    BinaryTransport, Client, CommitPolicy, Consumer, ConsumerOffsetClient, DiagnosticEvent,
-    Identifier, IggyDuration, IggyError, PollOptions, PolledMessages, PollingStrategy, TopicClient,
-    UserClient,
+    BinaryTransport, CommitPolicy, Consumer, ConsumerGroupClient, ConsumerOffsetClient,
+    DiagnosticEvent, Identifier, IggyDuration, IggyError, IggyTimestamp, PollOptions,
+    PolledMessages, PollingStrategy, TopicClient, UserClient,
 };
+use tokio::sync::Notify;
 use tokio::task::yield_now;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::fixtures::{
-    CONSUMER_ID, GROUP_ID, STREAM_ID, Section, TOPIC_ID, builder_on, committing, fetch_body, group,
-    identifier, partition_and_offsets, refused, served, stored_offsets,
+    CONSUMER_ID, CONTEXT, GROUP_ID, STREAM_ID, Section, TOPIC_ID, builder_on, committing,
+    fetch_body, group, identifier, lookup_answer, partition_and_offsets, polled_answer_in, refused,
+    served, stored_offsets,
 };
+use super::worker::{ASSIGNMENT_REFRESH_INTERVAL, MAX_LASTING_REFUSALS};
 use super::{ORDERING, PartitionReader, ReadError};
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::reader_builder::ReaderBuilder;
-use crate::links::OPERATION_TIMEOUT;
 use crate::links::fake_cluster::{
     Answer, FakeCluster, Received, TEST_BUDGET, connected, endpoint, eventually,
 };
@@ -77,12 +83,19 @@ const USERNAME: &str = "iggy";
 /// The commit of each scripted metadata reply.
 const COMMIT_OP: u64 = 1;
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+/// Lets the reader take a reply that the cluster already sent. Shorter than `RETRY_INTERVAL`, so
+/// no retry starts in it.
+const REPLY_STEP: Duration = Duration::from_millis(1);
 /// Long enough for every refresh and retry of a reader, and below the deadline of a read.
 const POLL_TIMEOUT: Duration = Duration::from_secs(2);
 /// The unanswered reads after the scripted ones. A reader that reads ahead then waits instead
 /// of spinning on the empty replies of the fake replicas, which stops the paused clock.
 const SILENT_READS: usize = 8;
 const GROUP_REFRESHES: usize = 16;
+/// The first batch of a partition that holds the messages before [`PARTITION_END`].
+const FIRST_BATCH: [u64; 2] = [0, 1];
+const SECOND_BATCH_START: u64 = FIRST_BATCH.len() as u64;
+const PARTITION_END: u64 = 4;
 
 #[tokio::test(start_paused = true)]
 async fn given_reader_options_when_reading_should_send_them_in_each_request() {
@@ -269,10 +282,11 @@ async fn given_a_missing_group_when_building_should_return_the_join_error() {
     );
 }
 
+/// A build abandons a join with an unknown outcome on the client at once, so the next build
+/// joins again instead of finding the metadata lane blocked.
 #[tokio::test(start_paused = true)]
-async fn given_an_uncertain_join_when_building_again_should_keep_it_until_the_caller_resolves_it() {
-    // Each build looks the group up, the blocked one too.
-    const BUILDS: usize = 3;
+async fn given_an_uncertain_join_when_building_again_should_abandon_it_and_join_again() {
+    const BUILDS: usize = 2;
     let (client, cluster) = connect_to_three_replicas().await;
     let metadata_primary = endpoint(METADATA_PRIMARY);
     cluster.script(
@@ -299,28 +313,16 @@ async fn given_an_uncertain_join_when_building_again_should_keep_it_until_the_ca
     let lost = reader().build().await.err();
     let op = cluster.received(JOIN_CONSUMER_GROUP_CODE)[0].header.request;
     assert_eq!(lost, Some(IggyError::OperationUncertain(op)));
-    assert_eq!(
-        reader().build().await.err(),
-        Some(IggyError::LaneBlocked(op)),
-        "the client keeps the join of the failed build"
+    assert!(
+        !client.read().await.retains_operation(op).await,
+        "the failed build abandons its join"
     );
-    assert_eq!(cluster.count(JOIN_CONSUMER_GROUP_CODE), 1);
 
-    client
-        .read()
-        .await
-        .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
-        .await
-        .unwrap();
     reader().build().await.unwrap();
 
     let joins = cluster.received(JOIN_CONSUMER_GROUP_CODE);
-    assert_eq!(joins.len(), 3);
-    assert_eq!(
-        joins[1].header.request, op,
-        "the resolution replays the lost join"
-    );
-    assert_ne!(joins[2].header.request, op);
+    assert_eq!(joins.len(), BUILDS);
+    assert_ne!(joins[1].header.request, op, "the build sends a new join");
 }
 
 #[tokio::test(start_paused = true)]
@@ -348,6 +350,94 @@ async fn given_a_lost_membership_when_the_join_fails_should_report_it_for_the_wh
         ),
         "{refused:?}"
     );
+}
+
+/// A join after a lost session has an unknown outcome, and the reader closes before the next
+/// refresh. The join abandoned it at once, so it does not block the leave.
+#[tokio::test(start_paused = true)]
+async fn given_a_join_with_an_unknown_outcome_when_closing_should_abandon_it_and_leave() {
+    let (client, cluster) = connect_to_three_replicas().await;
+    let metadata_primary = endpoint(METADATA_PRIMARY);
+    cluster.script(
+        &metadata_primary,
+        GET_CONSUMER_GROUP_CODE,
+        repeat_n(existing_group(), 2),
+    );
+    cluster.script(
+        &metadata_primary,
+        JOIN_CONSUMER_GROUP_CODE,
+        [Answer::Commit(COMMIT_OP), Answer::Silence],
+    );
+    let mut reader = member(client).build().await.unwrap();
+    forget_membership(&reader);
+    let lost = timeout(TEST_BUDGET, reader.next()).await.unwrap();
+    let op = cluster.received(JOIN_CONSUMER_GROUP_CODE)[1].header.request;
+    assert!(
+        matches!(
+            &lost,
+            Err(ReadError {
+                error: IggyError::OperationUncertain(uncertain),
+                ..
+            }) if *uncertain == op
+        ),
+        "{lost:?}"
+    );
+
+    let closed = reader.close().await;
+
+    assert_eq!(closed, Ok(()));
+    assert_eq!(
+        cluster.count(JOIN_CONSUMER_GROUP_CODE),
+        2,
+        "the close does not resolve the join"
+    );
+    assert_eq!(cluster.count(LEAVE_CONSUMER_GROUP_CODE), 1);
+}
+
+/// The leave of the close has an unknown outcome, which blocks the metadata writes of the
+/// client. The close abandons it, so a later metadata write of the application on the same
+/// client goes out.
+#[tokio::test(start_paused = true)]
+async fn given_a_leave_with_an_unknown_outcome_when_the_client_writes_metadata_after_the_close_should_find_its_lane_free()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    let metadata_primary = endpoint(METADATA_PRIMARY);
+    cluster.script(
+        &metadata_primary,
+        GET_CONSUMER_GROUP_CODE,
+        [existing_group()],
+    );
+    cluster.script(
+        &metadata_primary,
+        LEAVE_CONSUMER_GROUP_CODE,
+        [Answer::Silence],
+    );
+    let client = IggyRwLock::new(ClientWrapper::Tcp(client));
+    let reader = ReaderBuilder::new(
+        client.clone(),
+        identifier(STREAM_ID),
+        identifier(TOPIC_ID),
+        group(),
+        None,
+    )
+    .build()
+    .await
+    .unwrap();
+
+    let closed = reader.close().await;
+    let joined = client
+        .read()
+        .await
+        .join_consumer_group(
+            &identifier(STREAM_ID),
+            &identifier(TOPIC_ID),
+            &identifier(GROUP_ID),
+        )
+        .await;
+
+    assert_eq!(closed, Ok(()));
+    assert_eq!(cluster.count(LEAVE_CONSUMER_GROUP_CODE), 1);
+    assert_eq!(joined, Ok(()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -417,7 +507,162 @@ async fn given_a_member_unknown_to_the_server_when_refreshing_should_join_again_
 }
 
 #[tokio::test(start_paused = true)]
-async fn given_an_uncertain_group_mutation_when_the_refresh_joins_again_should_resolve_it_and_read()
+async fn given_a_join_whose_partition_becomes_pollable_later_when_reading_should_read_before_the_refresh_interval()
+ {
+    const OFFSET: u64 = 2;
+    let (client, cluster) = connect_to_three_replicas().await;
+    cluster.script(
+        &endpoint(METADATA_PRIMARY),
+        GET_CONSUMER_GROUP_CODE,
+        repeat_n(existing_group(), GROUP_REFRESHES),
+    );
+    // The partition log persists the new owner only after the first sync.
+    cluster.script(
+        &endpoint(METADATA_PRIMARY),
+        SYNC_CONSUMER_GROUP_CODE,
+        once(assignment(&[])).chain(repeat_n(
+            assignment_at(GROUP_GENERATION + 1, &[PARTITION]),
+            GROUP_REFRESHES,
+        )),
+    );
+    script_fetches(&cluster, [served_answer(PARTITION, OFFSET)]);
+    let mut reader = member(client).build().await.unwrap();
+    let started = Instant::now();
+
+    let read = timeout(TEST_BUDGET, reader.next()).await.unwrap();
+
+    assert!(
+        matches!(&read, Ok(batch) if partition_and_offsets(batch) == (PARTITION, vec![OFFSET])),
+        "{read:?} after {:?}: lookups {}, joins {}, syncs {}",
+        started.elapsed(),
+        cluster.count(GET_CONSUMER_GROUP_CODE),
+        cluster.count(JOIN_CONSUMER_GROUP_CODE),
+        cluster.count(SYNC_CONSUMER_GROUP_CODE)
+    );
+    assert!(
+        started.elapsed() < ASSIGNMENT_REFRESH_INTERVAL,
+        "the member asks again soon after the join, but read after {:?}",
+        started.elapsed()
+    );
+}
+
+/// A handover installs the owner of a partition in a metadata op after the join, and a sync
+/// lists the partition once its replica applied that op. So a sync that changes the assignment
+/// raises the metadata watermark to its commit, and a primary that has not applied the handover
+/// refuses a later read as not accepted, not as not owned. A sync that changes nothing keeps the
+/// watermark, so the reads of a settled member never wait for unrelated metadata.
+#[tokio::test(start_paused = true)]
+async fn given_syncs_at_rising_commits_when_reading_metadata_should_wait_only_for_the_syncs_that_changed_the_assignment()
+ {
+    const ADDED: u64 = 5;
+    const UNCHANGED: u64 = ADDED + 1;
+    const EXTENDED: u64 = UNCHANGED + 1;
+    const NOT_A_MEMBER: u64 = EXTENDED + 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let answers = [
+        assignment_at_commit(ADDED, GROUP_GENERATION, &[PARTITION]),
+        assignment_at_commit(UNCHANGED, GROUP_GENERATION, &[PARTITION]),
+        assignment_at_commit(
+            EXTENDED,
+            GROUP_GENERATION + 1,
+            &[OTHER_PARTITION, PARTITION],
+        ),
+        Answer::CommitBody(NOT_A_MEMBER, Vec::new()),
+    ];
+    let syncs = answers.len();
+    cluster.script(
+        &endpoint(METADATA_PRIMARY),
+        SYNC_CONSUMER_GROUP_CODE,
+        answers,
+    );
+    let (stream, topic, group) = (
+        identifier(STREAM_ID),
+        identifier(TOPIC_ID),
+        identifier(GROUP_ID),
+    );
+    let mut watermarks = Vec::with_capacity(syncs);
+
+    for _ in 0..syncs {
+        client
+            .sync_consumer_group(&stream, &topic, &group)
+            .await
+            .unwrap();
+        client
+            .send_raw_with_response(GET_STREAMS_CODE, Bytes::new())
+            .await
+            .unwrap();
+        let reads = cluster.received(GET_STREAMS_CODE);
+        watermarks.push(reads.last().unwrap().header.minimum_metadata_op);
+    }
+
+    assert_eq!(watermarks, [ADDED, ADDED, EXTENDED, EXTENDED]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_an_assignment_that_stops_changing_when_refreshing_should_back_off_to_the_refresh_interval()
+ {
+    const SETTLED: Duration = Duration::from_secs(2);
+    const INTERVALS: u32 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_group(&cluster, &[PARTITION]);
+    script_fetches(&cluster, []);
+    let _reader = member(client).build().await.unwrap();
+    sleep(SETTLED).await;
+    let settled = cluster.count(SYNC_CONSUMER_GROUP_CODE);
+
+    sleep(ASSIGNMENT_REFRESH_INTERVAL * INTERVALS).await;
+
+    let refreshes = cluster.count(SYNC_CONSUMER_GROUP_CODE) - settled;
+    assert!(
+        refreshes <= usize::try_from(INTERVALS).unwrap() + 1,
+        "one refresh per interval once the assignment settles, but {refreshes}"
+    );
+}
+
+/// A store refused as not owned can follow a rebalance that the member did not see yet, so the
+/// member asks for its assignment at once instead of at the next refresh.
+#[tokio::test(start_paused = true)]
+async fn given_a_commit_refused_as_not_owned_when_its_partition_stays_should_refresh_the_assignment_at_once()
+ {
+    const OFFSET: u64 = 2;
+    const SETTLED: Duration = Duration::from_secs(3);
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_group(&cluster, &[PARTITION]);
+    let (mut section, records) = served(PARTITION, &[OFFSET], OFFSET + 1);
+    section.context = CONTEXT;
+    script_fetches(&cluster, [sections_answer(&[(section, records)])]);
+    let mut reader = member(client).build().await.unwrap();
+    let checkpoint = next_batch(&mut reader).await.checkpoint().unwrap();
+    sleep(SETTLED).await;
+    let settled = cluster.count(SYNC_CONSUMER_GROUP_CODE);
+    eventually("a refresh at the settled interval", || {
+        cluster.count(SYNC_CONSUMER_GROUP_CODE) > settled
+    })
+    .await;
+    let refreshes = cluster.count(SYNC_CONSUMER_GROUP_CODE);
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Refuse(IggyError::ConsumerGroupPartitionNotOwned(
+            0, PARTITION,
+        ))],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [polled_answer_in(PARTITION, &[], CONTEXT)],
+    );
+
+    reader.commit(checkpoint).await.unwrap();
+    sleep(ASSIGNMENT_REFRESH_INTERVAL / 2).await;
+
+    assert_eq!(cluster.count(SYNC_CONSUMER_GROUP_CODE), refreshes + 1);
+}
+
+/// A refresh abandons a create or a join with an unknown outcome at once. The next refresh looks
+/// the group up again, finds the group that the lost create made, and joins anew.
+#[tokio::test(start_paused = true)]
+async fn given_an_uncertain_group_mutation_when_the_refresh_joins_again_should_abandon_it_and_read()
 {
     const OFFSET: u64 = 2;
     for mutation in [CREATE_CONSUMER_GROUP_CODE, JOIN_CONSUMER_GROUP_CODE] {
@@ -466,31 +711,27 @@ async fn given_an_uncertain_group_mutation_when_the_refresh_joins_again_should_r
         let read = timeout(TEST_BUDGET, reader.next()).await.unwrap();
 
         let requests = cluster.received(mutation);
-        let (lost, replayed) = (
-            &requests[earlier_mutations],
-            &requests[earlier_mutations + 1],
-        );
-        let op = lost.header.request;
+        let op = requests[earlier_mutations].header.request;
         assert_eq!(
             uncertain.unwrap_err(),
             ReadError::new(None, IggyError::OperationUncertain(op)),
             "mutation {mutation}"
         );
         assert!(read.is_ok(), "mutation {mutation}: {read:?}");
-        assert_eq!(
-            (replayed.header.request, &replayed.body),
-            (op, &lost.body),
-            "the next join resolves the mutation by its replay, mutation {mutation}"
+        assert!(
+            requests[earlier_mutations + 1..]
+                .iter()
+                .all(|later| later.header.request != op),
+            "the next join replays nothing, mutation {mutation}"
         );
-        assert_eq!(
-            reader
+        assert!(
+            !reader
                 .config
                 .client
                 .read()
                 .await
-                .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
+                .retains_operation(op)
                 .await,
-            Ok(()),
             "mutation {mutation}"
         );
     }
@@ -700,6 +941,12 @@ async fn given_the_first_committing_next_reply_is_lost_when_closing_should_rewin
         let (client, cluster) = connect_to_three_replicas().await;
         script_fetches(&cluster, [Answer::Silence]);
         script_initial_next(&cluster, &[(PARTITION, first)]);
+        // The server committed the read whose reply was lost.
+        cluster.script(
+            &endpoint(PRIMARY),
+            GET_CONSUMER_OFFSET_CODE,
+            [lookup_answer(PARTITION, Some(first))],
+        );
         let mut reader = committing(standalone(client, [PARTITION]))
             .build()
             .await
@@ -716,6 +963,156 @@ async fn given_the_first_committing_next_reply_is_lost_when_closing_should_rewin
             assert_eq!(stored_offsets(&cluster), [first - 1]);
         }
     }
+}
+
+/// A lost read may never reach the server, and the server refuses a delete of a missing offset.
+#[tokio::test(start_paused = true)]
+async fn given_a_lost_first_read_at_offset_0_without_a_stored_offset_when_closing_should_send_no_delete()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_fetches(&cluster, [Answer::Silence]);
+    script_initial_next(&cluster, &[(PARTITION, 0)]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .build()
+        .await
+        .unwrap();
+    start_fetch(&mut reader, &cluster, 1).await;
+
+    reader.close().await.unwrap();
+
+    assert_eq!(offset_resets(&cluster), (vec![Some(PARTITION)], vec![]));
+    assert!(stored_offsets(&cluster).is_empty());
+}
+
+/// The next reader resumes after the stored offset whatever its start, so the close moves the
+/// offset before the batch that the application never got.
+#[tokio::test(start_paused = true)]
+async fn given_an_offset_start_and_an_undelivered_batch_when_closing_should_rewind_before_the_batch()
+ {
+    for start in [0, SECOND_BATCH_START] {
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut server = ServerOffset::default();
+        cluster.script(
+            &endpoint(PRIMARY),
+            FETCH_MESSAGES_CODE,
+            [server.read(&[start, start + 1])],
+        );
+        let mut reader = committing(standalone(client, [PARTITION]))
+            .start(PollingStrategy::offset(start))
+            .build()
+            .await
+            .unwrap();
+        start_fetch(&mut reader, &cluster, 1).await;
+        cluster.script(
+            &endpoint(PRIMARY),
+            GET_CONSUMER_OFFSET_CODE,
+            [server.lookup()],
+        );
+        cluster.script(
+            &endpoint(PRIMARY),
+            DELETE_CONSUMER_OFFSET_CODE,
+            [server.delete()],
+        );
+
+        reader.close().await.unwrap();
+
+        if start == 0 {
+            assert_eq!(
+                offset_resets(&cluster),
+                (vec![Some(PARTITION); 2], vec![Some(PARTITION)]),
+                "the start and the close look the offset up, and the close deletes it"
+            );
+            assert!(stored_offsets(&cluster).is_empty());
+        } else {
+            assert_eq!(offset_resets(&cluster), (vec![Some(PARTITION)], vec![]));
+            assert_eq!(stored_offsets(&cluster), [start - 1]);
+        }
+    }
+}
+
+/// A read from an explicit offset learns the history of its partition only from its reply, so
+/// the close moves the offset before the start of a lost first read without a history.
+#[tokio::test(start_paused = true)]
+async fn given_an_offset_start_whose_first_reply_is_lost_when_closing_should_rewind_before_the_start()
+ {
+    for start in [0, SECOND_BATCH_START] {
+        let cluster = close_after_a_lost_first_read(PollingStrategy::offset(start), start).await;
+        // A start without a history names no known message, so the close looks the offset up.
+        assert_rewound_before(&cluster, start, 2, &format!("offset {start}"));
+    }
+}
+
+/// A read from past the end of the partition stores nothing, so the close leaves the offset.
+#[tokio::test(start_paused = true)]
+async fn given_an_offset_start_past_the_end_whose_reply_is_lost_when_closing_should_store_nothing()
+{
+    const PAST_END: u64 = PARTITION_END + 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let server = ServerOffset::default();
+    script_fetches(&cluster, [Answer::Silence]);
+    // The offset before the start lies past the last message.
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [server.store(PAST_END - 1)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(PAST_END))
+        .build()
+        .await
+        .unwrap();
+    start_fetch(&mut reader, &cluster, 1).await;
+
+    let closed = reader.close().await;
+
+    assert_eq!(closed, Ok(()));
+    assert!(stored_offsets(&cluster).is_empty());
+    assert_eq!(offset_resets(&cluster), (vec![Some(PARTITION); 2], vec![]));
+}
+
+/// The check of a `Last` or timestamp start resolves it to the offset of its first message.
+#[tokio::test(start_paused = true)]
+async fn given_a_last_or_timestamp_start_whose_first_reply_is_lost_when_closing_should_rewind_to_the_resolved_start()
+ {
+    const TIMESTAMP_US: u64 = 1_000;
+    for start in [
+        PollingStrategy::last(),
+        PollingStrategy::timestamp(IggyTimestamp::from(TIMESTAMP_US)),
+    ] {
+        for resolved in [0, SECOND_BATCH_START] {
+            let cluster = close_after_a_lost_first_read(start, resolved).await;
+            // The check names a known message, so only the delete at 0 looks the offset up again.
+            let lookups = if resolved == 0 { 2 } else { 1 };
+            assert_rewound_before(
+                &cluster,
+                resolved,
+                lookups,
+                &format!("{start} at {resolved}"),
+            );
+        }
+    }
+}
+
+/// The seek stores the offset before its target without a history, and the close stores it
+/// again after the lost first read from the target.
+#[tokio::test(start_paused = true)]
+async fn given_a_seek_without_a_history_whose_first_reply_is_lost_when_closing_should_store_before_it_again()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_fetches(&cluster, [Answer::Silence]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .build()
+        .await
+        .unwrap();
+    reader
+        .seek(PARTITION, PollingStrategy::offset(SECOND_BATCH_START))
+        .await
+        .unwrap();
+    start_fetch(&mut reader, &cluster, 1).await;
+
+    reader.close().await.unwrap();
+
+    assert_eq!(stored_offsets(&cluster), [SECOND_BATCH_START - 1; 2]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1026,7 +1423,7 @@ async fn given_a_lost_committing_reply_when_seeking_should_read_from_the_new_pos
 /// A seek to `Next` leaves the partition without a known start, which a poll resolves before a
 /// committing fetch reads it, whatever start the reader was built with.
 #[tokio::test(start_paused = true)]
-async fn given_a_committing_reader_started_at_first_when_a_partition_is_sought_to_next_should_read_it_again()
+async fn given_a_committing_reader_started_at_offset_0_when_a_partition_is_sought_to_next_should_read_it_again()
  {
     const RESUMED_OFFSET: u64 = 5;
     let (client, cluster) = connect_to_three_replicas().await;
@@ -1039,7 +1436,7 @@ async fn given_a_committing_reader_started_at_first_when_a_partition_is_sought_t
     );
     script_initial_next(&cluster, &[(PARTITION, RESUMED_OFFSET)]);
     let mut reader = committing(standalone(client, [PARTITION]))
-        .start(PollingStrategy::first())
+        .start(PollingStrategy::offset(0))
         .build()
         .await
         .unwrap();
@@ -1061,6 +1458,549 @@ async fn given_a_committing_reader_started_at_first_when_a_partition_is_sought_t
     );
     assert_eq!(cluster.count(POLL_MESSAGES_DEFERRED_CODE), 1);
     reader.close().await.unwrap();
+}
+
+/// The commit of a read never moves the stored offset back, so only the delete lets the `Next`
+/// reads after the first batch from offset 0 continue from there.
+#[tokio::test(start_paused = true)]
+async fn given_an_on_read_reader_past_its_first_batch_when_seeking_to_offset_0_should_replay_the_partition()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH), server.read_next()],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    let read = [next_batch(&mut reader).await, next_batch(&mut reader).await];
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [server.lookup()],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        DELETE_CONSUMER_OFFSET_CODE,
+        [server.delete()],
+    );
+
+    let sought = reader.seek(PARTITION, PollingStrategy::first()).await;
+    server.apply_deletes(&cluster);
+    script_fetches(&cluster, [server.read(&FIRST_BATCH), server.read_next()]);
+    let replayed = [next_batch(&mut reader).await, next_batch(&mut reader).await];
+
+    let expected = [
+        (PARTITION, FIRST_BATCH.to_vec()),
+        (PARTITION, (SECOND_BATCH_START..PARTITION_END).collect()),
+    ];
+    assert_eq!(read.each_ref().map(partition_and_offsets), expected);
+    assert_eq!(sought, Ok(()));
+    assert_eq!(replayed.each_ref().map(partition_and_offsets), expected);
+    assert_eq!(
+        offset_resets(&cluster),
+        (vec![Some(PARTITION); 2], vec![Some(PARTITION)]),
+        "the start and the seek look the offset up"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_an_on_read_partition_without_a_stored_offset_when_seeking_to_offset_0_should_send_the_lookup_and_no_delete()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    let server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [server.lookup()],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        DELETE_CONSUMER_OFFSET_CODE,
+        [server.delete()],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .build()
+        .await
+        .unwrap();
+
+    let sought = reader.seek(PARTITION, PollingStrategy::offset(0)).await;
+
+    assert_eq!(sought, Ok(()));
+    assert_eq!(offset_resets(&cluster), (vec![Some(PARTITION)], vec![]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_refused_delete_when_seeking_to_offset_0_should_fail_the_seek_and_read_on_from_the_old_position()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [server.lookup()],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        DELETE_CONSUMER_OFFSET_CODE,
+        [Answer::CommitRejected(
+            COMMIT_OP,
+            IggyError::HistoryUnavailable,
+        )],
+    );
+
+    let sought = reader.seek(PARTITION, PollingStrategy::first()).await;
+    script_fetches(&cluster, [server.read_next()]);
+    let resumed = next_batch(&mut reader).await;
+
+    assert_eq!(sought, Err(IggyError::HistoryUnavailable));
+    assert_eq!(
+        partition_and_offsets(&resumed),
+        (PARTITION, (SECOND_BATCH_START..PARTITION_END).collect())
+    );
+    let fetches = cluster.received(FETCH_MESSAGES_CODE);
+    assert_eq!(
+        targets_of(&fetches[1]),
+        [(
+            PARTITION,
+            WirePollingStrategy {
+                value: SECOND_BATCH_START,
+                ..WirePollingStrategy::next()
+            }
+        )],
+        "the reader reads on from its old position"
+    );
+}
+
+/// A cancelled `next()` leaves demand behind, so the fetch loop reads again after an empty
+/// reply. A read from the old position that started during the store would commit after it.
+#[tokio::test(start_paused = true)]
+async fn given_demand_left_by_a_cancelled_next_when_a_seek_stores_should_read_its_partition_only_after_the_store_and_from_the_seek_point()
+ {
+    const SEEK_POINT: u64 = 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read_next()],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    let (release, at_the_end) = gated(server.read_next());
+    script_fetches(&cluster, [at_the_end]);
+    start_fetch(&mut reader, &cluster, 2).await;
+    cluster.hold(STORE_CONSUMER_OFFSET_CODE);
+
+    let (sought, reads_during_store) = tokio::join!(
+        reader.seek(PARTITION, PollingStrategy::offset(SEEK_POINT)),
+        async {
+            sleep(RETRY_INTERVAL).await;
+            release.notify_one();
+            eventually("the store of the seek arrives", || {
+                cluster.count(STORE_CONSUMER_OFFSET_CODE) == 1
+            })
+            .await;
+            sleep(POLL_TIMEOUT).await;
+            let reads = read_starts(&cluster).len();
+            cluster.release(STORE_CONSUMER_OFFSET_CODE);
+            reads
+        }
+    );
+    start_fetch(&mut reader, &cluster, 3).await;
+
+    assert_eq!(sought, Ok(()));
+    assert_eq!(
+        reads_during_store, 2,
+        "no read of the partition starts while the seek stores"
+    );
+    assert_eq!(
+        targets_of(&cluster.received(FETCH_MESSAGES_CODE)[2]),
+        [(PARTITION, WirePollingStrategy::offset(SEEK_POINT))],
+        "the first read after the store starts at the seek point"
+    );
+}
+
+/// The seek fails before anything moves, so the batch of the read that it waited for stays.
+#[tokio::test(start_paused = true)]
+async fn given_a_read_in_flight_when_the_store_of_a_seek_is_refused_should_keep_its_batch_and_read_on_from_the_old_position()
+ {
+    const PAST_THE_END: u64 = PARTITION_END + 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    let (release, rest) = gated(server.read_next());
+    script_fetches(&cluster, [rest]);
+    start_fetch(&mut reader, &cluster, 2).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [server.store(PAST_THE_END - 1)],
+    );
+
+    let (sought, ()) = tokio::join!(
+        reader.seek(PARTITION, PollingStrategy::offset(PAST_THE_END)),
+        async {
+            sleep(RETRY_INTERVAL).await;
+            release.notify_one();
+        }
+    );
+    let kept = next_batch(&mut reader).await;
+    start_fetch(&mut reader, &cluster, 3).await;
+
+    assert_eq!(
+        sought.unwrap_err().as_code(),
+        IggyError::InvalidOffset(PARTITION_END).as_code()
+    );
+    assert_eq!(
+        partition_and_offsets(&kept),
+        (PARTITION, (SECOND_BATCH_START..PARTITION_END).collect()),
+        "the batch of the read that the seek waited for stays"
+    );
+    assert_eq!(
+        targets_of(&cluster.received(FETCH_MESSAGES_CODE)[2]),
+        [(PARTITION, next_at(PARTITION_END))],
+        "the reads go on from the old position"
+    );
+}
+
+/// The server answers `Next` after its stored offset, so a partition with one never reads from
+/// the start of the reader.
+#[tokio::test(start_paused = true)]
+async fn given_an_on_read_offset_start_and_a_stored_offset_when_reading_should_resume_after_the_stored_offset()
+ {
+    const STORED: u64 = 5;
+    let (client, cluster) = connect_to_three_replicas().await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [lookup_answer(PARTITION, Some(STORED))],
+    );
+    script_initial_next(&cluster, &[(PARTITION, STORED + 1)]);
+    script_fetches(&cluster, [served_answer(PARTITION, STORED + 1)]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+
+    let batch = next_batch(&mut reader).await;
+
+    assert_eq!(partition_and_offsets(&batch), (PARTITION, vec![STORED + 1]));
+    assert_eq!(
+        read_starts(&cluster),
+        [WirePollingStrategy::next(), next_at(STORED + 1)],
+        "no read starts at offset 0"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_an_on_read_offset_start_without_a_stored_offset_when_reading_should_read_from_the_start()
+ {
+    const START: u64 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_fetches(&cluster, [served_answer(PARTITION, START)]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(START))
+        .build()
+        .await
+        .unwrap();
+
+    let batch = next_batch(&mut reader).await;
+
+    assert_eq!(partition_and_offsets(&batch), (PARTITION, vec![START]));
+    assert_eq!(offset_resets(&cluster), (vec![Some(PARTITION)], vec![]));
+    assert_eq!(read_starts(&cluster), [WirePollingStrategy::offset(START)]);
+}
+
+/// Each new assignment looks the offset up again, because the reads of the member moved it on.
+#[tokio::test(start_paused = true)]
+async fn given_an_on_read_member_assigned_a_partition_with_a_stored_offset_when_reading_should_resume_after_it_at_each_assignment()
+ {
+    const STORED: u64 = 5;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let metadata_primary = endpoint(METADATA_PRIMARY);
+    cluster.script(
+        &metadata_primary,
+        GET_CONSUMER_GROUP_CODE,
+        repeat_n(existing_group(), GROUP_REFRESHES),
+    );
+    cluster.script(
+        &metadata_primary,
+        SYNC_CONSUMER_GROUP_CODE,
+        [
+            assignment(&[PARTITION]),
+            assignment_at(GROUP_GENERATION + 1, &[]),
+        ]
+        .into_iter()
+        .chain(repeat_n(
+            assignment_at(GROUP_GENERATION + 2, &[PARTITION]),
+            GROUP_REFRESHES,
+        )),
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [STORED, STORED + 1].map(|stored| lookup_answer(PARTITION, Some(stored))),
+    );
+    script_initial_next(
+        &cluster,
+        &[(PARTITION, STORED + 1), (PARTITION, STORED + 2)],
+    );
+    script_fetches(
+        &cluster,
+        [
+            served_answer(PARTITION, STORED + 1),
+            served_answer(PARTITION, STORED + 2),
+        ],
+    );
+    let mut reader = committing(member(client))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+
+    let first = next_batch(&mut reader).await;
+    sleep(ASSIGNMENT_REFRESH_INTERVAL * 2).await;
+    let reassigned = next_batch(&mut reader).await;
+
+    assert_eq!(partition_and_offsets(&first), (PARTITION, vec![STORED + 1]));
+    assert_eq!(
+        partition_and_offsets(&reassigned),
+        (PARTITION, vec![STORED + 2])
+    );
+    assert_eq!(offset_resets(&cluster), (vec![Some(PARTITION); 2], vec![]));
+    assert_eq!(
+        read_starts(&cluster),
+        [
+            WirePollingStrategy::next(),
+            WirePollingStrategy::next(),
+            next_at(STORED + 1),
+            next_at(STORED + 2),
+        ],
+        "no read starts at offset 0"
+    );
+}
+
+/// A read at the timestamp would commit no further than the stored offset ahead, so the reads
+/// after it would jump to that offset.
+#[tokio::test(start_paused = true)]
+async fn given_an_on_read_stored_offset_ahead_when_seeking_to_a_timestamp_should_read_from_its_offset_to_the_end()
+ {
+    const TIMESTAMP_US: u64 = 1_000;
+    const AT_TIMESTAMP: u64 = 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH), server.read_next()],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    next_batch(&mut reader).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [polled_answer(PARTITION, &[AT_TIMESTAMP])],
+    );
+
+    let sought = reader
+        .seek(
+            PARTITION,
+            PollingStrategy::timestamp(IggyTimestamp::from(TIMESTAMP_US)),
+        )
+        .await;
+    server.apply_stores(&cluster);
+    script_fetches(&cluster, [server.read_next()]);
+    let resumed = next_batch(&mut reader).await;
+
+    assert_eq!(sought, Ok(()));
+    assert_eq!(stored_offsets(&cluster), [AT_TIMESTAMP - 1]);
+    assert_eq!(
+        partition_and_offsets(&resumed),
+        (PARTITION, (AT_TIMESTAMP..PARTITION_END).collect())
+    );
+}
+
+/// The empty reply of a partition that could not serve the read has the zero context, so it
+/// does not show that no message lies at the timestamp.
+#[tokio::test(start_paused = true)]
+async fn given_an_empty_probe_reply_with_the_zero_context_when_seeking_to_a_timestamp_should_fail_the_seek_and_read_on_from_the_old_position()
+ {
+    const TIMESTAMP_US: u64 = 1_000;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [polled_answer(PARTITION, &[])],
+    );
+
+    let sought = reader
+        .seek(
+            PARTITION,
+            PollingStrategy::timestamp(IggyTimestamp::from(TIMESTAMP_US)),
+        )
+        .await;
+    script_fetches(&cluster, [server.read_next()]);
+    let resumed = next_batch(&mut reader).await;
+
+    assert_eq!(sought, Err(IggyError::TransientNotAccepted));
+    assert!(stored_offsets(&cluster).is_empty());
+    assert_eq!(
+        partition_and_offsets(&resumed),
+        (PARTITION, (SECOND_BATCH_START..PARTITION_END).collect())
+    );
+    let fetches = cluster.received(FETCH_MESSAGES_CODE);
+    assert_eq!(
+        targets_of(&fetches[1]),
+        [(PARTITION, next_at(SECOND_BATCH_START))],
+        "the reader reads on from its old position"
+    );
+}
+
+/// The server refuses a write under a history that it lost, and the last delivered message of
+/// the stopped partition names that history. So the store of the seek names none.
+#[tokio::test(start_paused = true)]
+async fn given_a_partition_stopped_for_a_lost_history_when_seeking_to_an_offset_should_store_without_a_history_and_read_from_the_offset()
+ {
+    const SEEK_OFFSET: u64 = 3;
+    let (mut reader, cluster) = stopped_for_a_lost_history().await;
+    script_fetches(&cluster, [served_answer(PARTITION, SEEK_OFFSET)]);
+
+    let sought = reader
+        .seek(PARTITION, PollingStrategy::offset(SEEK_OFFSET))
+        .await;
+    let resumed = next_batch(&mut reader).await;
+
+    assert_eq!(sought, Ok(()));
+    assert_eq!(stored_offsets(&cluster), [SEEK_OFFSET - 1]);
+    assert_eq!(
+        stored_incarnations(&cluster),
+        [INCARNATION],
+        "a store without a context names the history of the route"
+    );
+    assert_eq!(
+        partition_and_offsets(&resumed),
+        (PARTITION, vec![SEEK_OFFSET])
+    );
+}
+
+/// The read at the timestamp names no history, so the partition serves it from the history
+/// that it has now. The store names the context of that reply, and not the lost history.
+#[tokio::test(start_paused = true)]
+async fn given_a_partition_stopped_for_a_lost_history_when_seeking_to_a_timestamp_should_store_under_the_history_of_the_probe_reply()
+ {
+    const TIMESTAMP_US: u64 = 1_000;
+    const AT_TIMESTAMP: u64 = 3;
+    /// Differs from the history of the route, which a store without a context names.
+    const PROBED: PartitionContext = PartitionContext {
+        incarnation: INCARNATION + 2,
+        ..CONTEXT
+    };
+    let (mut reader, cluster) = stopped_for_a_lost_history().await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [polled_answer_in(PARTITION, &[AT_TIMESTAMP], PROBED)],
+    );
+
+    let sought = reader
+        .seek(
+            PARTITION,
+            PollingStrategy::timestamp(IggyTimestamp::from(TIMESTAMP_US)),
+        )
+        .await;
+
+    assert_eq!(sought, Ok(()));
+    assert_eq!(stored_offsets(&cluster), [AT_TIMESTAMP - 1]);
+    assert_eq!(stored_incarnations(&cluster), [PROBED.incarnation]);
+}
+
+/// A lookup commits nothing, so a lookup whose reply is lost only runs again.
+#[tokio::test(start_paused = true)]
+async fn given_a_lookup_whose_reply_is_lost_when_reading_should_look_up_again_and_read_from_the_start()
+ {
+    const START: u64 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [Answer::Silence],
+    );
+    script_fetches(&cluster, [served_answer(PARTITION, START)]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(START))
+        .build()
+        .await
+        .unwrap();
+
+    let mut errors = Vec::new();
+    let batch = timeout(TEST_BUDGET, async {
+        loop {
+            match reader.next().await {
+                Ok(batch) => return batch,
+                Err(error) => errors.push(error),
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(partition_and_offsets(&batch), (PARTITION, vec![START]));
+    assert_eq!(offset_resets(&cluster), (vec![Some(PARTITION); 2], vec![]));
+    assert!(
+        errors.iter().all(|error| !matches!(
+            error.error,
+            IggyError::FetchProgressUncertain(_) | IggyError::PartitionLaneBlocked(..)
+        )),
+        "a lost lookup is no lost read: {errors:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1093,16 +2033,47 @@ async fn given_a_partition_refused_beside_a_served_one_when_a_fetch_completes_sh
     );
 }
 
+/// A partition that the server keeps refusing to the member is no leave. The member reports one
+/// error at the limit and reads on, so a later read that the server serves arrives without a
+/// seek.
+#[tokio::test(start_paused = true)]
+async fn given_a_partition_not_owned_past_the_limit_when_the_server_serves_it_again_should_deliver_it_without_a_seek()
+ {
+    const OFFSET: u64 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_group(&cluster, &[PARTITION]);
+    let not_owned = IggyError::ConsumerGroupPartitionNotOwned(u128::default(), PARTITION);
+    let refusals = usize::try_from(MAX_LASTING_REFUSALS).unwrap();
+    script_fetches(
+        &cluster,
+        repeat_n(sections_answer(&[refused(PARTITION, &not_owned)]), refusals).chain(once(
+            sections_answer(&[served(PARTITION, &[OFFSET], OFFSET + 1)]),
+        )),
+    );
+    let mut reader = member(client).build().await.unwrap();
+
+    let reported = timeout(POLL_TIMEOUT, reader.next()).await.unwrap();
+    let batch = timeout(POLL_TIMEOUT, reader.next()).await.unwrap().unwrap();
+
+    assert_eq!(
+        reported.map(|_| ()),
+        Err(ReadError::new(Some(PARTITION), not_owned))
+    );
+    assert_eq!(partition_and_offsets(&batch), (PARTITION, vec![OFFSET]));
+}
+
 #[tokio::test(start_paused = true)]
 async fn given_a_partition_without_history_when_read_should_stop_it_until_a_seek() {
     const OFFSET: u64 = 3;
     const SEEK_OFFSET: u64 = 11;
     let (client, cluster) = connect_to_three_replicas().await;
     // The first reply gives the partition a position in its history, which the second loses.
+    let (mut section, records) = served(PARTITION, &[OFFSET], OFFSET + 1);
+    section.context = CONTEXT;
     script_fetches(
         &cluster,
         [
-            sections_answer(&[served(PARTITION, &[OFFSET], OFFSET + 1)]),
+            sections_answer(&[(section, records)]),
             sections_answer(&[
                 served(OTHER_PARTITION, &[OFFSET], OFFSET + 1),
                 refused(PARTITION, &IggyError::HistoryUnavailable),
@@ -1200,6 +2171,682 @@ async fn given_two_partitions_of_one_primary_when_one_moves_should_fetch_both_wi
 
 /// A signed-in client of three ready replicas. Replica 0 is the metadata primary, and
 /// `PRIMARY` leads every partition.
+/// A committing read refused for its permission can have stored its offset before the refusal,
+/// in the current fetch state or an older one, so the close rewinds before its start.
+#[tokio::test(start_paused = true)]
+async fn given_a_committing_read_refused_for_its_permission_when_closing_should_rewind_before_its_start()
+ {
+    for older_epoch in [false, true] {
+        let (client, cluster) = connect_to_three_replicas().await;
+        if older_epoch {
+            cluster.hold(FETCH_MESSAGES_CODE);
+        }
+        cluster.script(
+            &endpoint(PRIMARY),
+            FETCH_MESSAGES_CODE,
+            [Answer::Refuse(IggyError::Unauthorized)],
+        );
+        let mut reader = committing(standalone(client, [PARTITION]))
+            .start(PollingStrategy::offset(SECOND_BATCH_START))
+            .build()
+            .await
+            .unwrap();
+        start_fetch(&mut reader, &cluster, 1).await;
+        if older_epoch {
+            reader.shared.epoch.fetch_add(1, ORDERING);
+            cluster.release(FETCH_MESSAGES_CODE);
+        }
+        // The server committed the read before it refused it.
+        cluster.script(
+            &endpoint(PRIMARY),
+            GET_CONSUMER_OFFSET_CODE,
+            [lookup_answer(PARTITION, Some(SECOND_BATCH_START))],
+        );
+
+        reader.close().await.unwrap();
+
+        assert_rewound_before(
+            &cluster,
+            SECOND_BATCH_START,
+            2,
+            &format!("older epoch: {older_epoch}"),
+        );
+    }
+}
+
+/// A seek dropped once its store is on the wire still holds the reads of its partition until
+/// the store ends, and then moves, so the close goes after it.
+#[tokio::test(start_paused = true)]
+async fn given_a_seek_dropped_while_its_store_is_on_the_wire_when_the_store_ends_should_move_the_reader_and_let_the_close_follow()
+ {
+    const SEEK_POINT: u64 = 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    cluster.hold(STORE_CONSUMER_OFFSET_CODE);
+    tokio::select! {
+        sought = reader.seek(PARTITION, PollingStrategy::offset(SEEK_POINT)) => {
+            panic!("the store of the seek is held, yet the seek ended with {sought:?}");
+        }
+        () = eventually("the store of the seek arrives", || {
+            cluster.count(STORE_CONSUMER_OFFSET_CODE) == 1
+        }) => {}
+    }
+    script_fetches(&cluster, [server.read(&[SEEK_POINT])]);
+    let reads_before = read_starts(&cluster).len();
+
+    // The cancelled call leaves demand behind, which the hold keeps from reading.
+    let waited = timeout(POLL_TIMEOUT, reader.next()).await;
+    assert!(
+        waited.is_err(),
+        "no batch arrives while the store is on the wire"
+    );
+    assert_eq!(
+        read_starts(&cluster).len(),
+        reads_before,
+        "no read of the partition starts while the store is on the wire"
+    );
+    cluster.release(STORE_CONSUMER_OFFSET_CODE);
+    let resumed = next_batch(&mut reader).await;
+    let closed = reader.close().await;
+
+    assert_eq!(
+        partition_and_offsets(&resumed),
+        (PARTITION, vec![SEEK_POINT])
+    );
+    assert_eq!(
+        targets_of(&cluster.received(FETCH_MESSAGES_CODE)[1]),
+        [(PARTITION, WirePollingStrategy::offset(SEEK_POINT))],
+        "the first read after the store starts at the seek point"
+    );
+    assert_eq!(closed, Ok(()));
+    assert_eq!(stored_offsets(&cluster), [SEEK_POINT - 1]);
+}
+
+/// A seek dropped once its store is on the wire moves in the background and replaces the queued
+/// batch of its partition. The close then keeps the store of the seek, and does not rewind
+/// before that batch, which would skip the messages between the seek point and the batch.
+#[tokio::test(start_paused = true)]
+async fn given_a_queued_batch_when_a_dropped_seek_moves_in_the_background_should_close_without_rewinding_before_it()
+ {
+    const QUEUED_START: u64 = 10;
+    const SEEK_POINT: u64 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let (mut header, records) = served(
+        PARTITION,
+        &[QUEUED_START, QUEUED_START + 1],
+        QUEUED_START + 2,
+    );
+    // A server stamps the history of the partition on each section.
+    header.context = CONTEXT;
+    let (queued, queued_answer) = gated(sections_answer(&[(header, records)]));
+    script_fetches(&cluster, [queued_answer]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(QUEUED_START))
+        .build()
+        .await
+        .unwrap();
+    // The application asks once and drops the call, so the batch stays queued.
+    start_fetch(&mut reader, &cluster, 1).await;
+    queued.notify_one();
+    cluster.hold(STORE_CONSUMER_OFFSET_CODE);
+    tokio::select! {
+        sought = reader.seek(PARTITION, PollingStrategy::offset(SEEK_POINT)) => {
+            panic!("the store of the seek is held, yet the seek ended with {sought:?}");
+        }
+        () = eventually("the store of the seek arrives", || {
+            cluster.count(STORE_CONSUMER_OFFSET_CODE) == 1
+        }) => {}
+    }
+
+    cluster.release(STORE_CONSUMER_OFFSET_CODE);
+    let closed = reader.close().await;
+
+    assert_eq!(closed, Ok(()));
+    assert_eq!(
+        stored_offsets(&cluster),
+        [SEEK_POINT - 1],
+        "the close keeps the store of the seek"
+    );
+}
+
+/// A seek store with an unknown outcome can have moved the stored offset. The seek fails, the
+/// next read reads by offset and skips no message, and a later seek and the close still write.
+#[tokio::test(start_paused = true)]
+async fn given_a_seek_store_with_an_unknown_outcome_when_reading_on_should_skip_no_message_and_keep_later_writes_working()
+ {
+    const SEEK_POINT: u64 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Silence],
+    );
+
+    let sought = reader
+        .seek(PARTITION, PollingStrategy::offset(SEEK_POINT))
+        .await;
+    // The store can have landed, so the reader reads by offset from where it was.
+    script_fetches(
+        &cluster,
+        [sections_answer(&[served(
+            PARTITION,
+            &[SECOND_BATCH_START, SEEK_POINT],
+            SEEK_POINT + 1,
+        )])],
+    );
+    let recovered = next_batch(&mut reader).await;
+    let later = reader
+        .seek(PARTITION, PollingStrategy::offset(SECOND_BATCH_START))
+        .await;
+    let closed = reader.close().await;
+
+    assert!(
+        matches!(sought, Err(IggyError::OperationUncertain(_))),
+        "{sought:?}"
+    );
+    assert_eq!(
+        partition_and_offsets(&recovered),
+        (PARTITION, vec![SECOND_BATCH_START, SEEK_POINT]),
+        "the next read skips no message"
+    );
+    assert_eq!(later, Ok(()));
+    assert_eq!(closed, Ok(()));
+}
+
+/// A seek before the first read follows the stored offset, so it looks that offset up before its
+/// store. The store has an unknown outcome and lands. The reader reads on after the offset from
+/// before the seek, and the first `Next` read that finds the moved offset reads the skipped
+/// messages again.
+#[tokio::test(start_paused = true)]
+async fn given_a_seek_before_the_first_read_whose_store_has_an_unknown_outcome_when_reading_should_skip_no_message()
+ {
+    const STORED: u64 = 0;
+    const SEEK_POINT: u64 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .build()
+        .await
+        .unwrap();
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [lookup_answer(PARTITION, Some(STORED))],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Silence],
+    );
+
+    let sought = reader
+        .seek(PARTITION, PollingStrategy::offset(SEEK_POINT))
+        .await;
+    // The store landed. The first read serves one message, and the next `Next` read starts
+    // after the stored offset.
+    script_fetches(
+        &cluster,
+        [
+            served_answer(PARTITION, STORED + 1),
+            served_answer(PARTITION, SEEK_POINT),
+        ],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [polled_answer(PARTITION, &[STORED + 2, SEEK_POINT])],
+    );
+    // A first read from another position fails the wait with its reason, before the batch
+    // times out.
+    let ((), first) = tokio::join!(
+        eventually(
+            "the first read starts after the offset stored before the seek",
+            || {
+                cluster
+                    .received(FETCH_MESSAGES_CODE)
+                    .first()
+                    .is_some_and(|fetch| {
+                        targets_of(fetch) == [(PARTITION, WirePollingStrategy::offset(STORED + 1))]
+                    })
+            }
+        ),
+        next_batch(&mut reader)
+    );
+    let second = next_batch(&mut reader).await;
+
+    assert!(
+        matches!(sought, Err(IggyError::OperationUncertain(_))),
+        "{sought:?}"
+    );
+    assert_eq!(
+        [
+            partition_and_offsets(&first),
+            partition_and_offsets(&second)
+        ],
+        [
+            (PARTITION, vec![STORED + 1]),
+            (PARTITION, vec![STORED + 2, SEEK_POINT])
+        ],
+        "the reads skip no message"
+    );
+}
+
+/// A `Last` start whose lookup found no stored offset takes a seek whose store has an unknown
+/// outcome. The close before any read deletes what the store may have left, so a restart
+/// applies the start again.
+#[tokio::test(start_paused = true)]
+async fn given_a_last_start_without_a_stored_offset_when_a_seek_store_has_an_unknown_outcome_should_restore_the_empty_offset_at_the_close()
+ {
+    const SEEK_POINT: u64 = 3;
+    let (client, cluster) = connect_to_three_replicas().await;
+    // The check of the start waits, so the position stays `Last`.
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        repeat_n(Answer::Silence, SILENT_READS),
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::last())
+        .build()
+        .await
+        .unwrap();
+    eventually("the lookup of the start", || {
+        cluster.count(GET_CONSUMER_OFFSET_CODE) == 1
+    })
+    .await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Silence],
+    );
+
+    let sought = reader
+        .seek(PARTITION, PollingStrategy::offset(SEEK_POINT))
+        .await;
+    // The store landed.
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [lookup_answer(PARTITION, Some(SEEK_POINT - 1))],
+    );
+    let closed = reader.close().await;
+
+    assert!(
+        matches!(sought, Err(IggyError::OperationUncertain(_))),
+        "{sought:?}"
+    );
+    assert_eq!(closed, Ok(()));
+    assert_eq!(
+        offset_resets(&cluster),
+        (vec![Some(PARTITION); 3], vec![Some(PARTITION)]),
+        "the start, the seek and the close look the offset up, and the close deletes it"
+    );
+    assert_eq!(stored_offsets(&cluster), [SEEK_POINT - 1]);
+}
+
+/// An offset start whose lookup found no stored offset takes a seek back, and its store has an
+/// unknown outcome. A close before any batch of the partition arrived deletes what the store may
+/// have left, so a restart applies the start again and does not read before it. A queued batch
+/// still decides the rewind: the close stores the offset before it and deletes nothing.
+#[tokio::test(start_paused = true)]
+async fn given_an_offset_start_without_a_stored_offset_when_a_backward_seek_store_has_an_unknown_outcome_should_restore_the_empty_offset_at_the_close()
+ {
+    const START: u64 = 3;
+    const SEEK_POINT: u64 = 1;
+    for queued in [false, true] {
+        let (client, cluster) = connect_to_three_replicas().await;
+        let mut reader = committing(standalone(client, [PARTITION]))
+            .start(PollingStrategy::offset(START))
+            .build()
+            .await
+            .unwrap();
+        eventually("the lookup of the start", || {
+            cluster.count(GET_CONSUMER_OFFSET_CODE) == 1
+        })
+        .await;
+        cluster.script(
+            &endpoint(PRIMARY),
+            STORE_CONSUMER_OFFSET_CODE,
+            [Answer::Silence],
+        );
+
+        let sought = reader
+            .seek(PARTITION, PollingStrategy::offset(SEEK_POINT))
+            .await;
+        if queued {
+            // The partition reads on from the start, and the application takes nothing.
+            script_fetches(&cluster, [served_answer(PARTITION, START)]);
+            start_fetch(&mut reader, &cluster, 1).await;
+        }
+        // The store landed.
+        cluster.script(
+            &endpoint(PRIMARY),
+            GET_CONSUMER_OFFSET_CODE,
+            [lookup_answer(PARTITION, Some(SEEK_POINT - 1))],
+        );
+        let closed = reader.close().await;
+
+        assert!(
+            matches!(sought, Err(IggyError::OperationUncertain(_))),
+            "queued: {queued}: {sought:?}"
+        );
+        assert_eq!(closed, Ok(()), "queued: {queued}");
+        if queued {
+            assert_eq!(
+                offset_resets(&cluster),
+                (vec![Some(PARTITION); 2], Vec::new()),
+                "the start and the seek look the offset up, and the close deletes nothing"
+            );
+            assert_eq!(stored_offsets(&cluster), [SEEK_POINT - 1, START - 1]);
+        } else {
+            assert_eq!(
+                offset_resets(&cluster),
+                (vec![Some(PARTITION); 3], vec![Some(PARTITION)]),
+                "the start, the seek and the close look the offset up, and the close deletes it"
+            );
+            assert_eq!(stored_offsets(&cluster), [SEEK_POINT - 1]);
+        }
+    }
+}
+
+/// A seek to `First` before the first read deletes the stored offset, and the delete has an
+/// unknown outcome. The close before any delivery stores that offset again, also when it would
+/// find none, so a restart resumes after it and not at offset 0.
+#[tokio::test(start_paused = true)]
+async fn given_a_stored_offset_when_a_seek_to_first_deletes_it_with_an_unknown_outcome_should_store_it_again_at_the_close()
+ {
+    const STORED: u64 = 2;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .build()
+        .await
+        .unwrap();
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [lookup_answer(PARTITION, Some(STORED))],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        DELETE_CONSUMER_OFFSET_CODE,
+        [Answer::Silence],
+    );
+
+    // The delete lands, so a later lookup finds no offset.
+    let sought = reader.seek(PARTITION, PollingStrategy::first()).await;
+    let closed = reader.close().await;
+
+    assert!(
+        matches!(sought, Err(IggyError::OperationUncertain(_))),
+        "{sought:?}"
+    );
+    assert_eq!(closed, Ok(()));
+    assert_eq!(stored_offsets(&cluster), [STORED]);
+}
+
+/// A backward seek after a delivery stores before its point with an unknown outcome. The close
+/// stores the last delivered message again, so a restart does not deliver the read messages
+/// again.
+#[tokio::test(start_paused = true)]
+async fn given_delivered_messages_when_a_backward_seek_store_has_an_unknown_outcome_should_store_the_last_delivered_offset_at_the_close()
+ {
+    const SEEK_POINT: u64 = 1;
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Silence],
+    );
+
+    let sought = reader
+        .seek(PARTITION, PollingStrategy::offset(SEEK_POINT))
+        .await;
+    let closed = reader.close().await;
+
+    assert!(
+        matches!(sought, Err(IggyError::OperationUncertain(_))),
+        "{sought:?}"
+    );
+    assert_eq!(closed, Ok(()));
+    assert_eq!(
+        stored_offsets(&cluster),
+        [SEEK_POINT - 1, FIRST_BATCH[FIRST_BATCH.len() - 1]]
+    );
+}
+
+/// A seek store with an unknown outcome can have landed. A batch that waited in the reader then
+/// records its commit again when the application takes it, as if the server still stored its
+/// end. The close stores the last delivered message all the same, so the offset of the seek
+/// does not stay.
+#[tokio::test(start_paused = true)]
+async fn given_a_seek_store_with_an_unknown_outcome_when_a_queued_batch_is_taken_before_the_close_should_store_the_last_delivered_offset()
+ {
+    const SEEK_POINT: u64 = 1;
+    const QUEUED: [u64; 2] = [SECOND_BATCH_START, SECOND_BATCH_START + 1];
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH), server.read(&QUEUED)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    // The dropped call leaves its batch in the reader.
+    start_fetch(&mut reader, &cluster, 2).await;
+    sleep(REPLY_STEP).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Silence],
+    );
+
+    let sought = reader
+        .seek(PARTITION, PollingStrategy::offset(SEEK_POINT))
+        .await;
+    let queued = next_batch(&mut reader).await;
+    let closed = reader.close().await;
+
+    assert!(
+        matches!(sought, Err(IggyError::OperationUncertain(_))),
+        "{sought:?}"
+    );
+    assert_eq!(partition_and_offsets(&queued), (PARTITION, QUEUED.to_vec()));
+    assert_eq!(closed, Ok(()));
+    assert_eq!(
+        stored_offsets(&cluster),
+        [SEEK_POINT - 1, QUEUED[QUEUED.len() - 1]]
+    );
+}
+
+/// A committing read that lost its reply can have stored an offset past a batch that still
+/// waits in the reader. That batch records its commit again when the application takes it. The
+/// close stores the last delivered message all the same, so the next reader skips nothing.
+#[tokio::test(start_paused = true)]
+async fn given_a_lost_committing_fetch_when_a_queued_batch_is_taken_before_the_close_should_store_the_last_delivered_offset()
+ {
+    const DELIVERED: u64 = 0;
+    const QUEUED: u64 = DELIVERED + 1;
+    const ANSWERED_FETCHES: usize = 2;
+    let (client, cluster) = connect_to_three_replicas().await;
+    script_initial_next(&cluster, &[(PARTITION, DELIVERED)]);
+    script_fetches(
+        &cluster,
+        [
+            served_answer(PARTITION, DELIVERED),
+            served_answer(PARTITION, QUEUED),
+        ],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .build()
+        .await
+        .unwrap();
+    let delivered = reader.next().await.unwrap();
+    assert_eq!(
+        partition_and_offsets(&delivered),
+        (PARTITION, vec![DELIVERED])
+    );
+    // The dropped call leaves its batch in the reader.
+    start_fetch(&mut reader, &cluster, ANSWERED_FETCHES).await;
+    sleep(REPLY_STEP).await;
+    let request_timeout = request_timeout(&reader);
+    let asked = Instant::now();
+    // A batch in the reader while the application asks for one takes a race between the two,
+    // so the test sets that state. The read that it starts gets no reply.
+    reader.shared.demand.store(true, ORDERING);
+    reader.shared.progress.wake.notify_one();
+    eventually("the read without a reply starts", || {
+        cluster.count(FETCH_MESSAGES_CODE) > ANSWERED_FETCHES
+    })
+    .await;
+    // The loss forgets the commit record of the delivered message, and the read goes again only
+    // after `RETRY_INTERVAL`.
+    timeout(TEST_BUDGET, async {
+        while reader.shared.progress.last_committed(PARTITION).is_some() {
+            sleep(REPLY_STEP).await;
+        }
+    })
+    .await
+    .expect("the read loses its reply");
+    assert!(
+        asked.elapsed() >= request_timeout,
+        "the reader lost the read before its deadline"
+    );
+
+    let queued = reader.next().await.unwrap();
+    reader.close().await.unwrap();
+
+    assert_eq!(partition_and_offsets(&queued), (PARTITION, vec![QUEUED]));
+    assert_eq!(stored_offsets(&cluster), [QUEUED]);
+}
+
+/// A rewind store of the close with an unknown outcome fails the close, which abandons it on the
+/// client, so a later write of the partition on the same client goes out.
+#[tokio::test(start_paused = true)]
+async fn given_a_close_rewind_with_an_unknown_outcome_when_closing_should_fail_and_release_the_partition()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&[SECOND_BATCH_START, SECOND_BATCH_START + 1])],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(SECOND_BATCH_START))
+        .build()
+        .await
+        .unwrap();
+    start_fetch(&mut reader, &cluster, 1).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        STORE_CONSUMER_OFFSET_CODE,
+        [Answer::Silence, Answer::Commit(COMMIT_OP)],
+    );
+    let client = reader.config.client.clone();
+
+    let closed = reader.close().await;
+    let later = client
+        .read()
+        .await
+        .store_consumer_offset(
+            &Consumer::new(identifier(CONSUMER_ID)),
+            &identifier(STREAM_ID),
+            &identifier(TOPIC_ID),
+            Some(PARTITION),
+            SECOND_BATCH_START - 1,
+        )
+        .await;
+
+    assert!(
+        matches!(closed, Err(IggyError::OperationUncertain(_))),
+        "{closed:?}"
+    );
+    assert_eq!(later, Ok(()), "the close abandoned its write on the client");
+    assert_eq!(stored_offsets(&cluster), [SECOND_BATCH_START - 1; 2]);
+}
+
+/// A refused delete leaves the offset on the server, so the reader keeps its record of it, and
+/// the close finds the last delivered message stored.
+#[tokio::test(start_paused = true)]
+async fn given_a_refused_delete_when_seeking_to_offset_0_should_keep_the_commit_record_for_the_close()
+ {
+    let (client, cluster) = connect_to_three_replicas().await;
+    let mut server = ServerOffset::default();
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [server.read(&FIRST_BATCH)],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [server.lookup()],
+    );
+    cluster.script(
+        &endpoint(PRIMARY),
+        DELETE_CONSUMER_OFFSET_CODE,
+        [Answer::CommitRejected(
+            COMMIT_OP,
+            IggyError::HistoryUnavailable,
+        )],
+    );
+
+    let sought = reader.seek(PARTITION, PollingStrategy::first()).await;
+    let closed = reader.close().await;
+
+    assert_eq!(sought, Err(IggyError::HistoryUnavailable));
+    assert_eq!(closed, Ok(()));
+    assert!(
+        stored_offsets(&cluster).is_empty(),
+        "the close stores the delivered offset again only after a lost record"
+    );
+}
+
 async fn connect_to_three_replicas() -> (TcpClient, Arc<FakeCluster>) {
     let cluster = FakeCluster::new(REPLICAS);
     *cluster.route.lock().unwrap() = Some(route_to(PRIMARY, FIRST_VIEW));
@@ -1276,14 +2923,26 @@ fn existing_group() -> Answer {
 }
 
 fn assignment(partitions: &[u32]) -> Answer {
-    Answer::Body(
-        SyncConsumerGroupResponse {
-            generation: GROUP_GENERATION,
-            partitions: partitions.to_vec(),
-        }
-        .to_bytes()
-        .to_vec(),
-    )
+    assignment_at(GROUP_GENERATION, partitions)
+}
+
+/// The server bumps the generation of a group whenever the partitions of a member change.
+fn assignment_at(generation: u64, partitions: &[u32]) -> Answer {
+    Answer::Body(sync_body(generation, partitions))
+}
+
+/// [`assignment_at`] as a replica read it at the metadata commit `commit`.
+fn assignment_at_commit(commit: u64, generation: u64, partitions: &[u32]) -> Answer {
+    Answer::CommitBody(commit, sync_body(generation, partitions))
+}
+
+fn sync_body(generation: u64, partitions: &[u32]) -> Vec<u8> {
+    SyncConsumerGroupResponse {
+        generation,
+        partitions: partitions.to_vec(),
+    }
+    .to_bytes()
+    .to_vec()
 }
 
 /// Scripts `answers` for the next fetches on `PRIMARY`, then `SILENT_READS` fetches without a
@@ -1312,6 +2971,182 @@ fn sections_answer(sections: &[Section]) -> Answer {
     Answer::Body(fetch_body(sections).to_vec())
 }
 
+/// The offset that the server stores for the consumer of [`PARTITION`]. The commit of a read
+/// moves it only forward, a delete removes it, and a delete of a missing offset fails, as does
+/// a store past the last message. The replicas answer by script, so a test takes each answer
+/// from this model before its request goes out, and applies a delete only once it arrived.
+#[derive(Default)]
+struct ServerOffset {
+    stored: Option<u64>,
+}
+
+impl ServerOffset {
+    /// The reply of a committing read of `offsets`.
+    fn read(&mut self, offsets: &[u64]) -> Answer {
+        let next_offset = offsets.last().map_or(0, |last| last + 1);
+        self.commit(next_offset);
+        sections_answer(&[served(PARTITION, offsets, next_offset)])
+    }
+
+    /// The reply of a committing `Next` read, which starts after the stored offset and serves
+    /// the rest of the partition.
+    fn read_next(&mut self) -> Answer {
+        let from = self.stored.map_or(0, |stored| stored + 1);
+        let offsets: Vec<u64> = (from..PARTITION_END).collect();
+        let next_offset = from.max(PARTITION_END);
+        self.commit(next_offset);
+        sections_answer(&[served(PARTITION, &offsets, next_offset)])
+    }
+
+    fn commit(&mut self, next_offset: u64) {
+        if let Some(last) = next_offset.checked_sub(1) {
+            self.stored = Some(self.stored.map_or(last, |stored| stored.max(last)));
+        }
+    }
+
+    fn lookup(&self) -> Answer {
+        lookup_answer(PARTITION, self.stored)
+    }
+
+    fn store(&self, offset: u64) -> Answer {
+        if offset < PARTITION_END {
+            Answer::Commit(COMMIT_OP)
+        } else {
+            Answer::CommitRejected(COMMIT_OP, IggyError::InvalidOffset(offset))
+        }
+    }
+
+    fn delete(&self) -> Answer {
+        match self.stored {
+            Some(_) => Answer::Commit(COMMIT_OP),
+            None => Answer::CommitRejected(
+                COMMIT_OP,
+                IggyError::ConsumerOffsetNotFound(CONSUMER_ID as usize),
+            ),
+        }
+    }
+
+    fn apply_deletes(&mut self, cluster: &FakeCluster) {
+        if self.stored.is_some() && cluster.count(DELETE_CONSUMER_OFFSET_CODE) > 0 {
+            self.stored = None;
+        }
+    }
+
+    /// An explicit store sets the offset, also below the stored one.
+    fn apply_stores(&mut self, cluster: &FakeCluster) {
+        if let Some(&stored) = stored_offsets(cluster).last() {
+            self.stored = Some(stored);
+        }
+    }
+}
+
+/// The start of each deferred poll that `cluster` received, then of each fetch target.
+fn read_starts(cluster: &FakeCluster) -> Vec<WirePollingStrategy> {
+    let polls = cluster
+        .received(POLL_MESSAGES_DEFERRED_CODE)
+        .into_iter()
+        .map(|poll| {
+            DeferredPollMessagesRequest::decode_from(&poll.body)
+                .unwrap()
+                .poll
+                .strategy
+        });
+    let fetches = cluster
+        .received(FETCH_MESSAGES_CODE)
+        .into_iter()
+        .flat_map(|fetch| targets_of(&fetch).into_iter().map(|(_, strategy)| strategy));
+    polls.chain(fetches).collect()
+}
+
+/// The `Next` continuation that expects `offset`.
+fn next_at(offset: u64) -> WirePollingStrategy {
+    WirePollingStrategy {
+        value: offset,
+        ..WirePollingStrategy::next()
+    }
+}
+
+/// Reads [`PARTITION`] from `start` with a check that resolves it to `resolved`, loses the reply
+/// of the first committing read and closes. The lookup of the close finds the offset that the
+/// lost read committed.
+async fn close_after_a_lost_first_read(start: PollingStrategy, resolved: u64) -> Arc<FakeCluster> {
+    let (client, cluster) = connect_to_three_replicas().await;
+    // A server stamps the history of the partition on each reply, so the check names a message
+    // of a known history.
+    cluster.script(
+        &endpoint(PRIMARY),
+        POLL_MESSAGES_DEFERRED_CODE,
+        [polled_answer_in(PARTITION, &[resolved], CONTEXT)],
+    );
+    script_fetches(&cluster, [Answer::Silence]);
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(start)
+        .build()
+        .await
+        .unwrap();
+    start_fetch(&mut reader, &cluster, 1).await;
+    cluster.script(
+        &endpoint(PRIMARY),
+        GET_CONSUMER_OFFSET_CODE,
+        [lookup_answer(PARTITION, Some(resolved))],
+    );
+    reader.close().await.unwrap();
+    cluster
+}
+
+/// After `lookups` lookups, the close stored the offset before `resolved`, or deleted it at 0.
+fn assert_rewound_before(cluster: &FakeCluster, resolved: u64, lookups: usize, case: &str) {
+    let (looked_up, deleted) = offset_resets(cluster);
+    assert_eq!(looked_up, vec![Some(PARTITION); lookups], "{case}");
+    match resolved.checked_sub(1) {
+        Some(before) => {
+            assert_eq!(stored_offsets(cluster), [before], "{case}");
+            assert!(deleted.is_empty(), "{case}");
+        }
+        None => {
+            assert!(stored_offsets(cluster).is_empty(), "{case}");
+            assert_eq!(deleted, [Some(PARTITION)], "{case}");
+        }
+    }
+}
+
+/// The partitions of the offset lookups and of the offset deletes that `cluster` received.
+fn offset_resets(cluster: &FakeCluster) -> (Vec<Option<u32>>, Vec<Option<u32>>) {
+    let lookups = cluster
+        .received(GET_CONSUMER_OFFSET_CODE)
+        .iter()
+        .map(|lookup| {
+            GetConsumerOffsetRequest::decode_from(&lookup.body)
+                .unwrap()
+                .partition_id
+        })
+        .collect();
+    let deletes = cluster
+        .received(DELETE_CONSUMER_OFFSET_CODE)
+        .iter()
+        .map(|delete| {
+            DeleteConsumerOffsetRequest::decode_from(&delete.body)
+                .unwrap()
+                .partition_id
+        })
+        .collect();
+    (lookups, deletes)
+}
+
+/// `answer`, which the replica sends only once the returned notify fires.
+fn gated(answer: Answer) -> (Arc<Notify>, Answer) {
+    let Answer::Body(body) = answer else {
+        panic!("only a reply with a body waits for a release");
+    };
+    let release = Arc::new(Notify::new());
+    let gated = Answer::GatedBody {
+        release: Arc::clone(&release),
+        completed: Arc::default(),
+        body,
+    };
+    (release, gated)
+}
+
 /// A fetch reply that serves one message of `partition` at `offset`.
 fn served_answer(partition: u32, offset: u64) -> Answer {
     sections_answer(&[served(partition, &[offset], offset + 1)])
@@ -1319,18 +3154,50 @@ fn served_answer(partition: u32, offset: u64) -> Answer {
 
 /// A poll reply with one message of `partition` at each of `offsets`.
 fn polled_answer(partition: u32, offsets: &[u64]) -> Answer {
-    let next_offset = offsets.last().map_or(0, |last| last + 1);
-    let (section, records) = served(partition, offsets, next_offset);
-    let mut body = PollMessagesResponseHeader {
-        partition_id: partition,
-        current_offset: section.current_offset,
-        messages_count: section.messages_count,
-        context: section.context,
-    }
-    .to_bytes()
-    .to_vec();
-    body.extend(records);
-    Answer::Body(body)
+    polled_answer_in(partition, offsets, PartitionContext::default())
+}
+
+/// An `OnRead` reader of [`PARTITION`] that delivered [`FIRST_BATCH`] and then stopped the
+/// partition, because the server lost the history of that batch. The route names another
+/// history, the one that the partition has now.
+async fn stopped_for_a_lost_history() -> (PartitionReader, Arc<FakeCluster>) {
+    const LOST_HISTORY: PartitionContext = PartitionContext {
+        incarnation: INCARNATION + 1,
+        ..CONTEXT
+    };
+    let (client, cluster) = connect_to_three_replicas().await;
+    let (mut section, records) = served(PARTITION, &FIRST_BATCH, SECOND_BATCH_START);
+    section.context = LOST_HISTORY;
+    cluster.script(
+        &endpoint(PRIMARY),
+        FETCH_MESSAGES_CODE,
+        [
+            sections_answer(&[(section, records)]),
+            sections_answer(&[refused(PARTITION, &IggyError::HistoryUnavailable)]),
+        ],
+    );
+    let mut reader = committing(standalone(client, [PARTITION]))
+        .start(PollingStrategy::offset(0))
+        .build()
+        .await
+        .unwrap();
+    next_batch(&mut reader).await;
+    let stopped = timeout(POLL_TIMEOUT, reader.next()).await.unwrap();
+    assert_eq!(
+        stopped.unwrap_err(),
+        ReadError::new(Some(PARTITION), IggyError::HistoryUnavailable)
+    );
+    (reader, cluster)
+}
+
+/// The history that each offset store names, in order. A store without a context names the
+/// history of the route.
+fn stored_incarnations(cluster: &FakeCluster) -> Vec<u64> {
+    cluster
+        .received(STORE_CONSUMER_OFFSET_CODE)
+        .iter()
+        .map(|store| store.header.partition_incarnation)
+        .collect()
 }
 
 fn fetch_request(fetch: &Received) -> FetchMessagesRequest {

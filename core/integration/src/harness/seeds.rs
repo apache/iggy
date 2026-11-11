@@ -73,6 +73,7 @@ pub async fn stream_with_topic(client: &IggyClient) -> Result<(), SeedError> {
 }
 
 /// Seed for connector tests: creates stream and topic that connector will subscribe to.
+/// The connector tests live in apache/iggy-connectors.
 pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
 
@@ -99,6 +100,7 @@ pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
 /// Seed for multi-topic connector tests: creates stream with two topics.
 /// Both topics must exist before connector runtime starts (runtime health check
 /// validates all configured topics).
+/// The connector tests live in apache/iggy-connectors.
 pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;
 
