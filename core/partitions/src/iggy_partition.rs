@@ -13048,7 +13048,6 @@ where
     /// overtake a backlog. The caller checks that this replica is the primary.
     #[must_use]
     pub fn next_segment_upload(&self) -> Option<crate::SegmentUpload> {
-        let chain = self.segment_chain.as_ref()?;
         let floor = self.tiered_floor();
         let (segment, storage) =
             self.log
@@ -13061,17 +13060,7 @@ where
                         && segment.size.as_bytes_u64() > 0
                         && floor.is_none_or(|floor| segment.end_offset > floor)
                 })?;
-        let record = self
-            .sealed_segment_record(segment.start_offset)
-            .filter(|record| {
-                // An advance that ends anywhere inside the segment and does
-                // not match it means the store holds other bytes there.
-                chain
-                    .diverged()
-                    .range(record.start_offset..=record.end_offset)
-                    .next()
-                    .is_none()
-            })?;
+        let record = self.undisputed_segment_record(segment.start_offset)?;
         let (log_path, index_path) = storage.segment_and_index_paths();
         Some(crate::SegmentUpload {
             prefix: self.object_prefix()?,
@@ -13172,6 +13161,52 @@ where
         }) {
             segment.location = SegmentLocation::Uploaded;
         }
+        self.floor_advance_over(record)
+    }
+
+    /// The advance of an upload that finished and whose segment the floor has
+    /// not passed: its request was refused or lost, or has not committed yet.
+    ///
+    /// Only the oldest segment above the floor can owe one, since an advance
+    /// starts right after the floor. `None` while that segment is still
+    /// local, so no advance reaches over a segment the store does not hold.
+    #[must_use]
+    pub fn pending_floor_advance(&self) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        let floor = self.tiered_floor();
+        let segment = self.log.segments().iter().find(|segment| {
+            segment.sealed
+                && segment.size.as_bytes_u64() > 0
+                && floor.is_none_or(|floor| segment.end_offset > floor)
+        })?;
+        if segment.location != SegmentLocation::Uploaded {
+            return None;
+        }
+        let record = self.undisputed_segment_record(segment.start_offset)?;
+        Some(self.floor_advance_over(&record))
+    }
+
+    /// The chain's record of the sealed segment at `start_offset`, unless an
+    /// advance contradicted it.
+    fn undisputed_segment_record(
+        &self,
+        start_offset: u64,
+    ) -> Option<crate::segment_chain::SegmentRecord> {
+        let chain = self.segment_chain.as_ref()?;
+        self.sealed_segment_record(start_offset).filter(|record| {
+            // An advance that ends anywhere inside the segment and does
+            // not match it means the store holds other bytes there.
+            chain
+                .diverged()
+                .range(record.start_offset..=record.end_offset)
+                .next()
+                .is_none()
+        })
+    }
+
+    fn floor_advance_over(
+        &self,
+        record: &crate::segment_chain::SegmentRecord,
+    ) -> crate::tiered_floor::AdvanceTieredFloor {
         let next = self
             .tiered_floor()
             .map_or(0, |floor| floor.saturating_add(1));

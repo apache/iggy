@@ -550,6 +550,87 @@ async fn given_an_upload_that_ends_after_primacy_moved_when_it_finishes_should_n
     assert_eq!(local_starts(&partition), [0, 2]);
 }
 
+#[compio::test]
+async fn given_no_uploaded_segment_when_asking_for_the_pending_advance_should_have_none() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+
+    assert_eq!(partition.pending_floor_advance(), None);
+
+    // An upload in flight has stored nothing yet.
+    let _started = partition.begin_segment_upload().unwrap();
+    assert_eq!(partition.pending_floor_advance(), None);
+}
+
+#[compio::test]
+async fn given_uploaded_segments_when_the_floor_trails_should_owe_the_oldest_advance_until_it_passes()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let first = partition.next_segment_upload().unwrap().record;
+    let first_advance = partition.note_segment_uploaded(&first);
+    assert_eq!(partition.pending_floor_advance(), Some(first_advance));
+
+    let second = partition.next_segment_upload().unwrap().record;
+    partition.note_segment_uploaded(&second);
+    assert_eq!(
+        partition.pending_floor_advance(),
+        Some(first_advance),
+        "the oldest uploaded segment goes first"
+    );
+
+    Box::pin(apply(&mut partition, 100, first_advance)).await;
+    assert_eq!(
+        partition.pending_floor_advance(),
+        Some(AdvanceTieredFloor {
+            start: second.start_offset,
+            up_to: second.end_offset,
+            hash: second.hash,
+        })
+    );
+
+    let second_advance = partition.pending_floor_advance().unwrap();
+    Box::pin(apply(&mut partition, 101, second_advance)).await;
+    assert_eq!(partition.tiered_floor(), Some(second.end_offset));
+    assert_eq!(partition.pending_floor_advance(), None);
+}
+
+/// An advance starts right after the floor, so one sent for a segment behind
+/// a local one would tell every replica the store holds both.
+#[compio::test]
+async fn given_a_local_segment_before_an_uploaded_one_when_asking_for_the_pending_advance_should_have_none()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let second = partition.sealed_segment_record(2).unwrap();
+    partition.note_segment_uploaded(&second);
+    assert_eq!(local_starts(&partition), [0]);
+
+    assert_eq!(partition.pending_floor_advance(), None);
+}
+
+/// A segment that an advance contradicted is not in the store as this
+/// replica holds it, whatever its location says.
+#[compio::test]
+async fn given_an_uploaded_segment_an_advance_contradicted_when_asking_for_the_pending_advance_should_have_none()
+ {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let first = partition.next_segment_upload().unwrap().record;
+    partition.note_segment_uploaded(&first);
+    let second = partition.next_segment_upload().unwrap().record;
+    partition.note_segment_uploaded(&second);
+    let contradicting = AdvanceTieredFloor {
+        start: 0,
+        up_to: 2,
+        hash: [9; 32],
+    };
+    Box::pin(apply(&mut partition, 100, contradicting)).await;
+    assert_eq!(partition.tiered_floor(), Some(2));
+
+    assert_eq!(partition.pending_floor_advance(), None);
+}
+
 /// An executor that runs each job at once and keeps what it was asked for.
 struct Recording {
     store: Rc<MemoryStore>,

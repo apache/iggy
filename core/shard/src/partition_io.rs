@@ -11406,4 +11406,6 @@ mod tests {
             std::future::ready(Ok(SuperblockContents::Empty))
         }
     }
+
+    mod segment_uploads;
 }

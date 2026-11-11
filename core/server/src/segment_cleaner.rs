@@ -118,6 +118,9 @@ fn stage_owned_partitions(
                 now,
                 local_envelope(age, size, partition_count),
             );
+            // The timed pass is what retries an upload the store refused and
+            // an advance that did not commit.
+            shard.request_upload_segments(namespace);
             // Retention of a tiered topic covers its remote segments too, so
             // no replica expires its own.
             continue;

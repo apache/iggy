@@ -9953,6 +9953,7 @@ dependencies = [
  "hash32",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_object_store",
  "journal",
  "message_bus",
  "metadata",

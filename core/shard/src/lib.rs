@@ -25,6 +25,7 @@ pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
 mod poll;
 mod primary_rebalance;
 mod router;
+mod segment_uploads;
 mod served_reads;
 pub mod shards_table;
 #[cfg(test)]
@@ -1156,6 +1157,30 @@ pub enum LifecycleFrame {
         now: IggyTimestamp,
         envelope: partitions::LocalEnvelope,
     },
+    /// Per-shard pass over a partition of a tiered topic: start the upload of
+    /// its oldest sealed segment the store does not hold, when this replica
+    /// is the primary and no upload is in flight. Does nothing on a shard
+    /// without an uploader.
+    UploadSegments {
+        namespace: IggyNamespace,
+        /// Whether the pass also sends the floor advance that a stored
+        /// segment still owes. The pass that follows a finished upload leaves
+        /// it out, since that advance was sent a moment ago.
+        resend_advance: bool,
+    },
+    /// The result of an upload that an [`Self::UploadSegments`] pass started,
+    /// sent by the task that ran it.
+    SegmentUploadFinished(Box<FinishedSegmentUpload>),
+}
+
+/// What the task running a segment upload hands back to the pump.
+pub struct FinishedSegmentUpload {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the upload. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    pub record: partitions::segment_chain::SegmentRecord,
+    pub outcome: partitions::UploadOutcome,
 }
 
 /// Reconciler-staged partition mutation.
@@ -1917,6 +1942,22 @@ where
     /// wires it; pre-wire ticks drop with a metric bump.
     metadata_tick_handler: RefCell<Option<Rc<dyn Fn()>>>,
 
+    /// Late-bound uploader of sealed segments. `None` on a shard without an
+    /// object store, where every upload pass is a no-op. No boot path sets
+    /// it, so uploads run only where a caller of
+    /// [`Self::set_segment_uploader`] supplies one.
+    segment_uploader: RefCell<Option<Rc<dyn partitions::SegmentUploader>>>,
+
+    /// Upload results whose frame the inbox refused. The partition counts
+    /// such an upload as in flight until it sees the result, so the next
+    /// upload pass takes them from here.
+    undelivered_segment_uploads: Rc<RefCell<Vec<FinishedSegmentUpload>>>,
+
+    /// Request number of the last floor advance. An advance runs under the
+    /// auto-commit client, which the partition does not deduplicate, so the
+    /// number only tells two advances apart in a prepare.
+    floor_advance_requests: Cell<u64>,
+
     /// Reconciler → pump funnel. Borrow discipline: every push / drain
     /// runs without `.await` inside the borrow.
     reconcile_queue: RefCell<VecDeque<ReconcileOp<B, SB>>>,
@@ -2250,6 +2291,9 @@ where
             coordinator,
             metrics,
             metadata_tick_handler: RefCell::new(None),
+            segment_uploader: RefCell::new(None),
+            undelivered_segment_uploads: Rc::default(),
+            floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
@@ -3211,6 +3255,9 @@ where
             partition_consensus,
             metrics,
             metadata_tick_handler: RefCell::new(None),
+            segment_uploader: RefCell::new(None),
+            undelivered_segment_uploads: Rc::default(),
+            floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
@@ -3423,9 +3470,6 @@ where
         }
     }
 
-    /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
-    /// pump: delete sealed segments up to `up_to_offset`. The reconciler calls
-    /// this after observing a committed delete watermark for an owned partition.
     /// Stage an eviction pass for `namespace` on this shard's pump. A refused
     /// frame is picked up by the cleaner's next tick.
     pub fn request_evict_partition(
@@ -3444,6 +3488,9 @@ where
         }));
     }
 
+    /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
+    /// pump: delete sealed segments up to `up_to_offset`. The reconciler calls
+    /// this after observing a committed delete watermark for an owned partition.
     pub fn request_truncate_partition(&self, namespace: IggyNamespace, up_to_offset: u64) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
