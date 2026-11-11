@@ -118,6 +118,9 @@ fn stage_owned_partitions(
                 now,
                 local_envelope(age, size, partition_count),
             );
+            // Retention of a tiered topic covers its remote segments too, so
+            // no replica expires its own.
+            continue;
         }
         if !has_expiry && budget.is_none() {
             continue;

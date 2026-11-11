@@ -173,3 +173,35 @@ async fn given_a_chain_of_another_incarnation_when_tiering_is_enabled_should_sta
     // The request is dropped, so the lane does not ask again on every pass.
     Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
 }
+
+async fn expire_all(partition: &mut IggyPartition<IggyMessageBus>) -> crate::SegmentRemoval {
+    partition
+        .clean_expired_segments(
+            IggyTimestamp::from(u64::MAX),
+            iggy_common::IggyExpiry::from(1_u64),
+            Some(0),
+        )
+        .await
+}
+
+/// Retention of a tiered partition is decided once, for its local and remote
+/// segments together, so the local pass leaves even expired segments alone.
+#[compio::test]
+async fn given_expired_segments_when_the_partition_is_tiered_should_leave_them_to_total_retention()
+{
+    let (_directory, mut partition) = Box::pin(untiered_partition()).await;
+    let segments = partition.log.segments().len();
+    Box::pin(enable(&mut partition, PREFIX)).await;
+
+    let removal = Box::pin(expire_all(&mut partition)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+
+    assert_eq!(removal.segments, 0);
+    assert_eq!(partition.log.segments().len(), segments);
+
+    // The same pass on a partition without a chain removes them.
+    let (_directory, mut untiered) = Box::pin(untiered_partition()).await;
+    Box::pin(expire_all(&mut untiered)).await;
+    Box::pin(settle_partition_io(&mut untiered, &repair_config())).await;
+    assert!(untiered.log.segments().len() < segments);
+}

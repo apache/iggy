@@ -12762,7 +12762,8 @@ where
         consumers.chain(groups).min_by_key(|(offset, _, _)| *offset)
     }
 
-    /// Time-expiry plus size-retention in one pass: remove the leading sealed
+    /// Time-expiry plus size-retention in one pass, for a partition that is not
+    /// tiered: remove the leading sealed
     /// segments that have expired or that push the partition's SEALED bytes
     /// past `max_bytes`. Capped per call by
     /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
@@ -12774,6 +12775,13 @@ where
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
     ) -> SegmentRemoval {
+        // A tiered partition's retention is one decision for the local and
+        // the remote segments together, which the primary commits as a
+        // truncation. A replica that expired segments by itself could drop
+        // one that was never uploaded.
+        if self.is_tiered() {
+            return SegmentRemoval::default();
+        }
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
             max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
