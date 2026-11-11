@@ -466,6 +466,8 @@ async fn given_spread_primaries_when_consuming_deferred_should_route_every_group
             .consumer_group(GROUP_NAME, stream_name, TOPIC_NAME)
             .unwrap()
             .polling_strategy(PollingStrategy::next())
+            .prefetch_messages(1)
+            .prefetch_bytes(deferred_test_options().max_bytes)
             .poll_options(PollOptions {
                 count: 1,
                 commit,

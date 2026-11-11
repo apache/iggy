@@ -87,8 +87,7 @@ fn run() -> Result<(), ServerError> {
     capture_allowed_cpus();
 
     // Before bootstrap: partition persistence sizes its offset-file budget
-    // from the soft limit it reads first, and nothing else raises it except a
-    // side effect of sysinfo's first process refresh on Linux.
+    // from the soft limit it reads first, and nothing else raises it.
     match raise_open_file_limit() {
         Ok(limit) => info!(
             soft_before = limit.soft_before,
