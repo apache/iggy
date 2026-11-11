@@ -254,6 +254,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_ACCEPTED
                 && resultCode != IggyErrorCode.NOT_PRIMARY.getCode()
                 && resultCode != IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode();
+        pending.replyCommit = frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET);
         recordSessionReply(frame, pending, operation, resultCode, bodyStart, bodyLength);
         if (resultCode != 0) {
             throw IggyServerException.fromTcpResponse(resultCode, new byte[0]);
@@ -268,7 +269,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         synchronized (session) {
             if (pending.identity.matches(session)) {
                 if (pending.committed && advancesMetadata(operation)) {
-                    session.observeMetadata(frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
+                    session.observeMetadata(pending.replyCommit);
                 }
                 if (resultCode == 0) {
                     applySessionEffects(frame, operation, bodyStart, bodyLength);
@@ -364,6 +365,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private final RequestIdentity identity;
         private long maxResponseBody = Integer.MAX_VALUE;
         private volatile boolean committed;
+        private volatile long replyCommit;
         private volatile boolean failedByLink;
         private volatile boolean detachedSession;
         private volatile boolean keepsLineage;
@@ -381,6 +383,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         public boolean isCommitted() {
             return committed;
+        }
+
+        /** The metadata commit that the answering replica names in the reply header. */
+        public long replyCommit() {
+            return replyCommit;
         }
 
         /**

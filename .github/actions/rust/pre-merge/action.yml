@@ -248,7 +248,7 @@ runs:
           TEST_ARCHIVE_ARGS=(-E "$ARCHIVE_FILTER")
         fi
 
-        # SDKs need only server/CLI. Keep Rust-only binaries and plugins with their tests.
+        # SDKs need only server/CLI. Keep Rust-only binaries with their tests.
         BUILD_RUNTIME=false
         if [[ "$RUNTIME_SCOPE" == workspace ]]; then
           BUILD_RUNTIME=true
@@ -277,8 +277,7 @@ runs:
           jq -r --arg scope "$RUNTIME_SCOPE" --argjson packages "$RUNTIME_PACKAGE_IDS" '
             select(.reason == "compiler-artifact") |
             select($scope == "workspace" or (.package_id as $id | $packages | index($id))) |
-            (select(.target.kind | index("bin")) | .executable // empty),
-            (select(.target.crate_types | index("cdylib")) | .filenames[] | select(endswith(".so")))' \
+            select(.target.kind | index("bin")) | .executable // empty' \
             "$ARTIFACT_DIR/build.jsonl" | sort -u | \
             while IFS= read -r artifact; do
               realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
@@ -424,8 +423,6 @@ runs:
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
         fi
 
-        # Doris requires this host setting before its testcontainers fixture starts.
-        sudo sysctl -w vm.max_map_count=2000000 || true
         NO_TESTS=fail
         if [[ "$TEST_SCOPE" == "packages" ]]; then
           # BDD targets require features, so a BDD-only scope can contain no runnable tests.

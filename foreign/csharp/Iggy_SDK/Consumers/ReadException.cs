@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
 
@@ -52,6 +53,12 @@ public sealed class ReadException(uint? partitionId, Exception error, PollingStr
     ///     gone. A seek to <see cref="PollingStrategy.Next" /> reads it again after its stored offset.
     /// </summary>
     public bool IsResumable { get; internal init; }
+
+    /// <summary>
+    ///     For offsets that a lost read stored and that the reader could not read again: the first and the last of
+    ///     them. The error is status 14010 (FetchProgressUncertain). Null for every other error.
+    /// </summary>
+    public OffsetRange? Lost { get; internal init; }
 
     /// <summary>
     ///     For a message that does not decode: its offset, known when its frame decoded and a later step failed, such

@@ -87,6 +87,7 @@ impl Fixture {
             size: self.logs[slot].len() as u64,
             incarnation: PREFIX.created_revision,
             hash: *blake3::hash(&self.logs[slot]).as_bytes(),
+            crc32c: crc32c::crc32c(&self.logs[slot]),
             source: HashSource::CommitPath,
         }
     }

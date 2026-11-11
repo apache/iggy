@@ -22,14 +22,16 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use iggy_binary_protocol::STATUS_OK;
-use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader};
 use iggy_binary_protocol::codes::STORE_CONSUMER_OFFSET_CODE;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
-    FetchMessagesResponse, FetchMessagesSection, FetchMessagesSectionHeader, PartitionRouteResponse,
+    FetchMessagesResponse, FetchMessagesSection, FetchMessagesSectionHeader,
+    PartitionRouteResponse, PollMessagesResponseHeader,
 };
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     CommitPolicy, Consumer, FetchedSection, Identifier, IggyDuration, IggyError, IggyMessage,
@@ -38,7 +40,7 @@ use iggy_common::{
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::reader_builder::{DEFAULT_MAX_WAIT, ReaderBuilder};
-use crate::links::fake_cluster::{FakeCluster, connected};
+use crate::links::fake_cluster::{Answer, FakeCluster, connected};
 use crate::tcp::tcp_client::TcpClient;
 
 pub(super) const STREAM_ID: u32 = 1;
@@ -52,7 +54,7 @@ pub(super) const PRIMARY: u8 = 0;
 const VIEW: u32 = 0;
 /// The history of a batch until a test changes it. Metadata revisions start at 1, so no real
 /// partition has the incarnation 0 of an uncaptured context.
-pub(super) const CONTEXT: PartitionContext = PartitionContext {
+pub(crate) const CONTEXT: PartitionContext = PartitionContext {
     incarnation: 1,
     owner_generation: 0,
     metadata_op: 1,
@@ -120,6 +122,19 @@ pub(super) fn stored_offsets(cluster: &FakeCluster) -> Vec<u64> {
         .collect()
 }
 
+/// The reply of an offset lookup of `partition`, which is empty without a stored offset.
+pub(crate) fn lookup_answer(partition: u32, stored: Option<u64>) -> Answer {
+    Answer::Body(stored.map_or_else(Vec::new, |stored| {
+        ConsumerOffsetResponse {
+            partition_id: partition,
+            current_offset: stored,
+            stored_offset: stored,
+        }
+        .to_bytes()
+        .to_vec()
+    }))
+}
+
 pub(super) fn partition_and_offsets(batch: &PolledMessages) -> (u32, Vec<u64>) {
     let offsets = batch
         .messages
@@ -141,9 +156,24 @@ pub(crate) fn batch(
     offsets: impl IntoIterator<Item = u64>,
     current_offset: u64,
 ) -> PolledMessages {
+    batch_in(
+        partition,
+        offsets,
+        current_offset,
+        PartitionContext::default(),
+    )
+}
+
+/// [`batch`] in the history `context`.
+pub(crate) fn batch_in(
+    partition: u32,
+    offsets: impl IntoIterator<Item = u64>,
+    current_offset: u64,
+    context: PartitionContext,
+) -> PolledMessages {
     let messages: Vec<_> = offsets.into_iter().map(message_at).collect();
     PolledMessages::new(
-        PartitionContext::default(),
+        context,
         partition,
         current_offset,
         u32::try_from(messages.len()).unwrap(),
@@ -176,6 +206,26 @@ pub(crate) fn served(partition: u32, offsets: &[u64], next_offset: u64) -> Secti
 }
 
 /// A section that refuses `partition` with `error`.
+/// A poll reply of `partition` that carries the history `context`.
+pub(crate) fn polled_answer_in(
+    partition: u32,
+    offsets: &[u64],
+    context: PartitionContext,
+) -> Answer {
+    let next_offset = offsets.last().map_or(0, |last| last + 1);
+    let (section, records) = served(partition, offsets, next_offset);
+    let mut body = PollMessagesResponseHeader {
+        partition_id: partition,
+        current_offset: section.current_offset,
+        messages_count: section.messages_count,
+        context,
+    }
+    .to_bytes()
+    .to_vec();
+    body.extend(records);
+    Answer::Body(body)
+}
+
 pub(crate) fn refused(partition: u32, error: &IggyError) -> Section {
     let header = FetchMessagesSectionHeader {
         partition_id: partition,
