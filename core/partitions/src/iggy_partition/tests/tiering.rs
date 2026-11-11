@@ -16,12 +16,14 @@
 // under the License.
 
 use super::eviction::{KEEP_NOTHING, chain_records, evict};
+use super::floor_eviction::apply;
 use super::segment_chain::PREFIX;
 use super::*;
-use crate::SegmentEviction;
 use crate::segment_chain::{
     ChainRecord, HashSource, ObjectPrefix, chain_path, create_chain, hash_segment_file,
 };
+use crate::tiered_floor::AdvanceTieredFloor;
+use crate::{SegmentEviction, SegmentLocation};
 
 /// A partition with [`RECEIVER_OPS`] one-message ops and no chain: two sealed
 /// segments and an active one that holds a message.
@@ -204,4 +206,157 @@ async fn given_expired_segments_when_the_partition_is_tiered_should_leave_them_t
     Box::pin(expire_all(&mut untiered)).await;
     Box::pin(settle_partition_io(&mut untiered, &repair_config())).await;
     assert!(untiered.log.segments().len() < segments);
+}
+
+/// A tiered primary whose own retention removed its first segment before the
+/// topic was tiered, with the trim point that left. One sealed segment is
+/// left to upload, and it starts right after the trim point.
+async fn tiered_after_local_retention() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>, u64) {
+    let (directory, mut partition) = Box::pin(untiered_partition()).await;
+    let first_end = partition.log.segments()[0].end_offset;
+    Box::pin(partition.remove_sealed_segments_up_to(first_end)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    Box::pin(enable(&mut partition, PREFIX)).await;
+    let _ = partition.register_builtin_state_machines();
+    let trim_point = partition.chain_trim_point().unwrap();
+    assert_eq!(trim_point, first_end);
+    assert_eq!(partition.log.segments()[0].start_offset, trim_point + 1);
+    (directory, partition, trim_point)
+}
+
+#[compio::test]
+async fn given_a_trim_point_above_the_floor_when_asking_what_to_commit_should_offer_it_until_the_watermark_covers_it()
+ {
+    let (_directory, partition, trim_point) = Box::pin(tiered_after_local_retention()).await;
+    assert!(trim_point > 0);
+
+    assert_eq!(partition.trim_point_to_commit(0), Some(trim_point));
+    assert_eq!(
+        partition.trim_point_to_commit(trim_point - 1),
+        Some(trim_point)
+    );
+    assert_eq!(partition.trim_point_to_commit(trim_point), None);
+    assert_eq!(partition.trim_point_to_commit(trim_point + 1), None);
+}
+
+#[compio::test]
+async fn given_no_trim_point_when_asking_what_to_commit_should_offer_nothing() {
+    let (_directory, mut partition) = Box::pin(untiered_partition()).await;
+    assert_eq!(
+        partition.trim_point_to_commit(0),
+        None,
+        "a partition without a chain"
+    );
+
+    Box::pin(enable(&mut partition, PREFIX)).await;
+
+    assert_eq!(partition.chain_trim_point(), None);
+    assert_eq!(partition.trim_point_to_commit(0), None);
+    // The front is at zero, so nothing holds back the upload either.
+    assert!(partition.begin_segment_upload().is_some());
+}
+
+#[compio::test]
+async fn given_a_backup_with_a_trim_point_when_asking_what_to_commit_should_offer_nothing() {
+    let (_directory, mut partition, trim_point) = Box::pin(tiered_after_local_retention()).await;
+    assert_eq!(partition.trim_point_to_commit(0), Some(trim_point));
+
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+
+    assert_eq!(partition.trim_point_to_commit(0), None);
+}
+
+/// Another replica can still hold the offsets this primary removed before
+/// the topic was tiered, and the advance over the first upload covers them.
+#[compio::test]
+async fn given_an_uncommitted_trim_point_when_the_primary_would_upload_should_wait_for_the_committed_watermark()
+ {
+    let (_directory, mut partition, trim_point) = Box::pin(tiered_after_local_retention()).await;
+    let waiting = partition.next_segment_upload().unwrap().record;
+    assert_eq!(waiting.start_offset, trim_point + 1);
+
+    assert!(partition.begin_segment_upload().is_none());
+    partition.note_committed_truncation(trim_point - 1);
+    assert!(partition.begin_segment_upload().is_none());
+
+    partition.note_committed_truncation(trim_point);
+    // A pass that carries an older watermark takes nothing back.
+    partition.note_committed_truncation(0);
+    let (upload, _scope) = partition.begin_segment_upload().unwrap();
+    assert_eq!(upload.record, waiting);
+
+    let advance = partition
+        .finish_segment_upload(&upload.record, &Ok(Ok(())))
+        .unwrap();
+    assert_eq!(
+        advance,
+        AdvanceTieredFloor {
+            start: 0,
+            up_to: waiting.end_offset,
+            hash: waiting.hash,
+        }
+    );
+    // `apply` fails on an advance the floor machine refuses.
+    Box::pin(apply(&mut partition, 100, advance)).await;
+    assert_eq!(partition.tiered_floor(), Some(waiting.end_offset));
+    assert_eq!(
+        partition.trim_point_to_commit(0),
+        None,
+        "the floor passed the trim point"
+    );
+}
+
+#[compio::test]
+async fn given_a_gap_the_committed_watermark_does_not_cover_when_a_segment_is_stored_should_build_no_advance()
+ {
+    let (_directory, mut partition, trim_point) = Box::pin(tiered_after_local_retention()).await;
+    let stored = partition.next_segment_upload().unwrap().record;
+
+    assert_eq!(partition.note_segment_uploaded(&stored), None);
+    assert_eq!(
+        partition.log.segments()[0].location,
+        SegmentLocation::Uploaded
+    );
+    assert_eq!(partition.pending_floor_advance(), None);
+
+    partition.note_committed_truncation(trim_point);
+    assert_eq!(
+        partition.pending_floor_advance(),
+        Some(AdvanceTieredFloor {
+            start: 0,
+            up_to: stored.end_offset,
+            hash: stored.hash,
+        })
+    );
+}
+
+/// The floor can pass the trim point without a truncation: an advance of an
+/// earlier primary that held the offsets this replica removed covers them.
+#[compio::test]
+async fn given_a_floor_past_the_trim_point_when_the_primary_would_upload_should_not_wait_for_a_truncation()
+ {
+    let (_directory, mut partition, trim_point) = Box::pin(tiered_after_local_retention()).await;
+    let stored = partition.next_segment_upload().unwrap().record;
+    let earlier_primary = AdvanceTieredFloor {
+        start: 0,
+        up_to: stored.end_offset,
+        hash: stored.hash,
+    };
+    Box::pin(commit_records(
+        &mut partition,
+        RECEIVER_OPS + 1,
+        &segment_records(4),
+    ))
+    .await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    Box::pin(apply(&mut partition, 100, earlier_primary)).await;
+    assert!(partition.tiered_floor() > Some(trim_point));
+
+    assert_eq!(partition.trim_point_to_commit(0), None);
+    let (upload, _scope) = partition.begin_segment_upload().unwrap();
+    let advance = partition
+        .finish_segment_upload(&upload.record, &Ok(Ok(())))
+        .unwrap();
+    assert_eq!(advance.start, stored.end_offset + 1);
 }

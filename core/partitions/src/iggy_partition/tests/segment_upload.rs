@@ -103,7 +103,7 @@ async fn given_sealed_segments_when_the_primary_uploads_should_store_each_oldest
                 next.record.hash
             )
         );
-        uploaded.push(partition.note_segment_uploaded(&next.record));
+        uploaded.push(partition.note_segment_uploaded(&next.record).unwrap());
     }
 
     // The active segment is not sealed, so it stays out. Both advances start
@@ -141,7 +141,7 @@ async fn given_an_upload_and_its_advance_when_the_segment_is_evicted_should_poll
     let mut op = 100;
     while let Some(next) = partition.next_segment_upload() {
         upload(&store, &next).await.unwrap();
-        let advance = partition.note_segment_uploaded(&next.record);
+        let advance = partition.note_segment_uploaded(&next.record).unwrap();
         Box::pin(apply(&mut partition, op, advance)).await;
         op += 1;
     }
@@ -573,7 +573,7 @@ async fn given_uploaded_segments_when_the_floor_trails_should_owe_the_oldest_adv
     let (_directory, mut partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
     let first = partition.next_segment_upload().unwrap().record;
-    let first_advance = partition.note_segment_uploaded(&first);
+    let first_advance = partition.note_segment_uploaded(&first).unwrap();
     assert_eq!(partition.pending_floor_advance(), Some(first_advance));
 
     let second = partition.next_segment_upload().unwrap().record;
@@ -835,7 +835,7 @@ async fn given_a_segment_outside_the_envelope_when_it_is_not_uploaded_should_hav
     assert!(partition.eviction_awaits_upload(now));
 
     let first = partition.next_segment_upload().unwrap().record;
-    let advance = partition.note_segment_uploaded(&first);
+    let advance = partition.note_segment_uploaded(&first).unwrap();
     assert!(
         partition.eviction_awaits_upload(now),
         "a stored segment still waits for its floor advance"

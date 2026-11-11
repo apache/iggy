@@ -1195,6 +1195,10 @@ pub enum LifecycleFrame {
         /// segment still owes. The pass that follows a finished upload leaves
         /// it out, since that advance was sent a moment ago.
         resend_advance: bool,
+        /// The truncation watermark metadata holds, on the pass the timer
+        /// task stages. Any other pass has no metadata to read it from, and
+        /// leaves the partition with the last one a timed pass brought.
+        committed_up_to: Option<u64>,
     },
     /// The result of an upload that an [`Self::UploadSegments`] pass started,
     /// sent by the task that ran it.

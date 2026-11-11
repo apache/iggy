@@ -683,7 +683,11 @@ async fn given_an_upload_that_lands_after_its_segment_was_removed_when_it_finish
         Some(delete_of(&[SEALED[0].0]))
     );
     assert!(store(&deleter).inner.is_empty());
-    // The next upload is the next segment, as if the first never ran.
+    // The next upload is the next segment, as if the first never ran. Its
+    // advance reaches over the removed one, so it waits for a pass that
+    // brings the watermark of that truncation.
+    assert!(partition.begin_segment_upload().is_none());
+    partition.note_committed_truncation(committed);
     let (next, _scope) = partition.begin_segment_upload().unwrap();
     assert_eq!(next.record.start_offset, SEALED[1].0);
 }

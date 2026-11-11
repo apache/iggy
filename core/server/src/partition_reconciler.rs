@@ -4988,6 +4988,7 @@ mod tests {
             if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
                 namespace,
                 resend_advance: true,
+                committed_up_to: Some(0),
             }) = frame
             {
                 upload_passes.push(namespace);
@@ -5022,6 +5023,20 @@ mod tests {
         ))
         .expect("TruncatePartition apply succeeds");
         assert_eq!(staged(), (vec![(namespace, expiry, None, WATERMARK)], 0));
+        // The upload pass carries the watermark too: a primary holds back
+        // its uploads until it covers the trim point.
+        crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+        let mut upload_watermarks = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
+                committed_up_to,
+                ..
+            }) = frame
+            {
+                upload_watermarks.push(committed_up_to);
+            }
+        }
+        assert_eq!(upload_watermarks, [Some(WATERMARK)]);
 
         // A size cap alone is a retention policy too.
         update_options(

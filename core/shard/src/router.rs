@@ -1200,8 +1200,10 @@ where
             LifecycleFrame::UploadSegments {
                 namespace,
                 resend_advance,
+                committed_up_to,
             } => {
-                self.on_upload_segments(namespace, resend_advance).await;
+                self.on_upload_segments(namespace, resend_advance, committed_up_to)
+                    .await;
             }
             LifecycleFrame::SegmentUploadFinished(finished) => {
                 self.on_segment_upload_finished(*finished).await;
