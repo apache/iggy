@@ -5325,6 +5325,29 @@ where
                 .is_some_and(VsrConsensus::has_loopback)
     }
 
+    /// The runtime options that `init_partition` gives the partition of
+    /// `namespace`: those of its topic, or the defaults without one.
+    #[cfg(feature = "simulator")]
+    #[must_use]
+    pub fn topic_runtime_options(
+        &self,
+        namespace: IggyNamespace,
+    ) -> iggy_common::TopicRuntimeOptions
+    where
+        M: metadata::impls::metadata::StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map(|topic| {
+                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                })
+                .unwrap_or_default()
+        })
+    }
+
     /// Simulator-only: mutates `IggyPartitions` off the pump task, bypassing the
     /// reconciler's `ReconcileOp::InsertOwned` funnel (production's runtime path;
     /// bootstrap recovery uses `load_partition`). VSR replica id comes from
@@ -5435,21 +5458,14 @@ where
             partitions.config().segment_size,
         );
         partition.set_created_revision(epoch);
-        let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
-            inner
-                .items
-                .get(namespace.stream_id())
-                .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                .map(|topic| {
-                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
-                })
-                .unwrap_or_default()
-        });
-        partition.set_runtime_options(runtime_options);
+        partition.set_runtime_options(self.topic_runtime_options(namespace));
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state);
         }
+        // The retained log stands in for the chain and the WAL that the loader
+        // recovers.
+        let log_recovered = retained.is_some();
         // Retained log before the frontier restore, so the restore maxes against
         // the offsets the log proved rather than the zeroes of an empty one.
         // `restore_offset_frontier` takes each counter's own max against what is
@@ -5471,7 +5487,7 @@ where
         // a divergent copy of that rule cannot catch a violation of it. Without
         // the restore at all, a simulator replica rebuilt against a retained
         // store resumes minting at 0 while its group is at N.
-        partition.restore_offset_frontier(recovered_state);
+        partition.restore_offset_frontier(recovered_state, log_recovered);
         partition.attach_simulated_persistence(persistence);
         partition.consensus().resume_adopted_view();
         // Match production's solo reservation handling. A replicated WAL may
@@ -14384,13 +14400,13 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 // journal already held the adopted head, no repair frame moves the
                 // anchor, which then names a dropped op the WAL cannot certify.
                 // A durable commit point survives only in the repair ring.
-                if let Some(head) = partition
-                    .log
-                    .journal()
-                    .inner
-                    .repair_header(consensus.sequencer().current_sequence())
-                {
+                let head_op = consensus.sequencer().current_sequence();
+                if let Some(head) = partition.log.journal().inner.repair_header(head_op) {
                     consensus.set_last_prepare_checksum(head.checksum);
+                } else if head_op == 0 {
+                    // An empty log has no header to take the anchor from, and the
+                    // WAL certifies op 0 only with a zero checksum.
+                    consensus.set_last_prepare_checksum(0);
                 }
                 return;
             }
@@ -16241,6 +16257,31 @@ mod installed_transfer_dvc_tests {
         );
     }
 
+    #[compio::test]
+    async fn given_a_transfer_installed_above_the_adopted_head_when_the_view_log_is_reconciled_should_prove_the_log_at_the_checkpoint()
+     {
+        let transfer = HEAD + 3;
+        // Boxed: the setup future carries a whole partition.
+        let mut partition = Box::pin(lagging_after_install(IggyMessageBus::new(0), transfer)).await;
+
+        // `finish_partition_install`: the repair pass reconciles an open proof.
+        let pending = partition.consensus().pending_view_log();
+        reconcile_partition_view_divergence(0, &mut partition, pending.as_ref()).await;
+
+        let consensus = partition.consensus();
+        assert!(
+            !consensus.view_log_unproven(),
+            "the checkpoint at op {transfer} holds every op of the adopted view up to its head \
+             {HEAD}, so nothing is left to prove"
+        );
+        assert!(
+            !consensus.view_log_is_pending(),
+            "the adopted log still ends at op {HEAD}, below the commit point {}",
+            consensus.commit_min(),
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), transfer);
+    }
+
     /// The lagging replica's vote for `NEXT_VIEW`, and the frame the shard sends
     /// for it. Before the vote, the replica adopts the `ADOPTED_VIEW` `StartView`,
     /// installs a peer's state transfer at `transfer`, and then stops hearing the
@@ -16257,6 +16298,47 @@ mod installed_transfer_dvc_tests {
         for peer in (0..REPLICA_COUNT).filter(|&peer| peer != LAGGING) {
             crate::test_support::connect_replica_on(&bus, peer, 1);
         }
+        let partition = Box::pin(lagging_after_install(bus, transfer)).await;
+
+        // The heartbeat timeout votes to leave the view, so the `StartViewChange`
+        // of replica 1 completes a quorum of votes.
+        let voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            .flat_map(|_| partition.consensus().tick(PlaneKind::Partitions))
+            .any(|action| {
+                matches!(action, VsrAction::SendStartViewChange { view, .. } if view == NEXT_VIEW)
+            });
+        assert!(voted, "the lagging replica votes to leave the view");
+
+        // `on_start_view_change`: snapshot the suffix, then vote.
+        refresh_partition_dvc_suffix(&partition);
+        let consensus = partition.consensus();
+        let actions =
+            consensus.handle_start_view_change(PlaneKind::Partitions, start_view_change().header());
+        let vote = actions
+            .iter()
+            .find(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
+            .cloned()
+            .expect("the lagging replica votes");
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
+            .await;
+        let message = sent
+            .borrow()
+            .iter()
+            .find_map(|frame| {
+                Message::<DoViewChangeHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .ok()
+            })
+            .expect("the vote goes out on the wire");
+        (vote, message)
+    }
+
+    /// The lagging replica on `bus`, after it adopts the `ADOPTED_VIEW` `StartView`
+    /// and then installs a peer's state transfer at `transfer`.
+    #[allow(clippy::future_not_send)]
+    async fn lagging_after_install(
+        bus: IggyMessageBus,
+        transfer: u64,
+    ) -> IggyPartition<IggyMessageBus> {
         let consensus = VsrConsensus::new(
             CLUSTER,
             LAGGING,
@@ -16305,37 +16387,7 @@ mod installed_transfer_dvc_tests {
         partition
             .consensus()
             .install_checkpoint(transfer, Some(checkpoint.header().checksum));
-
-        // The heartbeat timeout votes to leave the view, so the `StartViewChange`
-        // of replica 1 completes a quorum of votes.
-        let voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
-            .flat_map(|_| partition.consensus().tick(PlaneKind::Partitions))
-            .any(|action| {
-                matches!(action, VsrAction::SendStartViewChange { view, .. } if view == NEXT_VIEW)
-            });
-        assert!(voted, "the lagging replica votes to leave the view");
-
-        // `on_start_view_change`: snapshot the suffix, then vote.
-        refresh_partition_dvc_suffix(&partition);
-        let consensus = partition.consensus();
-        let actions =
-            consensus.handle_start_view_change(PlaneKind::Partitions, start_view_change().header());
-        let vote = actions
-            .iter()
-            .find(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
-            .cloned()
-            .expect("the lagging replica votes");
-        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
-            .await;
-        let message = sent
-            .borrow()
-            .iter()
-            .find_map(|frame| {
-                Message::<DoViewChangeHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
-                    .ok()
-            })
-            .expect("the vote goes out on the wire");
-        (vote, message)
+        partition
     }
 
     /// The `ADOPTED_VIEW` `StartView`: its head and commit point, with the

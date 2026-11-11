@@ -2369,7 +2369,8 @@ public sealed class PartitionReader : IAsyncDisposable
     /// <summary>
     ///     The stop of a partition. A committing read that lost its reply stays pending until the next read shows what
     ///     it stored, and a seek to Next after the stop would skip that range without a word, so the stop reports the
-    ///     lost read instead of its own error.
+    ///     lost read instead of its own error. A catch-up that <see cref="GiveUpGap" /> ended reported that range
+    ///     before, so the stop then reports its own error.
     /// </summary>
     private static ReadException StopReport(uint partition, PartitionState state, Exception error, bool resumable)
     {
@@ -2408,6 +2409,8 @@ public sealed class PartitionReader : IAsyncDisposable
 
         state.CatchUpUntil = null;
         state.CatchUpBatch = null;
+        // The catch-up accounted for what the lost read stored, so a stop that follows reports its own error.
+        state.Lost = false;
         state.Position = PollingStrategy.Continuation(partition, MessagePolling.Next, next,
             held?.Context ?? state.Position.Context!.Value);
         if (held is { Messages.Count: > 0 })

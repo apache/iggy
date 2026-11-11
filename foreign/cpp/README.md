@@ -147,7 +147,9 @@ reader.Close();
 - `Commit` stores a checkpoint that the reader delivered, and under `CommitPolicy::Auto` `Mark` counts one for the policy to store.
 - `Seek` moves a partition to a `PollingStrategy`, or to a `Continuation` of that partition.
 - C++ cannot cancel `Commit` and `Seek`, so each one ends at a deadline 10 s after its start. The `Commit` and `Seek` of an `IggyConsumer` do the same.
-- A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it. A lost read can commit messages that the reader cannot read again. Then the reader throws `fetch_progress_uncertain` once. `Lost()` holds the first and last offset of those messages, and `Skip()` the continuation after them.
+- A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it.
+- A lost read can commit messages that the reader cannot read again. Then the reader throws `fetch_progress_uncertain` once. `Lost()` holds the first and last offset of those messages. This error stops nothing and needs no `Seek`. A `Seek` after it drops the batch that follows the range. If the reader stopped the partition, the error that stopped it comes after that batch.
+- Two errors stop a partition until a `Seek`. The first is `history_unavailable` (87) for a position whose history is gone. The second is the sixth refusal in a row that a retry does not change, such as `unauthorized` (41), and `IsLastingRefusal()` is then true. While a lost read is still pending, such a stop throws `fetch_progress_uncertain` (14010) with an empty `Lost()` in place of its own error.
 - `Close` stops the reader, and a second `Close` does nothing. Destroying a reader without `Close` moves no offset back and does not leave the group.
 
 A consumer group reader joins its group in `Reader` and leaves it in `Close`. A group create or join with an unknown outcome throws its error, and the next `Reader` or `GroupConsumer` joins again. A join that landed keeps its member in the group until the session ends.

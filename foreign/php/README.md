@@ -444,8 +444,10 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   a message that does not decode. The reader retries by itself. `HistoryUnavailable`
   (87) stops the partition until `seek()`. A lost read can commit messages that the
   reader cannot read again. Then the reader throws `FetchProgressUncertain` (14010)
-  once. Its `lost` holds the first and last offset of those messages as `[first, last]`,
-  and `skip` the continuation after them.
+  once. Its `lost` holds the first and last offset of those messages as `[first, last]`.
+  This error stops nothing and needs no seek. A seek after it drops the batch that
+  follows the range. If the reader stopped the partition, the error that stopped it
+  comes after that batch.
 - Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered

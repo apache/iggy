@@ -1506,7 +1506,9 @@ public final class PartitionReader implements AutoCloseable {
             partition.retryAt = now + retryIntervalNanos;
             return;
         }
-        if (code == IggyErrorCode.HISTORY_UNAVAILABLE.getCode() && !partition.fromRead) {
+        // The read of a gap names the history of the batch that showed the gap. So with an open gap the server lost
+        // that history, and the same read would be refused again without end.
+        if (code == IggyErrorCode.HISTORY_UNAVAILABLE.getCode() && !partition.fromRead && partition.gapFrom == null) {
             log.warn("Partition {} has a new history, the reader reads it again", partition.id);
             regroup = true;
             partition.retryAt = now + retryIntervalNanos;
@@ -1517,6 +1519,11 @@ public final class PartitionReader implements AutoCloseable {
                 || ++partition.lastingRefusals >= LASTING_REFUSALS_BEFORE_STOP;
         ReadException failure = new ReadException(OptionalLong.of(partition.id), error, Optional.empty());
         if (stops) {
+            if (partition.gapFrom != null) {
+                // Only a seek resumes the partition, and it drops the gap, so the gap ends before the stop.
+                loseGapBefore(partition, partition.gapEnd);
+                closeGap(partition);
+            }
             partition.stopped = failure;
             queue.addLast(new Entry(partition.id, partition.generation, null, failure));
             return;

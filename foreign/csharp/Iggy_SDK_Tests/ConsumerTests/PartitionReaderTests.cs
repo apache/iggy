@@ -2633,6 +2633,35 @@ public sealed class PartitionReaderTests
     }
 
     /// <summary>
+    ///     A lost read stored offsets 4 and 5, and the next read from Next skipped to 6 and held 6 to 9. The read
+    ///     again from 4 is refused with a lost history, which stops the partition. The report of 4 and 5 accounts for
+    ///     the lost read, so the stop after the held batch carries its own status and not a second uncertain read.
+    /// </summary>
+    [Fact]
+    public async Task given_on_read_when_a_lost_history_stops_the_read_again_of_a_lost_range_should_report_the_range_then_the_held_batch_then_the_stop()
+    {
+        var log = new ScriptedLog { End = 4, RecoveryRefusal = VsrError.HISTORY_UNAVAILABLE };
+        await using var reader = await log.ReaderAsync();
+        await reader.NextAsync(Token);
+        log.End = 6;
+        log.LoseNextCommittingRead = true;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+
+        var lost = await Assert.ThrowsAsync<ReadException>(() => reader.NextAsync(timeout.Token).AsTask());
+        var held = await reader.NextAsync(timeout.Token);
+        var stop = await Assert.ThrowsAsync<ReadException>(() => reader.NextAsync(timeout.Token).AsTask());
+
+        Assert.Equal(new OffsetRange(4, 5), lost.Lost);
+        Assert.False(lost.StopsPartition);
+        Assert.Equal([6ul, 7ul, 8ul, 9ul], held.Messages.Select(message => message.Header.Offset));
+        Assert.Equal(VsrError.HISTORY_UNAVAILABLE,
+            Assert.IsAssignableFrom<IggyInvalidStatusCodeException>(stop.InnerException).StatusCode);
+        Assert.True(stop.StopsPartition);
+        Assert.Null(stop.Lost);
+    }
+
+    /// <summary>
     ///     The committing read of offsets 4 to 7 stored its offset, but its reply does not decode. The reader reads
     ///     the range again by offset one message at a time, reports the bad message 5 with a skip past it, and after
     ///     the seek delivers the rest.
@@ -4402,6 +4431,9 @@ public sealed class PartitionReaderTests
         /// </summary>
         internal ulong RecoveryRetainsFrom { get; init; }
 
+        /// <summary>A read by offset without a commit is refused with this status.</summary>
+        internal int? RecoveryRefusal { get; init; }
+
         internal int RecoveryReads => Volatile.Read(ref _recoveryReads);
 
         /// <summary>A reader of partition 1 that reads 4 messages at a time and commits on read.</summary>
@@ -4436,6 +4468,12 @@ public sealed class PartitionReaderTests
                 if (recovers && Interlocked.Increment(ref _recoveryReads) == 1)
                 {
                     _firstKept = RecoveryRetainsFrom;
+                }
+
+                if (recovers && RecoveryRefusal is { } status)
+                {
+                    return Task.FromException<PolledMessages>(
+                        VsrError.Exception(status, "The read again is refused."));
                 }
 
                 var from = Math.Max(_firstKept, start.Kind == MessagePolling.Next ? _stored + 1 ?? 0 : start.Value);
