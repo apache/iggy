@@ -30,11 +30,13 @@ use std::io;
 
 use bytes::Bytes;
 use compio::io::AsyncReadAtExt;
-use futures::Stream;
+use futures::future::LocalBoxFuture;
+use futures::{FutureExt, Stream};
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_object_store::{
     ErrorClass, KeyLayout, ObjectPrefix, ObjectStore, ObjectStoreError, PutBody, PutMode,
-    PutOptions, SegmentKey, SegmentMetadata, SegmentObject, UserMetadata,
+    PutOptions, SegmentKey, SegmentMetadata, SegmentObject, TierExecutor, TierJobCancelled,
+    TierJobClass, TierJobRequest, TierScopeToken, UserMetadata,
 };
 use server_common::send_messages::decode_batch_slice;
 
@@ -83,6 +85,59 @@ impl UploadError {
             Self::Store(error) => matches!(error.class(), ErrorClass::Transient),
             Self::Io(_) | Self::MediaFault { .. } | Self::Diverged { .. } => false,
         }
+    }
+}
+
+/// What an upload ended as: the job's own result, or a cancellation before it
+/// finished.
+pub type UploadOutcome = Result<Result<(), UploadError>, TierJobCancelled>;
+
+/// Runs the uploads of a shard, behind a pointer, so the shard does not carry
+/// the executor's type.
+pub trait SegmentUploader {
+    /// Upload `upload` under `scope`. The upload stops when the scope is
+    /// cancelled, as when its partition loses primacy.
+    fn upload(
+        &self,
+        upload: SegmentUpload,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, UploadOutcome>;
+}
+
+/// Uploads through a tier executor, in its upload class, so its caps bound
+/// how many segments and bytes are in flight to the store.
+pub struct ExecutorUploader<E> {
+    executor: E,
+    layout: KeyLayout,
+}
+
+impl<E> ExecutorUploader<E> {
+    #[must_use]
+    pub const fn new(executor: E, layout: KeyLayout) -> Self {
+        Self { executor, layout }
+    }
+
+    /// The executor the uploads go through.
+    #[must_use]
+    pub const fn executor(&self) -> &E {
+        &self.executor
+    }
+}
+
+impl<E: TierExecutor> SegmentUploader for ExecutorUploader<E> {
+    fn upload(
+        &self,
+        upload: SegmentUpload,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, UploadOutcome> {
+        let layout = self.layout.clone();
+        let request =
+            TierJobRequest::new(TierJobClass::Upload, scope).with_bytes(upload.record.size);
+        self.executor
+            .submit(request, move |store| async move {
+                upload_segment(&*store, &layout, &upload).await
+            })
+            .boxed_local()
     }
 }
 

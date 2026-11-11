@@ -188,6 +188,9 @@ where
     /// How much of the partition stays on local disk, as the segment cleaner
     /// last resolved it from the topic. `None` until it has.
     local_envelope: Option<LocalEnvelope>,
+    /// The upload in flight: the first offset of its segment, and the scope
+    /// whose end stops the job.
+    segment_upload: Option<(u64, iggy_object_store::TierScope)>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -953,6 +956,7 @@ where
             remote_segments: None,
             pending_advances: VecDeque::new(),
             local_envelope: None,
+            segment_upload: None,
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -13075,6 +13079,82 @@ where
             log_path: log_path?,
             index_path: index_path?,
         })
+    }
+
+    /// Start the next upload, when this replica is the primary and none is in
+    /// flight. The caller runs it under the returned scope and hands the
+    /// result to [`Self::finish_segment_upload`].
+    ///
+    /// A replica that is no longer the primary cancels the upload it started,
+    /// so a scan of a demoted replica is what stops its job.
+    pub fn begin_segment_upload(
+        &mut self,
+    ) -> Option<(crate::SegmentUpload, iggy_object_store::TierScopeToken)> {
+        if !self.consensus.is_primary() || !self.consensus.is_normal() {
+            self.segment_upload = None;
+            return None;
+        }
+        if self.segment_upload.is_some() {
+            return None;
+        }
+        let upload = self.next_segment_upload()?;
+        let scope = iggy_object_store::TierScope::new();
+        let token = scope.token();
+        self.segment_upload = Some((upload.record.start_offset, scope));
+        Some((upload, token))
+    }
+
+    /// Take the result of the upload of the segment in `record`. Returns the
+    /// advance to commit when the segment is stored and this replica is still
+    /// the primary that started the upload.
+    ///
+    /// A failure leaves the segment local, so a later scan offers it again. A
+    /// failure that no retry changes is reported: the segment and everything
+    /// after it stay out of the store until someone repairs it.
+    pub fn finish_segment_upload(
+        &mut self,
+        record: &crate::segment_chain::SegmentRecord,
+        outcome: &crate::UploadOutcome,
+    ) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        let started_here = self
+            .segment_upload
+            .as_ref()
+            .is_some_and(|(start_offset, scope)| {
+                *start_offset == record.start_offset && !scope.is_cancelled()
+            });
+        if !started_here {
+            return None;
+        }
+        self.segment_upload = None;
+        match outcome {
+            Ok(Ok(())) if self.consensus.is_primary() && self.consensus.is_normal() => {
+                Some(self.note_segment_uploaded(record))
+            }
+            Ok(Ok(())) | Err(_) => None,
+            Ok(Err(failure)) => {
+                if failure.is_transient() {
+                    warn!(
+                        namespace_raw = self.namespace().inner(),
+                        start_offset = record.start_offset,
+                        %failure,
+                        "segment upload failed and is tried again"
+                    );
+                } else {
+                    error!(
+                        namespace_raw = self.namespace().inner(),
+                        start_offset = record.start_offset,
+                        %failure,
+                        "segment upload cannot succeed, and holds back every later segment"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Stop the upload in flight, as a partition does on its way out.
+    pub fn cancel_segment_upload(&mut self) {
+        self.segment_upload = None;
     }
 
     /// Account for a finished upload of the segment in `record`, and return

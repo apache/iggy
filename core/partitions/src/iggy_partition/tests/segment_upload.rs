@@ -22,10 +22,10 @@ use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::tiered_floor::AdvanceTieredFloor;
-use crate::{SegmentLocation, SegmentUpload, UploadError, upload_segment};
+use crate::{SegmentLocation, SegmentUpload, SegmentUploader, UploadError, upload_segment};
 use iggy_object_store::{
-    MemoryStore, ObjectStore, ObjectStoreError, PutBody, PutOptions, SegmentKey, SegmentMetadata,
-    SegmentObject,
+    InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PutBody, PutOptions,
+    SegmentKey, SegmentMetadata, SegmentObject,
 };
 
 fn key(start_offset: u64, object: SegmentObject) -> String {
@@ -425,4 +425,179 @@ async fn given_a_store_outage_when_uploading_should_report_a_failure_worth_a_ret
     // The store is told what the bytes must hash to, so bytes that changed
     // after the check are refused there.
     assert_eq!(store.crc32c.get(), Some(next.record.crc32c));
+}
+
+fn uploader<S: ObjectStore + 'static>(store: S) -> crate::ExecutorUploader<InlineTierExecutor<S>> {
+    crate::ExecutorUploader::new(InlineTierExecutor::new(store), layout())
+}
+
+fn local_starts(partition: &IggyPartition<IggyMessageBus>) -> Vec<u64> {
+    partition
+        .log
+        .segments()
+        .iter()
+        .filter(|segment| segment.sealed && segment.location == SegmentLocation::Local)
+        .map(|segment| segment.start_offset)
+        .collect()
+}
+
+#[compio::test]
+async fn given_a_primary_when_uploads_run_should_keep_one_in_flight_and_yield_each_advance() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    assert!(partition.consensus.is_primary(), "the fixture is a primary");
+    let uploader = uploader(MemoryStore::new());
+
+    let (first, scope) = partition.begin_segment_upload().unwrap();
+    assert_eq!(first.record.start_offset, 0);
+    assert!(
+        partition.begin_segment_upload().is_none(),
+        "one upload at a time"
+    );
+    let outcome = uploader.upload(first.clone(), scope).await;
+    assert!(matches!(outcome, Ok(Ok(()))));
+
+    let advance = partition
+        .finish_segment_upload(&first.record, &outcome)
+        .unwrap();
+    assert_eq!((advance.start, advance.up_to), (0, 1));
+    assert_eq!(advance.hash, first.record.hash);
+    // A result that arrives twice is not an upload this partition waits for.
+    assert_eq!(
+        partition.finish_segment_upload(&first.record, &outcome),
+        None
+    );
+
+    let (second, _scope) = partition.begin_segment_upload().unwrap();
+    assert_eq!(second.record.start_offset, 2);
+}
+
+#[compio::test]
+async fn given_an_upload_that_fails_when_it_finishes_should_offer_the_segment_again() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let uploader = uploader(Refusing::default());
+
+    let (first, scope) = partition.begin_segment_upload().unwrap();
+    let outcome = uploader.upload(first.clone(), scope).await;
+    assert!(matches!(&outcome, Ok(Err(failure)) if failure.is_transient()));
+
+    assert_eq!(
+        partition.finish_segment_upload(&first.record, &outcome),
+        None
+    );
+    assert_eq!(local_starts(&partition), [0, 2]);
+    let (again, _scope) = partition.begin_segment_upload().unwrap();
+    assert_eq!(again, first);
+}
+
+#[compio::test]
+async fn given_a_cancelled_upload_when_its_result_arrives_should_not_advance() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let (first, scope) = partition.begin_segment_upload().unwrap();
+
+    partition.cancel_segment_upload();
+
+    assert!(scope.is_cancelled());
+    assert_eq!(
+        partition.finish_segment_upload(&first.record, &Ok(Ok(()))),
+        None
+    );
+    assert_eq!(local_starts(&partition), [0, 2]);
+
+    // A job submitted under the cancelled scope does not end as an upload.
+    let outcome = uploader(MemoryStore::new()).upload(first, scope).await;
+    assert!(outcome.is_err());
+}
+
+#[compio::test]
+async fn given_a_replica_that_lost_primacy_when_scanned_should_cancel_its_upload_and_start_none() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let (first, scope) = partition.begin_segment_upload().unwrap();
+
+    // The next view's primary is another replica.
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(!partition.consensus.is_primary());
+
+    assert!(partition.begin_segment_upload().is_none());
+    assert!(
+        scope.is_cancelled(),
+        "the scan stops the demoted replica's job"
+    );
+    assert_eq!(
+        partition.finish_segment_upload(&first.record, &Ok(Ok(()))),
+        None
+    );
+    assert_eq!(local_starts(&partition), [0, 2]);
+}
+
+#[compio::test]
+async fn given_an_upload_that_ends_after_primacy_moved_when_it_finishes_should_not_advance() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let (first, _scope) = partition.begin_segment_upload().unwrap();
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+
+    // No scan ran in between, so the result is still the awaited one.
+    assert_eq!(
+        partition.finish_segment_upload(&first.record, &Ok(Ok(()))),
+        None
+    );
+    assert_eq!(local_starts(&partition), [0, 2]);
+}
+
+/// An executor that runs each job at once and keeps what it was asked for.
+struct Recording {
+    store: Rc<MemoryStore>,
+    requests: std::cell::RefCell<Vec<(iggy_object_store::TierJobClass, u64)>>,
+}
+
+impl iggy_object_store::TierExecutor for Recording {
+    type Store = MemoryStore;
+
+    fn submit<T, F, Fut>(
+        &self,
+        request: iggy_object_store::TierJobRequest,
+        job: F,
+    ) -> iggy_object_store::TierJobHandle<T>
+    where
+        T: 'static,
+        F: FnOnce(Rc<Self::Store>) -> Fut + 'static,
+        Fut: Future<Output = T> + 'static,
+    {
+        self.requests
+            .borrow_mut()
+            .push((request.class(), request.bytes()));
+        let job = job(Rc::clone(&self.store));
+        iggy_object_store::TierJobHandle::new(async move { Ok(job.await) })
+    }
+}
+
+/// The executor caps uploads by their class and their bytes, so an upload has
+/// to say both.
+#[compio::test]
+async fn given_an_upload_when_submitted_should_name_the_upload_class_and_the_segment_size() {
+    let (_directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let (first, scope) = partition.begin_segment_upload().unwrap();
+    let size = first.record.size;
+    let uploader = crate::ExecutorUploader::new(
+        Recording {
+            store: Rc::new(MemoryStore::new()),
+            requests: std::cell::RefCell::default(),
+        },
+        layout(),
+    );
+
+    let outcome = uploader.upload(first, scope).await;
+
+    assert!(matches!(outcome, Ok(Ok(()))));
+    assert_eq!(
+        uploader.executor().requests.take(),
+        [(iggy_object_store::TierJobClass::Upload, size)]
+    );
 }
