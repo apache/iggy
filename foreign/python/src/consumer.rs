@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::poll_fn;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::task::Poll;
 
 use futures::StreamExt;
 use futures::future::{Either, select};
@@ -33,15 +35,15 @@ use pyo3::intern;
 
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3_async_runtimes::tokio::{
-    future_into_py, get_current_locals, get_runtime, into_future, scope,
-};
+use pyo3_async_runtimes::tokio::{get_current_locals, get_runtime, into_future, scope};
 use pyo3_async_runtimes::{TaskLocals, into_future_with_locals};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::client::{to_read_error, to_runtime_error};
-use crate::event_loop::on_event_loop;
+use crate::event_loop::{
+    attach_unless_exiting, exit_gate_closed, future_into_py, gated, on_event_loop,
+};
 use crate::identifier::PyIdentifier;
 use crate::poll_options::CommitPolicy;
 use crate::receive_message::{Checkpoint, PollingStrategy, ReceiveMessage};
@@ -169,7 +171,9 @@ impl IggyConsumer {
 
     /// Sets the next read position of a partition and drops the rest of its batch that the
     /// consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
-    /// stores the offset before it, so a restart resumes at the new position. Every other seek
+    /// stores the offset before it, so a restart resumes at the new position. A seek to offset 0
+    /// or `PollingStrategy.First()` deletes the stored offset. A seek to a timestamp stores the
+    /// offset before the first message at the timestamp, if there is one. Every other seek
     /// stores nothing. It resumes a stopped partition.
     /// `start` is a new strategy or a continuation of the same partition, such as
     /// `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
@@ -177,9 +181,9 @@ impl IggyConsumer {
     /// Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
     /// read and for a continuation of another partition, `PendingOperationError` under
     /// `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
-    /// (abandon its operation first), the errors of the offset store with `OnRead`, and
-    /// `RuntimeError` while `consume_messages()` runs, also from its callback: seek after the
-    /// run ends.
+    /// (abandon its operation first), the errors of the read, lookup, store or delete with
+    /// `OnRead`, and `RuntimeError` while `consume_messages()` runs, also from its callback:
+    /// seek after the run ends.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn seek<'a>(
         &self,
@@ -324,7 +328,7 @@ impl IggyConsumer {
             failure: failure.clone(),
         };
         let shutdown_requested = shutdown_event
-            .map(|event| into_future_with_locals(&locals, event.call_method0("wait")?))
+            .map(|event| into_future_with_locals(&locals, event.call_method0("wait")?).map(gated))
             .transpose()?;
 
         future_into_py(py, async move {
@@ -334,7 +338,17 @@ impl IggyConsumer {
             let run = get_runtime().spawn(async move {
                 let mut inner = inner.lock().await;
                 let _consuming = Consuming::start(consuming);
-                inner.consume_messages(&consumer, stopped).await
+                let mut consume = pin!(inner.consume_messages(&consumer, stopped));
+                // Behind the closed exit gate no callback runs, so a run that went on would
+                // count and store messages that no callback saw.
+                poll_fn(|cx| {
+                    if exit_gate_closed() {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        consume.as_mut().poll(cx)
+                    }
+                })
+                .await
             });
             let outcome = match shutdown_requested {
                 None => run.await,
@@ -686,11 +700,11 @@ impl MessageConsumer for PyCallbackConsumer {
         let message = ReceiveMessage::from(received);
         let called = get_runtime()
             .spawn(scope(task_locals, async move {
-                Python::attach(|py| {
+                gated(attach_unless_exiting(|py| {
                     let callback = callback.bind(py);
                     let result = callback.as_any().call1((message,))?;
                     into_future(result)
-                })?
+                })?)
                 .await
             }))
             .await

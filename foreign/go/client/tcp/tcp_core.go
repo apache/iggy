@@ -75,6 +75,9 @@ type IggyTcpClient struct {
 	// Close waits for them. Each Add happens under mtx before the close of
 	// closed, or not at all.
 	commits sync.WaitGroup
+	// testHookPause, when set, turns the drawn length of each pause into the
+	// length the client waits, so a test sees a pause start and can hold it.
+	testHookPause func(drawn time.Duration) time.Duration
 }
 
 type config struct {
@@ -375,8 +378,9 @@ func (c *IggyTcpClient) doCaptured(ctx context.Context, cmd command.Command, cap
 			captured = poll.Strategy.Context
 		}
 		if cmd.Code() == command.FetchMessagesCode {
-			// Each target of a fetch carries its own fence.
-			captured = &iggcon.PartitionContext{}
+			// A replica answers 58 until it applied the metadata the session saw, instead
+			// of judging the targets on older group state. Each target keeps its own fence.
+			captured = &iggcon.PartitionContext{MetadataOp: c.metadataWatermark.Load()}
 		}
 		return c.drive(ctx, cmd.Code(), query, frame, captured, nil)
 	}
@@ -670,6 +674,14 @@ func (c *IggyTcpClient) startCommit() bool {
 }
 
 func (c *IggyTcpClient) pause(ctx context.Context, interval time.Duration) error {
+	return c.pauseUntil(ctx, interval, nil)
+}
+
+// pauseUntil is pause that also ends once wake closes.
+func (c *IggyTcpClient) pauseUntil(ctx context.Context, interval time.Duration, wake <-chan struct{}) error {
+	if c.testHookPause != nil {
+		interval = c.testHookPause(interval)
+	}
 	if interval <= 0 {
 		return ctx.Err()
 	}
@@ -681,6 +693,8 @@ func (c *IggyTcpClient) pause(ctx context.Context, interval time.Duration) error
 	case <-c.closed:
 		return ierror.ErrClientShutdown
 	case <-timer.C:
+		return nil
+	case <-wake:
 		return nil
 	}
 }
