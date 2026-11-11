@@ -765,6 +765,9 @@ struct PendingPartitionMaintenance {
     /// The removal appends a trim point at the removed segment's end.
     removal_trim: bool,
     eviction: Option<u64>,
+    /// The prefix tiering was asked for with, while its chain may still lack
+    /// the trim point or the record of a sealed segment.
+    tiering: Option<iggy_object_store::ObjectPrefix>,
 }
 
 struct PendingWireActions {
@@ -6212,6 +6215,7 @@ where
                 || self.maintenance.checkpoint.is_some()
                 || self.maintenance.retention.is_some()
                 || self.maintenance.eviction.is_some()
+                || self.maintenance.tiering.is_some()
                 || self
                     .maintenance
                     .shutdown
@@ -6714,6 +6718,9 @@ where
         {
             return self.io_plan(crate::PartitionIoContinuation::Eviction);
         }
+        if self.tiering_is_ready() {
+            return self.io_plan(crate::PartitionIoContinuation::Tiering);
+        }
         if self.maintenance.shutdown.is_some() && self.consensus.request_queue_len() > 0 {
             self.deny_queued_requests("shutdown queued request reply failed")
                 .await;
@@ -6848,6 +6855,9 @@ where
             }
             crate::PartitionIoContinuation::Retention => self.capture_segment_removal(),
             crate::PartitionIoContinuation::Eviction => self.capture_segment_eviction(),
+            crate::PartitionIoContinuation::Tiering => self
+                .next_tiering_job()
+                .map(|job| crate::PartitionIoJob::Tiering(Box::new(job))),
             crate::PartitionIoContinuation::Checkpoint => self.capture_checkpoint_phase()?,
             crate::PartitionIoContinuation::Superblock => {
                 let Some(guard) = self.superblock_lock.try_acquire_owned() else {
@@ -6954,6 +6964,7 @@ where
             crate::PartitionIoContinuation::Eviction => {
                 self.accept_segment_eviction(result).map(|_| ())
             }
+            crate::PartitionIoContinuation::Tiering => self.accept_tiering(result),
             crate::PartitionIoContinuation::Checkpoint => self.accept_checkpoint_io(result),
             crate::PartitionIoContinuation::Superblock => {
                 let Some((intent, backoff)) = self.superblock_running.take() else {
@@ -7009,6 +7020,7 @@ where
             }
             crate::PartitionIoContinuation::Retention => self.maintenance.retention = None,
             crate::PartitionIoContinuation::Eviction => self.maintenance.eviction = None,
+            crate::PartitionIoContinuation::Tiering => self.maintenance.tiering = None,
             _ => self.fail_io_work(
                 &error,
                 continuation == crate::PartitionIoContinuation::Checkpoint,
@@ -12701,6 +12713,11 @@ where
         self.stamp_sealed_segment(target.segment_start);
         if let Some(chain) = self.segment_chain.as_mut() {
             chain.sealed(target.chain_record.as_ref(), start_offset);
+            // A segment whose bytes did not all pass through the digest seals
+            // without a record, so it gets one hashed from disk.
+            if target.chain_record.is_none() {
+                self.maintenance.tiering = self.object_prefix();
+            }
         }
         debug!(
             namespace_raw = self.namespace().inner(),
@@ -12959,6 +12976,101 @@ where
             through = Some(segment.end_offset);
         }
         through
+    }
+
+    /// Turn tiering on for this partition, or check that its chain is
+    /// complete when it is on already.
+    ///
+    /// The I/O lane creates the chain holding `prefix` when the directory has
+    /// none, which starts the hashing of the active segment on the commit
+    /// path. It then records the front that retention left, and hashes every
+    /// sealed segment without a record from its `.log`. Until the chain is
+    /// adopted the partition is not tiered, so it evicts nothing.
+    pub fn enable_tiering(&mut self, prefix: iggy_object_store::ObjectPrefix) {
+        self.maintenance.tiering = Some(prefix);
+        self.notify_io();
+    }
+
+    /// The prefix of an enable that the I/O lane has not finished yet.
+    #[must_use]
+    pub const fn pending_tiering(&self) -> Option<iggy_object_store::ObjectPrefix> {
+        self.maintenance.tiering
+    }
+
+    /// Whether this partition keeps a chain.
+    #[must_use]
+    pub const fn is_tiered(&self) -> bool {
+        self.segment_chain.is_some()
+    }
+
+    fn tiering_is_ready(&mut self) -> bool {
+        if self.maintenance.tiering.is_none() {
+            return false;
+        }
+        if self.next_tiering_job().is_none() {
+            self.maintenance.tiering = None;
+            return false;
+        }
+        true
+    }
+
+    /// The next step toward a complete chain, `None` when it is complete.
+    fn next_tiering_job(&self) -> Option<crate::segment_chain::TieringJob> {
+        let prefix = self.maintenance.tiering?;
+        let Some(chain) = self.segment_chain.as_ref() else {
+            return Some(crate::segment_chain::TieringJob::Open {
+                directory: self.partition_dir.clone()?,
+                prefix,
+            });
+        };
+        let segments = self.log.segments();
+        // The trim point is the last offset retention removed, so a front at
+        // zero needs none.
+        if let Some(removed) = segments.first()?.start_offset.checked_sub(1)
+            && let Some(append) = chain.trim(removed)
+        {
+            return Some(crate::segment_chain::TieringJob::Trim(append));
+        }
+        let incarnation = self.created_revision();
+        segments
+            .iter()
+            .zip(self.log.storages())
+            .filter(|(segment, _)| segment.sealed && segment.size.as_bytes_u64() > 0)
+            .find_map(|(segment, storage)| {
+                let append = chain.hash_from_disk(segment, incarnation)?;
+                let log_path = storage.segment_and_index_paths().0?;
+                Some(crate::segment_chain::TieringJob::Hash { log_path, append })
+            })
+    }
+
+    /// A step that fails leaves the chain as it was and ends the pass. The
+    /// next seal or the next start asks again.
+    fn accept_tiering(&mut self, result: crate::PartitionIoResult) -> Result<(), IggyError> {
+        let crate::PartitionIoResult::Tiering(result) = result else {
+            return Err(IggyError::CannotWriteToFile);
+        };
+        let failure = match result {
+            crate::segment_chain::TieringResult::Opened(Ok(chain)) => self
+                .adopt_segment_chain(&chain)
+                .err()
+                .map(|error| error.to_string()),
+            crate::segment_chain::TieringResult::Opened(Err(error)) => Some(error.to_string()),
+            crate::segment_chain::TieringResult::Appended(Ok(record)) => {
+                if let Some(chain) = self.segment_chain.as_mut() {
+                    chain.note_appended(&record);
+                }
+                None
+            }
+            crate::segment_chain::TieringResult::Appended(Err(error)) => Some(error.to_string()),
+        };
+        if let Some(failure) = failure {
+            error!(
+                namespace_raw = self.namespace().inner(),
+                failure, "cannot complete the partition's segment chain"
+            );
+            self.maintenance.tiering = None;
+        }
+        Ok(())
     }
 
     fn eviction_is_ready(&mut self, through: u64) -> bool {

@@ -1906,5 +1906,6 @@ mod state_machines;
 mod state_transfer_offer;
 mod state_transfer_segments;
 mod superblock;
+mod tiering;
 mod transfer_ownership;
 mod wal;

@@ -42,6 +42,7 @@ use iggy_object_store::SEGMENT_HASH_LEN;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::sharding::IggyNamespace;
 use tracing::warn;
 
 use crate::IggyPartition;
@@ -638,6 +639,88 @@ impl ChainAppend {
     }
 }
 
+/// The prefix of the partition `namespace` names in the incarnation that
+/// `created_revision` identifies.
+#[must_use]
+pub fn object_prefix(namespace: IggyNamespace, created_revision: u64) -> ObjectPrefix {
+    ObjectPrefix {
+        stream_id: namespace.stream_id() as u64,
+        topic_id: namespace.topic_id() as u64,
+        partition_id: namespace.partition_id() as u64,
+        created_revision,
+    }
+}
+
+/// One step of turning tiering on for a partition, or of keeping its chain
+/// complete afterwards. Each runs on the partition's I/O lane.
+pub enum TieringJob {
+    /// Load the chain in the directory, or create it holding `prefix`.
+    Open {
+        directory: String,
+        prefix: ObjectPrefix,
+    },
+    /// Record the front that retention had left before tiering was enabled.
+    Trim(ChainAppend),
+    /// Hash a sealed segment that has no record from its `.log`, and record
+    /// it. `append` holds the record with a zero hash.
+    Hash {
+        log_path: String,
+        append: ChainAppend,
+    },
+}
+
+pub enum TieringResult {
+    Opened(Result<Chain, ChainError>),
+    Appended(io::Result<ChainRecord>),
+}
+
+impl TieringJob {
+    pub(crate) async fn execute(self) -> TieringResult {
+        match self {
+            Self::Open { directory, prefix } => {
+                TieringResult::Opened(open(&directory, prefix).await)
+            }
+            Self::Trim(append) => {
+                TieringResult::Appended(append.execute().await.map(|()| append.record))
+            }
+            Self::Hash {
+                log_path,
+                mut append,
+            } => TieringResult::Appended(
+                async {
+                    if let ChainRecord::Sealed(segment) = &mut append.record {
+                        let hashes = hash_segment_file(&log_path, segment.size).await?;
+                        segment.hash = hashes.blake3;
+                        segment.crc32c = hashes.crc32c;
+                    }
+                    append.execute().await.map(|()| append.record)
+                }
+                .await,
+            ),
+        }
+    }
+}
+
+/// The chain in `directory`, created holding `prefix` when there is none.
+async fn open(directory: &str, prefix: ObjectPrefix) -> Result<Chain, ChainError> {
+    if let Some(chain) = read_chain(directory).await? {
+        return if chain.prefix == prefix {
+            Ok(chain)
+        } else {
+            Err(ChainError::Prefix {
+                recorded: chain.prefix,
+            })
+        };
+    }
+    create_chain(directory, &prefix).await?;
+    Ok(Chain {
+        prefix,
+        records: Vec::new(),
+        valid_len: HEADER_SIZE as u64,
+        torn_tail: false,
+    })
+}
+
 /// Evicts one sealed segment: a durable remote record first, so no crash
 /// leaves the `.log` gone without a record standing in for it.
 pub struct EvictionJob {
@@ -825,6 +908,31 @@ impl SegmentChain {
         })
     }
 
+    /// The record of `segment` hashed from disk, with the hash still to fill
+    /// in, `None` when the chain already records the segment.
+    pub(crate) fn hash_from_disk(
+        &self,
+        segment: &Segment,
+        incarnation: u64,
+    ) -> Option<ChainAppend> {
+        if self.sealed.contains_key(&segment.start_offset)
+            || self
+                .trim_point
+                .is_some_and(|trim_point| segment.end_offset <= trim_point)
+        {
+            return None;
+        }
+        Some(self.append(ChainRecord::Sealed(SegmentRecord::new(
+            segment,
+            incarnation,
+            SegmentHashes {
+                blake3: [0; SEGMENT_HASH_SIZE],
+                crc32c: 0,
+            },
+            HashSource::Disk,
+        ))))
+    }
+
     /// Account for the remote record an eviction appended for the segment
     /// starting at `start_offset`.
     pub(crate) fn note_evicted(&mut self, start_offset: u64) {
@@ -882,22 +990,7 @@ where
     /// be created or read, or it records another prefix.
     pub async fn open_segment_chain(&mut self, prefix: ObjectPrefix) -> Result<(), ChainError> {
         let directory = self.partition_dir.clone().ok_or(ChainError::NoDirectory)?;
-        let chain = if let Some(chain) = read_chain(&directory).await? {
-            if chain.prefix != prefix {
-                return Err(ChainError::Prefix {
-                    recorded: chain.prefix,
-                });
-            }
-            chain
-        } else {
-            create_chain(&directory, &prefix).await?;
-            Chain {
-                prefix,
-                records: Vec::new(),
-                valid_len: HEADER_SIZE as u64,
-                torn_tail: false,
-            }
-        };
+        let chain = open(&directory, prefix).await?;
         self.adopt_segment_chain(&chain)
     }
 

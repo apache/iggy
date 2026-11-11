@@ -1315,6 +1315,8 @@ pub struct TopicRuntimeOptions {
     pub size_of_messages_required_to_save: Option<IggyByteSize>,
     pub preallocate_segments: Option<bool>,
     pub segment_max_age: Option<IggyExpiry>,
+    /// Whether each partition of the topic keeps a chain file.
+    pub tiered_storage: bool,
 }
 
 impl TopicRuntimeOptions {
@@ -1356,6 +1358,7 @@ impl From<&TopicCreateOptions> for TopicRuntimeOptions {
             size_of_messages_required_to_save: parsed.size_of_messages_required_to_save,
             preallocate_segments: parsed.preallocate_segments,
             segment_max_age: parsed.segment_max_age,
+            tiered_storage: parsed.tiered_storage == Some(true),
         }
     }
 }

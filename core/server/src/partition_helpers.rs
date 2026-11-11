@@ -755,6 +755,14 @@ async fn load_partition(
     let segment_checkpoint = recovered_persistence.0.segment_checkpoint();
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_runtime_options(runtime_options);
+    // The chain file comes with the partition of a tiered topic, and a chain
+    // that a crash left short of a record is completed here.
+    if runtime_options.tiered_storage {
+        partition.enable_tiering(partitions::object_prefix(
+            namespace,
+            partition_metadata.created_revision,
+        ));
+    }
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Recovered partitions honor the same config-surfaced ring ceilings as the
     // fresh-create path (build_partition_fresh). Retention is already off for
@@ -1138,6 +1146,11 @@ pub async fn build_partition_fresh(
         .consensus()
         .set_recovery_election_allowed(first_initialization && !lost_with_storage);
     partition.set_runtime_options(runtime_options);
+    // The chain file comes with the partition of a tiered topic, and a chain
+    // that a crash left short of a record is completed here.
+    if runtime_options.tiered_storage {
+        partition.enable_tiering(partitions::object_prefix(namespace, created_revision));
+    }
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
     // IggyPartition::new has already disabled retention for single-replica

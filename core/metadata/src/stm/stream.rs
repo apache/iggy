@@ -1090,6 +1090,9 @@ pub enum PartitionChangeKind {
     /// A consumer group of the partition's topic was deleted, so the group's
     /// offsets on the partition are now dead.
     ConsumerGroupDeleted,
+    /// The partition's topic turned tiered storage on, so every replica of
+    /// the partition starts its chain file.
+    TieringEnabled,
 }
 
 /// One partition change.
@@ -3597,7 +3600,20 @@ impl StateHandler for UpdateTopicResolvedRequest {
             topic.name = name.clone();
             stream.topic_index.insert(name, topic_id);
         }
+        let was_tiered = topic.resolved.tiered_storage;
         topic.set_options(options);
+        // Only a build that knows the option admits its enable, and only once
+        // every member of the cluster runs one, so every replica that applies
+        // this takes the same branch and bumps the same revision.
+        let newly_tiered: Vec<(usize, u64)> = if !was_tiered && topic.resolved.tiered_storage {
+            topic
+                .partitions
+                .iter()
+                .map(|partition| (partition.id, partition.created_revision))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // An equal patch commits as ok but changes nothing public.
         let after = stream
             .topics
@@ -3613,6 +3629,19 @@ impl StateHandler for UpdateTopicResolvedRequest {
             })
             .into_iter()
             .collect();
+        if !newly_tiered.is_empty() {
+            state.revision = state.revision.wrapping_add(1);
+            for (partition_id, created_revision) in newly_tiered {
+                state.recent_partition_changes.push(
+                    state.revision,
+                    PartitionChange {
+                        namespace: IggyNamespace::new(stream_id, topic_id, partition_id),
+                        created_revision,
+                        kind: PartitionChangeKind::TieringEnabled,
+                    },
+                );
+            }
+        }
         ApplyReply {
             changes,
             ..ApplyReply::ok(Bytes::new())
@@ -6007,6 +6036,55 @@ mod tests {
             IggyTimestamp::now(),
         );
         assert_eq!(apply.code, 0);
+    }
+
+    /// Every replica of every partition starts its chain file when the topic
+    /// turns tiered storage on, so the enable records one change per
+    /// partition. A patch that leaves the topic tiered records nothing.
+    #[test]
+    fn given_a_topic_when_tiered_storage_is_enabled_should_record_each_partition_once() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 2);
+        let created = inner.revision;
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert!(inner.items[0].topics[0].resolved.tiered_storage);
+        let enabled = inner.revision;
+        assert_eq!(enabled, created + 1);
+        let change = |partition_id| {
+            (
+                enabled,
+                PartitionChange {
+                    namespace: IggyNamespace::new(0, 0, partition_id),
+                    created_revision: created,
+                    kind: PartitionChangeKind::TieringEnabled,
+                },
+            )
+        };
+        assert_eq!(changes_since(&inner, created), [change(0), change(1)]);
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert_eq!(inner.revision, enabled);
+        assert_eq!(changes_since(&inner, enabled), []);
     }
 
     /// Readers act on every partition a commit touched, so each applied

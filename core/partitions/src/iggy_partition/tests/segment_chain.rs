@@ -231,12 +231,19 @@ async fn given_a_single_replica_with_wal_written_bodies_when_a_segment_seals_sho
 }
 
 /// A segment that held bytes before the chain opened cannot be hashed on the
-/// commit path, so it gets no record, while the next one does.
+/// commit path, so it is hashed from disk once it seals, while the next one
+/// is hashed as it is written.
 #[compio::test]
-async fn given_a_chain_opened_mid_segment_when_that_segment_seals_should_record_only_the_next() {
+async fn given_a_chain_opened_mid_segment_when_that_segment_seals_should_hash_it_from_disk() {
     let (directory, partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 1)).await;
-    assert!(partition.sealed_segment_record(0).is_none());
+    let first = partition.sealed_segment_record(0).unwrap();
+    assert_eq!(first.source, HashSource::Disk);
+    let log = directory.path().join(format!("{:020}.log", 0));
+    let on_disk = hash_segment_file(&log.to_string_lossy(), first.size)
+        .await
+        .unwrap();
+    assert_eq!((first.hash, first.crc32c), (on_disk.blake3, on_disk.crc32c));
     assert_records_hash_the_logs(&partition, directory.path(), &[2]).await;
 }
 
