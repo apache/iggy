@@ -61,7 +61,8 @@ use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
     OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
-    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_preallocated_topic_bytes,
+    TopicResolvedOptions, UserStatus, admit, derived_defaults, refuse_tiered_storage,
+    validate_local_retention, validate_preallocated_topic_bytes, validate_segment_max_age,
     validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
@@ -403,13 +404,16 @@ where
                     );
                     return Err(IggyError::InvalidReplicationFactor);
                 }
+                refuse_tiered_storage(&admitted.explicit)?;
                 let mut stored = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
                 stored.extend(admitted.explicit);
+                validate_local_retention(&stored)?;
                 let resolved = TopicResolvedOptions::from(&stored);
                 let segment_size = resolved.runtime.effective_segment_size().as_bytes_u64();
                 if resolved.runtime.preallocate_segments == Some(true) {
                     validate_preallocated_topic_bytes(segment_size, create_topic.partitions_count)?;
                 }
+                validate_segment_max_age(resolved.runtime)?;
                 let max_topic_size = resolved.max_topic_size;
                 validate_topic_bounds(create_topic.partitions_count, max_topic_size, segment_size)?;
                 warn_unenforceable_topic_size(
@@ -529,7 +533,16 @@ where
         user_id.filter(|user_id| may_update(streams, users, *user_id, &patch.target));
     let current = authorized_user_id.and_then(|_| stored_options(streams, users, &patch.target));
     let stored_state_visible = current.is_some();
+    let patched_from = matches!(patch.target, ResourceTarget::Topic { .. })
+        .then(|| current.clone())
+        .flatten();
     let admitted = admit_patch(patch, current)?;
+    if let Some(current) = patched_from {
+        refuse_tiered_storage(&admitted.explicit)?;
+        // A rule between two keys reads the one this patch leaves alone from
+        // the stored map, so a patch of either key meets it.
+        validate_local_retention(&admitted.patched(&current)?)?;
+    }
     if let (Some(actor_id), ResourceTarget::User { user_id: target_id }) =
         (authorized_user_id, &patch.target)
     {
@@ -682,7 +695,9 @@ mod tests {
     };
     use bytes::Bytes;
     use iggy_binary_protocol::requests::system::WireResetKeys;
-    use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
+    };
     use iggy_binary_protocol::{MAX_OPTIONS, WireName};
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::wire_conversions::resource_options_from_wire;
@@ -863,6 +878,182 @@ mod tests {
             assert_eq!(tcp, Err(expected.clone()), "binary chain, {operation:?}");
             assert_eq!(http, Err(expected), "HTTP chain, {operation:?}");
         }
+    }
+
+    #[test]
+    fn given_tiered_storage_when_patching_a_topic_should_refuse_on_and_off_on_either_chain() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let sessions = root_sessions(&shard, 1);
+        for (enabled, expected) in [
+            ("true", IggyError::FeatureUnavailable),
+            (
+                "false",
+                IggyError::OptionNotUpdatable(OptionKey::TieredStorage.to_string()),
+            ),
+        ] {
+            let body = topic_patch(&[(OptionKey::TieredStorage, enabled)], &[]);
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            )
+            .map(|_| ());
+            assert_eq!(tcp, Err(expected.clone()), "binary chain, {enabled}");
+            assert_eq!(http, Err(expected), "HTTP chain, {enabled}");
+        }
+    }
+
+    /// The rule spans two keys, so a patch of either one must meet it against
+    /// the value the topic already stores for the other.
+    #[test]
+    fn given_stored_retention_when_patching_either_key_should_refuse_a_local_retention_above_it() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let chain = |set: &[(OptionKey, &str)], reset: &[OptionKey]| {
+            http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, &topic_patch(set, reset)),
+            )
+            .map(|_| ())
+        };
+        let commit = |op: u64, set: &[(OptionKey, &str)]| commit_topic_patch(&shard, op, set);
+        let age_refused = Err(IggyError::InvalidOptionValue(
+            OptionKey::LocalRetentionAge.to_string(),
+        ));
+        let size_refused = Err(IggyError::InvalidOptionValue(
+            OptionKey::LocalRetentionSize.to_string(),
+        ));
+
+        // The topic keeps everything, so any local retention fits.
+        assert_eq!(chain(&[(OptionKey::LocalRetentionAge, "2h")], &[]), Ok(()));
+        commit(
+            3,
+            &[
+                (OptionKey::MessageExpiry, "1h"),
+                (OptionKey::MaxTopicSize, "4 GiB"),
+            ],
+        );
+        assert_eq!(
+            chain(&[(OptionKey::LocalRetentionAge, "2h")], &[]),
+            age_refused
+        );
+        assert_eq!(
+            chain(&[(OptionKey::LocalRetentionSize, "8 GiB")], &[]),
+            size_refused
+        );
+        assert_eq!(
+            chain(
+                &[
+                    (OptionKey::LocalRetentionAge, "30m"),
+                    (OptionKey::LocalRetentionSize, "2 GiB")
+                ],
+                &[]
+            ),
+            Ok(())
+        );
+        // One patch that raises both the topic's retention and the local one.
+        assert_eq!(
+            chain(
+                &[
+                    (OptionKey::MessageExpiry, "3h"),
+                    (OptionKey::LocalRetentionAge, "2h")
+                ],
+                &[]
+            ),
+            Ok(())
+        );
+
+        commit(
+            4,
+            &[
+                (OptionKey::LocalRetentionAge, "30m"),
+                (OptionKey::LocalRetentionSize, "2 GiB"),
+            ],
+        );
+        assert_eq!(
+            chain(&[(OptionKey::MessageExpiry, "10m")], &[]),
+            age_refused
+        );
+        assert_eq!(
+            chain(&[(OptionKey::MaxTopicSize, "1 GiB")], &[]),
+            size_refused
+        );
+        assert_eq!(chain(&[(OptionKey::MessageExpiry, "45m")], &[]), Ok(()));
+        assert_eq!(chain(&[], &[OptionKey::MessageExpiry]), Ok(()));
+        // A reset returns the local retention to a default, which yields.
+        assert_eq!(
+            chain(
+                &[(OptionKey::MessageExpiry, "10m")],
+                &[OptionKey::LocalRetentionAge]
+            ),
+            Ok(())
+        );
+    }
+
+    /// Admits `set` at the edge and applies it to the topic, as a commit does.
+    fn commit_topic_patch(shard: &Rc<TestShard>, op: u64, set: &[(OptionKey, &str)]) {
+        let (request, _) = http_chain(
+            shard,
+            DEFAULT_ROOT_USER_ID,
+            request_message(Operation::UpdateResource, 1, 1, 1, &topic_patch(set, &[])),
+        )
+        .expect("the patch is admitted");
+        let patch = UpdateResourceRequest::decode_from(crate::wire::request_body(&request))
+            .expect("the admitted patch decodes");
+        let body = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: patch.options,
+            derived_options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let applied = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::UpdateTopicResolved,
+                1,
+                op,
+                &body,
+            ))
+            .expect("the patch applies");
+        assert_eq!(applied.code, 0);
+    }
+
+    fn topic_patch(set: &[(OptionKey, &str)], reset: &[OptionKey]) -> Bytes {
+        let patch = TopicUpdateOptions {
+            raw: set
+                .iter()
+                .map(|(key, value)| (key.to_string(), (*value).to_owned()))
+                .collect(),
+            raw_reset: reset.iter().map(ToString::to_string).collect(),
+            ..TopicUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("the patch encodes");
+        UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        }
+        .to_bytes()
     }
 
     #[test]

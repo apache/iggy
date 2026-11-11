@@ -1214,26 +1214,41 @@ impl IggyClient {
     ///         nothing either, reset `OptionKey.MaxTopicSize` to return to the
     ///         default.
     ///     reset: Keys to return to their defaults as `list[OptionKey] | None`:
-    ///         `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+    ///         `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+    ///         `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
     ///     options: Additional option keys as `dict[str, str] | None`, sent
     ///         verbatim so an updatable server key can be set from this build.
     ///         A create-only key is refused by name.
     ///     raw_reset: Additional reset names as `list[str] | None`, sent
     ///         verbatim so a key newer than this build can be reset. The
     ///         server decides them.
+    ///     tiered_storage: `True` turns tiered storage on, unchanged when
+    ///         `None`. The server refuses `False`, an update never turns it
+    ///         off, and refuses `True` with `FeatureUnavailable` until it
+    ///         tiers topics.
+    ///     local_retention_age: How long a tiered topic keeps an uploaded
+    ///         segment on local disk as `IggyExpiry | None`, unchanged when
+    ///         `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+    ///         reset `OptionKey.LocalRetentionAge` to return to the default.
+    ///     local_retention_size: Topic-wide cap on the uploaded segments a
+    ///         tiered topic keeps on local disk as `MaxTopicSize | None`,
+    ///         unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+    ///         nothing either, reset `OptionKey.LocalRetentionSize` to return
+    ///         to the default.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     ValueError: If `message_expiry`, `max_topic_size`,
+    ///         `local_retention_age` or `local_retention_size` is out of range.
     ///     OptionError: A `RuntimeError` carrying the error `code` and
     ///         `kind` when the client or the server refuses an option.
     ///     RuntimeError: Before anything is sent, if the update changes
     ///         nothing, names a key both set and reset, the name does not fit,
     ///         or a reset key cannot be reset. Otherwise if the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None)
+        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -1256,11 +1271,25 @@ impl IggyClient {
         options: Option<BTreeMap<String, String>>,
         #[gen_stub(override_type(type_repr = "builtins.list[builtins.str] | None"))]
         raw_reset: Option<Vec<String>>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tiered_storage: Option<bool>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] local_retention_age: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let update_options = TopicUpdateOptions {
             name,
             message_expiry: message_expiry.map(RustIggyExpiry::try_from).transpose()?,
             max_topic_size: max_topic_size.map(RustMaxTopicSize::try_from).transpose()?,
+            tiered_storage,
+            local_retention_age: local_retention_age
+                .map(RustIggyExpiry::try_from)
+                .transpose()?,
+            local_retention_size: local_retention_size
+                .map(RustMaxTopicSize::try_from)
+                .transpose()?,
             reset: reset_keys(reset),
             raw_reset: raw_reset.into_iter().flatten().collect(),
             raw: options.unwrap_or_default(),

@@ -1795,8 +1795,13 @@ where
                         .checked_add(1)
                         .ok_or(IggyError::CannotReadFile)?
                 },
+                first_timestamp: segment.start_timestamp,
             };
-            persistence.enable_segment_storage(initial, segment.max_size.as_bytes_u64());
+            persistence.enable_segment_storage(
+                initial,
+                segment.max_size.as_bytes_u64(),
+                self.effective_segment_max_age(),
+            );
             if persistence.start() {
                 self.consensus
                     .message_bus()
@@ -3874,6 +3879,13 @@ where
     #[must_use]
     pub fn effective_segment_size(&self) -> IggyByteSize {
         self.runtime_options.effective_segment_size()
+    }
+
+    /// Microseconds past a segment's first batch at which a batch starts the
+    /// next one, shared by materialization and the WAL. `None` rolls by size.
+    #[must_use]
+    pub fn effective_segment_max_age(&self) -> Option<u64> {
+        self.runtime_options.effective_segment_max_age()
     }
 
     /// The stable-storage requirement for message acknowledgment.
@@ -10543,7 +10555,9 @@ where
             return Ok(MaterializationStep::Pending);
         }
         let segment = self.log.active_segment();
-        if segment.size.as_bytes_u64() >= segment.max_size.as_bytes_u64() {
+        if segment.size.as_bytes_u64() >= segment.max_size.as_bytes_u64()
+            || self.next_batch_rolls_by_age(pending.next_entry, pending.prefix_len)?
+        {
             let next_offset = segment
                 .end_offset
                 .checked_add(1)
@@ -10660,6 +10674,49 @@ where
         Ok(true)
     }
 
+    /// The last offset the active segment, or a recovered durable tail, already
+    /// holds. Batches at or below it are on disk and never materialized again.
+    fn materialization_persisted_end(&self) -> Option<u64> {
+        let segment = self.log.active_segment();
+        if segment.size.as_bytes_u64() == 0 {
+            segment.start_offset.checked_sub(1)
+        } else {
+            Some(segment.end_offset)
+        }
+        .max(self.recovered_durable_offset)
+    }
+
+    /// Whether the next batch the prefix still has to materialize is stamped
+    /// `segment_max_age` or more past the non-empty active segment's first
+    /// batch, so it starts the next segment, as the WAL decides at prepare.
+    fn next_batch_rolls_by_age(
+        &self,
+        first_entry: usize,
+        prefix_len: usize,
+    ) -> Result<bool, IggyError> {
+        let max_age = self.effective_segment_max_age();
+        let segment = self.log.active_segment();
+        if max_age.is_none() || segment.size.as_bytes_u64() == 0 {
+            return Ok(false);
+        }
+        let persisted_end = self.materialization_persisted_end();
+        self.log.journal().inner.with_entries(|entries| {
+            let entries = (first_entry <= prefix_len && prefix_len <= entries.len())
+                .then(|| entries.range(first_entry..prefix_len))
+                .ok_or(IggyError::CannotWriteToFile)?;
+            for entry in entries {
+                if let Some(meta) = materialization_batch_meta(entry, persisted_end)? {
+                    return Ok(rolls_by_age(
+                        max_age,
+                        segment.start_timestamp,
+                        meta.base_timestamp,
+                    ));
+                }
+            }
+            Ok(false)
+        })
+    }
+
     fn plan_materialization_chunk(
         &self,
         first_entry: usize,
@@ -10670,12 +10727,8 @@ where
         // retained index state. Coalesce adjacent index spans within that budget.
         let segment = self.log.active_segment();
         let position = segment.size.as_bytes_u64();
-        let persisted_end = if position == 0 {
-            segment.start_offset.checked_sub(1)
-        } else {
-            Some(segment.end_offset)
-        }
-        .max(self.recovered_durable_offset);
+        let persisted_end = self.materialization_persisted_end();
+        let max_age = self.effective_segment_max_age();
         let mut chunk = MaterializationChunk {
             first_entry,
             end_entry: first_entry,
@@ -10707,6 +10760,18 @@ where
                     chunk.end_entry += 1;
                     continue;
                 };
+                // The batch that ages the segment out starts the next one, which
+                // the drive rotates into before planning it.
+                let segment_first_timestamp = if position > 0 {
+                    Some(segment.start_timestamp)
+                } else {
+                    chunk.index.as_ref().map(|index| index.timestamp)
+                };
+                if segment_first_timestamp
+                    .is_some_and(|first| rolls_by_age(max_age, first, meta.base_timestamp))
+                {
+                    break;
+                }
                 let next_backing = backing
                     .checked_add(
                         Frozen::<4096>::allocation_size(entry.backing_capacity())
@@ -14435,6 +14500,17 @@ impl CommittedBatchStats {
     /// subtraction cannot underflow.
     fn end_offset(self) -> u64 {
         self.base_offset + u64::from(self.message_count) - 1
+    }
+}
+
+/// Whether a batch stamped `timestamp` starts a new segment rather than join
+/// one whose first batch was stamped `first`. The WAL applies the same rule at
+/// prepare time, so both sites roll at the same batch. A stamp behind `first`
+/// counts as no age.
+const fn rolls_by_age(max_age: Option<u64>, first: u64, timestamp: u64) -> bool {
+    match max_age {
+        Some(max_age) => timestamp.saturating_sub(first) >= max_age,
+        None => false,
     }
 }
 

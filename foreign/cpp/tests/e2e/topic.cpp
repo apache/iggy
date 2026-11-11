@@ -295,7 +295,12 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
         .SetMessagesRequiredToSave(messages_required_to_save)
         .SetSizeOfMessagesRequiredToSave(size_of_messages_required_to_save)
         .SetPreallocateSegments(false)
-        .SetReplicationFactor(1);
+        .SetReplicationFactor(1)
+        .SetSegmentMaxAge(iggy::Expiry::Duration(3600000000))
+        // Turning tiered storage on is refused until the server tiers topics.
+        .SetTieredStorage(false)
+        .SetLocalRetentionAge(iggy::Expiry::Duration(1800000000))
+        .SetLocalRetentionSize(iggy::MaxTopicSize::FromBytes(1ULL << 30));
 
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));
 
@@ -310,6 +315,10 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     EXPECT_EQ(explicit_options.count("size_of_messages_required_to_save"), 1u);
     EXPECT_EQ(explicit_options.count("preallocate_segments"), 1u);
     EXPECT_EQ(explicit_options.count("replication_factor"), 1u);
+    EXPECT_EQ(explicit_options.count("segment_max_age"), 1u);
+    EXPECT_EQ(explicit_options.count("tiered_storage"), 1u);
+    EXPECT_EQ(explicit_options.count("local_retention_age"), 1u);
+    EXPECT_EQ(explicit_options.count("local_retention_size"), 1u);
 
     auto check_kind = [&](const std::string &key, iggy::HeaderKind expected) {
         auto it = explicit_options.find(key);
@@ -323,6 +332,10 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     check_kind("size_of_messages_required_to_save", iggy::HeaderKind::Uint64);
     check_kind("preallocate_segments", iggy::HeaderKind::Bool);
     check_kind("replication_factor", iggy::HeaderKind::Uint32);
+    check_kind("segment_max_age", iggy::HeaderKind::Uint64);
+    check_kind("tiered_storage", iggy::HeaderKind::Bool);
+    check_kind("local_retention_age", iggy::HeaderKind::Uint64);
+    check_kind("local_retention_size", iggy::HeaderKind::Uint64);
 
     EXPECT_EQ(explicit_options.at("segment_size").Value(),
               (std::vector<std::uint8_t>{0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00}));
@@ -332,8 +345,15 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
               (std::vector<std::uint8_t>{0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00}));
     EXPECT_EQ(explicit_options.at("preallocate_segments").Value(), (std::vector<std::uint8_t>{0x00}));
     EXPECT_EQ(explicit_options.at("replication_factor").Value(), (std::vector<std::uint8_t>{0x01, 0x00, 0x00, 0x00}));
+    EXPECT_EQ(explicit_options.at("segment_max_age").Value(),
+              (std::vector<std::uint8_t>{0x00, 0xA4, 0x93, 0xD6, 0x00, 0x00, 0x00, 0x00}));
+    EXPECT_EQ(explicit_options.at("tiered_storage").Value(), (std::vector<std::uint8_t>{0x00}));
+    EXPECT_EQ(explicit_options.at("local_retention_age").Value(),
+              (std::vector<std::uint8_t>{0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00}));
+    EXPECT_EQ(explicit_options.at("local_retention_size").Value(),
+              (std::vector<std::uint8_t>{0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00}));
 
-    EXPECT_EQ(explicit_options.size(), 7u);
+    EXPECT_EQ(explicit_options.size(), 11u);
     EXPECT_EQ(topic_details.Options().Derived().count("segment_size"), 0u)
         << "segment_size was set explicitly, so it cannot be derived";
 }

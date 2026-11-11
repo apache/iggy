@@ -104,6 +104,16 @@ pub enum OptionKey {
     /// Fingerprints of the server keys wrapping the stream's key, computed by
     /// the server.
     EncryptionKekFingerprint,
+    /// Topic segment age roll, fixed at creation.
+    SegmentMaxAge,
+    /// Topic tiered storage. An update only turns it on.
+    TieredStorage,
+    /// Time a tiered topic keeps an uploaded segment on local disk,
+    /// resettable to one day.
+    LocalRetentionAge,
+    /// Cap on the uploaded segments a tiered topic keeps on local disk,
+    /// resettable to unlimited.
+    LocalRetentionSize,
 }
 
 /// Whether partitions can be added to or deleted from a topic after creation.
@@ -202,8 +212,9 @@ impl TopicOptions {
     /// Constructs topic create options.
     ///
     /// Every setting left as `None` resolves against the server default at
-    /// admission. Only `message_expiry`, `max_topic_size` and the name can
-    /// change after creation, through `update_topic`.
+    /// admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
+    /// `local_retention_age`, `local_retention_size` and the name can change
+    /// after creation, through `update_topic`.
     ///
     /// Args:
     ///     partitions_count: Number of partitions as `int`, at most 1000.
@@ -233,17 +244,36 @@ impl TopicOptions {
     ///         accepting writes while either node is down. The server rejects
     ///         an out-of-range value with an `OptionError` of kind
     ///         `invalid_replication_factor`.
+    ///     segment_max_age: Age past a segment's first batch at which a batch
+    ///         starts the next segment, as `IggyExpiry | None`, at least 10
+    ///         minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+    ///         which rolls segments by size alone. The server refuses a
+    ///         duration together with `preallocate_segments=True`.
+    ///     tiered_storage: Move sealed segments to the object store as
+    ///         `bool | None`. `None` leaves it off. The server refuses `True`
+    ///         with `FeatureUnavailable` until it tiers topics.
+    ///     local_retention_age: How long a tiered topic keeps an uploaded
+    ///         segment on local disk as `IggyExpiry | None`, one day when
+    ///         `None`. `IggyExpiry.ServerDefault()` is the same as `None`.
+    ///         The server refuses an age above a finite `message_expiry`.
+    ///     local_retention_size: Topic-wide cap on the uploaded segments a
+    ///         tiered topic keeps on local disk as `MaxTopicSize | None`,
+    ///         unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
+    ///         same as `None`. The server refuses a size above a finite
+    ///         `max_topic_size`.
     ///     raw: Additional option keys as `dict[str, str]`, sent as string
     ///         values so a key newer than this build can be set. A typed field
     ///         wins on collision.
     ///
     /// Raises:
-    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     ValueError: If `message_expiry`, `max_topic_size`,
+    ///         `segment_max_age`, `local_retention_age` or
+    ///         `local_retention_size` is out of range.
     ///     RuntimeError: If `compression_algorithm` names no known algorithm.
     ///     TypeError: If a durability is not a `Durability`.
     #[new]
     #[pyo3(
-        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, raw = None)
+        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, segment_max_age = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, raw = None)
     )]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -275,6 +305,16 @@ impl TopicOptions {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
             u32,
         >,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] segment_max_age: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tiered_storage: Option<bool>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] local_retention_age: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
+            &MaxTopicSize,
+        >,
         #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
         raw: Option<BTreeMap<String, String>>,
     ) -> PyResult<Self> {
@@ -288,6 +328,18 @@ impl TopicOptions {
             .transpose()?
             .filter(|expiry| *expiry != RustIggyExpiry::ServerDefault);
         let max_topic_size = max_topic_size
+            .map(RustMaxTopicSize::try_from)
+            .transpose()?
+            .filter(|size| *size != RustMaxTopicSize::ServerDefault);
+        let segment_max_age = segment_max_age
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .filter(|age| *age != RustIggyExpiry::ServerDefault);
+        let local_retention_age = local_retention_age
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .filter(|age| *age != RustIggyExpiry::ServerDefault);
+        let local_retention_size = local_retention_size
             .map(RustMaxTopicSize::try_from)
             .transpose()?
             .filter(|size| *size != RustMaxTopicSize::ServerDefault);
@@ -307,6 +359,10 @@ impl TopicOptions {
                     .map(IggyByteSize::from),
                 preallocate_segments,
                 replication_factor,
+                segment_max_age,
+                tiered_storage,
+                local_retention_age,
+                local_retention_size,
                 raw: raw.unwrap_or_default(),
             },
         })
@@ -386,6 +442,10 @@ impl From<OptionKey> for RustOptionKey {
             OptionKey::EncryptionKeySource => Self::EncryptionKeySource,
             OptionKey::EncryptionKeyFingerprint => Self::EncryptionKeyFingerprint,
             OptionKey::EncryptionKekFingerprint => Self::EncryptionKekFingerprint,
+            OptionKey::SegmentMaxAge => Self::SegmentMaxAge,
+            OptionKey::TieredStorage => Self::TieredStorage,
+            OptionKey::LocalRetentionAge => Self::LocalRetentionAge,
+            OptionKey::LocalRetentionSize => Self::LocalRetentionSize,
         }
     }
 }

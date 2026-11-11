@@ -355,6 +355,7 @@ async fn given_a_tiered_segment_reaching_the_checkpoint_segment_when_recovering_
         start_offset: 3,
         length: fixture.logs[1].len() as u64,
         next_offset: 6,
+        first_timestamp: 0,
     };
 
     assert!(matches!(
