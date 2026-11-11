@@ -366,10 +366,14 @@ cargo run -p iggy-gateway-kafka
   as the leader of every partition. Any gateway can serve any partition, because the Iggy SDK
   sends each partition request to its primary. A client of a stopped or crashed gateway goes on
   through another at its next Metadata.
-- A Java client from Kafka 4.4 names the node that it wants to reach in ApiVersions (KIP-1242). A
-  gateway with another node id answers `REBOOTSTRAP_REQUIRED` (129), and the client starts again
-  from its bootstrap servers. So each address in `IGGY_KAFKA_BROKERS` must reach the gateway with
-  that node id, and not a load balancer in front of several gateways.
+- A Java client from Kafka 4.4 names the cluster and the node that it wants to reach in
+  ApiVersions (KIP-1242). A franz-go client from 1.22.0 does the same. A gateway with another node
+  id or another cluster id answers `REBOOTSTRAP_REQUIRED` (129), and the client starts again from
+  its bootstrap servers. So each address in `IGGY_KAFKA_BROKERS` must reach the gateway with that
+  node id, and not a load balancer in front of several gateways.
+- Bridged gateways share one cluster id. Gateways without the bridge each draw their own, so with
+  several of them listed, a gateway compares only the node. A Java client set to
+  `metadata.cluster.check.enable=false` names neither the cluster nor the node, and gets no check.
 - The owner of log partition 0 is the controller. Only the controller creates and deletes topics
   and adds partitions. The others answer `NOT_CONTROLLER` (41), and Kafka admin clients retry at
   the controller.

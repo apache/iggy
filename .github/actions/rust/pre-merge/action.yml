@@ -399,7 +399,7 @@ runs:
           # Read the tags out of the suites themselves; hardcoding them here lets a bump in a test
           # desync silently, which pre-pulls the superseded image and puts the real one back
           # inside the budget this block exists to avoid. The failover suite runs the same
-          # clients against a cluster. `KAFKA_OLDEST_IMAGE` matches too.
+          # clients against a cluster. `KAFKA_4_0_IMAGE` and `KAFKA_3_9_IMAGE` match too.
           E2E_IMAGES=$(grep -ohP '^const (KCAT|KAFKA)\w*_IMAGE: &str = "\K[^"]+' \
             gateways/kafka/tests/kafka_client_e2e_tests.rs \
             gateways/kafka/tests/cluster_failover_tests.rs | sort -u)

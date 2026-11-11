@@ -42,12 +42,14 @@ pub struct IntendedBroker {
 
 /// Decodes an `ApiVersions` request at `version`, and returns the broker that it names.
 ///
-/// Only v5 names one, and only with a `ClusterId`. A Java client from 4.4 sends both fields when
-/// its metadata knows the cluster, and neither on a connection to a bootstrap server.
+/// Only v5 names one. A Java client from 4.4 sends both fields when its metadata knows the
+/// cluster, and neither on a connection to a bootstrap server.
 ///
 /// # Errors
 ///
-/// [`crate::KafkaWireError::Malformed`] when the body does not decode at `version`.
+/// [`crate::KafkaWireError::Malformed`] when the body does not decode at `version`, or when a v5
+/// body sets one of `ClusterId` and `NodeId` without the other, which
+/// `ApiVersionsRequest.isValid` refuses in Kafka 4.4.
 pub fn decode_request(version: i16, body: Bytes) -> Result<Option<IntendedBroker>> {
     if version <= CODEC_MAX_VERSION {
         decode_guarded::<ApiVersionsRequest>(version, body, validate_api_versions_shape)?;
@@ -59,6 +61,9 @@ pub fn decode_request(version: i16, body: Bytes) -> Result<Option<IntendedBroker
         node_id: request.node_id,
     }))
 }
+
+/// The `NodeId` of a v5 request that names no broker.
+const NO_NODE_ID: i32 = -1;
 
 /// The v5 fields after the client software name and version.
 struct RequestV5 {
@@ -76,6 +81,10 @@ impl Decodable for RequestV5 {
         );
         let cluster_id = compact_string(buf)?;
         let node_id = buf.try_get_i32()?;
+        anyhow::ensure!(
+            cluster_id.is_some() == (node_id != NO_NODE_ID),
+            "ClusterId and NodeId must both be set, or neither"
+        );
         skip_tagged_fields(buf)?;
         Ok(Self {
             cluster_id,
@@ -122,12 +131,22 @@ mod tests {
 
     use super::*;
 
+    /// The writer that Kafka's `ByteUtils.writeUnsignedVarint` is: 7 bits a byte, low bits first.
+    fn put_unsigned_varint(body: &mut BytesMut, value: usize) {
+        let mut value = u32::try_from(value).expect("a test length fits u32");
+        while value >= 0x80 {
+            body.put_u8(u8::try_from(value & 0x7F).expect("7 bits") | 0x80);
+            value >>= 7;
+        }
+        body.put_u8(u8::try_from(value).expect("7 bits"));
+    }
+
     fn put_compact_string(body: &mut BytesMut, value: Option<&str>) {
         let Some(value) = value else {
             body.put_u8(0);
             return;
         };
-        body.put_u8(u8::try_from(value.len() + 1).expect("a short test string"));
+        put_unsigned_varint(body, value.len() + 1);
         body.put_slice(value.as_bytes());
     }
 
@@ -156,6 +175,42 @@ mod tests {
     #[test]
     fn given_v5_without_a_cluster_id_should_name_no_broker() {
         assert_eq!(decode_request(5, v5_body(None, -1, &[0])).unwrap(), None);
+    }
+
+    /// `ApiVersionsRequest.isValid` in Kafka 4.4 refuses both halves, so a broker answers
+    /// `INVALID_REQUEST` to each.
+    #[test]
+    fn given_v5_with_only_one_of_cluster_id_and_node_id_should_be_malformed() {
+        assert!(decode_request(5, v5_body(Some("cluster-a"), NO_NODE_ID, &[0])).is_err());
+        assert!(decode_request(5, v5_body(None, 2, &[0])).is_err());
+    }
+
+    /// Lengths whose varint takes two bytes with a first byte of exactly 0x80 (127 + 1 = 128), two
+    /// bytes with low bits set (301), and three bytes (20,001). A reader that stops a varint one
+    /// byte early or late, or drops its low bits, reads the next field from the wrong offset.
+    #[test]
+    fn given_v5_fields_with_multi_byte_lengths_should_decode_each() {
+        for len in [127, 300, 20_000] {
+            let long = "c".repeat(len);
+            let mut body = BytesMut::new();
+            put_compact_string(&mut body, Some(&long));
+            put_compact_string(&mut body, Some(&long));
+            put_compact_string(&mut body, Some(&long));
+            body.put_i32(2);
+            // One tagged field: tag 300, then `len` bytes of data.
+            put_unsigned_varint(&mut body, 1);
+            put_unsigned_varint(&mut body, 300);
+            put_unsigned_varint(&mut body, len);
+            body.put_bytes(0xAB, len);
+            assert_eq!(
+                decode_request(5, body.freeze()).unwrap(),
+                Some(IntendedBroker {
+                    cluster_id: long,
+                    node_id: 2,
+                }),
+                "fields of {len} bytes"
+            );
+        }
     }
 
     #[test]

@@ -455,29 +455,33 @@ fn sasl_handshake() {
     );
 }
 
-/// `kafka_protocol` encodes `ApiVersions` only up to v4, so the v5 body is built by hand, and every
-/// version decodes through `decode_request`, as the gateway decodes it.
+/// `kafka_protocol` encodes `ApiVersions` only up to v4, so the v5 body is the v4 body with the v5
+/// fields added by hand, and every version decodes through `decode_request`, as the gateway
+/// decodes it.
+///
+/// The client software name and the `ClusterId` take 200 bytes each, so their lengths are
+/// two-byte varints and the prefix check cuts inside them.
 #[test]
 fn api_versions() {
+    let long = "c".repeat(200);
+    let flexible = ApiVersionsRequest::default()
+        .with_client_software_name(StrBytes::from_string(long.clone()))
+        .with_client_software_version(text("1"));
     sweep_bodies(
         API_KEY_API_VERSIONS,
         |version| {
             if version > CODEC_MAX_VERSION {
-                let mut body = BytesMut::new();
-                // `ClientSoftwareName`, `ClientSoftwareVersion` and `ClusterId`, as compact
-                // strings, then `NodeId` and no tagged fields.
-                for field in ["client", "1", "cluster"] {
-                    body.put_u8(u8::try_from(field.len() + 1).expect("a short field"));
-                    body.put_slice(field.as_bytes());
-                }
+                let mut body = BytesMut::from(&encode(&flexible, CODEC_MAX_VERSION)[..]);
+                // Drops the v4 body's empty tagged fields, which end the v5 body instead.
+                body.truncate(body.len() - 1);
+                // `ClusterId` as a compact string, then `NodeId`.
+                put_unsigned_varint(&mut body, long.len() + 1);
+                body.put_slice(long.as_bytes());
                 body.put_i32(1);
                 body.put_u8(0);
                 body.freeze()
             } else if version >= 3 {
-                let request = ApiVersionsRequest::default()
-                    .with_client_software_name(text("client"))
-                    .with_client_software_version(text("1"));
-                encode(&request, version)
+                encode(&flexible, version)
             } else {
                 encode(&ApiVersionsRequest::default(), version)
             }
@@ -485,6 +489,16 @@ fn api_versions() {
         validate_api_versions_shape,
         |version, body| decode_request(version, body).map(drop),
     );
+}
+
+/// Kafka's unsigned varint: 7 bits a byte, low bits first, the high bit set on all but the last.
+fn put_unsigned_varint(body: &mut BytesMut, value: usize) {
+    let mut value = u32::try_from(value).expect("a test length fits u32");
+    while value >= 0x80 {
+        body.put_u8(u8::try_from(value & 0x7F).expect("7 bits") | 0x80);
+        value >>= 7;
+    }
+    body.put_u8(u8::try_from(value).expect("7 bits"));
 }
 
 #[test]

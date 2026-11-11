@@ -26,6 +26,8 @@ mod tcp;
 #[path = "common/wire.rs"]
 mod wire;
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use kafka_protocol::messages::MetadataResponse;
 use kafka_protocol::protocol::Decodable;
@@ -33,9 +35,10 @@ use kafka_protocol::protocol::Decodable;
 use iggy_gateway_kafka::cluster_id::ClusterId;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS,
-    API_KEY_FETCH, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REBOOTSTRAP_REQUIRED,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION, GatewayState, handle_request,
+    API_KEY_FETCH, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, BrokerAdvertise,
+    Brokers, ConnectionState, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REBOOTSTRAP_REQUIRED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, handle_connection_request, handle_request,
     handle_request_bounded, is_supported_version, supported_api_ranges,
 };
 
@@ -185,6 +188,72 @@ async fn api_versions_v5_naming_another_broker_asks_for_a_rebootstrap() {
         assert_eq!(
             Decoder::new(response).read_i16().unwrap(),
             ERROR_REBOOTSTRAP_REQUIRED,
+            "{named}"
+        );
+    }
+}
+
+/// Kafka 4.4's `ApiVersionsRequest.isValid` takes `ClusterId` and `NodeId` together or not at all,
+/// and a broker answers `INVALID_REQUEST` to a request that sets one of them.
+#[tokio::test]
+async fn api_versions_v5_naming_half_a_broker_is_an_invalid_request() {
+    let state = GatewayState::stub(8 * 1024 * 1024).with_node_id(2);
+    let cluster_id = state.cluster_id.to_string();
+    for (body, named) in [
+        (
+            build_api_versions_v5_request(Some(&cluster_id), -1),
+            "this cluster without a node",
+        ),
+        (
+            build_api_versions_v5_request(None, 2),
+            "this node without a cluster",
+        ),
+    ] {
+        let response = handle_request_bounded(&state, API_KEY_API_VERSIONS, 5, body)
+            .await
+            .expect_response("INVALID_REQUEST is an answer, not a close");
+        assert_eq!(
+            Decoder::new(response).read_i16().unwrap(),
+            ERROR_INVALID_REQUEST,
+            "{named}"
+        );
+    }
+}
+
+/// Gateways without the bridge each draw their own cluster id, so a client that learned the
+/// cluster from one of several names a cluster that the others do not have. The gateway compares
+/// only the node then, and a client with the right node is served instead of being sent back to
+/// its bootstrap servers on every connection.
+#[tokio::test]
+async fn api_versions_v5_on_one_of_several_gateways_without_the_bridge_compares_only_the_node() {
+    let state = GatewayState::stub(8 * 1024 * 1024).with_node_id(2);
+    let endpoint = |node: i32| BrokerAdvertise {
+        host: format!("gateway-{node}.example"),
+        port: 9092,
+    };
+    let connection =
+        ConnectionState::for_listener(endpoint(2), false, false).with_brokers(Arc::new(Brokers {
+            node_id: 2,
+            peers: vec![(1, endpoint(1)), (3, endpoint(3))],
+        }));
+    let another_cluster = ClusterId::random().to_string();
+    for (node_id, expected, named) in [
+        (2, ERROR_NONE, "this node in another gateway's cluster"),
+        (3, ERROR_REBOOTSTRAP_REQUIRED, "another node"),
+    ] {
+        let response = handle_connection_request(
+            &state,
+            &connection,
+            None,
+            API_KEY_API_VERSIONS,
+            5,
+            build_api_versions_v5_request(Some(&another_cluster), node_id),
+        )
+        .await
+        .expect_response("ApiVersions answers");
+        assert_eq!(
+            Decoder::new(response).read_i16().unwrap(),
+            expected,
             "{named}"
         );
     }

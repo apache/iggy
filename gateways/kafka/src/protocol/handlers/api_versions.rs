@@ -18,7 +18,7 @@
 //! `ApiVersions` (API key 18).
 
 use bytes::Bytes;
-use iggy_kafka_wire::api_versions::{CODEC_MAX_VERSION, decode_request};
+use iggy_kafka_wire::api_versions::{CODEC_MAX_VERSION, IntendedBroker, decode_request};
 use kafka_protocol::messages::ApiVersionsResponse;
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 
@@ -83,13 +83,7 @@ pub async fn handle(
         );
     }
     let error_code = match decode_request(api_version, body) {
-        // KIP-1242, as a Kafka broker applies it: the client's metadata names another cluster or
-        // another node for this address. That follows an address that moved to another gateway,
-        // or a gateway without the bridge that restarted with a new random cluster id.
-        Ok(Some(intended))
-            if intended.cluster_id != state.cluster_id.as_str()
-                || intended.node_id != state.node_id =>
-        {
+        Ok(Some(intended)) if names_another_broker(state, connection, &intended) => {
             tracing::debug!(
                 cluster_id = intended.cluster_id,
                 node_id = intended.node_id,
@@ -160,6 +154,26 @@ pub fn encode_response(
         .with_api_keys(api_keys);
     // The v5 response has the fields of v4, and `kafka-protocol` encodes only up to v4.
     encode_message(&resp, api_version.min(CODEC_MAX_VERSION), 128)
+}
+
+/// KIP-1242: the client's metadata names another node or another cluster for this address. That
+/// follows an address that moved to another gateway, or a gateway without the bridge that
+/// restarted with a new random cluster id.
+///
+/// Gateways without the bridge each draw their own cluster id, so with several of them listed, a
+/// client that learned the cluster from one names a cluster that the others do not share. Only
+/// the node is compared there: comparing the cluster would answer 129 on every connection to the
+/// other gateways, and the client would rebootstrap into the same answer.
+fn names_another_broker(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    intended: &IntendedBroker,
+) -> bool {
+    if intended.node_id != state.node_id {
+        return true;
+    }
+    let cluster_id_shared = state.bridge.is_some() || connection.brokers.peers.is_empty();
+    cluster_id_shared && intended.cluster_id != state.cluster_id.as_str()
 }
 
 #[cfg(test)]
