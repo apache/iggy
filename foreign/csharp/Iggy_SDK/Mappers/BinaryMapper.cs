@@ -287,8 +287,22 @@ internal static partial class BinaryMapper
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[4..12]);
         var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]);
         var context = MapPartitionContext(span[16..]);
-        return MapRentedRecords(payload[DeferredPollOptions.POLL_REPLY_HEADER_SIZE..], payloadOwner, partitionId,
-            currentOffset, messagesCount, context, encryptor);
+        // The header decoded, so a caller that needs only the context of the reply can still take it.
+        try
+        {
+            return MapRentedRecords(payload[DeferredPollOptions.POLL_REPLY_HEADER_SIZE..], payloadOwner, partitionId,
+                currentOffset, messagesCount, context, encryptor);
+        }
+        catch (MalformedResponseException error)
+        {
+            error.Context = context;
+            throw;
+        }
+        catch (MessageDecryptionException error)
+        {
+            error.Context = context;
+            throw;
+        }
     }
 
     /// <summary>
@@ -549,7 +563,8 @@ internal static partial class BinaryMapper
             PartitionId = rental.PartitionId,
             Context = rental.Context,
             CurrentOffset = rental.CurrentOffset,
-            Messages = messages
+            Messages = messages,
+            RequestStart = rental.RequestStart
         };
     }
 

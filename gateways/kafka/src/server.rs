@@ -185,7 +185,8 @@ pub struct GatewayConfig {
     /// [`CoordinatorLog::Preferred`] when the bridge is on, `IGGY_KAFKA_BROKERS` lists the
     /// gateways and the variable is unset.
     pub coordinator_log: CoordinatorLog,
-    /// How the coordinator log behaves. No environment variable maps onto it yet.
+    /// How the coordinator log behaves. `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES` sets its offsets
+    /// retention.
     pub coordination: CoordinationConfig,
 }
 
@@ -654,6 +655,15 @@ impl KafkaGateway {
         if self.config.coordinator_log == CoordinatorLog::Preferred
             && bridge.follows_change_log(give_up).await == Some(false)
         {
+            if self.config.coordination.offsets_retention.is_some() {
+                return Err(KafkaProtocolError::InvalidConfig(
+                    "IGGY_KAFKA_OFFSETS_RETENTION_MINUTES needs the coordinator log, which needs \
+                     the bridge's Iggy user to read Iggy's metadata change log: grant that user \
+                     (IGGY_KAFKA_IGGY_USERNAME) the manage_servers permission, or leave the \
+                     variable unset"
+                        .into(),
+                ));
+            }
             warn!(
                 "the bridge's Iggy user cannot read Iggy's metadata change log, so this gateway \
                  runs without the coordinator log, as with IGGY_KAFKA_COORDINATOR_LOG=false: \
@@ -1437,8 +1447,9 @@ impl<'a> PermissionFollow<'a> {
             return Some(revision);
         };
         match board.changed_since(principal.user, &principal.username, &mut self.seen) {
-            Some(UserAccess::Active(permissions)) => {
-                principal.permissions = permissions;
+            Some(UserAccess::Active(grants)) => {
+                principal.permissions = grants.permissions;
+                principal.topic_reads = grants.topic_reads;
                 principal.permissions_known = true;
             }
             Some(UserAccess::Revoked) => {
@@ -1450,6 +1461,17 @@ impl<'a> PermissionFollow<'a> {
                 return None;
             }
             None => {}
+        }
+        // The read at login failed. No revoke of a user of that name came since, so the newest
+        // active one is the user that signed in.
+        if principal.user.is_none()
+            && !principal.permissions_known
+            && let Some((user, grants)) = board.active_user(&principal.username)
+        {
+            principal.user = Some(user);
+            principal.permissions = grants.permissions;
+            principal.topic_reads = grants.topic_reads;
+            principal.permissions_known = true;
         }
         Some(revision)
     }

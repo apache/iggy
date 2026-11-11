@@ -32,7 +32,8 @@ use tracing::{error, warn};
 
 const TOPIC_ID: &str = "topic-1";
 const PARTITION_ID: u32 = 0;
-const PREFETCH_BATCHES: u32 = 16;
+/// The reader's 32-batch floor overrides any smaller budget.
+const PREFETCH_BATCHES: u32 = 32;
 
 pub struct HighLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
