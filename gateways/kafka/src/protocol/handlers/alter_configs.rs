@@ -319,6 +319,8 @@ fn resource_error(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::protocol::acl::PrincipalPermissions;
 
@@ -330,6 +332,7 @@ mod tests {
                 manage_topics,
                 ..PrincipalPermissions::default()
             },
+            topic_reads: Arc::default(),
             permissions_known,
         }
     }

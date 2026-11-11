@@ -37,8 +37,8 @@ use server_common::sharding::{PartitionLocation, ShardId};
 
 use crate::poll::completion::PollCompletionLane;
 use crate::poll::test_support::{
-    PollTestMetadata, commit_messages, install_group_owner, partition_with_messages,
-    store_consumer_offset,
+    PollTestMetadata, commit_messages, delete_history, install_group_owner,
+    partition_with_messages, partition_with_messages_at_revision, store_consumer_offset,
 };
 use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
 use crate::shards_table::PapayaShardsTable;
@@ -50,6 +50,7 @@ use crate::{
 const DEADLINE: u64 = 100;
 const REQUEST_DEADLINE: u64 = DEADLINE + iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
 const CLIENT: u128 = 41;
+const CREATED_REVISION: u64 = 1;
 /// The metadata op that installs the fixture's consumer group owners.
 const METADATA_OP: u64 = 1;
 fn namespace() -> IggyNamespace {
@@ -67,17 +68,23 @@ async fn owner(payloads: &[&str]) -> TestShard {
 
 /// One owner shard with a partition for each entry of `partitions`.
 async fn owner_of(partitions: &[&[&str]]) -> TestShard {
-    shard_of(0, PollTestBus::default(), partitions).await
+    shard_of(0, PollTestBus::default(), partitions, CREATED_REVISION).await
 }
 
 /// Shard `shard` that owns a partition for each entry of `partitions`.
-async fn shard_of(shard: u16, bus: PollTestBus, partitions: &[&[&str]]) -> TestShard {
+async fn shard_of(
+    shard: u16,
+    bus: PollTestBus,
+    partitions: &[&[&str]],
+    created_revision: u64,
+) -> TestShard {
     let mut plane = None;
     let mut topic = Topic::default();
     let routes = PapayaShardsTable::new();
     for (id, payloads) in partitions.iter().enumerate() {
         let namespace = partition_namespace(id);
-        let (partition, config) = partition_with_messages(&bus, namespace, payloads).await;
+        let (partition, config) =
+            partition_with_messages_at_revision(&bus, namespace, payloads, created_revision).await;
         plane
             .get_or_insert_with(|| IggyPartitions::new(ShardId::new(shard), config))
             .insert(namespace, partition);
@@ -85,10 +92,13 @@ async fn shard_of(shard: u16, bus: PollTestBus, partitions: &[&[&str]]) -> TestS
             id,
             namespace.inner(),
             IggyTimestamp::default(),
-            1,
+            created_revision,
             0,
         ));
-        routes.insert(namespace, PartitionLocation::new(ShardId::new(shard), 1));
+        routes.insert(
+            namespace,
+            PartitionLocation::new(ShardId::new(shard), created_revision),
+        );
     }
     let partitions_plane = plane.expect("fixture requires a partition");
     let mut inner = StreamsInner::default();
@@ -97,7 +107,7 @@ async fn shard_of(shard: u16, bus: PollTestBus, partitions: &[&[&str]]) -> TestS
     let mut member = ConsumerGroupMember::new(0, CLIENT);
     member.session = Some(1);
     group.members.insert(member);
-    group.rebalance_members(&topic.partitions, METADATA_OP, 1);
+    group.rebalance_members(&topic.partitions, METADATA_OP.max(created_revision), 1);
     let config = partitions_plane.config().clone();
     for id in 0..partitions.len() {
         let assignment = &group.assignments[&id];
@@ -867,6 +877,104 @@ async fn replacement_history_rejects_parked_poll_on_its_next_signal() {
             IggyError::TransientNotAccepted
         ))
     ));
+}
+
+#[compio::test]
+async fn given_a_delete_fence_when_admitting_reads_should_apply_it_only_to_its_incarnation() {
+    const REPLACEMENT_REVISION: u64 = CREATED_REVISION + 2;
+    for revision in [CREATED_REVISION, REPLACEMENT_REVISION] {
+        let owner = shard_of(0, PollTestBus::default(), &[&["new"]], REPLACEMENT_REVISION).await;
+        let (mut partition, config) =
+            partition_with_messages_at_revision(&owner.bus, namespace(), &["old"], revision).await;
+        delete_history(&mut partition, &config, revision + 1).await;
+        owner.plane.partitions().insert(namespace(), partition);
+        owner.shards_table.insert(
+            namespace(),
+            PartitionLocation::new(ShardId::new(0), revision),
+        );
+        let expected = if revision == REPLACEMENT_REVISION {
+            IggyError::HistoryUnavailable
+        } else {
+            IggyError::TransientNotAccepted
+        };
+        for group in [false, true] {
+            for primary in [false, true] {
+                for auto_commit in [false, true] {
+                    let mut request = request(&owner, 1, group, auto_commit);
+                    request.context.primary = primary;
+                    let replies = submit(&owner, request).await;
+                    let reply = replies.try_recv();
+                    assert!(
+                        matches!(&reply, Ok(PartitionReadReply::Rejected(error)) if error == &expected),
+                        "revision {revision}, group {group}, primary {primary}, auto_commit {auto_commit}: {reply:?}"
+                    );
+                    assert_released(&owner);
+                }
+                let target = if group {
+                    group_target(&owner, 0, PollingStrategy::offset(0))
+                } else {
+                    readiness_target(&owner, 0, PollingStrategy::offset(0))
+                };
+                let (reply, replies) = channel(1);
+                owner.admit_readiness_wait(
+                    ReadinessWait {
+                        context: DeferredPollContext {
+                            primary,
+                            ..readiness_caller()
+                        },
+                        targets: vec![target],
+                        deadline: DEADLINE,
+                        min_count: ANY_MESSAGE,
+                    },
+                    &reply,
+                    None,
+                );
+                let reply = replies.try_recv();
+                assert!(
+                    matches!(&reply, Ok(PartitionReadReply::Rejected(error)) if error == &expected),
+                    "readiness, revision {revision}, group {group}, primary {primary}: {reply:?}"
+                );
+                assert_released(&owner);
+            }
+        }
+    }
+}
+
+#[compio::test]
+async fn given_a_stale_incarnation_when_checking_primary_should_wait_for_its_replacement() {
+    const REPLACEMENT_REVISION: u64 = CREATED_REVISION + 1;
+    let owner = shard_of(0, PollTestBus::default(), &[&["new"]], REPLACEMENT_REVISION).await;
+    let request = request(&owner, 1, false, false);
+    for backup in [false, true] {
+        for revision in [CREATED_REVISION, REPLACEMENT_REVISION] {
+            let status = PartitionStatus {
+                deleted: false,
+                backup,
+                unstable: false,
+                view_started: true,
+                primary: !backup,
+                incarnation: Some(revision),
+            };
+            let expected = if revision != REPLACEMENT_REVISION {
+                Err(IggyError::TransientNotAccepted)
+            } else if backup {
+                Err(IggyError::NotPrimary)
+            } else {
+                Ok(true)
+            };
+            assert_eq!(
+                status.check(
+                    namespace(),
+                    true,
+                    &request.metadata,
+                    request.consumer,
+                    |_| None
+                ),
+                expected,
+                "revision {revision}, backup {backup}"
+            );
+        }
+    }
 }
 
 #[compio::test]
@@ -2037,9 +2145,10 @@ async fn watched_by(
     let bus = PollTestBus::default();
     // Boxed: one shard held across the build of another outgrows the
     // `large_futures` cap.
-    let mut shards = vec![Box::pin(shard_of(WATCHER, bus.clone(), partitions)).await];
+    let mut shards =
+        vec![Box::pin(shard_of(WATCHER, bus.clone(), partitions, CREATED_REVISION)).await];
     for owner in OWNER..OWNER + owners {
-        shards.push(Box::pin(shard_of(owner, bus.clone(), partitions)).await);
+        shards.push(Box::pin(shard_of(owner, bus.clone(), partitions, CREATED_REVISION)).await);
     }
     for partition in 0..partitions.len() {
         let namespace = partition_namespace(partition);

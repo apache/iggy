@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Only the connector tests in apache/iggy-connectors implement
+//! [`TestFixture`]. They reach this crate through a git dependency, so the
+//! trait is not dead code.
+
 use crate::harness::error::TestBinaryError;
 use crate::harness::seeds::SeedError;
 use async_trait::async_trait;
@@ -23,8 +27,8 @@ use std::collections::HashMap;
 
 /// Trait for test fixtures that manage external dependencies.
 ///
-/// Fixtures are set up before the harness, provide environment variables
-/// for connector configuration, and optionally seed data after harness start.
+/// Fixtures are set up before the harness and provide environment variables
+/// for connector configuration.
 #[async_trait]
 pub trait TestFixture: Sized + Send {
     /// Set up the fixture (e.g., start containers, create database connections).
@@ -33,12 +37,13 @@ pub trait TestFixture: Sized + Send {
     /// Environment variables to pass to the connector configuration.
     fn connectors_runtime_envs(&self) -> HashMap<String, String>;
 
-    /// Optional seed function to run after harness start.
+    /// The harness does not call this. A test that needs seed data calls it
+    /// in its body, after the harness starts.
     async fn seed(&self, _client: &IggyClient) -> Result<(), SeedError> {
         Ok(())
     }
 
-    /// Whether this fixture has a seed function that should be called.
+    /// The harness does not read this.
     fn has_seed(&self) -> bool {
         false
     }
