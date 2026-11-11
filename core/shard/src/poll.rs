@@ -30,7 +30,9 @@
 //! before any replication wait.
 
 use crate::shards_table::ShardsTable;
-use crate::{ConsumerOffsetRead, IggyShard, PartitionRead, PartitionReadReply, Sender};
+use crate::{
+    COLD_POLL_BUDGET, ConsumerOffsetRead, IggyShard, PartitionRead, PartitionReadReply, Sender,
+};
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
@@ -297,6 +299,15 @@ where
                             completion::reject(&reply, self.metrics.frame_drop_metrics(), reason);
                             return;
                         }
+                        let Ok(cold) = self.poll_completions.admit(plan.reads_remote()) else {
+                            completion::reject(
+                                &reply,
+                                self.metrics.frame_drop_metrics(),
+                                crate::metrics::frame_drop_reason::FULL,
+                            );
+                            return;
+                        };
+                        let plan = plan.with_deadline(std::time::Instant::now() + COLD_POLL_BUDGET);
                         let Some(completion) = self
                             .poll_completions
                             .try_reserve(namespace, reply, attachment)
@@ -311,7 +322,7 @@ where
                             tier = "disk",
                             "partition poll dispatch"
                         );
-                        self.bus.spawn(read_poll(namespace, plan, completion));
+                        self.bus.spawn(read_poll(namespace, plan, completion, cold));
                         return;
                     }
                     Some(plan) => {
@@ -600,6 +611,10 @@ where
                 return;
             }
         }
+        if let Some(error) = result.tiered_read_failure() {
+            let _ = reply.try_send(PartitionReadReply::Rejected(error));
+            return;
+        }
         self.accept_poll_result(namespace, result, reply, None)
             .await;
     }
@@ -682,9 +697,11 @@ async fn read_poll(
     namespace: IggyNamespace,
     plan: PollPlan,
     completion: completion::PollCompletionSender,
+    cold: Option<completion::ColdPollPermit>,
 ) {
     let poll_started = std::time::Instant::now();
     let result = plan.execute().await;
+    drop(cold);
     let elapsed = poll_started.elapsed();
     if elapsed > std::time::Duration::from_secs(1) {
         tracing::warn!(

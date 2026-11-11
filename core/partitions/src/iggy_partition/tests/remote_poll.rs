@@ -28,7 +28,9 @@ use iggy_object_store::{
     KeyLayout, MemoryStore, ObjectRange, ObjectStore, ObjectStoreError, PutBody, PutOptions,
     SegmentKey, SegmentObject,
 };
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops.
 const SEALED: [u64; 2] = [0, 2];
@@ -221,9 +223,10 @@ async fn given_a_corrupt_index_object_when_polling_should_refuse_it_and_write_no
     let torn = index[..index.len() - 1].to_vec();
     for corrupt in [past_the_segment, before_the_segment, torn] {
         put(&store, &object_key(0, SegmentObject::Index), corrupt).await;
+        forget_failures(&partition);
         assert_eq!(
             Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
-            IggyError::CannotReadMessage
+            IggyError::TieredReadFailed
         );
         assert!(!index_path(directory.path(), 0).exists());
     }
@@ -309,20 +312,42 @@ impl RemoteObjects for Failing {
 
 #[compio::test]
 async fn given_a_failing_store_when_polling_should_map_the_error_to_its_class() {
-    let cases: [(StoreFailure, IggyError); 3] = [
+    let cases: [(StoreFailure, IggyError); 8] = [
         (
             |_| ObjectStoreError::Throttled("slow down".to_owned()),
+            IggyError::TransientNotAccepted,
+        ),
+        (
+            |_| ObjectStoreError::Unavailable("503".to_owned()),
+            IggyError::TransientNotAccepted,
+        ),
+        (
+            |_| ObjectStoreError::Transport("reset".to_owned()),
             IggyError::TransientNotAccepted,
         ),
         (
             |key| ObjectStoreError::NotFound {
                 key: key.to_owned(),
             },
-            IggyError::CannotReadMessage,
+            IggyError::TieredReadFailed,
         ),
         (
             |_| ObjectStoreError::Auth("denied".to_owned()),
-            IggyError::CannotReadMessage,
+            IggyError::TieredReadFailed,
+        ),
+        (
+            |_| ObjectStoreError::BucketNotFound("iggy".to_owned()),
+            IggyError::TieredReadFailed,
+        ),
+        (
+            |key| ObjectStoreError::Archived {
+                key: key.to_owned(),
+            },
+            IggyError::TieredReadFailed,
+        ),
+        (
+            |_| ObjectStoreError::Malformed("xml".to_owned()),
+            IggyError::TieredReadFailed,
         ),
     ];
     for (error, expected) in cases {
@@ -330,11 +355,178 @@ async fn given_a_failing_store_when_polling_should_map_the_error_to_its_class() 
         attach(&mut partition, Rc::new(Failing(error)));
         Box::pin(evict_sealed(&mut partition, directory.path())).await;
 
+        // Only a failure for good is shown to a poll whose reply has no status.
+        let result = plan(&mut partition, PollingStrategy::offset(0))
+            .execute()
+            .await;
+        assert_eq!(
+            result.tiered_read_failure(),
+            (expected == IggyError::TieredReadFailed).then_some(IggyError::TieredReadFailed)
+        );
+        forget_failures(&partition);
+
         assert_eq!(
             Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
             expected
         );
     }
+}
+
+fn forget_failures(partition: &IggyPartition<IggyMessageBus>) {
+    for state in partition.log.sealed_read_state() {
+        state.remote_failure.set(None);
+    }
+}
+
+/// A [`MemoryStore`] that counts its reads, fails them all while `failure` is
+/// set, and never answers a read of a key in `stalled`.
+#[derive(Default)]
+struct Outage {
+    store: MemoryStore,
+    gets: Cell<usize>,
+    failure: Cell<Option<StoreFailure>>,
+    stalled: RefCell<Vec<String>>,
+}
+
+impl RemoteObjects for Outage {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        self.gets.set(self.gets.get() + 1);
+        async move {
+            if self.stalled.borrow().iter().any(|stalled| stalled == key) {
+                futures::future::pending::<()>().await;
+            }
+            match self.failure.get() {
+                Some(failure) => Err(failure(key)),
+                None => ObjectStore::get_range(&self.store, key, range).await,
+            }
+        }
+        .boxed_local()
+    }
+}
+
+/// A tiered partition whose sealed segments are evicted to a store that can
+/// be told to fail or stall.
+async fn partition_on_outage() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    Rc<Outage>,
+    Vec<(Option<u64>, Vec<u8>)>,
+) {
+    let (directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let local = Box::pin(polled_all(&mut partition)).await;
+    let outage = Rc::new(Outage::default());
+    upload(&outage.store, directory.path()).await;
+    confirm(&mut partition, &SEALED);
+    attach(&mut partition, outage.clone());
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    (directory, partition, outage, local)
+}
+
+#[compio::test]
+async fn given_a_store_outage_when_clients_retry_should_answer_at_once_without_asking_the_store() {
+    let (_directory, mut partition, outage, local) = Box::pin(partition_on_outage()).await;
+    outage
+        .failure
+        .set(Some(|_| ObjectStoreError::Unavailable("503".to_owned())));
+
+    for _retry in 0..5 {
+        assert_eq!(
+            Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
+            IggyError::TransientNotAccepted
+        );
+    }
+    assert_eq!(outage.gets.get(), 1, "the retries reached the store");
+
+    // The store is asked again once the failure is forgotten, and a read that
+    // works clears it.
+    compio::time::sleep(crate::poll_plan::REMOTE_FAILURE_BACKOFF_MIN * 2).await;
+    assert_eq!(
+        Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
+        IggyError::TransientNotAccepted
+    );
+    assert_eq!(outage.gets.get(), 2);
+    let remembered = partition.log.sealed_read_state()[0]
+        .remote_failure
+        .get()
+        .unwrap();
+    assert_eq!(remembered.failures, 2);
+    outage.failure.set(None);
+    compio::time::sleep(crate::poll_plan::REMOTE_FAILURE_BACKOFF_MIN * 4).await;
+    assert_eq!(
+        Box::pin(polled(&mut partition, PollingStrategy::offset(0))).await,
+        local[0]
+    );
+    assert!(
+        partition.log.sealed_read_state()[0]
+            .remote_failure
+            .get()
+            .is_none()
+    );
+}
+
+#[compio::test]
+async fn given_a_stalled_store_when_the_deadline_passes_should_return_what_the_poll_has() {
+    let (_directory, mut partition, outage, local) = Box::pin(partition_on_outage()).await;
+    let deadline = || Instant::now() + Duration::from_millis(50);
+
+    // The second remote segment never answers, so the poll keeps the first.
+    outage
+        .stalled
+        .borrow_mut()
+        .push(object_key(2, SegmentObject::Log));
+    let started = Instant::now();
+    let result = plan(&mut partition, PollingStrategy::offset(0))
+        .with_deadline(deadline())
+        .execute()
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(result.truncated);
+    let (last, bytes) = accepted(&mut partition, result);
+    assert_eq!(last, Some(1));
+    assert!(local[0].1.starts_with(&bytes));
+
+    // With nothing to return, the poll asks for a retry.
+    forget_failures(&partition);
+    let result = plan(&mut partition, PollingStrategy::offset(2))
+        .with_deadline(deadline())
+        .execute()
+        .await;
+    assert_eq!(result.message_count, 0);
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+
+    // A deadline that is already past is no failure of the store.
+    forget_failures(&partition);
+    let gets = outage.gets.get();
+    let result = plan(&mut partition, PollingStrategy::offset(2))
+        .with_deadline(Instant::now())
+        .execute()
+        .await;
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert_eq!(outage.gets.get(), gets);
+    assert!(
+        partition.log.sealed_read_state()[1]
+            .remote_failure
+            .get()
+            .is_none()
+    );
+}
+
+#[compio::test]
+async fn given_a_plan_when_asked_whether_it_reads_remote_should_follow_its_segments() {
+    let (directory, mut partition, store, _local) = Box::pin(uploaded_partition()).await;
+    assert!(!plan(&mut partition, PollingStrategy::offset(0)).reads_remote());
+    attach(&mut partition, store);
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+
+    assert!(plan(&mut partition, PollingStrategy::offset(0)).reads_remote());
+    assert!(plan(&mut partition, PollingStrategy::offset(3)).reads_remote());
+    // The active segment is local, and a poll of it names nothing else.
+    assert!(!plan(&mut partition, PollingStrategy::offset(4)).reads_remote());
 }
 
 fn planned_segments(plan: &PollPlan) -> (Vec<u64>, bool) {

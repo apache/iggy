@@ -52,6 +52,8 @@ impl CommitErrorScope {
                     | IggyError::ConsumerGroupPartitionNotOwned(..)
                     // A read that needs a new offset key above the limit returns no messages.
                     | IggyError::TooManyConsumerOffsets
+                    // The object store failed the read before it returned a message.
+                    | IggyError::TieredReadFailed
             ),
             // None of these leaves an offset stored in the history that the request named.
             Self::Section => matches!(
@@ -63,6 +65,7 @@ impl CommitErrorScope {
                     | IggyError::ConsumerGroupPartitionNotOwned(..)
                     | IggyError::PartitionNotFound(..)
                     | IggyError::TooManyConsumerOffsets
+                    | IggyError::TieredReadFailed
             ),
         }
     }
@@ -75,6 +78,12 @@ mod tests {
     #[test]
     fn given_transient_not_accepted_section_when_classifying_then_should_prove_nothing_stored() {
         assert!(CommitErrorScope::Section.proves_nothing_stored(&IggyError::TransientNotAccepted));
+    }
+
+    #[test]
+    fn given_a_tiered_read_failure_when_classifying_should_prove_nothing_stored_in_both_scopes() {
+        assert!(CommitErrorScope::Request.proves_nothing_stored(&IggyError::TieredReadFailed));
+        assert!(CommitErrorScope::Section.proves_nothing_stored(&IggyError::TieredReadFailed));
     }
 
     /// The server checks the grant again after the owner's read stored the offset, so a

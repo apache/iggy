@@ -118,7 +118,7 @@ impl RemoteSegments {
         let start = source.range.start + position;
         let end = start + len as u64;
         if end > source.range.end {
-            return Err(DiskFault::Unreadable);
+            return Err(DiskFault::Tiered);
         }
         let object = self
             .objects
@@ -135,7 +135,7 @@ impl RemoteSegments {
                 returned = object.bytes.len(),
                 "remote poll: the object is shorter than its segment"
             );
-            return Err(DiskFault::Unreadable);
+            return Err(DiskFault::Tiered);
         }
         Ok(Frozen::from(Owned::<4096>::copy_from_slice(&object.bytes)))
     }
@@ -221,7 +221,7 @@ impl RemoteSegments {
                     at,
                     "remote poll: refusing an index object that does not describe its segment"
                 );
-                return Err(DiskFault::Unreadable);
+                return Err(DiskFault::Tiered);
             }
             let compio::BufResult(result, _) = file.write_all_at(object.bytes, at).await;
             result.map_err(|error| local_fault(staging, &error))?;
@@ -289,7 +289,7 @@ fn fault(key: &str, error: &ObjectStoreError) -> DiskFault {
     match error.class() {
         ErrorClass::Transient => DiskFault::Retryable,
         ErrorClass::NotFound | ErrorClass::PreconditionFailed | ErrorClass::Permanent => {
-            DiskFault::Unreadable
+            DiskFault::Tiered
         }
     }
 }

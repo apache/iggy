@@ -43,6 +43,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
@@ -122,7 +123,28 @@ pub struct SealedSegmentReadState {
     /// Set while a poll fetches the `.index` object of a remote segment, so a
     /// second poll does not write the same file under it.
     pub(crate) index_fetching: Cell<bool>,
+    /// The last failed read of the segment's objects, kept until its backoff
+    /// runs out. A client that retries meanwhile gets the same answer at once,
+    /// and the store gets no request.
+    pub(crate) remote_failure: Cell<Option<RemoteFailure>>,
 }
+
+/// See [`SealedSegmentReadState::remote_failure`].
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteFailure {
+    pub(crate) fault: DiskFault,
+    /// Failures in a row, which set how long the next one is remembered.
+    pub(crate) failures: u32,
+    pub(crate) until: Instant,
+}
+
+/// How long the first failed read of a segment's objects is remembered.
+pub const REMOTE_FAILURE_BACKOFF_MIN: Duration = Duration::from_millis(100);
+
+/// The longest a failed read is remembered. The store is asked again at
+/// least this often, so a repaired outage or a fixed credential shows within
+/// it.
+pub const REMOTE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// See [`SealedSegmentReadState::offset_cursor`].
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +180,9 @@ pub struct DiskReadPlan {
     /// segments it holds already cover what the poll can return. A walk that
     /// runs out of them anyway has more to read, never a tail to splice.
     pub(crate) cut: bool,
+    /// When the walk stops waiting for the store. A local read is not bound
+    /// by it: the disk answers or fails by itself.
+    pub(crate) deadline: Option<Instant>,
     pub(crate) start_position: u64,
     pub(crate) start_index_offset: Option<u64>,
     pub(crate) namespace_raw: u64,
@@ -205,10 +230,21 @@ enum SegmentBytes<'a> {
     Remote {
         remote: &'a RemoteSegments,
         range: RemoteRange,
+        state: &'a SealedSegmentReadState,
         /// The plan named the local `.log`, which was gone by the time the
         /// walk opened it.
         replanned: bool,
     },
+}
+
+impl SegmentBytes<'_> {
+    /// The fault of bytes that are not a segment's batches.
+    const fn unreadable(&self) -> DiskFault {
+        match self {
+            Self::File(_) => DiskFault::Unreadable,
+            Self::Remote { .. } => DiskFault::Tiered,
+        }
+    }
 }
 
 /// Admission inputs carried by a read without access to consumer progress maps.
@@ -417,6 +453,19 @@ impl PollReadResult {
         self.read_error.take().map_or_else(|| Ok(self), Err)
     }
 
+    /// The error of a read that the object store failed for good before it
+    /// matched anything.
+    ///
+    /// A poll without a status on its reply shows a failed read as an empty
+    /// one, which a consumer waits out. This one never reads again, so the
+    /// owner refuses the poll with it instead.
+    #[must_use]
+    pub fn tiered_read_failure(&self) -> Option<IggyError> {
+        self.read_error
+            .clone()
+            .filter(|error| matches!(error, IggyError::TieredReadFailed))
+    }
+
     #[must_use]
     pub const fn consumer_kind(&self) -> ConsumerKind {
         match self.context.consumer {
@@ -475,6 +524,24 @@ impl PollPlan {
     #[must_use]
     pub const fn needs_off_pump_io(&self) -> bool {
         matches!(self.tier, PollTier::Disk { .. })
+    }
+
+    /// Whether the snapshot names a segment in the object store, so the read
+    /// can wait on the store.
+    #[must_use]
+    pub fn reads_remote(&self) -> bool {
+        matches!(&self.tier, PollTier::Disk { disk, .. }
+            if disk.segments.iter().any(|segment| segment.source != SegmentSource::Local))
+    }
+
+    /// Stop waiting for the object store at `deadline`. The read then returns
+    /// the messages it has, or asks for a retry when it has none.
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Instant) -> Self {
+        if let PollTier::Disk { disk, .. } = &mut self.tier {
+            disk.deadline = Some(deadline);
+        }
+        self
     }
 
     /// Read the captured snapshot without changing consumer progress.
@@ -674,6 +741,9 @@ pub enum DiskFault {
     /// A batch failed its checksum or layout, or its bytes are gone. Every
     /// later poll of the offset fails the same way.
     Unreadable,
+    /// The object store refused a read for a reason no retry changes, or
+    /// answered with bytes that are not the segment's.
+    Tiered,
 }
 
 impl DiskFault {
@@ -683,6 +753,7 @@ impl DiskFault {
         match self {
             Self::Retryable => IggyError::TransientNotAccepted,
             Self::Unreadable => IggyError::CannotReadMessage,
+            Self::Tiered => IggyError::TieredReadFailed,
         }
     }
 }
@@ -1090,7 +1161,7 @@ impl DiskReadPlan {
                 // A batch that does not match its own checksum. Fail closed like
                 // an IO fault: serving it hands a consumer data provably not what
                 // was written, and skipping ahead punches a silent gap.
-                return SegmentWalk::Faulted(DiskFault::Unreadable);
+                return SegmentWalk::Faulted(bytes.unreadable());
             }
             if consumed == 0 {
                 if (len as u64) >= persisted - walk.position {
@@ -1098,13 +1169,13 @@ impl DiskReadPlan {
                     // corrupt batch in this segment. Fail-closed like an IO
                     // fault so a later segment is never served over the corrupt
                     // run, which would punch a silent gap into the poll.
-                    return SegmentWalk::Faulted(DiskFault::Unreadable);
+                    return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 // A single batch larger than the chunk. Its own header says
                 // how wide it is, so re-read exactly that; only a header this
                 // read could not reach leaves the old quadrupling.
                 if needed as u64 > persisted - walk.position {
-                    return SegmentWalk::Faulted(DiskFault::Unreadable);
+                    return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 chunk_len = if needed > len {
                     walk.batch_read_floor = walk
@@ -1132,11 +1203,11 @@ impl DiskReadPlan {
     /// A sealed segment planned as local can lose its `.log` to an eviction
     /// before the walk reaches it. Its bytes are then in the store under the
     /// partition's prefix, so the walk reads them there instead of failing.
-    async fn open_segment(
-        &self,
-        segment: &DiskSegment,
+    async fn open_segment<'a>(
+        &'a self,
+        segment: &'a DiskSegment,
         partition_dir: &str,
-    ) -> Result<SegmentBytes<'_>, DiskFault> {
+    ) -> Result<SegmentBytes<'a>, DiskFault> {
         if let SegmentSource::Remote(range) = &segment.source {
             // A shard that has not connected its store yet cannot read the
             // segment now, and can once it has.
@@ -1144,6 +1215,7 @@ impl DiskReadPlan {
             return Ok(SegmentBytes::Remote {
                 remote,
                 range: range.clone(),
+                state: &segment.read_state,
                 replanned: false,
             });
         }
@@ -1155,6 +1227,7 @@ impl DiskReadPlan {
                 Ok(SegmentBytes::Remote {
                     remote,
                     range,
+                    state: &segment.read_state,
                     replanned: true,
                 })
             }
@@ -1193,6 +1266,7 @@ impl DiskReadPlan {
             SegmentBytes::Remote {
                 remote,
                 range,
+                state,
                 replanned,
             } => {
                 #[cfg(feature = "poll-diagnostics")]
@@ -1200,21 +1274,62 @@ impl DiskReadPlan {
                     walk.requested_bytes += len as u64;
                     walk.chunk_reads += 1;
                 }
-                remote
-                    .read(range, walk.position, len)
-                    .await
-                    .map_err(|fault| {
-                        // A `.log` that was gone without an eviction was
-                        // retired, and so was its object. The next poll plans
-                        // against the segments that are left.
-                        if *replanned {
-                            DiskFault::Retryable
-                        } else {
-                            fault
-                        }
-                    })
+                let read = async {
+                    remote
+                        .read(range, walk.position, len)
+                        .await
+                        .map_err(|fault| {
+                            // A `.log` that was gone without an eviction was
+                            // retired, and so was its object. The next poll
+                            // plans against the segments that are left.
+                            if *replanned {
+                                DiskFault::Retryable
+                            } else {
+                                fault
+                            }
+                        })
+                };
+                self.wait_for_store(state, read).await
             }
         }
+    }
+
+    /// One wait on the object store for a segment.
+    ///
+    /// A failure is remembered on the segment, for longer after each one in a
+    /// row, and a wait that starts while it is remembered fails the same way
+    /// without a request. So the retries of clients during an outage reply at
+    /// once and cost the store nothing. The wait also ends at the poll's
+    /// deadline, which counts as a failure of the store only when the store
+    /// had the time to answer.
+    async fn wait_for_store<T>(
+        &self,
+        state: &SealedSegmentReadState,
+        wait: impl Future<Output = Result<T, DiskFault>>,
+    ) -> Result<T, DiskFault> {
+        let now = Instant::now();
+        let remembered = state.remote_failure.get();
+        if let Some(failure) = remembered
+            && now < failure.until
+        {
+            return Err(failure.fault);
+        }
+        let result = match self.deadline {
+            None => wait.await,
+            Some(deadline) if deadline <= now => return Err(DiskFault::Retryable),
+            Some(deadline) => compio::time::timeout(deadline - now, wait)
+                .await
+                .unwrap_or(Err(DiskFault::Retryable)),
+        };
+        state.remote_failure.set(result.as_ref().err().map(|fault| {
+            let failures = remembered.map_or(1, |failure| failure.failures.saturating_add(1));
+            RemoteFailure {
+                fault: *fault,
+                failures,
+                until: Instant::now() + remote_failure_backoff(failures),
+            }
+        }));
+        result
     }
 
     /// Resolve the read-only descriptor for `segment`'s file. A hit clones the
@@ -1365,13 +1480,16 @@ impl DiskReadPlan {
             return Ok(Some((reader, entry_count)));
         }
         let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
-        // A second poll of the segment waits for the first one's fetch through
-        // its client's retry.
-        let _fetch =
-            IndexFetch::begin(&segment.read_state.index_fetching).ok_or(DiskFault::Retryable)?;
-        remote
-            .fetch_index(log, segment.start_offset, partition_dir, path)
-            .await?;
+        let fetch = async {
+            // A second poll of the segment waits for the first one's fetch
+            // through its client's retry.
+            let _fetch = IndexFetch::begin(&segment.read_state.index_fetching)
+                .ok_or(DiskFault::Retryable)?;
+            remote
+                .fetch_index(log, segment.start_offset, partition_dir, path)
+                .await
+        };
+        self.wait_for_store(&segment.read_state, fetch).await?;
         self.open_local_index(path)
             .await
             .map(Some)
@@ -1484,6 +1602,14 @@ impl DiskReadPlan {
         }
         None
     }
+}
+
+/// How long the `failures`-th failed read in a row of a segment's objects is
+/// remembered: twice as long each time, up to the maximum.
+fn remote_failure_backoff(failures: u32) -> Duration {
+    REMOTE_FAILURE_BACKOFF_MIN
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(REMOTE_FAILURE_BACKOFF_MAX)
 }
 
 /// What a segment whose index cannot be read resolves to: the byte-0 scan for
@@ -1743,12 +1869,22 @@ mod tests {
         entry_count
     }
 
+    #[test]
+    fn given_failures_in_a_row_when_remembering_should_double_the_backoff_up_to_the_maximum() {
+        assert_eq!(remote_failure_backoff(1), REMOTE_FAILURE_BACKOFF_MIN);
+        assert_eq!(remote_failure_backoff(2), REMOTE_FAILURE_BACKOFF_MIN * 2);
+        assert_eq!(remote_failure_backoff(4), REMOTE_FAILURE_BACKOFF_MIN * 8);
+        assert_eq!(remote_failure_backoff(10), REMOTE_FAILURE_BACKOFF_MAX);
+        assert_eq!(remote_failure_backoff(u32::MAX), REMOTE_FAILURE_BACKOFF_MAX);
+    }
+
     fn sizing_plan(bytes_per_message: Option<u32>, widest_batch_bytes: u64) -> DiskReadPlan {
         DiskReadPlan {
             partition_dir: PartitionDirResolution::NoFiles,
             remote: None,
             object_prefix: None,
             cut: false,
+            deadline: None,
             bytes_per_message,
             widest_batch_bytes,
             segments: Vec::new(),
@@ -1842,6 +1978,7 @@ mod tests {
             remote: None,
             object_prefix: None,
             cut: false,
+            deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
             segments: Vec::new(),
@@ -2017,6 +2154,7 @@ mod tests {
             remote: None,
             object_prefix: None,
             cut: false,
+            deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
             segments: Vec::new(),
@@ -2160,6 +2298,7 @@ mod tests {
                         remote: None,
                         object_prefix: None,
                         cut: false,
+                        deadline: None,
                         bytes_per_message: None,
                         widest_batch_bytes: 0,
                         segments: vec![DiskSegment {
@@ -2292,6 +2431,7 @@ mod tests {
                     remote: None,
                     object_prefix: None,
                     cut: false,
+                    deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
                     segments: vec![DiskSegment {
@@ -2515,6 +2655,7 @@ mod tests {
                     remote: None,
                     object_prefix: None,
                     cut: false,
+                    deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
                     segments: vec![DiskSegment {
