@@ -43,18 +43,24 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use kafka_protocol::protocol::StrBytes;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, OwnedMutexGuard, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep_until, timeout_at};
+use tokio::time::{
+    Instant, MissedTickBehavior, interval, interval_at, sleep, sleep_until, timeout_at,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::bridge::{BridgeError, CoordinatorLink, DeletedTopic, IggyBridge, TopicShapes};
+use crate::bridge::{
+    BridgeError, CoordinatorLink, DeletedTopic, IggyBridge, OffsetCalls, OffsetGroupListing,
+    TopicShapes,
+};
 use crate::coordinator::partition::{LoadError, PartitionLog, Stop, Stopped, TAIL_WAIT};
 use crate::coordinator::record::{Announcement, Body, CommittedOffset};
 use crate::coordinator::replay::{GroupOffsets, PartitionState, TopicPartition};
-use crate::group::{GroupCoordinator, GroupHome, GroupSnapshot};
+use crate::group::{GroupCoordinator, GroupHome, GroupRemoval, GroupSnapshot};
 use crate::protocol::api::{ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NOT_COORDINATOR};
 
 /// Partitions of the coordinator log.
@@ -88,17 +94,23 @@ const ANNOUNCE_EVERY: Duration = Duration::from_mins(10);
 const ANNOUNCE_RETRY_FIRST: Duration = Duration::from_secs(1);
 const ANNOUNCE_RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// How long the log keeps the offsets of a group without members after its last commit. Kafka's
-/// `offsets.retention.minutes` default. Iggy keeps them after that.
-const OFFSETS_RETENTION: Duration = Duration::from_hours(24 * 7);
+/// Kafka's `offsets.retention.minutes` default. See [`CoordinationConfig::offsets_retention`].
+const DEFAULT_OFFSETS_RETENTION: Duration = Duration::from_hours(24 * 7);
 
 /// How often an owner looks for groups whose offsets expired. Kafka's
 /// `offsets.retention.check.interval.ms` default.
-const RETENTION_CHECK: Duration = Duration::from_mins(10);
+const DEFAULT_RETENTION_CHECK: Duration = Duration::from_mins(10);
 
 /// The records of one append that drops groups or their offsets, at most, so a sweep of many
 /// groups stays under Iggy's message size.
 const DROPS_PER_APPEND: usize = 1_000;
+
+/// How long the listing of an expiry check, and each deletion of expired offsets in Iggy, may
+/// take. A deletion cut off there can still land, and the next check finds nothing left to delete.
+const EXPIRY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The longest wait between expiry checks after checks that could not list the Iggy groups.
+const EXPIRY_BACKOFF_MAX: Duration = Duration::from_hours(1);
 
 /// How long a start waits for the bridge's first read of Iggy's metadata change log.
 const CHANGE_LOG_WAIT: Duration = Duration::from_secs(10);
@@ -112,19 +124,42 @@ const WRITERS: usize = 4;
 /// the deletion, and a removal that failed.
 const DELETION_MEMORY: Duration = Duration::from_mins(2);
 
-/// How the coordinator log behaves. No environment variable maps onto it.
+/// How the coordinator log behaves. Only `offsets_retention` has an environment variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinationConfig {
     /// Records after which an owner writes a checkpoint, so a load reads at most about this many
     /// records past the state, or as many as the state holds when that is more. An owner also
     /// writes one when the last is 24 hours old.
     pub checkpoint_records: u64,
+    /// How long the offsets of a group without members stay after its last commit, or after it
+    /// lost its last member when that came later (`IGGY_KAFKA_OFFSETS_RETENTION_MINUTES`). The
+    /// owner then deletes them in Iggy and in the log. `None` takes Kafka's default, 7 days.
+    pub offsets_retention: Option<Duration>,
+    /// How often an owner looks for groups whose offsets expired.
+    pub retention_check: Duration,
+    /// The groups whose offsets one check deletes, at most. The rest wait for the next check, so
+    /// a backlog never keeps a check running for long.
+    pub expiries_per_check: usize,
+    /// The groups whose offsets one deletion in Iggy takes. Their joins and commits wait for it.
+    pub expiries_per_deletion: usize,
+}
+
+impl CoordinationConfig {
+    /// [`Self::offsets_retention`], or Kafka's default.
+    #[must_use]
+    pub fn retention(&self) -> Duration {
+        self.offsets_retention.unwrap_or(DEFAULT_OFFSETS_RETENTION)
+    }
 }
 
 impl Default for CoordinationConfig {
     fn default() -> Self {
         Self {
             checkpoint_records: 10_000,
+            offsets_retention: None,
+            retention_check: DEFAULT_RETENTION_CHECK,
+            expiries_per_check: 1_000,
+            expiries_per_deletion: 100,
         }
     }
 }
@@ -203,6 +238,8 @@ pub struct Coordination {
     node_id: u16,
     config: CoordinationConfig,
     link: Arc<CoordinatorLink>,
+    /// Deletes the expired offsets in Iggy.
+    bridge: Arc<IggyBridge>,
     groups: GroupCoordinator,
     /// The partitions this gateway serves, each with its log.
     served: RwLock<HashMap<u32, Arc<PartitionLog>>>,
@@ -229,7 +266,74 @@ pub struct Coordination {
     leasing: CancellationToken,
     /// The lease loop, which a shutdown waits for.
     lease_loop: Mutex<Option<JoinHandle<()>>>,
+    /// Stops the expiry checks. A child of `cancel`, cancelled first by a shutdown.
+    expiry: CancellationToken,
+    /// Held by each deletion of expired offsets, from its fence to its append. A shutdown waits
+    /// for it before it hands the partitions over, so the next owner's log matches Iggy.
+    expiring: tokio::sync::Mutex<()>,
+    /// Each expired group whose deletion in Iggy failed, and since when.
+    failing: Mutex<HashMap<String, Instant>>,
+    holds: ExpiryHolds,
     cancel: CancellationToken,
+}
+
+/// A group whose offsets expired, as one check found it.
+struct Expiry {
+    log: Arc<PartitionLog>,
+    group_id: String,
+    /// Whether the check deletes the group's offsets in Iggy before the log drops them: the log
+    /// holds a commit of the group, so Iggy holds offsets of it too, and deleting them there has
+    /// not failed for a whole retention. A group of which the log holds only deletions has none
+    /// left there.
+    in_iggy: bool,
+}
+
+/// Why an expiry check deleted nothing in Iggy.
+#[derive(Debug, thiserror::Error)]
+enum ListingFailed {
+    #[error(transparent)]
+    Bridge(#[from] BridgeError),
+    #[error("the bridge user may not list the Iggy groups of the Kafka topics {0:?}")]
+    Unlisted(Vec<String>),
+}
+
+/// A step of an expiry check that a test can hold it at. See [`Coordination::hold_expiry`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryStep {
+    /// The check found the expired groups and listed their Iggy groups. No group is fenced yet.
+    Found,
+    /// A deletion fenced its groups, and has not checked them again or deleted anything.
+    Fenced,
+}
+
+/// Where tests hold expiry checks.
+#[derive(Debug, Default)]
+struct ExpiryHolds {
+    found: Arc<tokio::sync::Mutex<()>>,
+    fenced: Arc<tokio::sync::Mutex<()>>,
+    /// The step a check waits at.
+    waiting: watch::Sender<Option<ExpiryStep>>,
+}
+
+impl ExpiryHolds {
+    const fn of(&self, step: ExpiryStep) -> &Arc<tokio::sync::Mutex<()>> {
+        match step {
+            ExpiryStep::Found => &self.found,
+            ExpiryStep::Fenced => &self.fenced,
+        }
+    }
+
+    /// Waits while a test holds `step`.
+    async fn pass(&self, step: ExpiryStep) {
+        let hold = self.of(step);
+        if hold.try_lock().is_ok() {
+            return;
+        }
+        self.waiting.send_replace(Some(step));
+        drop(hold.lock().await);
+        self.waiting.send_replace(None);
+    }
 }
 
 impl Coordination {
@@ -238,16 +342,28 @@ impl Coordination {
     ///
     /// # Errors
     ///
-    /// [`BridgeError::InvalidConfig`] when the bridge cannot read Iggy's metadata change log, and
-    /// [`BridgeError::Timeout`] when its first read does not end in time. Another [`BridgeError`]
-    /// when the log cannot be prepared in Iggy or the lease group not joined.
+    /// [`BridgeError::InvalidConfig`] when the bridge cannot read Iggy's metadata change log, or
+    /// `config` sets a zero retention or check interval, and [`BridgeError::Timeout`] when the
+    /// first read of the change log does not end in time. Another [`BridgeError`] when the log
+    /// cannot be prepared in Iggy or the lease group not joined.
     pub async fn start(
-        bridge: &IggyBridge,
+        bridge: &Arc<IggyBridge>,
         groups: GroupCoordinator,
         node_id: u16,
         config: CoordinationConfig,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, BridgeError> {
+        if config.retention().is_zero()
+            || config.retention_check.is_zero()
+            || config.expiries_per_check == 0
+            || config.expiries_per_deletion == 0
+        {
+            return Err(BridgeError::InvalidConfig(
+                "the offsets retention, the interval of its check and the expiries of a check \
+                 must be above zero"
+                    .to_string(),
+            ));
+        }
         // Before the join, so no deletion slips between a load and this.
         let deletions = bridge.topic_deletions();
         let topics = bridge.topic_shapes();
@@ -278,6 +394,7 @@ impl Coordination {
             node_id,
             config,
             link,
+            bridge: Arc::clone(bridge),
             groups: groups.clone(),
             served: RwLock::new(HashMap::new()),
             loading: Mutex::new(HashSet::new()),
@@ -292,6 +409,10 @@ impl Coordination {
             stopped,
             leasing: cancel.child_token(),
             lease_loop: Mutex::new(None),
+            expiry: cancel.child_token(),
+            expiring: tokio::sync::Mutex::new(()),
+            failing: Mutex::new(HashMap::new()),
+            holds: ExpiryHolds::default(),
             cancel,
         });
         groups.set_home(Arc::clone(&this) as Arc<dyn GroupHome>);
@@ -303,6 +424,7 @@ impl Coordination {
         tokio::spawn(Arc::clone(&this).follow_owners());
         tokio::spawn(Arc::clone(&this).announce_on());
         tokio::spawn(Arc::clone(&this).sweep_on());
+        tokio::spawn(Arc::clone(&this).expire_on());
         tokio::spawn(Arc::clone(&this).forget_deleted_topics(deletions));
         tokio::spawn(warn_when_lost(
             bridge.change_log_lost(),
@@ -320,6 +442,10 @@ impl Coordination {
     /// members, so they do not rebalance. Gives up on Iggy at `until`: the others then take over
     /// when the session ends.
     pub async fn shutdown(&self, until: Instant) {
+        // A deletion of expired offsets in Iggy appends to the log before the partitions go.
+        self.expiry.cancel();
+        let expiring = timeout_at(until, self.expiring.lock()).await;
+        drop(expiring);
         if timeout_at(until, self.leave()).await.is_err() {
             warn!(
                 "could not leave the coordinator lease group in time; the other gateways take over when the session ends"
@@ -668,7 +794,7 @@ impl Coordination {
                     Arc::clone(&self.link),
                     partition,
                     self.node_id,
-                    self.config.checkpoint_records,
+                    self.config,
                     claimed,
                     self.stopped.clone(),
                     &self.cancel,
@@ -919,25 +1045,56 @@ impl Coordination {
 
     /// Every [`SWEEP_EVERY`], drops the groups whose members are all gone, and removes the
     /// state the log keeps for them. Without it a member restored from the log that never comes
-    /// back would stay listed. Every [`RETENTION_CHECK`], also drops the offsets that expired.
+    /// back would stay listed.
     async fn sweep_on(self: Arc<Self>) {
         let mut tick = interval(SWEEP_EVERY);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut retention = interval_at(Instant::now() + RETENTION_CHECK, RETENTION_CHECK);
-        retention.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            let expire = tokio::select! {
+            tokio::select! {
                 () = self.cancel.cancelled() => return,
-                _ = tick.tick() => false,
-                _ = retention.tick() => true,
-            };
+                _ = tick.tick() => {}
+            }
             self.groups.sweep().await;
             let logs: Vec<Arc<PartitionLog>> = self.served().values().cloned().collect();
             for log in logs {
                 self.forget_gone_groups(&log).await;
                 self.forget_recent_deletions(&log).await;
-                if expire {
-                    self.expire_offsets(&log).await;
+            }
+        }
+    }
+
+    /// Every `retention_check`, deletes the offsets that expired. Apart from the sweep, since a
+    /// deletion in Iggy can take seconds. A check that cannot list the Iggy groups stops, and the
+    /// wait before the next doubles, up to [`EXPIRY_BACKOFF_MAX`]. It warns once until a check
+    /// lists them again.
+    async fn expire_on(self: Arc<Self>) {
+        let every = self.config.retention_check;
+        let longest = every.max(EXPIRY_BACKOFF_MAX);
+        let (mut wait, mut failing) = (every, false);
+        loop {
+            tokio::select! {
+                () = self.expiry.cancelled() => return,
+                () = sleep(wait) => {}
+            }
+            // Not cancelled here: a deletion in Iggy appends to the log before it ends.
+            match self.expire_offsets().await {
+                Ok(()) => {
+                    if failing {
+                        info!("the gateway deletes the expired offsets of Kafka groups again");
+                    }
+                    (wait, failing) = (every, false);
+                }
+                Err(error) => {
+                    if failing {
+                        debug!(%error, "could not look for expired Kafka group offsets in Iggy");
+                    } else {
+                        warn!(
+                            %error,
+                            "could not look for expired Kafka group offsets in Iggy, so none \
+                             expire; trying again later, less often while this lasts"
+                        );
+                    }
+                    (wait, failing) = (wait.saturating_mul(2).min(longest), true);
                 }
             }
         }
@@ -960,22 +1117,290 @@ impl Coordination {
         append_drops(log, bodies, "emptied groups").await;
     }
 
-    /// Drops from the log the offsets of each group that has no members and committed nothing
-    /// for [`OFFSETS_RETENTION`], so the log does not grow with every group that ever committed.
-    /// Iggy still holds those offsets, and answers for them from then on.
-    async fn expire_offsets(&self, log: &PartitionLog) {
-        let retention = i64::try_from(OFFSETS_RETENTION.as_millis()).unwrap_or(i64::MAX);
-        let now = unix_millis();
-        let expired = log
-            .with_state(|state| state.expired_groups(retention, now))
-            .await;
-        // A group whose members joined meanwhile keeps its offsets.
-        let expired = self.groups.absent(expired).await;
-        let bodies = expired
-            .into_iter()
-            .map(|group_id| Body::GroupOffsetsExpired { group_id })
+    /// Deletes the offsets of each group whose offsets expired (`PartitionState::is_expired`),
+    /// so neither Iggy nor the log grows with every group that ever committed. Takes at most
+    /// `expiries_per_check` groups, `expiries_per_deletion` at a time, and lists their Iggy groups
+    /// once.
+    ///
+    /// A group whose deletion in Iggy failed for a whole retention leaves the log without it, and
+    /// Iggy keeps its offsets, so a deletion that keeps failing does not grow the log.
+    ///
+    /// # Errors
+    ///
+    /// [`ListingFailed`] when the Iggy groups cannot all be listed. Nothing is deleted in Iggy
+    /// then, and only the groups that failed for a whole retention leave the log.
+    async fn expire_offsets(&self) -> Result<(), ListingFailed> {
+        let retention = self.config.retention();
+        let mut expired = self.expired_groups(millis(retention)).await;
+        let overdue: HashSet<String> = {
+            let mut failing = self.failing();
+            let found: HashSet<&str> = expired
+                .iter()
+                .map(|expiry| expiry.group_id.as_str())
+                .collect();
+            failing.retain(|group_id, _| found.contains(group_id.as_str()));
+            failing
+                .iter()
+                .filter(|(_, since)| since.elapsed() >= retention)
+                .map(|(group_id, _)| group_id.clone())
+                .collect()
+        };
+        expired.truncate(self.config.expiries_per_check);
+        for expiry in &mut expired {
+            expiry.in_iggy &= !overdue.contains(&expiry.group_id);
+        }
+        let in_iggy: Vec<&str> = expired
+            .iter()
+            .filter(|expiry| expiry.in_iggy)
+            .map(|expiry| expiry.group_id.as_str())
             .collect();
-        append_drops(log, bodies, "expired offsets").await;
+        let listing = if in_iggy.is_empty() {
+            Ok(OffsetGroupListing::default())
+        } else {
+            self.list_in_iggy(&in_iggy).await
+        };
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(error) => {
+                self.note_failures(&in_iggy);
+                let out_of_iggy: Vec<Expiry> = expired
+                    .into_iter()
+                    .filter(|expiry| !expiry.in_iggy)
+                    .collect();
+                self.expire_all(&out_of_iggy, &OffsetGroupListing::default())
+                    .await;
+                return Err(error);
+            }
+        };
+        self.holds.pass(ExpiryStep::Found).await;
+        self.expire_all(&expired, &listing).await;
+        Ok(())
+    }
+
+    /// The groups whose offsets expired on the partitions this gateway serves.
+    async fn expired_groups(&self, retention_ms: i64) -> Vec<Expiry> {
+        let now = unix_millis();
+        let logs: Vec<Arc<PartitionLog>> = self
+            .served()
+            .values()
+            .filter(|log| log.is_serving())
+            .cloned()
+            .collect();
+        let mut expired = Vec::new();
+        for log in logs {
+            // An expired group holds no state, so `logs_group` asks whether it holds a commit.
+            let found: Vec<(String, bool)> = log
+                .with_state(|state| {
+                    state
+                        .expired_groups(retention_ms, now)
+                        .into_iter()
+                        .map(|group_id| {
+                            let in_iggy = logs_group(state, &group_id);
+                            (group_id, in_iggy)
+                        })
+                        .collect()
+                })
+                .await;
+            expired.extend(found.into_iter().map(|(group_id, in_iggy)| Expiry {
+                log: Arc::clone(&log),
+                group_id,
+                in_iggy,
+            }));
+        }
+        expired
+    }
+
+    /// The Iggy groups that hold the offsets of `groups`.
+    async fn list_in_iggy(&self, groups: &[&str]) -> Result<OffsetGroupListing, ListingFailed> {
+        let listing = timeout_at(
+            Instant::now() + EXPIRY_DEADLINE,
+            self.bridge.list_offset_groups(groups),
+        )
+        .await
+        .map_err(|_elapsed| BridgeError::Timeout)??;
+        if listing.unlisted.is_empty() {
+            Ok(listing)
+        } else {
+            Err(ListingFailed::Unlisted(listing.unlisted))
+        }
+    }
+
+    /// [`Self::expire`] for `expired`, `expiries_per_deletion` at a time, until a shutdown.
+    async fn expire_all(&self, expired: &[Expiry], listing: &OffsetGroupListing) {
+        let retention = millis(self.config.retention());
+        for batch in expired.chunks(self.config.expiries_per_deletion) {
+            let _expiring = self.expiring.lock().await;
+            if self.expiry.is_cancelled() {
+                return;
+            }
+            self.expire(batch, listing, retention).await;
+        }
+    }
+
+    /// Deletes the offsets of each group of `expired` while the groups take no join and no
+    /// commit: in Iggy on each topic `listing` found, as `DeleteGroups` does, then in the log. A
+    /// group that a member joined, or that a commit reached, since it expired keeps its offsets.
+    /// A group whose deletion in Iggy fails stays in the log, and the next check tries it again.
+    async fn expire(&self, expired: &[Expiry], listing: &OffsetGroupListing, retention: i64) {
+        let names: Vec<StrBytes> = expired
+            .iter()
+            .map(|expiry| StrBytes::from_string(expiry.group_id.clone()))
+            .collect();
+        // Until this drops, the groups take no join and no commit.
+        let (removals, deletion) = self.groups.group_deletion(&names).await;
+        let deadline = Instant::now() + EXPIRY_DEADLINE;
+        if !deletion.commits_ended(deadline).await {
+            debug!(
+                "a commit of a group whose offsets expired still runs; trying at the next check"
+            );
+            return;
+        }
+        self.holds.pass(ExpiryStep::Fenced).await;
+        // Checked again just before the deletion, so a group that came back keeps its offsets,
+        // and a partition that moved meanwhile deletes nothing.
+        let now = unix_millis();
+        let mut still: Vec<&Expiry> = Vec::with_capacity(expired.len());
+        for (expiry, removal) in expired.iter().zip(removals) {
+            let gone = removal == GroupRemoval::Absent
+                && expiry.log.is_serving()
+                && expiry
+                    .log
+                    .with_state(|state| state.is_expired(&expiry.group_id, retention, now))
+                    .await;
+            if gone {
+                still.push(expiry);
+            }
+        }
+        let in_iggy: Vec<&str> = still
+            .iter()
+            .filter(|expiry| expiry.in_iggy)
+            .map(|expiry| expiry.group_id.as_str())
+            .collect();
+        // Each deletion keeps the groups fenced until it can no longer land, also past the
+        // deadline, so no commit lands while a deletion can.
+        let calls = OffsetCalls::new(deadline).keeping(deletion);
+        let failed = self.delete_in_iggy(&in_iggy, listing, &calls).await;
+        let mut drops: HashMap<u32, (&PartitionLog, Vec<Body>)> = HashMap::new();
+        let mut kept_in_iggy = 0_usize;
+        for expiry in still
+            .into_iter()
+            .filter(|expiry| !failed.contains(expiry.group_id.as_str()))
+        {
+            kept_in_iggy +=
+                usize::from(!expiry.in_iggy && self.failing().remove(&expiry.group_id).is_some());
+            drops
+                .entry(expiry.log.partition)
+                .or_insert_with(|| (expiry.log.as_ref(), Vec::new()))
+                .1
+                .push(Body::GroupOffsetsExpired {
+                    group_id: expiry.group_id.clone(),
+                });
+        }
+        if kept_in_iggy > 0 {
+            warn!(
+                groups = kept_in_iggy,
+                "the expired offsets of Kafka groups could not be deleted in Iggy for a whole \
+                 retention, so only the coordinator log drops them; Iggy keeps them until \
+                 DeleteGroups deletes the groups"
+            );
+        }
+        // Still fenced by `calls`, so no commit lands between the deletion in Iggy and the one in
+        // the log.
+        for (log, bodies) in drops.into_values() {
+            append_drops(log, bodies, "expired offsets").await;
+        }
+    }
+
+    /// Deletes the offsets of `groups` in Iggy, on each topic `listing` found. The groups whose
+    /// deletion failed, which count as failing from their first failure on.
+    async fn delete_in_iggy<'g>(
+        &self,
+        groups: &[&'g str],
+        listing: &OffsetGroupListing,
+        calls: &OffsetCalls,
+    ) -> HashSet<&'g str> {
+        if groups.is_empty() {
+            return HashSet::new();
+        }
+        let results = self
+            .bridge
+            .delete_listed_offset_groups(groups, listing, calls)
+            .await;
+        let mut failed = HashSet::new();
+        let mut first_failure = None;
+        for (&group, result) in groups.iter().zip(results) {
+            match result {
+                Ok(_) => {
+                    self.failing().remove(group);
+                }
+                Err(error) => {
+                    failed.insert(group);
+                    first_failure.get_or_insert((group, error));
+                }
+            }
+        }
+        let failing: Vec<&str> = failed.iter().copied().collect();
+        let new = self.note_failures(&failing);
+        if let Some((group, error)) = first_failure {
+            if new > 0 {
+                warn!(
+                    group,
+                    failed = failed.len(),
+                    %error,
+                    "could not delete the expired offsets of Kafka groups in Iggy; trying again \
+                     at the next check"
+                );
+            } else {
+                debug!(
+                    group,
+                    failed = failed.len(),
+                    %error,
+                    "could not delete the expired offsets of Kafka groups in Iggy again"
+                );
+            }
+        }
+        failed
+    }
+
+    /// Counts each of `groups` as failing from now, unless it already does. How many did not.
+    fn note_failures(&self, groups: &[&str]) -> usize {
+        let now = Instant::now();
+        let mut failing = self.failing();
+        groups
+            .iter()
+            .filter(|group| {
+                if failing.contains_key(**group) {
+                    return false;
+                }
+                failing.insert((**group).to_owned(), now);
+                true
+            })
+            .count()
+    }
+
+    /// Runs one expiry check now, as each `retention_check` does. Whether it could list the Iggy
+    /// groups. For tests, which set a long check interval.
+    #[doc(hidden)]
+    pub async fn expire_now(&self) -> bool {
+        self.expire_offsets().await.is_ok()
+    }
+
+    /// Holds expiry checks at `step` until the guard drops. For tests that land a join or a commit
+    /// there. [`Self::expiry_waiting_at`] tells when a check waits.
+    #[doc(hidden)]
+    pub async fn hold_expiry(&self, step: ExpiryStep) -> OwnedMutexGuard<()> {
+        Arc::clone(self.holds.of(step)).lock_owned().await
+    }
+
+    /// Ends once an expiry check waits at `step`, which [`Self::hold_expiry`] holds.
+    #[doc(hidden)]
+    pub async fn expiry_waiting_at(&self, step: ExpiryStep) {
+        let mut waiting = self.holds.waiting.subscribe();
+        let _ = waiting.wait_for(|at| *at == Some(step)).await;
+    }
+
+    fn failing(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
+        self.failing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Removes the offsets of each topic Iggy deletes from the partitions this gateway serves, so
@@ -1124,9 +1549,12 @@ impl Coordination {
 pub fn unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-        })
+        .map_or(0, millis)
+}
+
+/// `duration` in milliseconds, the unit of a commit's time.
+fn millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Ends at `at`, or never without one.

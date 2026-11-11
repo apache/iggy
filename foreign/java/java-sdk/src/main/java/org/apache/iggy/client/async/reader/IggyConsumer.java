@@ -26,7 +26,11 @@ import org.apache.iggy.message.CommitAfter;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -52,10 +56,10 @@ import java.util.function.Function;
 public final class IggyConsumer {
     private final PartitionReader reader;
     private final CommitAfter after;
-    private PolledMessages batch;
-    private int index;
-    // The partitions of the seeks that the reader has not applied yet, each with the number of its latest seek.
-    private final Map<Long, Long> seeking = new HashMap<>();
+    private final Deque<Held> held = new ArrayDeque<>();
+    // The partitions of the seeks that the reader has not applied yet, each with its latest seek and its batches. A
+    // seek that moves drops them, and a failed one hands them over.
+    private final Map<Long, Parked> parked = new HashMap<>();
     private long seeks;
     private ReceivedMessage uncounted;
     private CompletableFuture<ReceivedMessage> waiting;
@@ -106,22 +110,28 @@ public final class IggyConsumer {
         return reader.mark(checkpoint);
     }
 
-    /** See {@link PartitionReader#seek}. The messages of the partition that the consumer still holds are dropped. */
+    /**
+     * See {@link PartitionReader#seek}. The consumer holds the messages of the partition back until the seek ends. A
+     * seek that moves drops them, and a failed one hands them over.
+     */
     public synchronized CompletableFuture<Void> seek(long partitionId, PollingStrategy start) {
-        if (batch != null && batch.partitionId() == partitionId) {
-            batch = null;
-        }
+        // A refused seek changes nothing, so the batches stay with an earlier seek of the partition.
+        start.requirePartition(partitionId);
         if (uncounted != null && uncounted.partitionId() == partitionId) {
             uncounted = null;
         }
         long seek = ++seeks;
-        seeking.put(partitionId, seek);
-        try {
-            return reader.seek(partitionId, start, () -> applied(partitionId, seek));
-        } catch (RuntimeException refused) {
-            applied(partitionId, seek);
-            throw refused;
+        Parked earlier = parked.get(partitionId);
+        List<Held> kept = earlier == null ? new ArrayList<>() : earlier.batches();
+        parked.put(partitionId, new Parked(seek, kept));
+        for (Iterator<Held> batches = held.iterator(); batches.hasNext(); ) {
+            Held next = batches.next();
+            if (next.batch.partitionId() == partitionId) {
+                kept.add(next);
+                batches.remove();
+            }
         }
+        return reader.seek(partitionId, start, moved -> applied(partitionId, seek, moved));
     }
 
     /** The partitions of the reader. */
@@ -132,7 +142,8 @@ public final class IggyConsumer {
     /**
      * Stops a running {@link #consume} after its current handler, counts the last message under
      * {@link CommitAfter#PROCESSING}, and closes the reader, which stores, moves offsets back and leaves its group as
-     * its commit policy says.
+     * its commit policy says. A cancel of the returned future cancels that close, as {@link PartitionReader#closeAsync()}
+     * describes.
      */
     public CompletableFuture<Void> shutdown() {
         stopping = true;
@@ -143,12 +154,22 @@ public final class IggyConsumer {
             }
             running = loop;
         }
-        return running.handle((ignored, error) -> null).thenCompose(ignored -> {
-            synchronized (this) {
-                countUncounted();
-            }
-            return reader.closeAsync();
-        });
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        running.handle((ignored, error) -> null)
+                .thenCompose(ignored -> {
+                    synchronized (this) {
+                        countUncounted();
+                    }
+                    CompletableFuture<Void> closing = reader.closeAsync();
+                    result.whenComplete((done, error) -> {
+                        if (result.isCancelled()) {
+                            closing.cancel(false);
+                        }
+                    });
+                    return closing;
+                })
+                .whenComplete((ignored, error) -> ReaderSupport.complete(result, error));
+        return result;
     }
 
     private void step(Function<ReceivedMessage, CompletableFuture<Void>> handler, CompletableFuture<Void> done) {
@@ -225,10 +246,14 @@ public final class IggyConsumer {
             waiting.completeExceptionally(new IggyClientException("The consumer is shut down"));
             return;
         }
-        if (batch != null && index < batch.messages().size()) {
+        while (!held.isEmpty()
+                && held.peekFirst().index == held.peekFirst().batch.messages().size()) {
+            held.pollFirst();
+        }
+        if (!held.isEmpty()) {
             CompletableFuture<ReceivedMessage> result = waiting;
             waiting = null;
-            ReceivedMessage message = handOver();
+            ReceivedMessage message = handOver(held.peekFirst());
             if (waitingProcesses && after == CommitAfter.PROCESSING) {
                 uncounted = message;
             }
@@ -242,7 +267,7 @@ public final class IggyConsumer {
         reading.whenComplete(this::receiveBatch);
     }
 
-    /** The reader handed a batch of a sought partition over before it applied the seek, so the batch is stale. */
+    /** The reader hands a batch of a sought partition over before it applies the seek, so the batch waits for it. */
     private synchronized void receiveBatch(PolledMessages next, Throwable error) {
         reading = null;
         if (error != null) {
@@ -251,19 +276,34 @@ public final class IggyConsumer {
             }
             return;
         }
-        if (!seeking.containsKey(next.partitionId())) {
-            batch = next;
-            index = 0;
+        Parked kept = parked.get(next.partitionId());
+        if (kept != null) {
+            kept.batches().add(new Held(next));
+        } else {
+            held.addLast(new Held(next));
         }
         resumeTake();
     }
 
-    private synchronized void applied(long partitionId, long seek) {
-        seeking.remove(partitionId, seek);
+    private synchronized void applied(long partitionId, long seek, boolean moved) {
+        Parked kept = parked.get(partitionId);
+        if (kept == null) {
+            return;
+        }
+        if (moved) {
+            kept.batches().clear();
+        }
+        // A later seek of the partition decides what the batches before it become.
+        if (kept.seek() == seek) {
+            parked.remove(partitionId);
+            held.addAll(kept.batches());
+            resumeTake();
+        }
     }
 
-    private ReceivedMessage handOver() {
-        int at = index++;
+    private ReceivedMessage handOver(Held next) {
+        int at = next.index++;
+        PolledMessages batch = next.batch;
         Checkpoint checkpoint = batch.checkpointAt(at).orElseThrow();
         ReceivedMessage message = new ReceivedMessage(
                 batch.partitionId(),
@@ -284,4 +324,17 @@ public final class IggyConsumer {
             reader.countDelivered(message.checkpoint(), 1, message.endsBatch());
         }
     }
+
+    /** A batch and the index of its next message to hand over. */
+    private static final class Held {
+        private final PolledMessages batch;
+        private int index;
+
+        private Held(PolledMessages batch) {
+            this.batch = batch;
+        }
+    }
+
+    /** The number of the latest seek of a partition, and the batches of the partition that wait for it. */
+    private record Parked(long seek, List<Held> batches) {}
 }

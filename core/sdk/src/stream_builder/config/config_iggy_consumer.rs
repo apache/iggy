@@ -34,11 +34,11 @@ pub struct IggyConsumerConfig {
     stream_name: String,
     /// Name of the topic. Must be unique.
     topic_name: String,
-    /// Maximum encoded bytes reserved for buffered and in-flight batches.
+    /// Requested encoded bytes for buffered and in-flight batches, raised to at least 32 batches.
     #[builder(default = DEFAULT_PREFETCH_BYTES)]
     prefetch_bytes: u32,
-    /// Maximum messages reserved for buffered and in-flight batches. Defaults to 16,000, or
-    /// the `count` of the poll options when that is larger.
+    /// Requested messages for buffered and in-flight batches. Defaults to 16,000, raised to at
+    /// least 32 batches.
     prefetch_messages: Option<u32>,
     /// Create the stream if it doesn't exist.
     create_stream_if_not_exists: bool,

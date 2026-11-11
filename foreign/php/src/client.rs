@@ -767,8 +767,10 @@ impl IggyClient {
     /// offset, PollingStrategy::next() when null, and a continuation is refused. `options`
     /// defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
     /// 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
-    /// `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
-    /// flight and the queued batches.
+    /// `prefetch_messages`, 16000 when null, set the requested budgets for requests in flight and
+    /// queued batches. Each effective budget holds at least 32 full batches so primary groups can
+    /// wait independently: 32 MiB and 32000 messages with the default options. Larger budgets
+    /// allow more queued batches.
     #[allow(clippy::too_many_arguments)]
     pub fn reader(
         &self,

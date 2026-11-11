@@ -60,7 +60,7 @@ use fetch::{FetchPool, LazyClient};
 use group_index::GroupIndex;
 pub use group_index::{OffsetGroupSource, OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
-pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
+pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroupListing};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{PartitionBatch, ProduceTurn, Producer};
@@ -588,6 +588,15 @@ impl IggyBridge {
     /// A bridge that never dialed, so a test needs no server. Each Iggy call on it fails at once.
     pub(crate) fn offline() -> Self {
         Self::offline_at("127.0.0.1:1")
+    }
+
+    /// [`Self::offline`], as a bridge that follows Iggy's change log. It shows the topics that
+    /// [`Self::show_topic_shapes`] gives it.
+    pub(crate) fn offline_following() -> Self {
+        Self {
+            group_index: GroupIndex::following(),
+            ..Self::offline()
+        }
     }
 
     /// [`Self::offline`], with clients that connect later dialing `address`.

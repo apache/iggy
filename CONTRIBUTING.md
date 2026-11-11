@@ -10,6 +10,8 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
+Connector issues and PRs go to [apache/iggy-connectors](https://github.com/apache/iggy-connectors).
+
 ### Good First Issues
 
 The `good first issue` label marks issues for new contributors.
@@ -25,7 +27,6 @@ These require design discussion in the issue before coding:
 - Protocol (binary format, wire encoding)
 - Concurrency (shards, inter-shard)
 - Public API (HTTP, SDKs, CLI)
-- Connectors
 
 ## PR Requirements
 

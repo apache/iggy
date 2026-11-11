@@ -25,7 +25,7 @@ use futures::TryStreamExt;
 use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, ConsensusHeader, Operation, PrepareHeader};
 use server_common::{
-    Message,
+    DISK_USAGE, Message,
     fatal::NoteDescriptorExhaustion,
     iobuf::{Frozen, Owned},
     send_messages::decode_prepare_slice,
@@ -36,7 +36,7 @@ use crate::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode}
 
 mod segments;
 pub use segments::SegmentPosition;
-use segments::SegmentState;
+use segments::{SegmentFile, SegmentState};
 
 pub const PARTITION_WAL_BLOCK_SIZE: usize = 4096;
 pub const PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
@@ -167,7 +167,7 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     obsolete: VecDeque<PathBuf>,
     cleanup_directory_dirty: bool,
     recovered_prepares: Vec<Message<PrepareHeader>>,
-    segment_files: BTreeMap<(u64, u64), S::File>,
+    segment_files: BTreeMap<(u64, u64), SegmentFile<S::File>>,
     segment_files_dirty: bool,
     segment_links_dirty: bool,
     preallocate_segments: bool,
@@ -1024,6 +1024,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.poisoned = true;
         self.write_segment_bodies(prepares, &records).await?;
         self.retain_segment_inodes(&records).await?;
+        let _charge = DISK_USAGE.charge(extent.as_slice().len() as u64);
         self.file.write_aligned(self.state.length, extent).await?;
         for (op, record, _) in records {
             self.entries.insert(op, record);
@@ -1566,6 +1567,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 encoded.as_mut_slice(),
             )?;
             let length = encoded.as_slice().len();
+            let _charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(0, encoded).await?;
             entries.insert(
                 checkpoint,
@@ -1646,6 +1648,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 )?;
             }
             let length = encoded.as_slice().len();
+            let _charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(state.length, encoded).await?;
             entries.insert(
                 op,
@@ -2046,26 +2049,13 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(target_os = "linux")]
+    use server_common::fs_utils::supports_preallocation;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
 
     const REFERENCE_TEST_BODY_BYTES: usize = 1024 * 1024;
     #[cfg(target_os = "linux")]
     const FILE_BLOCK_BYTES: u64 = 512;
-
-    #[cfg(target_os = "linux")]
-    fn supports_preallocation(directory: &Path, length: u64) -> bool {
-        let probe = tempfile::tempfile_in(directory).unwrap();
-        match nix::fcntl::fallocate(
-            &probe,
-            nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            0,
-            i64::try_from(length).unwrap(),
-        ) {
-            Ok(()) => true,
-            Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => false,
-            Err(error) => panic!("preallocation probe failed: {error}"),
-        }
-    }
 
     /// Reclamation used to run at the head of every append, so an unlink and a
     /// directory barrier for a generation the append does not touch landed
@@ -3942,7 +3932,8 @@ mod tests {
 
         for preallocate in [false, true] {
             let partition = tempdir().unwrap();
-            let preallocation_supported = supports_preallocation(partition.path(), SEGMENT_BYTES);
+            let preallocation_supported =
+                supports_preallocation(partition.path(), SEGMENT_BYTES).unwrap();
             let directory = partition.path().join("prepares-7");
             let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
@@ -4027,6 +4018,52 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_a_preallocated_segment_when_truncating_its_tail_should_reserve_it_again() {
+        const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+        const BODY_BYTES: usize = 256 * 1024;
+
+        let partition = tempdir().unwrap();
+        if !supports_preallocation(partition.path(), SEGMENT_BYTES).unwrap() {
+            eprintln!("skipped: the temporary directory does not support fallocate");
+            return;
+        }
+        let mut journal = PartitionPrepareJournal::open_with_options(
+            &partition.path().join("prepares-7"),
+            42,
+            7,
+            DiskStorage,
+            WalOpenOptions {
+                capacity: PARTITION_WAL_BYTES_MAX,
+                preallocate_segments: true,
+                ..WalOpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), SEGMENT_BYTES, None)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let second = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.append(second.into_frozen()).await.unwrap();
+
+        journal.truncate_from(2).await.unwrap();
+
+        let metadata =
+            std::fs::metadata(partition.path().join("00000000000000000000.log")).unwrap();
+        assert_eq!(metadata.len(), BODY_BYTES as u64);
+        assert!(
+            metadata.blocks() * FILE_BLOCK_BYTES >= SEGMENT_BYTES,
+            "the truncated tail must be reserved up to the segment size again, since writes \
+             into it are charged only past that size; allocated {} bytes",
+            metadata.blocks() * FILE_BLOCK_BYTES
+        );
+    }
+
     #[compio::test]
     async fn owned_segments_install_checkpoint_bodies_with_and_without_public_data() {
         const BODY_BYTES: usize = 8192;
@@ -4092,7 +4129,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(installed.len(), initial.length);
-                if supports_preallocation(partition.path(), (4 * BODY_BYTES) as u64) {
+                if supports_preallocation(partition.path(), (4 * BODY_BYTES) as u64).unwrap() {
                     assert!(installed.blocks() * FILE_BLOCK_BYTES >= (4 * BODY_BYTES) as u64);
                 }
             }

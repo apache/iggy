@@ -24,7 +24,9 @@ type PollingStrategy struct {
 	Value uint64
 	// Context is the partition incarnation and owner a continuation offset was
 	// polled under. A stale context refuses the poll instead of reading that
-	// offset in another incarnation. Nil takes the context the route reports.
+	// offset in another incarnation. Nil or a zero context takes the context
+	// the route reports. A context without an incarnation takes the
+	// incarnation of the route and keeps its owner and op.
 	Context *PartitionContext
 	// partition binds a continuation to the partition that it continues.
 	partition *uint32
