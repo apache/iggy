@@ -33,7 +33,6 @@ ignored = [
     "async-channel",
     "async_zip",
     "axum",
-    "axum-server",
     "bytes",
     "chrono",
     "ctrlc",
@@ -41,7 +40,6 @@ ignored = [
     "cyper-axum",
     "dashmap",
     "err_trail",
-    "error_set",
     "figlet-rs",
     "hash32",
     "human-repr",
@@ -56,7 +54,6 @@ ignored = [
     "opentelemetry_sdk",
     "papaya",
     "rand",
-    "ringbuffer",
     "rmp-serde",
     "rolling-file",
     "rust-embed",
@@ -94,7 +91,6 @@ argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
-axum-server = { workspace = true }
 blake3 = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
@@ -112,7 +108,6 @@ cyper-core = { workspace = true }
 dashmap = { workspace = true }
 dotenvy = { workspace = true }
 err_trail = { workspace = true }
-error_set = { workspace = true }
 figlet-rs = { workspace = true }
 fs2 = { workspace = true }
 futures = { workspace = true }
@@ -141,7 +136,6 @@ partitions = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 ring = { workspace = true }
-ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
 rolling-file = { workspace = true }
 rust-embed = { workspace = true, optional = true }
@@ -158,7 +152,6 @@ socket2 = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }
 system_stats = { workspace = true }
-tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
@@ -193,6 +186,7 @@ quote = { workspace = true }
 # build still links `shard` without `simulator`.
 shard = { workspace = true, features = ["simulator"] }
 syn = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints.clippy]

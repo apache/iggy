@@ -27,7 +27,7 @@ ignored = ["cfg_aliases"]
 
 [features]
 default = ["login-session"]
-login-session = ["dep:zbus-secret-service-keyring-store"]
+login-session = []
 
 [dependencies]
 assert_cmd = { workspace = true }
@@ -65,9 +65,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-zbus-secret-service-keyring-store = { workspace = true, optional = true }
-
 [build-dependencies]
 cfg_aliases = { workspace = true }
 
@@ -97,6 +94,9 @@ tempfile = { workspace = true }
 test-case = { workspace = true }
 twox-hash = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dev-dependencies]
+zbus-secret-service-keyring-store = { workspace = true }
 
 [lints]
 workspace = true
