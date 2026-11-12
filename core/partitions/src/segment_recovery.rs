@@ -452,6 +452,18 @@ pub enum PartitionRecoveryError {
         path: String,
         source: std::io::Error,
     },
+    /// A recovered consumer offset past the partition's offset space could not
+    /// be rewritten or removed in its file, or the change could not be synced.
+    /// Boot fails on it: a file left at the old value brings that value back
+    /// on the next boot.
+    ConsumerOffsetClamp {
+        consumer_kind: &'static str,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        path: String,
+        source: Box<IggyError>,
+    },
     /// Transient I/O with no structural verdict attached. Boot fails on it
     /// rather than fencing, so a retried boot can still serve the partition.
     /// The reconciler logs it and retries the partition with backoff.
@@ -496,6 +508,18 @@ impl std::fmt::Display for PartitionRecoveryError {
                 "failed to create offsets directory {path} for stream {stream_id}, \
                  topic {topic_id}, partition {partition_id}: {source}"
             ),
+            Self::ConsumerOffsetClamp {
+                consumer_kind,
+                stream_id,
+                topic_id,
+                partition_id,
+                path,
+                source,
+            } => write!(
+                f,
+                "failed to clamp the persisted {consumer_kind} offset at {path} for stream \
+                 {stream_id}, topic {topic_id}, partition {partition_id}: {source}"
+            ),
             Self::Iggy(source) => write!(f, "{source}"),
         }
     }
@@ -504,8 +528,10 @@ impl std::fmt::Display for PartitionRecoveryError {
 impl std::error::Error for PartitionRecoveryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            // Both put the cause in the Display text, the only part boot logs.
-            Self::Refused { .. } | Self::CreateOffsetsDirectory { .. } => None,
+            // These put the cause in the Display text, the only part boot logs.
+            Self::Refused { .. }
+            | Self::CreateOffsetsDirectory { .. }
+            | Self::ConsumerOffsetClamp { .. } => None,
             Self::ConsumerOffsetsLoad { source, .. } => Some(source.as_ref()),
             Self::Iggy(source) => std::error::Error::source(source),
         }

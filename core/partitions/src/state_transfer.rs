@@ -1685,7 +1685,9 @@ pub enum PartitionTransferUnavailable {
     },
     /// Primary-by-index of a group that has committed nothing: an empty group
     /// is trivially "caught up", so this is the only thing separating a real
-    /// primary from a view-0 phantom whose directory vanished.
+    /// primary from a view-0 phantom whose directory vanished. The primary of
+    /// a group of two that holds nothing serves instead, because this refusal
+    /// would never end there.
     NothingCommitted,
     /// More retained segments than the manifest can carry entries for.
     ManifestTooLarge {
@@ -1836,9 +1838,10 @@ pub enum PartitionInstallError {
         commit_op: u64,
         commit_min: u64,
     },
-    /// The install wipes the journal, which holds an op above `commit_op` that
-    /// this replica may have acknowledged: one at or below `held_max`, its
-    /// accepted WAL head, or the known commit without a WAL.
+    /// The install wipes the journal and resets the WAL, which hold an op above
+    /// `commit_op` that this replica may have acknowledged: one at or below
+    /// `held_max`, its accepted WAL head, the known commit without a WAL, or
+    /// the commit point the WAL names when boot skipped its replay.
     OfferErasesHeldOps {
         commit_op: u64,
         held_max: u64,
@@ -2244,7 +2247,8 @@ fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
     )
 }
 
-/// Consumer-offset files written concurrently while installing a transfer.
+/// Consumer-offset files written concurrently while installing a transfer or
+/// clamping recovered offsets at boot.
 /// Each is an open + write + optional fsync, so the width trades reactor queue
 /// depth against how long one partition monopolises it; matches the tick's
 /// superblock pre-pass.
@@ -2619,23 +2623,48 @@ where
         if self.repair.is_some() {
             return Err(PartitionTransferUnavailable::RepairInProgress);
         }
-        // Primary-by-index at view 0 over an empty log passes every gate above
-        // yet knows nothing: a group whose directory is absent boots through
-        // `consensus.init()`, comes up Normal at view 0, and an empty group is
-        // trivially "caught up". Its offer would be zero segments at frontier
-        // 0, which makes a receiver holding real data unlink its own chain.
+        // A primary by index over an empty log passes every gate above yet can
+        // know nothing: a group whose directory is absent boots through
+        // `consensus.init()`, comes up Normal, and an empty group is trivially
+        // "caught up". Its offer would be zero segments at frontier 0, which
+        // tells a receiver holding real data to unlink its own chain.
         //
-        // A RESTARTED replica holding a full chain matches this shape too
-        // (`commit_max == 0` because the partition journal is memory-only,
-        // `installed_frontier == None` for a recovered non-empty chain). That
-        // is the load-bearing reason this refusal is safe rather than a
-        // wedge: every transfer-arm site presupposes a peer that already
-        // reported commit > 0 (repair floor refusals, StartView adoption), so
-        // nobody ever asks a cluster where everything still reports 0.
-        // Extending the gate with `recovered_durable_offset.is_some()` would
-        // be WRONG: such an offer carries `commit_op = 0`, so the receiver's
-        // floor becomes a no-op while its counter jumps to the frontier.
-        if self.consensus().commit_max() == 0 && self.installed_frontier.is_none() {
+        // A RESTARTED replica holding a full chain matches this shape too: WAL
+        // replay restores the commit point from the checkpoint and the commit
+        // numbers in its prepares, which can all be 0, and
+        // `installed_frontier` is `None` for a recovered chain. Its offer
+        // would carry `commit_op = 0`, so the receiver's floor becomes a no-op
+        // while its counter jumps to the frontier.
+        //
+        // In a group of three or more the other members commit without the
+        // requester, and the first commit ends the refusal. In a group of two
+        // the requester is the only other member and acknowledges nothing
+        // while it waits, so the refusal would never end. There the primary
+        // serves when it holds nothing applied and no consumer offset: the
+        // offer is its true state at op 0, and the prepares it journaled reach
+        // the receiver by replication or repair. The boot clamp removes each
+        // consumer and group offset from a log that holds nothing, so only an
+        // external group offset keeps such a primary from serving.
+        //
+        // A primary that lost its storage unnoticed looks the same, so the
+        // receiver's own refusals stay the guard for what it still holds: its
+        // sized segments, its stored consumer offsets and a WAL that names a
+        // commit. Its superblock record is no guard: a group that acks before
+        // it persists ignores the record, see `restore_offset_frontier`. A
+        // replica that itself waits for a transfer skipped its WAL replay and
+        // can read as empty while its WAL holds prepares, so it never serves.
+        let empty_group_of_two = || {
+            self.consensus().replica_count() == 2
+                && !self.materialization_missing
+                && self.held_offset_frontier() == 0
+                && ConsumerKind::ALL
+                    .into_iter()
+                    .all(|kind| self.durable_consumer_offsets.count(kind) == 0)
+        };
+        if self.consensus().commit_max() == 0
+            && self.installed_frontier.is_none()
+            && !empty_group_of_two()
+        {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
         if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
@@ -3657,6 +3686,17 @@ where
             }
             InstallPhase::WalReset => {
                 if let Some(persistence) = &self.persistence {
+                    let wal_head = persistence.head();
+                    if wal_head > install.commit_op {
+                        tracing::warn!(
+                            namespace_raw = self.consensus().group(),
+                            commit_op = install.commit_op,
+                            wal_head,
+                            wal_commit = self.unreplayed_commit,
+                            "partition state transfer install resets a WAL that holds ops \
+                             above the offer"
+                        );
+                    }
                     let prepare =
                         (!install.offsets_wire.checkpoint_prepare.is_empty()).then(|| {
                             Owned::<4096>::copy_from_slice(&install.offsets_wire.checkpoint_prepare)
@@ -4104,7 +4144,12 @@ where
                 }
                 InstallFilePhase::CommitOffsets { start, end } => {
                     for write in &install.planned_offsets[start..end] {
-                        self.publish_transferred_offset(write);
+                        self.publish_persisted_offset(
+                            write.kind,
+                            write.id,
+                            write.value,
+                            write.path.clone(),
+                        );
                         install.offset_dirs_changed[write.kind.index()] = true;
                     }
                     InstallPhase::CommitOffsets(end)
@@ -4309,28 +4354,31 @@ where
         }
     }
 
-    fn publish_transferred_offset(&self, write: &PlannedOffsetWrite) {
-        let entry = ConsumerOffset::new(write.kind, write.id, write.value, write.path.clone());
-        match write.kind {
+    /// Publish an offset whose file at `path` already holds `value`. An install
+    /// and the boot clamp both end a file write with it.
+    pub(crate) fn publish_persisted_offset(
+        &self,
+        kind: ConsumerKind,
+        id: u32,
+        value: u64,
+        path: String,
+    ) {
+        let entry = ConsumerOffset::new(kind, id, value, path);
+        match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().insert(write.id as usize, entry);
+                self.consumer_offsets.pin().insert(id as usize, entry);
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
                     .pin()
-                    .insert(ConsumerGroupId(write.id as usize), entry);
+                    .insert(ConsumerGroupId(id as usize), entry);
             }
             // Recorded below: the durable table is the only store of an external offset.
             ConsumerKind::ExternalGroup => {}
         }
-        self.durable_consumer_offsets.record_explicit(
-            write.kind,
-            write.id,
-            write.value,
-            write.value,
-        );
-        self.consumer_offset_capacity_for(write.kind)
-            .clear_stranded(write.id);
+        self.durable_consumer_offsets
+            .record_explicit(kind, id, value, value);
+        self.consumer_offset_capacity_for(kind).clear_stranded(id);
     }
 
     fn publish_installed_state(&mut self, install: &mut PendingInstall) {
@@ -4514,6 +4562,20 @@ where
             return Err(PartitionInstallError::OfferErasesHeldOps {
                 commit_op,
                 held_max,
+            });
+        }
+        // A replica that booted awaiting a transfer skipped its WAL replay, so
+        // the journal read above is empty while its WAL still holds ops. An
+        // offer at op 0 comes from a primary that holds nothing applied, and a
+        // commit number in that WAL proves the group committed an op that the
+        // offer would erase. Offers above op 0 pass: a commit number is a lower
+        // bound, so a primary holding every op can offer less than this WAL
+        // names, and in a group of two the refusal would never end, because a
+        // waiting replica acknowledges nothing.
+        if commit_op == 0 && self.unreplayed_commit > 0 {
+            return Err(PartitionInstallError::OfferErasesHeldOps {
+                commit_op,
+                held_max: self.unreplayed_commit,
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;

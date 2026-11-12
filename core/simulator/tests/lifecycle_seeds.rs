@@ -46,6 +46,7 @@ const LIFECYCLE_ARGS: &[&str] = &[
     "--faults",
     "swarm",
     "--crash-primary",
+    "--require-faults",
 ];
 
 /// [`LIFECYCLE_ARGS`] on the consumer plane, which polls and joins and leaves
@@ -92,6 +93,7 @@ fuzz_seeds! {
     given_seed_18_when_lifecycle_runs_should_pass_every_floor => 18,
     given_seed_21_when_lifecycle_runs_should_pass_every_floor => 21,
     given_seed_23_when_lifecycle_runs_should_pass_every_floor => 23,
+    given_seed_178_when_lifecycle_runs_should_pass_every_floor => 178,
 }
 
 fuzz_seeds! {

@@ -699,8 +699,12 @@ itself. A partition that was deleted and created again stops with
 seek. If a message does not decode, pass `skip` to `seek()` to read past it.
 A lost read can commit messages that the reader cannot read again. Then the
 reader raises `FetchProgressUncertain` (14010) once. Its `lost` holds the first
-and last offset of those messages as `(first, last)`, and `skip` the
-continuation after them.
+and last offset of those messages as `(first, last)`. This error stops nothing
+and needs no seek. A seek after it drops the batch that follows the range. If
+the reader stopped the partition, the error that stopped it comes after that
+batch. Earlier versions gave this error a `skip` after the range. Code that
+handles `FetchProgressUncertain` with an abandon and a `seek()` must now check
+`lost` first and do neither for this error.
 
 ## Interpreter Exit
 

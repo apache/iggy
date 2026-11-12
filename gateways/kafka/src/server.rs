@@ -20,9 +20,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iggy_kafka_wire::KafkaWireError;
-use kafka_protocol::messages::RequestHeader;
+use kafka_protocol::messages::{ApiKey, RequestHeader};
 use kafka_protocol::protocol::Decodable;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -45,6 +46,10 @@ use crate::coordinator::{Coordination, CoordinationConfig};
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{BrokerEntry, ListenerConfig, SecurityProtocol, check_brokers, peers_of};
+use crate::observability::{
+    Census, CensusSource, CloseCause, Disconnect, FrameTimeout, ListenerCensus, Observability,
+    Pool, PoolCensus,
+};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
     Brokers, ConnectionState, DEFAULT_KAFKA_PORT, DEFAULT_NODE_ID, ERROR_ILLEGAL_SASL_STATE,
@@ -356,6 +361,7 @@ pub struct KafkaGateway {
     bridge: Option<Arc<IggyBridge>>,
     principal_resolver: Option<Arc<dyn PrincipalResolver>>,
     cluster_id: Option<ClusterId>,
+    observability: Arc<Observability>,
 }
 
 /// Owned by [`KafkaGateway::run`] and shared by every connection it serves.
@@ -428,7 +434,19 @@ impl KafkaGateway {
             bridge: None,
             principal_resolver: None,
             cluster_id: None,
+            observability: Arc::new(Observability::new()),
         }
+    }
+
+    /// Reports metrics and readiness to `observability`, which an [`HttpEndpoint`] serves.
+    ///
+    /// Without it the gateway keeps its own, which nothing reads.
+    ///
+    /// [`HttpEndpoint`]: crate::observability::HttpEndpoint
+    #[must_use]
+    pub fn with_observability(mut self, observability: Arc<Observability>) -> Self {
+        self.observability = observability;
+        self
     }
 
     /// Serve requests against `bridge` instead of the stub answers.
@@ -565,20 +583,8 @@ impl KafkaGateway {
             tokio::spawn(Arc::clone(tls).reload_until_cancelled(cancel.child_token()));
         }
 
-        let mut accept_loops = JoinSet::new();
-        for (listener, socket) in bound {
-            accept_loops.spawn(accept_loop(AcceptLoop {
-                socket,
-                listener,
-                config: Arc::clone(&self.config),
-                state: Arc::clone(&state),
-                auth: Arc::clone(&shared_auth),
-                tracker: tracker.clone(),
-                conn_limiter: Arc::new(Semaphore::new(self.config.max_connections)),
-                cancel: cancel.clone(),
-                tls: tls.clone(),
-            }));
-        }
+        let mut accept_loops =
+            self.accept_on(bound, &state, &shared_auth, &tracker, &cancel, tls.as_ref());
 
         let outcome = tokio::select! {
             result = shutdown.recv() => {
@@ -600,6 +606,8 @@ impl KafkaGateway {
                 Err(join_error) => Err(io::Error::other(join_error).into()),
             },
         };
+        // First, so an orchestrator sends no new client here while the connections drain.
+        self.observability.draining();
         // The accept loops stop first, so no connection is spawned after the drain starts waiting.
         // Aborted, not cancelled: the connections still answer while the drain hands groups over.
         accept_loops.shutdown().await;
@@ -609,7 +617,54 @@ impl KafkaGateway {
         state
             .shutdown_auto_topic_creation(auto_topic_creation::SHUTDOWN_WAIT)
             .await;
+        self.observability.stopped();
         outcome
+    }
+
+    /// Starts an accept loop on each listener of `bound`, then reports the gateway as serving.
+    fn accept_on(
+        &self,
+        bound: Vec<(Arc<Listener>, TcpListener)>,
+        state: &Arc<GatewayState>,
+        auth: &Arc<SharedAuth>,
+        tracker: &TaskTracker,
+        cancel: &CancellationToken,
+        tls: Option<&Arc<TlsState>>,
+    ) -> JoinSet<()> {
+        let mut accept_loops = JoinSet::new();
+        let mut connection_limits = Vec::with_capacity(bound.len());
+        for (listener, socket) in bound {
+            let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
+            connection_limits.push((listener.protocol, Arc::clone(&conn_limiter)));
+            accept_loops.spawn(accept_loop(AcceptLoop {
+                socket,
+                listener,
+                config: Arc::clone(&self.config),
+                state: Arc::clone(state),
+                auth: Arc::clone(auth),
+                tracker: tracker.clone(),
+                conn_limiter,
+                cancel: cancel.clone(),
+                tls: tls.cloned(),
+                observability: Arc::clone(&self.observability),
+            }));
+        }
+        let census = ServingView {
+            state: Arc::clone(state),
+            auth: Arc::clone(auth),
+            connection_limits,
+            max_connections: self.config.max_connections,
+            max_concurrent_authentications: self.config.max_concurrent_authentications,
+            maps_certificates: self.config.maps_certificate_identities(),
+        };
+        // Only when `/ready` has a reader: the probe opens an Iggy session of its own.
+        let iggy = self
+            .bridge
+            .as_ref()
+            .filter(|_| self.observability.is_published())
+            .map(|bridge| bridge.reach());
+        self.observability.serving(Arc::new(census), iggy);
+        accept_loops
     }
 
     /// The state every connection of [`Self::run`] shares. The group coordinator stops with
@@ -839,6 +894,80 @@ fn warn_on_own_entry(
     }
 }
 
+/// What a scrape of the metrics reads of a serving gateway.
+struct ServingView {
+    state: Arc<GatewayState>,
+    auth: Arc<SharedAuth>,
+    /// Each listener's connection permits.
+    connection_limits: Vec<(SecurityProtocol, Arc<Semaphore>)>,
+    max_connections: usize,
+    max_concurrent_authentications: usize,
+    /// Whether an `SSL` listener looks up the Iggy user of each client certificate.
+    maps_certificates: bool,
+}
+
+#[async_trait]
+impl CensusSource for ServingView {
+    async fn census(&self) -> Census {
+        let listeners = self
+            .connection_limits
+            .iter()
+            .map(|(protocol, permits)| ListenerCensus {
+                protocol: *protocol,
+                open: self
+                    .max_connections
+                    .saturating_sub(permits.available_permits()),
+                limit: self.max_connections,
+            })
+            .collect();
+        let slots = self.max_concurrent_authentications;
+        let in_use = |free: usize| slots.saturating_sub(free);
+        let mut pools = Vec::with_capacity(4);
+        if self.auth.authenticator.is_some() {
+            pools.push(PoolCensus {
+                pool: Pool::Authentication,
+                used: in_use(self.auth.slots.available_permits()),
+                capacity: slots,
+            });
+        }
+        if self.maps_certificates {
+            pools.push(PoolCensus {
+                pool: Pool::CertificateLookup,
+                used: in_use(self.auth.lookup_slots.available_permits()),
+                capacity: slots,
+            });
+        }
+        let bridge = self.state.bridge.as_deref();
+        // Fetch and Produce use their pools only with a bridge. Without one they answer stubs.
+        let produce_memory = bridge.map(|bridge| {
+            let (used, capacity) = bridge.fetch_slot_use();
+            pools.push(PoolCensus {
+                pool: Pool::Fetch,
+                used,
+                capacity,
+            });
+            let (large, memory) = self.state.produce_use();
+            pools.push(large);
+            memory
+        });
+        Census {
+            listeners,
+            pools,
+            produce_memory,
+            produce_sessions: bridge.map(IggyBridge::produce_sessions),
+            groups: self.state.groups.census().await,
+            coordinator: self
+                .state
+                .coordination
+                .as_ref()
+                .map(|coordination| coordination.census()),
+            sends_in_doubt: bridge.map(IggyBridge::sends_in_doubt),
+            // The readiness knows it. `Observability::render_metrics` fills it in.
+            iggy_reachable: None,
+        }
+    }
+}
+
 /// Everything one listener's accept loop needs, bundled so the loop is one spawnable future.
 struct AcceptLoop {
     socket: TcpListener,
@@ -850,6 +979,7 @@ struct AcceptLoop {
     conn_limiter: Arc<Semaphore>,
     cancel: CancellationToken,
     tls: Option<Arc<TlsState>>,
+    observability: Arc<Observability>,
 }
 
 /// Accepts on one listener until the cancel token fires. No `accept()` error ends it, because the
@@ -868,10 +998,16 @@ async fn accept_loop(this: AcceptLoop) {
         match accepted {
             Ok((stream, peer)) => {
                 backoff.reset();
+                let protocol = this.listener.protocol;
                 let Ok(permit) = Arc::clone(&this.conn_limiter).try_acquire_owned() else {
-                    warn!(%peer, protocol = %this.listener.protocol, max_connections = this.config.max_connections, "listener connection limit reached, rejecting");
+                    this.observability.connection_refused(
+                        peer,
+                        protocol,
+                        this.config.max_connections,
+                    );
                     continue;
                 };
+                this.observability.connection_accepted(protocol);
                 if let Err(e) = stream.set_nodelay(true) {
                     warn!(%peer, "TCP_NODELAY failed: {e}");
                 }
@@ -886,6 +1022,7 @@ async fn accept_loop(this: AcceptLoop) {
                     auth: Arc::clone(&this.auth),
                     cancel: this.cancel.child_token(),
                     tls: this.tls.clone(),
+                    observability: Arc::clone(&this.observability),
                 };
                 this.tracker.spawn(async move {
                     let _permit = permit;
@@ -949,72 +1086,71 @@ struct Connection {
     auth: Arc<SharedAuth>,
     cancel: CancellationToken,
     tls: Option<Arc<TlsState>>,
+    observability: Arc<Observability>,
 }
 
-/// Runs the TLS handshake when the listener calls for one, then the frame loop.
+/// Serves one accepted connection, then counts and logs why it closed.
 async fn serve_connection(stream: TcpStream, connection: Connection) {
     let peer = connection.peer;
-    let result = if connection.listener.protocol.uses_tls() {
-        let Some(tls) = connection.tls.clone() else {
-            // `check_tls_wiring` refuses to start a TLS listener without material.
-            error!(%peer, "TLS listener accepted a connection with no TLS material loaded");
-            return;
-        };
-        // Bounded like everything else a connection does before proving who it is: an
-        // unfinished handshake holds a `max_connections` permit.
-        let handshake = timeout(
-            connection.config.pre_auth_timeout,
-            tls.acceptor(connection.listener.protocol).accept(stream),
-        );
-        let handshake = tokio::select! {
-            () = connection.cancel.cancelled() => {
-                debug!(%peer, "TLS handshake abandoned by shutdown");
-                return;
-            }
-            handshake = handshake => handshake,
-        };
-        let tls_stream = match handshake {
-            Ok(Ok(tls_stream)) => tls_stream,
-            Ok(Err(error)) => {
-                // debug!, not warn!: a plaintext client on the TLS port, an untrusted client
-                // certificate or a scanner all end here, none of them operator-actionable.
-                debug!(%peer, %error, "TLS handshake failed");
-                return;
-            }
-            Err(_elapsed) => {
-                debug!(%peer, "TLS handshake did not finish within the pre-authentication budget");
-                return;
-            }
-        };
-        let certificate_name = if connection.listener.protocol.authenticates_by_certificate() {
-            match tls.principal_name(tls_stream.get_ref().1) {
-                Ok(name) => name,
-                // warn!: the CA signed this certificate, so a subject no rule maps is a mapping
-                // rule the operator has to fix.
-                Err(IdentityError::NoMatchingRule { subject }) => {
-                    warn!(%peer, subject, "client certificate subject matches no principal mapping rule; closing");
-                    return;
-                }
-                Err(error) => {
-                    debug!(%peer, %error, "client certificate names no principal; closing");
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        handle_connection(tls_stream, connection, certificate_name).await
+    let protocol = connection.listener.protocol;
+    let observability = Arc::clone(&connection.observability);
+    let disconnect = if protocol.uses_tls() {
+        serve_tls(stream, connection).await
     } else {
         handle_connection(stream, connection, None).await
     };
-    if let Err(err) = result {
-        // debug!, not warn!: every `KafkaProtocolError` that can reach here is either a
-        // malformed/oversized frame from the client (attacker-controlled, not
-        // operator-actionable) or a plain TCP reset/EOF - never an internal gateway fault. A
-        // flood of either at warn! would drown real signal in logs under adversarial load (same
-        // reasoning as the decode-failure downgrades in `protocol/api.rs`).
-        debug!(%peer, "connection closed with error: {err}");
-    }
+    observability.connection_closed(peer, protocol, &disconnect);
+}
+
+/// Runs the TLS handshake, names the client certificate's principal on an `SSL` listener, then
+/// runs the frame loop.
+async fn serve_tls(stream: TcpStream, connection: Connection) -> Disconnect {
+    let Some(tls) = connection.tls.clone() else {
+        // `check_tls_wiring` refuses to start a TLS listener without material.
+        return Disconnect::with_detail(
+            CloseCause::InternalError,
+            "a TLS listener has no TLS material loaded",
+        );
+    };
+    // Bounded like everything else a connection does before proving who it is: an unfinished
+    // handshake holds a `max_connections` permit.
+    let handshake = timeout(
+        connection.config.pre_auth_timeout,
+        tls.acceptor(connection.listener.protocol).accept(stream),
+    );
+    let handshake = tokio::select! {
+        () = connection.cancel.cancelled() => return Disconnect::new(CloseCause::Shutdown),
+        handshake = handshake => handshake,
+    };
+    let tls_stream = match handshake {
+        Ok(Ok(tls_stream)) => tls_stream,
+        // A plaintext client on the TLS port, an untrusted client certificate and a scanner all
+        // end here.
+        Ok(Err(error)) => return Disconnect::with_detail(CloseCause::TlsHandshakeFailed, error),
+        Err(_elapsed) => {
+            return Disconnect::with_detail(
+                CloseCause::TlsHandshakeFailed,
+                "the handshake did not finish within IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
+            );
+        }
+    };
+    let certificate_name = if connection.listener.protocol.authenticates_by_certificate() {
+        match tls.principal_name(tls_stream.get_ref().1) {
+            Ok(name) => name,
+            // The CA signed this certificate, so a subject no rule maps is a mapping rule the
+            // operator has to fix.
+            Err(IdentityError::NoMatchingRule { subject }) => {
+                return Disconnect::with_detail(
+                    CloseCause::CertificateRejected,
+                    format!("subject {subject} matches no principal mapping rule"),
+                );
+            }
+            Err(error) => return Disconnect::with_detail(CloseCause::CertificateRejected, error),
+        }
+    } else {
+        None
+    };
+    handle_connection(tls_stream, connection, certificate_name).await
 }
 
 /// Hand the groups to the other gateways, cancel in-flight connections, close the tracker to new
@@ -1091,7 +1227,44 @@ struct ConnectionContext<'a> {
     cancel: &'a CancellationToken,
 }
 
-/// Decides what one decoded frame earns, advancing `sasl_state` when it authenticates.
+/// What a close after one request means: its cause, and the reason the log line adds to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Closing {
+    cause: CloseCause,
+    reason: Option<&'static str>,
+}
+
+impl From<CloseCause> for Closing {
+    fn from(cause: CloseCause) -> Self {
+        Self {
+            cause,
+            reason: None,
+        }
+    }
+}
+
+impl From<Closing> for Disconnect {
+    fn from(closing: Closing) -> Self {
+        closing.reason.map_or_else(
+            || Self::new(closing.cause),
+            |reason| Self::with_detail(closing.cause, reason),
+        )
+    }
+}
+
+impl Closing {
+    /// The disconnect of a close after `req`.
+    fn disconnect(self, req: &RequestHeader) -> Disconnect {
+        let request = request_name(req);
+        match self.reason {
+            Some(reason) => Disconnect::with_detail(self.cause, format!("{request}: {reason}")),
+            None => Disconnect::with_detail(self.cause, request),
+        }
+    }
+}
+
+/// Decides what one decoded frame earns, advancing `sasl_state` when it authenticates. Also
+/// returns what a close of the connection by that answer means.
 ///
 /// Split out of [`handle_connection`] so the loop stays about framing and this stays about the
 /// SASL state machine.
@@ -1101,7 +1274,7 @@ async fn route_frame(
     principal: &mut Option<AuthenticatedPrincipal>,
     req: &RequestHeader,
     body: Bytes,
-) -> HandleOutcome {
+) -> (HandleOutcome, Closing) {
     let peer = ctx.peer;
 
     // The mechanism name lives in the handshake body, and the state machine needs it to decide.
@@ -1127,10 +1300,12 @@ async fn route_frame(
         SaslAction::Dispatch
             if ctx.listener.acls_enabled && req.request_api_key == API_KEY_DESCRIBE_ACLS =>
         {
-            describe_acls(ctx, principal.as_ref(), req.request_api_version, body)
+            let (outcome, cause) =
+                describe_acls(ctx, principal.as_ref(), req.request_api_version, body);
+            (outcome, cause.into())
         }
         SaslAction::Dispatch => {
-            handle_connection_request(
+            let outcome = handle_connection_request(
                 ctx.state,
                 ctx.connection,
                 principal.as_ref(),
@@ -1138,7 +1313,9 @@ async fn route_frame(
                 req.request_api_version,
                 body,
             )
-            .await
+            .await;
+            // A failed `acks=0` Produce closes by its own outcome, with its own cause.
+            (outcome, CloseCause::RequestRefused.into())
         }
         SaslAction::DispatchPreAuthApiVersions => {
             // Counted whatever the answer says. A refusal the client is entitled to retry at a
@@ -1148,7 +1325,7 @@ async fn route_frame(
             // on every frame and holding a `max_connections` permit with it.
             sasl_state.count_api_versions_answer();
             // Pre-authentication by construction: no principal exists yet at this point.
-            handle_connection_request(
+            let outcome = handle_connection_request(
                 ctx.state,
                 ctx.connection,
                 None,
@@ -1156,39 +1333,44 @@ async fn route_frame(
                 req.request_api_version,
                 body,
             )
-            .await
+            .await;
+            (outcome, CloseCause::RequestRefused.into())
         }
         SaslAction::AcceptHandshake(mechanism) => {
             let api_version = req.request_api_version;
             debug!(%peer, %mechanism, api_version, "SASL mechanism negotiated");
             *sasl_state = SaslState::awaiting_token(mechanism, api_version);
-            sasl_handshake_outcome(api_version, ERROR_NONE, false)
+            (
+                sasl_handshake_outcome(api_version, ERROR_NONE, false),
+                CloseCause::RequestRefused.into(),
+            )
         }
-        SaslAction::RejectMechanism => sasl_handshake_outcome(
-            req.request_api_version,
-            ERROR_UNSUPPORTED_SASL_MECHANISM,
-            true,
+        SaslAction::RejectMechanism => (
+            sasl_handshake_outcome(
+                req.request_api_version,
+                ERROR_UNSUPPORTED_SASL_MECHANISM,
+                true,
+            ),
+            CloseCause::UnsupportedSaslMechanism.into(),
         ),
         // No schema exists at the version the client asked for, and a body shaped for another
         // version would be misparsed.
-        SaslAction::RejectHandshakeVersion => HandleOutcome::Close,
-        SaslAction::RejectAuthenticateVersion => {
-            debug!(
-                %peer,
-                api_version = req.request_api_version,
-                "SaslAuthenticate version out of range; closing connection"
-            );
-            HandleOutcome::Close
+        SaslAction::RejectHandshakeVersion | SaslAction::RejectAuthenticateVersion => {
+            (HandleOutcome::Close, CloseCause::RequestRefused.into())
         }
         SaslAction::Authenticate => {
             let (outcome, verified) = authenticate_token(ctx, req.request_api_version, body).await;
-            // Only a plain `Respond` is success: every refusal path answers with
-            // `RespondThenClose`, so the state advances on exactly the accepting branch.
-            if matches!(outcome, HandleOutcome::Respond(_)) {
-                *sasl_state = SaslState::Authenticated;
-                *principal = verified;
+            match verified {
+                // Only a plain `Respond` is success: every refusal path answers with
+                // `RespondThenClose`, so the state advances on exactly the accepting branch.
+                Ok(verified) if matches!(outcome, HandleOutcome::Respond(_)) => {
+                    *sasl_state = SaslState::Authenticated;
+                    *principal = Some(verified);
+                    (outcome, CloseCause::InternalError.into())
+                }
+                Ok(_) => (outcome, CloseCause::InternalError.into()),
+                Err(closing) => (outcome, closing),
             }
-            outcome
         }
         SaslAction::IllegalState | SaslAction::IllegalStateKeepOpen => {
             debug!(
@@ -1196,13 +1378,25 @@ async fn route_frame(
                 api_key = req.request_api_key,
                 "request rejected: not legal in this connection's SASL state"
             );
-            illegal_state_outcome(
+            let outcome = illegal_state_outcome(
                 req.request_api_key,
                 req.request_api_version,
                 matches!(action, SaslAction::IllegalStateKeepOpen),
                 ctx.listener.advertisement(),
-            )
+            );
+            (outcome, CloseCause::IllegalSaslState.into())
         }
+    }
+}
+
+/// `Produce v9`, or `API key 4242` for a key Kafka does not define, for a log line.
+fn request_name(req: &RequestHeader) -> String {
+    match ApiKey::try_from(req.request_api_key) {
+        Ok(key) => format!("{key:?} v{}", req.request_api_version),
+        Err(()) => format!(
+            "API key {} v{}",
+            req.request_api_key, req.request_api_version
+        ),
     }
 }
 
@@ -1211,7 +1405,7 @@ async fn handle_connection<S>(
     stream: S,
     connection: Connection,
     certificate_name: Option<String>,
-) -> Result<()>
+) -> Disconnect
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -1220,15 +1414,15 @@ where
         .connection_state()
         .with_peer(connection.peer);
     let bridge = connection.state.bridge.clone();
-    let served = serve_frames(stream, connection, certificate_name, &connection_state).await;
+    let disconnect = serve_frames(stream, connection, certificate_name, &connection_state).await;
     // A producer without a producer id has its Produce session by connection, so it ends here.
     if let Some(bridge) = bridge {
         bridge.end_connection(connection_state.id());
     }
-    served
+    disconnect
 }
 
-/// The frame loop of one accepted connection.
+/// The frame loop of one accepted connection, until the connection closes. Returns why.
 ///
 /// `certificate_name` is the Iggy username the client certificate mapped to, on an `SSL`
 /// listener that verifies certificates. It is resolved against Iggy before the first frame, and
@@ -1239,7 +1433,7 @@ async fn serve_frames<S>(
     connection: Connection,
     certificate_name: Option<String>,
     connection_state: &ConnectionState,
-) -> Result<()>
+) -> Disconnect
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -1251,6 +1445,7 @@ where
         auth: shared_auth,
         cancel,
         tls: _,
+        observability,
     } = connection;
     debug!(%peer, protocol = %listener.protocol, "connection accepted");
 
@@ -1277,10 +1472,10 @@ where
     let mut permissions =
         PermissionFollow::new(state.bridge.as_deref(), certificate_name.is_some());
     let mut principal = if let Some(username) = certificate_name {
-        let Some(resolved) = resolve_certificate_principal(&ctx, &username).await else {
-            return Ok(());
-        };
-        Some(resolved)
+        match resolve_certificate_principal(&ctx, &username).await {
+            Ok(resolved) => Some(resolved),
+            Err(disconnect) => return disconnect,
+        }
     } else if listener.anonymous_without_principal {
         Some(AuthenticatedPrincipal::anonymous())
     } else {
@@ -1288,62 +1483,56 @@ where
     };
 
     loop {
-        let idle_budget = if sasl_state.is_authenticated() {
-            config.idle_timeout
-        } else {
-            config.pre_auth_timeout
+        let frame = match next_frame(&mut stream, &config, &sasl_state, &cancel).await {
+            Ok(frame) => frame,
+            Err(disconnect) => return disconnect,
         };
-        // A bare token gets the cap of a token, so the reader never buffers more than one holds.
-        let frame_cap = if sasl_state.awaits_raw_token() {
-            MAX_SASL_AUTH_BYTES
-        } else {
-            config.max_frame_size
-        };
-        let Some(frame) =
-            read_next_frame(&mut stream, &config, frame_cap, idle_budget, &peer, &cancel).await?
-        else {
-            return Ok(());
-        };
+        let started = Instant::now();
 
         // After a v0 handshake, the frame is the bare token, with no request header to parse.
         if sasl_state.awaits_raw_token() {
-            if !authenticate_raw_token(&ctx, &mut stream, &frame, &mut principal, &mut permissions)
-                .await?
+            if let Err(disconnect) =
+                authenticate_raw_token(&ctx, &mut stream, &frame, &mut principal, &mut permissions)
+                    .await
             {
-                return Ok(());
+                return disconnect;
             }
             sasl_state = SaslState::Authenticated;
             continue;
         }
 
-        let (req, resp_hdr_ver, body) = decode_request(frame, &peer, connection_state)?;
-        let Some(revision) = permissions.apply(principal.as_mut(), &peer) else {
-            return Ok(());
+        let (req, resp_hdr_ver, body) = match decode_request(frame, &peer, connection_state) {
+            Ok(decoded) => decoded,
+            Err(error) => return Disconnect::from_error(&error),
+        };
+        let revision = match permissions.apply(principal.as_mut()) {
+            Ok(revision) => revision,
+            Err(disconnect) => return disconnect,
         };
         let signed_in = principal.is_some();
-        let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
+        let (outcome, closing) =
+            route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
         if !signed_in && principal.is_some() {
             permissions.signed_in(revision);
         }
-        if dispatch_outcome(
-            &mut stream,
-            &peer,
-            &config,
-            &req,
-            resp_hdr_ver,
-            outcome,
-            &cancel,
-        )
-        .await?
-        {
-            return Ok(());
+        observability.record_response(req.request_api_key, req.request_api_version, &outcome);
+        let next = answer(&mut stream, &config, &req, resp_hdr_ver, outcome, closing).await;
+        // Before a graceful close, which waits for the client.
+        observability.observe_duration(req.request_api_key, started.elapsed());
+        match next {
+            Next::Serve => {}
+            Next::Close(disconnect) => return disconnect,
+            Next::CloseGracefully(disconnect) => {
+                close_gracefully(&mut stream, config.write_timeout, &cancel).await;
+                return disconnect;
+            }
         }
     }
 }
 
 /// Verifies the bare token that follows a v0 handshake (KIP-152), and answers it if it is valid.
 ///
-/// `false` closes the connection. A bare token has no answer that can carry an error, so a broker
+/// `Err` closes the connection. A bare token has no answer that can carry an error, so a broker
 /// closes the connection on every failure, and the client reports the close as one.
 async fn authenticate_raw_token<S: AsyncWrite + Unpin>(
     ctx: &ConnectionContext<'_>,
@@ -1351,20 +1540,22 @@ async fn authenticate_raw_token<S: AsyncWrite + Unpin>(
     token: &[u8],
     principal: &mut Option<AuthenticatedPrincipal>,
     permissions: &mut PermissionFollow<'_>,
-) -> Result<bool> {
-    let Some(revision) = permissions.apply(principal.as_mut(), ctx.peer) else {
-        return Ok(false);
-    };
+) -> std::result::Result<(), Disconnect> {
+    let revision = permissions.apply(principal.as_mut())?;
     let signed_in = principal.is_some();
-    let TokenCheck::Accepted(authenticated) = verify_plain(ctx, token).await else {
-        return Ok(false);
+    let authenticated = match verify_plain(ctx, token).await {
+        TokenCheck::Accepted(authenticated) => authenticated,
+        TokenCheck::Rejected => return Err(Disconnect::new(CloseCause::AuthenticationFailed)),
+        TokenCheck::Dropped(unchecked) => return Err(unchecked.closing().into()),
     };
-    send_raw_token_accepted(stream, ctx.config.write_timeout).await?;
+    send_raw_token_accepted(stream, ctx.config.write_timeout)
+        .await
+        .map_err(|error| Disconnect::from_error(&error))?;
     *principal = Some(authenticated);
     if !signed_in {
         permissions.signed_in(revision);
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Decodes the request header at the start of `frame`. Returns the header, the version of the
@@ -1432,19 +1623,18 @@ impl<'a> PermissionFollow<'a> {
     }
 
     /// Applies to `principal` what the change log said of its Iggy user since the last call. The
-    /// board's revision from before that. `None` when the user was deleted or is no longer
+    /// board's revision from before that. `Err` when the user was deleted or is no longer
     /// active: the connection then closes, as Iggy ends the sessions of such a user.
     fn apply(
         &mut self,
         principal: Option<&mut AuthenticatedPrincipal>,
-        peer: &SocketAddr,
-    ) -> Option<u64> {
+    ) -> std::result::Result<u64, Disconnect> {
         let Some(board) = self.board else {
-            return Some(0);
+            return Ok(0);
         };
         let revision = board.revision();
         let Some(principal) = principal.filter(|_| self.follows) else {
-            return Some(revision);
+            return Ok(revision);
         };
         match board.changed_since(principal.user, &principal.username, &mut self.seen) {
             Some(UserAccess::Active(grants)) => {
@@ -1453,12 +1643,10 @@ impl<'a> PermissionFollow<'a> {
                 principal.permissions_known = true;
             }
             Some(UserAccess::Revoked) => {
-                info!(
-                    %peer,
-                    username = principal.username,
-                    "the Iggy user was deleted, deactivated or renamed; closing its connection"
-                );
-                return None;
+                return Err(Disconnect::with_detail(
+                    CloseCause::UserRevoked,
+                    format!("user {}", principal.username),
+                ));
             }
             None => {}
         }
@@ -1473,7 +1661,7 @@ impl<'a> PermissionFollow<'a> {
             principal.topic_reads = grants.topic_reads;
             principal.permissions_known = true;
         }
-        Some(revision)
+        Ok(revision)
     }
 
     /// A login set the principal. Changes after `revision`, from before the login, apply to it,
@@ -1486,54 +1674,55 @@ impl<'a> PermissionFollow<'a> {
 
 /// Looks up the Iggy user a client certificate named, within the pre-authentication budget.
 ///
-/// `None` closes the connection. Unlike a SASL refusal there is no response to shape: the client
+/// `Err` closes the connection. Unlike a SASL refusal there is no response to shape: the client
 /// has sent nothing yet, and a certificate the CA signed for an account that does not exist is a
 /// provisioning mistake the gateway's log reports, not something the client can correct.
 async fn resolve_certificate_principal(
     ctx: &ConnectionContext<'_>,
     username: &str,
-) -> Option<AuthenticatedPrincipal> {
+) -> std::result::Result<AuthenticatedPrincipal, Disconnect> {
     let peer = ctx.peer;
     let Some(resolver) = ctx.resolver else {
         // Unreachable: `check_tls_wiring` refuses to start in this combination. Fail closed
         // anyway, since the alternative is admitting an unverified identity.
-        error!(%peer, "a client certificate named a principal but nothing can look it up");
-        return None;
+        return Err(Disconnect::with_detail(
+            CloseCause::InternalError,
+            "a client certificate named a principal but nothing can look it up",
+        ));
     };
     // The lookup is an Iggy call per handshake, so it is bounded like a SASL login, but in slots
     // of its own: it costs no password hash.
-    let lookup = within_auth_budget(
-        ctx,
-        ctx.lookup_slots,
-        "certificate identity lookup",
-        |slot| async move {
-            let _slot = slot;
-            resolver.resolve(username).await
-        },
-    );
+    let lookup = within_auth_budget(ctx, ctx.lookup_slots, |slot| async move {
+        let _slot = slot;
+        resolver.resolve(username).await
+    });
     let outcome = tokio::select! {
-        () = ctx.cancel.cancelled() => {
-            debug!(%peer, "certificate identity lookup abandoned by shutdown");
-            return None;
-        }
-        outcome = lookup => outcome?,
+        () = ctx.cancel.cancelled() => return Err(Disconnect::new(CloseCause::Shutdown)),
+        outcome = lookup => outcome,
     };
-    match outcome {
-        Ok(principal) => {
+    let unchecked = match outcome {
+        Ok(Ok(principal)) => {
             debug!(%peer, username, "client certificate authenticated");
-            Some(principal)
+            return Ok(principal);
         }
-        Err(AuthError::Rejected) => {
-            // warn!, not debug!: the certificate chained to the trusted CA, so this is an account
-            // the operator meant to exist, or a mapping rule that produced the wrong name.
-            warn!(%peer, username, "client certificate names no active Iggy user; closing");
-            None
+        // The certificate chained to the trusted CA, so this is an account the operator meant to
+        // exist, or a mapping rule that produced the wrong name.
+        Ok(Err(AuthError::Rejected)) => {
+            return Err(Disconnect::with_detail(
+                CloseCause::CertificateRejected,
+                format!("no active Iggy user {username}"),
+            ));
         }
-        Err(AuthError::Unavailable) => {
-            warn!(%peer, username, "could not look up the certificate's Iggy user; closing");
-            None
-        }
-    }
+        Ok(Err(AuthError::Unavailable)) => Unchecked::IggyUnreachable,
+        Err(unchecked) => unchecked,
+    };
+    Err(Disconnect::with_detail(
+        CloseCause::AuthenticationDropped,
+        format!(
+            "could not look up the certificate's Iggy user {username}: {}",
+            unchecked.reason()
+        ),
+    ))
 }
 
 /// Verifies a `SaslAuthenticate` token and answers it.
@@ -1545,12 +1734,15 @@ async fn authenticate_token(
     ctx: &ConnectionContext<'_>,
     api_version: i16,
     body: Bytes,
-) -> (HandleOutcome, Option<AuthenticatedPrincipal>) {
+) -> (
+    HandleOutcome,
+    std::result::Result<AuthenticatedPrincipal, Closing>,
+) {
     let peer = ctx.peer;
     let failed = || {
         (
             sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true),
-            None,
+            Err(CloseCause::AuthenticationFailed.into()),
         )
     };
     let Ok(auth_bytes) = decode_sasl_auth_bytes(api_version, body) else {
@@ -1560,7 +1752,7 @@ async fn authenticate_token(
     match verify_plain(ctx, &auth_bytes).await {
         TokenCheck::Accepted(authenticated) => (
             sasl_authenticate_outcome(api_version, ERROR_NONE, false),
-            Some(authenticated),
+            Ok(authenticated),
         ),
         // A rejection is the client's problem and is terminal, so it earns a parseable 58.
         TokenCheck::Rejected => failed(),
@@ -1569,7 +1761,7 @@ async fn authenticate_token(
         // authentication error for credentials that may be correct. Closing without a body reads
         // as a transport failure instead, which is retriable, and still tells the client nothing
         // about whether the account exists.
-        TokenCheck::Dropped => (HandleOutcome::Close, None),
+        TokenCheck::Dropped(unchecked) => (HandleOutcome::Close, Err(unchecked.closing())),
     }
 }
 
@@ -1578,9 +1770,50 @@ enum TokenCheck {
     Accepted(AuthenticatedPrincipal),
     /// The token is malformed, or Iggy rejected its credentials.
     Rejected,
-    /// Nothing says that the credentials are wrong: the peer is throttled, no slot came free, a
-    /// budget ran out, the gateway shuts down or Iggy is unreachable.
-    Dropped,
+    /// Nothing says that the credentials are wrong.
+    Dropped(Unchecked),
+}
+
+/// Why credentials or a certificate's user could not be checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unchecked {
+    /// The peer is throttled after a rejected login.
+    Throttled,
+    /// No check slot came free within `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS`.
+    NoSlot,
+    /// The check did not end within `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS`.
+    TimedOut,
+    IggyUnreachable,
+    Shutdown,
+}
+
+impl Unchecked {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Throttled => "the peer is throttled after a rejected login",
+            Self::NoSlot => {
+                "no check slot came free within IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS; see \
+                 IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS"
+            }
+            Self::TimedOut => "the check did not end within IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
+            Self::IggyUnreachable => "Iggy is unreachable",
+            Self::Shutdown => "the gateway shuts down",
+        }
+    }
+
+    /// The close of the connection: a shutdown logs as one, at debug.
+    const fn closing(self) -> Closing {
+        match self {
+            Self::Shutdown => Closing {
+                cause: CloseCause::Shutdown,
+                reason: None,
+            },
+            _ => Closing {
+                cause: CloseCause::AuthenticationDropped,
+                reason: Some(self.reason()),
+            },
+        }
+    }
 }
 
 /// Verifies the PLAIN token `auth_bytes` against Iggy, within the pre-authentication budget. Both
@@ -1602,24 +1835,21 @@ async fn verify_plain(ctx: &ConnectionContext<'_>, auth_bytes: &[u8]) -> TokenCh
     // rejection, for the same reason that an overload is not one: a correct password retried
     // after the delay must still get through.
     if ctx.failed_logins.is_blocked(peer.ip()) {
-        debug!(%peer, "SASL authentication refused: peer is throttled after a rejected login");
-        return TokenCheck::Dropped;
+        return TokenCheck::Dropped(Unchecked::Throttled);
     }
 
     // The connection loop only watches the shutdown token between frames, so a verification in
     // flight has to watch it here or a drain waits out the whole budget.
     let verified = tokio::select! {
-        () = ctx.cancel.cancelled() => {
-            debug!(%peer, "SASL authentication abandoned by shutdown");
-            return TokenCheck::Dropped;
-        }
-        verified = within_auth_budget(ctx, ctx.auth_slots, "SASL authentication", |slot| {
+        () = ctx.cancel.cancelled() => return TokenCheck::Dropped(Unchecked::Shutdown),
+        verified = within_auth_budget(ctx, ctx.auth_slots, |slot| {
             authenticator.authenticate(&credentials, slot)
         }) => verified,
     };
     // Overloaded or timed out. Nothing here says the credentials were wrong.
-    let Some(result) = verified else {
-        return TokenCheck::Dropped;
+    let result = match verified {
+        Ok(result) => result,
+        Err(unchecked) => return TokenCheck::Dropped(unchecked),
     };
 
     match result {
@@ -1633,10 +1863,7 @@ async fn verify_plain(ctx: &ConnectionContext<'_>, auth_bytes: &[u8]) -> TokenCh
             ctx.failed_logins.record_rejection(peer.ip());
             TokenCheck::Rejected
         }
-        Err(AuthError::Unavailable) => {
-            warn!(%peer, "SASL authentication could not be completed; Iggy is unreachable");
-            TokenCheck::Dropped
-        }
+        Err(AuthError::Unavailable) => TokenCheck::Dropped(Unchecked::IggyUnreachable),
     }
 }
 
@@ -1652,7 +1879,7 @@ async fn send_raw_token_accepted<S: AsyncWrite + Unpin>(
     };
     timeout(write_timeout, write)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
+        .map_err(|_| FrameTimeout::Write.into_io())??;
     Ok(())
 }
 
@@ -1668,7 +1895,7 @@ fn describe_acls(
     principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
-) -> HandleOutcome {
+) -> (HandleOutcome, CloseCause) {
     let peer = ctx.peer;
     let Some(principal) = principal else {
         // `error!` rather than `debug!` on purpose, unlike every other refusal here: reaching
@@ -1677,8 +1904,24 @@ fn describe_acls(
         error!(%peer, "DescribeAcls reached a connection with no authenticated principal");
         // Not `encode_error_for_key`: key 29 is absent from `SUPPORTED_RANGES`, so that helper
         // always returns `Close` here and the code would read as if it answers when it cannot.
-        return respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, true);
+        return (
+            respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, true),
+            CloseCause::InternalError,
+        );
     };
+    (
+        describe_acls_for(peer, principal, api_version, body),
+        CloseCause::RequestRefused,
+    )
+}
+
+/// [`describe_acls`] for the `principal` of the connection.
+fn describe_acls_for(
+    peer: &SocketAddr,
+    principal: &AuthenticatedPrincipal,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     // The firewall table cannot cover this key: it is kept out of `SUPPORTED_RANGES` on purpose,
     // so the advertised range would otherwise be enforced only by whatever `kafka_protocol`'s
     // schema happens to accept. A crate bump adding v4 would start answering v4 while ApiVersions
@@ -1721,29 +1964,25 @@ fn describe_acls(
 async fn within_auth_budget<'a, T, Work, Fut>(
     ctx: &ConnectionContext<'a>,
     slots: &'a Semaphore,
-    operation: &'static str,
     work: Work,
-) -> Option<T>
+) -> std::result::Result<T, Unchecked>
 where
     Work: FnOnce(SemaphorePermit<'a>) -> Fut,
     Fut: Future<Output = T>,
 {
-    let peer = ctx.peer;
     let budget = ctx.config.pre_auth_timeout;
+    // The close of the connection reports these at warn, as `authentication_dropped`.
     let Ok(acquired) = timeout(budget, slots.acquire()).await else {
-        warn!(%peer, operation, "no authentication slot came free within the pre-authentication budget");
-        return None;
+        return Err(Unchecked::NoSlot);
     };
     // Acquire fails only once the semaphore is closed, which this gateway never does.
     let Ok(slot) = acquired else {
-        error!(%peer, operation, "authentication slots unavailable");
-        return None;
+        error!(peer = %ctx.peer, "authentication slots unavailable");
+        return Err(Unchecked::NoSlot);
     };
-    let Ok(result) = timeout(budget, work(slot)).await else {
-        warn!(%peer, operation, "did not complete within the pre-authentication budget");
-        return None;
-    };
-    Some(result)
+    timeout(budget, work(slot))
+        .await
+        .map_err(|_| Unchecked::TimedOut)
 }
 
 /// Answers a request that is well-formed but not legal in this connection's SASL state.
@@ -1788,101 +2027,88 @@ fn illegal_state_outcome(
     }
 }
 
-/// Returns `Ok(None)` when shutdown cancellation wins; `Ok(Some(frame))` on a full frame of at
-/// most `max_frame_size` bytes.
-async fn read_next_frame<S: AsyncRead + Unpin>(
+/// The next frame of a connection in `sasl_state`. `Err` ends the connection: a shutdown, the
+/// client's close, a timeout or a frame that breaks the framing.
+async fn next_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     config: &GatewayConfig,
-    max_frame_size: usize,
-    idle_timeout: Duration,
-    peer: &SocketAddr,
+    sasl_state: &SaslState,
     cancel: &CancellationToken,
-) -> Result<Option<bytes::Bytes>> {
-    tokio::select! {
-        () = cancel.cancelled() => {
-            debug!(%peer, "connection cancelled by shutdown");
-            Ok(None)
+) -> std::result::Result<Bytes, Disconnect> {
+    let authenticated = sasl_state.is_authenticated();
+    let idle_timeout = if authenticated {
+        config.idle_timeout
+    } else {
+        config.pre_auth_timeout
+    };
+    // A bare token gets the cap of a token, so the reader never buffers more than one holds.
+    let max_frame_size = if sasl_state.awaits_raw_token() {
+        MAX_SASL_AUTH_BYTES
+    } else {
+        config.max_frame_size
+    };
+    let read = tokio::select! {
+        () = cancel.cancelled() => return Err(Disconnect::new(CloseCause::Shutdown)),
+        read = read_frame(stream, max_frame_size, idle_timeout, config.read_timeout) => read,
+    };
+    read.map_err(|error| match Disconnect::from_error(&error) {
+        idle if idle.cause() == CloseCause::IdleTimeout && !authenticated => {
+            Disconnect::with_detail(
+                CloseCause::IdleTimeout,
+                "no request within IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS before authentication",
+            )
         }
-        result = read_frame(
-            stream,
-            max_frame_size,
-            idle_timeout,
-            config.read_timeout,
-        ) => match result {
-            Ok(frame) => Ok(Some(frame)),
-            Err(KafkaProtocolError::Io(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
-            {
-                info!(%peer, "connection closed by client");
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        },
-    }
+        disconnect => disconnect,
+    })
 }
 
-/// Applies a [`HandleOutcome`]. Returns `true` when the connection should close.
-async fn dispatch_outcome<S: AsyncRead + AsyncWrite + Unpin>(
+/// What a connection does after it answered a request.
+enum Next {
+    Serve,
+    Close(Disconnect),
+    /// Close after the client read the response: see [`close_gracefully`].
+    CloseGracefully(Disconnect),
+}
+
+/// Writes the response of a [`HandleOutcome`], if it has one. `closing` says what a close by the
+/// outcome means. A failed write closes for its own error.
+async fn answer<S: AsyncWrite + Unpin>(
     stream: &mut S,
-    peer: &SocketAddr,
     config: &GatewayConfig,
     req: &RequestHeader,
     resp_hdr_ver: i16,
     outcome: HandleOutcome,
-    cancel: &CancellationToken,
-) -> Result<bool> {
-    match outcome {
-        HandleOutcome::NoResponse => {
-            // Produce with acks=0: the wire protocol forbids a response.
-            Ok(false)
+    closing: Closing,
+) -> Next {
+    let (body, then) = match outcome {
+        // Produce with acks=0: the wire protocol forbids a response.
+        HandleOutcome::NoResponse => return Next::Serve,
+        // An unsupported key or version, or no encodable response shape at the requested
+        // version: all chosen by the client. The disconnect log rate-limits the warning, so a
+        // version-probing client or a port scanner cannot flood it.
+        HandleOutcome::Close => return Next::Close(closing.disconnect(req)),
+        HandleOutcome::UnacknowledgedProduceFailed => {
+            return Next::Close(Disconnect::with_detail(
+                CloseCause::UnacknowledgedProduceFailed,
+                request_name(req),
+            ));
         }
-        HandleOutcome::Close => {
-            // debug!, not warn!: this fires for every `Close` outcome regardless of cause -
-            // unsupported API key, out-of-range version, no encodable response shape at the
-            // requested version - all client/attacker-chosen, not operator-actionable, and a
-            // version-probing client (or a port scanner) can trigger this once per attempt. The
-            // few close reasons worth surfacing distinctly already have their own warn! closer
-            // to the decision (`unsupported_version_response`'s "above encoder max" and the
-            // Metadata version-firewall log in `protocol/api.rs`); this generic handler doesn't
-            // need to double-log every one of those on top of its own record.
-            debug!(
-                %peer,
-                api_key = req.request_api_key,
-                api_version = req.request_api_version,
-                "closing connection: no parseable response for this request"
-            );
-            Ok(true)
+        HandleOutcome::Respond(body) => (body, Next::Serve),
+        HandleOutcome::RespondThenClose(body) => {
+            (body, Next::CloseGracefully(closing.disconnect(req)))
         }
-        HandleOutcome::Respond(body_response) => {
-            send_response(
-                stream,
-                req.correlation_id,
-                resp_hdr_ver,
-                body_response,
-                config.write_timeout,
-            )
-            .await?;
-            Ok(false)
-        }
-        HandleOutcome::RespondThenClose(body_response) => {
-            send_response(
-                stream,
-                req.correlation_id,
-                resp_hdr_ver,
-                body_response,
-                config.write_timeout,
-            )
-            .await?;
-            debug!(
-                %peer,
-                api_key = req.request_api_key,
-                api_version = req.request_api_version,
-                "closing connection after responding"
-            );
-            close_gracefully(stream, config.write_timeout, cancel).await;
-            Ok(true)
-        }
+    };
+    match send_response(
+        stream,
+        req.correlation_id,
+        resp_hdr_ver,
+        body,
+        config.write_timeout,
+    )
+    .await
+    {
+        Ok(()) => then,
+        Err(error) => Next::Close(Disconnect::from_error(&error)),
     }
 }
 
@@ -1953,7 +2179,7 @@ async fn send_response<S: AsyncWrite + Unpin>(
     };
     timeout(write_timeout, write)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
+        .map_err(|_| FrameTimeout::Write.into_io())??;
     Ok(())
 }
 
@@ -1973,7 +2199,7 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
     match timeout(idle_timeout, stream.read_exact(&mut len_buf)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "idle timeout").into()),
+        Err(_) => return Err(FrameTimeout::Idle.into_io().into()),
     }
 
     let frame_len_i32 = i32::from_be_bytes(len_buf);
@@ -2010,7 +2236,7 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
         // pre-zeroing the chunk first, since read_buf only writes into its own spare
         // capacity via chunk_mut() rather than requiring pre-initialized memory.
         match timeout_at(deadline, stream.read_buf(&mut (&mut data).limit(chunk))).await {
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout").into()),
+            Err(_) => return Err(FrameTimeout::Read.into_io().into()),
             Ok(Ok(0)) => {
                 return Err(
                     io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed").into(),
@@ -2057,7 +2283,27 @@ pub fn init_tracing() -> WorkerGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::sdk_quieted_filter;
+    use super::{CloseCause, Closing, Disconnect, Unchecked, sdk_quieted_filter};
+
+    /// The log line of an unchecked login says why. A shutdown is not a fault, so it counts and
+    /// logs as one.
+    #[test]
+    fn given_an_unchecked_login_should_close_with_its_reason() {
+        for unchecked in [
+            Unchecked::Throttled,
+            Unchecked::NoSlot,
+            Unchecked::TimedOut,
+            Unchecked::IggyUnreachable,
+        ] {
+            let disconnect = Disconnect::from(unchecked.closing());
+            assert_eq!(disconnect.cause(), CloseCause::AuthenticationDropped);
+            assert_eq!(disconnect.detail(), Some(unchecked.reason()));
+        }
+        assert_eq!(
+            Unchecked::Shutdown.closing(),
+            Closing::from(CloseCause::Shutdown)
+        );
+    }
 
     #[test]
     fn given_no_rust_log_should_quiet_the_sdk() {
