@@ -69,6 +69,7 @@ jobs:
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
       task: test-build
+      stack-base: ${{ needs.detect.outputs.stack_base }}
       timeout-minutes: 60
 
   # Rust components
@@ -95,6 +96,7 @@ jobs:
     uses: ./.github/workflows/_rust.yml
     with:
       plan: ${{ needs.detect.outputs.rust_runtime_plan }}
+      stack-base: ${{ needs.detect.outputs.stack_base }}
 
   # Python SDK
   test-python:
@@ -286,6 +288,8 @@ jobs:
 
 
       - name: Check status
+        env:
+          NEEDS_RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
           set -euxo pipefail
           echo "## CI Summary" >> "$GITHUB_STEP_SUMMARY"
@@ -369,14 +373,16 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total workflow time:** ${{ steps.times.outputs.total_time }}" >> "$GITHUB_STEP_SUMMARY"
 
-          # Check for failures
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+          # Only `success` and `skipped` pass. GitHub has more results than
+          # `failure` and `cancelled`: a job that never got a runner ends as
+          # `abandoned`.
+          NOT_PASSED=""
+          for result in $NEEDS_RESULTS; do
+            [[ "$result" == success || "$result" == skipped ]] || NOT_PASSED+=" $result"
+          done
+          if [[ -n "$NOT_PASSED" ]]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "❌ **CI Failed** - Please check the logs for details." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "⚠️ **CI Cancelled** - The workflow was cancelled." >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ **CI Failed** - Jobs ended as:$NOT_PASSED. Please check the logs for details." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           else
             echo "" >> "$GITHUB_STEP_SUMMARY"

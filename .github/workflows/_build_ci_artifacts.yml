@@ -26,6 +26,10 @@ on:
       test-scope:
         type: string
         default: affected
+      stack-base:
+        description: "Base branch commit under a stack; the affected test plan then covers every layer"
+        type: string
+        default: ""
       save-cache:
         type: boolean
         default: false
@@ -55,6 +59,7 @@ jobs:
         with:
           task: ${{ inputs.task }}
           test-scope: ${{ inputs.test-scope }}
+          stack-base: ${{ inputs.stack-base }}
           save-cache: ${{ inputs.save-cache }}
 
       - name: Upload artifacts
