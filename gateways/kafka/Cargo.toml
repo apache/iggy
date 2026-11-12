@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-gateway-kafka"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 description = "Kafka wire protocol gateway foundation for Apache Iggy"
 edition = "2024"
 license = "Apache-2.0"
@@ -35,6 +35,8 @@ path = "src/main.rs"
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+# The HTTP endpoint of metrics, readiness and liveness (`IGGY_KAFKA_HTTP_ADDR`).
+axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
@@ -43,9 +45,17 @@ iggy = { workspace = true }
 # export it.
 iggy_common = { workspace = true }
 iggy_kafka_wire = { workspace = true }
-# The codec features stay on for the encoder, which the batch tests use to build fixtures.
-kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
+# The codec features stay on for the encoder, which the batch tests use to build fixtures. The
+# client half decodes the gateway's own responses, so the metrics count the error codes they carry.
+kafka-protocol = { workspace = true, features = [
+    "client",
+    "gzip",
+    "lz4",
+    "snappy",
+    "zstd",
+] }
 libc = { workspace = true }
+prometheus-client = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true }
 rustls = { workspace = true }
@@ -75,8 +85,6 @@ x509-parser = { workspace = true }
 # Partition route requests for `examples/partition_routes.rs`, and the Iggy request frames that a
 # test relay holds back.
 iggy_binary_protocol = { workspace = true }
-# The client half, so a test encodes requests and decodes responses the way a consumer does.
-kafka-protocol = { workspace = true, features = ["client"] }
 # Certificates for the TLS listener tests, minted per test so nothing in the tree expires.
 rcgen = { workspace = true }
 # Reads the JSON events that kafka-verifiable-consumer.sh prints.

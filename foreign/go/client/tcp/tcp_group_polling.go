@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -105,20 +106,23 @@ func (c *groupAssignmentCache) nextPartition(key groupKey) (uint32, bool) {
 
 // putSynced stores a fresh sync result, carrying the round-robin cursor
 // forward when the generation is unchanged, all under one lock so a
-// concurrent poll's advance is never overwritten with a stale value.
-func (c *groupAssignmentCache) putSynced(key groupKey, assignment groupAssignment) {
+// concurrent poll's advance is never overwritten with a stale value. It reports
+// whether the result differs from the cached assignment.
+func (c *groupAssignmentCache) putSynced(key groupKey, assignment groupAssignment) bool {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.entries == nil {
 		c.entries = make(map[groupKey]*groupAssignment)
 	}
-	if current, ok := c.entries[key]; ok && current.generation == assignment.generation {
+	current, cached := c.entries[key]
+	if cached && current.generation == assignment.generation {
 		// A same-generation refresh is not a rebalance: the member still owns
 		// the same partitions, so the round-robin position carries over
 		// instead of resetting and starving the partitions behind it.
 		assignment.cursor = current.cursor
 	}
 	c.entries[key] = &assignment
+	return !cached || current.generation != assignment.generation || !slices.Equal(current.partitions, assignment.partitions)
 }
 
 func (c *groupAssignmentCache) drop(key groupKey) {
@@ -286,14 +290,12 @@ func (c *IggyTcpClient) ensureAssignment(
 		assignment := groupAssignment{
 			generation: synced.Generation,
 			partitions: synced.Partitions,
-			fetchedAt:  time.Now(),
 		}
 		c.logger.Debug("Synced the consumer group assignment",
 			slog.Uint64("generation", assignment.generation),
 			slog.Int("partitions", len(assignment.partitions)))
 		c.mtx.Lock()
 		if c.sessionFence == fence {
-			c.groups.putSynced(key, assignment)
 			c.mtx.Unlock()
 			return assignment, nil
 		}
