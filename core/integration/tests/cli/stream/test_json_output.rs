@@ -156,3 +156,49 @@ async fn given_stream_output_when_requested_should_preserve_json_and_output_mode
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+mod stdout_errors {
+    use std::fs::OpenOptions;
+    use std::process::Command;
+
+    use assert_cmd::prelude::CommandCargoExt;
+    use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+    use serial_test::parallel;
+
+    use crate::cli::common::IggyCmdTest;
+
+    #[tokio::test]
+    #[parallel]
+    async fn given_full_stdout_when_listing_streams_as_json_should_return_an_error() {
+        let mut test = IggyCmdTest::default();
+        test.setup().await;
+        let address = test.get_tcp_server_address().unwrap();
+        let stdout = OpenOptions::new().write(true).open("/dev/full").unwrap();
+
+        #[allow(deprecated)]
+        let output = Command::cargo_bin("iggy")
+            .unwrap()
+            .env("IGGY_USERNAME", DEFAULT_ROOT_USERNAME)
+            .env("IGGY_PASSWORD", DEFAULT_ROOT_PASSWORD)
+            .env("IGGY_TOKEN", "")
+            .args([
+                "--transport",
+                "tcp",
+                "--tcp-server-address",
+                &address,
+                "--quiet",
+                "stream",
+                "list",
+                "--output",
+                "json",
+            ])
+            .stdout(stdout)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("os error 28"), "{stderr}");
+    }
+}
