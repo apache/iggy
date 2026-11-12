@@ -1,0 +1,194 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+{{- include "iggy-kafka-gateway.validate" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "iggy-kafka-gateway.fullname" . }}
+  labels:
+    {{- include "iggy-kafka-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "iggy-kafka-gateway.headlessName" . }}
+  # The gateways do not wait for each other: each one connects to Iggy on its own.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "iggy-kafka-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+{{- if not .Values.iggy.existingSecret.name }}
+        checksum/credentials: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+{{- end }}
+{{- with .Values.podAnnotations }}
+          {{- toYaml . | nindent 8 }}
+{{- end }}
+      labels:
+        {{- include "iggy-kafka-gateway.labels" . | nindent 8 }}
+{{- with .Values.podLabels }}
+          {{- toYaml . | nindent 8 }}
+{{- end }}
+    spec:
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+      serviceAccountName: {{ include "iggy-kafka-gateway.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      # A Service such as `iggy-kafka-gateway` injects `IGGY_KAFKA_GATEWAY_SERVICE_HOST`, and the
+      # gateway refuses unknown `IGGY_KAFKA_*` variables.
+      enableServiceLinks: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # The node id follows the pod's ordinal, so each gateway keeps its id across restarts
+          # and matches its entry in IGGY_KAFKA_BROKERS.
+          command:
+            - /bin/sh
+            - -c
+            - export IGGY_KAFKA_NODE_ID=$(( ${POD_NAME##*-} + 1 )) && exec /iggy-gateway-kafka
+          ports:
+            - name: kafka
+              containerPort: {{ .Values.kafka.port }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.http.port }}
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: IGGY_KAFKA_BIND_ADDR
+              value: "0.0.0.0:{{ .Values.kafka.port }}"
+            - name: IGGY_KAFKA_ADVERTISED_HOST
+              value: "$(POD_NAME).{{ include "iggy-kafka-gateway.headlessName" . }}.$(POD_NAMESPACE).svc.{{ .Values.kafka.clusterDomain }}"
+            - name: IGGY_KAFKA_ADVERTISED_PORT
+              value: {{ .Values.kafka.port | quote }}
+            - name: IGGY_KAFKA_BROKERS
+              value: {{ include "iggy-kafka-gateway.brokers" . | quote }}
+{{- if gt (int .Values.replicaCount) 1 }}
+            # Without `manage_servers` the gateway then fails to start, instead of falling back to
+            # one coordinator for every group.
+            - name: IGGY_KAFKA_COORDINATOR_LOG
+              value: "true"
+{{- end }}
+            - name: IGGY_KAFKA_HTTP_ADDR
+              value: "0.0.0.0:{{ .Values.http.port }}"
+{{- if .Values.kafka.sasl.enabled }}
+            - name: IGGY_KAFKA_SASL_ENABLED
+              value: "true"
+{{- end }}
+            - name: IGGY_KAFKA_BRIDGE_ENABLED
+              value: "true"
+            - name: IGGY_KAFKA_IGGY_ADDR
+              value: {{ .Values.iggy.address | quote }}
+{{- with .Values.iggy.stream }}
+            - name: IGGY_KAFKA_IGGY_STREAM
+              value: {{ . | quote }}
+{{- end }}
+            - name: IGGY_KAFKA_IGGY_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "iggy-kafka-gateway.credentialsSecret" . }}
+                  key: {{ .Values.iggy.existingSecret.usernameKey }}
+            - name: IGGY_KAFKA_IGGY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "iggy-kafka-gateway.credentialsSecret" . }}
+                  key: {{ .Values.iggy.existingSecret.passwordKey }}
+{{- if .Values.iggy.tls.enabled }}
+            - name: IGGY_KAFKA_IGGY_TLS_ENABLED
+              value: "true"
+  {{- with .Values.iggy.tls.domain }}
+            - name: IGGY_KAFKA_IGGY_TLS_DOMAIN
+              value: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.iggy.tls.caSecret }}
+            - name: IGGY_KAFKA_IGGY_TLS_CA_FILE
+              value: "/etc/iggy-kafka-gateway/iggy-ca/{{ .Values.iggy.tls.caKey }}"
+  {{- end }}
+{{- end }}
+{{- if .Values.kafka.autoCreateTopics.enabled }}
+            - name: IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED
+              value: "true"
+            - name: IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS
+              value: {{ .Values.kafka.autoCreateTopics.partitions | quote }}
+{{- end }}
+{{- with .Values.extraEnv }}
+              {{- toYaml . | nindent 12 }}
+{{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+{{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+{{- if or (and .Values.iggy.tls.enabled .Values.iggy.tls.caSecret) .Values.extraVolumeMounts }}
+          volumeMounts:
+  {{- if and .Values.iggy.tls.enabled .Values.iggy.tls.caSecret }}
+            - name: iggy-ca
+              mountPath: /etc/iggy-kafka-gateway/iggy-ca
+              readOnly: true
+  {{- end }}
+  {{- with .Values.extraVolumeMounts }}
+              {{- toYaml . | nindent 12 }}
+  {{- end }}
+{{- end }}
+{{- if or (and .Values.iggy.tls.enabled .Values.iggy.tls.caSecret) .Values.extraVolumes }}
+      volumes:
+  {{- if and .Values.iggy.tls.enabled .Values.iggy.tls.caSecret }}
+        - name: iggy-ca
+          secret:
+            secretName: {{ .Values.iggy.tls.caSecret }}
+  {{- end }}
+  {{- with .Values.extraVolumes }}
+          {{- toYaml . | nindent 8 }}
+  {{- end }}
+{{- end }}
+{{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+{{- end }}

@@ -89,6 +89,7 @@ runs:
           -t iggy-server:test \
           --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
           --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+          --build-arg LICENSE_STAGE=license-skip \
           .
         echo "docker_image=iggy-server:test" >> "$GITHUB_OUTPUT"
 

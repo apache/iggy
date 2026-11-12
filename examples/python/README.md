@@ -149,6 +149,20 @@ python message-headers/typed-headers/producer.py
 python message-headers/typed-headers/consumer.py
 ```
 
+### Message Envelopes
+
+Shows the message envelope pattern, where each payload is wrapped in a JSON object with a `message_type` and a `payload` string so one topic can carry several message kinds.
+
+```bash
+# Using uv
+uv run message-envelope/producer.py
+uv run message-envelope/consumer.py
+
+# Without using uv
+python message-envelope/producer.py
+python message-envelope/consumer.py
+```
+
 ### Sink Data Producer
 
 Populates an Iggy topic with JSON records so that sink connectors have data to consume.

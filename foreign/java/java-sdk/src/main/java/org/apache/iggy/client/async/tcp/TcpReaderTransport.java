@@ -27,6 +27,7 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.FetchedMessages;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
 
@@ -76,15 +77,29 @@ final class TcpReaderTransport implements ReaderTransport {
             return messages().fetchMessages(stream, topic, targets, consumer, count, commit, fetch);
         }
         AsyncTcpConnection.TransientFailoverState state = messages().startCall();
-        committing.add(state);
+        // A fetch that the client refuses before the send throws here, and its state was never sent.
         CompletableFuture<List<FetchedMessages>> read =
                 messages().fetchMessages(stream, topic, targets, consumer, count, commit, fetch, state);
+        committing.add(state);
         read.whenComplete((sections, error) -> {
             if (!read.isCancelled()) {
                 committing.remove(state);
             }
         });
         return read;
+    }
+
+    @Override
+    public CompletableFuture<PolledMessages> poll(
+            long partition, PollingStrategy strategy, long count, DeferredPollOptions options) {
+        return messages()
+                .pollMessagesDeferred(stream, topic, Optional.of(partition), consumer, strategy, count, false, options);
+    }
+
+    @Override
+    public CompletableFuture<PartitionContext> pollContext(
+            long partition, PollingStrategy strategy, long count, DeferredPollOptions options) {
+        return messages().pollContext(stream, topic, partition, consumer, strategy, count, options);
     }
 
     @Override
@@ -96,6 +111,11 @@ final class TcpReaderTransport implements ReaderTransport {
     public CompletableFuture<Void> delete(long partition, PartitionContext context) {
         return ((ConsumerOffsetsTcpClient) client.consumerOffsets())
                 .deleteConsumerOffset(stream, topic, partition, consumer, context);
+    }
+
+    @Override
+    public BigInteger metadataWatermark() {
+        return new BigInteger(Long.toUnsignedString(client.metadataWatermark()));
     }
 
     @Override

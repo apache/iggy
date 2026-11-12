@@ -157,6 +157,16 @@ pub fn repair_config() -> PartitionsConfig {
     }
 }
 
+/// [`repair_config`] with the partition files under `dir`.
+fn offsets_config(dir: &tempfile::TempDir) -> PartitionsConfig {
+    PartitionsConfig {
+        path_layout: crate::PartitionPathLayout {
+            streams_root: dir.path().to_string_lossy().into_owned(),
+        },
+        ..repair_config()
+    }
+}
+
 /// A `SendMessages` request in the shape `convert_request_message` leaves at
 /// [`ChecksumMode::Skip`]: canonical batch, `batch_checksum` zeroed.
 pub fn checksumless_send_request(
@@ -907,18 +917,23 @@ async fn replica_with_prepare_history(
     partition.set_partition_dir(partition_dir.clone());
     // Boot loads the offset directories that partition creation made.
     set_offset_dirs_under(&mut partition, std::path::Path::new(&partition_dir));
-    crate::partition_storage::configure_consumer_offsets_with_storage(
+    let namespace = IggyNamespace::new(1, 1, 0);
+    crate::partition_storage::recover_consumer_offsets_with_storage(
         &DiskStorage,
         &mut partition,
         &config,
-        IggyNamespace::new(1, 1, 0),
-        0,
+        namespace,
     )
     .await
     .unwrap();
     partition.log.retire_front().unwrap();
     partition.install_empty_segment(&config, 0).await.unwrap();
     partition.open_persistence().await.unwrap();
+    // After the WAL replay, as boot does. Before it, the clamp removes an offset
+    // below data that only the WAL holds.
+    crate::partition_storage::clamp_consumer_offsets(&partition, namespace)
+        .await
+        .unwrap();
     (config, partition)
 }
 

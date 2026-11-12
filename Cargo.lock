@@ -5700,10 +5700,11 @@ dependencies = [
 
 [[package]]
 name = "iggy-gateway-kafka"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "axum",
  "base64 0.23.1",
  "bytes",
  "futures",
@@ -5713,6 +5714,7 @@ dependencies = [
  "iggy_kafka_wire",
  "kafka-protocol",
  "libc",
+ "prometheus-client",
  "rcgen",
  "regex",
  "regex-syntax",
@@ -5877,6 +5879,17 @@ dependencies = [
  "snap",
  "thiserror 2.0.21",
  "zstd 0.14.3",
+]
+
+[[package]]
+name = "iggy_object_store"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "futures",
+ "hex",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -6060,6 +6073,7 @@ dependencies = [
  "ctor",
  "dtor",
  "figment",
+ "fs2",
  "futures",
  "harness_derive",
  "hex",
@@ -6082,6 +6096,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "server_common",
  "sysinfo 0.40.1",
  "tempfile",
  "test-case",
@@ -6310,7 +6325,6 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
- "nix",
  "server_common",
  "tempfile",
  "tokio",

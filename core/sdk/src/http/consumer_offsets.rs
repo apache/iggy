@@ -49,7 +49,7 @@ impl ConsumerOffsetClient for HttpClient {
                 consumer: consumer.clone(),
                 partition_id: Some(checkpoint.partition_id()),
                 offset: checkpoint.offset(),
-                context: Some(checkpoint.context()),
+                context: checkpoint.context().non_zero(),
             },
         )
         .await?;

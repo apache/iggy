@@ -190,14 +190,17 @@ for target preparation and client-specific agent tools. Run
   `core/integration/src/harness/` spawns real `iggy-server`
   (`ServerHandle`), MCP server (`McpHandle`), client (`ClientHandle`).
   `#[iggy_harness]` proc macro wires fixtures. Suites: `cli/`, `cluster/`,
-  `config_provider/`, `data_integrity/`, `mcp/`, `sdk/`,
-  `server/`, `state/`, `storage/`. Per-test logs land in
+  `config_env_listing/`, `config_provider/`, `connectors_harness/`,
+  `data_integrity/`, `mcp/`, `sdk/`, `server/`. Per-test logs land in
   `test_logs/`.
 - **Connector parts of the harness:** `ConnectorsRuntimeHandle`,
   `TestFixture`, the connector seeds and the `connectors_runtime(...)`
   attribute of `#[iggy_harness]` exist for apache/iggy-connectors. That
-  repository uses them through a git dependency on `integration`. No
-  core test uses them, so do not remove them as unused.
+  repository uses them through a git dependency on `integration`. It
+  also calls `SinglePortReserver`, `ServerHandle::start_dependents`,
+  `ServerHandle::stop_dependents` and `TestBinaryError::FixtureSetup`.
+  In core, only the `connectors_harness/` suite compiles the attribute
+  and a fixture, so do not remove these items as unused.
 - **Cross-SDK BDD:** `bdd/`. Gherkin features against every SDK. Driver: `scripts/run-bdd-tests.sh`.
 
 BDD test naming: `given_X_when_Y_should_Z` (3-part). Promote to 4-part `given_X_when_Y_then_Z_should_W` only with a distinct "then" intermediate. Be consistent inside a file.
