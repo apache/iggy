@@ -20,6 +20,8 @@ set -euo pipefail
 
 # shellcheck source-path=SCRIPTDIR
 source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/files.sh"
 
 # Default values
 MODE="check"
@@ -67,30 +69,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Get files to check based on mode
-get_files() {
-  case "$FILE_MODE" in
-    ci)
-      # Get files changed in PR for CI
-      if [ -n "${GITHUB_BASE_REF:-}" ]; then
-        # GitHub Actions PR context
-        git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}:${GITHUB_BASE_REF}" 2>/dev/null || true
-        git diff --name-only --diff-filter=ACM "${GITHUB_BASE_REF}...HEAD"
-      elif [ -n "${CI:-}" ]; then
-        # Generic CI - compare with HEAD~1
-        git diff --name-only --diff-filter=ACM HEAD~1
-      else
-        # Local fallback: check all tracked files
-        git ls-files
-      fi
-      ;;
-    all)
-      # Get all tracked files
-      git ls-files
-      ;;
-  esac
-}
-
 # If files were provided as arguments, use them
 if [ ${#FILES[@]} -gt 0 ]; then
   CHANGED_FILES=("${FILES[@]}")
@@ -99,7 +77,7 @@ else
   CHANGED_FILES=()
   while IFS= read -r file; do
     CHANGED_FILES+=("$file")
-  done < <(get_files)
+  done < <(get_files "$FILE_MODE")
 fi
 
 # Exit early if no files to check

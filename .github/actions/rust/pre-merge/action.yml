@@ -40,6 +40,10 @@ inputs:
     description: "Save build dependencies for subsequent PRs"
     required: false
     default: "false"
+  base-sha:
+    description: "Commit that a push in a fork is compared with; empty for every other event"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -107,6 +111,10 @@ runs:
       if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
       continue-on-error: true
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
+      with:
+        # Without it the planner compares a push with the previous push, which
+        # misses the earlier commits of the branch.
+        since: ${{ inputs.base-sha }}
 
     # Individual lint tasks for parallel execution
     - name: Cargo check
@@ -188,6 +196,7 @@ runs:
         PLAN_STATUS: ${{ steps.rail.outcome }}
         TEST_SELECTION: ${{ inputs.test-scope }}
         ARTIFACT_TASK: ${{ inputs.task }}
+        BASE_SHA: ${{ inputs.base-sha }}
       run: |
         set -euo pipefail
         ARTIFACT_DIR="$RUNNER_TEMP/rust-$ARTIFACT_TASK"
@@ -321,8 +330,11 @@ runs:
           # KAFKA_FIXTURES_REQUIRED never set - every fixture-backed test quietly passed by
           # skipping all its assertions instead of running them (0.005s for a test meant to
           # decode 9 real fixtures).
-          BASE_SHA=""
-          if [[ "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]]; then
+          #
+          # A push in a fork has no synthetic merge commit. After `git merge master` its
+          # HEAD has two parents too, but the first one is the previous branch tip, and
+          # that diff shows only what master changed. The caller passes the base then.
+          if [[ -z "$BASE_SHA" && "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]]; then
             BASE_SHA=$(git cat-file -p HEAD | awk '/^parent /{print $2; exit}')
           fi
           if [[ -n "$BASE_SHA" ]] \
@@ -455,8 +467,12 @@ runs:
     # Compare the shared HEAD runtime with a separately built baseline server.
     - name: Storage format backwards compatibility
       if: inputs.task == 'test-storage-compat'
-      run: ./scripts/ci/storage-compat.sh --runtime-artifacts "$RUNNER_TEMP/rust-runtime"
+      run: ./scripts/ci/storage-compat.sh --runtime-artifacts "$RUNNER_TEMP/rust-runtime" ${BASE_SHA:+--baseline-ref "$BASE_SHA"}
       shell: bash
+      env:
+        # Outside a pull request the script takes origin/master, which in a
+        # fork can be stale or be the pushed branch itself.
+        BASE_SHA: ${{ inputs.base-sha }}
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /
     # compio. Pinned nightly so MIRIFLAGS behavior is stable across CI runs;

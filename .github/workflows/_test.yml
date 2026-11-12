@@ -262,6 +262,7 @@ jobs:
           done
           echo "All workflows are valid YAML"
           python3 scripts/ci/test-runtime-artifacts.py
+          node --test .github/fork-ci/fork-ci.test.cjs
 
       # Upload reports
       - name: Upload reports

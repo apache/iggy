@@ -20,6 +20,12 @@ name: _detect
 on:
   workflow_call:
     outputs:
+      run_ci:
+        description: "Whether this run executes the pipeline; false when the fork of the pull request runs it"
+        value: ${{ jobs.detect.outputs.run_ci }}
+      base_sha:
+        description: "Commit that a push in a fork is compared with; empty for every other event"
+        value: ${{ jobs.detect.outputs.base_sha }}
       runtime:
         description: "Whether selected tests need shared runtime binaries"
         value: ${{ jobs.detect.outputs.runtime }}
@@ -68,14 +74,17 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read # pulls.get in the gate step
 
 jobs:
   detect:
     runs-on: ubuntu-slim
     timeout-minutes: 10
     outputs:
+      run_ci: ${{ steps.gate.outputs.run_ci }}
+      base_sha: ${{ steps.base.outputs.sha }}
       runtime: ${{ steps.mk.outputs.runtime }}
-      third_party_licenses: ${{ github.event_name != 'pull_request' || steps.changed.outputs.third_party_licenses == 'true' }}
+      third_party_licenses: ${{ github.event_name == 'workflow_dispatch' || steps.changed.outputs.third_party_licenses == 'true' }}
       rust_plan: ${{ steps.mk.outputs.rust_plan }}
       rust_runtime_plan: ${{ steps.mk.outputs.rust_runtime_plan }}
       python_matrix: ${{ steps.mk.outputs.python_matrix }}
@@ -94,10 +103,34 @@ jobs:
         with:
           fetch-depth: 0
 
+      # A pull request that uses fork CI gets its result from the fork. This run
+      # then reads no changed files, so the matrices below select nothing. See
+      # .github/fork-ci/fork-ci.cjs. The step is here and not in a job of its
+      # own, because each job waits for a runner.
+      - name: Decide where the pipeline runs
+        id: gate
+        uses: actions/github-script@v9
+        with:
+          script: await require('./.github/fork-ci/fork-ci.cjs').gate({ github, context, core })
+
+      # A push reaches this workflow only through fork-ci.yml, where no pull
+      # request names the base. The pull request will show the changes since
+      # the branch left upstream master, so select the same ones. The fork's
+      # own master can be stale, or be the pushed branch itself.
+      - name: Find the upstream base of a fork push
+        id: base
+        if: github.event_name == 'push'
+        run: |
+          git fetch --no-tags https://github.com/apache/iggy.git master
+          sha=$(git merge-base FETCH_HEAD HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Get changed files (PR or push)
         id: changed
+        if: steps.gate.outputs.run_ci == 'true'
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          base: ${{ steps.base.outputs.sha }}
           filters: |
             all:
               - '**'
@@ -142,10 +175,13 @@ jobs:
       - name: Build matrices
         id: mk
         uses: actions/github-script@v9
+        env:
+          COMPONENTS: ${{ steps.config.outputs.components }}
+          CHANGED_FILES: ${{ steps.changed.outputs.all_files || '[]' }}
         with:
           script: |
-            const componentsJson = `${{ steps.config.outputs.components }}`;
-            const changedFilesJson = `${{ steps.changed.outputs.all_files || '[]' }}`;
+            const componentsJson = process.env.COMPONENTS;
+            const changedFilesJson = process.env.CHANGED_FILES;
 
             let componentsCfg = { components: {} };
             try { componentsCfg = JSON.parse(componentsJson); } catch {}
@@ -341,40 +377,6 @@ jobs:
                   : `dependency of ${trigger.dependency}`;
                 console.log(`  ○ ${name} - ${reason}`);
               });
-            }
-
-            // On master push, run everything
-            if (context.eventName === 'push' && context.ref === 'refs/heads/master') {
-              // Clear existing groups to avoid duplicates - we'll run everything anyway
-              groups.rust = [];
-              groups.python = [];
-              groups.php = [];
-              groups.node = [];
-              groups.go = [];
-              groups.java = [];
-              groups.csharp = [];
-              groups.cpp = [];
-              groups.swift = [];
-              groups.bdd = [];
-              groups.examples = [];
-              groups.other = [];
-
-              for (const [name, cfg] of Object.entries(components)) {
-                if (!cfg.tasks || cfg.tasks.length === 0) continue;
-                const entries = cfg.tasks.map(task => ({ component: name, task }));
-                if (name === 'rust' || name.startsWith('rust-')) groups.rust.push(...entries);
-                else if (name === 'sdk-python') groups.python.push(...entries);
-                else if (name === 'sdk-php') groups.php.push(...entries);
-                else if (name === 'sdk-node') groups.node.push(...entries);
-                else if (name === 'sdk-go') groups.go.push(...entries);
-                else if (name === 'sdk-java') groups.java.push(...entries);
-                else if (name === 'sdk-csharp') groups.csharp.push(...entries);
-                else if (name === 'sdk-cpp') groups.cpp.push(...entries);
-                else if (name === 'sdk-swift') groups.swift.push(...entries);
-                else if (name.startsWith('bdd-')) groups.bdd.push(...entries);
-                else if (name.startsWith('examples-')) groups.examples.push(...entries);
-                else groups.other.push(...entries);
-              }
             }
 
             // Deduplicate entries in each group (in case of any edge cases)

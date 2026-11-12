@@ -20,6 +20,8 @@ set -euo pipefail
 
 # shellcheck source-path=SCRIPTDIR
 source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/files.sh"
 
 # binary-artifacts.sh -- Prevent compiled binaries from entering the repo.
 #
@@ -71,31 +73,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-get_files() {
-  case "$FILE_MODE" in
-    ci)
-      if [ -n "${GITHUB_BASE_REF:-}" ]; then
-        git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}:${GITHUB_BASE_REF}" 2>/dev/null || true
-        git diff --name-only --diff-filter=ACM "${GITHUB_BASE_REF}...HEAD"
-      elif [ -n "${CI:-}" ]; then
-        git diff --name-only --diff-filter=ACM HEAD~1
-      else
-        git ls-files
-      fi
-      ;;
-    all)
-      git ls-files
-      ;;
-  esac
-}
-
 if [ ${#FILES[@]} -gt 0 ]; then
   CHANGED_FILES=("${FILES[@]}")
 else
   CHANGED_FILES=()
   while IFS= read -r file; do
     CHANGED_FILES+=("$file")
-  done < <(get_files)
+  done < <(get_files "$FILE_MODE")
 fi
 
 if [ ${#CHANGED_FILES[@]} -eq 0 ]; then

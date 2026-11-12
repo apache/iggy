@@ -24,6 +24,8 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+  # fork-ci.yml runs this pipeline for a push in a fork.
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,13 +39,15 @@ permissions:
   pull-requests: write
 
 jobs:
-  # Common checks - always run
+  # Common checks - always run, unless the fork of the pull request runs the pipeline
   common:
     name: Common checks
     needs: detect
+    if: needs.detect.outputs.run_ci == 'true'
     uses: ./.github/workflows/_common.yml
     with:
       validate-third-party-licenses: ${{ needs.detect.outputs.third_party_licenses == 'true' }}
+      base-sha: ${{ needs.detect.outputs.base_sha }}
     permissions:
       contents: read
       pull-requests: read
@@ -61,6 +65,9 @@ jobs:
     with:
       task: runtime
       timeout-minutes: 60
+      # Only a fork runs this pipeline for a push, and it has no cache of
+      # apache/iggy. Its next push to the branch then builds warm.
+      save-cache: ${{ github.event_name == 'push' }}
 
   rust-test-build:
     name: Rust test artifacts
@@ -70,6 +77,8 @@ jobs:
     with:
       task: test-build
       timeout-minutes: 60
+      base-sha: ${{ needs.detect.outputs.base_sha }}
+      save-cache: ${{ github.event_name == 'push' }}
 
   # Rust components
   test-rust:
@@ -95,6 +104,7 @@ jobs:
     uses: ./.github/workflows/_rust.yml
     with:
       plan: ${{ needs.detect.outputs.rust_runtime_plan }}
+      base-sha: ${{ needs.detect.outputs.base_sha }}
 
   # Python SDK
   test-python:
@@ -214,15 +224,23 @@ jobs:
 
   # Final status check
   finalize_pr:
+    # Branch protection requires the check named `finalize_pr`. A run that left
+    # the pipeline to the fork tested nothing, so it must not report that name.
+    name: ${{ needs.detect.outputs.run_ci == 'false' && 'finalize_pr (pipeline runs in the fork)' || 'finalize_pr' }}
     runs-on: ubuntu-slim
     timeout-minutes: 5
     needs: [common, detect, runtime, rust-test-build, test-rust, test-rust-runtime, test-rust-runtime-checks, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:
+      - name: Point to the fork run
+        if: needs.detect.outputs.run_ci == 'false'
+        run: echo "This pull request uses fork CI. The pipeline runs in the fork and the \`Fork CI\` status on the pull request links to that run." >> "$GITHUB_STEP_SUMMARY"
+
       # The durations only fill the summary table. A GitHub API error here
       # must not skip "Check status", which decides the required check.
       - name: Get job execution times
         id: times
+        if: needs.detect.outputs.run_ci != 'false'
         continue-on-error: true
         uses: actions/github-script@v9
         with:
@@ -245,9 +263,12 @@ jobs:
               common: 'Common checks', detect: 'Detect changes', runtime: 'Runtime binaries',
               rust_test_build: 'Rust test artifacts', rust_runtime_checks: 'Rust runtime checks',
             };
+            // A workflow that calls this one puts the name of its own job first.
+            const names = Object.values(groups);
+            const groupOf = job => job.name.split(' / ').slice(0, 2).find(part => names.includes(part));
             for (const [key, group] of Object.entries(groups)) {
               const completed = jobs.filter(job =>
-                (job.name === group || job.name.startsWith(`${group} /`)) &&
+                groupOf(job) === group &&
                 job.conclusion !== 'skipped' && job.started_at && job.completed_at);
               const duration = completed.length ? formatDuration(
                 Math.max(...completed.map(job => new Date(job.completed_at).getTime())) -
@@ -286,6 +307,7 @@ jobs:
 
 
       - name: Check status
+        if: needs.detect.outputs.run_ci != 'false'
         run: |
           set -euxo pipefail
           echo "## CI Summary" >> "$GITHUB_STEP_SUMMARY"

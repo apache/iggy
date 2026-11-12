@@ -130,7 +130,7 @@ class RuntimeBuildSelection(unittest.TestCase):
                            if step.get("name") == "Build coverage artifacts")
         self.revision = run("git", "rev-parse", "HEAD").stdout.strip()
         self.env = dict(os.environ, RUNNER_TEMP=str(self.root), ARTIFACT_TASK="test-build",
-                        TEST_SELECTION="affected", PLAN_STATUS="failure", PLAN_FILE="",
+                        TEST_SELECTION="affected", PLAN_STATUS="failure", PLAN_FILE="", BASE_SHA="",
                         GITHUB_WORKSPACE=str(self.root), PATH=f"{self.root}:{os.environ['PATH']}")
         git = self.root / "git"
         git.write_text(f"#!/bin/sh\ncase $1 in\n  rev-parse) echo {self.revision} ;;\n  cat-file) echo 'parent fixture' ;;\n  *) exit 1 ;;\nesac\n")
@@ -205,6 +205,25 @@ elif sys.argv[1] in ('build', 'metadata'):
     def test_explicit_workspace_selection_does_not_need_a_planner(self):
         self.env["TEST_SELECTION"] = "workspace"
         self.assert_workspace_fallback()
+
+    def kafka_fixtures_after_a_merge_of_master(self, base_sha):
+        # HEAD merges master into a branch that changed gateways/. The first
+        # parent is the previous branch tip, so that diff shows only master.
+        git = self.root / "git"
+        git.write_text(f"#!/bin/sh\ncase $1 in\n  rev-parse) echo {self.revision} ;;\n"
+                       "  cat-file) printf 'parent tip\\nparent master\\n' ;;\n  fetch) ;;\n"
+                       "  diff) [ \"$3\" = tip ] && echo core/server/src/main.rs || echo gateways/kafka/src/lib.rs ;;\n"
+                       "  *) exit 1 ;;\nesac\n")
+        self.env["BASE_SHA"] = base_sha
+        result = run("bash", "-euo", "pipefail", "-c", self.script, cwd=self.root, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return (self.root / "rust-test-build/kafka-fixtures").read_text()
+
+    def test_fork_push_finds_gateway_changes_from_the_passed_base(self):
+        self.assertEqual(self.kafka_fixtures_after_a_merge_of_master("upstream-base"), "true\n")
+
+    def test_pull_request_merge_commit_is_compared_with_its_first_parent(self):
+        self.assertEqual(self.kafka_fixtures_after_a_merge_of_master(""), "false\n")
 
     def select(self, packages, *, tests=(), runtime_packages=()):
         outputs = {
@@ -282,14 +301,30 @@ class RuntimeSelection(unittest.TestCase):
         components = yaml.safe_load((REPO_ROOT / ".github/config/components.yml").read_text())
         step = next(step for step in workflow["jobs"]["detect"]["steps"] if step.get("id") == "mk")
         script = step["with"]["script"]
-        script = script.replace("${{ steps.config.outputs.components }}", json.dumps(components))
-        script = script.replace("${{ steps.changed.outputs.all_files || '[]' }}", json.dumps(files))
+        self.assertNotIn("${{", script)
+        self.assertEqual(set(step["env"]), {"COMPONENTS", "CHANGED_FILES"})
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "outputs"
-            env = dict(os.environ, GITHUB_OUTPUT=str(output))
-            result = run("node", "-e", "const context = {eventName: 'pull_request'};\n" + script, env=env)
+            env = dict(os.environ, GITHUB_OUTPUT=str(output),
+                       COMPONENTS=json.dumps(components), CHANGED_FILES=json.dumps(files))
+            result = run("node", "-e", script, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+    def test_selection_reads_file_names_as_data(self):
+        rust = ["core/server/src/main.rs"]
+        selected = self.select(rust + ["notes/a${(JSON.parse=()=>[],'')}`\\.txt"])
+        self.assertEqual(selected, self.select(rust))
+        self.assertNotEqual(selected["rust_runtime_plan"], "")
+
+    def test_no_changed_file_selects_no_work(self):
+        # A run that leaves the pipeline to the fork reads no changed files.
+        outputs = self.select([])
+        self.assertEqual((outputs["runtime"], outputs["rust_plan"], outputs["rust_runtime_plan"]), ("false", "", ""))
+        matrices = {name: json.loads(value)["include"] for name, value in outputs.items() if name.endswith("_matrix")}
+        self.assertEqual(len(matrices), len(outputs) - 3)
+        for name, include in matrices.items():
+            self.assertEqual(include, [{"component": "noop", "task": "noop"}], name)
 
     def test_component_config_change_runs_selection_validation(self):
         outputs = self.select([".github/config/components.yml"])
@@ -595,6 +630,56 @@ const console = { log() {} };
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not appear to be a git repository", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+class ForkCi(unittest.TestCase):
+    """Wiring of fork CI. .github/fork-ci/fork-ci.test.cjs covers its rules."""
+
+    def constant(self, name):
+        result = run("node", "-p", f"require('./.github/fork-ci/fork-ci.cjs').{name}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    @staticmethod
+    def workflow(name):
+        return yaml.safe_load((REPO_ROOT / ".github/workflows" / name).read_text())
+
+    def test_bridge_reports_the_check_that_branch_protection_requires(self):
+        required = self.constant("REQUIRED_CONTEXT")
+        protection = yaml.safe_load((REPO_ROOT / ".asf.yaml").read_text())["github"]["protected_branches"]
+        checks = protection["master"]["required_status_checks"]
+        self.assertIn(required, checks["contexts"])
+        # The bridge trusts the workflows of a fork run only because a head
+        # that can merge contains master.
+        self.assertIs(checks["strict"], True)
+        # A run that tested nothing must report another name.
+        self.assertRegex(
+            self.workflow("pre-merge.yml")["jobs"][required]["name"],
+            rf"needs\.detect\.outputs\.run_ci == 'false' && '(?!{required}')[^']+' \|\| '{required}' ")
+
+    def test_bridge_reads_the_workflow_that_runs_the_pipeline_on_a_fork_push(self):
+        workflow = self.workflow(self.constant("FORK_WORKFLOW"))
+        # PyYAML reads the key `on` as a boolean.
+        self.assertIn("push", workflow[True])
+        self.assertEqual([job["uses"] for job in workflow["jobs"].values()], ["./.github/workflows/pre-merge.yml"])
+
+    def test_bridge_follows_the_pipeline_at_the_sweep_interval(self):
+        triggers = self.workflow("fork-ci-status.yml")[True]
+        self.assertEqual(triggers["workflow_run"]["workflows"], [self.workflow("pre-merge.yml")["name"]])
+        # The rotating slice of a sweep advances one step in each interval.
+        minutes, *rest = triggers["schedule"][0]["cron"].split()
+        self.assertEqual(rest, ["*"] * 4)
+        minutes = sorted(int(minute) for minute in minutes.split(","))
+        gaps = {(later - earlier) % 60 for earlier, later in zip(minutes, minutes[1:] + minutes[:1])}
+        self.assertEqual(gaps, {int(self.constant("SWEEP_INTERVAL_MS")) // 60_000})
+
+    def test_gated_run_selects_no_work(self):
+        steps = {step.get("id"): step for step in self.workflow("_detect.yml")["jobs"]["detect"]["steps"]}
+        self.assertEqual(steps["changed"]["if"], "steps.gate.outputs.run_ci == 'true'")
+        # Each job needs the gate itself or a selection that is empty without changed files.
+        for name, job in self.workflow("pre-merge.yml")["jobs"].items():
+            if name not in ("detect", "finalize_pr"):
+                self.assertIn("needs.detect.outputs.", str(job.get("if", "")), name)
 
 
 if __name__ == "__main__":

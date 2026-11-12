@@ -606,7 +606,9 @@ components:
   # CI/CD workflow monitoring (informational, no tasks)
   ci-workflows:
     paths:
+      - ".asf.yaml"
       - ".github/config/components.yml"
+      - ".github/fork-ci/**"
       - "scripts/ci/restore-runtime.sh"
       - "scripts/ci/test-runtime-artifacts.py"
       - "scripts/run-examples-from-readme.sh"

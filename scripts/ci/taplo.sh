@@ -20,6 +20,8 @@ set -euo pipefail
 
 # shellcheck source-path=SCRIPTDIR
 source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/files.sh"
 
 # Default values
 MODE="check"
@@ -78,30 +80,6 @@ if ! command -v taplo &> /dev/null; then
   exit 1
 fi
 
-# Get files to check based on mode
-get_files() {
-  case "$FILE_MODE" in
-    ci)
-      # Get TOML files changed in PR for CI
-      if [ -n "${GITHUB_BASE_REF:-}" ]; then
-        # GitHub Actions PR context
-        git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}:${GITHUB_BASE_REF}" 2>/dev/null || true
-        git diff --name-only --diff-filter=ACM "${GITHUB_BASE_REF}...HEAD" -- '*.toml'
-      elif [ -n "${CI:-}" ]; then
-        # Generic CI - compare with HEAD~1
-        git diff --name-only --diff-filter=ACM HEAD~1 -- '*.toml'
-      else
-        # Local fallback: check all tracked TOML files
-        git ls-files -- '*.toml'
-      fi
-      ;;
-    all)
-      # Get all TOML files (excluding common build directories)
-      git ls-files -- '*.toml'
-      ;;
-  esac
-}
-
 # If files were provided as arguments, use them
 if [ ${#FILES[@]} -gt 0 ]; then
   TOML_FILES=("${FILES[@]}")
@@ -110,7 +88,7 @@ else
   TOML_FILES=()
   while IFS= read -r file; do
     [ -n "$file" ] && TOML_FILES+=("$file")
-  done < <(get_files)
+  done < <(get_files "$FILE_MODE" '*.toml')
 fi
 
 # Exit early if no files to check

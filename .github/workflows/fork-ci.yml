@@ -1,0 +1,49 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Runs the Pre-merge pipeline for every branch push in a fork, on the fork's
+# own runners. fork-ci-status.yml reports the result on the pull request.
+#
+# This is a separate workflow because a push trigger on pre-merge.yml would
+# report its `finalize_pr` check on every commit pushed to apache/iggy.
+
+name: Fork CI
+on:
+  push:
+    # Without a filter a pushed tag starts a run too.
+    branches: ["**"]
+
+# pre-merge.yml has its own group, named after this workflow. The two names
+# must differ, or the called workflow waits for its caller forever.
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    # apache/iggy tests pull requests in pre-merge.yml and master in post-merge.yml.
+    if: github.event.repository.fork
+    uses: ./.github/workflows/pre-merge.yml
+    # A called workflow cannot hold more than its caller grants.
+    permissions:
+      contents: read
+      issues: read
+      security-events: write
+      pull-requests: write

@@ -23,10 +23,18 @@ on:
         description: "Whether to validate bundled third-party licenses"
         type: boolean
         default: true
+      base-sha:
+        description: "Commit that a push in a fork is compared with; empty for every other event"
+        type: string
+        default: ""
 
 permissions:
   contents: read
   pull-requests: read
+
+env:
+  # The --ci mode of the scripts in scripts/ci reads it.
+  CI_BASE_SHA: ${{ inputs.base-sha }}
 
 jobs:
   rust-versions:

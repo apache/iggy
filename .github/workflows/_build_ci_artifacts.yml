@@ -35,6 +35,10 @@ on:
       timeout-minutes:
         type: number
         default: 120
+      base-sha:
+        description: "Commit that a push in a fork is compared with; empty for every other event"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -55,6 +59,7 @@ jobs:
         with:
           task: ${{ inputs.task }}
           test-scope: ${{ inputs.test-scope }}
+          base-sha: ${{ inputs.base-sha }}
           save-cache: ${{ inputs.save-cache }}
 
       - name: Upload artifacts

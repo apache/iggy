@@ -1,0 +1,72 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Reports the Fork CI run of a fork on its pull request, including the
+# `finalize_pr` status that branch protection requires. The rules are in
+# .github/fork-ci/fork-ci.cjs.
+#
+# The job runs only the default branch copy of this workflow and of that
+# script, with a token that can write statuses. It never checks out or runs
+# pull request code, and takes only the head commit from a workflow_run event.
+
+name: Fork CI status
+on:
+  # A fork cannot notify this repository when its run changes, so poll.
+  # GitHub delays scheduled runs at the start of an hour, so stay away from it.
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  # Reports a pull request as soon as its Pre-merge run ends, without waiting
+  # for the next poll. A cancelled run mostly belongs to a replaced commit.
+  workflow_run:
+    workflows: ["Pre-merge"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions: {}
+
+# Two syncs of one pull request can report in the wrong order. GitHub keeps one
+# pending run per group, and the next scheduled run covers what a replaced one
+# would have reported.
+concurrency:
+  group: fork-ci-status
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # A manual run can select another branch, and with it another script.
+    if: >-
+      github.repository == 'apache/iggy' && github.ref == 'refs/heads/master' &&
+      (github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.head_repository.full_name != github.repository))
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          sparse-checkout: .github/fork-ci
+
+      - name: Report fork runs
+        uses: actions/github-script@v9
+        with:
+          script: await require('./.github/fork-ci/fork-ci.cjs').sync({ github, context, core })

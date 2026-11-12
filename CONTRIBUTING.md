@@ -103,6 +103,60 @@ Maintainers will not start reviewing a PR while its CI is failing. Get the
 pipeline green first - a red build, lint, or test means the PR is not ready
 for review.
 
+### Fork CI
+
+A pull request from a fork can get its CI result from a run in the fork. This keeps load
+off the GitHub Actions runners that all Apache projects share. For such a pull request,
+`apache/iggy` skips its own pipeline. A scheduled job copies the result of the fork run
+to the pull request.
+
+Fork CI is in a pilot. It applies only to a pull request from a fork that a maintainer
+labels `ci:fork`.
+
+Prepare your fork one time:
+
+1. Open the Actions tab of your fork and enable workflows.
+2. Start your branch from a current `master`, or merge `master` into it. The branch must
+   contain `.github/workflows/fork-ci.yml`.
+
+After that, each push to a branch of your fork starts a `Fork CI` run there. The run
+executes the `Pre-merge` pipeline for the changes since your branch left `master` of
+`apache/iggy`. You do not need to sync the `master` of your fork.
+
+The run starts for each branch that contains the workflow, with or without a pull request
+or a label. To stop these runs, open the Actions tab of your fork, select `Fork CI` and
+disable the workflow.
+
+The pull request shows two statuses. A job updates them about every 15 minutes:
+
+- `Fork CI` shows the state of the run and links to it.
+- `finalize_pr` is the check that a merge requires. When the run is green, the job adds it.
+
+If the run fails, push a fix or re-run the failed jobs in your fork. If the pull request
+had no activity for 6 hours, the job can take longer to find a re-run.
+
+A maintainer must add `ci:upstream` to run the pipeline in `apache/iggy` in these cases:
+
+- The pull request changes a file under `.github/` or `.config/`. Those files decide what
+  the run executes, so a green fork run is not accepted.
+- A job of the fork run did not use a GitHub-hosted runner.
+- The pull request needs a `breaking:storage`, `breaking:protocol` or
+  `breaking:client-to-replica-protocol` label. A fork run cannot read the labels of the
+  pull request.
+
+Notes for maintainers:
+
+- `ci:upstream` wins over `ci:fork`. The pipeline reads the labels when it starts. After
+  you change a label, wait for the next push or re-run all jobs of the `Pre-merge` run.
+- After you add `ci:upstream`, the `finalize_pr` status follows the pipeline of
+  `apache/iggy`. Merge only after that pipeline passes for the head commit.
+- Add `ci:fork` before the pipeline of `apache/iggy` runs for the head commit. A failed or
+  cancelled `finalize_pr` check of that pipeline stays on the commit and blocks the merge.
+  The pull request then needs a new commit.
+- To update the statuses immediately, run the `Fork CI status` workflow on `master`.
+- The job accepts a green fork run only if GitHub hosted every runner and the CI files
+  are those of `master`. It does not inspect the Actions caches of the fork.
+
 ### Single Purpose
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
