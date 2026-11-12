@@ -6091,21 +6091,24 @@ where
         }
     }
 
-    fn reclaim_phantom_offset_keys<K: Ord>(
+    fn reclaim_phantom_offset_keys<K: Ord + Copy>(
         &self,
         offsets: &RefCell<BTreeMap<K, ConsumerOffset>>,
         kind: ConsumerKind,
-        mut remaining: usize,
+        remaining: usize,
         consumer_id: impl Fn(&K) -> Option<u32>,
     ) {
         let capacity = self.consumer_offset_capacity_for(kind);
-        offsets.borrow_mut().retain(|key, _| {
-            let Some(id) = consumer_id(key) else {
-                return true;
-            };
-            if remaining == 0 || capacity.holds(id, &self.durable_consumer_offsets) {
-                return true;
-            }
+        // `take` ends the walk at the last key this call needs.
+        let phantoms: Vec<(K, u32)> = offsets
+            .borrow()
+            .keys()
+            .filter_map(|key| Some((*key, consumer_id(key)?)))
+            .filter(|(_, id)| !capacity.holds(*id, &self.durable_consumer_offsets))
+            .take(remaining)
+            .collect();
+        for (key, id) in phantoms {
+            offsets.borrow_mut().remove(&key);
             capacity.forget_inactive_provisional(id);
             // This cursor was never durable, so the consumer's next `Next`
             // poll restarts from offset 0 and redelivers. At-least-once
@@ -6119,9 +6122,7 @@ where
                 "reclaimed a local consumer offset cursor with no durable backing; its next \
                  poll restarts from offset 0"
             );
-            remaining -= 1;
-            false
-        });
+        }
     }
 
     /// Snapshot read resources synchronously on the partition owner.
