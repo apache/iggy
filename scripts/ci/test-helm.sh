@@ -341,6 +341,10 @@ validate() {
     --set server.encryption.existingSecret.name=shared-key \
     > "$HELM_RENDER_DIR/auto-flat-encryption.yaml"
   grep -q 'name: IGGY_ENCRYPTION_KEY' "$HELM_RENDER_DIR/auto-flat-encryption.yaml"
+  if grep -q 'PREVIOUS_KEYS' "$HELM_RENDER_DIR/auto-flat-encryption.yaml"; then
+    echo "Error: a flat image without key rotation was given IGGY_ENCRYPTION_PREVIOUS_KEYS" >&2
+    exit 1
+  fi
 
   helm template iggy "$CHART_DIR" \
     --set-string server.image.tag=custom-flat \
@@ -433,6 +437,10 @@ validate() {
     --set-string server.encryption.key=bm90LTMyLWJ5dGVz
   assert_render_rejected "previous encryption keys on the legacy layout" \
     --set-string server.image.tag=0.9.0-edge.7 \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    --set-string "server.encryption.previousKeys[0]=$HELM_TEST_PREVIOUS_ENCRYPTION_KEY"
+  assert_render_rejected "previous encryption keys on an image without key rotation" \
+    --set-string server.image.tag=0.9.0 \
     --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
     --set-string "server.encryption.previousKeys[0]=$HELM_TEST_PREVIOUS_ENCRYPTION_KEY"
   assert_render_rejected "previous encryption keys without a key" \

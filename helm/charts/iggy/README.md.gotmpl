@@ -93,7 +93,7 @@ helm install iggy ./helm/charts/iggy \
 
 With persistence on, the chart uses the `Recreate` strategy. A rolling update
 starts the replacement server while the outgoing one is still running on the
-same volume, which loses messages. Charts before 0.7.0 used a rolling update
+same volume, which loses messages. Charts before 0.8.0 used a rolling update
 here, so an existing release moves from `RollingUpdate` to `Recreate` on its
 first upgrade. On Helm 4, run that one upgrade with
 `helm upgrade --server-side=false`, as described under [Upgrades](#upgrades).
@@ -276,6 +276,43 @@ subpath with no lock between them, which corrupts the data directory while
 `helm --wait` still reports success. The chart ships no HorizontalPodAutoscaler
 for the same reason. Cluster size is a roster decision, so add a node to
 `server.cluster.nodes` and install another release instead.
+
+## Upgrading from chart 0.7
+
+Chart 0.8 moves the default image from `0.9.0-edge.6` to the `0.10.0` release.
+
+* **Data does not carry over.** `0.10.0` refuses to start on a data directory
+  written by an earlier server, including `0.9.0` and its edge builds, with
+  `storage at local_data does not match this build's storage format; startup
+  refused without modifying data. No in-place upgrade is supported`. A release
+  with persistence on needs a new, empty volume for `0.10.0`, so install
+  `0.10.0` as a new release with its own volume. Move the
+  streams, topics, users and consumer offsets you need across by recreating
+  them and replaying the messages, and give topics that used
+  `enforce_fsync=true` explicit durability when you recreate them. If an
+  upgrade is attempted on the old volume, the server leaves it unchanged, so
+  `helm rollback` to the previous revision brings the release back with its
+  data.
+* **`IGGY_SYSTEM_*` variables in `server.env`.** `0.10.0` refuses to start on
+  variables from the old config layout. Rename `IGGY_SYSTEM_PATH`,
+  `IGGY_SYSTEM_RUNTIME_*`, `IGGY_SYSTEM_LOGGING_*`,
+  `IGGY_SYSTEM_ENCRYPTION_*`, `IGGY_SYSTEM_PARTITION_*`,
+  `IGGY_SYSTEM_SHARDING_*` and `IGGY_SYSTEM_MEMORY_POOL_*` by dropping
+  `SYSTEM_`, for example `IGGY_SYSTEM_SHARDING_CPU_ALLOCATION` to
+  `IGGY_SHARDING_CPU_ALLOCATION`. Remove any other `IGGY_SYSTEM_*`,
+  `IGGY_STREAM_*`, `IGGY_TOPIC_*`, `IGGY_EXTRA_*` and `IGGY_PARTITION_PATH`
+  variables. `IGGY_PARTITION_CONSUMER_OFFSET_ENFORCE_FSYNC` is replaced by the
+  `consumer_offset_durability` topic option, and
+  `IGGY_CONSUMER_GROUP_SESSION_TIMEOUT` by 1.2 times
+  `IGGY_HEARTBEAT_INTERVAL`.
+* **Update strategy.** With persistence on, the Deployment moves from
+  `RollingUpdate` to `Recreate`. On Helm 4, run the upgrade or rollback that
+  changes it with `--server-side=false`, as described under
+  [Upgrades](#upgrades).
+* **Encryption key rotation.** `server.encryption.previousKeys` and
+  `existingSecret.previousKeysKey` need server `0.9.1-edge.2` or later. The
+  chart rejects inline previous keys on an older image and leaves
+  `IGGY_ENCRYPTION_PREVIOUS_KEYS` out of its environment.
 
 ## Upgrading from chart 0.6
 
