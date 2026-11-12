@@ -24,10 +24,11 @@
 //! [`crate::boot`].
 
 use configs::server::ServerConfig;
-use consensus::{ConsensusTimers, VsrConsensus};
+use consensus::{ConsensusTimers, HeartbeatSchedule, VsrConsensus};
 use iggy_common::variadic;
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::PingPongSuperblock;
+use message_bus::replica::auth::HeartbeatTimings;
 use message_bus::{ConnectionInstaller, IggyMessageBus, MessageBus};
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -95,31 +96,53 @@ fn duration_to_ticks(interval: Duration) -> u64 {
     u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
 }
 
-/// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
-/// (metadata and per-partition planes alike) gets the same window: the failure
-/// it guards against - a primary that stopped heartbeating - is host-level, not
-/// per-plane.
-pub(crate) fn cluster_heartbeat_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.heartbeat_timeout.get_duration())
+// The config checks the heartbeat values against this tick.
+const _: () = assert!(
+    configs::cluster::CONSENSUS_TICK.as_nanos() == shard::CONSENSUS_TICK_INTERVAL.as_nanos()
+);
+
+/// The five `[cluster] commit_*heartbeat*` values in consensus ticks. Every
+/// consensus group uses the same schedule, because a primary that stops is a
+/// host failure and not a failure of one plane.
+pub(crate) fn heartbeat_schedule(config: &ServerConfig) -> HeartbeatSchedule {
+    let cluster = &config.cluster;
+    HeartbeatSchedule {
+        grid_ticks: duration_to_ticks(cluster.commit_heartbeat_grid.get_duration()),
+        busy_interval_ticks: duration_to_ticks(
+            cluster.commit_busy_heartbeat_interval.get_duration(),
+        ),
+        busy_timeout_ticks: duration_to_ticks(cluster.commit_busy_heartbeat_timeout.get_duration()),
+        idle_interval_ticks: duration_to_ticks(
+            cluster.commit_idle_heartbeat_interval.get_duration(),
+        ),
+        idle_timeout_ticks: duration_to_ticks(cluster.commit_idle_heartbeat_timeout.get_duration()),
+    }
 }
 
-/// `[cluster] commit_broadcast_interval` in consensus ticks: how often the
-/// primary broadcasts its commit point, the cluster's liveness feed. Applied
-/// to every consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn commit_broadcast_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.commit_broadcast_interval.get_duration())
+/// The five heartbeat values in milliseconds. Each replica sends them in its
+/// handshake, and a peer with other values refuses the link.
+pub(crate) fn heartbeat_timings(config: &ServerConfig) -> HeartbeatTimings {
+    let cluster = &config.cluster;
+    let millis = |interval: Duration| u32::try_from(interval.as_millis()).unwrap_or(u32::MAX);
+    HeartbeatTimings {
+        grid_ms: millis(cluster.commit_heartbeat_grid.get_duration()),
+        busy_interval_ms: millis(cluster.commit_busy_heartbeat_interval.get_duration()),
+        busy_timeout_ms: millis(cluster.commit_busy_heartbeat_timeout.get_duration()),
+        idle_interval_ms: millis(cluster.commit_idle_heartbeat_interval.get_duration()),
+        idle_timeout_ms: millis(cluster.commit_idle_heartbeat_timeout.get_duration()),
+    }
 }
 
 /// `[cluster] prepare_retransmit_interval` in consensus ticks: how often the
 /// primary retransmits un-acked prepares. Applied to every consensus group,
-/// matching `cluster_heartbeat_ticks`.
+/// matching `heartbeat_schedule`.
 pub(crate) fn prepare_retransmit_ticks(config: &ServerConfig) -> u64 {
     duration_to_ticks(config.cluster.prepare_retransmit_interval.get_duration())
 }
 
 /// `[cluster] view_change_retransmit_interval` in consensus ticks: how often a
 /// replica retransmits its `StartViewChange` / `DoViewChange` during a view
-/// change. Applied to every consensus group, matching `cluster_heartbeat_ticks`.
+/// change. Applied to every consensus group, matching `heartbeat_schedule`.
 pub(crate) fn view_change_retransmit_ticks(config: &ServerConfig) -> u64 {
     duration_to_ticks(
         config
@@ -131,14 +154,14 @@ pub(crate) fn view_change_retransmit_ticks(config: &ServerConfig) -> u64 {
 
 /// `[cluster] view_change_status_timeout` in consensus ticks: the stalled
 /// view-change backstop before escalating to a fresh election. Applied to every
-/// consensus group, matching `cluster_heartbeat_ticks`.
+/// consensus group, matching `heartbeat_schedule`.
 pub(crate) fn view_change_status_ticks(config: &ServerConfig) -> u64 {
     duration_to_ticks(config.cluster.view_change_status_timeout.get_duration())
 }
 
 /// `[cluster] request_start_view_retransmit_interval` in consensus ticks: how
 /// often a recovering or view-change backup re-requests the current `StartView`.
-/// Applied to every consensus group, matching `cluster_heartbeat_ticks`.
+/// Applied to every consensus group, matching `heartbeat_schedule`.
 pub(crate) fn request_start_view_ticks(config: &ServerConfig) -> u64 {
     duration_to_ticks(
         config
@@ -152,8 +175,7 @@ pub(crate) fn request_start_view_ticks(config: &ServerConfig) -> u64 {
 /// once so the planes cannot diverge in what they apply.
 pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
     ConsensusTimers {
-        normal_heartbeat_ticks: cluster_heartbeat_ticks(config),
-        commit_message_ticks: commit_broadcast_ticks(config),
+        heartbeat: heartbeat_schedule(config),
         prepare_ticks: prepare_retransmit_ticks(config),
         view_change_retransmit_ticks: view_change_retransmit_ticks(config),
         view_change_status_ticks: view_change_status_ticks(config),

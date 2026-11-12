@@ -702,7 +702,7 @@ const RECOVERY_BARRIER_MULTIPLIER: u32 = 3;
 
 /// How long the post-restart read path waits for the recovered WAL suffix to
 /// re-commit before failing loud (retryable 503): the largest of the fixed
-/// floor, a `[cluster] heartbeat_timeout`-scaled window, and a
+/// floor, a `[cluster] commit_busy_heartbeat_timeout`-scaled window, and a
 /// `[cluster] view_change_status_timeout`-scaled window. Both knobs feed it
 /// because either, raised far past its default, stretches worst-case recovery
 /// past the fixed floor; see `await_recovery_barrier` for the read-side wait.
@@ -753,7 +753,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
     let commit_watermark = owner.last_applied_op.unwrap_or(snapshot_floor);
     let restored_op = owner.last_journaled_op.unwrap_or(snapshot_floor);
     let recovery_deadline = recovery_barrier_deadline(
-        config.cluster.heartbeat_timeout.get_duration(),
+        config.cluster.commit_busy_heartbeat_timeout.get_duration(),
         config.cluster.view_change_status_timeout.get_duration(),
     );
     let prepare_queue_depth = config.metadata.prepare_queue_depth;
@@ -1241,20 +1241,15 @@ mod tests {
     }
 
     #[test]
-    fn default_cluster_heartbeat_timeout_matches_consensus_constant() {
-        // The config default lives in core/server/config.toml (a string,
-        // so no static assert can pin it); keep it in lockstep with the
-        // built-in the simulator and un-configured replicas run on.
-        let config_default = configs::cluster::ClusterConfig::default()
-            .heartbeat_timeout
-            .get_duration()
-            .as_millis();
-        let built_in = u128::from(consensus::TimeoutManager::NORMAL_HEARTBEAT_TICKS)
-            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+    fn default_heartbeat_values_match_consensus_constants() {
+        // The config defaults are strings in core/server/config.toml, so no
+        // static assert can pin them. The simulator and replicas without a
+        // config run on the built-in schedule.
+        let config = configs::server::ServerConfig::default();
         assert_eq!(
-            config_default, built_in,
-            "[cluster] heartbeat_timeout default drifted from \
-             TimeoutManager::NORMAL_HEARTBEAT_TICKS"
+            crate::shell::heartbeat_schedule(&config),
+            consensus::HeartbeatSchedule::default(),
+            "a [cluster] heartbeat default drifted from the consensus constants"
         );
     }
 
@@ -1308,7 +1303,7 @@ mod tests {
         let cluster = configs::cluster::ClusterConfig::default();
         assert_eq!(
             recovery_barrier_deadline(
-                cluster.heartbeat_timeout.get_duration(),
+                cluster.commit_busy_heartbeat_timeout.get_duration(),
                 cluster.view_change_status_timeout.get_duration(),
             ),
             RECOVERY_BARRIER_DEADLINE_FLOOR
@@ -1330,19 +1325,19 @@ mod tests {
     }
 
     #[test]
-    fn default_commit_broadcast_interval_matches_consensus_constant() {
+    fn default_commit_busy_heartbeat_interval_matches_consensus_constant() {
         // The config default lives in core/server/config.toml (a string,
         // so no static assert can pin it); keep it in lockstep with the
         // built-in the simulator and un-configured replicas run on.
         let config_default = configs::cluster::ClusterConfig::default()
-            .commit_broadcast_interval
+            .commit_busy_heartbeat_interval
             .get_duration()
             .as_millis();
         let built_in = u128::from(consensus::TimeoutManager::COMMIT_MESSAGE_TICKS)
             * shard::CONSENSUS_TICK_INTERVAL.as_millis();
         assert_eq!(
             config_default, built_in,
-            "[cluster] commit_broadcast_interval default drifted from \
+            "[cluster] commit_busy_heartbeat_interval default drifted from \
              TimeoutManager::COMMIT_MESSAGE_TICKS"
         );
     }

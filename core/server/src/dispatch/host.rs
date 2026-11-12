@@ -120,7 +120,7 @@ where
             completion_relays: Rc::new(RefCell::new(CompletionRelays::new(
                 server_config
                     .cluster
-                    .commit_broadcast_interval
+                    .commit_busy_heartbeat_interval
                     .get_duration(),
             ))),
             server_config,
@@ -229,8 +229,8 @@ mod tests {
     use super::*;
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, test_shard};
     use iggy_binary_protocol::{
-        CommitHeader, ConsensusHeader, HEADER_SIZE, PrimaryRebalanceHeader, PrimaryRebalanceKind,
-        SegmentDeleteHeader, SegmentDeleteKind,
+        CommitEntry, ConsensusHeader, HEADER_SIZE, HeartbeatState, PrimaryRebalanceHeader,
+        PrimaryRebalanceKind, SegmentDeleteHeader, SegmentDeleteKind,
     };
     use journal::prepare_journal::PrepareJournal;
     use metadata::impls::metadata::IggySnapshot;
@@ -307,15 +307,20 @@ mod tests {
             assert_eq!(message.header().replica, 2);
         }
 
-        let commit = Message::<CommitHeader>::new(HEADER_SIZE).transmute_header(
-            |_, header: &mut CommitHeader| {
-                header.command = Command::Commit;
-                header.size = u32::try_from(HEADER_SIZE).unwrap();
-                header.replica = 0;
-                header.group = METADATA_GROUP;
-                header.seal();
-            },
-        );
+        let commit = shard::commit_batch::encode_commit_batch(
+            0,
+            0,
+            &[CommitEntry::new(
+                METADATA_GROUP,
+                0,
+                0,
+                0,
+                0,
+                HeartbeatState::Busy,
+                0,
+            )],
+        )
+        .unwrap();
         host.on_replica_message(1, commit.into_generic());
         assert!(matches!(
             inbox.try_recv(),

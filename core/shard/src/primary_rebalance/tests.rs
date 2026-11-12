@@ -16,13 +16,14 @@
 // under the License.
 
 use super::*;
+use crate::commit_batch::encode_commit_batch;
 use crate::shards_table::PapayaShardsTable;
 use crate::{
     PartitionConsensusConfig, Receiver, ReplicaTopology, ShardIdentity, shard_mesh_channels,
 };
 use consensus::{LocalPipeline, PlaneKind, StateTransferStage};
 use iggy_binary_protocol::{
-    CommitHeader, DoViewChangeHeader, StartViewChangeHeader, StartViewHeader,
+    CommitEntry, DoViewChangeHeader, HeartbeatState, StartViewChangeHeader, StartViewHeader,
 };
 use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
@@ -759,18 +760,22 @@ fn given_pending_move_when_unrelated_or_current_traffic_arrives_should_preserve_
                         },
                     ),
                 ),
-                _ => {
-                    MessageBag::Commit(Message::<CommitHeader>::new(HEADER_SIZE).transmute_header(
-                        |_, header: &mut CommitHeader| {
-                            header.cluster = CLUSTER;
-                            header.group = group;
-                            header.view = view;
-                            header.replica = 1;
-                            header.command = command;
-                            header.size = u32::try_from(HEADER_SIZE).unwrap();
-                        },
-                    ))
-                }
+                _ => MessageBag::Commit(
+                    encode_commit_batch(
+                        CLUSTER,
+                        1,
+                        &[CommitEntry::new(
+                            group,
+                            0,
+                            view,
+                            0,
+                            0,
+                            HeartbeatState::Busy,
+                            1,
+                        )],
+                    )
+                    .unwrap(),
+                ),
             };
             shard.fence_rebalance_authority(&message);
             assert_eq!(

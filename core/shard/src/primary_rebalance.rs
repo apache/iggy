@@ -23,6 +23,7 @@
 //! loss after receipt does not revoke an accepted grant, so the worst case is
 //! one extra move.
 
+use crate::commit_batch;
 use crate::shards_table::calculate_shard_assignment;
 use crate::{
     IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, ShardsTable,
@@ -36,7 +37,7 @@ use iggy_binary_protocol::primitives::partition_status::{
     PartitionStatusEntry, encode_status_entries,
 };
 use iggy_binary_protocol::{
-    Command, ConsensusHeader, HEADER_SIZE, PrepareHeader, PrimaryRebalanceHeader,
+    Command, CommitEntry, ConsensusHeader, HEADER_SIZE, PrepareHeader, PrimaryRebalanceHeader,
     PrimaryRebalanceKind,
 };
 use journal::superblock::SuperblockStore;
@@ -490,7 +491,15 @@ where
             MessageBag::DoViewChange(message) => message.header().view > consensus.view(),
             MessageBag::StartView(message) => message.header().view >= consensus.view(),
             MessageBag::RequestStartView(message) => message.header().view > consensus.view(),
-            MessageBag::Commit(message) => message.header().view > consensus.view(),
+            MessageBag::Commit(message) => commit_batch::verified_entries::<_, CommitEntry>(
+                message,
+                message.header().checksum_body,
+            )
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.group == METADATA_GROUP && entry.view > consensus.view())
+            }),
             MessageBag::Prepare(message) => message.header().view > consensus.view(),
             MessageBag::RepairPrepare(message) => message.header().0.view > consensus.view(),
             _ => false,

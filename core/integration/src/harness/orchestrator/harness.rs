@@ -23,7 +23,7 @@ use crate::harness::handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
     ServerLogs,
 };
-use crate::harness::peer_relay::PeerRelays;
+use crate::harness::peer_relay::{PeerRelays, PeerTraffic};
 use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
 use iggy::prelude::{ClientWrapper, IggyClient};
@@ -625,6 +625,12 @@ impl TestHarness {
     /// index dials a higher one. Needs [`TestHarnessBuilder::peer_relays`].
     pub fn drop_peer_connection(&self, from: usize, to: usize) -> Result<(), TestBinaryError> {
         self.peer_relays()?.drop_connection(from, to)
+    }
+
+    /// The frames that crossed every replica link from node `from` to node
+    /// `to` since the cluster started. Needs [`TestHarnessBuilder::peer_relays`].
+    pub fn peer_traffic(&self, from: usize, to: usize) -> Result<PeerTraffic, TestBinaryError> {
+        Ok(self.peer_relays()?.traffic(from, to))
     }
 
     fn peer_relays(&self) -> Result<&PeerRelays, TestBinaryError> {

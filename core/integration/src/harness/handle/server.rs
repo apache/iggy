@@ -158,14 +158,14 @@ impl ServerHandle {
             .join(format!("server_{}_local_data", self.server_id))
     }
 
-    /// The `cluster.commit_broadcast_interval` the server runs with, read from
+    /// The `cluster.commit_busy_heartbeat_interval` the server runs with, read from
     /// the config it dumped at boot.
     ///
     /// # Errors
     ///
     /// [`TestBinaryError::InvalidState`] when the dump cannot be read or holds
     /// no valid interval.
-    pub fn commit_broadcast_interval(&self) -> Result<Duration, TestBinaryError> {
+    pub fn commit_busy_heartbeat_interval(&self) -> Result<Duration, TestBinaryError> {
         let path = self.data_path().join(CONFIG_DUMP_PATH);
         let invalid = |reason: String| TestBinaryError::InvalidState {
             message: format!("{}: {reason}", path.display()),
@@ -174,12 +174,16 @@ impl ServerHandle {
         let config: Value = toml::from_str(&dump).map_err(|error| invalid(error.to_string()))?;
         let interval = config
             .get("cluster")
-            .and_then(|cluster| cluster.get("commit_broadcast_interval"))
+            .and_then(|cluster| cluster.get("commit_busy_heartbeat_interval"))
             .and_then(Value::as_str)
-            .ok_or_else(|| invalid("no cluster.commit_broadcast_interval".to_string()))?;
+            .ok_or_else(|| invalid("no cluster.commit_busy_heartbeat_interval".to_string()))?;
         IggyDuration::from_str(interval)
             .map(|interval| interval.get_duration())
-            .map_err(|error| invalid(format!("commit_broadcast_interval {interval:?}: {error}")))
+            .map_err(|error| {
+                invalid(format!(
+                    "commit_busy_heartbeat_interval {interval:?}: {error}"
+                ))
+            })
     }
 
     fn stdout_log_path(&self) -> PathBuf {

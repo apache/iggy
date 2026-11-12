@@ -64,9 +64,6 @@ pub enum ConsensusError {
     #[error("command must be Commit")]
     CommitInvalidCommand,
 
-    #[error("size must be 256, found {0}")]
-    CommitInvalidSize(u32),
-
     #[error("command must be Reply")]
     ReplyInvalidCommand,
 

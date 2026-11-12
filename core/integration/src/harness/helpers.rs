@@ -332,7 +332,7 @@ pub async fn wait_for_topic(
 }
 
 /// How long a backup can take to learn a commit at the longest
-/// `cluster.commit_broadcast_interval` the running servers of `harness` use.
+/// `cluster.commit_busy_heartbeat_interval` the running servers of `harness` use.
 ///
 /// # Panics
 ///
@@ -344,7 +344,7 @@ pub fn backup_commit_budget(harness: &TestHarness) -> Duration {
         .filter(|server| server.is_running())
         .map(|server| {
             server
-                .commit_broadcast_interval()
+                .commit_busy_heartbeat_interval()
                 .expect("the commit broadcast interval of a running server")
         })
         .max()

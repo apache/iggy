@@ -194,7 +194,7 @@ pub struct MessageBusConfig {
     pub handshake_grace: Duration,
 
     /// `TCP_USER_TIMEOUT` of every replica link, from
-    /// `cluster.heartbeat_timeout`: sent data or keepalive probes that stay
+    /// `cluster.commit_busy_heartbeat_timeout`: sent data or keepalive probes that stay
     /// unacknowledged this long close the link. Linux only; see
     /// `socket_opts::apply_replica_socket_options`.
     pub replica_user_timeout: Duration,
@@ -250,7 +250,7 @@ impl From<&ServerConfig> for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.get_duration(),
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),
-            replica_user_timeout: cfg.cluster.heartbeat_timeout.get_duration(),
+            replica_user_timeout: cfg.cluster.commit_busy_heartbeat_timeout.get_duration(),
             ws_config: build_ws_config(&cfg.websocket),
             quic: build_quic_tuning(&cfg.quic),
         }

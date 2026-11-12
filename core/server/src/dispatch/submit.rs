@@ -422,11 +422,11 @@ pub(in crate::dispatch) struct CompletionRelays {
 
 impl CompletionRelays {
     /// The interval is [`COMPLETION_RELAY_BROADCASTS`] periods of
-    /// `commit_broadcast_interval` plus [`COMPLETION_RELAY_MARGIN`], so 1.5 s
+    /// `commit_busy_heartbeat_interval` plus [`COMPLETION_RELAY_MARGIN`], so 1.5 s
     /// at the default 500 ms broadcast.
-    pub(in crate::dispatch) fn new(commit_broadcast_interval: Duration) -> Self {
+    pub(in crate::dispatch) fn new(commit_busy_heartbeat_interval: Duration) -> Self {
         Self {
-            interval: commit_broadcast_interval
+            interval: commit_busy_heartbeat_interval
                 .saturating_mul(COMPLETION_RELAY_BROADCASTS)
                 .saturating_add(COMPLETION_RELAY_MARGIN),
             since: AHashMap::default(),
@@ -677,7 +677,7 @@ mod tests {
     const REPORTER: u16 = 3;
     /// The completion arms do not read it.
     const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
-    /// The default `cluster.commit_broadcast_interval`.
+    /// The default `cluster.commit_busy_heartbeat_interval`.
     const BROADCAST: Duration = Duration::from_millis(500);
     /// Two broadcasts of [`BROADCAST`] and the 500 ms margin.
     const RELAY_INTERVAL_MICROS: u64 = 1_500_000;
@@ -1369,12 +1369,12 @@ mod tests {
         );
     }
 
-    /// The relay interval follows `[cluster] commit_broadcast_interval`.
+    /// The relay interval follows `[cluster] commit_busy_heartbeat_interval`.
     #[compio::test]
     async fn given_configured_commit_broadcast_when_backup_answers_lifecycle_batch_should_wait_two_broadcasts_and_the_margin()
      {
         let mut server_config = ServerConfig::default();
-        server_config.cluster.commit_broadcast_interval =
+        server_config.cluster.commit_busy_heartbeat_interval =
             IggyDuration::from(Duration::from_secs(1));
         let bus = SpyBus::default();
         bus.instant_timers.set(true);
