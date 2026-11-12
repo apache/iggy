@@ -59,7 +59,7 @@ pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
 const OFFSET_FILE_BLOCK_BYTES: u64 = 4096;
 
 /// Sibling name an atomic offset replacement writes before its rename lands.
-const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
+pub(crate) const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
 
 #[cfg(unix)]
 const OFFSET_FILES_TOTAL_MAX: usize = 1024;

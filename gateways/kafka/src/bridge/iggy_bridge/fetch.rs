@@ -113,6 +113,15 @@ impl FetchPool {
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         LazyClient::close_all(&self.all).await
     }
+
+    /// The slots held now, and how many there are.
+    fn usage(&self) -> (usize, usize) {
+        let slots = self.all.len();
+        (
+            slots.saturating_sub(self.permits.available_permits()),
+            slots,
+        )
+    }
 }
 
 /// An Iggy client that connects at its first call, so a bridge that never needs it opens no
@@ -380,6 +389,12 @@ impl IggyBridge {
         Some(slot)
     }
 
+    /// The Fetch read slots held now, and how many there are (`IGGY_KAFKA_FETCH_SLOTS`).
+    #[must_use]
+    pub fn fetch_slot_use(&self) -> (usize, usize) {
+        self.fetch_pool.usage()
+    }
+
     /// Probes every partition of the topic `kafka_topic` maps to, with one `get_topic` call, or
     /// two when a partition reads as loading.
     ///
@@ -524,6 +539,23 @@ mod tests {
             .build()
             .expect("building a client dials nothing");
         Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn given_a_held_fetch_slot_should_count_it_as_used() {
+        let bridge = IggyBridge::offline();
+        bridge.hold_fetch_clients(&unconnected()).await;
+        let slots = bridge.fetch_slot_use().1;
+
+        let slot = bridge
+            .fetch_slot(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("a free slot");
+        assert_eq!(bridge.fetch_slot_use(), (1, slots));
+        assert_eq!(slots, crate::bridge::DEFAULT_FETCH_SLOTS.get());
+
+        drop(slot);
+        assert_eq!(bridge.fetch_slot_use(), (0, slots));
     }
 
     fn config() -> IggyBridgeConfig {
