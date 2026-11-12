@@ -6045,15 +6045,28 @@ class ReadException final : public IggyException {
 
     /**
      * @return For a message that does not decode, the continuation after it,
-     *         to pass to PartitionReader::Seek(). For a lost range, the
-     *         continuation after the last offset of Lost(). Otherwise `nullptr`.
+     *         to pass to PartitionReader::Seek(). Otherwise `nullptr`.
      */
     [[nodiscard]] const ::iggy::Continuation *Skip() const noexcept { return skip_.get(); }
+
+    /**
+     * @return True when the reader stopped the partition after six refusals
+     *         in a row that a retry does not change, such as `unauthorized`.
+     *         Only a Seek() of the partition reads it again. While a lost
+     *         read is still pending, such a stop arrives as
+     *         `fetch_progress_uncertain` (14010) with an empty Lost(), and
+     *         this flag is then false.
+     */
+    [[nodiscard]] bool IsLastingRefusal() const noexcept { return lasting_refusal_; }
 
     /**
      * @return For messages that a lost read committed and that the reader
      *         could not read again, their first and last offset, with the
      *         error `fetch_progress_uncertain`. Otherwise `std::nullopt`.
+     *         This error stops nothing and needs no Seek(). A batch that the
+     *         reader holds after the range comes next, and a Seek() before
+     *         the application takes it drops it. If the reader stopped the
+     *         partition, the error that stopped it comes after that batch.
      */
     [[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>> Lost() const noexcept { return lost_; }
 
@@ -6062,10 +6075,13 @@ class ReadException final : public IggyException {
 
     friend class PartitionReader;
     friend class IggyConsumer;
+    // The unit tests have no server to fail a read, so they build one through this class.
+    friend class ReadExceptionTestPeer;
 
     std::optional<std::uint32_t> partition_id_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const ::iggy::Continuation> skip_;
+    bool lasting_refusal_;
     std::optional<std::pair<std::uint64_t, std::uint64_t>> lost_;
 };
 
