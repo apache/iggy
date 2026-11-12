@@ -35,6 +35,7 @@ use crate::cluster_id::ClusterId;
 use crate::coordinator::{Coordination, Placement};
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember, MAX_CLIENT_ID_BYTES};
+use crate::observability::{Pool, PoolCensus};
 use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
@@ -84,6 +85,9 @@ pub enum HandleOutcome {
     RespondThenClose(Bytes),
     /// No parseable response exists for this request; close the TCP connection.
     Close,
+    /// Produce with `acks=0` whose records Iggy did not take in time. Write nothing and close,
+    /// as Kafka does, so the client refreshes its metadata.
+    UnacknowledgedProduceFailed,
 }
 
 impl HandleOutcome {
@@ -99,6 +103,7 @@ impl HandleOutcome {
             Self::Respond(body) | Self::RespondThenClose(body) => body,
             Self::NoResponse => panic!("{msg}: got NoResponse"),
             Self::Close => panic!("{msg}: got Close"),
+            Self::UnacknowledgedProduceFailed => panic!("{msg}: got UnacknowledgedProduceFailed"),
         }
     }
 
@@ -355,7 +360,32 @@ const PRODUCE_LARGE: usize = 4;
 /// large slots: large requests can hold a cap each, and the small ones still have one.
 const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
 
+/// The bytes of [`GatewayState::produce_memory`]: [`PRODUCE_CAPS`] frames, at most what a
+/// semaphore counts.
+const fn produce_memory_capacity(max_frame_size: usize) -> usize {
+    let capacity = PRODUCE_CAPS.saturating_mul(max_frame_size);
+    if capacity < Semaphore::MAX_PERMITS {
+        capacity
+    } else {
+        Semaphore::MAX_PERMITS
+    }
+}
+
 impl GatewayState {
+    /// The large Produce slots in use, and the bytes of decoded Produce partitions held now with
+    /// the most the gateway holds, for the metrics.
+    #[must_use]
+    pub fn produce_use(&self) -> (PoolCensus, (usize, usize)) {
+        let large = PoolCensus {
+            pool: Pool::ProduceLarge,
+            used: PRODUCE_LARGE.saturating_sub(self.produce_large.available_permits()),
+            capacity: PRODUCE_LARGE,
+        };
+        let capacity = produce_memory_capacity(self.max_frame_size);
+        let used = capacity.saturating_sub(self.produce_memory.available_permits());
+        (large, (used, capacity))
+    }
+
     /// Whether this gateway gave out `producer_id` lately, so Produce may key an Iggy session on
     /// it. With a bridge the ids come from Iggy. Without one, from the local allocator.
     #[must_use]
@@ -377,11 +407,7 @@ impl GatewayState {
             bridge,
             max_frame_size,
             producer_ids: ProducerIdAllocator::new(instance_id),
-            produce_memory: Arc::new(Semaphore::new(
-                PRODUCE_CAPS
-                    .saturating_mul(max_frame_size)
-                    .min(Semaphore::MAX_PERMITS),
-            )),
+            produce_memory: Arc::new(Semaphore::new(produce_memory_capacity(max_frame_size))),
             produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
             groups,
             loading: Mutex::default(),
@@ -948,6 +974,18 @@ mod tests {
     use iggy_kafka_wire::bounds_guard::guarded_range;
 
     use super::*;
+
+    #[tokio::test]
+    async fn given_held_produce_slots_and_memory_should_count_them() {
+        let state = GatewayState::stub(1_024);
+        let _large = state.produce_large.acquire().await.unwrap();
+        let _memory = state.produce_memory.acquire_many(300).await.unwrap();
+
+        let (large, (used, capacity)) = state.produce_use();
+        assert_eq!(large.pool, Pool::ProduceLarge);
+        assert_eq!((large.used, large.capacity), (1, PRODUCE_LARGE));
+        assert_eq!((used, capacity), (300, produce_memory_capacity(1_024)));
+    }
 
     /// A version this gateway advertises but the guard does not walk would reach the decoder
     /// unchecked, so the two tables must never drift apart.
