@@ -9231,10 +9231,19 @@ where
                 .with_op(header.op),
             );
             // A new primary may still need quorum for an op committed here.
-            // Retained bytes prove its identity; the ack gate proves durability.
-            if let Some(journaled) = self.log.journal().inner.repair_entry(header.op)
-                && journaled_prepare_matches_retransmit(&journaled, &message)
-            {
+            // Retained bytes prove its identity, or the header and the batch
+            // checksum kept for a body that went back to its segment. The ack
+            // gate proves durability.
+            let journal = &self.log.journal().inner;
+            let same_prepare = journal.repair_entry(header.op).map_or_else(
+                || {
+                    journal
+                        .evicted_header(header.op)
+                        .is_some_and(|released| released.matches_retransmit(&message))
+                },
+                |journaled| journaled_prepare_matches_retransmit(&journaled, &message),
+            );
+            if same_prepare {
                 self.send_prepare_ok(&header).await;
             }
             return;
