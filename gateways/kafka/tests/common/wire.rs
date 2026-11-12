@@ -102,6 +102,19 @@ pub fn build_api_versions_flexible_request(software_name: &str, software_version
     enc.freeze()
 }
 
+/// `ApiVersions` v5 body: the v3 fields, then the `ClusterId` and `NodeId` of the broker that the
+/// client means to reach (KIP-1242). A client sends a null `ClusterId` and `NodeId` -1 to a
+/// bootstrap server.
+pub fn build_api_versions_v5_request(cluster_id: Option<&str>, node_id: i32) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_compact_nullable_string(Some("iggy-test"));
+    enc.write_compact_nullable_string(Some("0.1.0"));
+    enc.write_compact_nullable_string(cluster_id);
+    enc.write_i32(node_id);
+    enc.write_empty_tagged_fields();
+    enc.freeze()
+}
+
 /// Legacy Metadata request body for a specific version (v0–v8).
 pub fn build_metadata_legacy_request_for_version(version: i16, topic_names: &[&str]) -> Bytes {
     let mut enc = Encoder::with_capacity(64);

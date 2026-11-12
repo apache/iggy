@@ -198,6 +198,9 @@ pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
 pub const ERROR_MISMATCHED_ENDPOINT_TYPE: i16 = ResponseError::MismatchedEndpointType.code();
 /// `DescribeCluster` v1+ named an endpoint type Kafka does not define.
 pub const ERROR_UNSUPPORTED_ENDPOINT_TYPE: i16 = ResponseError::UnsupportedEndpointType.code();
+/// `ApiVersions` v5 named another cluster or another node (KIP-1242). A Java client then closes
+/// its connections and starts again from its bootstrap servers.
+pub const ERROR_REBOOTSTRAP_REQUIRED: i16 = ResponseError::RebootstrapRequired.code();
 
 #[derive(Debug, Clone, Copy)]
 pub struct ApiVersionRange {
