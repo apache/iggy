@@ -27,12 +27,14 @@ pub struct SelectFieldProps {
     pub options: Vec<(String, String)>,
     pub selected: String,
     pub onchange: Callback<String>,
-    /// Shows the choice in its own style instead of the select's text. The select stays on top,
-    /// invisible, so it still opens on a click and takes key presses.
+    /// Shows the choice in its own style instead of the text of its option.
     #[prop_or_default]
     pub face: Option<Html>,
 }
 
+/// The field shows its label and the choice. The select covers the whole field, invisible, so a
+/// click anywhere on the field opens it, and the field still takes key presses.
+///
 /// The select sets its value after every render: once the user picks an option, the browser
 /// no longer follows the `selected` attribute, so Back would show a stale choice.
 #[function_component(SelectField)]
@@ -55,17 +57,52 @@ pub fn select_field(props: &SelectFieldProps) -> Html {
             }
         })
     };
+    let face = props
+        .face
+        .clone()
+        .unwrap_or_else(|| html! { chosen_text(&props.options, &props.selected).to_owned() });
     html! {
-        <label class={classes!("explore-facet", props.face.is_some().then_some("explore-facet-face"))}>
-            <span class="explore-facet-label">{ props.label }</span>
-            if let Some(face) = &props.face {
-                { face.clone() }
-            }
+        <label class="explore-facet">
+            <span class="explore-facet-text">
+                <span class="explore-facet-label">{ props.label }</span>
+                // The select gives the choice to screen readers.
+                <span class="explore-facet-value" aria-hidden="true">{ face }</span>
+            </span>
             <select ref={select_ref} class="explore-select" {onchange}>
                 { for props.options.iter().map(|(value, text)| html! {
                     <option key={value.clone()} value={value.clone()}>{ text.as_str() }</option>
                 }) }
             </select>
         </label>
+    }
+}
+
+/// The text of the chosen option. A value with no option shows nothing, like the select.
+fn chosen_text<'a>(options: &'a [(String, String)], selected: &str) -> &'a str {
+    options
+        .iter()
+        .find(|(value, _)| value == selected)
+        .map_or("", |(_, text)| text.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options() -> Vec<(String, String)> {
+        [("", "Any machine (3)"), ("mxpc", "mxpc (2)")]
+            .map(|(value, text)| (value.to_owned(), text.to_owned()))
+            .to_vec()
+    }
+
+    #[test]
+    fn given_chosen_value_when_shown_should_show_text_of_its_option() {
+        assert_eq!(chosen_text(&options(), "mxpc"), "mxpc (2)");
+        assert_eq!(chosen_text(&options(), ""), "Any machine (3)");
+    }
+
+    #[test]
+    fn given_value_without_option_when_shown_should_show_nothing() {
+        assert_eq!(chosen_text(&options(), "atlas"), "");
     }
 }

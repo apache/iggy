@@ -22,11 +22,11 @@ use std::rc::Rc;
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::delta::Metric;
-use bench_dashboard_shared::series::{BenchmarkSeries, SeriesMetric, SeriesScope};
+use bench_dashboard_shared::series::{BenchmarkSeries, ChartSeries, SeriesMetric, SeriesScope};
 use bench_report::add_latency_distributions;
 use bench_report::group_metrics_kind::GroupMetricsKind;
 use bench_report::plotting::chart::IggyChart;
-use charming::element::{ItemStyle, Tooltip, Trigger};
+use charming::element::{AxisPointer, AxisPointerType, ItemStyle, Tooltip, Trigger};
 use charming::series::{Line, Scatter};
 use charming::theme::Theme;
 use charming::{Chart, WasmRenderer};
@@ -39,7 +39,7 @@ use super::change::{metric_name, metric_value_text};
 use super::facts::P9999_LABEL;
 use super::history::{CURRENT_LABEL, HistoryChart, VersionPoint};
 use crate::api::fetch_benchmark_series;
-use crate::components::chart::dispose_chart_at;
+use crate::components::chart::{dispose_chart_at, reset_zoom_at};
 use crate::components::page::loadable;
 use crate::hooks::use_size;
 use crate::state::data::{Loadable, fetch_into};
@@ -76,6 +76,16 @@ pub struct SeriesChartProps {
     pub scope: SeriesScope,
 }
 
+/// The first two colors of the ECharts theme in light and dark mode. The group charts draw each
+/// group in its theme color, so its actors and its average take that color too.
+const LIGHT_GROUP_COLORS: [&str; 2] = ["#5470c6", "#91cc75"];
+const DARK_GROUP_COLORS: [&str; 2] = ["#4992ff", "#7cffb2"];
+const ACTOR_LINE_WIDTH: f64 = 1.0;
+/// Light enough that the average stays readable over many actors, dark enough to show a peak.
+const ACTOR_LINE_OPACITY: f64 = 0.5;
+const AVERAGE_LINE_WIDTH: f64 = 3.0;
+const LATENCY_AXIS_INDEX: usize = 0;
+
 /// One line per actor group, or per actor.
 #[function_component(SeriesChart)]
 pub fn series_chart(props: &SeriesChartProps) -> Html {
@@ -100,11 +110,7 @@ pub fn series_chart(props: &SeriesChartProps) -> Html {
         _ => None,
     });
 
-    let status = match &*series {
-        Loadable::Ready(series) if has_points(series) => Html::default(),
-        Loadable::Ready(_) => html! { <p class="data-status">{ NO_POINTS_NOTE }</p> },
-        loading_or_failed => loadable(loading_or_failed, "the chart", &load, |_| Html::default()),
-    };
+    let status = chart_status(&series, chart.is_some(), &load);
     let id = format!(
         "series-chart-{:?}-{:?}-{}",
         props.metric, props.scope, props.uuid
@@ -112,6 +118,61 @@ pub fn series_chart(props: &SeriesChartProps) -> Html {
     html! {
         <ChartCanvas {id} chart={(*chart).clone()}>{ status }</ChartCanvas>
     }
+}
+
+#[derive(Properties, PartialEq)]
+pub struct ActorLatencyChartProps {
+    pub uuid: Uuid,
+}
+
+/// A thin line per actor with its latency in each sampling window, under a thick line per group
+/// with the group's moving average. The peaks of one actor stand out against the average, and the
+/// slider zooms into them.
+#[function_component(ActorLatencyChart)]
+pub fn actor_latency_chart(props: &ActorLatencyChartProps) -> Html {
+    let is_dark = use_context::<(bool, Callback<()>)>().is_some_and(|(is_dark, _)| is_dark);
+    let lines = use_state_eq(|| Loadable::Loading);
+    let load = {
+        let (lines, uuid) = (lines.clone(), props.uuid);
+        Callback::from(move |()| {
+            fetch_into(lines.clone(), async move {
+                let groups =
+                    fetch_benchmark_series(uuid, SeriesMetric::Latency, SeriesScope::Group).await?;
+                let actors =
+                    fetch_benchmark_series(uuid, SeriesMetric::Latency, SeriesScope::Actors)
+                        .await?;
+                Ok(LatencyLines { groups, actors })
+            });
+        })
+    };
+    {
+        let load = load.clone();
+        use_effect_with(props.uuid, move |_| load.emit(()));
+    }
+    let chart = use_memo(
+        ((*lines).clone(), is_dark),
+        |(lines, is_dark)| match lines {
+            Loadable::Ready(lines) if has_points(&lines.groups) || has_points(&lines.actors) => {
+                Some(SharedChart::new(actor_latency_options(lines, *is_dark)))
+            }
+            _ => None,
+        },
+    );
+
+    let status = chart_status(&lines, chart.is_some(), &load);
+    let id = format!("actor-latency-chart-{}", props.uuid);
+    html! {
+        <ChartCanvas {id} chart={(*chart).clone()} class={classes!("run-chart-tall")}>
+            { status }
+        </ChartCanvas>
+    }
+}
+
+/// The latency series of one run, of its groups and of its actors.
+#[derive(Debug, Clone)]
+struct LatencyLines {
+    groups: BenchmarkSeries,
+    actors: BenchmarkSeries,
 }
 
 #[derive(Properties, PartialEq)]
@@ -192,9 +253,13 @@ pub struct ChartCanvasProps {
     /// Over the chart, for example the loading state.
     #[prop_or_default]
     pub children: Html,
+    /// Added to the frame, for example to change its height.
+    #[prop_or_default]
+    pub class: Classes,
 }
 
-/// Draws the chart at its frame's size and in the page's theme, and redraws on each change.
+/// Draws the chart at its frame's size and in the page's theme, and redraws on each change. A double
+/// click zooms a chart with a zoom slider out to the whole run.
 #[function_component(ChartCanvas)]
 pub fn chart_canvas(props: &ChartCanvasProps) -> Html {
     let is_dark = use_context::<(bool, Callback<()>)>().is_some_and(|(is_dark, _)| is_dark);
@@ -221,9 +286,17 @@ pub fn chart_canvas(props: &ChartCanvasProps) -> Html {
             },
         );
     }
+    let ondblclick = {
+        let canvas = canvas.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(element) = canvas.cast::<Element>() {
+                reset_zoom_at(&element);
+            }
+        })
+    };
     html! {
-        <div class="run-chart" ref={frame}>
-            <div id={props.id.clone()} class="run-chart-canvas" ref={canvas}></div>
+        <div class={classes!("run-chart", props.class.clone())} ref={frame}>
+            <div id={props.id.clone()} class="run-chart-canvas" ref={canvas} {ondblclick}></div>
             <div class="run-chart-status">{ props.children.clone() }</div>
         </div>
     }
@@ -238,6 +311,16 @@ pub const fn metric_label(metric: SeriesMetric) -> &'static str {
 
 fn has_points(series: &BenchmarkSeries) -> bool {
     series.series.iter().any(|line| !line.points.is_empty())
+}
+
+/// Nothing once the chart is drawn, a note when the loaded report has no points, else the loading
+/// or failed state.
+fn chart_status<T>(data: &Loadable<T>, drawn: bool, reload: &Callback<()>) -> Html {
+    match data {
+        Loadable::Ready(_) if drawn => Html::default(),
+        Loadable::Ready(_) => html! { <p class="data-status">{ NO_POINTS_NOTE }</p> },
+        loading_or_failed => loadable(loading_or_failed, "the chart", reload, |_| Html::default()),
+    }
 }
 
 fn distribution_options(report: &BenchmarkReportLight) -> Chart {
@@ -300,14 +383,71 @@ fn series_options(series: &BenchmarkSeries) -> Chart {
         series.unit
     ));
     for line in &series.series {
-        let points = line
-            .points
-            .iter()
-            .map(|point| vec![point.time_s, point.value])
-            .collect();
-        chart = chart.add_time_series(&line.source.to_string(), points, None, LINE_OPACITY);
+        chart = chart.add_time_series(
+            &line.source.to_string(),
+            chart_points(line),
+            None,
+            LINE_OPACITY,
+        );
     }
     chart.inner
+}
+
+/// The averages come after the actors, so they're drawn over them. The cross pointer shows the time
+/// and the latency at the pointer on the axes.
+fn actor_latency_options(lines: &LatencyLines, is_dark: bool) -> Chart {
+    let palette = if is_dark {
+        DARK_GROUP_COLORS
+    } else {
+        LIGHT_GROUP_COLORS
+    };
+    let groups: Vec<GroupMetricsKind> = lines
+        .groups
+        .series
+        .iter()
+        .map(|line| line.source.group())
+        .collect();
+    let color = |line: &ChartSeries| {
+        groups
+            .iter()
+            .position(|group| *group == line.source.group())
+            .and_then(|index| palette.get(index).copied())
+    };
+    let mut chart = IggyChart::zoomable_card()
+        .with_time_x_axis()
+        .with_y_axis(LATENCY_AXIS_NAME);
+    for line in &lines.actors.series {
+        chart = chart.add_dual_time_line_series(
+            &line.source.to_string(),
+            chart_points(line),
+            color(line),
+            ACTOR_LINE_OPACITY,
+            LATENCY_AXIS_INDEX,
+            ACTOR_LINE_WIDTH,
+        );
+    }
+    for line in &lines.groups.series {
+        chart = chart.add_dual_time_line_series(
+            &format!("{} average", line.source),
+            chart_points(line),
+            color(line),
+            LINE_OPACITY,
+            LATENCY_AXIS_INDEX,
+            AVERAGE_LINE_WIDTH,
+        );
+    }
+    chart.inner.tooltip(
+        Tooltip::new()
+            .trigger(Trigger::Axis)
+            .axis_pointer(AxisPointer::new().type_(AxisPointerType::Cross)),
+    )
+}
+
+fn chart_points(line: &ChartSeries) -> Vec<Vec<f64>> {
+    line.points
+        .iter()
+        .map(|point| vec![point.time_s, point.value])
+        .collect()
 }
 
 fn version_options(chart: &HistoryChart) -> Chart {

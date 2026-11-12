@@ -70,7 +70,10 @@
     --top-bar-height: 56px;
     --section-nav-height: 52px;
     --page-max: 1180px;
+    /* The width of the top bar's and the footer's content, which is wider than the page's. */
+    --frame-max: 1320px;
     --gutter: 24px;
+    --compare-tray-offset: 48px;
 }
 
 html, body {
@@ -195,9 +198,9 @@ body.dark select option {
 }
 
 .footer-inner {
-    max-width: 1320px;
+    width: min(var(--frame-max), calc(100% - 2 * var(--gutter)));
     margin: 0 auto;
-    padding: 10px 20px;
+    padding: 10px 0;
     display: grid;
     grid-template-columns: auto 1fr auto;
     align-items: center;
@@ -375,17 +378,22 @@ body.dark .footer {
 /* The top bar of every page, and the parts the pages share. They only use the app-wide tokens.
    Glows are radial gradients, because blur filters slow down phones and screenshots. */
 .top-bar {
-    display: flex;
-    align-items: center;
-    gap: 16px;
     height: var(--top-bar-height);
-    padding: 0 var(--gutter);
     box-sizing: border-box;
     background: var(--bg);
     border-bottom: 1px solid var(--border);
     color: var(--text);
     position: relative;
     z-index: 30;
+}
+
+.top-bar-inner {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    width: min(var(--frame-max), calc(100% - 2 * var(--gutter)));
+    height: 100%;
+    margin-inline: auto;
 }
 
 .top-bar-brand {
@@ -850,6 +858,154 @@ code.flag {
     gap: 6px;
 }
 
+/* The kinds sit at the bottom of each card, so they line up across a row of cards whose texts
+   have different lengths. */
+.kind-card {
+    display: flex;
+    flex-direction: column;
+}
+
+.kind-card .kind-list {
+    flex-direction: column;
+    align-items: flex-start;
+    margin-top: auto;
+    padding-top: 4px;
+}
+
+/* Paragraphs in a card as wide as the page keep a line length that the eye can follow. */
+.prose-card p,
+.prose-card .rule-list,
+.prose-card .badge-rule dd {
+    max-width: 75ch;
+}
+
+/* The table is wider than the card's content by its cell padding, so its text lines up with the
+   card's title and a hovered row's band reaches the card's padding. */
+.option-table {
+    width: calc(100% + 24px);
+    margin: 16px -12px 0;
+    border-collapse: collapse;
+}
+
+.option-table th,
+.option-table td {
+    padding: 14px 12px;
+    border-top: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+}
+
+.option-table thead th {
+    padding-top: 0;
+    padding-bottom: 10px;
+    border-top: 0;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.option-table tbody tr {
+    transition: background-color 150ms;
+}
+
+.option-table tbody tr:hover {
+    background: var(--grid-line);
+}
+
+.option-table tbody th,
+.option-table .option-default {
+    width: 1%;
+    white-space: nowrap;
+}
+
+.option-table tbody th {
+    padding-right: 32px;
+    font-weight: normal;
+}
+
+.option-name {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--text);
+    font-size: 14.5px;
+    font-weight: 600;
+}
+
+.option-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.option-flags code.flag {
+    font-size: 12.5px;
+}
+
+.option-table .option-default {
+    padding-right: 32px;
+    font-size: 13.5px;
+}
+
+.option-value {
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+}
+
+.option-unset {
+    color: var(--muted);
+}
+
+.option-table .option-text p {
+    max-width: 72ch;
+    margin: 0;
+}
+
+/* On a phone, each option is a block: its name and flags, its default, then its text. */
+@media (max-width: 720px) {
+    .option-table,
+    .option-table tbody,
+    .option-table tr,
+    .option-table tbody th,
+    .option-table .option-default,
+    .option-table td {
+        display: block;
+        width: auto;
+    }
+
+    .option-table thead {
+        display: none;
+    }
+
+    .option-table tbody tr {
+        padding: 12px 0;
+        border-top: 1px solid var(--border);
+    }
+
+    .option-table tbody th,
+    .option-table td {
+        padding: 0 12px;
+        border: 0;
+        white-space: normal;
+    }
+
+    .option-table .option-default {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin: 10px 0 6px;
+    }
+
+    .option-table .option-default::before {
+        content: attr(data-label);
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+    }
+}
+
 .kind-list code {
     padding: 3px 8px;
     border-radius: 6px;
@@ -860,17 +1016,20 @@ code.flag {
     overflow-wrap: anywhere;
 }
 
+/* The badges sit side by side, each with its name above its rule, so the rules keep a short line
+   in a card as wide as the page. */
 .badge-list {
     display: grid;
-    gap: 14px;
-    margin: 16px 0 0;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+    gap: 20px 48px;
+    margin: 20px 0 0;
 }
 
 .badge-rule {
     display: grid;
-    grid-template-columns: 170px 1fr;
-    gap: 12px;
-    align-items: start;
+    gap: 8px;
+    align-content: start;
+    justify-items: start;
 }
 
 .badge-rule dt,
@@ -903,6 +1062,19 @@ code.flag {
     color: var(--muted);
     font-size: 14.5px;
     line-height: 1.6;
+}
+
+/* The delta rule on the left and its thresholds on the right, so the text keeps a short line. */
+.noise-card {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(260px, 2fr);
+    gap: 24px 56px;
+}
+
+@media (max-width: 900px) {
+    .noise-card {
+        grid-template-columns: minmax(0, 1fr);
+    }
 }
 
 .threshold-table {
@@ -1142,14 +1314,14 @@ code.flag {
     gap: 8px;
 }
 
+/* The text and the select share the field's one cell. The select lies on top, invisible, so a
+   click anywhere on the field opens it, and its widest option sets the field's width. */
 .explore-facet {
     position: relative;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
+    display: grid;
     min-width: 0;
+    max-width: 264px;
     height: 46px;
-    padding: 0 30px 0 12px;
     box-sizing: border-box;
     border: 1px solid var(--border);
     border-radius: 12px;
@@ -1170,26 +1342,57 @@ code.flag {
     pointer-events: none;
 }
 
+.explore-facet > * {
+    grid-area: 1 / 1;
+}
+
+.explore-facet-text {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-width: 0;
+    padding: 0 30px 0 12px;
+}
+
 .explore-facet-label {
     color: var(--muted);
     font-size: 11px;
     line-height: 1;
 }
 
-/* Two classes, so these win over the global select rules. */
-.explore-facet .explore-select {
-    width: 100%;
-    max-width: 220px;
-    margin: 0;
-    padding: 2px 0 0;
-    border: 0;
-    border-radius: 0;
-    background: transparent;
+.explore-facet-value {
+    overflow: hidden;
+    padding-top: 2px;
     color: var(--text);
-    font: inherit;
     font-size: 13px;
     font-weight: 600;
     text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.explore-facet-value .version-tag {
+    display: inline-block;
+    margin-top: 1px;
+    padding: 0 6px;
+    font-size: 12px;
+}
+
+/* Two classes, so these win over the global select rules. The padding and the font are the
+   text's, so the select is as wide as the text of its widest option. */
+.explore-facet .explore-select {
+    width: 100%;
+    min-width: 0;
+    height: 100%;
+    margin: 0;
+    padding: 0 30px 0 12px;
+    box-sizing: border-box;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    opacity: 0;
     cursor: pointer;
     appearance: none;
     -webkit-appearance: none;
@@ -1432,7 +1635,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .explore-facet .explore-select {
+    .explore-facet {
         max-width: none;
     }
 
@@ -1540,12 +1743,12 @@ body.dark .family-end-to-end { --family: #b69cff; }
 /* The tray floats over the end of the page, so the page leaves room for it there: its height
    with two lines of runs, its offset and a gap. */
 .compare-tray-space {
-    height: 124px;
+    height: calc(108px + var(--compare-tray-offset));
 }
 
 .compare-tray {
     position: fixed;
-    bottom: 16px;
+    bottom: var(--compare-tray-offset);
     left: 50%;
     z-index: 40;
     display: flex;
@@ -1565,7 +1768,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
 /* From below the screen, at the tray's offset, which also centers it. */
 @keyframes compare-tray-in {
     from {
-        transform: translate(-50%, calc(100% + 16px));
+        transform: translate(-50%, calc(100% + var(--compare-tray-offset)));
     }
 }
 
@@ -1667,12 +1870,15 @@ body.dark .family-end-to-end { --family: #b69cff; }
         transform: none;
     }
 
+    :root {
+        --compare-tray-offset: 24px;
+    }
+
     .compare-tray-space {
-        height: 120px;
+        height: calc(112px + var(--compare-tray-offset));
     }
 
     .compare-tray {
-        bottom: 8px;
         padding: 10px 12px;
     }
 
@@ -1862,6 +2068,11 @@ body.dark .family-end-to-end { --family: #b69cff; }
     height: 340px;
 }
 
+/* A chart with many lines and a zoom slider, which takes the whole row. */
+.run-chart-tall {
+    height: 480px;
+}
+
 .run-chart-canvas {
     width: 100%;
     height: 100%;
@@ -2027,7 +2238,8 @@ body.dark .family-end-to-end { --family: #b69cff; }
     overflow-x: auto;
 }
 
-.run-charts + .run-table-card {
+.run-charts + .run-table-card,
+.run-chart-card + .run-table-card {
     margin-top: 16px;
 }
 
@@ -2343,9 +2555,144 @@ body.dark .family-end-to-end { --family: #b69cff; }
     display: block;
 }
 
-.compare-table .run-change-wrap {
-    justify-content: flex-end;
-    margin-top: 4px;
+/* The value and the change sit in fixed slots, so the values and the changes each line up down a
+   column. */
+.compare-cell {
+    display: inline-grid;
+    grid-template-columns: minmax(5.5em, auto) 4.5em;
+    align-items: center;
+    gap: 8px;
+    font-variant-numeric: tabular-nums;
+}
+
+.compare-cell .compare-value {
+    text-align: right;
+}
+
+.compare-cell-change {
+    justify-self: start;
+}
+
+.compare-table-note {
+    margin: 12px 0 0;
+    padding: 0 8px;
+}
+
+/* On a wide screen, the run columns take only the width of their values and the metric names take
+   the rest, so a row's results sit close together on the right. */
+@media (min-width: 721px) {
+    .compare-latency-table th:not(:first-child),
+    .compare-latency-table td {
+        width: 1%;
+        padding-left: 48px;
+    }
+}
+
+/* A light band under the pointer guides the eye across a row. */
+.compare-latency-table tbody tr {
+    transition: background-color 150ms;
+}
+
+.compare-latency-table tbody tr:hover {
+    background: var(--grid-line);
+}
+
+/* The chart takes most of the row, and each run's numbers sit in a narrow card beside it. */
+.compare-throughput {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(240px, 1fr);
+    gap: 16px;
+}
+
+.compare-throughput-runs {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+/* Each run takes two columns: its name and value on the left, its change and message rate on the
+   right, so the values of all runs line up down the card. */
+.compare-throughput-run {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: baseline;
+    gap: 4px 12px;
+    padding: 16px 0;
+    border-top: 1px solid var(--border);
+}
+
+.compare-throughput-run:first-child {
+    padding-top: 6px;
+    border-top: 0;
+}
+
+.compare-throughput-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.compare-throughput-run-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.compare-throughput-change {
+    justify-self: end;
+}
+
+.compare-throughput-baseline {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.compare-throughput-rate {
+    color: var(--text);
+    font-size: 24px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    white-space: nowrap;
+}
+
+.compare-throughput-messages {
+    justify-self: end;
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* The bar's length is the run's throughput against the fastest run. */
+.compare-throughput-bar {
+    grid-column: 1 / -1;
+    height: 4px;
+    margin-top: 6px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--border);
+}
+
+.compare-throughput-bar > span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--run-color);
+}
+
+/* Below this width the chart would get too narrow, so the card goes under it. */
+@media (max-width: 900px) {
+    .compare-throughput {
+        grid-template-columns: minmax(0, 1fr);
+    }
 }
 
 .compare-report-rows tr:first-child th,
@@ -2464,6 +2811,22 @@ body.dark .family-end-to-end { --family: #b69cff; }
         text-align: right;
     }
 
+    /* A compare cell's value and change join the line of its run's name. */
+    .compare-cell {
+        display: contents;
+    }
+
+    /* The baseline's slot stays empty but keeps its width, so its value lines up with the others. */
+    .compare-cell-change {
+        flex: 0 0 4.5em;
+    }
+
+    /* A run's name gives way to its value and change, and wraps, so a row keeps them on one line. */
+    .compare-latency-table td::after {
+        flex: 1 1 0;
+        min-width: 0;
+    }
+
     /* A row's mark runs down the whole block instead of stopping at its first line. */
     .compare-differs,
     .run-table-current {
@@ -2491,21 +2854,6 @@ body.dark .family-end-to-end { --family: #b69cff; }
 
 .release-page > .page-section {
     padding-top: 40px;
-}
-
-/* A field with a face shows the choice in its own style. The select covers the field, invisible, so
-   a click or a key still opens it. */
-.explore-facet-face .explore-select {
-    position: absolute;
-    inset: 0;
-    max-width: none;
-    opacity: 0;
-}
-
-.explore-facet-face .version-tag {
-    margin-top: 3px;
-    padding: 0 6px;
-    font-size: 12px;
 }
 
 .release-summary-worse {
@@ -2630,6 +2978,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
     .run-kpi { padding: 14px 16px; }
     .run-kpi-value { font-size: 22px; }
     .run-chart { height: 280px; }
+    .run-chart-tall { height: 360px; }
     .run-ladder-card { grid-template-columns: minmax(0, 1fr); }
     .run-ladder-row { grid-template-columns: 48px minmax(40px, 1fr) 76px; }
     .run-ladder-change { grid-column: 2 / -1; }
@@ -2642,7 +2991,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
         --gutter: 16px;
     }
 
-    .top-bar {
+    .top-bar-inner {
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto;
         grid-template-rows: 48px minmax(0, 1fr);

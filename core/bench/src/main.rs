@@ -28,7 +28,7 @@ use chrono::Utc;
 use clap::Parser;
 use figlet_rs::FIGlet;
 use iggy::prelude::IggyError;
-use std::path::PathBuf;
+use std::path::{PathBuf, is_separator};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use utils::{cpu_name::append_cpu_name_lowercase, create_run_dir};
@@ -113,10 +113,41 @@ async fn main() -> Result<(), IggyError> {
     Ok(())
 }
 
-/// The UTC start time tells repeated runs of one command apart.
+/// The UTC start time tells repeated runs of one command apart. A label such as a branch
+/// `--gitref` can hold a path separator, which would nest the run below the level that the
+/// dashboard reads, so each separator becomes `_`.
 fn run_dir_name(args: &IggyBenchArgs) -> String {
     let mut dir_name = args.generate_dir_name();
     append_cpu_name_lowercase(&mut dir_name);
     dir_name.push_str(&Utc::now().format(RUN_START_TIME_FORMAT).to_string());
-    dir_name
+    dir_name.replace(is_separator, "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_labels_with_path_separators_when_naming_run_dir_should_keep_one_path_component() {
+        let args = IggyBenchArgs::try_parse_from([
+            "iggy-bench",
+            "-b",
+            "10",
+            "pinned-producer",
+            "tcp",
+            "output",
+            "--remark",
+            "a/b",
+            "--gitref",
+            "feat/x",
+            "--identifier",
+            "rack/host",
+        ])
+        .expect("the arguments parse");
+
+        let dir_name = run_dir_name(&args);
+
+        assert!(!dir_name.contains(is_separator), "{dir_name}");
+        assert!(dir_name.contains("_a_b_feat_x_rack_host_"), "{dir_name}");
+    }
 }

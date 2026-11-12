@@ -19,11 +19,9 @@ use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::Thresholds;
 use bench_dashboard_shared::summary::BenchmarkSummary;
-use dashmap::DashMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod loader;
@@ -33,19 +31,17 @@ mod watcher;
 
 use series::{SERIES_CACHE_MAX_BYTES, SeriesCache};
 
-pub use series::{SeriesBuilder, SeriesKey};
+pub use series::{SeriesBuilder, SeriesKey, read_report};
 pub use watcher::CacheWatcher;
 
 pub type Result<T> = std::result::Result<T, IggyBenchDashboardServerError>;
 
 #[derive(Debug)]
 pub struct BenchmarkCache {
-    /// Map benchmark identifier to benchmark light report and path
-    benchmarks: DashMap<Uuid, (BenchmarkReportLight, PathBuf)>,
-
-    /// Summaries of all runs, newest first. A load swaps in the new list when it finishes, so a
-    /// request during a reload gets the previous list.
-    summaries: RwLock<Arc<Vec<BenchmarkSummary>>>,
+    /// The runs of the last load that read the results directory. A load builds the next runs
+    /// aside and swaps them in whole, so a request during a reload, or after a failed one, reads
+    /// the previous runs and their list together.
+    runs: RwLock<Arc<Runs>>,
 
     /// Thresholds for the badges of the summaries
     thresholds: Thresholds,
@@ -55,20 +51,24 @@ pub struct BenchmarkCache {
 
     /// Path to the results directory
     results_dir: PathBuf,
+}
 
-    /// Last reload request time
-    last_reload_request: Arc<Mutex<Option<Instant>>>,
+#[derive(Debug, Default)]
+struct Runs {
+    /// Map benchmark identifier to benchmark light report and path
+    reports: HashMap<Uuid, (BenchmarkReportLight, PathBuf)>,
+
+    /// Summaries of `reports`, newest first
+    summaries: Arc<Vec<BenchmarkSummary>>,
 }
 
 impl BenchmarkCache {
     pub fn new(results_dir: PathBuf, thresholds: Thresholds) -> Self {
         Self {
-            benchmarks: DashMap::new(),
-            summaries: RwLock::default(),
+            runs: RwLock::default(),
             thresholds,
             series: SeriesCache::new(SERIES_CACHE_MAX_BYTES),
             results_dir,
-            last_reload_request: Arc::new(Mutex::new(None)),
         }
     }
 }

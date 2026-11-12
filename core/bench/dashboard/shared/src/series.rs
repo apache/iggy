@@ -122,6 +122,16 @@ impl SeriesMetric {
     }
 }
 
+impl SeriesSource {
+    /// The group itself, or the group that holds the actor.
+    pub fn group(self) -> GroupMetricsKind {
+        match self {
+            Self::Group(kind) => kind,
+            Self::Actor { kind, .. } => kind.into(),
+        }
+    }
+}
+
 impl ChartSeries {
     fn new(source: SeriesSource, stored: &TimeSeries) -> Self {
         Self {
@@ -315,6 +325,23 @@ mod tests {
             serde_json::to_value(actor).expect("a source serializes"),
             json!({ "actor": { "kind": "consumer", "id": ACTOR_ID } })
         );
+    }
+
+    #[test]
+    fn given_sources_when_asked_for_group_should_return_group_or_group_of_actor() {
+        for (kind, group) in [
+            (ActorKind::Producer, GroupMetricsKind::Producers),
+            (ActorKind::Consumer, GroupMetricsKind::Consumers),
+            (
+                ActorKind::ProducingConsumer,
+                GroupMetricsKind::ProducingConsumers,
+            ),
+        ] {
+            let actor = SeriesSource::Actor { kind, id: ACTOR_ID };
+
+            assert_eq!(actor.group(), group, "{kind:?}");
+            assert_eq!(SeriesSource::Group(group).group(), group, "{group:?}");
+        }
     }
 
     #[test]

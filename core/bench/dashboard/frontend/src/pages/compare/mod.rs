@@ -28,6 +28,7 @@ pub use self::runs::{CompareLink, RunList, oldest_first};
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::DashboardConfig;
+use bench_dashboard_shared::delta::Metric;
 use bench_dashboard_shared::series::SeriesMetric;
 use bench_dashboard_shared::summary::{BenchmarkSummary, Comparability};
 use uuid::Uuid;
@@ -36,11 +37,13 @@ use yew_router::Routable;
 use yew_router::prelude::{Link, use_location, use_navigator};
 
 use self::chart::{ChartRun, OverlayChart};
-use self::matrix::{Cell, CellChange, MatrixRow, change_rows, report_rows, summary_changes};
+use self::matrix::{
+    Cell, CellChange, MatrixRow, RowKind, change_rows, report_rows, summary_changes,
+};
 use self::runs::{RUNS_PARAM, RunEntry, opens_elsewhere, with_baseline, without};
 use self::settings::{SettingRow, setting_rows};
 use crate::api::fetch_benchmark_by_uuid;
-use crate::components::headline::judged_chip;
+use crate::components::headline::{compact_judged_chip, judged_chip};
 use crate::components::page::{
     Crumb, breadcrumbs, data_status, loadable, page_head, page_shell, section_head,
 };
@@ -59,22 +62,27 @@ const CRUMB: &str = "Compare";
 const REPORTS: &str = "the run reports";
 const SUMMARY_TITLE: &str = "What changed";
 const BASELINE: &str = "baseline";
+const CHANGE_NOTE: &str = "A green or red change passes the delta rule. A gray change does not: it is \
+                           within run-to-run noise, a run has a badge, or the parameters differ. \
+                           Point at a change to see why, and the two values that it compares.";
 /// The baseline takes the accent, like the page's own run on the run page. Blue and violet stay
 /// distinct from it and from the colors of a better or worse change.
 const RUN_COLORS: [&str; MAX_COMPARED_RUNS] = [CURRENT_COLOR, "#147ce5", "#8b5cf6"];
-const NUMBERS: NavSection = NavSection {
-    id: "numbers",
-    label: "Numbers",
+const LATENCY: NavSection = NavSection {
+    id: "latency",
+    label: "Latency",
 };
-const OVER_THE_RUN: NavSection = NavSection {
-    id: "over-the-run",
-    label: "Over the run",
+const THROUGHPUT: NavSection = NavSection {
+    id: "throughput",
+    label: "Throughput",
 };
 const CONFIGURATION: NavSection = NavSection {
     id: "configuration",
     label: "Configuration",
 };
-static SECTIONS: [NavSection; 3] = [NUMBERS, OVER_THE_RUN, CONFIGURATION];
+static SECTIONS: [NavSection; 3] = [LATENCY, THROUGHPUT, CONFIGURATION];
+/// Runs without a rate limit measure throughput only, so the page has no latency to show.
+static THROUGHPUT_SECTIONS: [NavSection; 2] = [THROUGHPUT, CONFIGURATION];
 
 #[derive(Properties, PartialEq)]
 pub struct ComparePageProps {
@@ -300,7 +308,18 @@ fn compare_view(
         Loadable::Loading | Loadable::Failed(_) => None,
     };
     let status = loadable(reports, REPORTS, reload, |_| Html::default());
-    let sections: &'static [NavSection] = &SECTIONS;
+    let chart_runs = chart_runs(view);
+    let latency_runs: Vec<ChartRun> = chart_runs
+        .iter()
+        .filter(|(_, rate_limited)| *rate_limited)
+        .map(|(line, _)| line.clone())
+        .collect();
+    let throughput_runs: Vec<ChartRun> = chart_runs.into_iter().map(|(line, _)| line).collect();
+    let sections: &'static [NavSection] = if latency_runs.is_empty() {
+        &THROUGHPUT_SECTIONS
+    } else {
+        &SECTIONS
+    };
     html! {
         <>
             { head(&lead) }
@@ -311,26 +330,40 @@ fn compare_view(
             </section>
             <SectionNav {sections} scroll_ref={scroll_ref.clone()} />
 
-            <section id={NUMBERS.id} class="page-section page-container">
-                { section_head(
-                    NUMBERS.label,
-                    "The main group against the baseline",
-                    "Each run's main group numbers. A change follows the delta rule from the \
-                     Methodology page, with one run on each side. The rows below the line come \
-                     from the reports and only show values.",
-                ) }
-                { matrix_view(view, ready) }
-                { status.clone() }
-            </section>
+            if !latency_runs.is_empty() {
+                <section id={LATENCY.id} class="page-section page-container">
+                    { section_head(
+                        LATENCY.label,
+                        "Latency against the baseline",
+                        "One line per run with a rate limit, for its main group. In the table, a \
+                         change follows the delta rule from the Methodology page, with one run on \
+                         each side. The rows below the line come from the reports and only show \
+                         values.",
+                    ) }
+                    <article class="card run-chart-card">
+                        <h3>{"Average latency"}</h3>
+                        <OverlayChart runs={latency_runs} metric={SeriesMetric::Latency} />
+                        <p class="card-note">{ LATENCY_CHART_NOTE }</p>
+                    </article>
+                    { latency_table(view, ready) }
+                    { status.clone() }
+                </section>
+            }
 
-            <section id={OVER_THE_RUN.id} class="page-section page-container">
+            <section id={THROUGHPUT.id} class="page-section page-container">
                 { section_head(
-                    OVER_THE_RUN.label,
-                    "Over the run",
+                    THROUGHPUT.label,
+                    "Throughput against the baseline",
                     "One line per run for its main group, plotted against the time since the run \
-                     started.",
+                     started. The card next to the chart gives each run's rates and their change.",
                 ) }
-                { charts(view) }
+                <div class="compare-throughput">
+                    <article class="card run-chart-card">
+                        <h3>{"Throughput"}</h3>
+                        <OverlayChart runs={throughput_runs} metric={SeriesMetric::Throughput} />
+                    </article>
+                    { throughput_card(view) }
+                </div>
             </section>
 
             <section id={CONFIGURATION.id} class="page-section page-container">
@@ -590,20 +623,25 @@ fn columns(view: &CompareView) -> Vec<Column> {
         .collect()
 }
 
-fn matrix_view(view: &CompareView, reports: Option<&[BenchmarkReportLight]>) -> Html {
+fn latency_table(view: &CompareView, reports: Option<&[BenchmarkReportLight]>) -> Html {
     let report_rows = reports.map(|reports| report_rows(&view.refs(), reports));
     let columns = columns(view);
+    let change_rows = view
+        .change_rows
+        .iter()
+        .filter(|row| row.kind == RowKind::Latency);
     html! {
         <div class="card run-table-card">
-            <table class="run-table compare-table">
+            <table class="run-table compare-table compare-latency-table">
                 <thead>{ run_heads(view, "Metric") }</thead>
-                <tbody>{ for view.change_rows.iter().map(|row| matrix_row(row, &columns)) }</tbody>
+                <tbody>{ for change_rows.map(|row| matrix_row(row, &columns)) }</tbody>
                 if let Some(rows) = report_rows.filter(|rows| !rows.is_empty()) {
                     <tbody class="compare-report-rows">
                         { for rows.iter().map(|row| matrix_row(row, &columns)) }
                     </tbody>
                 }
             </table>
+            <p class="card-note compare-table-note">{ CHANGE_NOTE }</p>
         </div>
     }
 }
@@ -617,6 +655,8 @@ fn matrix_row(row: &MatrixRow, columns: &[Column]) -> Html {
     }
 }
 
+/// Every cell has a slot for its change, even the baseline's, so the values of every column sit
+/// at the same place under their heads.
 fn matrix_cell(cell: &Cell, column: &Column) -> Html {
     html! {
         <td
@@ -625,18 +665,22 @@ fn matrix_cell(cell: &Cell, column: &Column) -> Html {
             data-label={column.run.clone()}
             style={column.style.clone()}
         >
-            <span class="compare-value">{ cell.value.clone().unwrap_or_else(|| NO_VALUE.to_owned()) }</span>
-            if let Some(change) = &cell.change {
-                { judged_chip(change.text.clone(), change.values.clone(), change.judgment) }
-            }
+            <span class="compare-cell">
+                <span class="compare-value">{ cell_text(cell) }</span>
+                <span class="compare-cell-change">
+                    if let Some(change) = &cell.change {
+                        { compact_judged_chip(change.text.clone(), change.values.clone(), change.judgment) }
+                    }
+                </span>
+            </span>
         </td>
     }
 }
 
-/// A run without a rate limit has no latency to draw, so the latency chart leaves it out.
-fn charts(view: &CompareView) -> Html {
-    let lines: Vec<(ChartRun, bool)> = view
-        .runs
+/// Each run's line, and whether the run has a rate limit. A run without one has no latency to draw,
+/// so the latency chart leaves it out.
+fn chart_runs(view: &CompareView) -> Vec<(ChartRun, bool)> {
+    view.runs
         .iter()
         .zip(RUN_COLORS)
         .map(|(run, color)| {
@@ -648,27 +692,79 @@ fn charts(view: &CompareView) -> Html {
             };
             (line, run.workload_key.rate_limit.is_some())
         })
+        .collect()
+}
+
+/// Each run's throughput with its change, its message rate, and a bar against the fastest run, so
+/// the runs read at a glance. The numbers come from the matrix rows that the summary at the top also
+/// uses, so the two never disagree. The message rate moves with the throughput, so its change would
+/// only repeat the throughput's.
+fn throughput_card(view: &CompareView) -> Html {
+    let row_of = |kind: RowKind| view.change_rows.iter().find(|row| row.kind == kind);
+    let (Some(throughput), Some(messages)) =
+        (row_of(RowKind::Throughput), row_of(RowKind::MessageRate))
+    else {
+        return Html::default();
+    };
+    let rates: Vec<Option<f64>> = view
+        .runs
+        .iter()
+        .map(|run| {
+            run.group(run.kind_family.primary_group())
+                .map(|group| group.value(Metric::Throughput))
+        })
         .collect();
-    let throughput: Vec<ChartRun> = lines.iter().map(|(line, _)| line.clone()).collect();
-    let latency: Vec<ChartRun> = lines
-        .into_iter()
-        .filter_map(|(line, rate_limited)| rate_limited.then_some(line))
-        .collect();
-    html! {
-        <div class="run-charts">
-            <article class="card run-chart-card">
-                <h3>{"Throughput"}</h3>
-                <OverlayChart runs={throughput} metric={SeriesMetric::Throughput} />
-            </article>
-            if !latency.is_empty() {
-                <article class="card run-chart-card">
-                    <h3>{"Average latency"}</h3>
-                    <OverlayChart runs={latency} metric={SeriesMetric::Latency} />
-                    <p class="card-note">{ LATENCY_CHART_NOTE }</p>
-                </article>
+    let fastest = rates.iter().flatten().copied().fold(0.0, f64::max);
+    let runs = view
+        .runs
+        .iter()
+        .zip(RUN_COLORS)
+        .zip(rates)
+        .enumerate()
+        .map(|(position, ((run, color), rate))| {
+            let (Some(rate_cell), Some(messages_cell)) =
+                (throughput.cells.get(position), messages.cells.get(position))
+            else {
+                return Html::default();
+            };
+            let share = rate
+                .filter(|_| fastest > 0.0)
+                .map_or(0.0, |rate| rate / fastest * 100.0);
+            html! {
+                <li class="compare-throughput-run" style={run_color(color)}>
+                    <span class="compare-throughput-name">
+                        <span class="compare-swatch" aria-hidden="true"></span>
+                        <span class="compare-throughput-run-name">{ run_name(run) }</span>
+                    </span>
+                    <span class="compare-throughput-change">
+                        if position == 0 {
+                            <span class="compare-throughput-baseline">{ BASELINE }</span>
+                        } else if let Some(change) = &rate_cell.change {
+                            { compact_judged_chip(change.text.clone(), change.values.clone(), change.judgment) }
+                        }
+                    </span>
+                    <strong class="compare-throughput-rate" title={throughput.hint}>
+                        { cell_text(rate_cell) }
+                    </strong>
+                    <span class="compare-throughput-messages" title={messages.hint}>
+                        { cell_text(messages_cell) }
+                    </span>
+                    <span class="compare-throughput-bar" aria-hidden="true">
+                        <span style={format!("width: {share:.1}%")}></span>
+                    </span>
+                </li>
             }
-        </div>
+        });
+    html! {
+        <article class="card compare-throughput-card">
+            <h3>{"Against the baseline"}</h3>
+            <ul class="compare-throughput-runs">{ for runs }</ul>
+        </article>
     }
+}
+
+fn cell_text(cell: &Cell) -> String {
+    cell.value.clone().unwrap_or_else(|| NO_VALUE.to_owned())
 }
 
 fn settings_view(view: &CompareView, reports: Option<&[BenchmarkReportLight]>) -> Html {

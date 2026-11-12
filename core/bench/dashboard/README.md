@@ -44,7 +44,7 @@ The server provides the following HTTP endpoints:
 ### Benchmarks
 
 - `GET /api/benchmarks`
-  - List all runs as summaries, newest first: identity, workload key, badges, and the comparable metrics of each actor group
+  - List all runs as summaries, newest first: identity, the hardware of the machine that ran the bench, workload key, badges, and the comparable metrics of each actor group
   - Response: Array of run summaries
 
 - `GET /api/config`
@@ -99,9 +99,10 @@ The server provides the following HTTP endpoints:
     - `uuid`: UUID of the benchmark
     - `type`: `latency` (default), `throughput`, or `distribution`
     - `theme`: `dark` (default), `light`, `dark_nobg`, or `light_nobg` (transparent background)
-    - `width`, `height`: image size in pixels (default 1600 x 1200)
+    - `width`, `height`: image size in pixels, from 1 to 4096 (default 1600 x 1200)
     - `legend`: `true` (default) or `false`
-  - Response: PNG image, built on the first request and then served from `--cache-dir`
+  - Response: PNG image. At the default size it is built on the first request and then served from
+    `--cache-dir`. Other sizes are built on every request.
 
 `/health` and the `/api` endpoints return JSON, except `/api/artifacts/{uuid}`, which returns a ZIP file. The embed
 endpoints return HTML or PNG. All of them use standard HTTP status codes:
@@ -160,10 +161,13 @@ A page path with no file there gets `index.html` with 200, so the frontend's pag
    ./scripts/dashboard/build_release.sh
    ```
 
-2. Start the server:
+2. Start the server from `core/bench/dashboard`. The server reads `dashboard.toml` and `frontend/dist` from its
+   working directory:
 
    ```bash
-   ./target/release/iggy-bench-dashboard-server --host 127.0.0.1 --port 8061
+   cd core/bench/dashboard
+   ../../../target/release/iggy-bench-dashboard-server --host 127.0.0.1 --port 8061 \
+       --results-dir ../../../performance_results
    ```
 
 ### Development Mode
@@ -202,10 +206,10 @@ First, check that your performance results directory exists and has proper permi
   chmod 755 performance_results
   ```
 
-Basic usage (recommended):
+Basic usage (recommended). The server listens on port 80 in the container:
 
   ```bash
-  docker run -p 8061:8061 \
+  docker run -p 8061:80 \
      -v "$(pwd)/performance_results:/data/performance_results" \
      --user "$(id -u):$(id -g)" \
      apache/iggy-bench-dashboard
@@ -223,6 +227,20 @@ With custom configuration:
         apache/iggy-bench-dashboard
   ```
 
+With your own dashboard configuration and a cache directory that persists between restarts:
+
+  ```bash
+  mkdir -p dashboard_cache
+  docker run -p 8061:80 \
+        -v "$(pwd)/performance_results:/data/performance_results" \
+        -v "$(pwd)/dashboard.toml:/config/dashboard.toml:ro" \
+        -v "$(pwd)/dashboard_cache:/cache" \
+        --user "$(id -u):$(id -g)" \
+        -e CONFIG=/config/dashboard.toml \
+        -e CACHE_DIR=/cache \
+        apache/iggy-bench-dashboard
+  ```
+
 Using a named volume:
 
   ```bash
@@ -230,7 +248,7 @@ Using a named volume:
   docker volume create iggy-results
 
   # Run with named volume
-  docker run -p 8061:8061 \
+  docker run -p 8061:80 \
      -v iggy-results:/data/performance_results \
      apache/iggy-bench-dashboard
   ```
@@ -241,11 +259,13 @@ Using a named volume:
 
 #### Environment Variables
 
-| Variable     | Default                   | Description                       |
-| ------------ | ------------------------- | --------------------------------- |
-| HOST         | 0.0.0.0                   | Server host address               |
-| PORT         | 8061                      | Server port                       |
-| RESULTS_DIR  | /data/performance_results | Directory for performance results |
+| Variable      | Default                     | Description                                                         |
+| ------------- | --------------------------- | ------------------------------------------------------------------- |
+| `HOST`        | `0.0.0.0`                   | Server host address                                                 |
+| `PORT`        | `80`                        | Server port                                                         |
+| `RESULTS_DIR` | `/data/performance_results` | Directory for performance results                                   |
+| `CONFIG`      | `/app/dashboard.toml`       | Dashboard configuration file. The image holds the official one      |
+| `CACHE_DIR`   | not set                     | Directory for cached PNG files and artifact zips. See `--cache-dir` |
 
 #### Volume Permissions
 
@@ -276,16 +296,16 @@ Options:
   -V, --version                      Print version
 ```
 
-The server only reads `--results-dir`. It writes the files it generates to `--cache-dir`: chart PNG files for
-`/embed/{uuid}/chart.png` under `embed/` and artifact zips for `/api/artifacts/{uuid}` under `artifacts/`.
-Each file is built on the first request and reused later. When a file in a run directory changes or is removed,
-the server rebuilds that run's artifact zip. To rebuild the PNG files, delete the directory. The default is
-`iggy-bench-dashboard` in the system temp directory (`$TMPDIR`, usually `/tmp`). If `--cache-dir` is inside
-`--results-dir`, the server doesn't start.
+The server only reads `--results-dir`. It writes the files it generates to `--cache-dir`: chart PNG files of
+the default size for `/embed/{uuid}/chart.png` under `embed/` and artifact zips for `/api/artifacts/{uuid}`
+under `artifacts/`. Each file is built on the first request and reused later. When a file in a run directory
+changes or is removed, the server rebuilds that run's artifact zip. To rebuild the PNG files, delete the
+directory. The default is `iggy-bench-dashboard` in the system temp directory (`$TMPDIR`, usually `/tmp`). If
+`--cache-dir` is inside `--results-dir`, the server does not start.
 
 The server reads `--config` at start. The default is `dashboard.toml` in the working directory, and this
 directory holds the file for the official AWS suites. If a run's `suite` label is in `[[suites]]`, the run is
-official. If the file is missing or invalid, the server doesn't start.
+official. If the file is missing or invalid, the server does not start.
 
 ### Environment Variables for Development
 

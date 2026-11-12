@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{BenchmarkCache, Result};
+use super::{BenchmarkCache, Result, Runs};
 use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::summary::BenchmarkSummary;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use tracing::{error, info};
 
 impl BenchmarkCache {
@@ -38,6 +39,7 @@ impl BenchmarkCache {
             .filter(|entry| entry.file_name() != "embed_cache")
             .collect();
 
+        let mut reports = HashMap::with_capacity(entries.len());
         entries.iter().for_each(|entry| {
             // Relative path to report.json, for example `./performance_results/poll_8_1000_100_10000_tcp_no_cache_e1393367_atlas/report.json`
             let path = entry.path().join("report.json");
@@ -56,28 +58,13 @@ impl BenchmarkCache {
 
             info!("Loaded light benchmark report for {:?}", &entry.path());
 
-            if light_report.hardware.identifier.is_none() {
-                error!(
-                    "No identifier found in benchmark report: {:#?}",
-                    &entry.path()
-                );
-                return;
-            }
-
-            if light_report.params.gitref.is_none() {
-                error!("No gitref found in benchmark report: {:#?}", &entry.path());
-                return;
-            }
-
             // Store the benchmark report
-            self.benchmarks
-                .insert(light_report.uuid, (light_report, path));
+            reports.insert(light_report.uuid, (light_report, path));
         });
 
-        let mut summaries: Vec<_> = self
-            .benchmarks
-            .iter()
-            .map(|entry| BenchmarkSummary::new(&entry.value().0, &self.thresholds))
+        let mut summaries: Vec<_> = reports
+            .values()
+            .map(|(report, _)| BenchmarkSummary::new(report, &self.thresholds))
             .collect();
         summaries.sort_by(|a, b| {
             b.version_order
@@ -86,11 +73,10 @@ impl BenchmarkCache {
                 .then_with(|| a.uuid.cmp(&b.uuid))
         });
         info!("Built {} benchmark summaries", summaries.len());
-        // The writer only swaps an Arc, so a poisoned lock still holds a whole list.
-        *self
-            .summaries
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::new(summaries);
+        self.replace_runs(Runs {
+            reports,
+            summaries: Arc::new(summaries),
+        });
 
         Ok(())
     }
@@ -114,5 +100,49 @@ impl BenchmarkCache {
             );
             IggyBenchDashboardServerError::InvalidJson(e.to_string())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config;
+    use serde_json::Value;
+
+    const FIXTURE_RUN_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fixtures/results/live-0.9.0-pinned-producer-20p"
+    );
+    const SHIPPED_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dashboard.toml");
+    const REPORT_FILE: &str = "report.json";
+    /// `server_stats` of the fixture run, which differ from its `identifier` and `gitref`.
+    const FIXTURE_SERVER_HOSTNAME: &str = "ip-10-0-0-40";
+    const FIXTURE_SERVER_VERSION: &str = "0.9.0";
+
+    #[test]
+    fn given_report_without_gitref_and_identifier_when_loading_should_list_run_with_server_labels()
+    {
+        let fixture = std::fs::read_to_string(Path::new(FIXTURE_RUN_DIR).join(REPORT_FILE))
+            .expect("the fixture report is readable");
+        let mut report: Value = serde_json::from_str(&fixture).expect("the fixture report is JSON");
+        report["params"]["gitref"] = Value::Null;
+        report["hardware"]["identifier"] = Value::Null;
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let run_dir = results_dir.path().join("run");
+        std::fs::create_dir(&run_dir).expect("the run directory is created");
+        std::fs::write(run_dir.join(REPORT_FILE), report.to_string())
+            .expect("the report is written");
+        let thresholds = config::load(Path::new(SHIPPED_CONFIG))
+            .expect("the shipped config is valid")
+            .thresholds;
+        let cache = BenchmarkCache::new(results_dir.path().to_path_buf(), thresholds);
+
+        cache.load().expect("the results directory is readable");
+
+        let summaries = cache.get_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].machine, FIXTURE_SERVER_HOSTNAME);
+        assert_eq!(summaries[0].version, FIXTURE_SERVER_VERSION);
+        assert_eq!(summaries[0].gitref, None);
     }
 }

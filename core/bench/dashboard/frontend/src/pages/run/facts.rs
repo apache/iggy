@@ -36,8 +36,8 @@ use bench_report::transport::BenchmarkTransport;
 use super::change::metric_name;
 use crate::components::run_labels::{
     CONDITION_SEPARATOR, DayLabel, MachineName, batch_size_text, data_volume_text, durability_text,
-    message_size_text, milliseconds, nodes_text, numeric_text, rate_limit_text, rate_text,
-    topic_durability,
+    memory_text, message_size_text, milliseconds, nodes_text, numeric_text, rate_limit_text,
+    rate_text, topic_durability,
 };
 use crate::format::{format_bytes, group_digits};
 
@@ -58,7 +58,6 @@ const MICROS_PER_MILLISECOND: u64 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 3_600;
 const PERCENT: f64 = 100.0;
-const MEBIBYTES_PER_GIBIBYTE: f64 = 1024.0;
 const BENCH_HOST_FACTS: usize = 5;
 pub const MACHINE_LABEL: &str = "Machine";
 pub const TOPOLOGY_LABEL: &str = "Topology";
@@ -378,12 +377,7 @@ pub fn bench_host_values(hardware: &BenchmarkHardware) -> [Option<String>; BENCH
     [
         Some(hardware.cpu_name.clone()),
         (hardware.cpu_cores > 0).then(|| hardware.cpu_cores.to_string()),
-        (hardware.total_memory_mb > 0).then(|| {
-            format!(
-                "{:.1} GiB",
-                hardware.total_memory_mb as f64 / MEBIBYTES_PER_GIBIBYTE
-            )
-        }),
+        memory_text(hardware.total_memory_mb),
         Some(hardware.os_name.clone()),
         Some(hardware.os_version.clone()),
     ]

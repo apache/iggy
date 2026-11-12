@@ -176,17 +176,41 @@ impl BuildJob {
         if let Some(json) = cache.get(&self.key) {
             return Ok(json);
         }
-        let json = read_series(&self.report, self.key.metric, self.key.scope)?;
+        // The pages ask for both metrics of a scope together, and the parse costs far more than a
+        // series, so one parse builds both. The sibling goes in first, so it never evicts the
+        // requested series.
+        let sibling = SeriesKey {
+            metric: sibling_metric(self.key.metric),
+            ..self.key
+        };
+        let [sibling_json, json] = read_series(
+            &self.report,
+            self.key.scope,
+            [sibling.metric, self.key.metric],
+        )?;
+        cache.insert(sibling, sibling_json, self.generation);
         cache.insert(self.key, json.clone(), self.generation);
         Ok(json)
     }
 }
 
-fn read_series(path: &Path, metric: SeriesMetric, scope: SeriesScope) -> Result<Bytes> {
+fn sibling_metric(metric: SeriesMetric) -> SeriesMetric {
+    match metric {
+        SeriesMetric::Latency => SeriesMetric::Throughput,
+        SeriesMetric::Throughput => SeriesMetric::Latency,
+    }
+}
+
+/// Parses the report once, and returns the series of each metric in the order of `metrics`.
+fn read_series(path: &Path, scope: SeriesScope, metrics: [SeriesMetric; 2]) -> Result<[Bytes; 2]> {
     let report = read_report(path)?;
-    let series = BenchmarkSeries::new(&report, metric, scope);
+    let [first, second] = metrics.map(|metric| BenchmarkSeries::new(&report, metric, scope));
     drop(report);
-    serde_json::to_vec(&series)
+    Ok([serialize(&first, path)?, serialize(&second, path)?])
+}
+
+fn serialize(series: &BenchmarkSeries, path: &Path) -> Result<Bytes> {
+    serde_json::to_vec(series)
         // Without spare capacity, so the cache bound counts every byte that it holds.
         .map(|json| Bytes::from(json.into_boxed_slice()))
         .map_err(|e| {
@@ -197,7 +221,7 @@ fn read_series(path: &Path, metric: SeriesMetric, scope: SeriesScope) -> Result<
         })
 }
 
-fn read_report(path: &Path) -> Result<BenchmarkReport> {
+pub fn read_report(path: &Path) -> Result<BenchmarkReport> {
     let raw = std::fs::read(path).map_err(|e| {
         IggyBenchDashboardServerError::InternalError(format!(
             "Failed to read report file '{}': {e}",
@@ -222,6 +246,11 @@ mod tests {
     const NEW_RUN: u128 = 4;
     /// Never read, because the job finds the cached series first.
     const MISSING_REPORT: &str = "missing/report.json";
+    /// 8 producers, 8 consumers, and the groups of producers, consumers, and both.
+    const FIXTURE_REPORT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fixtures/results/old-0.4.202-pinned-producer-and-consumer/report.json"
+    );
 
     fn key(run: u128) -> SeriesKey {
         SeriesKey {
@@ -229,6 +258,28 @@ mod tests {
             metric: SeriesMetric::Latency,
             scope: SeriesScope::Group,
         }
+    }
+
+    fn fixture_key(metric: SeriesMetric, scope: SeriesScope) -> SeriesKey {
+        SeriesKey {
+            uuid: Uuid::from_u128(NEW_RUN),
+            metric,
+            scope,
+        }
+    }
+
+    fn fixture_job(key: SeriesKey, generation: u64) -> BuildJob {
+        BuildJob {
+            report: PathBuf::from(FIXTURE_REPORT),
+            key,
+            generation,
+        }
+    }
+
+    fn metric_of(json: &Bytes) -> SeriesMetric {
+        serde_json::from_slice::<BenchmarkSeries>(json)
+            .expect("a cached response is a series")
+            .metric
     }
 
     fn json(len: usize) -> Bytes {
@@ -325,5 +376,70 @@ mod tests {
             built.expect("the job returns the cached series"),
             json(ENTRY_BYTES)
         );
+    }
+
+    #[test]
+    fn given_group_miss_when_job_runs_should_cache_both_group_metrics_only() {
+        let cache = SeriesCache::new(SERIES_CACHE_MAX_BYTES);
+        let latency = fixture_key(SeriesMetric::Latency, SeriesScope::Group);
+        let throughput = fixture_key(SeriesMetric::Throughput, SeriesScope::Group);
+
+        let built = fixture_job(latency, cache.generation())
+            .run(&cache)
+            .expect("the job builds the fixture series");
+
+        assert_eq!(metric_of(&built), SeriesMetric::Latency);
+        assert_eq!(cache.get(&latency), Some(built));
+        let sibling = cache
+            .get(&throughput)
+            .expect("the job caches the other metric of the scope");
+        assert_eq!(metric_of(&sibling), SeriesMetric::Throughput);
+        for metric in [SeriesMetric::Latency, SeriesMetric::Throughput] {
+            assert!(
+                cache
+                    .get(&fixture_key(metric, SeriesScope::Actors))
+                    .is_none(),
+                "{metric:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_sibling_built_when_sibling_job_runs_should_answer_from_cache() {
+        let cache = SeriesCache::new(SERIES_CACHE_MAX_BYTES);
+        let latency = fixture_key(SeriesMetric::Latency, SeriesScope::Actors);
+        let throughput = fixture_key(SeriesMetric::Throughput, SeriesScope::Actors);
+        fixture_job(latency, cache.generation())
+            .run(&cache)
+            .expect("the job builds the fixture series");
+
+        let answered = BuildJob {
+            report: PathBuf::from(MISSING_REPORT),
+            key: throughput,
+            generation: cache.generation(),
+        }
+        .run(&cache)
+        .expect("the job answers from the cache without reading the report");
+
+        assert_eq!(metric_of(&answered), SeriesMetric::Throughput);
+        assert_eq!(cache.get(&throughput), Some(answered));
+    }
+
+    #[test]
+    fn given_reload_during_build_when_job_runs_should_cache_neither_metric() {
+        let cache = SeriesCache::new(SERIES_CACHE_MAX_BYTES);
+        let latency = fixture_key(SeriesMetric::Latency, SeriesScope::Group);
+        let throughput = fixture_key(SeriesMetric::Throughput, SeriesScope::Group);
+        let before_reload = cache.generation();
+
+        cache.clear();
+        let built = fixture_job(latency, before_reload)
+            .run(&cache)
+            .expect("the job still answers its caller");
+
+        assert_eq!(metric_of(&built), SeriesMetric::Latency);
+        assert!(cache.get(&latency).is_none());
+        assert!(cache.get(&throughput).is_none());
+        assert_eq!(cache.lock().bytes, 0);
     }
 }

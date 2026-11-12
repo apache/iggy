@@ -213,6 +213,14 @@ fn run_row_view(props: &RunRowProps) -> Html {
                 { cell("Machine", "explore-machine", html! {
                     <>
                         <span class="explore-main">{ row.machine.as_str() }</span>
+                        if let Some(cpu) = &row.cpu {
+                            <span class="explore-sub" title={AttrValue::from(Rc::clone(&cpu.brand))}>
+                                { cpu.name.as_str() }
+                            </span>
+                        }
+                        if let Some(specs) = &row.specs {
+                            <span class="explore-sub">{ specs.as_str() }</span>
+                        }
                         <span class="explore-sub">{ row.topology.as_str() }</span>
                     </>
                 }) }

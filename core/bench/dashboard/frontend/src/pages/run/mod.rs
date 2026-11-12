@@ -408,7 +408,6 @@ fn found_view(
                 ) }
                 <Advanced
                     uuid={run.uuid}
-                    rate_limited={view.rate_limited()}
                     report={report.clone()}
                     reload={reload.clone()}
                 />

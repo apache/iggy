@@ -20,7 +20,8 @@
 use std::fmt;
 
 use bench_report::{
-    benchmark_kind::BenchmarkKind, group_metrics_kind::GroupMetricsKind, params::BenchmarkParams,
+    benchmark_kind::BenchmarkKind, group_metrics_kind::GroupMetricsKind,
+    hardware::BenchmarkHardware, params::BenchmarkParams,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,6 +42,8 @@ pub struct BenchmarkSummary {
     /// For example `Pinned producer, 20 producers`.
     pub title: String,
     pub machine: String,
+    /// The machine that ran the bench. In a cluster run, the server nodes are other machines.
+    pub hardware: BenchmarkHardware,
     pub nodes: usize,
     /// For display, for example `0.10.0-rc.1` or `0.10.0 at 91e020636`.
     pub version: String,
@@ -90,6 +93,7 @@ impl BenchmarkSummary {
             timestamp: report.timestamp.clone(),
             title: title(params),
             machine: report.machine().to_owned(),
+            hardware: report.hardware.clone(),
             nodes: report.nodes(),
             version_order: VersionOrder::new(
                 version.semver,
@@ -238,6 +242,12 @@ mod tests {
         );
         assert_eq!(summary.title, "Pinned producer, 2 producers");
         assert_eq!(summary.machine, "atlas");
+        assert_eq!(
+            summary.hardware.cpu_name,
+            "AMD Ryzen 9 9950X3D 16-Core Processor"
+        );
+        assert_eq!(summary.hardware.cpu_cores, 32);
+        assert_eq!(summary.hardware.total_memory_mb, 94075);
         assert_eq!(summary.nodes, 1);
         assert_eq!(summary.version, "0.10.0 at 53e3bf1e3");
         assert_eq!(summary.version_order.version, Version::parse("0.10.0").ok());

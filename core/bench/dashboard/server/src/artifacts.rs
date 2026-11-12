@@ -18,43 +18,71 @@
 //! Cached zip archives of benchmark run directories.
 
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use tempfile::NamedTempFile;
-use walkdir::WalkDir;
-use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+use walkdir::{DirEntry, WalkDir};
+use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+const FINGERPRINT_PREFIX: &str = "iggy-bench-dashboard run fingerprint ";
 
 /// Makes `zip_path` a zip of every file under `run_dir`. Returns `true` when it built the
 /// archive and `false` when the cached one is still current.
 ///
-/// The cached zip is current while no entry under `run_dir` has an mtime at or after the zip's
-/// mtime. Entries include directories, so a removed file also triggers a rebuild.
+/// The zip comment holds a fingerprint of `run_dir`, and the cached zip is current while that
+/// fingerprint still matches. The fingerprint only uses values read from the results file
+/// system, so it never compares them with times from the cache file system, which can run on
+/// another clock.
 pub fn refresh_zip(run_dir: &Path, zip_path: &Path) -> io::Result<bool> {
-    if is_current(run_dir, zip_path)? {
+    let fingerprint = fingerprint(run_dir)?;
+    if has_fingerprint(zip_path, &fingerprint)? {
         return Ok(false);
     }
-    build_zip(run_dir, zip_path)?;
+    build_zip(run_dir, zip_path, &fingerprint)?;
     Ok(true)
 }
 
-fn is_current(run_dir: &Path, zip_path: &Path) -> io::Result<bool> {
-    let zip_mtime = match fs::metadata(zip_path) {
-        Ok(metadata) => metadata.modified()?,
+/// Hashes the relative path, size and times of every entry under `run_dir`. Entries include
+/// directories, so an added or removed file changes the fingerprint. On unix it also hashes the
+/// ctime and inode, because `rsync -a`, `cp -a` and `tar x` restore old mtimes but can't set
+/// those.
+fn fingerprint(run_dir: &Path) -> io::Result<String> {
+    let mut hasher = DefaultHasher::new();
+    for entry in WalkDir::new(run_dir).sort_by_file_name() {
+        let Some(entry) = skip_vanished(entry)? else {
+            continue;
+        };
+        let Some(metadata) = skip_vanished(entry.metadata())? else {
+            continue;
+        };
+        relative_path(run_dir, &entry)?.hash(&mut hasher);
+        metadata.len().hash(&mut hasher);
+        metadata.modified()?.hash(&mut hasher);
+        #[cfg(unix)]
+        (metadata.ctime(), metadata.ctime_nsec(), metadata.ino()).hash(&mut hasher);
+    }
+    // DefaultHasher can change between Rust releases. That only makes each zip rebuild once.
+    let hash = hasher.finish();
+    Ok(format!("{FINGERPRINT_PREFIX}{hash:016x}"))
+}
+
+/// A zip that doesn't parse counts as stale, so a damaged cache file gets rebuilt.
+fn has_fingerprint(zip_path: &Path, fingerprint: &str) -> io::Result<bool> {
+    let zip_file = match File::open(zip_path) {
+        Ok(zip_file) => zip_file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    for entry in WalkDir::new(run_dir) {
-        if entry?.metadata()?.modified()? >= zip_mtime {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(ZipArchive::new(zip_file).is_ok_and(|archive| archive.comment() == fingerprint.as_bytes()))
 }
 
 /// The archive goes to a temp file that is renamed into place, so readers and concurrent
-/// builders never see a partial zip. The zip gets the mtime of the build start, so a file
-/// that changes during the build makes the next refresh rebuild.
-fn build_zip(run_dir: &Path, zip_path: &Path) -> io::Result<()> {
+/// builders never see a partial zip. `fingerprint` is taken before the walk, so a file that
+/// changes during the build makes the next refresh rebuild.
+fn build_zip(run_dir: &Path, zip_path: &Path, fingerprint: &str) -> io::Result<()> {
     let zip_dir = zip_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -63,32 +91,54 @@ fn build_zip(run_dir: &Path, zip_path: &Path) -> io::Result<()> {
     })?;
     fs::create_dir_all(zip_dir)?;
     let temp_file = NamedTempFile::new_in(zip_dir)?;
-    // Taken from the file system and not from SystemTime::now(): file mtimes come from a
-    // coarser clock, and the freshness check must compare values from the same clock.
-    let build_started = temp_file.as_file().metadata()?.modified()?;
 
     let mut zip = ZipWriter::new(temp_file);
+    zip.set_comment(fingerprint)?;
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o755);
     for entry in WalkDir::new(run_dir) {
-        let entry = entry?;
+        let Some(entry) = skip_vanished(entry)? else {
+            continue;
+        };
         if !entry.file_type().is_file() {
             continue;
         }
-        let relative_path = entry
-            .path()
-            .strip_prefix(run_dir)
-            .map_err(|e| io::Error::other(format!("Error creating relative path: {e}")))?;
-        zip.start_file(relative_path.to_string_lossy(), options)?;
-        io::copy(&mut File::open(entry.path())?, &mut zip)?;
+        let mut file = match File::open(entry.path()) {
+            Ok(file) => file,
+            Err(e) if is_vanished(entry.depth(), &e) => continue,
+            Err(e) => return Err(e),
+        };
+        zip.start_file(relative_path(run_dir, &entry)?.to_string_lossy(), options)?;
+        io::copy(&mut file, &mut zip)?;
     }
 
     let temp_file = zip.finish()?;
-    temp_file.as_file().set_modified(build_started)?;
     temp_file.as_file().sync_all()?;
     temp_file.persist(zip_path)?;
     Ok(())
+}
+
+/// Drops an entry that went away between the directory read and its use. Its parent directory
+/// changed with it, so the next fingerprint differs. A missing `run_dir` stays an error, so a
+/// deleted run never becomes an empty zip.
+fn skip_vanished<T>(result: walkdir::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.io_error().is_some_and(|io| is_vanished(e.depth(), io)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn is_vanished(depth: usize, error: &io::Error) -> bool {
+    depth > 0 && error.kind() == io::ErrorKind::NotFound
+}
+
+fn relative_path<'a>(run_dir: &Path, entry: &'a DirEntry) -> io::Result<&'a Path> {
+    entry
+        .path()
+        .strip_prefix(run_dir)
+        .map_err(|e| io::Error::other(format!("Error creating relative path: {e}")))
 }
 
 #[cfg(test)]
@@ -97,25 +147,29 @@ mod tests {
     use std::io::Read;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
-    use zip::ZipArchive;
 
     const AGE: Duration = Duration::from_secs(60);
 
-    /// Creates a run directory whose entries are all dated in the past, so the first zip is newer
-    /// than every entry, however coarse the file system clock is.
-    fn old_run_dir(root: &Path) -> PathBuf {
+    /// Creates a run directory whose entries all have `mtime`.
+    fn dated_run_dir(root: &Path, mtime: SystemTime) -> PathBuf {
         let run_dir = root.join("run");
         fs::create_dir_all(run_dir.join("logs")).expect("create run dir");
         fs::write(run_dir.join("report.json"), "v1").expect("write report");
         fs::write(run_dir.join("logs").join("server.log"), "log").expect("write log");
-        let past = SystemTime::now() - AGE;
         for entry in WalkDir::new(&run_dir) {
-            let path = entry.expect("walk run dir").into_path();
-            File::open(&path)
-                .and_then(|file| file.set_modified(past))
-                .expect("set mtime in the past");
+            set_mtime(entry.expect("walk run dir").path(), mtime);
         }
         run_dir
+    }
+
+    fn past() -> SystemTime {
+        SystemTime::now() - AGE
+    }
+
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        File::open(path)
+            .and_then(|file| file.set_modified(mtime))
+            .expect("set mtime");
     }
 
     fn zip_entries(zip_path: &Path) -> Vec<(String, String)> {
@@ -147,7 +201,7 @@ mod tests {
     #[test]
     fn given_unchanged_run_dir_when_refreshing_twice_should_build_once() {
         let root = tempfile::tempdir().expect("create temp dir");
-        let run_dir = old_run_dir(root.path());
+        let run_dir = dated_run_dir(root.path(), past());
         let zip_path = root.path().join("cache").join("run.zip");
 
         assert!(refresh_zip(&run_dir, &zip_path).expect("first refresh"));
@@ -164,7 +218,7 @@ mod tests {
     #[test]
     fn given_rewritten_report_when_refreshing_should_rebuild_with_new_content() {
         let root = tempfile::tempdir().expect("create temp dir");
-        let run_dir = old_run_dir(root.path());
+        let run_dir = dated_run_dir(root.path(), past());
         let zip_path = root.path().join("cache").join("run.zip");
         assert!(refresh_zip(&run_dir, &zip_path).expect("first refresh"));
 
@@ -180,7 +234,7 @@ mod tests {
     #[test]
     fn given_removed_file_when_refreshing_should_rebuild_without_it() {
         let root = tempfile::tempdir().expect("create temp dir");
-        let run_dir = old_run_dir(root.path());
+        let run_dir = dated_run_dir(root.path(), past());
         let zip_path = root.path().join("cache").join("run.zip");
         assert!(refresh_zip(&run_dir, &zip_path).expect("first refresh"));
 
@@ -188,5 +242,78 @@ mod tests {
 
         assert!(refresh_zip(&run_dir, &zip_path).expect("refresh after removal"));
         assert_eq!(zip_entries(&zip_path), vec![entry("report.json", "v1")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_report_replaced_with_restored_mtimes_when_refreshing_should_rebuild_with_new_content()
+    {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let old_mtime = past();
+        let run_dir = dated_run_dir(root.path(), old_mtime);
+        let zip_path = root.path().join("cache").join("run.zip");
+        assert!(refresh_zip(&run_dir, &zip_path).expect("first refresh"));
+
+        // Same size and mtime as the old report, swapped in by a rename as `rsync -a` does.
+        let staged_report = run_dir.join(".report.json.staged");
+        fs::write(&staged_report, "v2").expect("stage report");
+        set_mtime(&staged_report, old_mtime);
+        fs::rename(&staged_report, run_dir.join("report.json")).expect("replace report");
+        set_mtime(&run_dir, old_mtime);
+
+        assert!(refresh_zip(&run_dir, &zip_path).expect("refresh after replacement"));
+        assert_eq!(
+            zip_entries(&zip_path),
+            vec![entry("logs/server.log", "log"), entry("report.json", "v2")]
+        );
+    }
+
+    #[test]
+    fn given_file_added_with_restored_mtimes_when_refreshing_should_rebuild_with_it() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let old_mtime = past();
+        let run_dir = dated_run_dir(root.path(), old_mtime);
+        let zip_path = root.path().join("cache").join("run.zip");
+        assert!(refresh_zip(&run_dir, &zip_path).expect("first refresh"));
+
+        let client_log = run_dir.join("logs").join("client.log");
+        fs::write(&client_log, "client").expect("write client log");
+        set_mtime(&client_log, old_mtime);
+        set_mtime(&run_dir.join("logs"), old_mtime);
+
+        assert!(refresh_zip(&run_dir, &zip_path).expect("refresh after addition"));
+        assert_eq!(
+            zip_entries(&zip_path),
+            vec![
+                entry("logs/client.log", "client"),
+                entry("logs/server.log", "log"),
+                entry("report.json", "v1")
+            ]
+        );
+    }
+
+    #[test]
+    fn given_entries_dated_in_the_future_when_refreshing_twice_should_build_once() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let run_dir = dated_run_dir(root.path(), SystemTime::now() + AGE);
+        let zip_path = root.path().join("cache").join("run.zip");
+
+        assert!(refresh_zip(&run_dir, &zip_path).expect("first refresh"));
+        assert!(!refresh_zip(&run_dir, &zip_path).expect("second refresh"));
+    }
+
+    #[test]
+    fn given_corrupt_cached_zip_when_refreshing_should_rebuild_it() {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let run_dir = dated_run_dir(root.path(), past());
+        let zip_path = root.path().join("cache").join("run.zip");
+        fs::create_dir_all(root.path().join("cache")).expect("create cache dir");
+        fs::write(&zip_path, "not a zip").expect("write corrupt zip");
+
+        assert!(refresh_zip(&run_dir, &zip_path).expect("refresh over corrupt zip"));
+        assert_eq!(
+            zip_entries(&zip_path),
+            vec![entry("logs/server.log", "log"), entry("report.json", "v1")]
+        );
     }
 }

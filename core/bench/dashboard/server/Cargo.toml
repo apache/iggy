@@ -30,7 +30,6 @@ bench-dashboard-shared = { workspace = true }
 bench-report = { workspace = true }
 charming = { workspace = true, features = ["ssr", "ssr-raster"] }
 clap = { workspace = true }
-dashmap = { workspace = true }
 notify = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

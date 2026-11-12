@@ -25,7 +25,7 @@ use web_sys::Element;
 use yew::prelude::*;
 
 use super::chart::{
-    DistributionChart, LATENCY_CHART_NOTE, PercentileChart, SeriesChart, has_percentiles,
+    ActorLatencyChart, DistributionChart, PercentileChart, SeriesChart, has_percentiles,
 };
 use super::fact_group_card;
 use super::facts::server_facts;
@@ -36,6 +36,11 @@ const OPEN_ATTRIBUTE: &str = "open";
 const DISTRIBUTION_NOTE: &str = "Latency in ms on the x axis. The last bar also counts the slower \
                                  samples past the range, and the line is the fitted log-normal \
                                  curve.";
+const ACTOR_LATENCY_NOTE: &str = "Each thin line is one actor: the average latency of its batches \
+                                  in each sampling window, the finest detail that the report \
+                                  keeps. The thick line is the group's moving average. Drag the \
+                                  ends of the slider to zoom into a peak, and double click the \
+                                  chart to see the whole run again.";
 const SERVER_NOTE: &str = "What the server reported about itself at the end of the run.";
 const PERCENTILE_NOTE: &str = "Each point is one percentile averaged over the actors. The axis is \
                                logarithmic because the tail can sit orders of magnitude above the \
@@ -44,8 +49,6 @@ const PERCENTILE_NOTE: &str = "Each point is one percentile averaged over the ac
 #[derive(Properties, PartialEq)]
 pub struct AdvancedProps {
     pub uuid: Uuid,
-    /// A run without a rate limit has its group latency chart here, not under Performance.
-    pub rate_limited: bool,
     /// The light report that the page holds.
     pub report: Loadable<BenchmarkReportLight>,
     pub reload: Callback<()>,
@@ -89,18 +92,12 @@ fn views(props: &AdvancedProps) -> Html {
     };
     html! {
         <>
+            <article class="card run-chart-card">
+                <h3>{"Latency of every actor"}</h3>
+                <ActorLatencyChart {uuid} />
+                <p class="card-note">{ ACTOR_LATENCY_NOTE }</p>
+            </article>
             <div class="run-charts">
-                if !props.rate_limited {
-                    <article class="card run-chart-card">
-                        <h3>{"Average latency"}</h3>
-                        <SeriesChart {uuid} metric={SeriesMetric::Latency} scope={SeriesScope::Group} />
-                        <p class="card-note">{ LATENCY_CHART_NOTE }</p>
-                    </article>
-                }
-                <article class="card run-chart-card">
-                    <h3>{"Average latency per actor"}</h3>
-                    <SeriesChart {uuid} metric={SeriesMetric::Latency} scope={SeriesScope::Actors} />
-                </article>
                 <article class="card run-chart-card">
                     <h3>{"Throughput per actor"}</h3>
                     <SeriesChart {uuid} metric={SeriesMetric::Throughput} scope={SeriesScope::Actors} />

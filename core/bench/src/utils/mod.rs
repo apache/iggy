@@ -109,10 +109,7 @@ pub async fn collect_server_logs_and_save_to_file(
 /// Creates the directory for one run. It never reuses an existing directory, so no run replaces
 /// another's results.
 pub fn create_run_dir(output_dir: &Path, dir_name: &str) -> io::Result<PathBuf> {
-    // Labels such as `--gitref` can contain `/`, which nests the run directory.
-    if let Some(parent) = output_dir.join(dir_name).parent() {
-        fs::create_dir_all(parent)?;
-    }
+    fs::create_dir_all(output_dir)?;
     for attempt in 1..=MAX_RUN_DIR_ATTEMPTS {
         let path = match attempt {
             1 => output_dir.join(dir_name),

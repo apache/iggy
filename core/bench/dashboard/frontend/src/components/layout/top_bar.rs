@@ -55,42 +55,44 @@ pub fn top_bar() -> Html {
 
     html! {
         <header class="top-bar">
-            <Link<AppRoute> to={AppRoute::Home} classes={classes!("top-bar-brand")}>
-                <img src={logo_src} alt="Apache Iggy" />
-                <span class="top-bar-divider" aria-hidden="true"></span>
-                <span class="top-bar-wordmark">{"Benchmarks"}</span>
-            </Link<AppRoute>>
-            <nav class="top-bar-nav" aria-label="Main">
-                <Link<AppRoute> to={AppRoute::Home} classes={tab_class(NavTab::Overview)}>
-                    {"Overview"}
+            <div class="top-bar-inner">
+                <Link<AppRoute> to={AppRoute::Home} classes={classes!("top-bar-brand")}>
+                    <img src={logo_src} alt="Apache Iggy" />
+                    <span class="top-bar-divider" aria-hidden="true"></span>
+                    <span class="top-bar-wordmark">{"Benchmarks"}</span>
                 </Link<AppRoute>>
-                <Link<AppRoute> to={AppRoute::Explore} classes={tab_class(NavTab::Explore)}>
-                    {"Explore"}
-                </Link<AppRoute>>
-                <Link<AppRoute> to={AppRoute::Methodology} classes={tab_class(NavTab::Methodology)}>
-                    {"Methodology"}
-                </Link<AppRoute>>
-            </nav>
-            <div class="top-bar-actions">
-                <button
-                    type="button"
-                    class="top-bar-icon"
-                    onclick={on_theme_click}
-                    title={theme_title}
-                    aria-label={theme_title}
-                >
-                    { render_theme_icon(is_dark) }
-                </button>
-                <a
-                    class="top-bar-github"
-                    href={GITHUB_URL}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    aria-label="Apache Iggy on GitHub"
-                >
-                    { render_github_icon() }
-                    <span class="top-bar-github-label">{"GitHub"}</span>
-                </a>
+                <nav class="top-bar-nav" aria-label="Main">
+                    <Link<AppRoute> to={AppRoute::Home} classes={tab_class(NavTab::Overview)}>
+                        {"Overview"}
+                    </Link<AppRoute>>
+                    <Link<AppRoute> to={AppRoute::Explore} classes={tab_class(NavTab::Explore)}>
+                        {"Explore"}
+                    </Link<AppRoute>>
+                    <Link<AppRoute> to={AppRoute::Methodology} classes={tab_class(NavTab::Methodology)}>
+                        {"Methodology"}
+                    </Link<AppRoute>>
+                </nav>
+                <div class="top-bar-actions">
+                    <button
+                        type="button"
+                        class="top-bar-icon"
+                        onclick={on_theme_click}
+                        title={theme_title}
+                        aria-label={theme_title}
+                    >
+                        { render_theme_icon(is_dark) }
+                    </button>
+                    <a
+                        class="top-bar-github"
+                        href={GITHUB_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        aria-label="Apache Iggy on GitHub"
+                    >
+                        { render_github_icon() }
+                        <span class="top-bar-github-label">{"GitHub"}</span>
+                    </a>
+                </div>
             </div>
         </header>
     }

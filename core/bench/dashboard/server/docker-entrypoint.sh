@@ -27,5 +27,15 @@ ARGS=()
 ARGS+=(--host "${HOST}")
 ARGS+=(--port "${PORT}")
 ARGS+=(--results-dir "${RESULTS_DIR}")
+if [ -n "${CONFIG:-}" ]; then
+    ARGS+=(--config "${CONFIG}")
+fi
+if [ -n "${CACHE_DIR:-}" ]; then
+    ARGS+=(--cache-dir "${CACHE_DIR}")
+fi
+
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "Warning: GITHUB_TOKEN is set, but the server no longer polls GitHub. Put new results into ${RESULTS_DIR}." >&2
+fi
 
 exec /app/iggy-bench-dashboard-server "${ARGS[@]}"

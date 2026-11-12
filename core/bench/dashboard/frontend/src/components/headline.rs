@@ -78,23 +78,44 @@ pub fn change_chip(change: &Change) -> Html {
 
 /// `text` is the change, and `ranges` names the values that it compares.
 pub fn judged_chip(text: String, ranges: String, judgment: Judgment) -> Html {
-    let look = match judgment {
+    html! {
+        <span class="run-change-wrap">
+            <span class={classes!("run-change", judgment_look(judgment))} title={ranges}>
+                { text }
+            </span>
+            if let Some(note) = judgment_note(judgment) {
+                <span class="run-change-note">{ note }</span>
+            }
+        </span>
+    }
+}
+
+/// The chip alone, for a narrow card. Its note, if any, follows the compared values in its
+/// tooltip, and its color still tells a real change from noise.
+pub fn compact_judged_chip(text: String, ranges: String, judgment: Judgment) -> Html {
+    let title = match judgment_note(judgment) {
+        Some(note) => format!("{ranges} Change: {note}."),
+        None => ranges,
+    };
+    html! {
+        <span class={classes!("run-change", judgment_look(judgment))} {title}>{ text }</span>
+    }
+}
+
+const fn judgment_look(judgment: Judgment) -> &'static str {
+    match judgment {
         Judgment::Rule(verdict) => verdict_look(verdict),
         Judgment::ParametersDiffer => GRAY_LOOK,
-    };
-    let note = match judgment {
+    }
+}
+
+/// Why a gray change has no color. A better or worse change needs no note.
+const fn judgment_note(judgment: Judgment) -> Option<&'static str> {
+    match judgment {
         Judgment::Rule(DeltaVerdict::Better | DeltaVerdict::Worse) => None,
         Judgment::Rule(DeltaVerdict::Noise) => Some(NOISE_NOTE),
         Judgment::Rule(DeltaVerdict::Flagged) => Some(FLAGGED_NOTE),
         Judgment::ParametersDiffer => Some(PARAMETERS_NOTE),
-    };
-    html! {
-        <span class="run-change-wrap">
-            <span class={classes!("run-change", look)} title={ranges}>{ text }</span>
-            if let Some(note) = note {
-                <span class="run-change-note">{ note }</span>
-            }
-        </span>
     }
 }
 

@@ -111,69 +111,102 @@ const STEPS: [TextCard; 4] = [
     },
 ];
 
-const OPTIONS: [TextCard; 5] = [
-    TextCard {
-        title: "Transport",
-        paragraphs: &[
-            "The transport is the protocol between the bench and the server: tcp, quic, \
-                       http or websocket. The dashboard treats runs over different transports as \
-                       different workloads.",
-        ],
-        command: None,
+/// One row of the options table. The defaults come from the bench's `args` module.
+struct BenchOption {
+    name: &'static str,
+    flags: &'static [&'static str],
+    default: OptionDefault,
+    text: &'static str,
+}
+
+enum OptionDefault {
+    /// The value that the bench uses when the command leaves the option out.
+    Value(&'static str),
+    /// Why there is no value: the option is off, or the command must name one.
+    Unset(&'static str),
+}
+
+const OPTIONS: [BenchOption; 10] = [
+    BenchOption {
+        name: "Transport",
+        flags: &["tcp", "quic", "http", "websocket"],
+        default: OptionDefault::Unset("required"),
+        text: "The protocol between the bench and the server. It goes after the kind's options. \
+               The dashboard treats runs over different transports as different workloads.",
     },
-    TextCard {
-        title: "Durability",
-        paragraphs: &[
-            "Durability sets when the server confirms a write. With replicated, the default, it \
-             confirms once a quorum of replicas has the write. A quorum is the number of replicas \
-             that must confirm, for example 2 of 3.",
-            "With persisted, the server also waits until the quorum, or the single server, has the \
-             write in recoverable stable storage.",
-            "--durability sets the policy for messages. --consumer-offset-durability sets it for \
-             consumer offsets, which are the consumers' saved read positions. The bench applies \
-             both when it creates its topics.",
-        ],
-        command: None,
+    BenchOption {
+        name: "Message durability",
+        flags: &["--durability"],
+        default: OptionDefault::Value("replicated"),
+        text: "When the server confirms a write. With replicated, it confirms once a quorum of \
+               replicas has the write. A quorum is the number of replicas that must confirm, for \
+               example 2 of 3. With persisted, the server also waits until the quorum, or the \
+               single server, has the write in recoverable stable storage.",
     },
-    TextCard {
-        title: "Rate limit",
-        paragraphs: &[
-            "--rate-limit sets the total rate for all actors together, in bytes per second, for \
-             example 800MB. Each actor gets an equal share.",
-            "In Producer + consumer kinds, consumers get 5 percent more by default \
-             (--read-amplification), so they keep up. In end-to-end-producing-consumer-group, \
-             only the actors that send share the rate, and an actor that only polls has no \
-             limit. Without a rate limit, each actor runs as fast as it can.",
-        ],
-        command: None,
+    BenchOption {
+        name: "Offset durability",
+        flags: &["--consumer-offset-durability"],
+        default: OptionDefault::Value("replicated"),
+        text: "The same policy for consumer offsets, which are the consumers' saved read \
+               positions. The bench applies both policies when it creates its topics.",
     },
-    TextCard {
-        title: "Warm-up",
-        paragraphs: &[
-            "--warmup-time runs the load before the bench starts recording. The default is 0s, so \
-             the bench records from the start. After the warm-up, consumer-only runs read the \
-             topic again from offset zero.",
-        ],
-        command: None,
+    BenchOption {
+        name: "Rate limit",
+        flags: &["--rate-limit"],
+        default: OptionDefault::Unset("no limit"),
+        text: "The total rate for all actors together, in bytes per second, for example 800MB. \
+               Each actor gets an equal share. In end-to-end-producing-consumer-group, only the \
+               actors that send share the rate, and an actor that only polls has no limit. \
+               Without a rate limit, each actor runs as fast as it can.",
     },
-    TextCard {
-        title: "Message size and batches",
-        paragraphs: &[
-            "--message-size sets each message's payload in bytes, 1000 by default. A range such as \
-             200..500 also works. --messages-per-batch sets how many messages go in each batch, \
-             1000 by default.",
-            "--message-batches sets how many batches each actor does, 1000 by default. In \
-             pinned-producer-and-consumer, the bench scales the value: a producer does the value \
-             times the number of actors divided by the number of producers, and a consumer divides \
-             by the number of consumers instead. With equal counts, each actor does twice the \
-             value.",
-            "--total-data sets the data for all actors together instead. In Producer + consumer \
-             kinds, the producers send that much data and the consumers read it back. A command \
-             takes at most one of the two.",
-        ],
-        command: None,
+    BenchOption {
+        name: "Consumer rate",
+        flags: &["--read-amplification"],
+        default: OptionDefault::Value("1.05"),
+        text: "Only for Producer + consumer kinds. Each consumer gets this many times its share \
+               of the rate, so it keeps up. It is an option of the kind, so it goes after the \
+               kind.",
+    },
+    BenchOption {
+        name: "Warm-up",
+        flags: &["--warmup-time"],
+        default: OptionDefault::Value("0s"),
+        text: "How long the load runs before the bench starts recording. After the warm-up, \
+               consumer-only runs read the topic again from offset zero.",
+    },
+    BenchOption {
+        name: "Message size",
+        flags: &["--message-size"],
+        default: OptionDefault::Value("1000 bytes"),
+        text: "The payload of each message. A range such as 200..500 also works.",
+    },
+    BenchOption {
+        name: "Batch size",
+        flags: &["--messages-per-batch"],
+        default: OptionDefault::Value("1000"),
+        text: "How many messages go in each batch.",
+    },
+    BenchOption {
+        name: "Batches",
+        flags: &["--message-batches"],
+        default: OptionDefault::Value("1000"),
+        text: "How many batches each actor does. In pinned-producer-and-consumer, the bench \
+               scales the value: a producer does the value times the number of actors divided by \
+               the number of producers, and a consumer divides by the number of consumers \
+               instead. With equal counts, each actor does twice the value.",
+    },
+    BenchOption {
+        name: "Total data",
+        flags: &["--total-data"],
+        default: OptionDefault::Unset("not set"),
+        text: "The data for all actors together, instead of --message-batches. In Producer + \
+               consumer kinds, the producers send that much data and the consumers read it back. \
+               A command takes at most one of the two.",
     },
 ];
+
+const OPTIONS_NOTE: &str = "Each option goes before the kind, apart from the two rows that say \
+                            otherwise.";
 
 // Macros and not consts, because `concat!` only takes literals. Each one opens a paragraph on this
 // page, and the Overview repeats it, so both pages say the same thing.
@@ -371,7 +404,7 @@ pub fn methodology() -> Html {
                 </p>
                 <div class="card-grid">
                     { for FAMILIES.iter().map(|(family, text, kinds)| html! {
-                        <article class="card">
+                        <article class="card kind-card">
                             <h3>{ family.to_string() }</h3>
                             <p>{ *text }</p>
                             <p class="kind-list">
@@ -386,7 +419,11 @@ pub fn methodology() -> Html {
                              consumer groups. With --high-level-api, a consumer measures the \
                              time to collect one batch instead.") }
                 </p>
-                <div class="card-columns">{ articles(&OPTIONS) }</div>
+                <div class="card option-card">
+                    <h3>{"Options and their defaults"}</h3>
+                    <p>{ OPTIONS_NOTE }</p>
+                    { option_table(&OPTIONS) }
+                </div>
             </section>
 
             <section id={metrics.id} class="page-section page-container">
@@ -397,7 +434,7 @@ pub fn methodology() -> Html {
                      follow the same rules.",
                 ) }
                 <div class="card-grid">{ articles(&METRICS) }</div>
-                <div class="card">
+                <div class="card prose-card">
                     <h3>{"Badges"}</h3>
                     <p>
                         {"A badge warns that a run didn't get the load it asked for. Only runs \
@@ -416,32 +453,41 @@ pub fn methodology() -> Html {
                     "When a difference is real",
                     NOISE,
                 ) }
-                <div class="card">
-                    <p>
-                        {"The dashboard compares two versions on one history line: one workload \
-                          on one machine with one number of nodes. For each version, it takes the \
-                          median of the runs and their range, from the lowest to the highest \
-                          value. With an even number of runs, the median is the mean of the two \
-                          middle values."}
-                    </p>
-                    <p>{"A difference is beyond run-to-run noise only if both conditions are \
-                         true:"}</p>
-                    <ol class="rule-list">
-                        { for DELTA_RULE.iter().map(|condition| html! { <li>{ *condition }</li> }) }
-                    </ol>
-                    <p>
-                        {"The dashboard marks every other difference as within run-to-run noise. A \
-                          difference beyond the noise is better when throughput goes up or latency \
-                          goes down, and worse in the other direction. If a run of either version \
-                          has a badge, the dashboard shows the difference in gray and doesn't \
-                          judge it. Latency isn't compared when a run has no rate limit."}
-                    </p>
-                    { loadable(&data.config, "the thresholds", &data.reload, |config| {
-                        threshold_table(&config.thresholds)
-                    }) }
-                    <p class="card-note">
-                        {"The dashboard server reads these thresholds from dashboard.toml."}
-                    </p>
+                <div class="card prose-card noise-card">
+                    <div>
+                        <h3>{"The delta rule"}</h3>
+                        <p>
+                            {"The dashboard compares two versions on one history line: one \
+                              workload on one machine with one number of nodes. For each version, \
+                              it takes the median of the runs and their range, from the lowest to \
+                              the highest value. With an even number of runs, the median is the \
+                              mean of the two middle values."}
+                        </p>
+                        <p>{"A difference is beyond run-to-run noise only if both conditions are \
+                             true:"}</p>
+                        <ol class="rule-list">
+                            { for DELTA_RULE.iter().map(|condition| html! {
+                                <li>{ *condition }</li>
+                            }) }
+                        </ol>
+                        <p>
+                            {"The dashboard marks every other difference as within run-to-run \
+                              noise. A difference beyond the noise is better when throughput goes \
+                              up or latency goes down, and worse in the other direction. If a run \
+                              of either version has a badge, the dashboard shows the difference in \
+                              gray and doesn't judge it. Latency isn't compared when a run has no \
+                              rate limit."}
+                        </p>
+                    </div>
+                    <div>
+                        <h3>{"Thresholds"}</h3>
+                        { loadable(&data.config, "the thresholds", &data.reload, |config| {
+                            threshold_table(&config.thresholds)
+                        }) }
+                        <p class="card-note">
+                            {"The dashboard server reads these thresholds from dashboard.toml."}
+                        </p>
+                    </div>
                 </div>
             </section>
 
@@ -477,6 +523,47 @@ fn articles(cards: &[TextCard]) -> Html {
         .iter()
         .map(|card| html! { <article class="card">{ card_body(card) }</article> })
         .collect()
+}
+
+fn option_table(options: &[BenchOption]) -> Html {
+    html! {
+        <table class="option-table">
+            <thead>
+                <tr>
+                    <th scope="col">{"Option"}</th>
+                    <th scope="col">{"Default"}</th>
+                    <th scope="col">{"What it does"}</th>
+                </tr>
+            </thead>
+            <tbody>
+                { for options.iter().map(|option| html! {
+                    <tr>
+                        <th scope="row">
+                            <span class="option-name">{ option.name }</span>
+                            <span class="option-flags">
+                                { for option.flags.iter().map(|flag| html! {
+                                    <code class="flag">{ *flag }</code>
+                                }) }
+                            </span>
+                        </th>
+                        <td class="option-default" data-label="Default">
+                            { option.default.view() }
+                        </td>
+                        <td class="option-text"><p>{ prose(option.text) }</p></td>
+                    </tr>
+                }) }
+            </tbody>
+        </table>
+    }
+}
+
+impl OptionDefault {
+    fn view(&self) -> Html {
+        match self {
+            Self::Value(value) => html! { <code class="option-value">{ *value }</code> },
+            Self::Unset(reason) => html! { <span class="option-unset">{ *reason }</span> },
+        }
+    }
 }
 
 fn card_body(card: &TextCard) -> Html {

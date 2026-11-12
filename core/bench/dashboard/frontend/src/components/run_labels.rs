@@ -22,6 +22,7 @@
 use bench_dashboard_shared::identity::{DataVolumeKey, KindFamily};
 use bench_dashboard_shared::metrics::{BYTES_PER_MEGABYTE, rate_limit_bytes};
 use bench_dashboard_shared::summary::BenchmarkSummary;
+use bench_report::hardware::BenchmarkHardware;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use bench_report::options::BenchmarkDurability;
 use bench_report::params::BenchmarkDataVolume;
@@ -48,6 +49,16 @@ const EC2_LABEL_PREFIX: &str = "aws_";
 const EC2_LABEL_SEPARATOR: char = '_';
 const EC2_NAME_PREFIX: &str = "AWS";
 const EC2_TYPE_SEPARATOR: char = '.';
+/// The bench writes this CPU name when it can't read the CPU.
+const UNKNOWN_CPU: &str = "unknown";
+/// A brand string ends with the base clock, for example `@ 2.90GHz`.
+const CPU_CLOCK_MARK: char = '@';
+const CPU_TRADEMARKS: [&str; 3] = ["(R)", "(TM)", "(tm)"];
+const CPU_FILLER_WORDS: [&str; 2] = ["CPU", "Processor"];
+/// AMD names the core count, for example `16-Core`, which the logical CPUs already tell.
+const CPU_CORE_COUNT_SUFFIX: &str = "-Core";
+/// The report counts memory in MiB, despite the `_mb` in its field name.
+const MEBIBYTES_PER_GIBIBYTE: f64 = 1024.0;
 
 /// A day the way the pages write it, plus the exact time for a `<time>` element.
 #[derive(Debug, PartialEq, Eq)]
@@ -162,6 +173,61 @@ impl fmt::Display for MachineName<'_> {
     }
 }
 
+/// The CPU of the machine that ran the bench, without trademark marks, filler words, the core
+/// count and the base clock: `Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz` reads
+/// `Intel Xeon Platinum 8375C`. Search and tooltips keep the brand string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuName<'a>(&'a str);
+
+impl<'a> CpuName<'a> {
+    /// `None` when the bench couldn't read the CPU, or the report has no CPU name.
+    pub fn of(hardware: &'a BenchmarkHardware) -> Option<Self> {
+        let brand = hardware.cpu_name.trim();
+        (!brand.is_empty() && brand != UNKNOWN_CPU).then_some(Self(brand))
+    }
+
+    /// The brand string as the report writes it, without surrounding spaces.
+    pub const fn brand(self) -> &'a str {
+        self.0
+    }
+}
+
+impl fmt::Display for CpuName<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let words: Vec<_> = self
+            .0
+            .split_whitespace()
+            .take_while(|word| !word.starts_with(CPU_CLOCK_MARK))
+            .map(|word| {
+                CPU_TRADEMARKS
+                    .iter()
+                    .fold(word.to_owned(), |word, mark| word.replace(mark, ""))
+            })
+            .filter(|word| {
+                !word.is_empty()
+                    && !CPU_FILLER_WORDS.contains(&word.as_str())
+                    && !word.ends_with(CPU_CORE_COUNT_SUFFIX)
+            })
+            .collect();
+        formatter.write_str(&words.join(" "))
+    }
+}
+
+/// For example `12 logical CPUs`. `None` when an older report leaves the count at 0.
+pub fn logical_cpus_text(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 logical CPU".to_owned()),
+        _ => Some(format!("{count} logical CPUs")),
+    }
+}
+
+/// For example `62.7 GiB`. `None` when an older report leaves the memory at 0.
+pub fn memory_text(total_memory_mb: u64) -> Option<String> {
+    (total_memory_mb > 0)
+        .then(|| format!("{:.1} GiB", total_memory_mb as f64 / MEBIBYTES_PER_GIBIBYTE))
+}
+
 pub fn nodes_text(nodes: usize) -> String {
     match nodes {
         1 => "1 node".to_owned(),
@@ -271,5 +337,55 @@ mod tests {
         ] {
             assert_eq!(MachineName(label).to_string(), label);
         }
+    }
+
+    fn cpu(brand: &str) -> BenchmarkHardware {
+        BenchmarkHardware {
+            cpu_name: brand.to_owned(),
+            ..BenchmarkHardware::default()
+        }
+    }
+
+    #[test]
+    fn given_cpu_brand_strings_when_shown_should_drop_marks_filler_core_count_and_clock() {
+        for (brand, name) in [
+            (
+                "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+                "Intel Xeon Platinum 8375C",
+            ),
+            (
+                "11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz",
+                "11th Gen Intel Core i5-1145G7",
+            ),
+            ("AMD Ryzen 5 3600 6-Core Processor", "AMD Ryzen 5 3600"),
+            (
+                "AMD Ryzen 9 9950X3D 16-Core Processor",
+                "AMD Ryzen 9 9950X3D",
+            ),
+            ("AMD EPYC 7R13 Processor", "AMD EPYC 7R13"),
+            ("Apple M4 Max", "Apple M4 Max"),
+            ("  Intel(R)  Xeon(R) CPU @2.50GHz ", "Intel Xeon"),
+        ] {
+            let hardware = cpu(brand);
+            let shown = CpuName::of(&hardware).map(|name| name.to_string());
+            assert_eq!(shown.as_deref(), Some(name), "{brand}");
+        }
+    }
+
+    #[test]
+    fn given_unknown_or_missing_cpu_when_read_should_have_no_name() {
+        for brand in ["", "   ", UNKNOWN_CPU] {
+            assert_eq!(CpuName::of(&cpu(brand)), None, "{brand:?}");
+        }
+    }
+
+    #[test]
+    fn given_host_counts_when_shown_should_write_logical_cpus_and_gibibytes() {
+        assert_eq!(logical_cpus_text(0), None);
+        assert_eq!(logical_cpus_text(1).as_deref(), Some("1 logical CPU"));
+        assert_eq!(logical_cpus_text(12).as_deref(), Some("12 logical CPUs"));
+        assert_eq!(memory_text(0), None);
+        assert_eq!(memory_text(64218).as_deref(), Some("62.7 GiB"));
+        assert_eq!(memory_text(1024).as_deref(), Some("1.0 GiB"));
     }
 }

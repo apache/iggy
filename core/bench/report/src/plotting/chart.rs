@@ -40,6 +40,9 @@ const GRID_LEFT: i32 = 70;
 const CARD_GRID_TOP: i32 = 40;
 const CARD_GRID_RIGHT: i32 = 24;
 const CARD_GRID_BOTTOM: i32 = 32;
+/// Room under the grid of a zoomable card chart for the x axis labels and the slider below them.
+const ZOOM_CARD_GRID_BOTTOM: i32 = 76;
+const ZOOM_SLIDER_BOTTOM: i32 = 8;
 const TRANSPARENT: &str = "transparent";
 
 impl IggyChart {
@@ -120,6 +123,25 @@ impl IggyChart {
     /// grid and margins in pixels, so a short chart keeps its axis labels clear. The card draws the
     /// background.
     pub fn card() -> Self {
+        Self::card_with_grid_bottom(CARD_GRID_BOTTOM)
+    }
+
+    /// A card chart with a zoom slider under the x axis, so a reader can narrow a long run down to
+    /// one peak. The slider takes no mouse wheel events, so the page still scrolls over the chart.
+    pub fn zoomable_card() -> Self {
+        let chart = Self::card_with_grid_bottom(ZOOM_CARD_GRID_BOTTOM)
+            .inner
+            .data_zoom(
+                DataZoom::new()
+                    .type_(DataZoomType::Slider)
+                    .bottom(ZOOM_SLIDER_BOTTOM)
+                    .start(0)
+                    .end(100),
+            );
+        Self { inner: chart }
+    }
+
+    fn card_with_grid_bottom(grid_bottom: i32) -> Self {
         let chart = Chart::new()
             .background_color(TRANSPARENT)
             .tooltip(Tooltip::new().trigger(Trigger::Axis))
@@ -135,7 +157,7 @@ impl IggyChart {
                     .left(GRID_LEFT)
                     .right(CARD_GRID_RIGHT)
                     .top(CARD_GRID_TOP)
-                    .bottom(CARD_GRID_BOTTOM),
+                    .bottom(grid_bottom),
             );
         Self { inner: chart }
     }

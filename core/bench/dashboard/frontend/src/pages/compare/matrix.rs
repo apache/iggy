@@ -45,23 +45,33 @@ const LATENCY_METRICS: [Metric; 5] = [
 type GroupValue = fn(&BenchmarkGroupMetricsSummary) -> f64;
 
 /// The rows that the report has and the summary doesn't. The delta rule doesn't compare them across
-/// runs, so they only show values.
+/// runs, so they only show values. P99.99 comes first, right under the percentiles of the summary.
 const REPORT_ROWS: [(&str, GroupValue); 4] = [
-    (MIN_LABEL, |group| group.min_latency_ms),
-    (MAX_LABEL, |group| group.max_latency_ms),
-    (AVERAGE_LABEL, |group| group.average_latency_ms),
     (P9999_LABEL, |group| group.average_p9999_latency_ms),
+    (MIN_LABEL, |group| group.min_latency_ms),
+    (AVERAGE_LABEL, |group| group.average_latency_ms),
+    (MAX_LABEL, |group| group.max_latency_ms),
 ];
 /// The rows whose changes the page summary repeats, in the summary's order.
 const SUMMARY_METRICS: [Metric; 2] = [Metric::Throughput, Metric::P99];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatrixRow {
+    pub kind: RowKind,
     pub label: &'static str,
     /// What the row measures, in the Methodology page's words.
     pub hint: Option<&'static str>,
     /// One per run, the baseline first.
     pub cells: Vec<Cell>,
+}
+
+/// The page shows the latency rows in a table under the latency chart, and the throughput and the
+/// message rate in a card next to the throughput chart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    Throughput,
+    MessageRate,
+    Latency,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +98,7 @@ pub struct CellChange {
 /// latency row with no value in any run is left out.
 pub fn change_rows(runs: &[&BenchmarkSummary], thresholds: &Thresholds) -> Vec<MatrixRow> {
     let throughput = MatrixRow {
+        kind: RowKind::Throughput,
         label: metric_name(Metric::Throughput),
         hint: Some(metric_hint(Metric::Throughput)),
         cells: cells(runs, |run, baseline| {
@@ -95,6 +106,7 @@ pub fn change_rows(runs: &[&BenchmarkSummary], thresholds: &Thresholds) -> Vec<M
         }),
     };
     let messages = MatrixRow {
+        kind: RowKind::MessageRate,
         label: MESSAGES_LABEL,
         hint: Some(MESSAGES_HINT),
         cells: cells(runs, |run, baseline| {
@@ -102,6 +114,7 @@ pub fn change_rows(runs: &[&BenchmarkSummary], thresholds: &Thresholds) -> Vec<M
         }),
     };
     let latency = LATENCY_METRICS.iter().map(|&metric| MatrixRow {
+        kind: RowKind::Latency,
         label: metric_name(metric),
         hint: Some(metric_hint(metric)),
         cells: cells(runs, |run, baseline| {
@@ -114,12 +127,13 @@ pub fn change_rows(runs: &[&BenchmarkSummary], thresholds: &Thresholds) -> Vec<M
         .collect()
 }
 
-/// Min, max, average and P99.99 of the main group, from each run's report. Old reports lack min and
+/// P99.99, min, average and max of the main group, from each run's report. Old reports lack min and
 /// max, and a row with no value in any run is left out.
 pub fn report_rows(runs: &[&BenchmarkSummary], reports: &[BenchmarkReportLight]) -> Vec<MatrixRow> {
     REPORT_ROWS
         .into_iter()
         .map(|(label, value_of)| MatrixRow {
+            kind: RowKind::Latency,
             label,
             hint: None,
             cells: runs
@@ -478,8 +492,8 @@ mod tests {
         let rows = report_rows(&[&base, &other], &reports);
 
         let labels: Vec<_> = rows.iter().map(|row| row.label).collect();
-        assert_eq!(labels, [AVERAGE_LABEL, P9999_LABEL]);
-        let averages: Vec<_> = rows[0]
+        assert_eq!(labels, [P9999_LABEL, AVERAGE_LABEL]);
+        let averages: Vec<_> = rows[1]
             .cells
             .iter()
             .map(|cell| cell.value.clone())
@@ -489,6 +503,26 @@ mod tests {
             rows.iter()
                 .flat_map(|row| &row.cells)
                 .all(|cell| cell.change.is_none())
+        );
+        assert!(rows.iter().all(|row| row.kind == RowKind::Latency));
+    }
+
+    #[test]
+    fn given_rate_limited_runs_when_matrixed_should_mark_each_row_with_its_kind() {
+        let rows = rows(&[&baseline(), &faster(limited(2, CANDIDATE))]);
+
+        let kinds: Vec<_> = rows.iter().map(|row| (row.label, row.kind)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("Throughput", RowKind::Throughput),
+                (MESSAGES_LABEL, RowKind::MessageRate),
+                ("P50", RowKind::Latency),
+                ("P90", RowKind::Latency),
+                ("P95", RowKind::Latency),
+                ("P99", RowKind::Latency),
+                ("P99.9", RowKind::Latency),
+            ]
         );
     }
 

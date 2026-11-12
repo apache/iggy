@@ -99,7 +99,8 @@ RUN chmod +x /app/docker-entrypoint.sh && \
 # Set default environment variables for configuration
 ENV HOST=0.0.0.0 \
     PORT=80 \
-    RESULTS_DIR=/data/performance_results
+    RESULTS_DIR=/data/performance_results \
+    CONFIG=/app/dashboard.toml
 
 # Set volume for results with proper permissions
 VOLUME ["/data/performance_results"]

@@ -26,15 +26,16 @@ use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::identity::{KindFamily, VersionOrder};
 use bench_dashboard_shared::metrics::{Badge, GroupMetrics};
 use bench_dashboard_shared::summary::BenchmarkSummary;
+use bench_report::hardware::BenchmarkHardware;
 use bench_report::options::BenchmarkDurability;
 use uuid::Uuid;
 
 use super::query::{ExploreQuery, Facet, Sort};
 use crate::api::api_name;
 use crate::components::run_labels::{
-    CONDITION_SEPARATOR, DayLabel, MachineName, batch_size_text, data_volume_text, durability_text,
-    message_size_text, messages_text, milliseconds, nodes_text, numeric_text, rate_limit_text,
-    topic_durability, version_tag,
+    CONDITION_SEPARATOR, CpuName, DayLabel, MachineName, batch_size_text, data_volume_text,
+    durability_text, logical_cpus_text, memory_text, message_size_text, messages_text,
+    milliseconds, nodes_text, numeric_text, rate_limit_text, topic_durability, version_tag,
 };
 use crate::format::format_throughput_mb_s;
 
@@ -62,6 +63,11 @@ pub struct RunRow {
     pub conditions: String,
     /// For example `AWS i4i.4xlarge`.
     pub machine: String,
+    /// `None` when the report doesn't name the CPU.
+    pub cpu: Option<RowCpu>,
+    /// The logical CPUs and memory of the machine that ran the bench, for example
+    /// `12 logical CPUs · 62.7 GiB`. `None` when an older report has neither.
+    pub specs: Option<String>,
     /// For example `3 nodes`.
     pub topology: String,
     /// The version without the commit, which `commit` holds.
@@ -75,7 +81,7 @@ pub struct RunRow {
     version: String,
     version_order: VersionOrder,
     official: bool,
-    /// The title, version, commit, suite and workload labels in lowercase.
+    /// The title, version, commit, suite and workload labels and the CPU, in lowercase.
     search_text: String,
     /// Where each facet's value sits in that facet's options. `None` where the facet doesn't apply.
     /// Indexed by facet.
@@ -83,6 +89,15 @@ pub struct RunRow {
     throughput_mb_s: Option<f64>,
     /// `None` without a rate limit, so those runs sort last by P99.
     p99_ms: Option<f64>,
+}
+
+/// The CPU of the machine that ran the bench.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RowCpu {
+    /// For example `AMD Ryzen 5 3600`.
+    pub name: String,
+    /// As the report writes it, for example `AMD Ryzen 5 3600 6-Core Processor`.
+    pub brand: Rc<str>,
 }
 
 /// A run's main group numbers.
@@ -230,6 +245,11 @@ impl RunRow {
             title: summary.title.clone(),
             conditions: conditions(summary),
             machine: MachineName(&summary.machine).to_string(),
+            cpu: CpuName::of(&summary.hardware).map(|cpu| RowCpu {
+                name: cpu.to_string(),
+                brand: Rc::from(cpu.brand()),
+            }),
+            specs: specs_text(&summary.hardware),
             topology: nodes_text(summary.nodes),
             version_tag: version_tag(summary),
             commit: summary.commit.clone(),
@@ -446,6 +466,17 @@ fn conditions(summary: &BenchmarkSummary) -> String {
     parts.join(CONDITION_SEPARATOR)
 }
 
+fn specs_text(hardware: &BenchmarkHardware) -> Option<String> {
+    let specs: Vec<_> = [
+        logical_cpus_text(hardware.cpu_cores),
+        memory_text(hardware.total_memory_mb),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!specs.is_empty()).then(|| specs.join(CONDITION_SEPARATOR))
+}
+
 fn search_text(summary: &BenchmarkSummary) -> String {
     [
         Some(summary.title.as_str()),
@@ -453,6 +484,7 @@ fn search_text(summary: &BenchmarkSummary) -> String {
         summary.commit.as_deref(),
         summary.suite.as_deref(),
         summary.workload_key.workload.as_deref(),
+        Some(summary.hardware.cpu_name.as_str()),
     ]
     .into_iter()
     .flatten()
@@ -767,15 +799,47 @@ mod tests {
         runs[0].suite = Some("nightly-i3en".to_owned());
         runs[1].workload_key.workload = Some("consumer-20c-cold@800MB".to_owned());
         runs[2].commit = Some("71f29618b".to_owned());
+        runs[3].hardware.cpu_name = "AMD Ryzen 5 3600 6-Core Processor".to_owned();
         let search = |text: &str| ids(&view(&runs, &link(&[("q", text)])));
 
         assert_eq!(search("NIGHTLY-I3EN"), [id(1)]);
         assert_eq!(search("cold@800"), [id(2)]);
         assert_eq!(search("71f2"), [id(3)]);
+        assert_eq!(search("ryzen 3600"), [id(4)]);
         assert_eq!(search("rc.1"), [id(2)]);
         assert_eq!(search("  pinned   0.9.0 "), [id(4), id(3), id(1)]);
         assert_eq!(search("pinned consumer 0.9.0"), [id(4)]);
         assert_eq!(search("pinned nowhere"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn given_bench_host_when_shown_as_row_should_name_cpu_and_list_its_counts() {
+        let mut summary = run(1, producer(), "mxpc", RELEASE);
+        summary.hardware.cpu_name = "AMD Ryzen 5 3600 6-Core Processor".to_owned();
+        summary.hardware.cpu_cores = 12;
+        summary.hardware.total_memory_mb = 64218;
+
+        let shown = row(&summary);
+
+        assert_eq!(shown.machine, "mxpc");
+        assert_eq!(
+            shown.cpu,
+            Some(RowCpu {
+                name: "AMD Ryzen 5 3600".to_owned(),
+                brand: Rc::from("AMD Ryzen 5 3600 6-Core Processor"),
+            })
+        );
+        assert_eq!(shown.specs.as_deref(), Some("12 logical CPUs · 62.7 GiB"));
+        assert_eq!(shown.topology, "1 node");
+    }
+
+    #[test]
+    fn given_report_without_hardware_when_shown_as_row_should_show_topology_only() {
+        let shown = row(&run(1, producer(), "atlas", RELEASE));
+
+        assert_eq!(shown.cpu, None);
+        assert_eq!(shown.specs, None);
+        assert_eq!(shown.topology, "1 node");
     }
 
     #[test]

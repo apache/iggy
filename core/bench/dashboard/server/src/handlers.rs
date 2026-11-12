@@ -17,7 +17,7 @@
 
 use crate::artifacts;
 use crate::cache::{SeriesBuilder, SeriesKey};
-use crate::render::PngRenderPool;
+use crate::render::{ChartType, EmbedChart, PngRenderPool};
 use crate::{cache::BenchmarkCache, error::IggyBenchDashboardServerError};
 use actix_files::NamedFile;
 use actix_web::http::header::{ContentDisposition, ContentType, DispositionParam, DispositionType};
@@ -25,9 +25,11 @@ use actix_web::{HttpRequest, HttpResponse, get, web};
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use tempfile::NamedTempFile;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -311,6 +313,8 @@ fn default_theme() -> String {
 
 const DEFAULT_PNG_WIDTH: u32 = 1600;
 const DEFAULT_PNG_HEIGHT: u32 = 1200;
+/// Bounds the pixel buffer of one render at 64 MiB.
+const MAX_PNG_SIDE: u32 = 4096;
 
 fn default_png_width() -> u32 {
     DEFAULT_PNG_WIDTH
@@ -347,7 +351,26 @@ pub struct PngQuery {
     pub legend: bool,
 }
 
-fn png_cache_path(cache_dir: &std::path::Path, uuid: &Uuid, query: &PngQuery) -> PathBuf {
+impl PngQuery {
+    fn check_size(&self) -> Result<()> {
+        let sides = 1..=MAX_PNG_SIDE;
+        if sides.contains(&self.width) && sides.contains(&self.height) {
+            return Ok(());
+        }
+        Err(IggyBenchDashboardServerError::BadRequest(format!(
+            "Invalid size '{}x{}': width and height must be between 1 and {MAX_PNG_SIDE}",
+            self.width, self.height
+        )))
+    }
+
+    /// Only the default size goes to the disk cache, so the sizes that clients pick can't fill
+    /// the disk.
+    fn is_cached_size(&self) -> bool {
+        self.width == DEFAULT_PNG_WIDTH && self.height == DEFAULT_PNG_HEIGHT
+    }
+}
+
+fn png_cache_path(cache_dir: &Path, uuid: &Uuid, query: &PngQuery) -> PathBuf {
     let legend_suffix = if query.legend { "" } else { "_nolegend" };
     let filename = format!(
         "{uuid}_{chart_type}_{w}x{h}_{theme}{legend_suffix}.png",
@@ -377,12 +400,7 @@ pub async fn embed_chart_png(
         IggyBenchDashboardServerError::InvalidUuid(format!("Invalid UUID format: '{uuid_str}'"))
     })?;
 
-    let chart_type = &query.chart_type;
-    if chart_type != "latency" && chart_type != "throughput" && chart_type != "distribution" {
-        return Err(IggyBenchDashboardServerError::BadRequest(format!(
-            "Invalid chart type: '{chart_type}'. Must be 'latency', 'throughput', or 'distribution'"
-        )));
-    }
+    let chart_type: ChartType = query.chart_type.parse()?;
 
     let theme = &query.theme;
     let is_dark = theme == "dark" || theme == "dark_nobg";
@@ -396,13 +414,18 @@ pub async fn embed_chart_png(
             "Invalid theme: '{theme}'. Must be 'dark', 'light', 'dark_nobg', or 'light_nobg'"
         )));
     }
+    query.check_size()?;
 
     let embed_dir = data.cache_dir.join(EMBED_CACHE_DIR);
-    let cached_path = png_cache_path(&embed_dir, &uuid, &query);
+    let cached_path = query
+        .is_cached_size()
+        .then(|| png_cache_path(&embed_dir, &uuid, &query));
 
-    if cached_path.exists() {
+    if let Some(cached_path) = &cached_path
+        && cached_path.exists()
+    {
         info!("{}: Serving cached PNG for '{}'", client_addr, uuid_str);
-        let bytes = std::fs::read(&cached_path).map_err(|e| {
+        let bytes = std::fs::read(cached_path).map_err(|e| {
             IggyBenchDashboardServerError::InternalError(format!("Failed to read cached PNG: {e}"))
         })?;
         return Ok(HttpResponse::Ok().content_type("image/png").body(bytes));
@@ -411,40 +434,13 @@ pub async fn embed_chart_png(
     let json_path = data.cache.get_benchmark_json_path(&uuid).ok_or_else(|| {
         IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"))
     })?;
-
-    let json_content = std::fs::read_to_string(&json_path).map_err(|e| {
-        IggyBenchDashboardServerError::InternalError(format!(
-            "Failed to read report file '{}': {}",
-            json_path.display(),
-            e
-        ))
-    })?;
-
-    let report: bench_report::report::BenchmarkReport = serde_json::from_str(&json_content)
-        .map_err(|e| {
-            IggyBenchDashboardServerError::InternalError(format!(
-                "Failed to deserialize report: {e}"
-            ))
-        })?;
-
-    let hardware_line = format!(
-        "{} @ {} (server {})",
-        report
-            .hardware
-            .identifier
-            .as_deref()
-            .unwrap_or("identifier"),
-        report.hardware.cpu_name,
-        report.params.gitref.as_deref().unwrap_or("version")
-    );
-
-    let chart = if chart_type == "latency" {
-        bench_report::create_latency_chart(&report, is_dark, false)
-    } else if chart_type == "throughput" {
-        bench_report::create_throughput_chart(&report, is_dark, false)
-    } else {
-        bench_report::create_latency_distribution_chart(&report, is_dark, false)
-    };
+    let EmbedChart {
+        chart,
+        hardware_line,
+    } = data
+        .render_pool
+        .load_chart(json_path, chart_type, is_dark)
+        .await?;
 
     // Strip interactive-only components and adapt layout for static PNG
     let mut chart_value = serde_json::to_value(&chart).map_err(|e| {
@@ -542,27 +538,41 @@ pub async fn embed_chart_png(
         ))
     })?;
 
-    let png_bytes = data
-        .render_pool
-        .render_png(chart, query.width, query.height, is_dark)
-        .await
-        .map_err(IggyBenchDashboardServerError::InternalError)?;
+    let png_bytes = web::Bytes::from(
+        data.render_pool
+            .render_png(chart, query.width, query.height, is_dark)
+            .await
+            .map_err(IggyBenchDashboardServerError::InternalError)?,
+    );
 
-    std::fs::create_dir_all(&embed_dir).map_err(|e| {
-        IggyBenchDashboardServerError::InternalError(format!(
-            "Failed to create embed cache directory: {e}"
-        ))
-    })?;
-    if let Err(e) = std::fs::write(&cached_path, &png_bytes) {
-        warn!("Failed to cache PNG to {}: {}", cached_path.display(), e);
+    if let Some(cached_path) = cached_path {
+        let png = png_bytes.clone();
+        let target = cached_path.clone();
+        let stored = web::block(move || store_png(&embed_dir, &target, &png))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)));
+        if let Err(e) = stored {
+            warn!("Failed to cache PNG to {}: {}", cached_path.display(), e);
+        }
     }
 
     info!(
-        "{}: Generated and cached PNG for '{}' ({}x{})",
+        "{}: Generated PNG for '{}' ({}x{})",
         client_addr, uuid_str, query.width, query.height
     );
 
     Ok(HttpResponse::Ok().content_type("image/png").body(png_bytes))
+}
+
+/// Writes through a temp file renamed into place, so a parallel reader or a failed write never
+/// leaves a partial PNG at `cached_path` for later requests.
+fn store_png(embed_dir: &Path, cached_path: &Path, png: &[u8]) -> io::Result<()> {
+    std::fs::create_dir_all(embed_dir)?;
+    let mut temp_file = NamedTempFile::new_in(embed_dir)?;
+    temp_file.write_all(png)?;
+    temp_file.as_file().sync_all()?;
+    temp_file.persist(cached_path)?;
+    Ok(())
 }
 
 #[get("/embed/{uuid}")]
@@ -583,50 +593,18 @@ pub async fn embed_chart(
     })?;
 
     let is_dark = query.theme != "light";
-    let chart_type = &query.chart_type;
-    if chart_type != "latency" && chart_type != "throughput" && chart_type != "distribution" {
-        return Err(IggyBenchDashboardServerError::BadRequest(format!(
-            "Invalid chart type: '{chart_type}'. Must be 'latency', 'throughput', or 'distribution'"
-        )));
-    }
+    let chart_type: ChartType = query.chart_type.parse()?;
 
     let json_path = data.cache.get_benchmark_json_path(&uuid).ok_or_else(|| {
         IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"))
     })?;
-
-    let json_content = std::fs::read_to_string(&json_path).map_err(|e| {
-        IggyBenchDashboardServerError::InternalError(format!(
-            "Failed to read report file '{}': {}",
-            json_path.display(),
-            e
-        ))
-    })?;
-
-    let report: bench_report::report::BenchmarkReport = serde_json::from_str(&json_content)
-        .map_err(|e| {
-            IggyBenchDashboardServerError::InternalError(format!(
-                "Failed to deserialize report: {e}"
-            ))
-        })?;
-
-    let hardware_line = format!(
-        "{} @ {} (server {})",
-        report
-            .hardware
-            .identifier
-            .as_deref()
-            .unwrap_or("identifier"),
-        report.hardware.cpu_name,
-        report.params.gitref.as_deref().unwrap_or("version")
-    );
-
-    let chart = if chart_type == "latency" {
-        bench_report::create_latency_chart(&report, is_dark, false)
-    } else if chart_type == "throughput" {
-        bench_report::create_throughput_chart(&report, is_dark, false)
-    } else {
-        bench_report::create_latency_distribution_chart(&report, is_dark, false)
-    };
+    let EmbedChart {
+        chart,
+        hardware_line,
+    } = data
+        .render_pool
+        .load_chart(json_path, chart_type, is_dark)
+        .await?;
 
     let chart_json = serde_json::to_string(&chart).map_err(|e| {
         IggyBenchDashboardServerError::InternalError(format!(
@@ -781,6 +759,9 @@ mod tests {
     /// 8 producers, 8 consumers, and the groups of producers, consumers, and both.
     const PRODUCER_AND_CONSUMER_DIR: &str = "old-0.4.202-pinned-producer-and-consumer";
     const PRODUCER_AND_CONSUMER_RUN: &str = "6b1e288a-9155-4da3-8d3f-ec4d929de3d3";
+    const TWO_PRODUCERS_DIR: &str = "phase1a-pinned-producer-2p-20MB";
+    const TWO_PRODUCERS_RUN: &str = "b5c560ad-1ad2-49f0-88dd-c29db75126aa";
+    const RESULTS_DIR: &str = "results";
     /// The fixture reports keep 3 points of every series.
     const FIXTURE_SERIES_POINTS: usize = 3;
     const LATENCY_OF_GROUPS: &str = "metric=latency&scope=group";
@@ -919,6 +900,22 @@ mod tests {
 
     fn series_uri(uuid: &str, query: &str) -> String {
         format!("/api/benchmark/series/{uuid}?{query}")
+    }
+
+    fn light_uri(uuid: &str) -> String {
+        format!("/api/benchmark/light/{uuid}")
+    }
+
+    fn copy_fixture_run(run_dir: &str, results_dir: &Path) {
+        let target = results_dir.join(run_dir);
+        std::fs::create_dir(&target).expect("the run directory is created");
+        std::fs::copy(
+            Path::new(FIXTURE_RESULTS_DIR)
+                .join(run_dir)
+                .join(REPORT_FILE),
+            target.join(REPORT_FILE),
+        )
+        .expect("the fixture report is copied");
     }
 
     fn producer_and_consumer_key(metric: SeriesMetric, scope: SeriesScope) -> SeriesKey {
@@ -1074,8 +1071,6 @@ mod tests {
         assert!(response.status().is_success(), "{}", response.status());
         assert!(state.cache.series().get(&key).is_some());
 
-        // The two steps of `BenchmarkCache::schedule_reload`.
-        state.cache.clear();
         state
             .cache
             .load()
@@ -1085,18 +1080,110 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn given_series_build_started_before_reload_when_it_finishes_should_stay_out_of_cache() {
+        let state = app_state();
+        let key = producer_and_consumer_key(SeriesMetric::Latency, SeriesScope::Group);
+        let generation = state.cache.series().generation();
+
+        state
+            .cache
+            .load()
+            .expect("the fixture directory is readable");
+        state
+            .cache
+            .series()
+            .insert(key, web::Bytes::from_static(b"{}"), generation);
+
+        assert!(state.cache.series().get(&key).is_none());
+    }
+
+    #[actix_web::test]
+    async fn given_loaded_runs_when_reload_fails_should_keep_serving_them() {
+        let root = tempfile::tempdir().expect("a temporary directory is created");
+        let results_dir = root.path().join(RESULTS_DIR);
+        std::fs::create_dir(&results_dir).expect("the results directory is created");
+        copy_fixture_run(PRODUCER_AND_CONSUMER_DIR, &results_dir);
+        let state = web::Data::new(app_state_with_results(&results_dir));
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(list_benchmark_summaries)
+                .service(get_benchmark_report_light),
+        )
+        .await;
+        std::fs::remove_dir_all(&results_dir).expect("the results directory is removed");
+
+        assert!(state.cache.load().is_err());
+
+        let summaries: Vec<BenchmarkSummary> = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/api/benchmarks").to_request(),
+        )
+        .await;
+        let runs: Vec<_> = summaries
+            .iter()
+            .map(|summary| summary.uuid.to_string())
+            .collect();
+        assert_eq!(runs, [PRODUCER_AND_CONSUMER_RUN]);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&light_uri(PRODUCER_AND_CONSUMER_RUN))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+    }
+
+    #[actix_web::test]
+    async fn given_run_removed_when_reloading_should_drop_it_from_list_and_lookups() {
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        copy_fixture_run(PRODUCER_AND_CONSUMER_DIR, results_dir.path());
+        copy_fixture_run(TWO_PRODUCERS_DIR, results_dir.path());
+        let state = web::Data::new(app_state_with_results(results_dir.path()));
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .service(list_benchmark_summaries)
+                .service(get_benchmark_report_light),
+        )
+        .await;
+        std::fs::remove_dir_all(results_dir.path().join(PRODUCER_AND_CONSUMER_DIR))
+            .expect("the run directory is removed");
+
+        state
+            .cache
+            .load()
+            .expect("the results directory is readable");
+
+        let summaries: Vec<BenchmarkSummary> = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/api/benchmarks").to_request(),
+        )
+        .await;
+        let runs: Vec<_> = summaries
+            .iter()
+            .map(|summary| summary.uuid.to_string())
+            .collect();
+        assert_eq!(runs, [TWO_PRODUCERS_RUN]);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&light_uri(PRODUCER_AND_CONSUMER_RUN))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
     async fn given_report_broken_after_load_when_requesting_series_should_answer_internal_error() {
         let results_dir = tempfile::tempdir().expect("a temporary directory is created");
-        let run_dir = results_dir.path().join(PRODUCER_AND_CONSUMER_DIR);
-        std::fs::create_dir(&run_dir).expect("the run directory is created");
-        let report = run_dir.join(REPORT_FILE);
-        std::fs::copy(
-            Path::new(FIXTURE_RESULTS_DIR)
-                .join(PRODUCER_AND_CONSUMER_DIR)
-                .join(REPORT_FILE),
-            &report,
-        )
-        .expect("the fixture report is copied");
+        copy_fixture_run(PRODUCER_AND_CONSUMER_DIR, results_dir.path());
+        let report = results_dir
+            .path()
+            .join(PRODUCER_AND_CONSUMER_DIR)
+            .join(REPORT_FILE);
         let state = app_state_with_results(results_dir.path());
         std::fs::write(&report, "{").expect("the report is overwritten");
         let app = test::init_service(
@@ -1122,5 +1209,292 @@ mod tests {
                 .is_some_and(|error| error.contains("Failed to parse report file")),
             "{body}"
         );
+    }
+
+    const CACHED_PNG: &[u8] = b"cached png";
+    const PNG_CONTENT_TYPE: &str = "image/png";
+    const HTML_CONTENT_TYPE: &str = "text/html";
+
+    fn app_state_with_cache_dir(state: AppState, cache_dir: &Path) -> AppState {
+        AppState {
+            cache_dir: cache_dir.to_path_buf(),
+            ..state
+        }
+    }
+
+    fn embed_uri(uuid: &str, query: &str) -> String {
+        format!("/embed/{uuid}?{query}")
+    }
+
+    fn png_uri(uuid: &str, query: &str) -> String {
+        format!("/embed/{uuid}/chart.png?{query}")
+    }
+
+    fn png_query(query: &str) -> PngQuery {
+        web::Query::<PngQuery>::from_query(query)
+            .expect("the PNG query parses")
+            .into_inner()
+    }
+
+    fn content_type(response: &actix_web::dev::ServiceResponse) -> Option<&str> {
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[actix_web::test]
+    async fn given_fixture_run_when_requesting_embed_page_should_return_chart_with_hardware_line() {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state()))
+                .service(embed_chart),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&embed_uri(
+                    PRODUCER_AND_CONSUMER_RUN,
+                    "type=throughput&theme=light",
+                ))
+                .to_request(),
+        )
+        .await;
+
+        assert!(response.status().is_success(), "{}", response.status());
+        assert_eq!(content_type(&response), Some(HTML_CONTENT_TYPE));
+        let body = test::read_body(response).await;
+        let page = std::str::from_utf8(&body).expect("the page is UTF-8");
+        assert!(page.contains("var option = {"), "{page}");
+        assert!(
+            page.contains(
+                "var hardwareLine = 'atlas @ AMD Ryzen 9 5950X 16-Core Processor (server server-0.4.202)';"
+            ),
+            "{page}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn given_unknown_chart_type_when_requesting_embed_should_answer_bad_request() {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state_with_cache_dir(
+                    app_state(),
+                    cache_dir.path(),
+                )))
+                .service(embed_chart_png)
+                .service(embed_chart),
+        )
+        .await;
+
+        for uri in [
+            embed_uri(PRODUCER_AND_CONSUMER_RUN, "type=p99"),
+            png_uri(PRODUCER_AND_CONSUMER_RUN, "type=p99"),
+        ] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Invalid chart type")),
+                "{uri}: {body}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_png_size_out_of_range_when_requesting_png_should_answer_bad_request_without_caching()
+     {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state_with_cache_dir(
+                    app_state(),
+                    cache_dir.path(),
+                )))
+                .service(embed_chart_png),
+        )
+        .await;
+
+        for query in [
+            "width=0",
+            "height=0",
+            "width=4097",
+            "height=4097",
+            "width=4294967295&height=4294967295",
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&png_uri(PRODUCER_AND_CONSUMER_RUN, query))
+                    .to_request(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Invalid size")),
+                "{query}: {body}"
+            );
+        }
+        assert!(!cache_dir.path().join(EMBED_CACHE_DIR).exists());
+    }
+
+    #[actix_web::test]
+    async fn given_png_size_at_bounds_when_checking_should_accept_it() {
+        for query in [
+            "width=1&height=1",
+            "width=4096&height=4096",
+            "width=1&height=4096",
+        ] {
+            assert!(png_query(query).check_size().is_ok(), "{query}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_cached_png_when_requesting_png_should_serve_it_only_at_default_size() {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
+        std::fs::create_dir(&embed_dir).expect("the embed directory is created");
+        // An unknown run, so a request that skips the cache answers 404 before any render.
+        let uuid = Uuid::nil();
+        let default_size = "type=latency";
+        let other_size = "type=latency&width=800&height=600";
+        for query in [default_size, other_size] {
+            std::fs::write(
+                png_cache_path(&embed_dir, &uuid, &png_query(query)),
+                CACHED_PNG,
+            )
+            .expect("the cached PNG is written");
+        }
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state_with_cache_dir(
+                    app_state(),
+                    cache_dir.path(),
+                )))
+                .service(embed_chart_png),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&png_uri(&uuid.to_string(), default_size))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+        assert_eq!(content_type(&response), Some(PNG_CONTENT_TYPE));
+        assert_eq!(test::read_body(response).await, CACHED_PNG);
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&png_uri(&uuid.to_string(), other_size))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn given_unknown_run_when_requesting_embed_should_answer_not_found() {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(app_state_with_cache_dir(
+                    app_state(),
+                    cache_dir.path(),
+                )))
+                .service(embed_chart_png)
+                .service(embed_chart),
+        )
+        .await;
+        let uuid = Uuid::nil().to_string();
+
+        for uri in [embed_uri(&uuid, ""), png_uri(&uuid, "")] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_report_broken_after_load_when_requesting_embed_should_answer_internal_error() {
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        copy_fixture_run(PRODUCER_AND_CONSUMER_DIR, results_dir.path());
+        let state =
+            app_state_with_cache_dir(app_state_with_results(results_dir.path()), cache_dir.path());
+        std::fs::write(
+            results_dir
+                .path()
+                .join(PRODUCER_AND_CONSUMER_DIR)
+                .join(REPORT_FILE),
+            "{",
+        )
+        .expect("the report is overwritten");
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(embed_chart_png)
+                .service(embed_chart),
+        )
+        .await;
+
+        for uri in [
+            embed_uri(PRODUCER_AND_CONSUMER_RUN, ""),
+            png_uri(PRODUCER_AND_CONSUMER_RUN, ""),
+        ] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri}"
+            );
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Failed to parse report file")),
+                "{uri}: {body}"
+            );
+        }
+        assert!(!cache_dir.path().join(EMBED_CACHE_DIR).exists());
+    }
+
+    #[actix_web::test]
+    async fn given_partial_png_in_cache_when_storing_should_replace_it_without_leaving_temp_files()
+    {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
+        std::fs::create_dir(&embed_dir).expect("the embed directory is created");
+        let cached_path = embed_dir.join("run.png");
+        std::fs::write(&cached_path, &CACHED_PNG[..CACHED_PNG.len() / 2])
+            .expect("the partial PNG is written");
+
+        store_png(&embed_dir, &cached_path, CACHED_PNG).expect("the PNG is stored");
+
+        assert_eq!(
+            std::fs::read(&cached_path).expect("the cached PNG is readable"),
+            CACHED_PNG
+        );
+        let files = std::fs::read_dir(&embed_dir)
+            .expect("the embed directory is readable")
+            .count();
+        assert_eq!(files, 1);
     }
 }

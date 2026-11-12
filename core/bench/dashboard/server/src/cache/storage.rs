@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{BenchmarkCache, SeriesCache};
+use super::{BenchmarkCache, Runs, SeriesCache};
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use std::path::PathBuf;
@@ -24,38 +24,41 @@ use uuid::Uuid;
 
 impl BenchmarkCache {
     pub fn get_benchmark_json_path(&self, uuid: &Uuid) -> Option<PathBuf> {
-        self.benchmarks
-            .get(uuid)
-            .map(|ref_guard| ref_guard.value().1.clone())
+        self.runs().reports.get(uuid).map(|(_, path)| path.clone())
     }
 
     pub fn get_benchmark_path(&self, uuid: &Uuid) -> Option<PathBuf> {
-        self.benchmarks
+        self.runs()
+            .reports
             .get(uuid)
-            .map(|ref_guard| ref_guard.value().1.clone().parent().unwrap().to_path_buf())
+            .map(|(_, path)| path.parent().unwrap().to_path_buf())
     }
 
     pub fn get_benchmark_report_light(&self, uuid: &Uuid) -> Option<BenchmarkReportLight> {
-        self.benchmarks
+        self.runs()
+            .reports
             .get(uuid)
-            .map(|entry| entry.value().0.clone())
+            .map(|(report, _)| report.clone())
     }
 
     pub fn get_summaries(&self) -> Arc<Vec<BenchmarkSummary>> {
-        Arc::clone(
-            &self
-                .summaries
-                .read()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
+        Arc::clone(&self.runs().summaries)
     }
 
     pub fn series(&self) -> &SeriesCache {
         &self.series
     }
 
-    pub(crate) fn clear(&self) {
+    /// Call it after every report read of the load. The cached series keep serving until then,
+    /// and the new series generation keeps every build that began before the swap out of the
+    /// cache.
+    pub(super) fn replace_runs(&self, runs: Runs) {
         self.series.clear();
-        self.benchmarks.clear();
+        *self.runs.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(runs);
+    }
+
+    fn runs(&self) -> Arc<Runs> {
+        // The writer only swaps an Arc, so a poisoned lock still holds whole runs.
+        Arc::clone(&self.runs.read().unwrap_or_else(PoisonError::into_inner))
     }
 }
