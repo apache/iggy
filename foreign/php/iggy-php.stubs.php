@@ -2787,7 +2787,10 @@ namespace Iggy\Exception {
         /**
          * For messages that a lost read committed and that the reader could not read again: their
          * first and last offset, as [first, last]. The code is then FetchProgressUncertain
-         * (14010). Null for every other error.
+         * (14010). Null for every other error. This error stops nothing and needs no seek. A
+         * batch that the reader holds after the range comes next, and a seek before the
+         * application takes it drops it. If the reader stopped the partition, the error that
+         * stopped it comes after that batch.
          *
          * @var array|null
          */
@@ -2802,8 +2805,8 @@ namespace Iggy\Exception {
 
         /**
          * For a message that does not decode: the continuation after it. The reader reads the
-         * message again until a seek of its partition to this continuation skips it. For a lost
-         * range: the continuation after the last offset of `lost`. Null for every other error.
+         * message again until a seek of its partition to this continuation skips it. Null for
+         * every other error.
          *
          * @var \Iggy\PollingStrategy|null
          */

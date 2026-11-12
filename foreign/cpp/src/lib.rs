@@ -394,9 +394,8 @@ mod ffi {
         /// For a message that does not decode: one continuation after it. The
         /// reader reads the message again until a `seek` of its partition to
         /// this continuation passes it. The messages before it arrive in a
-        /// batch first. For a lost range: one continuation after its last
-        /// offset. Empty for every other error: cxx has no `Option`, and a
-        /// `Box` is never empty.
+        /// batch first. Empty for every other error: cxx has no `Option`, and
+        /// a `Box` is never empty.
         // A `rust::Vec` holds an opaque Rust type only behind a `Box`.
         #[allow(clippy::vec_box)]
         skip: Vec<Box<Continuation>>,
@@ -406,6 +405,9 @@ mod ffi {
         /// The first and last offset of those messages.
         lost_first: u64,
         lost_last: u64,
+        /// True when the reader stopped the partition after refusals in a row
+        /// that a retry does not change. Only a `seek` reads it again.
+        lasting_refusal: bool,
     }
 
     /// Commit confirmation for one partition written by `send_messages`.

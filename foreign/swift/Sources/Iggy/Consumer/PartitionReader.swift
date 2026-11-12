@@ -100,7 +100,10 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
     public let stopsPartition: Bool
     /// For ``IggyErrorCode/fetchProgressUncertain``: the first and the last
     /// offset of a range that a lost read stored and the reader never
-    /// delivered, or that the history no longer holds.
+    /// delivered, or that the history no longer holds. This report stops
+    /// nothing and needs no ``PartitionReader/seek(partitionID:to:)``. A
+    /// batch that the reader holds after the range follows it, and then, if
+    /// the partition stopped, an error whose ``stopsPartition`` is true.
     public let lost: ClosedRange<UInt64>?
 
     init(
@@ -2298,8 +2301,9 @@ public actor PartitionReader: AsyncSequence {
     }
 
     /// The partition moved to another member before its gap was read again,
-    /// or the history no longer holds the rest of the gap: those messages are
-    /// lost to this reader, the batches after them are not.
+    /// the history no longer holds the rest of the gap, or the server lost
+    /// that history: those messages are lost to this reader, the batches
+    /// after them are not.
     /// The error comes first, as the lost offsets precede those batches.
     private func giveUp(_ gap: Gap, of partition: UInt32) {
         reportLost(gap.next..<gap.end, of: partition)
@@ -2353,7 +2357,12 @@ public actor PartitionReader: AsyncSequence {
             return
         case .historyUnavailable:
             for partition in partitions {
-                if positions[partition]?.context != nil {
+                // A gap is read in the history of its context. The server lost that history, so the gap is lost and the partition stops.
+                let gap = gaps.removeValue(forKey: partition)
+                if let gap {
+                    giveUp(gap, of: partition)
+                }
+                if gap != nil || positions[partition]?.context != nil {
                     stopped.insert(partition)
                     report(ReadError(partitionID: partition, error: error, stopsPartition: true))
                 } else {

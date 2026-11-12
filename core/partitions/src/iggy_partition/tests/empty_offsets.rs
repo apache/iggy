@@ -731,12 +731,7 @@ async fn given_emptied_table_when_retained_across_a_restart_should_keep_the_empt
 #[compio::test]
 async fn given_emptied_marker_beside_an_offset_file_when_recovering_should_remove_the_marker() {
     let dir = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: dir.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
+    let config = offsets_config(&dir);
     let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
     persist_offset(&external_file, 1_000, true).await.unwrap();
     let offsets_dir = config.get_offsets_path(1, 1, 0);
@@ -750,7 +745,6 @@ async fn given_emptied_marker_beside_an_offset_file_when_recovering_should_remov
         &mut partition,
         &config,
         IggyNamespace::new(1, 1, 0),
-        10,
     )
     .await
     .unwrap();
@@ -766,12 +760,7 @@ async fn given_emptied_marker_beside_an_offset_file_when_recovering_should_remov
 async fn given_emptied_marker_beside_a_stranded_offset_file_when_recovering_should_remove_the_marker()
  {
     let dir = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: dir.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
+    let config = offsets_config(&dir);
     let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
     persist_offset(&external_file, 1_000, true).await.unwrap();
     let offsets_dir = config.get_offsets_path(1, 1, 0);
@@ -785,7 +774,6 @@ async fn given_emptied_marker_beside_a_stranded_offset_file_when_recovering_shou
         &mut partition,
         &config,
         IggyNamespace::new(1, 1, 0),
-        10,
     )
     .await
     .unwrap();

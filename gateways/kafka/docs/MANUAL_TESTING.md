@@ -24,8 +24,8 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 # From iggy workspace root (or iggy-gateway-kafka subdir)
 cargo build -p iggy-gateway-kafka
 
-# Terminal 1 — start listener (default 127.0.0.1:9093)
-RUST_LOG=info cargo run -p iggy-gateway-kafka
+# Terminal 1 — start listener (default 127.0.0.1:9093) in stub mode, without Iggy
+IGGY_KAFKA_BRIDGE_ENABLED=false RUST_LOG=info cargo run -p iggy-gateway-kafka
 ```
 
 Expected log:
@@ -79,7 +79,7 @@ No host installs needed, both clients run from containers with `--network host`:
 IGGY_PATH=/tmp/iggy-sasl-data ./target/debug/iggy-server --fresh --with-default-root-credentials
 
 # Terminal 2 - gateway with SASL on
-IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_BRIDGE_ENABLED=false IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
   IGGY_KAFKA_BIND_ADDR=127.0.0.1:9095 RUST_LOG=debug cargo run -p iggy-gateway-kafka
 ```
 
@@ -112,15 +112,14 @@ sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="iggy" password="iggy";
 EOF
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
 ```
 
 S7 and S8 send `SaslHandshake` v0 and then the token in a bare frame with no request header
 (KIP-152). kafka-python 2.0.2 always does this, and Sarama does it by default up to 1.40.1. Both
-cases produce, so add `IGGY_KAFKA_BRIDGE_ENABLED=true IGGY_KAFKA_IGGY_USERNAME=iggy
-IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway in
-terminal 2. kafka-python 2.0.2 needs Python 3.11 or older:
+cases produce, so in terminal 2 drop `IGGY_KAFKA_BRIDGE_ENABLED=false` and add
+`IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway. kafka-python 2.0.2 needs Python 3.11 or older:
 
 ```bash
 uv venv --python 3.11 /tmp/kafka-python-2.0.2
@@ -171,7 +170,7 @@ Then list each principal's ACLs with the real admin client, swapping the usernam
 
 ```bash
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-acls.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-acls.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties --list
 ```
 
@@ -247,7 +246,7 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://
 ```
 
 `KC` below is `docker run --rm --network host -v /tmp/certs:/certs:ro edenhill/kcat:1.7.1`, and
-`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:3.9.0`.
+`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:4.4.0`.
 
 | ID | Test | Command | Pass criteria | Last run |
 | ---- | ------ | --------- | --------------- | ---------- |
@@ -385,8 +384,8 @@ The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:909
 broker's usual port). Every command below passes `--host 127.0.0.1:9093` explicitly - omitting it
 connection-refuses before any assertion runs.
 
-Every case below describes a gateway started **without** a bridge (`IGGY_KAFKA_BRIDGE_ENABLED`
-unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
+Every case below describes a gateway started **without** a bridge
+(`IGGY_KAFKA_BRIDGE_ENABLED=false`). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
 `tests/produce_real_bridge_tests.rs` covers the bridge path.
 
 | ID | Test | Steps | Expected result | Pass criteria |
@@ -406,9 +405,13 @@ unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists
 
 For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-message-gen send --host 127.0.0.1:9093` with `--version N`.
 
+`kafka-protocol` 0.18 encodes ApiVersions only up to v4, so `kafka-message-gen` writes the v5
+request itself. To check v5 with a real client, run `kafka-broker-api-versions.sh` from
+`apache/kafka:4.4.0`. It prints `ApiVersions(18): 0 to 5 [usable: 5]`.
+
 | API key | Name | Min | Max | Test versions |
 | --------- | ------ | ----- | ----- | --------------- |
-| 18 | ApiVersions | 0 | 3 | −1, 0, 3, 4 |
+| 18 | ApiVersions | 0 | 5 | −1, 0, 5, 6 |
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
