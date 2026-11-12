@@ -50,11 +50,15 @@ public sealed class PartitionPollTests
     private static readonly PartitionContext Served = new(17, 9, 52);
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
+    [InlineData(false, 1_500_000L)]
+    [InlineData(true, 1_500_000L)]
+    [InlineData(false, 1_500_900L)]
+    [InlineData(true, 1_500_900L)]
     public async Task given_poll_options_when_polling_a_partition_should_send_one_deferred_poll_with_their_limits(
-        bool onRead)
+        bool onRead, long maxWaitUs)
     {
+        const ulong ReplyTimeoutMarginUs = 10_000_000;
+        const ulong WireRoundingUs = 1;
         using var node = new MockNode();
         var polls = new ConcurrentQueue<MockRequest>();
         node.Serve(request =>
@@ -70,7 +74,7 @@ public sealed class PartitionPollTests
         var options = new PollOptions
         {
             Count = 50,
-            MaxWait = TimeSpan.FromMilliseconds(1500),
+            MaxWait = TimeSpan.FromTicks(maxWaitUs * TimeSpan.TicksPerMicrosecond),
             MinCount = 2,
             MaxBytes = 4096,
             Commit = onRead ? CommitPolicy.OnRead : CommitPolicy.Manual
@@ -89,8 +93,8 @@ public sealed class PartitionPollTests
         // Each attempt sends what is left of the wait and of the request timeout, which is the wait plus 10 s.
         var waitUs = BinaryPrimitives.ReadUInt64LittleEndian(tail);
         var requestTimeoutUs = BinaryPrimitives.ReadUInt64LittleEndian(tail.AsSpan(16));
-        Assert.InRange(waitUs, 1_000_000ul, 1_500_000ul);
-        Assert.InRange(requestTimeoutUs - waitUs, 9_999_000ul, 10_000_000ul);
+        Assert.InRange(waitUs, 1_000_000ul, (ulong)maxWaitUs);
+        Assert.InRange(requestTimeoutUs - waitUs, ReplyTimeoutMarginUs - WireRoundingUs, ReplyTimeoutMarginUs);
     }
 
     [Fact]
@@ -172,6 +176,35 @@ public sealed class PartitionPollTests
         Assert.Null(polled.Checkpoint);
         Assert.Equal((continuedKind, continuedValue, Served), (polled.Continuation.Kind, polled.Continuation.Value,
             polled.Continuation.Context));
+    }
+
+    /// <summary>
+    ///     A poll without options keeps the start of its request for an empty batch too. A reply without a body names
+    ///     no history, so its continuation is that start as it was.
+    /// </summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task given_a_plain_poll_by_offset_when_its_batch_is_empty_should_continue_from_that_offset(
+        bool strategyPerPartition, bool withoutBody)
+    {
+        using var node = new MockNode();
+        node.Serve(request => request.Code != CommandCodes.POLL_MESSAGES_CODE ? Standalone(node, request)
+            : withoutBody ? Reply(request.Operation, []) : Empty(request));
+        using var client = await ConnectAsync(node);
+        var start = PollingStrategy.Offset(7);
+
+        var polled = strategyPerPartition
+            ? await client.PollMessagesAsync(Stream, Topic, Partition, Consumer.New(4), _ => start, 10, false,
+                TestContext.Current.CancellationToken)
+            : await client.PollMessagesAsync(Stream, Topic, Partition, Consumer.New(4), start, 10, false,
+                TestContext.Current.CancellationToken);
+
+        Assert.Empty(polled.Messages);
+        Assert.Equal((MessagePolling.Offset, 7ul, withoutBody ? default(PartitionContext?) : Served),
+            (polled.Continuation.Kind, polled.Continuation.Value, polled.Continuation.Context));
     }
 
     [Fact]

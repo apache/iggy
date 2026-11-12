@@ -306,6 +306,9 @@ func (c *IggyTcpClient) fenceTargets(ctx context.Context, fetch *fetchRequest) e
 	fetch.body = append([]byte(nil), fetch.body...)
 	for lookup, offset := range unfenced {
 		if routes[lookup].context.Incarnation == 0 {
+			// A route without a history is not ready yet. The next call looks
+			// it up again.
+			c.polls.invalidate(routes[lookup], false)
 			return ierror.ErrTransientNotAccepted
 		}
 		incarnation := fetch.body[offset+fetchTargetIncarnationAt:]

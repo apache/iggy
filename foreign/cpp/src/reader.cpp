@@ -115,6 +115,9 @@ ReadException::ReadException(const std::string &message, ffi::ReadErrorInfo &err
     if (!error.skip.empty()) {
         skip_ = std::shared_ptr<const ::iggy::Continuation>(new ::iggy::Continuation(error.skip[0]->copy()));
     }
+    if (error.has_lost) {
+        lost_.emplace(error.lost_first, error.lost_last);
+    }
 }
 
 ffi::ReaderOptions ReaderOptions::ToFfi() const {

@@ -627,10 +627,11 @@ pub(in crate::http) async fn get_stats(
 /// `GET <http.metrics.endpoint>`: the metric set in prometheus text
 /// exposition. The `Identity` extractor rejects a missing or invalid bearer
 /// with 401, and any authenticated user may scrape the aggregate gauges.
-/// The per-topic series name every stream and topic, so they are exported only
-/// to a user the `/stats` rule ([`Permissioner::get_stats`]) admits; anyone
-/// else gets the aggregates with no per-topic series. Scrapers present a JWT
-/// or a raw PAT the same way every read route accepts them.
+/// The per-topic series name every stream and topic, and the disk series
+/// describe the host's volume, so both are exported only to a user the `/stats`
+/// rule ([`Permissioner::get_stats`]) admits; anyone else gets the aggregates
+/// alone. Scrapers present a JWT or a raw PAT the same way every read route
+/// accepts them.
 ///
 /// The entity gauges sample the same reads `/stats` serves: the metadata STM
 /// stream and user maps plus the stats-registry rollups, whose partition-plane
@@ -663,7 +664,7 @@ pub(in crate::http) async fn get_metrics(
     state
         .ensure_active_user(identity.user_id, Some(identity.user_created_at))
         .map_err(ReadError::Rejected)?;
-    let exports_topics = state
+    let exports_stats = state
         .shard
         .plane
         .metadata()
@@ -685,7 +686,7 @@ pub(in crate::http) async fn get_metrics(
             let mut partitions_count = 0u64;
             let mut segments_count = 0u64;
             let mut messages_count = 0u64;
-            let mut topic_usage = if exports_topics {
+            let mut topic_usage = if exports_stats {
                 Vec::with_capacity(
                     streams
                         .items
@@ -705,7 +706,7 @@ pub(in crate::http) async fn get_metrics(
                 for (_, topic) in &stream.topics {
                     partitions_count =
                         partitions_count.saturating_add(topic.partitions.len() as u64);
-                    if !exports_topics {
+                    if !exports_stats {
                         continue;
                     }
                     topic_usage.push(TopicUsageSample {
@@ -748,7 +749,7 @@ pub(in crate::http) async fn get_metrics(
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
     metrics.topic_usage.replace(topic_usage);
-    Ok(metrics.formatted_output())
+    Ok(metrics.formatted_output(exports_stats))
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP

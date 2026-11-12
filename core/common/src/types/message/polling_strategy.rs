@@ -46,8 +46,9 @@ pub struct PollingStrategy {
     pub value: u64,
     /// Partition incarnation and owner captured with a continuation offset. A stale
     /// context rejects the poll instead of interpreting that offset in another incarnation.
+    /// The serialized form leaves out a zero context, as it does no context.
     #[serde_as(as = "Option<JsonString>")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "names_no_history")]
     context: Option<PartitionContext>,
     /// The partition of a continuation, because a context names no partition. Not on the
     /// wire: every request names its partition in a field of its own.
@@ -167,6 +168,16 @@ impl PollingStrategy {
         self.context
     }
 
+    /// The strategy without a zero context, which names no history, so it counts as none.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_zero_context(self) -> Self {
+        Self {
+            context: self.context.and_then(PartitionContext::non_zero),
+            ..self
+        }
+    }
+
     /// The partition of a continuation. `None` for a strategy of any partition.
     #[doc(hidden)]
     pub fn partition_id(&self) -> Option<u32> {
@@ -185,6 +196,10 @@ impl PollingStrategy {
             _ => Ok(()),
         }
     }
+}
+
+fn names_no_history(context: &Option<PartitionContext>) -> bool {
+    context.and_then(PartitionContext::non_zero).is_none()
 }
 
 #[cfg(test)]
@@ -229,6 +244,37 @@ mod tests {
         for unbound in [PollingStrategy::offset(OFFSET), PollingStrategy::next()] {
             assert_eq!(unbound.partition_id(), None);
             assert_eq!(unbound.validate_partition(PARTITION + 1), Ok(()));
+        }
+    }
+
+    #[test]
+    fn given_a_zero_context_when_dropping_it_should_clear_only_that_context_and_keep_the_partition()
+    {
+        let dropped = PollingStrategy::continuation(
+            PARTITION,
+            PollingKind::Offset,
+            OFFSET,
+            PartitionContext::default(),
+        )
+        .without_zero_context();
+
+        assert_eq!(
+            (dropped.context(), dropped.partition_id()),
+            (None, Some(PARTITION))
+        );
+        assert_eq!(
+            dropped.validate_partition(PARTITION + 1),
+            Err(IggyError::InvalidCommand),
+            "the continuation still belongs to its partition"
+        );
+        let without_incarnation = PartitionContext {
+            incarnation: 0,
+            ..CONTEXT
+        };
+        for context in [CONTEXT, without_incarnation] {
+            let kept =
+                PollingStrategy::continuation(PARTITION, PollingKind::Offset, OFFSET, context);
+            assert_eq!(kept.without_zero_context(), kept, "{context:?}");
         }
     }
 

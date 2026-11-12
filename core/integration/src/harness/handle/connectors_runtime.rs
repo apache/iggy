@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Starts the `iggy-connectors` binary next to a test server.
+//!
+//! No test in this repository uses this module. The connector tests live in
+//! apache/iggy-connectors and reach it through a git dependency on this
+//! crate, so it is not dead code.
+
 use super::common;
 use crate::harness::config::ConnectorsRuntimeConfig;
 use crate::harness::context::TestContext;
@@ -22,6 +28,7 @@ use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::SinglePortReserver;
 use crate::harness::traits::{IggyServerDependent, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
+use configs::CONNECTORS_CONFIG_PATH_ENV;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -122,7 +129,7 @@ impl ConnectorsRuntimeHandle {
 
         if let Some(ref config_path) = self.config.config_path {
             self.envs.insert(
-                "IGGY_CONNECTORS_CONFIG_PATH".to_string(),
+                CONNECTORS_CONFIG_PATH_ENV.to_string(),
                 config_path.display().to_string(),
             );
         }
