@@ -1024,13 +1024,13 @@ async fn live_retransmits_fill_an_announced_gap_only_after_the_matching_prefix()
             .consensus()
             .handle_start_view(PlaneKind::Partitions, start.header(), &[]);
         assert!(!partition.consensus().view_log_is_pending());
-        partition.repair = Some(Box::new(armed_fetch_session(0, 3, 0)));
+        partition.set_repair(Some(armed_fetch_session(0, 3, 0)));
         partition.apply_repaired_prepare(first.clone()).await;
         assert!(
             !partition.log.journal().inner.holds_op(1),
             "unattributed repair still needs a canonical header above commit"
         );
-        partition.repair = None;
+        partition.set_repair(None);
 
         partition.on_replicate(third.clone()).await;
         let fork = first

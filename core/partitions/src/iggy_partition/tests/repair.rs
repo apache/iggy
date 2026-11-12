@@ -82,20 +82,20 @@ async fn given_a_recovered_commit_point_when_fenced_should_walk_the_committed_pr
 async fn given_paused_repair_when_valid_frames_arrive_should_refresh_activity_without_writing() {
     const IDLE_TICKS: u32 = 7;
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_session(3, 0)));
-    partition.repair.as_mut().unwrap().idle_ticks = IDLE_TICKS;
+    partition.set_repair(Some(armed_session(3, 0)));
+    partition.repair_mut().unwrap().idle_ticks = IDLE_TICKS;
     partition.repair_attempts = 2;
     partition.transition = Some(PendingPartitionTransition::View { drain: None });
 
     partition
         .apply_repaired_prepare(repaired_send_prepare(4, 0, 4))
         .await;
-    assert_eq!(partition.repair.as_ref().unwrap().idle_ticks, IDLE_TICKS);
+    assert_eq!(partition.repair().unwrap().idle_ticks, IDLE_TICKS);
     assert_eq!(partition.repair_attempts, 2);
     partition
         .apply_repaired_prepare(repaired_send_prepare(1, 0, 1))
         .await;
-    assert_eq!(partition.repair.as_ref().unwrap().idle_ticks, 0);
+    assert_eq!(partition.repair().unwrap().idle_ticks, 0);
     assert_eq!(partition.repair_attempts, 0);
     assert_eq!(partition.log.journal().inner.resident_count(), 0);
     assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
@@ -109,7 +109,7 @@ async fn given_local_ops_below_repair_floor_when_completing_should_apply_them_an
         journal_send_batch(&mut partition, op).await;
     }
     partition.consensus().advance_commit_max(3);
-    partition.repair = Some(Box::new(armed_session(3, 2)));
+    partition.set_repair(Some(armed_session(3, 2)));
     partition.transfer_rearm = Some(crate::state_transfer::PendingTransferRearm {
         peer: 0,
         after_ticks: 1,
@@ -120,7 +120,7 @@ async fn given_local_ops_below_repair_floor_when_completing_should_apply_them_an
 
     assert_eq!(conclusion, RepairConclusion::Done);
     assert_eq!(partition.consensus().commit_min(), 3);
-    assert!(partition.repair.is_none());
+    assert!(partition.repair().is_none());
     assert!(partition.transfer_rearm.is_none());
 }
 
@@ -128,7 +128,7 @@ async fn given_local_ops_below_repair_floor_when_completing_should_apply_them_an
 async fn given_no_repaired_batch_when_window_never_arrived_should_refuse_commit_floor() {
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(8);
-    partition.repair = Some(Box::new(armed_session(8, 5)));
+    partition.set_repair(Some(armed_session(8, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -139,7 +139,7 @@ async fn given_no_repaired_batch_when_window_never_arrived_should_refuse_commit_
     );
     assert_eq!(partition.consensus().commit_min(), 0);
     assert!(
-        partition.repair.is_some(),
+        partition.repair().is_some(),
         "session must stay armed for retry"
     );
 }
@@ -150,7 +150,7 @@ async fn given_unproven_history_when_repair_floor_connects_should_require_state_
     const HEAD: u64 = 3;
     let (mut backup, _) = recording_partition_at(1, 3);
     backup.consensus().advance_commit_max(HEAD);
-    backup.repair = Some(Box::new(armed_session(HEAD, FLOOR)));
+    backup.set_repair(Some(armed_session(HEAD, FLOOR)));
     backup
         .apply_repaired_prepare(checksummed_segment_prepare(HEAD, 0, 0, b"connected"))
         .await;
@@ -165,7 +165,7 @@ async fn given_unproven_history_when_repair_floor_connects_should_require_state_
     );
     assert_eq!(backup.consensus().commit_min(), 0);
     assert!(backup.consensus().view_log_unproven());
-    assert!(backup.repair.is_none());
+    assert!(backup.repair().is_none());
 }
 
 #[compio::test]

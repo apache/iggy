@@ -126,7 +126,7 @@ async fn given_an_unproven_walk_past_the_wal_byte_budget_when_completing_should_
     backup.consensus().advance_commit_max(head);
     backup.consensus().sequencer().set_sequence(head);
     backup.consensus().fence_view_log(head, head);
-    backup.repair = Some(Box::new(floorless_session(head, head)));
+    backup.set_repair(Some(floorless_session(head, head)));
 
     backup.apply_repaired_prepare(prepare(head)).await;
     assert_eq!(
@@ -156,7 +156,7 @@ async fn given_an_unproven_walk_past_the_wal_byte_budget_when_completing_should_
         }
     );
     assert_eq!(backup.consensus().commit_min(), 0);
-    assert!(backup.repair.is_none());
+    assert!(backup.repair().is_none());
 }
 
 #[compio::test]
@@ -181,7 +181,7 @@ async fn given_walks_sharing_a_node_budget_when_it_is_full_should_transfer_and_r
         partition.consensus().advance_commit_max(HEAD);
         partition.consensus().sequencer().set_sequence(HEAD);
         partition.consensus().fence_view_log(HEAD, HEAD);
-        partition.repair = Some(Box::new(floorless_session(HEAD, HEAD)));
+        partition.set_repair(Some(floorless_session(HEAD, HEAD)));
         partition
     };
     let mut first = backup();
@@ -351,7 +351,7 @@ async fn given_a_primary_elect_when_repair_memory_is_exhausted_should_request_tr
         .handle_do_view_change(consensus::PlaneKind::Partitions, dvc.header(), body);
     assert!(partition.consensus.is_primary_elect());
     partition.consensus.fence_view_log(HEAD, HEAD);
-    partition.repair = Some(Box::new(RepairSession {
+    partition.set_repair(Some(RepairSession {
         view: VIEW,
         ..floorless_session(HEAD, HEAD)
     }));
@@ -388,7 +388,7 @@ async fn given_floor_above_wal_head_when_refused_window_exceeds_one_chunk_should
     let directory = tempfile::tempdir().unwrap();
     let mut backup = backup_with_durable_wal(directory.path(), WAL_HEAD).await;
     backup.consensus().advance_commit_max(COMMIT_TO_OP);
-    backup.repair = Some(Box::new(RepairSession {
+    backup.set_repair(Some(RepairSession {
         floor: None,
         ..armed_session(COMMIT_TO_OP, 0)
     }));
@@ -401,7 +401,7 @@ async fn given_floor_above_wal_head_when_refused_window_exceeds_one_chunk_should
         // that with `RangeEvicted`, and serves at most one chunk.
         let from_op = (*request.start()).max(RETAINED_FROM);
         if from_op > *request.start() {
-            backup.repair.as_mut().unwrap().floor = Some(RETAINED_FROM - 1);
+            backup.repair_mut().unwrap().floor = Some(RETAINED_FROM - 1);
         }
         for op in from_op..=(*request.end()).min(from_op + CHUNK_OPS - 1) {
             backup
@@ -420,8 +420,8 @@ async fn given_floor_above_wal_head_when_refused_window_exceeds_one_chunk_should
         if rotate {
             break;
         }
-        request = backup.consensus().commit_min() + 1
-            ..=backup.repair.as_deref().copied().unwrap().fetch_to_op;
+        request =
+            backup.consensus().commit_min() + 1..=backup.repair().copied().unwrap().fetch_to_op;
     }
 
     assert_eq!(
@@ -433,7 +433,7 @@ async fn given_floor_above_wal_head_when_refused_window_exceeds_one_chunk_should
         "a floor above the WAL head can never be accepted, so its refusal is final; \
              rounds as (request, conclusion, rotate): {rounds:?}"
     );
-    assert!(backup.repair.is_none());
+    assert!(backup.repair().is_none());
 }
 
 /// Can a WAL-backed partition accept a floor above its WAL head? This window
@@ -449,7 +449,7 @@ async fn given_wal_attached_when_connected_floor_above_wal_head_should_refuse_co
     let directory = tempfile::tempdir().unwrap();
     let mut backup = backup_with_durable_wal(directory.path(), WAL_HEAD).await;
     backup.consensus().advance_commit_max(COMMIT_TO_OP);
-    backup.repair = Some(Box::new(armed_session(COMMIT_TO_OP, FLOOR)));
+    backup.set_repair(Some(armed_session(COMMIT_TO_OP, FLOOR)));
     for (offset, op) in (WAL_HEAD..).zip(FLOOR + 1..=SERVED_THROUGH) {
         backup
             .apply_repaired_prepare(checksummed_segment_prepare(op, 0, offset, b"repaired"))
@@ -466,7 +466,7 @@ async fn given_wal_attached_when_connected_floor_above_wal_head_should_refuse_co
         },
         "the WAL cannot become durable through ops the peer no longer retains"
     );
-    assert!(backup.repair.is_none());
+    assert!(backup.repair().is_none());
     assert_eq!(
         backup.consensus().commit_min(),
         WAL_HEAD,
@@ -523,7 +523,7 @@ async fn given_boot_replayed_wal_when_floor_at_or_below_wal_head_should_walk_res
             "boot replay must leave (commit_min, head] resident"
         );
         backup.consensus().advance_commit_max(WAL_HEAD);
-        backup.repair = Some(Box::new(armed_session(WAL_HEAD, floor)));
+        backup.set_repair(Some(armed_session(WAL_HEAD, floor)));
 
         let conclusion = backup.complete_repair(&config).await;
 
@@ -555,7 +555,7 @@ async fn given_no_batch_above_floor_when_window_carries_no_messages_should_refus
         for op in 6..=8 {
             journal_prepare(&partition, op, Operation::CreateStream).await;
         }
-        partition.repair = Some(Box::new(armed_session(8, 5)));
+        partition.set_repair(Some(armed_session(8, 5)));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -565,7 +565,7 @@ async fn given_no_batch_above_floor_when_window_carries_no_messages_should_refus
             "committed messages before the window: {committed_messages}"
         );
         assert!(
-            partition.repair.is_none(),
+            partition.repair().is_none(),
             "a definitive refusal hands recovery to state transfer"
         );
     }
@@ -593,11 +593,7 @@ async fn given_suffix_batch_above_commit_to_op_when_committed_window_carries_no_
         .append(checksummed_segment_prepare(SUFFIX_OP, 0, 0, b"suffix").into_frozen())
         .await
         .expect("journal append");
-    partition.repair = Some(Box::new(armed_fetch_session(
-        COMMIT_TO_OP,
-        SUFFIX_OP,
-        FLOOR,
-    )));
+    partition.set_repair(Some(armed_fetch_session(COMMIT_TO_OP, SUFFIX_OP, FLOOR)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -622,7 +618,7 @@ async fn given_no_repaired_batch_when_window_holds_message_op_should_refuse_comm
     for op in 7..=8 {
         journal_prepare(&partition, op, Operation::CreateStream).await;
     }
-    partition.repair = Some(Box::new(armed_session(8, 5)));
+    partition.set_repair(Some(armed_session(8, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -633,7 +629,7 @@ async fn given_no_repaired_batch_when_window_holds_message_op_should_refuse_comm
     );
     assert_eq!(partition.consensus().commit_min(), 0);
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "a definitive refusal hands recovery to state transfer"
     );
 }
@@ -642,7 +638,7 @@ async fn given_no_repaired_batch_when_window_holds_message_op_should_refuse_comm
 async fn given_no_repaired_batch_when_window_fully_evicted_should_refuse_commit_floor() {
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(8);
-    partition.repair = Some(Box::new(armed_session(8, 8)));
+    partition.set_repair(Some(armed_session(8, 8)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -654,14 +650,14 @@ async fn given_no_repaired_batch_when_window_fully_evicted_should_refuse_commit_
         RepairConclusion::FloorRefused { floor: 8, to_op: 8 }
     );
     assert_eq!(partition.consensus().commit_min(), 0);
-    assert!(partition.repair.is_none());
+    assert!(partition.repair().is_none());
 }
 
 #[compio::test]
 async fn given_empty_committed_window_with_a_suffix_fetch_should_escape_to_state_transfer() {
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(5);
-    partition.repair = Some(Box::new(armed_fetch_session(5, 9, 5)));
+    partition.set_repair(Some(armed_fetch_session(5, 9, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -670,7 +666,7 @@ async fn given_empty_committed_window_with_a_suffix_fetch_should_escape_to_state
         RepairConclusion::FloorRefused { floor: 5, to_op: 5 },
         "the uncommitted fetch ceiling must not postpone a definitive committed-floor refusal"
     );
-    assert!(partition.repair.is_none());
+    assert!(partition.repair().is_none());
 }
 
 #[compio::test]
@@ -686,7 +682,7 @@ async fn given_committed_suffix_evicted_when_completing_repair_should_close_the_
         journal_send_batch(&mut partition, op).await;
     }
     partition.consensus().advance_commit_max(3);
-    partition.repair = Some(Box::new(armed_fetch_session(2, 3, 0)));
+    partition.set_repair(Some(armed_fetch_session(2, 3, 0)));
     partition.commit_journal(&repair_config()).await;
     partition.log.journal().inner.evict_prefix(3);
 
@@ -694,7 +690,7 @@ async fn given_committed_suffix_evicted_when_completing_repair_should_close_the_
 
     assert_eq!(conclusion, RepairConclusion::Done);
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "a fully committed suffix fetch must not stay armed after its \
              headers are flushed out of the resident journal"
     );
@@ -703,14 +699,14 @@ async fn given_committed_suffix_evicted_when_completing_repair_should_close_the_
 #[compio::test]
 async fn given_suffix_fetch_when_its_view_is_discarded_should_clear_the_session() {
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_fetch_session(0, 3, 0)));
+    partition.set_repair(Some(armed_fetch_session(0, 3, 0)));
     partition.consensus.set_view(1);
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
     assert_eq!(conclusion, RepairConclusion::Done);
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "a discarded view must not leave its suffix fetch blocking future repair"
     );
 }
@@ -722,7 +718,7 @@ async fn given_repaired_batch_above_durable_end_when_floor_arrives_should_refuse
     // No recovered segments (durable end None) and the served window's
     // first batch starts at offset 8: ops below the floor are neither
     // locally durable nor repaired.
-    partition.repair = Some(Box::new(armed_session(8, 5)));
+    partition.set_repair(Some(armed_session(8, 5)));
     partition
         .apply_repaired_prepare(repaired_send_prepare(8, 0, 0x88))
         .await;
@@ -736,7 +732,7 @@ async fn given_repaired_batch_above_durable_end_when_floor_arrives_should_refuse
              the anchor and connect"
     );
     assert_eq!(partition.consensus().commit_min(), 0);
-    assert!(partition.repair.is_some());
+    assert!(partition.repair().is_some());
 }
 
 /// The repair window `(floor, to_op]` is longer than one repair chunk and
@@ -750,7 +746,7 @@ async fn given_a_resident_leading_edge_above_durable_end_when_the_window_is_long
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(300, 5)));
+    partition.set_repair(Some(armed_session(300, 5)));
     journal_prepare(&partition, 6, Operation::CreateStream).await;
     partition
         .apply_repaired_prepare(repaired_send_prepare(7, 0, 0x77))
@@ -771,7 +767,7 @@ async fn given_a_resident_leading_edge_above_durable_end_when_the_window_is_long
              refusal is final"
     );
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "a definitive refusal hands recovery to state transfer"
     );
 }
@@ -785,15 +781,15 @@ async fn given_a_connecting_batch_from_an_earlier_session_when_the_floor_arrives
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(floorless_session(300, 300)));
+    partition.set_repair(Some(floorless_session(300, 300)));
     partition
         .apply_repaired_prepare(repaired_send_prepare_at(6, 4, 0, 0x66))
         .await;
     partition
         .apply_repaired_prepare(repaired_send_prepare_at(7, 5, 0x66, 0x77))
         .await;
-    partition.repair = None;
-    partition.repair = Some(Box::new(armed_session(300, 5)));
+    partition.set_repair(None);
+    partition.set_repair(Some(armed_session(300, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -804,7 +800,7 @@ async fn given_a_connecting_batch_from_an_earlier_session_when_the_floor_arrives
         "the window connects at offset 4, so the floor stands and the walk \
              commits the resident batches above it"
     );
-    assert!(partition.repair.is_some());
+    assert!(partition.repair().is_some());
 }
 
 /// The same connecting window as above, on a partition with a state
@@ -821,15 +817,15 @@ async fn given_state_machines_when_a_connecting_floor_arrives_should_refuse_the_
         .unwrap();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(floorless_session(300, 300)));
+    partition.set_repair(Some(floorless_session(300, 300)));
     partition
         .apply_repaired_prepare(repaired_send_prepare_at(6, 4, 0, 0x66))
         .await;
     partition
         .apply_repaired_prepare(repaired_send_prepare_at(7, 5, 0x66, 0x77))
         .await;
-    partition.repair = None;
-    partition.repair = Some(Box::new(armed_session(300, 5)));
+    partition.set_repair(None);
+    partition.set_repair(Some(armed_session(300, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -841,7 +837,7 @@ async fn given_state_machines_when_a_connecting_floor_arrives_should_refuse_the_
         }
     );
     assert_eq!(partition.consensus().commit_min(), 0);
-    assert!(partition.repair.is_none());
+    assert!(partition.repair().is_none());
 }
 
 /// The same shape as above with batches that start past the durable end:
@@ -853,15 +849,15 @@ async fn given_a_disconnected_batch_from_an_earlier_session_when_the_floor_arriv
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(floorless_session(300, 300)));
+    partition.set_repair(Some(floorless_session(300, 300)));
     partition
         .apply_repaired_prepare(repaired_send_prepare(6, 0, 0x66))
         .await;
     partition
         .apply_repaired_prepare(repaired_send_prepare(7, 0x66, 0x77))
         .await;
-    partition.repair = None;
-    partition.repair = Some(Box::new(armed_session(300, 5)));
+    partition.set_repair(None);
+    partition.set_repair(Some(armed_session(300, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -873,7 +869,7 @@ async fn given_a_disconnected_batch_from_an_earlier_session_when_the_floor_arriv
         }
     );
     assert_eq!(partition.consensus().commit_min(), 0);
-    assert!(partition.repair.is_none());
+    assert!(partition.repair().is_none());
 }
 
 /// The anchor sits directly above the floor, so the leading edge is empty
@@ -884,7 +880,7 @@ async fn given_the_anchor_directly_above_the_floor_when_it_does_not_connect_shou
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(300, 5)));
+    partition.set_repair(Some(armed_session(300, 5)));
     partition
         .apply_repaired_prepare(repaired_send_prepare(6, 0, 0x66))
         .await;
@@ -898,7 +894,7 @@ async fn given_the_anchor_directly_above_the_floor_when_it_does_not_connect_shou
             to_op: 300
         }
     );
-    assert!(partition.repair.is_none());
+    assert!(partition.repair().is_none());
 }
 
 /// A resident batch whose stamped `base_offset` no longer matches its batch
@@ -953,7 +949,7 @@ async fn given_a_hole_below_the_anchor_when_the_window_is_incomplete_should_keep
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(300, 5)));
+    partition.set_repair(Some(armed_session(300, 5)));
     journal_prepare(&partition, 6, Operation::CreateStream).await;
     partition
         .apply_repaired_prepare(repaired_send_prepare(8, 0, 0x88))
@@ -962,7 +958,7 @@ async fn given_a_hole_below_the_anchor_when_the_window_is_incomplete_should_keep
     let conclusion = partition.complete_repair(&repair_config()).await;
 
     assert_eq!(conclusion, RepairConclusion::InProgress);
-    assert!(partition.repair.is_some());
+    assert!(partition.repair().is_some());
 }
 
 /// Round one repaired op 4 and lost op 5. Before the stall retry the peer
@@ -975,7 +971,7 @@ async fn given_a_connecting_batch_below_a_raised_floor_when_the_floor_arrives_sh
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(10);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(10, 5)));
+    partition.set_repair(Some(armed_session(10, 5)));
     partition
         .apply_repaired_prepare(repaired_send_prepare(4, 0, 0x44))
         .await;
@@ -1009,7 +1005,7 @@ async fn given_a_committed_batch_below_the_floor_when_the_floor_arrives_should_k
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(300, 6)));
+    partition.set_repair(Some(armed_session(300, 6)));
     for op in 1..=3 {
         journal_prepare(&partition, op, Operation::CreateStream).await;
     }
@@ -1027,7 +1023,7 @@ async fn given_a_committed_batch_below_the_floor_when_the_floor_arrives_should_k
         4,
         "the floor must not skip op 5"
     );
-    assert!(partition.repair.is_some());
+    assert!(partition.repair().is_some());
 }
 
 /// Ops up to the floor were resident but uncommitted, so the walk inside
@@ -1039,7 +1035,7 @@ async fn given_lazy_flush_when_the_walk_passes_a_disconnected_floor_should_keep_
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(300, 5)));
+    partition.set_repair(Some(armed_session(300, 5)));
     for op in 1..=6 {
         journal_prepare(&partition, op, Operation::CreateStream).await;
     }
@@ -1060,7 +1056,7 @@ async fn given_lazy_flush_when_the_walk_passes_a_disconnected_floor_should_keep_
         partition.log.journal().inner.holds_op(6),
         "lazy flush keeps the committed headers resident"
     );
-    assert!(partition.repair.is_some());
+    assert!(partition.repair().is_some());
 }
 
 /// The resident run past the floor is longer than one capped commit walk.
@@ -1074,7 +1070,7 @@ async fn given_resident_run_longer_than_one_walk_when_it_passes_a_disconnected_f
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(300);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(300, FLOOR)));
+    partition.set_repair(Some(armed_session(300, FLOOR)));
     for op in 1..=FLOOR + 1 {
         journal_prepare(&partition, op, Operation::CreateStream).await;
     }
@@ -1090,7 +1086,7 @@ async fn given_resident_run_longer_than_one_walk_when_it_passes_a_disconnected_f
         COMMIT_WALK_OPS_MAX as u64,
         "one capped walk, the rest resumes on the next"
     );
-    assert!(partition.repair.is_some());
+    assert!(partition.repair().is_some());
 }
 
 /// As above, with the whole repaired window resident, which would make a
@@ -1103,7 +1099,7 @@ async fn given_resident_run_longer_than_one_walk_when_the_window_is_complete_sho
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(FLOOR + 2);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(FLOOR + 2, FLOOR)));
+    partition.set_repair(Some(armed_session(FLOOR + 2, FLOOR)));
     for op in 1..=FLOOR {
         journal_prepare(&partition, op, Operation::CreateStream).await;
     }
@@ -1116,7 +1112,10 @@ async fn given_resident_run_longer_than_one_walk_when_the_window_is_complete_sho
     let conclusion = partition.complete_repair(&repair_config()).await;
 
     assert_eq!(conclusion, RepairConclusion::InProgress);
-    assert!(partition.repair.is_some(), "no state transfer for held ops");
+    assert!(
+        partition.repair().is_some(),
+        "no state transfer for held ops"
+    );
 }
 
 /// Repair frames arrive out of order. Op 7 connects at offset 4, op 9 does
@@ -1127,7 +1126,7 @@ async fn given_batches_applied_out_of_order_when_the_floor_arrives_should_anchor
         let mut partition = test_partition();
         partition.consensus().advance_commit_max(300);
         partition.recovered_durable_offset = Some(3);
-        partition.repair = Some(Box::new(armed_session(300, 5)));
+        partition.set_repair(Some(armed_session(300, 5)));
         for op in ops {
             let base_offset = if op == 7 { 4 } else { 6 };
             partition
@@ -1164,7 +1163,7 @@ async fn given_a_floor_holding_the_walk_when_the_first_chunk_has_no_batch_should
     let mut partition = test_partition();
     partition.consensus().advance_commit_max(TO_OP);
     partition.recovered_durable_offset = Some(3);
-    partition.repair = Some(Box::new(armed_session(TO_OP, FLOOR)));
+    partition.set_repair(Some(armed_session(TO_OP, FLOOR)));
     for op in FLOOR + 1..=FIRST_CHUNK_LAST {
         journal_prepare(&partition, op, Operation::CreateStream).await;
     }
@@ -1208,7 +1207,7 @@ async fn given_a_floor_holding_the_walk_when_the_first_chunk_has_no_batch_should
 async fn walless_backup_walked_to(walked_to: u64, to_op: u64) -> IggyPartition<RecordingBus> {
     let (mut backup, _) = recording_partition_at(1, 3);
     backup.consensus().advance_commit_max(to_op);
-    backup.repair = Some(Box::new(RepairSession {
+    backup.set_repair(Some(RepairSession {
         floor: None,
         ..armed_session(to_op, 0)
     }));
@@ -1411,14 +1410,14 @@ async fn given_floor_below_commit_min_when_completing_repair_should_ignore_the_f
     // boot-recovered segments. Meaningless below commit_min.
     partition.recovered_durable_offset = Some(10);
     journal_prepare(&partition, 8, Operation::CreateStream).await;
-    partition.repair = Some(Box::new(armed_session(8, 5)));
+    partition.set_repair(Some(armed_session(8, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
     assert_eq!(conclusion, RepairConclusion::Done);
     assert_eq!(partition.consensus().commit_min(), 8);
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "nothing is left to fetch, so the session must close instead of \
              re-requesting past its ceiling"
     );
@@ -1430,7 +1429,7 @@ async fn given_floor_clamped_to_commit_min_when_completing_repair_should_still_r
     partition.consensus().restore_commit_state(5, 5);
     // The peer retains nothing below op 10, so it cannot serve the suffix
     // either. Only the raw floor tells this apart from a moot one.
-    partition.repair = Some(Box::new(armed_fetch_session(5, 9, 9)));
+    partition.set_repair(Some(armed_fetch_session(5, 9, 9)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -1440,7 +1439,7 @@ async fn given_floor_clamped_to_commit_min_when_completing_repair_should_still_r
         "a floor the clamp pulls down to commit_min still names an evicted \
              range and must escape to state transfer"
     );
-    assert!(partition.repair.is_none());
+    assert!(partition.repair().is_none());
 }
 
 #[compio::test]
@@ -1450,14 +1449,13 @@ async fn given_moot_floor_with_unfetched_suffix_when_completing_repair_should_ke
     // The peer retains from op 6, everything this replica still needs, so
     // the suffix fetch must go on. Escaping to state transfer here copied
     // segments for a window the peer can serve.
-    partition.repair = Some(Box::new(armed_fetch_session(5, 9, 5)));
+    partition.set_repair(Some(armed_fetch_session(5, 9, 5)));
 
     let conclusion = partition.complete_repair(&repair_config()).await;
 
     assert_eq!(conclusion, RepairConclusion::InProgress);
     let session = partition
-        .repair
-        .as_deref()
+        .repair()
         .copied()
         .expect("the suffix fetch stays armed");
     assert!(

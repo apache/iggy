@@ -1077,7 +1077,7 @@ async fn given_stale_offset_repair_when_incarnation_changed_should_preserve_the_
     partition.set_created_revision(INCARNATION);
     partition.consensus.restore_commit_state(1, 1);
     partition.consensus.sequencer().set_sequence(1);
-    partition.repair = Some(Box::new(armed_session(2, 1)));
+    partition.set_repair(Some(armed_session(2, 1)));
     for incarnation in [INCARNATION - 1, INCARNATION + 1] {
         let stale = valid
             .clone()
@@ -1159,7 +1159,7 @@ async fn given_repair_window_with_delete_fence_when_completing_should_close_the_
     replica.open_persistence().await.unwrap();
     let persistence = Rc::clone(replica.persistence.as_ref().unwrap());
     replica.consensus().advance_commit_max(to_op);
-    replica.repair = Some(Box::new(armed_session(to_op, 0)));
+    replica.set_repair(Some(armed_session(to_op, 0)));
     for prepare in prepares {
         replica.apply_repaired_prepare(prepare).await;
     }

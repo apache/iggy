@@ -974,7 +974,7 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
                 .consensus()
                 .set_state_transfer_stage(StateTransferStage::AwaitingTarget),
             "repair" => {
-                partition.repair = Some(Box::new(partitions::RepairSession {
+                partition.set_repair(Some(partitions::RepairSession {
                     nonce: NONCE,
                     view: PARTITION_VIEW,
                     from_op: COMMITTED + 1,

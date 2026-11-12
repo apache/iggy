@@ -250,12 +250,9 @@ where
     pending_persisted_acks: RefCell<BTreeMap<u64, PrepareHeader>>,
     /// Without a WAL, an install must still preserve ops admitted to an ack.
     pub(crate) acknowledged_op: Cell<u64>,
-    /// In-flight journal repair:
-    /// set when the recovery handshake finds this replica behind the group's
-    /// commit frontier, cleared when `RepairDone` completes the walk. Boxed like
-    /// the other session state of this struct, because idle partitions hold
-    /// none of it.
-    pub repair: Option<Box<RepairSession>>,
+    /// In-flight journal repair session. Boxed like the other session state of
+    /// this struct, because idle partitions hold none of it.
+    repair: Option<Box<RepairSession>>,
     /// Consecutive shard-sweep ticks this partition has been seen gap-stopped
     /// (committed ops it cannot walk to, because the op at its commit frontier
     /// plus one is missing). Debounces the sweep's level-triggered repair arm,
@@ -442,10 +439,8 @@ where
     /// Offsets the append fence claims per superblock write; installed by boot
     /// from `PartitionsConfig`.
     offset_reservation_lease: u64,
-    /// In-flight state transfer for this group (rejoin whose repair floor was
-    /// refused); tail repair takes over at install. See
-    /// [`PartitionTransferSession`].
-    pub transfer: Option<Box<PartitionTransferSession>>,
+    /// In-flight state transfer session. Boxed for the same reason as `repair`.
+    transfer: Option<Box<PartitionTransferSession>>,
     /// Consecutive transfer stall rounds WITHIN one recovery attempt. NOT in the
     /// session: three of four metadata arming sites re-minted their session, so
     /// a per-session counter bounded nothing and a permanent failure cycled
@@ -3945,6 +3940,28 @@ where
         self.injected_commit_failure = true;
     }
 
+    /// In-flight journal repair:
+    /// set when the recovery handshake finds this replica behind the group's
+    /// commit frontier, cleared when `RepairDone` completes the walk.
+    #[must_use]
+    pub fn repair(&self) -> Option<&RepairSession> {
+        self.repair.as_deref()
+    }
+
+    // A match, because the const `note_repair_floor` calls this and
+    // `Option::as_deref_mut` is not a const fn yet.
+    pub const fn repair_mut(&mut self) -> Option<&mut RepairSession> {
+        match &mut self.repair {
+            Some(session) => Some(session),
+            None => None,
+        }
+    }
+
+    /// Open a repair session, or close the open one with `None`.
+    pub fn set_repair(&mut self, session: Option<RepairSession>) {
+        self.repair = session.map(Box::new);
+    }
+
     /// Burn one repair stall round; `true` once the session spent the budget.
     /// The count then restarts, so the session that the shard opens in its
     /// place gets the whole budget.
@@ -3996,6 +4013,28 @@ where
     pub const fn restart_repair_budget(&mut self) {
         self.repair_attempts = 0;
         self.repair_rotations = 0;
+    }
+
+    /// In-flight state transfer for this group (rejoin whose repair floor was
+    /// refused); tail repair takes over at install. See
+    /// [`PartitionTransferSession`].
+    #[must_use]
+    pub fn transfer(&self) -> Option<&PartitionTransferSession> {
+        self.transfer.as_deref()
+    }
+
+    pub fn transfer_mut(&mut self) -> Option<&mut PartitionTransferSession> {
+        self.transfer.as_deref_mut()
+    }
+
+    /// Open a transfer session, or close the open one with `None`.
+    pub fn set_transfer(&mut self, session: Option<PartitionTransferSession>) {
+        self.transfer = session.map(Box::new);
+    }
+
+    /// Close the transfer session and hand it to the caller.
+    pub fn take_transfer(&mut self) -> Option<PartitionTransferSession> {
+        self.transfer.take().map(|session| *session)
     }
 
     /// Burn one transfer stall round; `true` once the budget is exhausted.
@@ -6958,7 +6997,7 @@ where
             return Ok(self.drive_install_io().await);
         }
         if !self.is_shutting_down()
-            && self.transfer.as_ref().is_some_and(|session| {
+            && self.transfer().is_some_and(|session| {
                 session.target_accepted
                     && (session
                         .scan
@@ -10704,7 +10743,7 @@ where
         // Nothing is in flight for a cut range, so the next sweep re-requests it
         // instead of waiting out the retry timer.
         if removed > 0
-            && let Some(session) = self.repair.as_mut()
+            && let Some(session) = self.repair_mut()
         {
             session.requested_from = None;
         }
@@ -14850,7 +14889,7 @@ where
 
     /// Settle the session floor that a `RangeEvicted` reply reports.
     pub const fn note_repair_floor(&mut self, floor: u64) {
-        if let Some(session) = self.repair.as_mut() {
+        if let Some(session) = self.repair_mut() {
             session.floor = Some(floor);
         }
     }
@@ -14921,7 +14960,7 @@ where
         if self.unproven_drop_from.is_some() {
             return RepairIngest::Handled;
         }
-        let Some(session) = self.repair.as_deref().copied() else {
+        let Some(session) = self.repair().copied() else {
             return RepairIngest::Handled;
         };
         let consensus = self.consensus();
@@ -14930,7 +14969,7 @@ where
         // first inbound frame leaves the coverage scan re-arming every tick over
         // a stream it can never keep.
         if !repair_session_live(consensus) || consensus.view() != session.view {
-            self.repair = None;
+            self.set_repair(None);
             return RepairIngest::Handled;
         }
         if header.op <= consensus.commit_min() || header.op > session.fetch_to_op {
@@ -14979,7 +15018,7 @@ where
         }
         // Any other in-window frame proves the stream is alive; only silence
         // should age the stall counter.
-        if let Some(session) = self.repair.as_mut() {
+        if let Some(session) = self.repair_mut() {
             session.idle_ticks = 0;
         }
         if self.materialization_missing
@@ -15055,13 +15094,13 @@ where
         if self.history_is_busy() {
             return RepairConclusion::InProgress;
         }
-        let Some(mut session) = self.repair.as_deref().copied() else {
+        let Some(mut session) = self.repair().copied() else {
             return RepairConclusion::Done;
         };
         if !consensus::repair_session_live(self.consensus())
             || self.consensus().view() != session.view
         {
-            self.repair = None;
+            self.set_repair(None);
             return RepairConclusion::Done;
         }
         if self.proof_walk_over_budget() {
@@ -15077,7 +15116,7 @@ where
                 node_memory_exhausted,
                 "unproven repair walk is past its memory budget, so state transfer takes the window"
             );
-            self.repair = None;
+            self.set_repair(None);
             return RepairConclusion::FloorRefused {
                 floor: self.consensus().commit_min(),
                 to_op: session.commit_to_op,
@@ -15103,7 +15142,7 @@ where
                 .is_some_and(|persistence| floor > persistence.head())
         {
             self.commit_journal(config).await;
-            self.repair = None;
+            self.set_repair(None);
             return RepairConclusion::FloorRefused {
                 floor,
                 to_op: session.commit_to_op,
@@ -15124,7 +15163,7 @@ where
             // So does any jump past commands, which no machine would apply,
             // while a transfer carries the machines' snapshot.
             if self.consensus().view_log_unproven() || !self.state_machines.is_empty() {
-                self.repair = None;
+                self.set_repair(None);
                 return RepairConclusion::FloorRefused {
                     floor,
                     to_op: session.commit_to_op,
@@ -15214,7 +15253,7 @@ where
             .is_none_or(|persistence| persistence.is_durable_through(session.fetch_to_op));
         let done = commit_min >= session.commit_to_op && fetch_complete && window_durable;
         if done {
-            self.repair = None;
+            self.set_repair(None);
             self.transfer_rearm = None;
         }
         tracing::info!(
@@ -15290,7 +15329,7 @@ where
                 "refusing commit floor: repaired window does not connect \
                  to recovered durable state (needs state transfer)"
             );
-            self.repair = None;
+            self.set_repair(None);
             return Some(RepairConclusion::FloorRefused {
                 floor,
                 to_op: session.commit_to_op,
@@ -15319,7 +15358,7 @@ where
             || self.consensus.has_untrusted_log()
             || self.consensus.view_log_unproven()
             || self.consensus.commit_min() >= self.consensus.commit_max()
-            || self.repair.as_deref().is_some_and(|session| {
+            || self.repair().is_some_and(|session| {
                 session
                     .floor
                     .is_some_and(|floor| floor > self.consensus.commit_min())
@@ -15337,7 +15376,7 @@ where
     /// same first chunk forever while the rest of the window stays absent.
     #[must_use]
     pub fn repair_pull_from(&self) -> Option<u64> {
-        let session = self.repair.as_ref()?;
+        let session = self.repair()?;
         let commit_min = self.consensus().commit_min();
         let journal = &self.log.journal().inner;
         let Some(floor) = session.floor.filter(|&floor| floor > commit_min) else {
@@ -15359,7 +15398,7 @@ where
     pub fn next_floor_pull(&mut self) -> Option<u64> {
         let commit_min = self.consensus().commit_min();
         let from_op = self.repair_pull_from()?;
-        let session = self.repair.as_mut()?;
+        let session = self.repair_mut()?;
         let floor_pending = session.floor.is_some_and(|floor| floor > commit_min);
         if !floor_pending || from_op > session.fetch_to_op || from_op <= session.floor_pulled_from {
             return None;

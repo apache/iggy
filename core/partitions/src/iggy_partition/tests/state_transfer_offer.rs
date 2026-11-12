@@ -738,7 +738,7 @@ async fn given_lagging_message_less_replica_when_window_fully_evicted_should_cat
     let (_receiver_directory, mut receiver) = transfer_receiver();
     receiver.consensus().advance_commit_max(3);
     // An empty serving journal reports eviction from its commit point.
-    receiver.repair = Some(Box::new(armed_session(3, 3)));
+    receiver.set_repair(Some(armed_session(3, 3)));
 
     let conclusion = receiver.complete_repair(&repair_config()).await;
     assert_eq!(
@@ -769,7 +769,7 @@ async fn given_lagging_message_less_replica_when_window_partly_evicted_should_ca
     let (_receiver_directory, mut receiver) = transfer_receiver();
     receiver.consensus().advance_commit_max(3);
     // The serving peer evicted op 1 and still retains ops 2 and 3.
-    receiver.repair = Some(Box::new(armed_session(3, 1)));
+    receiver.set_repair(Some(armed_session(3, 1)));
     for op in [2, 3] {
         receiver
             .apply_repaired_prepare(retained_prepare(&origin, op))
@@ -840,7 +840,7 @@ async fn given_restarted_message_less_backup_when_floor_skips_unserved_op_should
         assert!(receiver.log.journal().inner.holds_op(1), "{durability:?}");
         assert_eq!(receiver.consensus().commit_min(), 0, "{durability:?}");
         receiver.consensus().advance_commit_max(3);
-        receiver.repair = Some(Box::new(armed_session(3, 2)));
+        receiver.set_repair(Some(armed_session(3, 2)));
         receiver
             .apply_repaired_prepare(retained_prepare(&origin, 3))
             .await;

@@ -3967,7 +3967,7 @@ where
     (partition.repair_rotations().saturating_add(1) >= other_replicas
         && consensus.is_normal_backup()
         && consensus.commit_min() < consensus.commit_max()
-        && partition.transfer.is_none()
+        && partition.transfer().is_none()
         && partition.transfer_rearm.is_none())
     .then(|| {
         consensus
@@ -6161,7 +6161,7 @@ where
             // Any stream armed before this adoption belongs to the superseded
             // view. Repair bodies carry no nonce, so drop the receiving session
             // before reconciling or arming the new view's canonical range.
-            partition.repair = None;
+            partition.set_repair(None);
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
             // journal this rewrites. Same position as the metadata arm's twin, and
             // like it, pending-less adoptions (empty StartView suffix) still sweep
@@ -7663,7 +7663,7 @@ where
         }
         // Repair replies do not replace history. complete_repair waits for
         // file results; fencing live prepares here would create another gap.
-        let Some(session) = partition.repair.as_deref().copied() else {
+        let Some(session) = partition.repair().copied() else {
             return;
         };
         if (header.replica, header.nonce) != (session.peer, session.nonce) {
@@ -7675,7 +7675,7 @@ where
         if !consensus::repair_session_live(partition.consensus())
             || partition.consensus().view() != session.view
         {
-            partition.repair = None;
+            partition.set_repair(None);
             return;
         }
         match header.command {
@@ -7746,7 +7746,7 @@ where
                     }
                     return;
                 }
-                if partition.repair.is_none() {
+                if partition.repair().is_none() {
                     tracing::info!(
                         shard = self.id,
                         namespace_raw = header.group,
@@ -7757,8 +7757,7 @@ where
                     let repaired_through = partition.held_through();
                     let proof_op = partition.consensus().view_log_repair_op();
                     let from_op = partition
-                        .repair
-                        .as_ref()
+                        .repair()
                         .and_then(|live| {
                             proof_op.filter(|&op| op != live.from_op).or_else(|| {
                                 partition_repair_next_chunk(
@@ -7772,10 +7771,10 @@ where
                         .or_else(|| partition.next_floor_pull());
                     let next = from_op.and_then(|from_op| {
                         if !partition.repair_fetch_ready() {
-                            partition.repair.as_mut()?.requested_from = None;
+                            partition.repair_mut()?.requested_from = None;
                             return None;
                         }
-                        let live = partition.repair.as_mut()?;
+                        let live = partition.repair_mut()?;
                         live.from_op = from_op;
                         live.requested_from = Some(from_op);
                         Some((live.peer, live.nonce, from_op, live.fetch_to_op))
@@ -9981,7 +9980,7 @@ where
                 // two ingest sites, so the arming side and the ingest side cannot
                 // drift apart.
                 let session_live = consensus::repair_session_live(partition.consensus());
-                let repair_finished = partition.repair.as_deref().is_some_and(|session| {
+                let repair_finished = partition.repair().is_some_and(|session| {
                     if !session_live || consensus_view != session.view {
                         return true;
                     }
@@ -10003,7 +10002,7 @@ where
                     commit_min >= session.commit_to_op && fetch_complete
                 });
                 if repair_finished {
-                    partition.repair = None;
+                    partition.set_repair(None);
                     partition.transfer_rearm = None;
                     tracing::info!(
                         shard = self.id,
@@ -10016,7 +10015,7 @@ where
                 }
                 let proof_op = partition.consensus().view_log_repair_op();
                 let fetch_ready = partition.repair_fetch_ready();
-                let retry_due = partition.repair.as_mut().is_some_and(|session| {
+                let retry_due = partition.repair_mut().is_some_and(|session| {
                     if !session_live || !fetch_ready {
                         return false;
                     }
@@ -10036,8 +10035,7 @@ where
                 // move until the whole window is held.
                 let pull_from = retry_due.then(|| partition.repair_pull_from()).flatten();
                 let due = partition
-                    .repair
-                    .as_mut()
+                    .repair_mut()
                     .filter(|_| retry_due)
                     .and_then(|session| {
                         let floor_pending = session.floor.is_some_and(|floor| floor > commit_min);
@@ -10129,7 +10127,7 @@ where
                         "partition repair stalled past its retry budget; re-arming from \
                          another replica"
                     );
-                    partition.repair = None;
+                    partition.set_repair(None);
                     // A parked view change re-arms from the merged log's senders,
                     // not around the cluster ring:
                     // `maybe_request_partition_repair` refuses outside `Normal`,
@@ -10343,7 +10341,7 @@ where
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
                 };
-                partition.transfer.as_mut().and_then(|session| {
+                partition.transfer_mut().and_then(|session| {
                     session.idle_ticks += 1;
                     // A nonce-preserving retry renews the same pinned offer
                     // while this node validates or syncs its local files.
@@ -10464,7 +10462,7 @@ where
                     Some(pending) => {
                         let peer = pending.peer;
                         partition.transfer_rearm = None;
-                        if partition.transfer.is_none()
+                        if partition.transfer().is_none()
                             && partition.consensus().state_transfer_stage()
                                 == consensus::StateTransferStage::Idle
                             && !journal_recovered
@@ -10507,9 +10505,9 @@ where
         let mut stranded = [0usize; ConsumerKind::COUNT];
         for namespace in partitions.namespaces() {
             if let Some(partition) = partitions.get_by_ns(namespace) {
-                repairs_live += usize::from(partition.repair.is_some());
-                recovering |= partition.repair.is_some()
-                    || partition.transfer.is_some()
+                repairs_live += usize::from(partition.repair().is_some());
+                recovering |= partition.repair().is_some()
+                    || partition.transfer().is_some()
                     || partition.transfer_rearm.is_some()
                     || partition.consensus().is_transferring()
                     || partition.consensus().has_untrusted_log();
@@ -11344,7 +11342,7 @@ where
         partitions
             .get_by_ns(&IggyNamespace::from_raw(namespace_raw))
             .is_some_and(|partition| {
-                partition.transfer.is_none()
+                partition.transfer().is_none()
                     && matches!(
                         partition.consensus().state_transfer_stage(),
                         consensus::StateTransferStage::AwaitingTarget
@@ -11368,7 +11366,7 @@ where
             .filter(|namespace| {
                 partitions
                     .get_by_ns(namespace)
-                    .is_some_and(|partition| partition.transfer.is_some())
+                    .is_some_and(|partition| partition.transfer().is_some())
             })
             .count()
     }
@@ -11584,7 +11582,7 @@ where
         if self.shutting_down.get() || partition.is_shutting_down() {
             return false;
         }
-        if partition.transfer.is_none()
+        if partition.transfer().is_none()
             && transfers_inflight >= Self::PARTITION_TRANSFERS_INFLIGHT_MAX
         {
             tracing::info!(
@@ -11604,24 +11602,22 @@ where
             });
             return false;
         }
-        partition.repair = None;
+        partition.set_repair(None);
         partition.restart_repair_budget();
         let nonce = iggy_common::random_id::get_uuid();
-        let armed = partition.transfer.is_none();
-        partition.transfer = Some(Box::new(
-            partitions::state_transfer::PartitionTransferSession {
-                nonce,
-                peer,
-                commit_op: 0,
-                artifacts: Vec::new(),
-                target_accepted: false,
-                idle_ticks: 0,
-                spill: None,
-                scan: None,
-                seed: None,
-                pulled_len: 0,
-            },
-        ));
+        let armed = partition.transfer().is_none();
+        partition.set_transfer(Some(partitions::state_transfer::PartitionTransferSession {
+            nonce,
+            peer,
+            commit_op: 0,
+            artifacts: Vec::new(),
+            target_accepted: false,
+            idle_ticks: 0,
+            spill: None,
+            scan: None,
+            seed: None,
+            pulled_len: 0,
+        }));
         self.send_request_state_transfer(partition.consensus(), peer, nonce)
             .await;
         armed
@@ -11657,7 +11653,7 @@ where
         if !partition.consensus().is_normal()
             || partition.consensus().is_transferring()
             || partition.transfer_rearm.is_some()
-            || partition.repair.is_some()
+            || partition.repair().is_some()
             || partition.view_truncation_pending()
         {
             return false;
@@ -11760,7 +11756,7 @@ where
         partition.gap_ticks.set(0);
         self.partition_repairs_inflight
             .set(self.partition_repairs_inflight.get() + 1);
-        partition.repair = Some(Box::new(partitions::RepairSession {
+        partition.set_repair(Some(partitions::RepairSession {
             nonce,
             view: consensus.view(),
             from_op,
@@ -11810,8 +11806,7 @@ where
             return;
         };
         let next = partition
-            .repair
-            .as_mut()
+            .repair_mut()
             .filter(|live| proof_op > live.from_op)
             .map(|live| {
                 live.from_op = proof_op;
@@ -11851,8 +11846,7 @@ where
             .view_log_repair_op()
             .unwrap_or_else(|| consensus.commit_min() + 1);
         let retarget = partition
-            .repair
-            .as_mut()
+            .repair_mut()
             .filter(|session| session.peer != primary)
             .map(|session| {
                 session.peer = primary;
@@ -11908,7 +11902,7 @@ where
     ) where
         B: MessageBus,
     {
-        if partition.repair.is_some() || from_op > to_op {
+        if partition.repair().is_some() || from_op > to_op {
             return;
         }
         if self.partition_repairs_inflight.get() >= PARTITION_REPAIRS_INFLIGHT_MAX {
@@ -11935,7 +11929,7 @@ where
         let view = consensus.view();
         self.partition_repairs_inflight
             .set(self.partition_repairs_inflight.get() + 1);
-        partition.repair = Some(Box::new(partitions::RepairSession {
+        partition.set_repair(Some(partitions::RepairSession {
             nonce,
             view,
             from_op,
@@ -12011,8 +12005,7 @@ where
             return;
         }
         let session_matches = partition
-            .transfer
-            .as_ref()
+            .transfer()
             .is_some_and(|session| session.nonce == header.nonce);
         if !session_matches {
             return;
@@ -12160,8 +12153,7 @@ where
             return;
         }
         if partition
-            .transfer
-            .as_ref()
+            .transfer()
             .is_some_and(|session| session.target_accepted)
         {
             // A crossed stall-retry descriptor: first-wins already served the
@@ -12170,7 +12162,7 @@ where
             return;
         }
         let scan = partition.begin_reuse_scan(&entries);
-        let Some(session) = partition.transfer.as_mut() else {
+        let Some(session) = partition.transfer_mut() else {
             return;
         };
         session.target_accepted = true;
@@ -12230,7 +12222,7 @@ where
             return;
         }
         {
-            let Some(session) = partition.transfer.as_mut() else {
+            let Some(session) = partition.transfer_mut() else {
                 return;
             };
             if session.nonce != header.nonce || !session.target_accepted {
@@ -12290,17 +12282,17 @@ where
         // would assert. Detect the out-from-under abandon and drop the
         // session here (staging files are KEPT for reuse).
         if partition.consensus().state_transfer_stage() != consensus::StateTransferStage::Fetching {
-            if partition.transfer.is_some() {
+            if partition.transfer().is_some() {
                 tracing::info!(
                     shard = self.id,
                     namespace_raw = namespace,
                     "partition state transfer was abandoned out from under its session; dropping it"
                 );
-                partition.transfer = None;
+                partition.set_transfer(None);
             }
             return;
         }
-        let Some(session) = partition.transfer.as_ref() else {
+        let Some(session) = partition.transfer() else {
             return;
         };
         if !session.target_accepted {
@@ -12311,7 +12303,7 @@ where
         if self.drive_reuse_scan(partition, namespace) {
             return;
         }
-        let landed_spill = partition.transfer.as_mut().and_then(|session| {
+        let landed_spill = partition.transfer_mut().and_then(|session| {
             let spill = session.spill.as_ref()?;
             let result = spill.work.result.borrow_mut().take()?;
             let artifact = spill.artifact;
@@ -12323,7 +12315,7 @@ where
             match result {
                 Ok(spilled) => {
                     let meta = partition.accept_transfer_segment_spill(spilled);
-                    if let Some(session) = partition.transfer.as_mut() {
+                    if let Some(session) = partition.transfer_mut() {
                         session.artifacts[index] = TransferArtifact::Staged(meta);
                     }
                 }
@@ -12355,7 +12347,7 @@ where
             }
             return Box::pin(self.on_partition_transfer_progress(namespace)).await;
         }
-        let Some(session) = partition.transfer.as_ref() else {
+        let Some(session) = partition.transfer() else {
             return;
         };
 
@@ -12379,7 +12371,7 @@ where
             });
         if let Some(index) = spill_candidate {
             let (entry, bytes, prefix) = {
-                let Some(session) = partition.transfer.as_mut() else {
+                let Some(session) = partition.transfer_mut() else {
                     return;
                 };
                 let prefix = match session.seed.take() {
@@ -12401,7 +12393,7 @@ where
             };
             let seeded = prefix.is_some();
             let work = partition.begin_transfer_segment_spill(&entry, bytes, prefix);
-            if let Some(session) = partition.transfer.as_mut() {
+            if let Some(session) = partition.transfer_mut() {
                 session.idle_ticks = 0;
                 session.spill = Some(partitions::state_transfer::SegmentSpill {
                     artifact: index,
@@ -12412,7 +12404,7 @@ where
             return;
         }
 
-        let Some(session) = partition.transfer.as_ref() else {
+        let Some(session) = partition.transfer() else {
             return;
         };
         let all_done = session.artifacts.iter().all(ChunkProgress::complete);
@@ -12427,7 +12419,7 @@ where
         }
 
         // Everything present: verify + decode the offsets artifact, install.
-        let Some(session) = partition.transfer.take() else {
+        let Some(session) = partition.take_transfer() else {
             return;
         };
         tracing::info!(
@@ -12722,7 +12714,7 @@ where
     ) where
         B: MessageBus + 'static,
     {
-        partition.transfer = None;
+        partition.set_transfer(None);
         let consensus = partition.consensus();
         if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
             consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
@@ -12786,8 +12778,7 @@ where
             return;
         };
         if partition
-            .transfer
-            .as_ref()
+            .transfer()
             .is_some_and(|session| session.spill.is_some())
         {
             return;
@@ -12795,7 +12786,7 @@ where
         if self.drive_reuse_scan(partition, namespace) || partition.drive_prefix_seed() {
             return;
         }
-        let request = partition.transfer.as_mut().and_then(|session| {
+        let request = partition.transfer_mut().and_then(|session| {
             if !session.target_accepted {
                 return None;
             }
@@ -12837,7 +12828,7 @@ where
     where
         B: MessageBus,
     {
-        let Some(peer) = partition.transfer.as_ref().map(|session| session.peer) else {
+        let Some(peer) = partition.transfer().map(|session| session.peer) else {
             return false;
         };
         let Poll::Ready(reused) = partition.drive_reuse_scan() else {
@@ -14181,9 +14172,9 @@ where
     let consensus = partition.consensus();
     let commit_min = consensus.commit_min();
     let commit_max = consensus.commit_max();
-    let recovery_owned = partition.transfer.is_some()
+    let recovery_owned = partition.transfer().is_some()
         || partition.transfer_rearm.is_some()
-        || partition.repair.is_some();
+        || partition.repair().is_some();
     let normal = consensus.is_normal();
     let transferring = consensus.is_transferring();
     // Residency last, and only once the guards both predicates share already

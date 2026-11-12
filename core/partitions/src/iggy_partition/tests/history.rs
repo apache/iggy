@@ -166,7 +166,7 @@ async fn given_deleted_history_when_retirement_is_replicated_or_repaired_should_
         backup.commit_journal(&config).await;
         assert!(backup.history_deleted());
         if repaired {
-            backup.repair = Some(Box::new(armed_session(RETIREMENT_OP, 0)));
+            backup.set_repair(Some(armed_session(RETIREMENT_OP, 0)));
             backup.apply_repaired_prepare(retirement.clone()).await;
         } else {
             backup.on_replicate(retirement.clone()).await;

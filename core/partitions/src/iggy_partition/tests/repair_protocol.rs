@@ -283,7 +283,7 @@ async fn given_a_dispatcher_when_the_proof_breaks_should_defer_the_drop_to_the_l
     partition.consensus().restore_commit_state(0, 1);
     let canonical = checksummed_segment_prepare(1, 0, 7, b"canonical");
     let anchor = checksummed_segment_prepare(2, canonical.header().checksum, 0, b"anchor");
-    partition.repair = Some(Box::new(RepairSession {
+    partition.set_repair(Some(RepairSession {
         view,
         ..armed_session(2, 0)
     }));
@@ -342,10 +342,7 @@ async fn given_a_dispatcher_when_the_proof_breaks_should_defer_the_drop_to_the_l
     assert_eq!(partition.unproven_drop_from, None);
     assert_eq!(persistence.head(), 0);
     assert_eq!(
-        partition
-            .repair
-            .as_ref()
-            .map(|session| session.requested_from),
+        partition.repair().map(|session| session.requested_from),
         Some(None),
         "the hole must be refetched without waiting out the retry timer"
     );
@@ -410,7 +407,7 @@ async fn given_busy_history_when_an_anchor_breaks_the_window_should_not_append_i
 #[compio::test]
 async fn given_a_pending_unproven_drop_when_a_repair_frame_arrives_should_not_journal_it() {
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_session(3, 0)));
+    partition.set_repair(Some(armed_session(3, 0)));
     partition.unproven_drop_from = Some(1);
     assert!(!partition.refuses_prepares());
 
@@ -720,12 +717,12 @@ async fn given_held_repair_frame_when_peer_re_serves_it_should_keep_stall_budget
     const IDLE_TICKS: u32 = 7;
     const ATTEMPTS: u32 = 2;
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_session(3, 0)));
+    partition.set_repair(Some(armed_session(3, 0)));
     partition
         .apply_repaired_prepare(repaired_send_prepare(1, 0, 1))
         .await;
     assert!(partition.log.journal().inner.holds_op(1));
-    partition.repair.as_mut().unwrap().idle_ticks = IDLE_TICKS;
+    partition.repair_mut().unwrap().idle_ticks = IDLE_TICKS;
     partition.repair_attempts = ATTEMPTS;
 
     partition
@@ -733,7 +730,7 @@ async fn given_held_repair_frame_when_peer_re_serves_it_should_keep_stall_budget
         .await;
 
     assert_eq!(
-        partition.repair.as_ref().unwrap().idle_ticks,
+        partition.repair().unwrap().idle_ticks,
         IDLE_TICKS,
         "a held frame must not restart the stall clock"
     );
@@ -749,7 +746,7 @@ async fn given_held_repair_frame_when_peer_re_serves_it_should_keep_stall_budget
 #[compio::test]
 async fn given_unjournalable_repair_frame_when_peer_re_serves_it_should_spend_stall_budget() {
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_session(3, 0)));
+    partition.set_repair(Some(armed_session(3, 0)));
 
     let mut verdicts = Vec::new();
     for _ in 0..=crate::types::REPAIR_MAX_STALL_RETRIES {
@@ -785,7 +782,7 @@ async fn given_walless_refused_floor_when_peer_re_serves_held_frames_should_rota
         .consensus()
         .restore_commit_state(COMMIT_MIN, COMMIT_MIN);
     backup.consensus().advance_commit_max(COMMIT_TO_OP);
-    backup.repair = Some(Box::new(armed_session(COMMIT_TO_OP, FLOOR)));
+    backup.set_repair(Some(armed_session(COMMIT_TO_OP, FLOOR)));
     let config = repair_config();
 
     let mut verdicts = Vec::new();
@@ -846,7 +843,7 @@ async fn given_a_repair_larger_than_the_wal_when_a_prefix_is_durable_should_appl
         .await
         .unwrap();
     backup.consensus().advance_commit_max(OPS);
-    backup.repair = Some(Box::new(RepairSession {
+    backup.set_repair(Some(RepairSession {
         floor: None,
         ..armed_session(OPS, 0)
     }));
@@ -874,7 +871,7 @@ async fn given_a_repair_larger_than_the_wal_when_a_prefix_is_durable_should_appl
         1,
         "the verified durable prefix must apply before the rest of the window can fit"
     );
-    assert!(backup.repair.is_some());
+    assert!(backup.repair().is_some());
     Rc::clone(&persistence).run().await;
     settle_partition_io(&mut backup, &config).await;
     assert_eq!(
@@ -924,7 +921,7 @@ async fn given_advancing_repair_walk_when_peer_re_serves_held_frames_should_keep
     const COMMIT_TO_OP: u64 = COMMIT_WALK_OPS_MAX as u64 * ROUNDS as u64;
     let (mut backup, _) = recording_partition_at(1, 3);
     backup.consensus().advance_commit_max(COMMIT_TO_OP);
-    backup.repair = Some(Box::new(RepairSession {
+    backup.set_repair(Some(RepairSession {
         floor: None,
         ..armed_session(COMMIT_TO_OP, 0)
     }));
@@ -1015,7 +1012,7 @@ async fn given_lower_backfill_when_applying_repaired_prepare_should_not_rewind_p
     const CHECKSUM_2: u128 = 0x22;
     const CHECKSUM_3: u128 = 0x33;
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_session(3, 0)));
+    partition.set_repair(Some(armed_session(3, 0)));
 
     partition
         .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
@@ -1057,7 +1054,7 @@ async fn given_gap_closure_when_applying_repaired_prepare_should_adopt_new_head_
     const CHECKSUM_2: u128 = 0x22;
     const CHECKSUM_3: u128 = 0x33;
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_session(3, 0)));
+    partition.set_repair(Some(armed_session(3, 0)));
 
     partition
         .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
@@ -1083,7 +1080,7 @@ async fn given_gap_closure_when_applying_repaired_prepare_should_adopt_new_head_
 #[compio::test]
 async fn given_prior_view_repair_when_a_new_view_started_should_discard_it() {
     let mut partition = test_partition();
-    partition.repair = Some(Box::new(armed_fetch_session(0, 1, 0)));
+    partition.set_repair(Some(armed_fetch_session(0, 1, 0)));
     partition.consensus.set_view(1);
 
     partition
@@ -1091,7 +1088,7 @@ async fn given_prior_view_repair_when_a_new_view_started_should_discard_it() {
         .await;
 
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "the prior-view session is obsolete"
     );
     assert!(
@@ -1107,7 +1104,7 @@ async fn given_session_remint_when_attempts_burned_should_survive_on_partition()
         assert!(!partition.burn_transfer_attempt());
         // A re-minted session must not reset the budget: it lives on the
         // partition precisely because arming sites mint fresh sessions.
-        partition.transfer = Some(Box::new(crate::state_transfer::PartitionTransferSession {
+        partition.set_transfer(Some(crate::state_transfer::PartitionTransferSession {
             nonce: u128::from(round),
             peer: 0,
             commit_op: 0,
