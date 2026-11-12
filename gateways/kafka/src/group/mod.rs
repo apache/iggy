@@ -50,6 +50,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::group::offset_work::OffsetWork;
 use crate::group::state::{GroupState, JoinStep, Replacement, Step, SyncStep};
+use crate::observability::GroupCensus;
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID,
 };
@@ -991,6 +992,13 @@ impl GroupCoordinator {
     pub async fn list_groups(&self) -> Vec<GroupListing> {
         let groups = self.groups.lock().await;
         state::list_groups(&groups, Instant::now())
+    }
+
+    /// The groups per Kafka state and their members, for the metrics. Counts the groups that
+    /// [`Self::list_groups`] lists, and does not tick for the same reason.
+    pub async fn census(&self) -> GroupCensus {
+        let groups = self.groups.lock().await;
+        state::census(&groups, Instant::now())
     }
 
     /// Sleeps until the group changes or `wake_at` passes. `false` means the gateway is draining.
