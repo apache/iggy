@@ -29,7 +29,7 @@ runs:
     - name: Setup Rust
       uses: ./.github/actions/utils/setup-rust
       with:
-        free-disk-space: ${{ inputs.task != 'test' }}
+        free-disk-space: "false"
 
     - name: Download runtime binaries
       if: inputs.task == 'test'
@@ -45,6 +45,7 @@ runs:
           --target runtime-prebuilt \
           --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
           --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+          --build-arg LICENSE_STAGE=license-skip \
           -t iggy-server:local .
       shell: bash
 

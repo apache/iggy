@@ -20,8 +20,11 @@
 //! lookups. Several older test files still hold local copies of these helpers;
 //! consolidating them onto this module is a follow-up.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,6 +36,9 @@ use journal::superblock::{SLOT_FILE_NAMES, SuperblockContents, decode_slots};
 use tokio::time::sleep;
 
 use super::TestHarness;
+
+/// The unit of `st_blocks`, whatever the filesystem's block size.
+const FILE_BLOCK_BYTES: u64 = 512;
 
 // Poll the per-node segment `.log` sizes until they agree and hold steady,
 // instead of a fixed sleep: a fixed wait either flakes under CI load or hides a
@@ -122,6 +128,63 @@ pub fn walk(root: &Path, matches: &mut dyn FnMut(&Path) -> bool) -> Option<PathB
         }
     }
     None
+}
+
+/// Bytes the filesystem has allocated for `root` and everything under it, the
+/// way `du` counts them: from `st_blocks`, each inode once. File lengths would
+/// count a WAL hard link to a segment body twice and miss the preallocated
+/// tail of a segment.
+pub fn allocated_bytes(root: &Path) -> u64 {
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        // Not following links: a link counts as itself, as in `du`.
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if seen.insert((metadata.dev(), metadata.ino())) {
+            total += metadata.blocks() * FILE_BLOCK_BYTES;
+        }
+        if metadata.is_dir()
+            && let Ok(entries) = fs::read_dir(&path)
+        {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    total
+}
+
+/// Flushes the filesystem holding `path` with `syncfs`, so `statvfs` shows
+/// what was written to or deleted from it. ext4 and XFS move their free count
+/// at once, but btrfs moves it only after writeback and a commit, and OpenZFS
+/// after a transaction group sync. Off Linux it flushes every filesystem.
+pub fn sync_volume(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let file = fs::File::open(path).expect("open a path on the volume to sync");
+        // SAFETY: `file` owns the descriptor and outlives the call.
+        let synced = unsafe { libc::syncfs(file.as_raw_fd()) };
+        assert_eq!(
+            synced,
+            0,
+            "syncfs failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        // SAFETY: `sync` takes no arguments and cannot fail.
+        unsafe { libc::sync() };
+    }
+}
+
+/// Bytes used on the volume holding `path`, counted as `df` and the server's
+/// disk usage sampler count them: total minus free.
+pub fn volume_used_bytes(path: &Path) -> u64 {
+    let stats = fs2::statvfs(path).expect("statvfs on the data volume");
+    stats.total_space().saturating_sub(stats.free_space())
 }
 
 /// `Ok(())` when every payload in `expected` appears in node-local segment
@@ -697,7 +760,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{assert_replica_data_identical, compare_replica_data, compare_replica_offsets};
+    use super::{
+        allocated_bytes, assert_replica_data_identical, compare_replica_data,
+        compare_replica_offsets,
+    };
 
     const SEGMENT_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000000.log";
     const NEXT_SEGMENT_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000010.log";
@@ -705,6 +771,7 @@ mod tests {
     const WAL_PATH: &str = "metadata/journal.wal";
     const CONSUMER_OFFSET_PATH: &str = "streams/1/topics/1/partitions/0/offsets/consumers/10";
     const GROUP_OFFSET_PATH: &str = "streams/1/topics/1/partitions/1/offsets/groups/1";
+    const BYTES: usize = 64 * 1024;
 
     #[test]
     fn given_identical_segments_when_comparing_should_inventory_only_replicated_files() {
@@ -844,6 +911,34 @@ mod tests {
         let comparison = compare_replica_offsets(&paths);
         assert_eq!(comparison.problems.len(), 1, "{comparison:?}");
         assert!(comparison.problems[0].contains("vacuous"), "{comparison:?}");
+    }
+
+    #[test]
+    fn given_a_hard_link_when_summing_allocated_bytes_should_count_the_inode_once() {
+        let directory = tempdir().unwrap();
+        let empty = allocated_bytes(directory.path());
+        let file = directory.path().join("segment.log");
+        fs::write(&file, vec![1u8; BYTES]).unwrap();
+        let with_file = allocated_bytes(directory.path());
+
+        fs::hard_link(&file, directory.path().join("wal.link")).unwrap();
+
+        assert!(with_file - empty >= BYTES as u64);
+        assert_eq!(allocated_bytes(directory.path()), with_file);
+    }
+
+    #[test]
+    fn given_a_sparse_file_when_summing_allocated_bytes_should_skip_the_hole() {
+        let directory = tempdir().unwrap();
+        let empty = allocated_bytes(directory.path());
+        let file = fs::File::create(directory.path().join("sparse.log")).unwrap();
+
+        file.set_len(16 * BYTES as u64).unwrap();
+
+        assert!(
+            allocated_bytes(directory.path()) - empty < BYTES as u64,
+            "a file's length must not count as allocated space"
+        );
     }
 
     /// Offset plus an arbitrary checksum: the comparison reads the offset only.
