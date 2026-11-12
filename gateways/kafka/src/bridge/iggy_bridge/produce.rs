@@ -520,16 +520,13 @@ impl IggyBridge {
         };
         // The SDK cannot cancel a send. One that outlives this call keeps the turn in its task,
         // so the next one waits for it here instead of queueing its batch inside the SDK.
-        let Some(((response, kept), turn)) = in_slot(turn, deadline, send).await else {
-            self.produce_pool.in_doubt.fetch_add(1, Ordering::Relaxed);
-            return (Err(BridgeError::Timeout), None);
-        };
-        if matches!(
-            response,
-            Err(BridgeError::SendLost(_) | BridgeError::Iggy(IggyError::OperationUncertain(_)))
-        ) {
+        let finished = in_slot(turn, deadline, send).await;
+        if may_have_landed(finished.as_ref().map(|((response, _), _)| response)) {
             self.produce_pool.in_doubt.fetch_add(1, Ordering::Relaxed);
         }
+        let Some(((response, kept), turn)) = finished else {
+            return (Err(BridgeError::Timeout), None);
+        };
         let base_offset = response.map(|response| {
             response
                 .confirmations
@@ -573,6 +570,17 @@ const fn send_error(error: IggyError) -> BridgeError {
         }
         error => BridgeError::Iggy(error),
     }
+}
+
+/// Whether a send can have landed although its caller gets an error: it still ran when the
+/// caller gave up (`None`), or it went out and its answer was lost.
+fn may_have_landed<T>(sent: Option<&Result<T, BridgeError>>) -> bool {
+    sent.is_none_or(|response| {
+        matches!(
+            response,
+            Err(BridgeError::SendLost(_) | BridgeError::Iggy(IggyError::OperationUncertain(_)))
+        )
+    })
 }
 
 #[cfg(test)]
@@ -722,6 +730,24 @@ mod tests {
             .await;
         assert!(sent.is_err(), "the client never dialed");
         assert_eq!(bridge.sends_in_doubt(), 0);
+    }
+
+    /// The SDK stops a send 50 ms before its caller does, so only a send that overruns the SDK's
+    /// own deadline is still running when the caller gives up.
+    #[test]
+    fn given_a_send_still_running_at_its_deadline_should_count_it_in_doubt() {
+        assert!(may_have_landed::<u64>(None), "it can still land");
+        assert!(may_have_landed::<u64>(Some(&Err(BridgeError::SendLost(
+            IggyError::Disconnected
+        )))));
+        assert!(may_have_landed::<u64>(Some(&Err(BridgeError::Iggy(
+            IggyError::OperationUncertain(1)
+        )))));
+        assert!(!may_have_landed(Some(&Ok(7_u64))));
+        assert!(
+            !may_have_landed::<u64>(Some(&Err(BridgeError::Iggy(IggyError::NotConnected)))),
+            "a send that never went out cannot land"
+        );
     }
 
     #[tokio::test]
