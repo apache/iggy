@@ -56,10 +56,10 @@ use consensus::{
     PlaneKind, Project, RepairEvidence, ReplicaLogContext, RequestLogEvent, Sequencer,
     SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, build_deny_reply_from_request,
     build_reply_from_request, build_reply_message, dvc_header_kind, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repair_session_live,
-    repaired_frontier_update, repaired_prepare_evidence, replicate_frozen_prepare,
-    replicate_preflight, restamp_prepare_view, send_prepare_ok as send_prepare_ok_common,
-    verify_prepare_integrity,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, field_size,
+    repair_session_live, repaired_frontier_update, repaired_prepare_evidence,
+    replicate_frozen_prepare, replicate_preflight, restamp_prepare_view,
+    send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::batch::BatchProducer;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
@@ -516,6 +516,20 @@ where
     /// describes.
     pub(crate) transfer_plan: RefCell<Option<TransferPlanSlot>>,
 }
+
+// Cold state stays behind one pointer per field. Inline, one of these fields
+// costs every idle partition a few hundred bytes, and the limit of the idle
+// memory test is too coarse to catch that.
+const BOXED_FIELD_BYTES: usize = size_of::<usize>();
+const _: () = {
+    assert!(field_size(|partition: &IggyPartition| &partition.repair) == BOXED_FIELD_BYTES);
+    assert!(field_size(|partition: &IggyPartition| &partition.transfer) == BOXED_FIELD_BYTES);
+    assert!(
+        field_size(|partition: &IggyPartition| &partition.materialization) == BOXED_FIELD_BYTES
+    );
+    assert!(field_size(|partition: &IggyPartition| &partition.view_fence) == BOXED_FIELD_BYTES);
+    assert!(field_size(|partition: &IggyPartition| &partition.maintenance) == BOXED_FIELD_BYTES);
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstalledConsumerGroupOwner {
