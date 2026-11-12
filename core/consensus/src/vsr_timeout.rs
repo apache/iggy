@@ -30,6 +30,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use iggy_binary_protocol::HeartbeatState;
 use twox_hash::XxHash3_64;
 
 /// Wall-clock length of one consensus tick.
@@ -87,6 +88,12 @@ impl Timeout {
 
     pub const fn stop(&mut self) {
         self.deadline = STOPPED;
+    }
+
+    /// Start the timer for `ticks` this one time. The period of later
+    /// [`Self::start`] and [`Self::reset`] calls does not change.
+    pub fn start_with(&mut self, now: u64, ticks: u64) {
+        self.deadline = deadline_after(now, ticks);
     }
 
     /// Restart a running timer's interval.
@@ -188,6 +195,14 @@ impl TimeoutManager {
     /// request_start_view_retransmit_interval` config default against this
     /// built-in.
     pub const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
+    /// Ticks between grid ticks (`[cluster] commit_heartbeat_grid`).
+    pub const HEARTBEAT_GRID_TICKS: u64 = 10;
+    /// Ticks between the heartbeats of an idle group (`[cluster]
+    /// commit_idle_heartbeat_interval`).
+    pub const IDLE_HEARTBEAT_TICKS: u64 = 100;
+    /// Ticks that the backups of an idle group wait (`[cluster]
+    /// commit_idle_heartbeat_timeout`).
+    pub const IDLE_HEARTBEAT_TIMEOUT_TICKS: u64 = 1200;
 
     #[must_use]
     pub const fn new(clock: TickClock) -> Self {
@@ -324,6 +339,12 @@ impl TimeoutManager {
         self.clear_backoff(kind);
     }
 
+    pub fn start_with(&mut self, kind: TimeoutKind, ticks: u64) {
+        let now = self.clock.now();
+        self.get_mut(kind).start_with(now, ticks);
+        self.clear_backoff(kind);
+    }
+
     pub const fn stop(&mut self, kind: TimeoutKind) {
         self.get_mut(kind).stop();
         self.clear_backoff(kind);
@@ -385,6 +406,89 @@ fn jitter(salt: u64, attempt: u32, now: u64, span: u64) -> u64 {
 /// Below [`STOPPED`], so a deadline past the end of the clock still runs.
 fn deadline_after(now: u64, ticks: u64) -> u64 {
     now.saturating_add(ticks).min(STOPPED - 1)
+}
+
+/// The Commit heartbeat schedule of a group, in shard ticks.
+///
+/// The fields come from the five `[cluster] commit_*heartbeat*` options.
+/// Boot makes sure that they follow the schedule rules of the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatSchedule {
+    /// Ticks between grid ticks. Heartbeats leave only on grid ticks.
+    pub grid_ticks: u64,
+    /// Ticks between the heartbeats of a busy group.
+    pub busy_interval_ticks: u64,
+    /// Ticks that the backups of a busy group wait. It is also the quiet time
+    /// before a group turns idle, and the quorum window of a busy group.
+    pub busy_timeout_ticks: u64,
+    /// Ticks between the heartbeats of an idle group.
+    pub idle_interval_ticks: u64,
+    /// Ticks that the backups of an idle group wait, at least the busy wait.
+    pub idle_timeout_ticks: u64,
+}
+
+impl Default for HeartbeatSchedule {
+    fn default() -> Self {
+        Self {
+            grid_ticks: TimeoutManager::HEARTBEAT_GRID_TICKS,
+            busy_interval_ticks: TimeoutManager::COMMIT_MESSAGE_TICKS,
+            busy_timeout_ticks: TimeoutManager::NORMAL_HEARTBEAT_TICKS,
+            idle_interval_ticks: TimeoutManager::IDLE_HEARTBEAT_TICKS,
+            idle_timeout_ticks: TimeoutManager::IDLE_HEARTBEAT_TIMEOUT_TICKS,
+        }
+    }
+}
+
+impl HeartbeatSchedule {
+    /// Whether shard tick `shard_tick` is a grid tick.
+    #[must_use]
+    pub const fn is_grid_tick(self, shard_tick: u64) -> bool {
+        shard_tick.is_multiple_of(if self.grid_ticks == 0 {
+            1
+        } else {
+            self.grid_ticks
+        })
+    }
+
+    /// Ticks between the heartbeats of a group in this state.
+    #[must_use]
+    pub const fn heartbeat_interval_ticks(self, idle: bool) -> u64 {
+        if idle {
+            self.idle_interval_ticks
+        } else {
+            self.busy_interval_ticks
+        }
+    }
+
+    /// Ticks that a backup waits for the next Commit after a Commit in `state`.
+    #[must_use]
+    pub const fn backup_wait_ticks(self, state: HeartbeatState) -> u64 {
+        match state {
+            HeartbeatState::Idle => {
+                if self.idle_timeout_ticks > self.busy_timeout_ticks {
+                    self.idle_timeout_ticks
+                } else {
+                    self.busy_timeout_ticks
+                }
+            }
+            HeartbeatState::Busy | HeartbeatState::Eager => self.busy_timeout_ticks,
+        }
+    }
+
+    /// Ticks of the quorum window of a primary. The idle window never uses the
+    /// idle timeout, because a primary cut off from its backups serves reads
+    /// for up to one window.
+    #[must_use]
+    pub const fn quorum_window_ticks(self, idle: bool) -> u64 {
+        let idle_floor = self
+            .idle_interval_ticks
+            .saturating_add(self.busy_interval_ticks);
+        if idle && idle_floor > self.busy_timeout_ticks {
+            idle_floor
+        } else {
+            self.busy_timeout_ticks
+        }
+    }
 }
 
 #[cfg(test)]

@@ -39,8 +39,8 @@ use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
 use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 use iggy_binary_protocol::{
-    Command, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, ReplyHeader,
-    RequestHeader, RoutedRequestHeader, StartViewHeader,
+    Command, CommitEntry, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader,
+    ReplyHeader, RequestHeader, RoutedRequestHeader, StartViewHeader,
 };
 use iggy_common::{Durability, IggyError};
 use message_bus::MessageBus;
@@ -59,6 +59,7 @@ use replica::{Replica, SIM_INBOX_CAPACITY, new_shard};
 use seeds::SimSeeds;
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP, PartitionLocation, ShardId};
+use shard::commit_batch;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
@@ -512,7 +513,7 @@ impl Simulator {
                     outbox.monotonic_now(),
                     configs::server::ServerConfig::default()
                         .cluster
-                        .heartbeat_timeout
+                        .commit_busy_heartbeat_timeout
                         .get_duration(),
                 );
             }
@@ -1615,7 +1616,7 @@ impl Simulator {
                 outbox.monotonic_now(),
                 configs::server::ServerConfig::default()
                     .cluster
-                    .heartbeat_timeout
+                    .commit_busy_heartbeat_timeout
                     .get_duration(),
             );
         }
@@ -2261,8 +2262,14 @@ fn view_scoped_partition_frame(
             (header.group, header.partition_incarnation)
         }
         Command::Commit => {
-            let header = message.try_as_typed::<CommitHeader>().ok()?.header();
-            (header.group, header.partition_incarnation)
+            let entry = single_commit_entry(message)?;
+            return (entry.group != METADATA_GROUP).then(|| {
+                (
+                    IggyNamespace::from_raw(entry.group),
+                    entry.partition_incarnation,
+                    entry.view,
+                )
+            });
         }
         Command::DoViewChange => {
             let header = message.try_as_typed::<DoViewChangeHeader>().ok()?.header();
@@ -2291,6 +2298,15 @@ fn view_scoped_partition_frame(
             message.header().view,
         )
     })
+}
+
+/// The entry of a `Commit` frame. The simulated bus sends one entry per
+/// frame, so the first entry is the only one.
+pub(crate) fn single_commit_entry(message: &Message<GenericHeader>) -> Option<CommitEntry> {
+    let batch = message.try_as_typed::<CommitHeader>().ok()?;
+    commit_batch::verified_entries(batch, batch.header().checksum_body)?
+        .first()
+        .copied()
 }
 
 /// How long the reconciler lets a revocation wait for its drain, in microseconds.
@@ -13177,8 +13193,8 @@ mod partition_repair_driver_tests {
     use bytes::Bytes;
     use consensus::{Sequencer, Status};
     use iggy_binary_protocol::{
-        CommitHeader, ConsensusHeader, PrepareHeader, RepairRangeReplyHeader,
-        RequestPreparesHeader, StartViewHeader,
+        ConsensusHeader, PrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader,
+        StartViewHeader,
     };
     use packet::Packet;
     use server_common::MessageBag;
@@ -13304,12 +13320,8 @@ mod partition_repair_driver_tests {
 
     /// Whether a packet is a commit heartbeat for `group`.
     pub fn is_commit_for(packet: &Packet, group: u64) -> bool {
-        if packet.message.header().command != Command::Commit {
-            return false;
-        }
-        let header: &CommitHeader =
-            bytemuck::checked::from_bytes(&packet.message.as_slice()[..size_of::<CommitHeader>()]);
-        header.group == group
+        packet.message.header().command == Command::Commit
+            && single_commit_entry(&packet.message).is_some_and(|entry| entry.group == group)
     }
 
     /// Whether a packet is a repair request for `group`.
@@ -13719,19 +13731,16 @@ mod partition_repair_driver_tests {
             .get_by_ns(&namespace)
             .expect("the replica hosts the partition")
             .created_revision();
-        let message = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-            |_, header: &mut CommitHeader| {
-                header.command = Command::Commit;
-                header.cluster = 1;
-                header.replica = 0;
-                header.group = namespace.inner();
-                header.partition_incarnation = incarnation;
-                header.commit = commit;
-                header.timestamp_monotonic = commit;
-                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-                header.seal();
-            },
+        let entry = CommitEntry::new(
+            namespace.inner(),
+            incarnation,
+            0,
+            commit,
+            commit,
+            iggy_binary_protocol::HeartbeatState::Busy,
+            0,
         );
+        let message = commit_batch::encode_commit_batch(1, 0, &[entry]).unwrap();
         futures::executor::block_on(shard.on_message(MessageBag::Commit(message)));
     }
 
@@ -17025,7 +17034,7 @@ mod metadata_read_frontier_tests {
         }
     }
 
-    fn partition_freshness_cluster(
+    pub fn partition_freshness_cluster(
         replicas: u8,
         seed: u64,
     ) -> (Simulator, SimClient, IggyNamespace) {
@@ -18525,8 +18534,9 @@ mod metadata_walk_stuck_detector_tests {
     use super::*;
 
     /// Swarm seed whose network elects replica 1 primary of view 1 with a
-    /// committed pipeline head it has not yet walked.
-    const SEED: u64 = 70;
+    /// committed pipeline head it has not yet walked. Found by scanning seeds
+    /// again after Commit batching changed the packet sequence.
+    const SEED: u64 = 105;
     const REPLICAS: u8 = 3;
     const CLIENTS: [u128; 3] = [1, 2, 3];
 
@@ -19478,6 +19488,227 @@ mod unsynced_power_loss_tests {
             tests::retained_prepare(&sim, usize::from(survivor), namespace, committed_op)
                 .as_slice(),
             "the members journaled different bytes for the send"
+        );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_schedule_sim_tests {
+    //! The Commit heartbeat schedule on the real shards over the simulated
+    //! network. The bus sends one entry per frame, so a fault hits one group.
+
+    use super::metadata_read_frontier_tests::partition_freshness_cluster;
+    use super::tests::submit_and_wait_for_reply;
+    use super::*;
+    use bytes::Bytes;
+    use consensus::HeartbeatSchedule;
+    use iggy_binary_protocol::HeartbeatState;
+    use packet::Packet;
+    use std::cell::Cell;
+
+    const REPLICAS: u8 = 3;
+    const SEED: u64 = 0x4842_0001;
+
+    thread_local! {
+        /// Each Commit entry that a replica sent over a watched link.
+        static SENT_COMMITS: RefCell<Vec<CommitEntry>> = const { RefCell::new(Vec::new()) };
+        /// Batch frames seen by [`drop_every_third_batch`].
+        static BATCH_FRAMES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn record_commit(packet: &Packet) -> bool {
+        if packet.message.header().command == Command::Commit
+            && let Some(entry) = single_commit_entry(&packet.message)
+        {
+            SENT_COMMITS.with_borrow_mut(|sent| sent.push(entry));
+        }
+        false
+    }
+
+    /// Drop one of every three Commit and reply frames, so the losses fall on
+    /// every phase of the quorum window.
+    fn drop_every_third_batch(packet: &Packet) -> bool {
+        if !matches!(
+            packet.message.header().command,
+            Command::Commit | Command::CommitReply
+        ) {
+            return false;
+        }
+        BATCH_FRAMES.with(|frames| {
+            frames.set(frames.get() + 1);
+            frames.get().is_multiple_of(3)
+        })
+    }
+
+    fn watch_links(sim: &mut Simulator, watch: fn(&Packet) -> bool) {
+        for from in 0..REPLICAS {
+            for to in (0..REPLICAS).filter(|to| *to != from) {
+                *sim.network
+                    .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) =
+                    Some(watch);
+            }
+        }
+    }
+
+    fn take_commits(group: u64) -> Vec<CommitEntry> {
+        SENT_COMMITS
+            .with_borrow_mut(std::mem::take)
+            .into_iter()
+            .filter(|entry| entry.group == group)
+            .collect()
+    }
+
+    /// Step until a Commit of `group` with `state` goes out, at most `steps`
+    /// times. Returns the steps taken.
+    fn step_until_commit(
+        sim: &mut Simulator,
+        group: u64,
+        state: HeartbeatState,
+        steps: u64,
+    ) -> Option<u64> {
+        (1..=steps).find(|_| {
+            sim.step();
+            take_commits(group)
+                .iter()
+                .any(|entry| entry.heartbeat_state() == Ok(state))
+        })
+    }
+
+    fn partition_primary(sim: &Simulator, namespace: IggyNamespace) -> u8 {
+        (0..REPLICAS)
+            .find(|replica| {
+                sim.partition_consensus_state(usize::from(*replica), namespace)
+                    .is_some_and(|state| state.is_primary)
+            })
+            .expect("the partition has a primary")
+    }
+
+    #[test]
+    fn given_a_metadata_group_without_writes_when_past_the_busy_timeout_should_stay_busy() {
+        let schedule = HeartbeatSchedule::default();
+        let (mut sim, _client, _namespace) = partition_freshness_cluster(REPLICAS, SEED);
+        watch_links(&mut sim, record_commit);
+        take_commits(METADATA_GROUP);
+
+        for _ in 0..2 * schedule.busy_timeout_ticks {
+            sim.step();
+        }
+
+        let commits = take_commits(METADATA_GROUP);
+        let heartbeats_per_backup = 2 * schedule.busy_timeout_ticks / schedule.busy_interval_ticks;
+        assert!(
+            commits.len() as u64 >= heartbeats_per_backup,
+            "{} metadata Commits in two busy timeouts",
+            commits.len()
+        );
+        assert!(
+            commits
+                .iter()
+                .all(|entry| entry.heartbeat_state() != Ok(HeartbeatState::Idle)),
+            "the metadata group never turns idle"
+        );
+    }
+
+    #[test]
+    fn given_an_idle_partition_when_written_and_its_primary_stops_should_wake_and_then_elect_within_the_idle_wait()
+     {
+        const NETWORK_SKEW_TICKS: u64 = 16;
+        let schedule = HeartbeatSchedule::default();
+        let wait = schedule.backup_wait_ticks(HeartbeatState::Idle);
+        let (mut sim, client, namespace) = partition_freshness_cluster(REPLICAS, SEED);
+        let group = namespace.inner();
+        watch_links(&mut sim, record_commit);
+        let to_idle = schedule.busy_timeout_ticks + 2 * schedule.busy_interval_ticks;
+        assert!(
+            step_until_commit(&mut sim, group, HeartbeatState::Idle, to_idle).is_some(),
+            "a partition without writes turns idle"
+        );
+
+        let primary = partition_primary(&sim, namespace);
+        let reply = submit_and_wait_for_reply(
+            &mut sim,
+            1,
+            primary,
+            client.send_messages(namespace, &[Bytes::from_static(b"wake")]),
+        );
+        assert_eq!(reply.header().status, 0);
+        assert!(
+            step_until_commit(
+                &mut sim,
+                group,
+                HeartbeatState::Busy,
+                2 * schedule.busy_interval_ticks
+            )
+            .is_some(),
+            "a write makes the idle partition busy again"
+        );
+        assert!(
+            step_until_commit(&mut sim, group, HeartbeatState::Idle, to_idle).is_some(),
+            "the partition turns idle again"
+        );
+
+        sim.replica_crash(primary);
+        let backups: Vec<usize> = (0..REPLICAS)
+            .filter(|replica| *replica != primary)
+            .map(usize::from)
+            .collect();
+        let elected = (1..=wait + schedule.busy_interval_ticks).find(|_| {
+            sim.step();
+            backups.iter().any(|backup| {
+                sim.partition_consensus_state(*backup, namespace)
+                    .is_some_and(|state| state.view > 0 || state.status != Status::Normal)
+            })
+        });
+        // The last Idle Commit reaches each backup after its own network delay,
+        // and the view change needs both votes. The skew is a few ticks of that
+        // delay, far below the gap between the busy and the idle wait.
+        assert!(
+            elected.is_some_and(|ticks| {
+                ticks > schedule.busy_timeout_ticks && ticks <= wait + NETWORK_SKEW_TICKS
+            }),
+            "a backup of an idle group starts a view change within max(T_I, T_B) = {wait} ticks, \
+             took {elected:?}"
+        );
+    }
+
+    #[test]
+    fn given_lost_and_late_batches_on_every_window_phase_when_groups_run_should_keep_their_quorum()
+    {
+        let schedule = HeartbeatSchedule::default();
+        let (mut sim, _client, namespace) = partition_freshness_cluster(REPLICAS, SEED);
+        let primary = partition_primary(&sim, namespace);
+        let metadata_view = sim.metadata_consensus(0).unwrap().view();
+        let partition_view = sim
+            .partition_consensus_state(usize::from(primary), namespace)
+            .unwrap()
+            .view;
+        watch_links(&mut sim, drop_every_third_batch);
+        // A late reply that still lands inside its window counts.
+        for backup in (0..REPLICAS).filter(|replica| *replica != primary) {
+            *sim.network
+                .link_extra_delay(ProcessId::Replica(backup), ProcessId::Replica(primary)) =
+                schedule.grid_ticks;
+        }
+
+        for _ in 0..3 * schedule
+            .quorum_window_ticks(true)
+            .max(schedule.idle_timeout_ticks)
+        {
+            sim.step();
+        }
+
+        let partition = sim
+            .partition_consensus_state(usize::from(primary), namespace)
+            .unwrap();
+        assert!(partition.is_primary && partition.status == Status::Normal);
+        assert_eq!(
+            partition.view, partition_view,
+            "the partition kept its view"
+        );
+        assert_eq!(
+            sim.metadata_consensus(0).unwrap().view(),
+            metadata_view,
+            "the metadata group kept its view"
         );
     }
 }

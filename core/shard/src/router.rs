@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::commit_batch;
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
@@ -24,14 +25,17 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use futures::future::poll_fn;
-use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{
+    Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader, ConsensusError,
+    GenericHeader, Operation, PrepareHeader,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn, ReplicaLinkId};
 use partitions::{FatalCommit, PartitionIncarnation};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,7 +149,104 @@ where
             }
         };
         let (operation, namespace) = bag.routing();
-        self.route_typed(operation, namespace, bag);
+        match bag {
+            MessageBag::Commit(message) => self.route_commit_batch(message, operation),
+            MessageBag::CommitReply(message) => self.route_commit_reply_batch(message, operation),
+            bag => self.route_typed(operation, namespace, bag),
+        }
+    }
+
+    /// Send each entry of a Commit batch to the shard that owns its group. A
+    /// body that does not match its checksum drops the whole frame.
+    fn route_commit_batch(&self, message: Message<CommitHeader>, operation: Operation) {
+        let header = *message.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitEntry>(&message, header.checksum_body)
+        else {
+            self.drop_corrupt_batch(header.command);
+            return;
+        };
+        self.metrics.record_commit_batch_received(entries.len());
+        if let Some(target) = self.single_target(&entries, |entry| entry.group) {
+            self.try_send_to_target(target, MessageBag::Commit(message), operation);
+            return;
+        }
+        for (target, entries) in self.entries_by_shard(entries, |entry| entry.group) {
+            if let Some(part) =
+                commit_batch::encode_commit_batch(header.cluster, header.replica, &entries)
+            {
+                self.try_send_to_target(target, MessageBag::Commit(part), operation);
+            }
+        }
+    }
+
+    /// Send each entry of a `CommitReply` batch to the shard that owns its
+    /// group. A body that does not match its checksum drops the whole frame.
+    fn route_commit_reply_batch(&self, message: Message<CommitReplyHeader>, operation: Operation) {
+        let header = *message.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitReplyEntry>(&message, header.checksum_body)
+        else {
+            self.drop_corrupt_batch(header.command);
+            return;
+        };
+        self.metrics
+            .record_commit_reply_batch_received(entries.len());
+        if let Some(target) = self.single_target(&entries, |entry| entry.group) {
+            self.try_send_to_target(target, MessageBag::CommitReply(message), operation);
+            return;
+        }
+        for (target, entries) in self.entries_by_shard(entries, |entry| entry.group) {
+            if let Some(part) =
+                commit_batch::encode_commit_reply_batch(header.cluster, header.replica, &entries)
+            {
+                self.try_send_to_target(target, MessageBag::CommitReply(part), operation);
+            }
+        }
+    }
+
+    /// The shard that owns every group of `entries`, or `None` when they span
+    /// shards. Nodes with equal shard counts hash a group to the same shard, so
+    /// a batch between them has one owner.
+    fn single_target<E>(&self, entries: &[E], group: impl Fn(&E) -> u64) -> Option<u16> {
+        let (first, rest) = entries.split_first()?;
+        let target = self.group_shard(group(first));
+        rest.iter()
+            .all(|entry| self.group_shard(group(entry)) == target)
+            .then_some(target)
+    }
+
+    fn entries_by_shard<E>(
+        &self,
+        entries: Vec<E>,
+        group: impl Fn(&E) -> u64,
+    ) -> BTreeMap<u16, Vec<E>> {
+        let mut targets: BTreeMap<u16, Vec<E>> = BTreeMap::new();
+        for entry in entries {
+            targets
+                .entry(self.group_shard(group(&entry)))
+                .or_default()
+                .push(entry);
+        }
+        targets
+    }
+
+    fn group_shard(&self, group: u64) -> u16 {
+        if group == METADATA_GROUP {
+            0
+        } else {
+            calculate_shard_from_consensus_ns(group, self.shard_count)
+        }
+    }
+
+    fn drop_corrupt_batch(&self, command: Command) {
+        self.metrics
+            .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNPARSABLE);
+        tracing::warn!(
+            shard = self.id,
+            ?command,
+            "dropping a batch frame whose body does not match its checksum"
+        );
     }
 
     /// Invoke the client-request handler directly, exactly as the client-fd
@@ -1334,10 +1435,10 @@ enum ReplicaHandshakeOutcome {
 mod tests {
     use super::*;
     use crate::partition_placement_tests::owner;
-    use crate::{build_deny_reply_from_request_header, shard_channel};
+    use crate::{build_deny_reply_from_request_header, shard_channel, shard_mesh_channels};
     use iggy_binary_protocol::RoutedRequestHeader;
     use iggy_binary_protocol::{
-        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, HeartbeatState, PrepareHeader,
         prepare_identity_checksum_bytes,
     };
     use iggy_common::IggyError;
@@ -1582,5 +1683,80 @@ mod tests {
             matches!(reply.try_recv(), Ok(None)),
             "a staged denial without its owner must not fill an HTTP slot"
         );
+    }
+
+    #[test]
+    fn given_commit_batches_when_dispatched_should_send_each_owner_shard_one_frame_of_its_entries()
+    {
+        const SHARDS: u16 = 2;
+        const INBOX_CAPACITY: usize = 4;
+        const SENDER: u8 = 1;
+        let (mut shard, _) = owner(0);
+        let (senders, inboxes, _replies) = shard_mesh_channels(SHARDS, INBOX_CAPACITY, 1);
+        shard.attach_senders(senders);
+        let inboxes: Vec<_> = inboxes.into_iter().map(Option::unwrap).collect();
+        let groups_on = |target| {
+            (0..)
+                .map(|id| IggyNamespace::new(1, 1, id).inner())
+                .filter(move |group| {
+                    calculate_shard_from_consensus_ns(*group, u32::from(SHARDS)) == target
+                })
+        };
+        let on_zero = groups_on(0).next().unwrap();
+        let on_one: Vec<u64> = groups_on(1).take(2).collect();
+
+        let commit = |group| CommitEntry::new(group, 1, 2, 3, 4, HeartbeatState::Busy, 0);
+        let one_owner = [commit(METADATA_GROUP), commit(on_zero)];
+        let two_owners = [commit(on_zero), commit(on_one[0]), commit(METADATA_GROUP)];
+        for entries in [&one_owner[..], &two_owners] {
+            let batch = commit_batch::encode_commit_batch(1, SENDER, entries).unwrap();
+            shard.dispatch(batch.into_generic());
+        }
+        assert_eq!(
+            routed(&inboxes[0]),
+            [
+                (SENDER, one_owner.to_vec()),
+                (SENDER, vec![commit(on_zero), commit(METADATA_GROUP)]),
+            ]
+        );
+        assert_eq!(routed(&inboxes[1]), [(SENDER, vec![commit(on_one[0])])]);
+
+        let reply = |group| CommitReplyEntry::new(group, 1, 2, 3, 0);
+        let one_owner = [reply(on_one[0]), reply(on_one[1])];
+        let two_owners = [reply(on_one[1]), reply(METADATA_GROUP), reply(on_one[0])];
+        for entries in [&one_owner[..], &two_owners] {
+            let batch = commit_batch::encode_commit_reply_batch(1, SENDER, entries).unwrap();
+            shard.dispatch(batch.into_generic());
+        }
+        assert_eq!(routed(&inboxes[0]), [(SENDER, vec![reply(METADATA_GROUP)])]);
+        assert_eq!(
+            routed(&inboxes[1]),
+            [
+                (SENDER, one_owner.to_vec()),
+                (SENDER, vec![reply(on_one[1]), reply(on_one[0])]),
+            ]
+        );
+    }
+
+    /// The sender node and the entries of every batch frame in `inbox`.
+    fn routed<E: bytemuck::Pod>(inbox: &Receiver<ShardFrame>) -> Vec<(u8, Vec<E>)> {
+        std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(|frame| {
+                let decoded = match frame {
+                    ShardFrame::Consensus {
+                        message: MessageBag::Commit(message),
+                        ..
+                    } => commit_batch::verified_entries(&message, message.header().checksum_body)
+                        .map(|entries| (message.header().replica, entries)),
+                    ShardFrame::Consensus {
+                        message: MessageBag::CommitReply(message),
+                        ..
+                    } => commit_batch::verified_entries(&message, message.header().checksum_body)
+                        .map(|entries| (message.header().replica, entries)),
+                    _ => None,
+                };
+                decoded.expect("only batch frames with a matching body checksum")
+            })
+            .collect()
     }
 }
