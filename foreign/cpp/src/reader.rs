@@ -188,6 +188,7 @@ impl ffi::ReadErrorInfo {
         let lost = error.lost.as_ref().map(|lost| (*lost.start(), *lost.end()));
         self.has_lost = lost.is_some();
         (self.lost_first, self.lost_last) = lost.unwrap_or_default();
+        self.lasting_refusal = error.is_lasting_refusal();
     }
 }
 
@@ -322,11 +323,11 @@ mod tests {
             Some(PARTITION),
             IggyError::FetchProgressUncertain(OPERATION),
         );
-        lost.skip = Some(continuation_at(LAST + 1));
         lost.lost = Some(FIRST..=LAST);
 
         info.record(&lost);
         assert!(info.has_lost);
+        assert!(info.skip.is_empty());
         assert_eq!((info.lost_first, info.lost_last), (FIRST, LAST));
 
         info.record(&ReadError::new(Some(PARTITION), IggyError::ClientShutdown));
@@ -335,6 +336,21 @@ mod tests {
             "a later error must not keep the lost range of an earlier one"
         );
         assert_eq!((info.lost_first, info.lost_last), (0, 0));
+    }
+
+    #[test]
+    fn given_a_read_error_of_a_lasting_refusal_when_recording_should_flag_only_the_stop() {
+        let mut info = ffi::ReadErrorInfo::default();
+        // The flagged error goes first, so each later one must also clear the flag.
+        for (partition_id, error, flagged) in [
+            (Some(PARTITION), IggyError::Unauthorized, true),
+            (None, IggyError::Unauthorized, false),
+            (Some(PARTITION), IggyError::HistoryUnavailable, false),
+        ] {
+            info.record(&ReadError::new(partition_id, error));
+
+            assert_eq!(info.lasting_refusal, flagged);
+        }
     }
 
     #[test]

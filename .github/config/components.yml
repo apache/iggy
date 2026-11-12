@@ -586,6 +586,9 @@ components:
   helm:
     paths:
       - "helm/**"
+      # The smoke builds the gateway image.
+      - "gateways/kafka/Dockerfile"
+      - "gateways/kafka/Dockerfile.dockerignore"
       - "scripts/ci/setup-helm-smoke-cluster.sh"
       - "scripts/ci/test-helm.sh"
     tasks: ["validate", "smoke"]

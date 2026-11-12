@@ -346,6 +346,8 @@ The partitions that a read served go last in the next read of their group, so a 
 
   A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, `next()` first throws `fetchProgressUncertain`, whose `lost` holds the first and the last offset of the range. Then it returns the batch after the gap. If the history no longer holds the gap or its start, for example after retention, the reader does the same with the missing range.
 
+  When `historyUnavailable` stops the partition during the gap read, the reader first reports the rest of the gap the same way. Then `next()` returns the batch after the gap, and only then it throws the error that stopped the partition.
+
   A seek to an offset above zero stores the offset before it first, once the committing read of the partition in flight ended, so a restart resumes at the sought offset. If a stored offset exists, a seek to offset zero or to `.first` deletes it instead. A seek to a timestamp first reads the message at the timestamp without a commit, then works as a seek to its offset. Without such a message it stores nothing. A read never moves the stored offset back.
 
   No committing read of the partition starts while the seek runs. A refused read, store, lookup or delete fails the seek and moves nothing. A store or delete refused as not owned goes once more, as described for `consumerGroupPartitionNotOwned` below. A store or delete with an unknown outcome also fails the seek. If that write moved the stored offset forward, the next read reads the skipped messages again. After such a delete, the partition reads on after the deleted offset.
@@ -361,7 +363,7 @@ The partitions that a read served go last in the next read of their group, so a 
   `AutoCommit.default` stores every 10,000 messages or 5 seconds after `.processing`. A store only moves forward, and a position of an older generation is dropped.
 
 A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. For a lost range it has `lost`.
-The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
+The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek. A lost range itself does not stop the partition and needs no seek.
 
 `consumerGroupPartitionNotOwned` on a read of a group member is not a leave. A new session and a move of the partition away and back look the same. The partition keeps its position and what `close()` needs of it. The reader syncs its assignment and reads the partition again after `retryInterval`.
 Each further refusal in a row doubles that wait, up to 32 times `retryInterval` at the sixth. The sixth refusal in a row also makes `next()` throw one `ReadError` for the partition, the partition reads on, and the count starts again.
