@@ -473,6 +473,7 @@ where
     /// The entry itself, when the request queue is at its depth bound.
     pub fn push_queued_request(&self, mut entry: RequestEntry) -> Result<(), RequestEntry> {
         entry.received_at = self.clock_realtime_micros();
+        self.pipeline_used.set(true);
         self.pipeline.borrow_mut().push_request(entry)
     }
 }
@@ -625,6 +626,13 @@ impl LocalPipeline {
             prepare_queue_max,
             request_queue_max,
         }
+    }
+
+    /// Gives back the capacity of both queues that holds no entry, so an
+    /// empty pipeline keeps no heap.
+    pub fn shrink_to_fit(&mut self) {
+        self.prepare_queue.shrink_to_fit();
+        self.request_queue.shrink_to_fit();
     }
 
     #[must_use]
@@ -887,9 +895,13 @@ impl LocalPipeline {
 
     /// Clear both queues at view-change completion. New primary rebuilds
     /// prepares from journal; clients retry dropped requests via read-timeout.
+    ///
+    /// The buffers go too. Only a primary fills the queues, and only its
+    /// heartbeat runs [`Self::shrink_to_fit`], so a replica that leaves the
+    /// primary role here would keep them until it restarts.
     pub fn clear(&mut self) {
-        self.prepare_queue.clear();
-        self.request_queue.clear();
+        self.prepare_queue = VecDeque::new();
+        self.request_queue = VecDeque::new();
     }
 
     /// Drop reply senders on all prepare entries; receivers wake with
@@ -1034,6 +1046,10 @@ impl Pipeline for LocalPipeline {
 
     fn request_queue_len(&self) -> usize {
         Self::request_queue_len(self)
+    }
+
+    fn shrink_to_fit(&mut self) {
+        Self::shrink_to_fit(self);
     }
 }
 
@@ -1479,6 +1495,11 @@ where
     last_prepare_checksum: Cell<u128>,
 
     pipeline: RefCell<P>,
+    /// An entry may have entered the pipeline since the last commit heartbeat.
+    /// A pipeline under load is empty between batches, so an empty pipeline
+    /// alone does not show that the group is idle. Kept here, because in the
+    /// pipeline the flag would add 16 B to every partition.
+    pipeline_used: Cell<bool>,
     /// Snapshot of the pipeline's in-flight prepare capacity, taken at
     /// construction. Bounds the loopback queue and the view-change rebuild
     /// range without re-borrowing `pipeline`.
@@ -1651,6 +1672,22 @@ where
     /// [`ConsensusClock`].
     clock: ConsensusClock,
 }
+
+/// Size of the field that `projection` returns.
+///
+/// For const asserts on a field that must stay as small as one pointer: the
+/// assert reads the type of the field itself, so it fails the build when the
+/// field holds its state inline again.
+#[must_use]
+pub const fn field_size<T, F>(_projection: fn(&T) -> &F) -> usize {
+    size_of::<F>()
+}
+
+// Inline, the DVC table costs every group 3 KiB outside a view change.
+const _: () = assert!(
+    field_size(|consensus: &VsrConsensus| &consensus.do_view_change_from_all_replicas)
+        == size_of::<RefCell<usize>>()
+);
 
 /// What carried a log that contradicts an op this replica applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2033,6 +2070,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(pipeline),
+            pipeline_used: Cell::new(false),
             prepare_queue_max,
             message_bus,
             loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
@@ -2604,7 +2642,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Callers that pop or clear should prefer [`Self::pop_committed_prepare`] /
     /// [`Self::clear_pipeline`], which also keep the prepare timeout's
     /// ticking-iff-non-empty invariant. This form does not.
+    ///
+    /// `f` can push, so the call counts as use of the pipeline for the idle
+    /// check of the commit heartbeat.
     pub fn with_pipeline_mut<R>(&self, f: impl FnOnce(&mut P) -> R) -> R {
+        self.pipeline_used.set(true);
         f(&mut self.pipeline.borrow_mut())
     }
 
@@ -2731,6 +2773,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         pipeline.push(entry);
         let pipeline_depth = pipeline.len();
         drop(pipeline);
+        self.pipeline_used.set(true);
 
         let header = message.header();
 
@@ -4027,6 +4070,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         self.timeouts.borrow_mut().reset(TimeoutKind::CommitMessage);
+        // The heartbeat is the one periodic event of an idle primary, so the
+        // idle check of the pipeline needs no timer of its own. A group that
+        // takes a write in every heartbeat interval keeps its queue buffers.
+        // An idle group gives them back at the second heartbeat after its
+        // last write.
+        if !self.pipeline_used.replace(false) {
+            self.pipeline.borrow_mut().shrink_to_fit();
+        }
 
         vec![self.commit_heartbeat()]
     }
@@ -6642,6 +6693,31 @@ mod request_queue_tests {
         assert_eq!(head.header.op, 7);
     }
 
+    #[test]
+    fn given_pipeline_with_entries_when_shrinking_should_keep_them_and_free_the_rest() {
+        let mut pipeline = LocalPipeline::new();
+        pipeline.push(PipelineEntry::new(PrepareHeader {
+            op: 1,
+            ..PrepareHeader::default()
+        }));
+        pipeline
+            .push_request(RequestEntry::new(make_request(1, 1)))
+            .unwrap();
+
+        pipeline.shrink_to_fit();
+        assert_eq!(
+            pipeline.prepare_head().map(|entry| entry.header.op),
+            Some(1)
+        );
+        assert_eq!(pipeline.request_queue_len(), 1);
+
+        assert!(pipeline.pop_message().is_some());
+        assert!(pipeline.pop_request().is_some());
+        pipeline.shrink_to_fit();
+        assert_eq!(pipeline.prepare_queue.capacity(), 0);
+        assert_eq!(pipeline.request_queue.capacity(), 0);
+    }
+
     // is_full() tracks ONLY prepare_queue, splits "backpressure" signal
     // from "drop the request" signal.
     #[test]
@@ -8237,6 +8313,70 @@ mod vsr_consensus_tests {
         commit_acked_head(&consensus, 1);
         assert_eq!(commits(), 1, "the heartbeat answers the request");
         assert_eq!(commits(), 0, "the heartbeat consumed the request");
+    }
+
+    /// Slots allocated for the prepare queue and for the request queue.
+    fn queue_capacities(consensus: &VsrConsensus<StageNoopBus>) -> (usize, usize) {
+        consensus.with_pipeline(|pipeline| {
+            (
+                pipeline.prepare_queue.capacity(),
+                pipeline.request_queue.capacity(),
+            )
+        })
+    }
+
+    /// One committed write that passed through both queues.
+    fn commit_queued_write(consensus: &VsrConsensus<StageNoopBus>, op: u64) {
+        assert!(
+            consensus
+                .push_queued_request(RequestEntry::new(client_request(u128::from(op))))
+                .is_ok()
+        );
+        assert!(consensus.pop_queued_request().is_some());
+        pipeline(consensus, &projected_prepare(op, 0));
+        commit_acked_head(consensus, op);
+    }
+
+    #[test]
+    fn given_a_primary_that_took_writes_when_a_heartbeat_interval_passes_without_one_should_free_its_queues()
+     {
+        const HEARTBEAT_TICKS: u64 = 2;
+        const BUSY_INTERVALS: u64 = 3;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.set_commit_message_ticks(HEARTBEAT_TICKS);
+        consensus.init();
+        let pass_heartbeat_interval = || {
+            for _ in 0..HEARTBEAT_TICKS {
+                let _ = consensus.tick(PlaneKind::Metadata);
+            }
+        };
+
+        for op in 1..=BUSY_INTERVALS {
+            commit_queued_write(&consensus, op);
+            pass_heartbeat_interval();
+            let (prepares, requests) = queue_capacities(&consensus);
+            assert!(
+                prepares > 0 && requests > 0,
+                "a write in every heartbeat interval keeps both queues"
+            );
+        }
+
+        pass_heartbeat_interval();
+        assert_eq!(queue_capacities(&consensus), (0, 0));
+    }
+
+    #[test]
+    fn given_a_primary_that_took_writes_when_it_adopts_the_next_view_should_free_its_queues() {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        commit_queued_write(&consensus, 1);
+
+        let start_view = test_bus::make_start_view(1, 1, 1, 1, 0);
+        let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+
+        assert!(!consensus.is_primary(), "replica 1 leads view 1");
+        assert_eq!(queue_capacities(&consensus), (0, 0));
     }
 
     #[test]
