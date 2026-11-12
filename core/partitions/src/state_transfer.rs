@@ -2482,6 +2482,15 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
+    /// The first op past a pinned transfer plan. The offer for that plan needs
+    /// every body from this op on in memory.
+    pub(crate) fn pinned_transfer_tail(&self) -> Option<u64> {
+        match &*self.transfer_plan.borrow() {
+            Some(TransferPlanSlot::Pinned(plan)) => Some(plan.commit_op.saturating_add(1)),
+            _ => None,
+        }
+    }
+
     /// Pin before building the manifest: flushing and hashing can span several
     /// rounds while writes keep evicting the suffix the receiver will need.
     pub fn retain_transfer_tail(&self, peer: u8, nonce: u128, tick: u64) -> bool {
@@ -2640,7 +2649,7 @@ where
             .as_ref()
             .is_err_and(PartitionTransferUnavailable::resumable)
         {
-            self.transfer_plan.borrow_mut().take();
+            self.drop_transfer_plan();
         }
         offer
     }
@@ -2847,6 +2856,7 @@ where
                 .memory_retained_from()
                 .is_none_or(|retained_from| retained_from > plan.commit_op.saturating_add(1))
         {
+            self.drop_transfer_plan();
             *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Wanted);
             self.notify_io();
             return Err(PartitionTransferUnavailable::FlushPending);
@@ -3083,7 +3093,7 @@ where
     /// name segments that retention may be about to unlink.
     pub fn clear_state_transfer_offer_cache(&self) {
         self.transfer_offer_cache.borrow_mut().take();
-        self.transfer_plan.borrow_mut().take();
+        self.drop_transfer_plan();
     }
 
     fn validate_consumer_offset_transfer_counts(&self) -> Result<(), PartitionTransferUnavailable> {

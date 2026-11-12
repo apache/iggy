@@ -10638,7 +10638,7 @@ mod tests {
             path_layout: PartitionPathLayout::default(),
         };
         let partitions = match repair_memory {
-            Some(budget) => IggyPartitions::with_repair_memory(shard_id, config, 0, budget),
+            Some(budget) => IggyPartitions::new(shard_id, config).with_repair_memory(budget),
             None => IggyPartitions::new(shard_id, config),
         };
         let routes = PapayaShardsTable::new();

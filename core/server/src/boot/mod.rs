@@ -60,6 +60,7 @@ use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::server_error::ServerError;
 use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
+use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::Operation;
@@ -352,6 +353,7 @@ pub fn bootstrap(
         &config,
         total_shards,
     )?));
+    check_repair_ring_share(&config.partition, total_shards)?;
     let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
         usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
             ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
@@ -1227,6 +1229,33 @@ async fn shard_main(
 /// and dropped (the periodic tick recovers). Installed via
 /// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
 /// sole writer of the metadata state machine.
+/// Every shard sheds its repair rings against an equal share of the node
+/// budget, so the shard count decides what the budget is worth.
+fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
+    let share = config.evicted_ring_shard_bytes_max(total_shards);
+    let ring = config.evicted_ring_bytes_max.as_bytes_u64();
+    if share == 0 {
+        error!(
+            "partition.evicted_ring_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
+            config.evicted_ring_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    if share < ring {
+        warn!(
+            "each of {total_shards} shards gets {share} bytes of partition.evicted_ring_node_bytes_max, \
+             less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
+        );
+    } else {
+        info!(
+            "each of {total_shards} shards gets {share} bytes of partition.evicted_ring_node_bytes_max"
+        );
+    }
+    Ok(())
+}
+
 fn make_metadata_commit_notifier(
     senders: Vec<TaggedSender>,
     metrics: ShardMetrics,
@@ -1389,6 +1418,20 @@ mod tests {
         }
         std::fs::write(&marker, STORAGE_FORMAT).unwrap();
         assert!(validate_storage_format(directory.path()).unwrap());
+    }
+
+    /// A share of nothing sheds every ring to its newest entry from the
+    /// first tick, so the node refuses to start with it.
+    #[test]
+    fn given_a_ring_budget_below_one_byte_per_shard_when_booting_should_refuse() {
+        const SHARDS: u16 = 32;
+        let config = |bytes: u64| PartitionConfig {
+            evicted_ring_node_bytes_max: iggy_common::IggyByteSize::from(bytes),
+            ..PartitionConfig::default()
+        };
+        assert!(check_repair_ring_share(&config(u64::from(SHARDS) - 1), SHARDS).is_err());
+        assert!(check_repair_ring_share(&config(u64::from(SHARDS)), SHARDS).is_ok());
+        assert!(check_repair_ring_share(&PartitionConfig::default(), SHARDS).is_ok());
     }
 
     #[test]
