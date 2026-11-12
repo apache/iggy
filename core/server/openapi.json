@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Apache Iggy HTTP API",
-    "version": "0.9.0",
+    "version": "0.10.0",
     "description": "REST API of the Apache Iggy server. Most routes need a bearer credential: either an access token from a login or refresh route, or a raw personal access token. Names and numeric IDs are both accepted wherever a path takes a stream, topic, consumer group, user or consumer. In a cluster, a follower forwards control plane writes to the primary. The web UI routes under `/ui` are not described here.",
     "license": {
       "name": "Apache-2.0",
@@ -212,7 +212,7 @@
         "tags": [
           "System"
         ],
-        "description": "Requires the `read_servers` or `manage_servers` permission.",
+        "description": "Requires the `manage_servers` permission.",
         "parameters": [
           {
             "$ref": "#/components/parameters/Consistency"
@@ -290,7 +290,7 @@
         "tags": [
           "System"
         ],
-        "description": "Registered only when `http.metrics.enabled` is true, at the path set by `http.metrics.endpoint`. `/metrics` is the default in the shipped `config.toml`. Any authenticated user may scrape.",
+        "description": "Registered only when `http.metrics.enabled` is true, at the path set by `http.metrics.endpoint`. `/metrics` is the default in the shipped `config.toml`. Any authenticated user gets the aggregate series. Per-topic and disk series need the `read_servers` or `manage_servers` permission.",
         "security": [
           {
             "bearerAuth": []
@@ -317,6 +317,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthenticated"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       }
@@ -485,7 +488,7 @@
         "tags": [
           "Users"
         ],
-        "description": "Unauthenticated. Wrong credentials and an inactive user are answered with 400. Answers 503 if the node has not finished replaying its log after a restart.",
+        "description": "Unauthenticated. Wrong credentials and an inactive user are answered with 400. With external authentication enabled, an unknown username is checked with the external service: a refusal is 400, and a failed check is 503. Also answers 503 if the node has not finished replaying its log after a restart.",
         "requestBody": {
           "required": true,
           "content": {
@@ -688,8 +691,14 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -825,8 +834,14 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -886,12 +901,6 @@
           },
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
-          },
-          "415": {
-            "$ref": "#/components/responses/UnsupportedMediaType"
-          },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
           },
           "502": {
             "$ref": "#/components/responses/BadGateway"
@@ -967,7 +976,7 @@
         "tags": [
           "Users"
         ],
-        "description": "A wrong current password is answered with 400.",
+        "description": "Changing your own password needs no permission; changing another user's needs `manage_users`. A wrong current password is answered with 400, and an unknown user with 404.",
         "parameters": [
           {
             "$ref": "#/components/parameters/UserId"
@@ -1119,7 +1128,7 @@
         "tags": [
           "Personal access tokens"
         ],
-        "description": "Unauthenticated. An unknown or expired token is answered with 401.",
+        "description": "Unauthenticated. An unknown or expired token is answered with 401, and a token whose user is inactive with 400.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1223,8 +1232,14 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -1413,8 +1428,14 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -1548,8 +1569,24 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "500": {
+            "description": "The resource carries a critical option this server build cannot read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -1609,12 +1646,6 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
-          "415": {
-            "$ref": "#/components/responses/UnsupportedMediaType"
-          },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
-          },
           "502": {
             "$ref": "#/components/responses/BadGateway"
           },
@@ -1645,62 +1676,6 @@
         "responses": {
           "204": {
             "description": "The stream was deleted.",
-            "headers": {
-              "Iggy-View": {
-                "$ref": "#/components/headers/IggyView"
-              },
-              "Iggy-Applied-Op": {
-                "$ref": "#/components/headers/IggyAppliedOp"
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/SessionConflict"
-          },
-          "502": {
-            "$ref": "#/components/responses/BadGateway"
-          },
-          "503": {
-            "$ref": "#/components/responses/ServiceUnavailable"
-          },
-          "504": {
-            "$ref": "#/components/responses/GatewayTimeout"
-          }
-        }
-      }
-    },
-    "/streams/{stream_id}/purge": {
-      "delete": {
-        "operationId": "purge_stream",
-        "summary": "Purge a stream's messages",
-        "tags": [
-          "Streams"
-        ],
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/StreamId"
-          }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "The stream's messages were removed.",
             "headers": {
               "Iggy-View": {
                 "$ref": "#/components/headers/IggyView"
@@ -1794,8 +1769,14 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -1937,8 +1918,24 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "500": {
+            "description": "The resource carries a critical option this server build cannot read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -2001,12 +1998,6 @@
           "413": {
             "$ref": "#/components/responses/PayloadTooLarge"
           },
-          "415": {
-            "$ref": "#/components/responses/UnsupportedMediaType"
-          },
-          "422": {
-            "$ref": "#/components/responses/UnprocessableEntity"
-          },
           "502": {
             "$ref": "#/components/responses/BadGateway"
           },
@@ -2040,65 +2031,6 @@
         "responses": {
           "204": {
             "description": "The topic was deleted.",
-            "headers": {
-              "Iggy-View": {
-                "$ref": "#/components/headers/IggyView"
-              },
-              "Iggy-Applied-Op": {
-                "$ref": "#/components/headers/IggyAppliedOp"
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/SessionConflict"
-          },
-          "502": {
-            "$ref": "#/components/responses/BadGateway"
-          },
-          "503": {
-            "$ref": "#/components/responses/ServiceUnavailable"
-          },
-          "504": {
-            "$ref": "#/components/responses/GatewayTimeout"
-          }
-        }
-      }
-    },
-    "/streams/{stream_id}/topics/{topic_id}/purge": {
-      "delete": {
-        "operationId": "purge_topic",
-        "summary": "Purge a topic's messages",
-        "tags": [
-          "Topics"
-        ],
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/StreamId"
-          },
-          {
-            "$ref": "#/components/parameters/TopicId"
-          }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "The topic's messages were removed.",
             "headers": {
               "Iggy-View": {
                 "$ref": "#/components/headers/IggyView"
@@ -2415,8 +2347,14 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -2564,8 +2502,14 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
           }
         }
       },
@@ -2637,7 +2581,7 @@
         "tags": [
           "Consumer offsets"
         ],
-        "description": "Answers 404 when no offset has been stored for the consumer.",
+        "description": "Answers 404 when no offset has been stored for the consumer, or when the group does not exist.",
         "parameters": [
           {
             "$ref": "#/components/parameters/StreamId"
@@ -2649,9 +2593,18 @@
             "name": "consumer_id",
             "in": "query",
             "required": false,
-            "description": "Consumer ID or name. Defaults to 1. HTTP always uses a regular consumer, never a consumer group.",
+            "description": "Consumer or group ID or name. Defaults to 1.",
             "schema": {
               "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "consumer_kind",
+            "in": "query",
+            "required": false,
+            "description": "Defaults to `consumer`. All three kinds can be read.",
+            "schema": {
+              "$ref": "#/components/schemas/ConsumerKind"
             }
           },
           {
@@ -2707,6 +2660,12 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
           },
           "503": {
             "$ref": "#/components/responses/ServiceUnavailable"
@@ -2816,6 +2775,15 @@
             "$ref": "#/components/parameters/ConsumerId"
           },
           {
+            "name": "consumer_kind",
+            "in": "query",
+            "required": false,
+            "description": "Defaults to `consumer`. `consumer_group` is refused with 400.",
+            "schema": {
+              "$ref": "#/components/schemas/ConsumerKind"
+            }
+          },
+          {
             "name": "partition_id",
             "in": "query",
             "required": false,
@@ -2881,7 +2849,7 @@
         "tags": [
           "Messages"
         ],
-        "description": "Requires the `poll_messages` permission for the topic. A poll that the server fences as a stale consumer group assignment is answered with 200 and an empty batch.",
+        "description": "Requires the `poll_messages` permission for the topic.",
         "parameters": [
           {
             "$ref": "#/components/parameters/StreamId"
@@ -2893,9 +2861,18 @@
             "name": "consumer_id",
             "in": "query",
             "required": false,
-            "description": "Consumer ID or name. Defaults to 1. HTTP always uses a regular consumer, never a consumer group.",
+            "description": "Consumer ID or name. Defaults to 1.",
             "schema": {
               "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "consumer_kind",
+            "in": "query",
+            "required": false,
+            "description": "Defaults to `consumer`. `consumer_group` is refused with 400.",
+            "schema": {
+              "$ref": "#/components/schemas/ConsumerKind"
             }
           },
           {
@@ -2939,6 +2916,19 @@
             }
           },
           {
+            "name": "context",
+            "in": "query",
+            "required": false,
+            "description": "JSON-encoded `PartitionContext` from an earlier reply, such as `{\"incarnation\":1,\"owner_generation\":2,\"metadata_op\":3}`. The poll is refused with 400 if the partition was recreated or changed owner since, and with 503 if this node has not yet seen that context.",
+            "schema": {
+              "type": "string",
+              "contentMediaType": "application/json",
+              "contentSchema": {
+                "$ref": "#/components/schemas/PartitionContext"
+              }
+            }
+          },
+          {
             "name": "count",
             "in": "query",
             "required": false,
@@ -2954,9 +2944,10 @@
             "name": "auto_commit",
             "in": "query",
             "required": false,
-            "description": "Store the consumer offset after polling. The offset may advance before the response arrives, and a successful response does not confirm the commit.",
+            "description": "Must be false here. A poll that stores its offset is a write, so `true` is refused with 400: send it as `POST .../messages/deferred` instead.",
             "schema": {
               "type": "boolean",
+              "const": false,
               "default": false
             }
           },
@@ -3002,6 +2993,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           },
           "502": {
             "$ref": "#/components/responses/BadGateway"
@@ -3132,6 +3126,577 @@
           }
         }
       }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/messages/deferred": {
+      "get": {
+        "operationId": "poll_messages_deferred",
+        "summary": "Poll messages, waiting for them to arrive",
+        "tags": [
+          "Messages"
+        ],
+        "description": "Requires the `poll_messages` permission for the topic. Waits until `min_count` messages are available or `wait_us` passes, then answers like `GET .../messages`. The wait limits are checked before authentication. Answers 503 with Retry-After when the server has too many deferred polls waiting.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "name": "consumer_id",
+            "in": "query",
+            "required": false,
+            "description": "Consumer ID or name. Defaults to 1.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "consumer_kind",
+            "in": "query",
+            "required": false,
+            "description": "Defaults to `consumer`. `consumer_group` is refused with 400.",
+            "schema": {
+              "$ref": "#/components/schemas/ConsumerKind"
+            }
+          },
+          {
+            "name": "partition_id",
+            "in": "query",
+            "required": false,
+            "description": "Partition ID. Defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "Where to start polling. Defaults to `offset`. The single letters `o`, `t`, `f`, `l` and `n` are also accepted.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "offset",
+                "timestamp",
+                "first",
+                "last",
+                "next"
+              ],
+              "default": "offset"
+            }
+          },
+          {
+            "name": "value",
+            "in": "query",
+            "required": false,
+            "description": "Offset, or timestamp in microseconds, for the `offset` and `timestamp` kinds. Defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "context",
+            "in": "query",
+            "required": false,
+            "description": "JSON-encoded `PartitionContext` from an earlier reply, such as `{\"incarnation\":1,\"owner_generation\":2,\"metadata_op\":3}`. The poll is refused with 400 if the partition was recreated or changed owner since, and with 503 if this node has not yet seen that context.",
+            "schema": {
+              "type": "string",
+              "contentMediaType": "application/json",
+              "contentSchema": {
+                "$ref": "#/components/schemas/PartitionContext"
+              }
+            }
+          },
+          {
+            "name": "count",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of messages to return. Defaults to 10.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 10
+            }
+          },
+          {
+            "name": "wait_us",
+            "in": "query",
+            "required": false,
+            "description": "How long to wait for `min_count` messages, in microseconds. At most 600000000. 0 answers at once.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 1000000
+            }
+          },
+          {
+            "name": "min_count",
+            "in": "query",
+            "required": false,
+            "description": "Answer as soon as this many messages are available. At least 1 and no more than `count`.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 1
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "required": false,
+            "description": "Upper bound on the reply size in bytes. At least 344.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 1048576
+            }
+          },
+          {
+            "name": "request_timeout_us",
+            "in": "query",
+            "required": false,
+            "description": "Server-side budget for the whole request, in microseconds, from 1 to 630000000. When `wait_us` is above 0 it must be at least `wait_us` plus 1000000.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 11000000
+            }
+          },
+          {
+            "name": "auto_commit",
+            "in": "query",
+            "required": false,
+            "description": "Must be false here. `true` is refused with 400: use `POST` on this path.",
+            "schema": {
+              "type": "boolean",
+              "const": false,
+              "default": false
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The polled messages.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolledMessages"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      },
+      "post": {
+        "operationId": "poll_messages_committing",
+        "summary": "Poll messages and store the offset, waiting for them to arrive",
+        "tags": [
+          "Messages"
+        ],
+        "description": "Requires the `poll_messages` permission for the topic. Waits until `min_count` messages are available or `wait_us` passes, then answers like `GET .../messages`. The wait limits are checked before authentication. Answers 503 with Retry-After when the server has too many deferred polls waiting. With `auto_commit=true` the poll stores the consumer offset and counts as a write. No body is read.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "name": "consumer_id",
+            "in": "query",
+            "required": false,
+            "description": "Consumer ID or name. Defaults to 1.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "consumer_kind",
+            "in": "query",
+            "required": false,
+            "description": "Defaults to `consumer`. `consumer_group` is refused with 400.",
+            "schema": {
+              "$ref": "#/components/schemas/ConsumerKind"
+            }
+          },
+          {
+            "name": "partition_id",
+            "in": "query",
+            "required": false,
+            "description": "Partition ID. Defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "Where to start polling. Defaults to `offset`. The single letters `o`, `t`, `f`, `l` and `n` are also accepted.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "offset",
+                "timestamp",
+                "first",
+                "last",
+                "next"
+              ],
+              "default": "offset"
+            }
+          },
+          {
+            "name": "value",
+            "in": "query",
+            "required": false,
+            "description": "Offset, or timestamp in microseconds, for the `offset` and `timestamp` kinds. Defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "context",
+            "in": "query",
+            "required": false,
+            "description": "JSON-encoded `PartitionContext` from an earlier reply, such as `{\"incarnation\":1,\"owner_generation\":2,\"metadata_op\":3}`. The poll is refused with 400 if the partition was recreated or changed owner since, and with 503 if this node has not yet seen that context.",
+            "schema": {
+              "type": "string",
+              "contentMediaType": "application/json",
+              "contentSchema": {
+                "$ref": "#/components/schemas/PartitionContext"
+              }
+            }
+          },
+          {
+            "name": "count",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of messages to return. Defaults to 10.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 10
+            }
+          },
+          {
+            "name": "wait_us",
+            "in": "query",
+            "required": false,
+            "description": "How long to wait for `min_count` messages, in microseconds. At most 600000000. 0 answers at once.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 1000000
+            }
+          },
+          {
+            "name": "min_count",
+            "in": "query",
+            "required": false,
+            "description": "Answer as soon as this many messages are available. At least 1 and no more than `count`.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 1
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "required": false,
+            "description": "Upper bound on the reply size in bytes. At least 344.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 1048576
+            }
+          },
+          {
+            "name": "request_timeout_us",
+            "in": "query",
+            "required": false,
+            "description": "Server-side budget for the whole request, in microseconds, from 1 to 630000000. When `wait_us` is above 0 it must be at least `wait_us` plus 1000000.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 11000000
+            }
+          },
+          {
+            "name": "auto_commit",
+            "in": "query",
+            "required": false,
+            "description": "Store the consumer offset after polling. The offset may advance before the response arrives, and a successful response does not confirm the commit.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The polled messages.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolledMessages"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/metadata/changes": {
+      "get": {
+        "operationId": "get_metadata_changes",
+        "summary": "Follow metadata changes",
+        "tags": [
+          "System"
+        ],
+        "description": "Requires the `manage_servers` permission, whatever groups are asked for. Pages through the log of metadata changes, or through the current state of the selected groups when `from=current`, so a client can follow changes without listing resources again. Exactly one of `from` and `after` is required. Unknown, repeated or malformed query keys are refused with 400, including `consistency`.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "Where to start: the oldest retained change, the newest, or a page of the current state.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "earliest",
+                "latest",
+                "current"
+              ]
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "Cursor from `next` of an earlier reply.",
+            "schema": {
+              "type": "string",
+              "pattern": "^mc1_[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "current_after",
+            "in": "query",
+            "required": false,
+            "description": "Token from `current_page_token`. Only with `from=current`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "groups",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated groups to include. Absent or empty means all.",
+            "style": "form",
+            "explode": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "streams",
+                  "topics",
+                  "partitions",
+                  "consumer_groups",
+                  "consumer_group_members",
+                  "users",
+                  "personal_access_tokens",
+                  "sessions"
+                ]
+              }
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Only changes at or after this time, in microseconds. Not with `latest` or `current`.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "description": "Only changes at or before this time, in microseconds. Not with `latest` or `current`.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of changes or current items.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MetadataChanges"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -3140,7 +3705,7 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT",
-        "description": "`Authorization: Bearer <token>`. The token is an access token from `POST /users/login`, `POST /personal-access-tokens/login` or `POST /users/refresh-token`, or a raw personal access token. The server tries it as a JWT first and then as a personal access token. Tokens from configured trusted external issuers are also accepted."
+        "description": "`Authorization: Bearer <token>`, with `Bearer` written exactly so. The token is an access token from `POST /users/login`, `POST /personal-access-tokens/login` or `POST /users/refresh-token`, or a raw personal access token. The server tries it as a JWT first and then as a personal access token. An access token stops working once its user is deleted, even if the ID is reused. Tokens from configured trusted external issuers are also accepted, and act as the user the issuer names, who must exist, be active and not be root."
       }
     },
     "parameters": {
@@ -3247,7 +3812,7 @@
         "name": "consistency",
         "in": "query",
         "required": false,
-        "description": "`serializable` reads from this node's local state, which may lag the primary. `linearizable` reads from the primary: a follower redirects with 307 when it can resolve the primary's address, and answers 503 otherwise. Unknown values are rejected with 400.",
+        "description": "`serializable` reads from this node's local state, which may lag the primary. `linearizable` reads at the primary: a follower that forwards requests relays the read to the primary, or for message and offset reads waits for the primary's commit point. A follower that does not forward redirects with 307 when it can resolve the primary's address, and answers 503 otherwise. Unknown values are rejected with 400.",
         "schema": {
           "type": "string",
           "enum": [
@@ -3315,7 +3880,7 @@
     },
     "responses": {
       "TemporaryRedirect": {
-        "description": "Only for `consistency=linearizable` on a follower. Repeat the request against the primary at `Location`.",
+        "description": "Only for `consistency=linearizable` on a follower that does not forward requests. Repeat the request against the primary at `Location`.",
         "headers": {
           "Location": {
             "$ref": "#/components/headers/Location"
@@ -3329,7 +3894,7 @@
         }
       },
       "BadRequest": {
-        "description": "The request was rejected: an invalid identifier, a failed validation, or a business error such as a duplicate name. A path or query string that cannot be parsed, or malformed JSON, is answered with a plain text body instead.",
+        "description": "The request was rejected: an invalid identifier, a failed validation, or a business error such as a duplicate name. A path or query string that cannot be parsed, or malformed JSON, is answered with a plain text body instead. A typed user header the server cannot decode is answered with 400 JSON.",
         "content": {
           "application/json": {
             "schema": {
@@ -3384,7 +3949,7 @@
         }
       },
       "PayloadTooLarge": {
-        "description": "The body is larger than `http.max_request_size`. The body is plain text, or JSON with code `payload_too_large` when the node was forwarding the request. The connection is closed on HTTP/1.",
+        "description": "The body is larger than `http.max_request_size`. The body is JSON with code `payload_too_large` on message and offset routes and when the node was forwarding the request, and plain text otherwise. The connection is closed on HTTP/1.",
         "content": {
           "application/json": {
             "schema": {
@@ -3419,7 +3984,7 @@
         }
       },
       "TooManyRequests": {
-        "description": "This session already has too many writes in flight. Wait for them to finish, then retry.",
+        "description": "Too many requests in flight: this session's writes, or the relayed requests the target node accepts for this credential. Wait for them to finish, then retry.",
         "headers": {
           "Retry-After": {
             "$ref": "#/components/headers/RetryAfter"
@@ -3434,7 +3999,7 @@
         }
       },
       "BadGateway": {
-        "description": "The node forwarded the request to the primary and the forward failed after sending. The outcome is unknown.",
+        "description": "The node forwarded the request to the primary and the forward failed after sending, or the primary's reply was too large to relay. The outcome is unknown.",
         "content": {
           "application/json": {
             "schema": {
@@ -3525,20 +4090,6 @@
         "minimum": 0,
         "description": "Expiry in microseconds. 0 means the server default and 18446744073709551615 (the largest unsigned 64-bit value) means never expire."
       },
-      "MaxTopicSize": {
-        "type": "integer",
-        "format": "uint64",
-        "minimum": 0,
-        "description": "Maximum topic size in bytes. 0 means the server default and 18446744073709551615 (the largest unsigned 64-bit value) means unlimited."
-      },
-      "CompressionAlgorithm": {
-        "type": "string",
-        "enum": [
-          "none",
-          "gzip"
-        ],
-        "description": "Compression algorithm. Input is matched without regard to case."
-      },
       "UserStatus": {
         "type": "string",
         "enum": [
@@ -3551,7 +4102,10 @@
         "properties": {
           "value": {
             "type": "string",
-            "description": "Value in the same string form a create request takes."
+            "description": "Value as text: base64 for `raw`, `0x` and the hexadecimal IEEE 754 bits for floats, otherwise the same form a create request takes."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/HeaderKind"
           },
           "explicit": {
             "type": "boolean",
@@ -3560,6 +4114,7 @@
         },
         "required": [
           "value",
+          "kind",
           "explicit"
         ]
       },
@@ -3571,25 +4126,7 @@
             "description": "Option key."
           },
           "kind": {
-            "type": "string",
-            "enum": [
-              "raw",
-              "string",
-              "bool",
-              "int8",
-              "int16",
-              "int32",
-              "int64",
-              "int128",
-              "uint8",
-              "uint16",
-              "uint32",
-              "uint64",
-              "uint128",
-              "float32",
-              "float64"
-            ],
-            "description": "Value type the server stores the option as."
+            "$ref": "#/components/schemas/HeaderKind"
           },
           "default_value": {
             "type": "array",
@@ -3602,11 +4139,36 @@
           },
           "description": {
             "type": "string"
+          },
+          "updatable": {
+            "type": "boolean",
+            "description": "Can be changed by an update request."
+          },
+          "resettable": {
+            "type": "boolean",
+            "description": "Can be named in the `reset` array of an update request."
+          },
+          "secret": {
+            "type": "boolean",
+            "description": "Never returned in plain text."
+          },
+          "read_only": {
+            "type": "boolean",
+            "description": "Computed by the server; a request cannot set it."
+          },
+          "critical": {
+            "type": "boolean",
+            "description": "A build that cannot read this option refuses the resource instead of ignoring it."
           }
         },
         "required": [
           "key",
           "kind",
+          "updatable",
+          "resettable",
+          "secret",
+          "read_only",
+          "critical",
           "default_value",
           "description"
         ]
@@ -3836,7 +4398,7 @@
               "object",
               "null"
             ],
-            "description": "Per-topic permissions keyed by numeric topic ID.",
+            "description": "Per-topic permissions keyed by numeric topic ID. Omit or send null for none.",
             "propertyNames": {
               "pattern": "^[0-9]+$"
             },
@@ -3851,8 +4413,7 @@
           "manage_topics",
           "read_topics",
           "poll_messages",
-          "send_messages",
-          "topics"
+          "send_messages"
         ]
       },
       "TopicPermissions": {
@@ -3890,7 +4451,7 @@
               "object",
               "null"
             ],
-            "description": "Per-stream permissions keyed by numeric stream ID.",
+            "description": "Per-stream permissions keyed by numeric stream ID. Omit or send null for none.",
             "propertyNames": {
               "pattern": "^[0-9]+$"
             },
@@ -3900,8 +4461,7 @@
           }
         },
         "required": [
-          "global",
-          "streams"
+          "global"
         ]
       },
       "UserInfo": {
@@ -4006,6 +4566,14 @@
               }
             ],
             "description": "Permissions. Omit or send null for none."
+          },
+          "options": {
+            "type": "object",
+            "description": "Options keyed by name. `GET /options/user` lists the keys, their kinds and which can be set at create. Unknown and repeated keys are rejected.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionInput"
+            },
+            "default": {}
           }
         },
         "required": [
@@ -4016,13 +4584,14 @@
       },
       "UpdateUser": {
         "type": "object",
+        "description": "User options to change, as one flat object. Send only the keys to change. `null` keeps the current value. A body that changes nothing is refused with 400.",
         "properties": {
           "username": {
             "type": [
               "string",
               "null"
             ],
-            "description": "New username, 3 to 50 bytes. Omit to keep the current one."
+            "description": "New username, 3 to 50 bytes."
           },
           "status": {
             "oneOf": [
@@ -4032,19 +4601,11 @@
               {
                 "type": "null"
               }
-            ],
-            "description": "New status. Omit to keep the current one."
-          },
-          "options": {
-            "type": "object",
-            "description": "User options to change. No user option can be changed yet, so any key is rejected.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "default": {}
+            ]
           }
         },
-        "required": []
+        "additionalProperties": false,
+        "minProperties": 1
       },
       "ChangePassword": {
         "type": "object",
@@ -4185,6 +4746,14 @@
           "name": {
             "type": "string",
             "description": "Unique stream name, up to 255 bytes."
+          },
+          "options": {
+            "type": "object",
+            "description": "Options keyed by name. `GET /options/stream` lists the keys, their kinds and which can be set at create. Unknown and repeated keys are rejected. A stored option sent at the top level instead of inside `options` is refused with 400.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionInput"
+            },
+            "default": {}
           }
         },
         "required": [
@@ -4193,23 +4762,18 @@
       },
       "UpdateStream": {
         "type": "object",
+        "description": "Stream options to change, as one flat object. Send only the keys to change. `null` keeps the current value. A body that changes nothing is refused with 400.",
         "properties": {
           "name": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "New stream name, up to 255 bytes."
-          },
-          "options": {
-            "type": "object",
-            "description": "Stream options to change. No stream option can be changed yet, so any key is rejected.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "default": {}
           }
         },
-        "required": [
-          "name"
-        ]
+        "additionalProperties": false,
+        "minProperties": 1
       },
       "Topic": {
         "type": "object",
@@ -4228,15 +4792,6 @@
           "size": {
             "$ref": "#/components/schemas/ByteSize"
           },
-          "message_expiry": {
-            "$ref": "#/components/schemas/Expiry"
-          },
-          "compression_algorithm": {
-            "$ref": "#/components/schemas/CompressionAlgorithm"
-          },
-          "max_topic_size": {
-            "$ref": "#/components/schemas/MaxTopicSize"
-          },
           "messages_count": {
             "type": "integer",
             "format": "uint64",
@@ -4249,7 +4804,7 @@
           },
           "options": {
             "type": "object",
-            "description": "Resource options keyed by option name.",
+            "description": "Resource options keyed by name, including `compression_algorithm`, `message_expiry` and `max_topic_size`.",
             "additionalProperties": {
               "$ref": "#/components/schemas/OptionValue"
             }
@@ -4260,9 +4815,6 @@
           "created_at",
           "name",
           "size",
-          "message_expiry",
-          "compression_algorithm",
-          "max_topic_size",
           "messages_count",
           "partitions_count",
           "options"
@@ -4285,15 +4837,6 @@
           "size": {
             "$ref": "#/components/schemas/ByteSize"
           },
-          "message_expiry": {
-            "$ref": "#/components/schemas/Expiry"
-          },
-          "compression_algorithm": {
-            "$ref": "#/components/schemas/CompressionAlgorithm"
-          },
-          "max_topic_size": {
-            "$ref": "#/components/schemas/MaxTopicSize"
-          },
           "messages_count": {
             "type": "integer",
             "format": "uint64",
@@ -4312,7 +4855,7 @@
           },
           "options": {
             "type": "object",
-            "description": "Resource options keyed by option name.",
+            "description": "Resource options keyed by name, including `compression_algorithm`, `message_expiry` and `max_topic_size`.",
             "additionalProperties": {
               "$ref": "#/components/schemas/OptionValue"
             }
@@ -4323,9 +4866,6 @@
           "created_at",
           "name",
           "size",
-          "message_expiry",
-          "compression_algorithm",
-          "max_topic_size",
           "messages_count",
           "partitions_count",
           "partitions",
@@ -4360,6 +4900,29 @@
             "type": "integer",
             "format": "uint64",
             "minimum": 0
+          },
+          "context": {
+            "$ref": "#/components/schemas/PartitionContext"
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "description": "Replica IDs of the nodes that hold the partition."
+          },
+          "in_sync_members": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "description": "Replica IDs of the members that are in sync."
           }
         },
         "required": [
@@ -4368,7 +4931,10 @@
           "segments_count",
           "current_offset",
           "size",
-          "messages_count"
+          "messages_count",
+          "context",
+          "members",
+          "in_sync_members"
         ]
       },
       "CreateTopic": {
@@ -4385,84 +4951,66 @@
             "maximum": 1000,
             "description": "Number of partitions, up to 1000."
           },
-          "compression_algorithm": {
-            "$ref": "#/components/schemas/CompressionAlgorithm"
-          },
-          "message_expiry": {
-            "$ref": "#/components/schemas/Expiry"
-          },
-          "max_topic_size": {
-            "$ref": "#/components/schemas/MaxTopicSize"
-          },
           "options": {
             "type": "object",
-            "description": "Further topic options as strings, parsed with the same rules as the server config. Accepted keys: `compression_algorithm`, `message_expiry`, `max_topic_size`, `segment_size`, `durability`, `consumer_offset_durability`, `messages_required_to_save`, `size_of_messages_required_to_save` and `preallocate_segments`. Unknown keys are rejected. `GET /options/topic` describes each key.",
+            "description": "Options keyed by name. `GET /options/topic` lists the keys, their kinds and which can be set at create. Unknown and repeated keys are rejected. A stored option such as `message_expiry` sent at the top level instead of inside `options` is refused with 400.",
             "additionalProperties": {
-              "type": "string"
+              "$ref": "#/components/schemas/OptionInput"
             },
             "default": {}
           }
         },
         "required": [
           "name",
-          "partitions_count",
-          "compression_algorithm",
-          "message_expiry",
-          "max_topic_size"
+          "partitions_count"
         ]
       },
       "UpdateTopic": {
         "type": "object",
+        "description": "Topic options to change, as one flat object. Only `name`, `message_expiry` and `max_topic_size` can be changed; the other topic options are fixed at create. Send only the keys to change. `null` keeps the current value. A body that changes nothing is refused with 400.",
         "properties": {
           "name": {
-            "type": "string",
-            "description": "Topic name, up to 255 bytes."
-          },
-          "compression_algorithm": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/CompressionAlgorithm"
-              },
-              {
-                "type": "null"
-              }
+            "type": [
+              "string",
+              "null"
             ],
-            "description": "Omit to keep the current value."
+            "description": "New topic name, up to 255 bytes."
           },
           "message_expiry": {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/Expiry"
+                "$ref": "#/components/schemas/OptionInput"
               },
               {
                 "type": "null"
               }
-            ],
-            "description": "Omit to keep the current value."
+            ]
           },
           "max_topic_size": {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/MaxTopicSize"
+                "$ref": "#/components/schemas/OptionInput"
               },
               {
                 "type": "null"
               }
-            ],
-            "description": "Omit to keep the current value."
+            ]
           },
-          "options": {
-            "type": "object",
-            "description": "Topic options to change. Only `compression_algorithm`, `message_expiry` and `max_topic_size` are accepted. Keys that are not sent keep their current values.",
-            "additionalProperties": {
-              "type": "string"
+          "reset": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "message_expiry",
+                "max_topic_size"
+              ]
             },
-            "default": {}
+            "description": "Options to return to their defaults."
           }
         },
-        "required": [
-          "name"
-        ]
+        "additionalProperties": false,
+        "minProperties": 1
       },
       "CreatePartitions": {
         "type": "object",
@@ -4628,6 +5176,10 @@
       "StoreConsumerOffset": {
         "type": "object",
         "properties": {
+          "consumer_kind": {
+            "$ref": "#/components/schemas/ConsumerKind",
+            "description": "`consumer_group` is refused with 400."
+          },
           "consumer_id": {
             "$ref": "#/components/schemas/ConsumerId"
           },
@@ -4645,6 +5197,17 @@
             "format": "uint64",
             "minimum": 0,
             "description": "Offset to store."
+          },
+          "context": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PartitionContext"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Fences the store: it is refused if the partition changed since this context was read."
           }
         },
         "required": [
@@ -4769,6 +5332,18 @@
           },
           "total_disk_space": {
             "$ref": "#/components/schemas/ByteSize"
+          },
+          "open_files_count": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "File descriptors the server process holds open, 0 when unknown. Can be up to 10 seconds old."
+          },
+          "open_files_limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Soft limit on open file descriptors, 0 when unknown."
           }
         },
         "required": [
@@ -4799,7 +5374,9 @@
           "cache_metrics",
           "threads_count",
           "free_disk_space",
-          "total_disk_space"
+          "total_disk_space",
+          "open_files_count",
+          "open_files_limit"
         ]
       },
       "CacheMetrics": {
@@ -4884,6 +5461,13 @@
       "ClusterNode": {
         "type": "object",
         "properties": {
+          "replica_id": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "The node's VSR replica ID. Key nodes by it, not by position."
+          },
           "name": {
             "type": "string"
           },
@@ -4914,6 +5498,7 @@
           }
         },
         "required": [
+          "replica_id",
           "name",
           "ip",
           "endpoints",
@@ -5194,7 +5779,7 @@
       },
       "SendMessages": {
         "type": "object",
-        "description": "Only `partitioning` and `messages` are accepted. Other fields are rejected.",
+        "description": "Only `partitioning`, `messages` and `context` are accepted. Other fields are rejected.",
         "properties": {
           "partitioning": {
             "$ref": "#/components/schemas/Partitioning"
@@ -5205,12 +5790,24 @@
               "$ref": "#/components/schemas/SendMessage"
             },
             "minItems": 1
+          },
+          "context": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PartitionContext"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Fences the send: it is refused if the partition changed since this context was read."
           }
         },
         "required": [
           "partitioning",
           "messages"
-        ]
+        ],
+        "additionalProperties": false
       },
       "SendMessagesConfirmations": {
         "type": "object",
@@ -5262,6 +5859,9 @@
       "PolledMessages": {
         "type": "object",
         "properties": {
+          "context": {
+            "$ref": "#/components/schemas/PartitionContext"
+          },
           "partition_id": {
             "type": "integer",
             "format": "uint32",
@@ -5288,6 +5888,7 @@
           }
         },
         "required": [
+          "context",
           "partition_id",
           "current_offset",
           "count",
@@ -5372,6 +5973,227 @@
           "payload_length",
           "reserved"
         ]
+      },
+      "HeaderKind": {
+        "type": "string",
+        "enum": [
+          "raw",
+          "string",
+          "bool",
+          "int8",
+          "int16",
+          "int32",
+          "int64",
+          "int128",
+          "uint8",
+          "uint16",
+          "uint32",
+          "uint64",
+          "uint128",
+          "float32",
+          "float64"
+        ],
+        "description": "Value type an option is stored as."
+      },
+      "OptionInput": {
+        "oneOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          {
+            "type": "string",
+            "description": "The same form a config file uses, such as `7 days` or `1 GiB`. A 64-bit value above 2^53 - 1 is sent as a decimal string."
+          }
+        ],
+        "description": "One option value: a boolean, a non-negative integer, or a string."
+      },
+      "PartitionContext": {
+        "type": "object",
+        "description": "Partition history a request is fenced with. Send back the context from an earlier reply so the server refuses the request if the partition was recreated or changed owner since.",
+        "properties": {
+          "incarnation": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "owner_generation": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "metadata_op": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "incarnation",
+          "owner_generation",
+          "metadata_op"
+        ]
+      },
+      "ConsumerKind": {
+        "type": "string",
+        "enum": [
+          "consumer",
+          "consumer_group",
+          "external_group"
+        ],
+        "default": "consumer",
+        "description": "`consumer` is a single consumer. `external_group` is a group whose membership is managed outside Iggy, so only its offsets are stored here."
+      },
+      "MetadataChanges": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "behind",
+              "expired",
+              "reset"
+            ]
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "changes",
+              "current"
+            ]
+          },
+          "log_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{32}$",
+            "description": "Identity of the change log, as 32 hexadecimal digits."
+          },
+          "oldest_op": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "retained_since": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "head_op": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor to pass as `after` for the next page."
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MetadataChangeRecord"
+            }
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MetadataCurrentItem"
+            }
+          },
+          "current_page_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Token to pass as `current_after` for the next page of the current phase."
+          }
+        },
+        "required": [
+          "status",
+          "phase",
+          "log_id",
+          "oldest_op",
+          "retained_since",
+          "head_op",
+          "next",
+          "has_more",
+          "records",
+          "items",
+          "current_page_token"
+        ]
+      },
+      "MetadataChangeRecord": {
+        "type": "object",
+        "description": "One change. The fields of the change itself sit alongside these, and depend on `kind`. A kind this server cannot render carries its raw body as base64 in `body`.",
+        "properties": {
+          "op": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "ordinal": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "checksum": {
+            "type": "string",
+            "description": "Checksum as hexadecimal digits."
+          },
+          "timestamp": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Microseconds since the Unix epoch."
+          },
+          "actor_user_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Left out when no user made the change."
+          },
+          "group": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "For example `stream_created`, `topic_updated` or `session_closed`."
+          }
+        },
+        "required": [
+          "op",
+          "ordinal",
+          "checksum",
+          "timestamp",
+          "group",
+          "kind"
+        ],
+        "additionalProperties": true
+      },
+      "MetadataCurrentItem": {
+        "type": "object",
+        "description": "One resource in the current phase. Its fields sit alongside `group`.",
+        "properties": {
+          "group": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "group"
+        ],
+        "additionalProperties": true
       }
     }
   }

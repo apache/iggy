@@ -26,11 +26,13 @@
 //! the operations in `openapi.json`, and each operation's `operationId` must
 //! name the handler registered for it.
 //!
-//! Two surfaces are left out of the comparison:
+//! Three surfaces are left out of the comparison:
 //! - The metrics scrape route. It is mounted at the configurable
 //!   `http.metrics.endpoint`, so its path is not in the source. The route is
 //!   recognised by its `get_metrics` handler, and the document's operation by
 //!   the same `operationId`.
+//! - Internal cluster routes, which only other nodes call with a relay proof.
+//!   They are recognised by their handlers in `INTERNAL_HANDLERS`.
 //! - The web UI routes under `/ui`. `merge_web_ui` merges them from
 //!   `src/http/web.rs`, which this test does not parse, and the document does
 //!   not describe them.
@@ -42,6 +44,9 @@ use std::path::Path;
 
 /// Handler of the metrics route, excluded from the comparison (see above).
 const METRICS_HANDLER: &str = "get_metrics";
+
+/// Handlers of internal cluster routes, excluded from the comparison (see above).
+const INTERNAL_HANDLERS: [&str; 1] = ["answer_metadata_floor"];
 
 /// axum method-router constructors and their chained counterparts.
 const METHODS: [&str; 8] = [
@@ -204,6 +209,12 @@ fn record_route(
     };
 
     let methods = method_router(method_tokens);
+    if methods
+        .iter()
+        .all(|(_, handler)| INTERNAL_HANDLERS.contains(&handler.as_str()))
+    {
+        return;
+    }
     let path = match path_tokens.as_slice() {
         [TokenTree::Literal(literal)] => syn::parse_str::<syn::LitStr>(&literal.to_string())
             .map_or_else(
