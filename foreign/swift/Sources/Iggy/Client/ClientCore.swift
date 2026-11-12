@@ -185,6 +185,15 @@ actor ClientCore {
         code: UInt32, payload: [UInt8], context: PartitionContext = .empty, deadline limit: ContinuousClock.Instant? = nil,
         lineage captured: UInt64? = nil
     ) async throws -> [UInt8] {
+        try await exchangeWithCommit(code: code, payload: payload, context: context, deadline: limit, lineage: captured).body
+    }
+
+    /// ``exchange(code:payload:context:deadline:lineage:)`` with the metadata
+    /// commit that its reply names.
+    func exchangeWithCommit(
+        code: UInt32, payload: [UInt8], context: PartitionContext = .empty, deadline limit: ContinuousClock.Instant? = nil,
+        lineage captured: UInt64? = nil
+    ) async throws -> (body: [UInt8], commit: UInt64) {
         if state == .shutdown { throw IggyError(.clientShutdown) }
         let lineage = captured ?? lineage
         if let refusal = lineageRefusal(lineage, code: code) { throw refusal }
@@ -323,8 +332,8 @@ actor ClientCore {
             code: code, payload: payload, context: context, lineage: captured ?? lineage, request: &request, epoch: &epoch, outcome: &outcome,
             transientDeadline: now, readDeadline: requestDeadline(within: limit), replaysUncommitted: false)
         switch attempted {
-        case .success(let body):
-            return body
+        case .success(let reply):
+            return reply.body
         case .failure(let error):
             dropConnection(after: error, epoch: epoch)
             throw Self.graded(error)
@@ -380,7 +389,43 @@ actor ClientCore {
     }
 
     private func stamp(code: UInt32, payload: [UInt8], context: PartitionContext) throws -> VSRFrame.EncodedRequest {
-        try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
+        try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: sentContext(context, code: code, payload: payload))
+    }
+
+    /// The context that `code` goes out with. The server binds a group offset
+    /// write with owner generation 0 to the owner of the session only when it
+    /// installed that owner at or before the metadata op of the write. The
+    /// register or the join that installs it raises the watermark with its
+    /// reply, and no frame of a session is stamped before its register reply,
+    /// so such a write takes the newer of its op and the watermark. The
+    /// incarnation stays, so a write of an earlier history is still refused.
+    ///
+    /// A fetch names only the watermark, read at each stamp, so every attempt
+    /// names the commits the session saw before it.
+    private func sentContext(_ context: PartitionContext, code: UInt32, payload: [UInt8]) -> PartitionContext {
+        if code == CommandCode.fetchMessages.rawValue {
+            return Self.readContext(metadataWatermark)
+        }
+        let writesOffset = code == CommandCode.storeConsumerOffset.rawValue || code == CommandCode.deleteConsumerOffset.rawValue
+        guard writesOffset, context.ownerGeneration == 0,
+            (try? RawRequest.consumerTarget(payload))?.consumerKind == Consumer.Kind.consumerGroup.rawValue
+        else {
+            return context
+        }
+        return PartitionContext(incarnation: context.incarnation, ownerGeneration: 0, metadataOp: max(context.metadataOp, metadataWatermark))
+    }
+
+    /// Whether the client comes back on its own: it is signed in, or a
+    /// request or the heartbeat reconnects and signs it in again. A client
+    /// that is shut down, that the caller disconnected, or that has no
+    /// reconnection or no credentials only comes back when the caller acts.
+    var canRecover: Bool {
+        switch state {
+        case .shutdown: false
+        case .authenticated: true
+        case .disconnected, .connecting, .connected, .authenticating:
+            !disconnectedByCaller && configuration.reconnection.enabled && signInCredentials() != nil
+        }
     }
 
     /// The refusal of a call that started under `captured` once the caller
@@ -411,21 +456,22 @@ actor ClientCore {
     /// cancelled request, or an outage longer than the request timeout leaves
     /// the client disconnected, and with credentials to sign in again the
     /// next typed call reconnects instead of failing until ``connect()``. A
-    /// reconnect that outlasts the request timeout refuses the call as not
-    /// accepted, since nothing was sent, and one whose sign-in the server
-    /// refused ends it as unauthenticated.
+    /// reconnect that outlasts the request timeout, or `limit` of a caller
+    /// with a budget of its own, refuses the call as not accepted, since
+    /// nothing was sent, and one whose sign-in the server refused ends it as
+    /// unauthenticated.
     ///
     /// Returns the lineage the call started under, read before the reconnect
     /// can wait for a sign-in of the caller, so that no request of the call
     /// is written under the session that sign-in opens.
-    func requireAuthenticated() async throws -> UInt64 {
+    func requireAuthenticated(within limit: ContinuousClock.Instant? = nil) async throws -> UInt64 {
         let started = lineage
         switch state {
         case .disconnected, .connecting, .authenticating:
             if !disconnectedByCaller, configuration.reconnection.enabled, signInCredentials() != nil {
                 let reconnected: Void?
                 do {
-                    reconnected = try await withDeadline(ContinuousClock.now + configuration.requestTimeout) { [self] in
+                    reconnected = try await withDeadline(requestDeadline(within: limit)) { [self] in
                         try await self.connect()
                     }
                 } catch {
@@ -504,7 +550,7 @@ actor ClientCore {
     private func sendRaw(
         code: UInt32, payload: [UInt8], context: PartitionContext, lineage: UInt64, deadline: ContinuousClock.Instant,
         request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, outcome: inout RetryOutcome
-    ) async throws -> [UInt8] {
+    ) async throws -> (body: [UInt8], commit: UInt64) {
         switch state {
         case .shutdown:
             throw IggyError(.clientShutdown)
@@ -529,9 +575,9 @@ actor ClientCore {
                 transientDeadline: transientDeadline,
                 readDeadline: deadline, replaysUncommitted: true)
             switch attempted {
-            case .success(let body):
+            case .success(let reply):
                 refreshCredentials(afterCommitting: code, payload: payload)
-                return body
+                return reply
             case .failure(let failure):
                 let error = outcome.observe(Self.graded(failure))
                 guard error.code == .transientNotAccepted || failure.code == .notPrimary, !isLogin, clock.now < deadline else {
@@ -661,7 +707,7 @@ actor ClientCore {
     private func attempt(
         code: UInt32, payload: [UInt8], context: PartitionContext, lineage: UInt64, request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64,
         outcome: inout RetryOutcome, transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant, replaysUncommitted: Bool
-    ) async throws -> Result<[UInt8], IggyError> {
+    ) async throws -> Result<(body: [UInt8], commit: UInt64), IggyError> {
         try await exchangeLock.lock()
         defer { exchangeLock.unlock() }
         return await exchangeLocked(
@@ -679,7 +725,7 @@ actor ClientCore {
     private func exchangeLocked(
         code: UInt32, payload: [UInt8], context: PartitionContext, lineage: UInt64, request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64,
         outcome: inout RetryOutcome, transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant, replaysUncommitted: Bool
-    ) async -> Result<[UInt8], IggyError> {
+    ) async -> Result<(body: [UInt8], commit: UInt64), IggyError> {
         if let refusal = lineageRefusal(lineage, code: code) {
             return .failure(refusal)
         }
@@ -747,7 +793,7 @@ actor ClientCore {
                 {
                     throw IggyError(.transientNotCommitted, context: "the reply does not prove the earlier attempt committed")
                 }
-                return .success(Array(body))
+                return .success((body: Array(body), commit: VSRFrame.readReplyCommit(header) ?? 0))
             } catch let answer as IggyError {
                 let evicted = VSRFrame.peekCommand(header) == .eviction
                 if evicted, answer.code == .staleClient || Self.endsSessionOfWrite(answer, stamped.operation) {
@@ -768,6 +814,12 @@ actor ClientCore {
                 // of the same request no longer proves it never committed.
                 let error = outcome.observe(answer, committed: VSRFrame.hasCommittedResult(header))
                 refusal = error
+                logger.debug(
+                    "The server refused the request",
+                    metadata: [
+                        "code": "\(code)", "request_id": "\(stamped.requestID)", "error": "\(answer)", "server_address": "\(currentAddress)",
+                        "metadata_watermark": "\(metadataWatermark)",
+                    ])
                 if answer.code == .notPrimary, !VSRFrame.hasCommittedResult(header) {
                     return .failure(answer)
                 }
@@ -796,14 +848,32 @@ actor ClientCore {
     }
 
     /// Raises the metadata watermark to the commit of a metadata reply, as
-    /// `observe_metadata_reply` in the Rust SDK. Reads and partition replies
-    /// carry no metadata commit.
+    /// `observe_metadata_reply` in the Rust SDK. A read reply names the commit
+    /// of the node that answered it, which only a changed group assignment
+    /// takes, in ``applyGroupSync(_:member:scope:commit:)``.
     private func observeMetadataReply(_ header: ArraySlice<UInt8>) {
         guard VSRFrame.peekCommand(header) == .reply, let operation = VSRFrame.readReplyOperation(header),
             operation != .nonReplicated, !operation.isPartition, let commit = VSRFrame.readReplyCommit(header)
         else {
             return
         }
+        observeMetadataCommit(commit)
+    }
+
+    /// Records the assignment that a sync read under `scope` found at
+    /// `commit`, as `synced_group_assignment` in the Rust SDK. A handover
+    /// installs the owner of a partition in a later op than the join, and a
+    /// primary that has not applied it refuses a read as not owned. So a
+    /// changed assignment raises the watermark to `commit` in the same turn
+    /// of the actor that publishes it: stamps run on this actor too, so no
+    /// read of a partition it added is stamped under the older watermark.
+    func applyGroupSync(_ key: ConsumerGroupState.GroupKey, member: (generation: UInt64, partitions: [UInt32]), scope: UInt64, commit: UInt64) {
+        if groupState.applySync(key, member: member, scope: scope) {
+            observeMetadataCommit(commit)
+        }
+    }
+
+    private func observeMetadataCommit(_ commit: UInt64) {
         metadataWatermark = max(metadataWatermark, commit)
     }
 
@@ -1185,6 +1255,9 @@ actor ClientCore {
         lineage += 1
         rememberedSignIn = nil
         stopHeartbeat()
+        // A committing read parked on its own connection ends now, with an
+        // unknown outcome, before the server can answer it for the session.
+        await pollRouter.closeDeferredConnections()
         await disconnectTransport()
         resetSession()
     }

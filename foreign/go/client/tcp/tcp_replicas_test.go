@@ -1296,7 +1296,7 @@ func TestPublicMultiRequestCallsStopAfterCallerSignIn(t *testing.T) {
 		{"keyed_send", command.GetPartitionRouteCode, send(iggcon.Partitioning{Kind: iggcon.MessageKey, Value: []byte("key")})},
 		{"roster_before_send", command.GetClusterMetadataCode, send(iggcon.PartitionId(0))},
 		{"group_poll", command.SyncGroupCode, func(ctx context.Context, client *IggyTcpClient) error {
-			_, err := client.PollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, false, nil)
+			_, err := client.pollMessages(ctx, stream, topic, consumer, iggcon.NextPollingStrategy(), 1, false, nil)
 			return err
 		}},
 	} {
@@ -1355,4 +1355,97 @@ func TestPublicMultiRequestCallsStopAfterCallerSignIn(t *testing.T) {
 			require.Zero(t, requestCount(server.recorded(), command.PollMessagesCode), "the later request must not go out")
 		})
 	}
+}
+
+// heldPause outlasts every test, so a held pause ends only with its client.
+const heldPause = time.Hour
+
+// holdPauses holds every pause of client. The length that the client drew for
+// each pause arrives on the returned channel when the pause starts.
+func holdPauses(client *IggyTcpClient) <-chan time.Duration {
+	drawn := make(chan time.Duration, 16)
+	client.testHookPause = func(length time.Duration) time.Duration {
+		select {
+		case drawn <- length:
+		default:
+		}
+		return heldPause
+	}
+	return drawn
+}
+
+// listenReplicas starts count replicas of one roster, replica 0 the metadata
+// primary. Each signs in, binds and reads the roster. answer, when set, sees
+// each request first, and a replica sends its reply unless it is nil.
+func listenReplicas(t *testing.T, count int, answer func(replica int, read request) []byte) []*testListener {
+	t.Helper()
+	servers := make([]*testListener, count)
+	for replica := range servers {
+		servers[replica] = listenVSR(t, nil, func(_, _ int, read request) []byte {
+			if answer != nil {
+				if reply := answer(replica, read); reply != nil {
+					return reply
+				}
+			}
+			switch {
+			case read.operation() == vsr.OperationRegister:
+				return registerReplyFrame(7, managedLinkSession)
+			case read.code() == uint32(command.BindSessionCode):
+				return bindReplyFrame(7, read.sessionID())
+			case read.code() == uint32(command.GetClusterMetadataCode):
+				addresses := make([]string, 0, len(servers))
+				for _, server := range servers {
+					addresses = append(addresses, server.address())
+				}
+				return clusterMetadataFrame(t, 0, addresses...)
+			default:
+				return replyFrame(vsr.OperationNonReplicated, nil)
+			}
+		})
+	}
+	return servers
+}
+
+// connectReplicas signs a client in on replica 0 of servers. Every pause of
+// the client is held, and its drawn length arrives on the returned channel.
+func connectReplicas(t *testing.T, servers []*testListener) (*IggyTcpClient, <-chan time.Duration) {
+	t.Helper()
+	client := newDialingClient(t, servers[0].address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	pauses := holdPauses(client)
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	require.NoError(t, client.Connect(ctx))
+	return client, pauses
+}
+
+func TestManagedLinks_ConnectDialsEachReplicaWithoutAPause(t *testing.T) {
+	servers := listenReplicas(t, 3, nil)
+	client, pauses := connectReplicas(t, servers)
+
+	require.Eventually(t, func() bool {
+		return client.links.replica(1) != nil && client.links.replica(2) != nil
+	}, managedLinkTestBudget, managedLinkPoll, "each replica of the roster is dialed at connect time")
+	require.Empty(t, pauses, "no dial waits for a pause")
+	for _, server := range servers {
+		require.Equal(t, 1, server.connections())
+	}
+}
+
+func TestManagedLinks_ARedialAfterADropWaitsItsJitter(t *testing.T) {
+	servers := listenReplicas(t, 2, nil)
+	client, pauses := connectReplicas(t, servers)
+	require.Eventually(t, func() bool { return client.links.replica(1) != nil },
+		managedLinkTestBudget, managedLinkPoll)
+
+	client.links.replica(1).close(ierror.ErrTransientNotCommitted)
+
+	select {
+	case drawn := <-pauses:
+		require.LessOrEqual(t, drawn, client.config.reconnection.interval,
+			"a link that stayed up resets the backoff, so the first redial draws from the first step")
+	case <-time.After(managedLinkTestBudget):
+		t.Fatal("the slot redialed without its jitter")
+	}
+	require.Nil(t, client.links.replica(1))
+	require.Equal(t, 1, servers[1].connections(), "nothing dials before the pause ends")
 }

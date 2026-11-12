@@ -620,6 +620,13 @@ impl TestHarness {
         self.peer_relays()?.heal_node(index)
     }
 
+    /// Close one live replica connection that node `from` dialed to node
+    /// `to`. The link stays up, so the redial goes through. Only a lower
+    /// index dials a higher one. Needs [`TestHarnessBuilder::peer_relays`].
+    pub fn drop_peer_connection(&self, from: usize, to: usize) -> Result<(), TestBinaryError> {
+        self.peer_relays()?.drop_connection(from, to)
+    }
+
     fn peer_relays(&self) -> Result<&PeerRelays, TestBinaryError> {
         self.peer_relays
             .as_ref()

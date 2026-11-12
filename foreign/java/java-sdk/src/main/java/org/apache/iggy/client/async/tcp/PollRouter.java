@@ -41,6 +41,7 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.partition.PartitionRoute;
@@ -50,11 +51,12 @@ import org.apache.iggy.serde.CommandCode;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -63,6 +65,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -77,9 +80,19 @@ import java.util.function.Supplier;
  */
 final class PollRouter {
     static final int POLL_PARAMETERS_BYTES = 14;
+    // A deferred poll ends with [wait_us u64][min_count u32][max_bytes u32][request_timeout_us u64].
+    static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
 
     static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     static final int MAX_CONCURRENT_DIALS = 4;
+    // Deferred polls and fetches together, as MAX_DEFERRED_REQUESTS in core/sdk/src/driver.rs.
+    private static final int MAX_DEFERRED_REQUESTS = 64;
+    private static final int MAX_ROUTE_LOOKUPS_IN_FLIGHT = 16;
+
+    private static final int DEFERRED_MIN_COUNT_OFFSET = Long.BYTES;
+    private static final int DEFERRED_MAX_BYTES_OFFSET = Long.BYTES + Integer.BYTES;
+    private static final int DEFERRED_TIMEOUT_OFFSET = Long.BYTES + 2 * Integer.BYTES;
+
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
@@ -97,6 +110,8 @@ final class PollRouter {
     private long topologyGeneration;
     private final Map<ConnectionInfo, Slot> connections = new HashMap<>();
     private final Set<Poll> pending = new HashSet<>();
+    private final Set<Poll> deferredWaiting = new LinkedHashSet<>();
+    private int activeDeferredPolls;
     private volatile int rosterSize;
     private final NavigableMap<Integer, ConnectionInfo> replicas = new TreeMap<>();
     // Read without the monitor: a slot opens its link under the slot monitor, and the client reads this there to size
@@ -294,9 +309,7 @@ final class PollRouter {
             AsyncTcpConnection.TransientFailoverState state) {
         try {
             byte[] query = partitionQuery(command, payload);
-            Poll poll = new Poll(query, command, payload, deadline, context);
-            poll.state = state;
-            return send(poll);
+            return send(new Poll(query, command, payload, deadline, context, state));
         } catch (RuntimeException error) {
             payload.release();
             return CompletableFuture.failedFuture(error);
@@ -313,9 +326,45 @@ final class PollRouter {
 
     CompletableFuture<ByteBuf> sendMessages(
             ByteBuf payload, ByteBuf query, long deadline, AsyncTcpConnection.TransientFailoverState state) {
-        byte[] target = takeBytes(query);
-        Poll poll = new Poll(target, CommandCode.Messages.SEND.getValue(), payload, deadline, Optional.empty());
-        poll.state = state;
+        return targetedRequest(
+                CommandCode.Messages.SEND.getValue(), payload, takeBytes(query), Optional.empty(), deadline, state);
+    }
+
+    /**
+     * Fetches from the primary of {@code partition} using the encoded stream and topic in {@code topic}.
+     * Each target of a fetch carries its own fence, so the request header carries none.
+     * Attempts stop {@link DeferredPollOptions#REPLY_MARGIN} before {@code deadline}, preserving the last capacity
+     * refusal when no retry fits. In-flight replies keep the full deadline.
+     */
+    CompletableFuture<ByteBuf> fetchRequest(
+            ByteBuf payload,
+            byte[] topic,
+            long partition,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
+        return targetedRequest(
+                CommandCode.Messages.FETCH_MESSAGES.getValue(),
+                payload,
+                target(topic, partition),
+                Optional.of(PartitionContext.EMPTY),
+                deadline,
+                state);
+    }
+
+    private CompletableFuture<ByteBuf> targetedRequest(
+            int command,
+            ByteBuf payload,
+            byte[] target,
+            Optional<PartitionContext> context,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
+        Poll poll;
+        try {
+            poll = new Poll(target, command, payload, deadline, context, state);
+        } catch (RuntimeException error) {
+            payload.release();
+            return CompletableFuture.failedFuture(error);
+        }
         return send(poll);
     }
 
@@ -352,16 +401,146 @@ final class PollRouter {
                 return CompletableFuture.completedFuture(count);
             }
         }
+        return lookup(target, deadline, state, Route::partitionsCount);
+    }
+
+    /**
+     * The partitions grouped by their primary and split to fit one fetch each, each group in the
+     * order of {@code partitions}. A partition without a current route costs a route lookup, and at most {@value
+     * #MAX_ROUTE_LOOKUPS_IN_FLIGHT} of them run at once. Once the returned future ends, also by a cancel, no lookup of
+     * it runs on. Mirrors readiness_groups in core/sdk/src/driver.rs.
+     *
+     * @param topic the encoded stream and topic identifiers
+     */
+    CompletableFuture<List<List<Long>>> readinessGroups(
+            byte[] topic, List<Long> partitions, long deadline, AsyncTcpConnection.TransientFailoverState state) {
+        return withRoutes(topic, partitions, deadline, state, known -> groupByPrimary(partitions, known));
+    }
+
+    /**
+     * The context of the current route of each of {@code partitions}, which a fetch stamps on a target whose strategy
+     * has none. Routes are looked up as {@link #readinessGroups} looks them up.
+     *
+     * @param topic the encoded stream and topic identifiers
+     */
+    CompletableFuture<Map<Long, PartitionContext>> routeContexts(
+            byte[] topic, List<Long> partitions, long deadline, AsyncTcpConnection.TransientFailoverState state) {
+        return withRoutes(topic, partitions, deadline, state, known -> {
+            Map<Long, PartitionContext> contexts = new HashMap<>();
+            known.forEach((partition, route) -> contexts.put(partition, route.context));
+            return contexts;
+        });
+    }
+
+    private <T> CompletableFuture<T> withRoutes(
+            byte[] topic,
+            List<Long> partitions,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state,
+            Function<Map<Long, Route>, T> answer) {
+        Map<Long, Route> known = new ConcurrentHashMap<>();
+        List<Long> unknown = new ArrayList<>();
+        synchronized (this) {
+            for (long partition : partitions) {
+                Route route = routes.get(TargetKey.of(target(topic, partition)));
+                if (route != null && routeIsCurrent(route)) {
+                    known.put(partition, route);
+                } else {
+                    unknown.add(partition);
+                }
+            }
+        }
+        CompletableFuture<T> groups = new CompletableFuture<>();
+        Set<CompletableFuture<Route>> lookups = ConcurrentHashMap.newKeySet();
+        groups.whenComplete((ignored, error) -> lookups.forEach(lookup -> lookup.cancel(false)));
+        CompletableFuture<Void> looked = CompletableFuture.completedFuture(null);
+        for (int start = 0; start < unknown.size(); start += MAX_ROUTE_LOOKUPS_IN_FLIGHT) {
+            List<Long> batch = unknown.subList(start, Math.min(unknown.size(), start + MAX_ROUTE_LOOKUPS_IN_FLIGHT));
+            looked = looked.thenCompose(ignored -> groups.isDone()
+                    ? CompletableFuture.completedFuture(null)
+                    : CompletableFuture.allOf(batch.stream()
+                            .map(partition -> {
+                                CompletableFuture<Route> lookup = lookup(
+                                        target(topic, partition), deadline, state.nextHistory(), Function.identity());
+                                lookups.add(lookup);
+                                // If the groups ended after the check above, their cancel missed this lookup.
+                                if (groups.isDone()) {
+                                    lookup.cancel(false);
+                                }
+                                return lookup.thenAccept(route -> known.put(partition, route));
+                            })
+                            .toArray(CompletableFuture[]::new)));
+        }
+        looked.whenComplete((ignored, error) -> {
+            if (error != null) {
+                groups.completeExceptionally(unwrap(error));
+                return;
+            }
+            if (groups.isDone()) {
+                return;
+            }
+            try {
+                groups.complete(answer.apply(known));
+            } catch (RuntimeException failure) {
+                groups.completeExceptionally(failure);
+            }
+        });
+        return groups;
+    }
+
+    /**
+     * Marks the routes of {@code partitions} stale after a fetch over them got NOT_PRIMARY, which does not
+     * name the partition that moved. Each next lookup asks the last known primary first, and the view of each route
+     * stays its floor, so a partition that did not move keeps its route. Mirrors may_have_moved in
+     * core/sdk/src/driver/route_cache.rs.
+     *
+     * @param topic the encoded stream and topic identifiers
+     */
+    synchronized void mayHaveMoved(byte[] topic, List<Long> partitions) {
+        for (long partition : partitions) {
+            TargetKey key = TargetKey.of(target(topic, partition));
+            Route previous = routes.get(key);
+            if (previous != null) {
+                routes.put(key, previous.markedStale(previous.view, previous.endpoint));
+            }
+        }
+    }
+
+    private static List<List<Long>> groupByPrimary(List<Long> partitions, Map<Long, Route> routes) {
+        Map<ConnectionInfo, List<Long>> byPrimary = new LinkedHashMap<>();
+        for (long partition : partitions) {
+            byPrimary
+                    .computeIfAbsent(routes.get(partition).endpoint, primary -> new ArrayList<>())
+                    .add(partition);
+        }
+        List<List<Long>> groups = new ArrayList<>();
+        for (List<Long> group : byPrimary.values()) {
+            for (int start = 0; start < group.size(); start += FetchMessages.MAX_PARTITIONS_PER_REQUEST) {
+                int end = Math.min(group.size(), start + FetchMessages.MAX_PARTITIONS_PER_REQUEST);
+                groups.add(List.copyOf(group.subList(start, end)));
+            }
+        }
+        return List.copyOf(groups);
+    }
+
+    /** The routing target of {@code partition}, which follows the encoded stream and topic identifiers. */
+    private static byte[] target(byte[] topic, long partition) {
+        return takeBytes(
+                Unpooled.buffer(topic.length + Integer.BYTES).writeBytes(topic).writeIntLE((int) partition));
+    }
+
+    private <T> CompletableFuture<T> lookup(
+            byte[] target, long deadline, AsyncTcpConnection.TransientFailoverState state, Function<Route, T> answer) {
         Poll lookup = new Poll(
                 target,
                 CommandCode.Messages.GET_PARTITION_ROUTE.getValue(),
                 Unpooled.wrappedBuffer(target),
                 deadline,
-                Optional.empty());
-        lookup.state = state;
+                Optional.empty(),
+                state);
         return AsyncTcpConnection.mapResponse(send(lookup), response -> {
             response.release();
-            return lookup.partitionsCount;
+            return answer.apply(lookup.route);
         });
     }
 
@@ -434,9 +613,8 @@ final class PollRouter {
                     }
                 });
             } else {
-                Poll poll =
-                        new Poll(ticket.routingBody(), ticket.commandCode(), payload, deadline, Optional.of(context));
-                poll.state = state;
+                Poll poll = new Poll(
+                        ticket.routingBody(), ticket.commandCode(), payload, deadline, Optional.of(context), state);
                 poll.payloadLease = ticket;
                 replayed = send(poll);
             }
@@ -531,7 +709,9 @@ final class PollRouter {
             if (!explicit) {
                 if (command == CommandCode.ConsumerOffset.STORE.getValue()
                         || command == CommandCode.ConsumerOffset.DELETE.getValue()
-                        || (command == CommandCode.Messages.POLL.getValue() && consumerKind == 2)) {
+                        || ((command == CommandCode.Messages.POLL.getValue()
+                                        || command == CommandCode.Messages.POLL_DEFERRED.getValue())
+                                && consumerKind == 2)) {
                     throw new IggyInvalidArgumentException("A group poll or offset mutation requires a partition id");
                 }
                 partition = 0;
@@ -555,12 +735,67 @@ final class PollRouter {
         body.skipBytes(length);
     }
 
-    private static byte[] takeBytes(ByteBuf payload) {
+    static byte[] takeBytes(ByteBuf payload) {
         try {
             return ByteBufUtil.getBytes(payload);
         } finally {
             payload.release();
         }
+    }
+
+    /** Appends the limits that end a deferred poll request. */
+    static void writeDeferredOptions(ByteBuf request, DeferredPollOptions options) {
+        request.writeLongLE(options.maxWaitMicros())
+                .writeIntLE((int) options.minCount())
+                .writeIntLE((int) options.maxBytes())
+                .writeLongLE(options.requestTimeoutMicros());
+    }
+
+    /** The limits that end a deferred poll request or frame, checked by the {@link DeferredPollOptions} constructor. */
+    static DeferredPollOptions deferredOptions(ByteBuf request) {
+        int parameters = deferredWait(request);
+        return new DeferredPollOptions(
+                Duration.of(request.getLongLE(parameters), ChronoUnit.MICROS),
+                request.getUnsignedIntLE(parameters + DEFERRED_MIN_COUNT_OFFSET),
+                deferredMaxBytes(request),
+                Duration.of(request.getLongLE(deferredTimeout(request)), ChronoUnit.MICROS));
+    }
+
+    /** The index in a deferred poll request or frame of its wait, the first of the limits that end it. */
+    static int deferredWait(ByteBuf request) {
+        return request.writerIndex() - DEFERRED_PARAMETERS_BYTES;
+    }
+
+    /** The index in a deferred poll request or frame of its request timeout. */
+    static int deferredTimeout(ByteBuf request) {
+        return deferredWait(request) + DEFERRED_TIMEOUT_OFFSET;
+    }
+
+    /** The byte limit of a deferred poll request or frame, which also bounds its reply body. */
+    static long deferredMaxBytes(ByteBuf request) {
+        return request.getUnsignedIntLE(deferredWait(request) + DEFERRED_MAX_BYTES_OFFSET);
+    }
+
+    /** The wait and request timeout of a deferred request, checked by the {@link DeferredPollOptions} constructor. */
+    static DeferredPollOptions deferredBudget(long waitMicros, long requestTimeoutMicros) {
+        return new DeferredPollOptions(
+                Duration.of(waitMicros, ChronoUnit.MICROS),
+                DeferredPollOptions.DEFAULT_MIN_COUNT,
+                DeferredPollOptions.DEFAULT_MAX_BYTES,
+                Duration.of(requestTimeoutMicros, ChronoUnit.MICROS));
+    }
+
+    /**
+     * The index in {@code request} of the wait of a fetch whose body starts at {@code body}. The consumer,
+     * stream and topic lead the body, and the request timeout follows the wait.
+     */
+    static int waitParameters(ByteBuf request, int body) {
+        ByteBuf fields = request.duplicate().readerIndex(body);
+        fields.skipBytes(Byte.BYTES);
+        skipIdentifier(fields);
+        skipIdentifier(fields);
+        skipIdentifier(fields);
+        return fields.readerIndex();
     }
 
     ConsensusSession sessionOwner() {
@@ -609,12 +844,7 @@ final class PollRouter {
     }
 
     private CompletableFuture<ByteBuf> send(Poll poll) {
-        poll.result.whenComplete((response, error) -> {
-            poll.finish(error);
-            synchronized (this) {
-                pending.remove(poll);
-            }
-        });
+        poll.result.whenComplete((response, error) -> finish(poll, error));
         synchronized (this) {
             if (pending.size() >= MAX_PENDING_POLLS) {
                 poll.result.completeExceptionally(
@@ -630,6 +860,20 @@ final class PollRouter {
                     .eventLoop()
                     .schedule(poll::endPending, Math.max(0, poll.deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             poll.result.whenComplete((response, error) -> timeout.cancel(false));
+            synchronized (this) {
+                if (poll.result.isDone()) {
+                    return poll.result;
+                }
+                if (poll.dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue()
+                        || poll.dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+                    if (activeDeferredPolls >= MAX_DEFERRED_REQUESTS) {
+                        deferredWaiting.add(poll);
+                        return poll.result;
+                    }
+                    poll.deferredAdmitted = true;
+                    activeDeferredPolls++;
+                }
+            }
             attempt(poll);
         } catch (RuntimeException error) {
             poll.fail(error);
@@ -702,6 +946,67 @@ final class PollRouter {
         return replicas.get(replicaId);
     }
 
+    private void finish(Poll poll, Throwable error) {
+        poll.finish(error);
+        Poll next = null;
+        synchronized (this) {
+            pending.remove(poll);
+            deferredWaiting.remove(poll);
+            if (poll.deferredAdmitted) {
+                activeDeferredPolls--;
+                var waiting = deferredWaiting.iterator();
+                while (waiting.hasNext()) {
+                    Poll candidate = waiting.next();
+                    waiting.remove();
+                    if (!candidate.result.isDone()) {
+                        candidate.deferredAdmitted = true;
+                        activeDeferredPolls++;
+                        next = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        if (next != null) {
+            startDeferred(next);
+        }
+    }
+
+    private void startDeferred(Poll poll) {
+        try {
+            // Completion can hold another poll's monitor, so admission continues on the client loop.
+            coordinator.get().eventLoop().execute(() -> {
+                try {
+                    attempt(poll);
+                } catch (RuntimeException error) {
+                    poll.fail(error);
+                }
+            });
+        } catch (RuntimeException error) {
+            List<Poll> waiting;
+            synchronized (this) {
+                waiting = List.copyOf(deferredWaiting);
+                deferredWaiting.clear();
+            }
+            poll.fail(error);
+            waiting.forEach(queued -> queued.fail(error));
+        }
+    }
+
+    /** Completes once every committing poll and fetch that is pending now has ended, with any outcome. */
+    CompletableFuture<Void> committingReadsEnded() {
+        List<CompletableFuture<ByteBuf>> committing;
+        synchronized (this) {
+            committing = pending.stream()
+                    .filter(poll -> poll.commits)
+                    .map(poll -> poll.result)
+                    .toList();
+        }
+        return CompletableFuture.allOf(committing.stream()
+                .map(result -> result.handle((response, error) -> null))
+                .toArray(CompletableFuture[]::new));
+    }
+
     CompletableFuture<Void> clearSession() {
         return clearSession(null);
     }
@@ -713,6 +1018,7 @@ final class PollRouter {
             topologyGeneration++;
             clear();
             ending = Set.copyOf(pending);
+            deferredWaiting.clear();
             closing = List.copyOf(connections.values());
             connections.clear();
         }
@@ -727,6 +1033,10 @@ final class PollRouter {
         if (poll.result.isDone()) {
             return;
         }
+        if (poll.attemptDeadline - System.nanoTime() <= 0) {
+            poll.endPending();
+            return;
+        }
         if (poll.state.signedOut()) {
             poll.fail(poll.state.lineageEnded(null));
             return;
@@ -737,7 +1047,11 @@ final class PollRouter {
                 synchronized (this) {
                     Route known = routes.get(poll.key);
                     if (known != null) {
-                        coordinator.get().sessionOwner().checkRetained(poll.laneFor(known.context));
+                        var session = coordinator.get().sessionOwner();
+                        boolean inspect = !poll.advancesProgress() && !poll.isMutation();
+                        for (ConsensusSession.LaneKey lane : poll.lanesFor(known.context)) {
+                            session.checkRetained(lane, poll.isMutation(), inspect);
+                        }
                     }
                 }
             } catch (RuntimeException error) {
@@ -765,18 +1079,24 @@ final class PollRouter {
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void failedAttempt(Poll poll, Throwable error) {
         if (poll.retryingRefusal && unwrap(error) instanceof IggyTimeoutException) {
-            poll.fail(notAccepted());
+            poll.fail(poll.deadlineRefusal());
             return;
         }
         IggyServerException refusal = AsyncTcpConnection.findServerError(error);
         boolean notPrimary = refusal != null && refusal.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY;
+        if (notPrimary && poll.dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+            // A fetch names several partitions and its refusal does not name the one that moved, so the
+            // caller looks up every route of the request again, see mayHaveMoved.
+            poll.fail(error);
+            return;
+        }
         boolean lostLink = connectionFailed(error);
         invalidateRoute(poll, error, notPrimary);
-        if ((!poll.requiresLane || poll.isMutation())
+        if (!poll.advancesProgress()
                 && (lostLink
                         || (refusal != null
                                 && refusal.getRawErrorCode() == AsyncTcpConnection.TRANSIENT_NOT_COMMITTED))) {
-            if (poll.deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
+            if (poll.attemptDeadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(RETRY_INTERVAL_MILLIS)) {
                 // A mutation that an attempt can have applied keeps that in its ticket, which fail() retains.
                 poll.fail(lostLink && (poll.isMutation() || !poll.dataSent) ? notAccepted() : uncommitted());
             } else {
@@ -795,8 +1115,13 @@ final class PollRouter {
             retryLifecycle(poll, refusal);
             return;
         }
-        if (!poll.terminalRoutingRefusal && (isNotAccepted(error) || notPrimary)) {
-            retry(poll, notPrimary);
+        if (!poll.terminalRoutingRefusal
+                && (isNotAccepted(error)
+                        || notPrimary
+                        || (refusal != null
+                                && refusal.getRawErrorCode()
+                                        == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()))) {
+            retry(poll, notPrimary, refusal);
         } else {
             poll.fail(error);
         }
@@ -815,19 +1140,10 @@ final class PollRouter {
             if (previous != null) {
                 routes.put(
                         poll.key,
-                        new Route(
-                                previous.endpoint,
-                                previous.attachment,
-                                previous.parent,
-                                previous.generation,
-                                previous.bindSecret,
-                                previous.context,
-                                previous.partitionsCount,
-                                previous.local,
+                        previous.markedStale(
                                 notPrimary && poll.dataSent
-                                        ? Math.max(previous.view, Math.min(0xffff_ffffL, poll.routeView + 1))
+                                        ? Math.max(previous.view, Math.min(0xffff_ffffL, poll.route.view + 1))
                                         : previous.view,
-                                true,
                                 poll.backupMiss
                                         ? metadataPrimary
                                         : notPrimary && poll.dataSent
@@ -853,7 +1169,7 @@ final class PollRouter {
 
     private void retryLifecycle(Poll poll, IggyServerException refusal) {
         long delay = poll.lifecycleRetryMillis;
-        if (poll.deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delay)) {
+        if (poll.attemptDeadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delay)) {
             poll.fail(refusal);
             return;
         }
@@ -863,9 +1179,12 @@ final class PollRouter {
         coordinator.get().eventLoop().schedule(() -> attempt(poll), delay, TimeUnit.MILLISECONDS);
     }
 
-    private void retry(Poll poll, boolean notPrimary) {
-        long delay = notPrimary ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0 : RETRY_INTERVAL_MILLIS;
-        if (!poll.retryRefusal(delay)) {
+    private void retry(Poll poll, boolean notPrimary, IggyServerException refusal) {
+        long delay = notPrimary
+                ? poll.notPrimarySeen ? poll.notPrimaryRetryMillis : 0
+                : TimeUnit.NANOSECONDS.toMillis(
+                        poll.state.retryPauseNanos(ThreadLocalRandom.current().nextDouble()));
+        if (!poll.retryRefusal(delay, refusal)) {
             return;
         }
         if (notPrimary && poll.notPrimarySeen) {
@@ -1133,18 +1452,17 @@ final class PollRouter {
         if (poll.result.isDone()) {
             return CompletableFuture.failedFuture(notAccepted());
         }
-        poll.partitionsCount = route.partitionsCount;
-        poll.routeView = route.view;
+        poll.route = route;
         poll.backupMiss = false;
         if (poll.dataCommand == CommandCode.Messages.GET_PARTITION_ROUTE.getValue()) {
             return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
         }
         poll.routed();
-        poll.context.compareAndSet(null, route.context);
+        poll.context.updateAndGet(caller -> RoutedContext.of(poll.dataCommand, caller, route.context));
         poll.state.setContext(poll.context.get());
         poll.state.setRoutingBody(poll.routingBody);
         if (poll.requiresLane) {
-            poll.state.setLane(poll.laneFor(poll.context.get()));
+            poll.state.setLanes(poll.lanesFor(route.context));
         }
         if (route.local) {
             poll.dataSent = true;
@@ -1171,7 +1489,7 @@ final class PollRouter {
         return slot;
     }
 
-    private static Throwable unwrap(Throwable error) {
+    static Throwable unwrap(Throwable error) {
         return error instanceof CompletionException && error.getCause() != null ? unwrap(error.getCause()) : error;
     }
 
@@ -1379,14 +1697,22 @@ final class PollRouter {
         private ConsensusSession.Ticket payloadLease;
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
         private final long deadline;
+        private long attemptDeadline;
         private volatile CompletableFuture<ByteBuf> activeExchange;
-        // The caller's context, or else the first route's, stays fixed within one operation.
+        private boolean deferredAdmitted;
+        // Fixed within one operation once the first route filled it, see RoutedContext.
         private final AtomicReference<PartitionContext> context;
         private final boolean hasCallerContext;
         // Read once, since the deadline timer can run after the payload was released.
         private final boolean requiresLane;
+        private final List<ConsensusSession.LaneKey> fetchLanes;
+        // A poll or fetch that commits on the server. Its cancel waits for the reply, which tells whether it stored.
+        private final boolean commits;
         private boolean historyRefreshed;
         private boolean retryingRefusal;
+        // The last capacity refusal, which the call reports when its deadline ends the retries. A budget too short
+        // for another attempt also ends them with 58, which would hide it.
+        private IggyServerException capacityRefusal;
         private boolean notPrimarySeen;
         private long notPrimaryRetryMillis = RETRY_INTERVAL_MILLIS;
         private boolean terminalRoutingRefusal;
@@ -1396,28 +1722,39 @@ final class PollRouter {
         private boolean backupMiss;
         private long lifecycleRetryMillis = RETRY_INTERVAL_MILLIS;
         private IggyServerException lifecycleRefusal;
-        private long partitionsCount;
-        private long routeView;
+        private Route route;
         private final Set<ConnectionInfo> lookupVisited = new HashSet<>();
-        private AsyncTcpConnection.TransientFailoverState state = new AsyncTcpConnection.TransientFailoverState();
+        private AsyncTcpConnection.TransientFailoverState state;
 
         private Poll(
                 byte[] routingBody,
                 int dataCommand,
                 ByteBuf payload,
                 long deadline,
-                Optional<PartitionContext> callerContext) {
+                Optional<PartitionContext> callerContext,
+                AsyncTcpConnection.TransientFailoverState state) {
             this.key = TargetKey.of(routingBody);
             this.routingBody = routingBody;
             this.dataCommand = dataCommand;
             this.payload = payload;
             this.deadline = deadline;
+            this.state = state;
             this.context = new AtomicReference<>(callerContext.orElse(null));
             this.hasCallerContext = callerContext.isPresent();
+            int pollEnd = payload.writerIndex()
+                    - (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue() ? DEFERRED_PARAMETERS_BYTES : 0);
+            boolean fetch = dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue();
+            // Mirrors FetchMessages.keepsReplyMargin, which also applies to a fetch with zero wait.
+            this.attemptDeadline = fetch ? deadline - DeferredPollOptions.REPLY_MARGIN.toNanos() : deadline;
+            this.fetchLanes = fetch ? FetchMessages.progressLanes(payload) : List.of();
+            this.commits = CommittingRead.commits(dataCommand, payload);
             this.requiresLane = isMutation()
-                    || (dataCommand == CommandCode.Messages.POLL.getValue()
-                            && (payload.getUnsignedByte(payload.writerIndex() - 1) != 0
-                                    || payload.getUnsignedByte(payload.writerIndex() - POLL_PARAMETERS_BYTES)
+                    || dataCommand == CommandCode.ConsumerOffset.GET.getValue()
+                    || !fetchLanes.isEmpty()
+                    || ((dataCommand == CommandCode.Messages.POLL.getValue()
+                                    || dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue())
+                            && (payload.getUnsignedByte(pollEnd - 1) != 0
+                                    || payload.getUnsignedByte(pollEnd - POLL_PARAMETERS_BYTES)
                                             == PollingKind.Next.asCode()));
         }
 
@@ -1425,13 +1762,25 @@ final class PollRouter {
             return VsrOperation.operationForCode(dataCommand) != VsrOperation.NON_REPLICATED;
         }
 
+        private boolean advancesProgress() {
+            return requiresLane && !isMutation() && dataCommand != CommandCode.ConsumerOffset.GET.getValue();
+        }
+
+        private List<ConsensusSession.LaneKey> lanesFor(PartitionContext fallback) {
+            return dataCommand == CommandCode.Messages.FETCH_MESSAGES.getValue()
+                    ? fetchLanes
+                    : List.of(laneFor(fallback));
+        }
+
         private ConsensusSession.LaneKey laneFor(PartitionContext fallback) {
             PartitionContext captured = context.get();
+            long incarnation = captured == null ? 0 : captured.incarnation().longValue();
             ByteBuf query = Unpooled.wrappedBuffer(routingBody);
             try {
                 return new ConsensusSession.LaneKey(
-                        (captured == null ? fallback : captured).incarnation().longValue(),
-                        query.getUnsignedIntLE(query.writerIndex() - Integer.BYTES));
+                        incarnation == 0 ? fallback.incarnation().longValue() : incarnation,
+                        query.getUnsignedIntLE(query.writerIndex() - Integer.BYTES),
+                        dataCommand != CommandCode.Messages.SEND.getValue());
             } finally {
                 query.release();
             }
@@ -1477,10 +1826,22 @@ final class PollRouter {
             lifecycleRefusal = null;
         }
 
-        private synchronized boolean retryRefusal(long delayMillis) {
+        /**
+         * Whether a refused attempt gets a retry after {@code delayMillis}. A retry of a deferred poll leaves
+         * {@link DeferredPollOptions#REPLY_MARGIN} for the reply, as each attempt of a fetch does, and the resend after
+         * a first NOT_PRIMARY is a retry too. So a poll with that margin or less of its budget left gets no retry, also
+         * a poll without a wait whose whole budget is that short. It ends with {@link #deadlineRefusal()}.
+         */
+        private synchronized boolean retryRefusal(long delayMillis, IggyServerException refusal) {
             retryingRefusal = true;
-            if (deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delayMillis)) {
-                fail(notAccepted());
+            if (dataCommand == CommandCode.Messages.POLL_DEFERRED.getValue()) {
+                attemptDeadline = deadline - DeferredPollOptions.REPLY_MARGIN.toNanos();
+            }
+            if (refusal != null && refusal.getErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED) {
+                capacityRefusal = refusal;
+            }
+            if (attemptDeadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delayMillis)) {
+                fail(deadlineRefusal());
                 return false;
             }
             return !result.isDone();
@@ -1494,16 +1855,24 @@ final class PollRouter {
             if (payloadLease != null) {
                 payloadLease.finishWrite();
             }
-            if (state.ticket() != null) {
-                if (error != null
-                        && !state.committed()
-                        && (state.wasUncertain()
-                                || unwrap(error) instanceof IggyOperationException operationError
-                                        && operationError.getErrorCode() == IggyErrorCode.OPERATION_UNCERTAIN)) {
-                    state.retainTicket();
-                } else {
-                    state.ticket().complete();
-                }
+            CompletableFuture<Void> settled =
+                    state.ticket() == null ? null : state.ticket().attemptSettled();
+            if (commits && result.isCancelled() && settled != null && !settled.isDone()) {
+                settled.whenComplete((ignored, attemptError) -> settleTicket(error));
+            } else if (state.ticket() != null) {
+                settleTicket(error);
+            }
+        }
+
+        private void settleTicket(Throwable error) {
+            if (error != null
+                    && !state.committed()
+                    && (state.wasUncertain()
+                            || unwrap(error) instanceof IggyOperationException operationError
+                                    && operationError.getErrorCode() == IggyErrorCode.OPERATION_UNCERTAIN)) {
+                state.retainTicket();
+            } else {
+                state.ticket().complete();
             }
         }
 
@@ -1514,14 +1883,10 @@ final class PollRouter {
                             : unwrap(error));
         }
 
-        /**
-         * Ends a poll that a session change or its deadline caught between attempts. A poll that a sign-in or a
-         * sign-out of the caller ended ends with 40, unless its mutation can have taken effect.
-         */
+        /** Ends a poll between attempts, preserving uncertainty once its frame may have been sent. */
         @SuppressWarnings("checkstyle:CyclomaticComplexity")
         private synchronized void endPending() {
-            // A link writes a request that needs a lane only after the lane admits it, which gives the request a
-            // ticket.
+            // Admission supplies the ticket before a lane-bound request can be written.
             boolean mayBeWritten = dataSent && (!requiresLane || state.ticket() != null);
             fail(
                     state.ticket() != null && dataSent && !retryingRefusal && lifecycleRefusal == null
@@ -1530,50 +1895,13 @@ final class PollRouter {
                                     ? state.lineageEnded(null)
                                     : lifecycleRefusal != null
                                             ? lifecycleRefusal
-                                            : retryingRefusal || !mayBeWritten ? notAccepted() : uncommitted());
-        }
-    }
-
-    /**
-     * The target bytes of a partition request, or their stream and topic prefix, compared by content. Nothing writes
-     * the bytes after a key holds them.
-     */
-    private static final class TargetKey {
-        private final byte[] target;
-        private final int length;
-        private final int hash;
-
-        private TargetKey(byte[] target, int length) {
-            this.target = target;
-            this.length = length;
-            int contentHash = 1;
-            for (int index = 0; index < length; index++) {
-                contentHash = 31 * contentHash + target[index];
-            }
-            this.hash = contentHash;
+                                            : retryingRefusal
+                                                    ? deadlineRefusal()
+                                                    : !mayBeWritten ? notAccepted() : uncommitted());
         }
 
-        static TargetKey of(byte[] target) {
-            return new TargetKey(target, target.length);
-        }
-
-        /** The stream and topic of a partition target, without its trailing partition id. */
-        TargetKey topic() {
-            return new TargetKey(target, length - Integer.BYTES);
-        }
-
-        boolean startsWith(TargetKey prefix) {
-            return length >= prefix.length && Arrays.equals(target, 0, prefix.length, prefix.target, 0, prefix.length);
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            return other instanceof TargetKey key && Arrays.equals(target, 0, length, key.target, 0, key.length);
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
+        private synchronized IggyServerException deadlineRefusal() {
+            return capacityRefusal != null ? capacityRefusal : notAccepted();
         }
     }
 
@@ -1594,7 +1922,26 @@ final class PollRouter {
             boolean local,
             long view,
             boolean stale,
-            ConnectionInfo hint) {}
+            ConnectionInfo hint) {
+        /**
+         * This route, to be looked up again before its next use. The lookup asks {@code lookupHint} first, and an answer
+         * of the same incarnation with a view below {@code floorView} does not replace the route.
+         */
+        Route markedStale(long floorView, ConnectionInfo lookupHint) {
+            return new Route(
+                    endpoint,
+                    attachment,
+                    parent,
+                    generation,
+                    bindSecret,
+                    context,
+                    partitionsCount,
+                    local,
+                    floorView,
+                    true,
+                    lookupHint);
+        }
+    }
 
     private record Attachment(long clientLow, long clientHigh, long session, long watermark) {
         private Attachment {

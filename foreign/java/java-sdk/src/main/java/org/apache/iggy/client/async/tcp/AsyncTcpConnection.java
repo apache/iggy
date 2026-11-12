@@ -91,12 +91,10 @@ import java.util.function.LongConsumer;
  * Manages the connection lifecycle and request/response correlation.
  */
 public class AsyncTcpConnection {
-    // Transient VSR denials (not-committed / not-accepted) are replayed with
-    // the same encoded frame so the server's dedup sees the same request id.
-    // A not-committed outcome is unknown, so it replays for the whole budget.
-    // A not-accepted deny was refused outright (typically a demoted primary),
-    // so after a short same-node retry it is handed to the owning client for
-    // a leader recheck and safe replay.
+    // Transient VSR denials (not-committed / not-accepted) are replayed with the same encoded frame so the server's
+    // dedup sees the same request id. A not-committed outcome is unknown, so it replays for the whole budget. A
+    // not-accepted deny was refused outright (typically a demoted primary), so after a short same-node retry it is
+    // handed to the owning client for a leader recheck and safe replay.
     //
     // Package-private: the client classifies a failed sign-in by these codes,
     // and a transient one is not a rejected credential.
@@ -119,18 +117,16 @@ public class AsyncTcpConnection {
     // A missing reply must not hold the single VSR-pinned channel forever.
     private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
     private static final long TRANSIENT_RETRY_INTERVAL_MS = 50;
-    // Each lifecycle retry commits another refusal, so its pause doubles from
-    // the transient interval up to this cap; mirrors LIFECYCLE_RETRY_MAX_INTERVAL
-    // in core/sdk/src/vsr.rs.
+    // Each lifecycle retry commits another refusal, so its pause doubles from the transient interval up to this cap;
+    // mirrors LIFECYCLE_RETRY_MAX_INTERVAL in core/sdk/src/vsr.rs.
     private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
-    // The pause before a leader recheck that follows NOT_PRIMARY in a row grows from the base to the cap with full
-    // jitter; mirrors RETRY_BACKOFF_BASE and RETRY_BACKOFF_MAX in core/sdk/src/links/mod.rs.
+    // Full-jitter refusal retries mirror core/sdk/src/links/mod.rs.
     private static final Duration RETRY_BACKOFF_BASE = Duration.ofMillis(50);
     private static final Duration RETRY_BACKOFF_MAX = Duration.ofSeconds(1);
     private static final String EVENT_LOOP_THREAD_PREFIX = "iggy-tcp-io";
 
     private final IoEventLoopGroup eventLoopGroup;
-    private final boolean ownsEventLoopGroup;
+    private final Optional<EventLoopShutdown> ownedGroupShutdown;
     private final EventLoop eventLoop;
     private final FixedChannelPool channelPool;
     private final ChannelGroup channels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE, true);
@@ -143,6 +139,7 @@ public class AsyncTcpConnection {
     private final IntConsumer sessionResetListener;
     private final BiConsumer<AsyncTcpConnection, Throwable> connectionFailureListener;
     private final long requestTimeoutNanos;
+    private final long maxReplyBody;
     private final ConnectionHeartbeat heartbeat;
     // Shared with the connections that bind this session, see bindSharedSession.
     private volatile SessionLogin login = new SessionLogin();
@@ -197,6 +194,7 @@ public class AsyncTcpConnection {
         this.sessionResetListener = sessionResetListener;
         this.connectionFailureListener = connectionFailureListener;
         this.requestTimeoutNanos = toTimeoutNanos(requestTimeout.orElse(DEFAULT_REQUEST_TIMEOUT));
+        this.maxReplyBody = maxVsrFrameSize - VsrHeaders.HEADER_SIZE;
         SslContext sslContext = null;
         if (enableTls) {
             try {
@@ -210,7 +208,8 @@ public class AsyncTcpConnection {
 
         this.consensusSession = new ConsensusSession();
         this.vsrEncoder = new VsrRequestEncoder(consensusSession);
-        this.ownsEventLoopGroup = sharedEventLoopGroup.isEmpty();
+        this.ownedGroupShutdown =
+                sharedEventLoopGroup.isEmpty() ? Optional.of(EventLoopShutdown.resolve(null, null)) : Optional.empty();
         this.eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> newEventLoopGroup(ioThreads));
         this.eventLoop = eventLoopGroup.next();
         this.heartbeat = new ConnectionHeartbeat(
@@ -539,6 +538,22 @@ public class AsyncTcpConnection {
     }
 
     void acquireForCall(Call call, ByteBuf payload, long requiredSessionGeneration) {
+        if (!isLoginCode(call.commandCode()) || !eventLoop.inEventLoop()) {
+            acquireChannel(call, payload, requiredSessionGeneration);
+            return;
+        }
+        // An off-loop discardAuthentication queues the close of the channels it abandons. A Register that a loop
+        // callback starts would take such a channel before that close runs, and the close would fail it. A new loop
+        // task runs after the close, like the acquire that the pool queues for a Register from another thread.
+        try {
+            eventLoop.execute(() -> acquireChannel(call, payload, requiredSessionGeneration));
+        } catch (RejectedExecutionException loopGone) {
+            payload.release();
+            call.fail(loopGone);
+        }
+    }
+
+    private void acquireChannel(Call call, ByteBuf payload, long requiredSessionGeneration) {
         TransientFailoverState failoverState = call.state();
         failoverState.linkFailed = false;
         failoverState.detachedSession = false;
@@ -807,17 +822,14 @@ public class AsyncTcpConnection {
     private static boolean isRefusal(IggyServerException serverError) {
         return serverError != null
                 && (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED
-                        || serverError.getRawErrorCode() == NOT_PRIMARY);
+                        || serverError.getRawErrorCode() == NOT_PRIMARY
+                        || serverError.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode());
     }
 
-    /**
-     * Paces lost-link and non-admission retries with full jitter and a doubling ceiling. First NOT_PRIMARY retries
-     * immediately; a pause that would reach the deadline ends the call.
-     */
+    /** Paces lost-link and non-admission retries; a pause that reaches the deadline ends the call. */
     private void pauseBeforeRecheck(Call call, Throwable rejection) {
         TransientFailoverState state = call.state();
-        long pause = ThreadLocalRandom.current().nextLong(state.pauseCeilingNanos + 1);
-        state.pauseCeilingNanos = Math.min(state.pauseCeilingNanos * 2, RETRY_BACKOFF_MAX.toNanos());
+        long pause = state.retryPauseNanos(ThreadLocalRandom.current().nextDouble());
         if (call.deadline() - System.nanoTime() - pause <= 0) {
             call.end(notAccepted());
         } else {
@@ -1060,9 +1072,11 @@ public class AsyncTcpConnection {
         return isPollRoutingCode(commandCode) || (sharedSession && isPartitionCommand(commandCode));
     }
 
-    private static boolean isPartitionCommand(int code) {
+    static boolean isPartitionCommand(int code) {
         return code == CommandCode.Messages.SEND.getValue()
                 || code == CommandCode.Messages.POLL.getValue()
+                || code == CommandCode.Messages.POLL_DEFERRED.getValue()
+                || code == CommandCode.Messages.FETCH_MESSAGES.getValue()
                 || code == CommandCode.ConsumerOffset.GET.getValue()
                 || isOffsetWriteCode(code);
     }
@@ -1095,14 +1109,14 @@ public class AsyncTcpConnection {
             TransientFailoverState state) {
         int operation = VsrOperation.operationForCode(commandCode);
         boolean mutation = operation != VsrOperation.NON_REPLICATED && !mutatesSessionState(commandCode);
-        if (state.ticket == null && (mutation || state.lane != null)) {
-            ConsensusSession.LaneKey lane = state.lane == null ? ConsensusSession.LaneKey.METADATA : state.lane;
+        if (state.ticket == null && (mutation || !state.lanes.isEmpty())) {
             CompletableFuture<ConsensusSession.Ticket> admission = consensusSession.acquire(
-                    lane,
+                    state.lanes.isEmpty() ? List.of(ConsensusSession.LaneKey.METADATA) : state.lanes,
                     mutation,
                     (long) VsrHeaders.HEADER_SIZE + payload.readableBytes(),
                     deadline,
-                    channel.eventLoop());
+                    channel.eventLoop(),
+                    commandCode == CommandCode.ConsumerOffset.GET.getValue());
             callerFuture.whenComplete((response, error) -> {
                 if (callerFuture.isCancelled()) {
                     admission.cancel(false);
@@ -1135,6 +1149,7 @@ public class AsyncTcpConnection {
             long requestDeadlineNanos,
             TransientFailoverState failoverState) {
         try {
+            CommittingRead.admit(failoverState.ticket, commandCode, payload);
             if (failoverState.ticket != null
                     && failoverState.ticket.prepareWrite(channel.isActive(), failoverState.lineage)) {
                 failoverState.renewRequestId();
@@ -1207,15 +1222,24 @@ public class AsyncTcpConnection {
     }
 
     /** Replays transient refusals with the same dedup identity; committed lifecycle refusals need a new id. */
-    @SuppressWarnings("checkstyle:NPathComplexity")
-    private void writeVsrFrame(VsrExchange exchange, ByteBuf frame, boolean uncertain, long lifecycleRetryIntervalMs) {
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    private void writeVsrFrame(
+            VsrExchange exchange, ByteBuf retainedFrame, boolean uncertain, long lifecycleRetryIntervalMs) {
         Channel channel = exchange.channel();
         VsrResponseHandler handler = exchange.handler();
         CompletableFuture<ByteBuf> responseFuture = exchange.responseFuture();
         if (exchange.requestDeadlineNanos() - System.nanoTime() <= 0) {
             IggyTimeoutException timeout = responseTimeout(exchange.commandCode());
-            releaseFrame(exchange, frame);
+            releaseFrame(exchange, retainedFrame);
             responseFuture.completeExceptionally(preserveUncertainOutcome(timeout, uncertain));
+            return;
+        }
+        ByteBuf frame;
+        try {
+            frame = exchange.frameForAttempt(retainedFrame, maxReplyBody);
+        } catch (RuntimeException error) {
+            releaseFrame(exchange, retainedFrame);
+            responseFuture.completeExceptionally(preserveUncertainOutcome(error, uncertain));
             return;
         }
         CompletableFuture<ByteBuf> attempt = new CompletableFuture<>();
@@ -1223,6 +1247,11 @@ public class AsyncTcpConnection {
         try {
             pending = handler.registerRequest(
                     channel, frame, attempt, exchange.requestDeadlineNanos(), exchange.commandCode());
+            if (exchange.commandCode() == CommandCode.Messages.POLL_DEFERRED.getValue()) {
+                pending.limitResponseBody(FetchMessages.pollReplyLimit(frame));
+            } else if (exchange.commandCode() == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+                FetchMessages.configureResponse(pending, frame);
+            }
         } catch (RuntimeException error) {
             releaseFrame(exchange, frame);
             responseFuture.completeExceptionally(error);
@@ -1231,13 +1260,12 @@ public class AsyncTcpConnection {
         if (exchange.failoverState().keepsLineage) {
             pending.keepLineage();
         }
-        attempt.whenComplete((response, error) ->
-                completeAttempt(exchange, frame, uncertain, pending, lifecycleRetryIntervalMs, response, error));
-        exchange.callerFuture().whenComplete((response, error) -> {
-            if (exchange.callerFuture().isCancelled()) {
-                attempt.cancel(false);
-            }
-        });
+        attempt.whenComplete(CommittingRead.settling(
+                exchange.failoverState().ticket,
+                (response, error) -> completeAttempt(
+                        exchange, frame, uncertain, pending, lifecycleRetryIntervalMs, response, error)));
+        exchange.callerFuture()
+                .whenComplete((response, error) -> CommittingRead.onCallerCancel(exchange, pending, attempt, channel));
         if (attempt.isDone()) {
             return;
         }
@@ -1261,6 +1289,7 @@ public class AsyncTcpConnection {
                 handler.closeChannel(channel, future.cause());
             }
         });
+        pending.sent(channel);
     }
 
     private static void releaseFrame(VsrExchange exchange, ByteBuf frame) {
@@ -1281,10 +1310,20 @@ public class AsyncTcpConnection {
             Throwable error) {
         Channel channel = exchange.channel();
         IggyServerException serverError = findServerError(error);
+        RuntimeException fetchFailure =
+                FetchMessages.completeAttempt(exchange, response, error, pending.isFailedByLink());
+        if (fetchFailure != null) {
+            releaseFrame(exchange, frame);
+            releaseIfPresent(response);
+            closeIfDetached(exchange, pending, serverError);
+            exchange.responseFuture().completeExceptionally(fetchFailure);
+            return;
+        }
         // A cancel can end an attempt after its reply was marked committed, and then nothing holds the outcome.
         // The operation stays uncertain, as in Rust, so a resolve can still prove it.
         boolean committed = pending.isCommitted() && (error == null || serverError != null);
         exchange.failoverState().committed = committed;
+        exchange.failoverState().replyCommit = pending.replyCommit();
         exchange.failoverState().linkFailed = pending.isFailedByLink();
         exchange.failoverState().detachedSession = pending.isSessionDetached();
         closeIfDetached(exchange, pending, serverError);
@@ -1305,7 +1344,9 @@ public class AsyncTcpConnection {
                         || PollRouter.isNamespaceMiss(error))) {
             exchange.failoverState().ticket.settleSent(nextUncertain);
         }
-        if (shouldRetryTransient(
+        boolean abandonedRead = CommittingRead.abandoned(exchange, error);
+        if (!abandonedRead
+                && shouldRetryTransient(
                         exchange.commandCode(),
                         error,
                         exchange.deadlineNanos(),
@@ -1331,6 +1372,7 @@ public class AsyncTcpConnection {
             }
         }
         if (!wasUncertain
+                && !abandonedRead
                 && !exchange.failoverState().routed
                 && scheduleLifecycleRetry(exchange, frame, serverError, nextUncertain, lifecycleRetryIntervalMs)) {
             return;
@@ -1378,11 +1420,10 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Only ordinary requests retry a lifecycle refusal, and only when the next
-     * attempt starts before the request deadline, as in Rust's TCP client. Routed
-     * exchanges hand it to their router. Sign-in and sign-out hold the
-     * channel lease until answered, so a pause there would stall every other
-     * request; the server never refuses them for a lifecycle change.
+     * Only ordinary requests retry a lifecycle refusal, and only when the next attempt starts before the request
+     * deadline, as in Rust's TCP client. Routed exchanges hand it to their router. Sign-in and sign-out hold the
+     * channel lease until answered, so a pause there would stall every other request; the server never refuses them
+     * for a lifecycle change.
      */
     private boolean scheduleLifecycleRetry(
             VsrExchange exchange,
@@ -1424,10 +1465,9 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Sends the refused request again under a fresh request id with the same
-     * payload and context, because the server's dedup answers the old id with
-     * its committed refusal. The frame is encoded after the pause so its id
-     * stays in order with the requests other callers sent meanwhile.
+     * Sends the refused request again under a fresh request id with the same payload and context, because the server's
+     * dedup answers the old id with its committed refusal. The frame is encoded after the pause so its id stays in
+     * order with the requests other callers sent meanwhile.
      */
     private void retryLifecycleBusy(
             VsrExchange exchange,
@@ -1558,11 +1598,16 @@ public class AsyncTcpConnection {
         if (isPollRoutingCode(commandCode)
                 || (routed
                         && (commandCode == CommandCode.Messages.POLL.getValue()
+                                || commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()
+                                || commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue()
                                 || commandCode == CommandCode.ConsumerOffset.GET.getValue()))) {
             return false;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED) {
             return System.nanoTime() < deadlineNanos;
+        }
+        if (serverError.getRawErrorCode() == IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode()) {
+            return !routed && System.nanoTime() < deadlineNanos;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED) {
             return !routed && System.nanoTime() < notAcceptedDeadlineNanos;
@@ -1657,13 +1702,11 @@ public class AsyncTcpConnection {
     private void closePool(CompletableFuture<Void> shutdownFuture) {
         try {
             channelPool.closeAsync().addListener(poolClosed -> {
-                if (!ownsEventLoopGroup) {
-                    completeShutdown(shutdownFuture, poolClosed);
-                    return;
-                }
-                eventLoopGroup
-                        .shutdownGracefully()
-                        .addListener(groupClosed -> completeShutdown(shutdownFuture, groupClosed));
+                // The caller shuts a supplied group down, so for one the close ends with the pool.
+                Future<?> closed = ownedGroupShutdown
+                        .<Future<?>>map(shutdown -> shutdown.shutdown(eventLoopGroup))
+                        .orElse(poolClosed);
+                closed.addListener(step -> completeShutdown(shutdownFuture, step));
             });
         } catch (RejectedExecutionException loopGone) {
             log.warn("Event loop rejected the pool close, channel already gone: {}", loopGone.getMessage());
@@ -1728,9 +1771,8 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Fails a routed exchange that its link failed, by an eviction or a lost
-     * connection. An eviction carries the code of a reply, and only this tells
-     * the router to try the exchange again where a reply ends the call.
+     * Fails a routed exchange that its link failed, by an eviction or a lost connection. An eviction carries the code
+     * of a reply, and only this tells the router to try the exchange again where a reply ends the call.
      */
     static final class LinkFailure extends CompletionException {
         LinkFailure(Throwable cause) {
@@ -1746,6 +1788,7 @@ public class AsyncTcpConnection {
         private boolean retryAuthentication;
         private long requestId;
         private boolean committed;
+        private long replyCommit;
         private boolean linkFailed;
         private boolean detachedSession;
         private boolean uncertain;
@@ -1755,7 +1798,8 @@ public class AsyncTcpConnection {
         // A 58 or 89 refusal or a link lost before the frame went out sent the call to another attempt, see Call#end.
         private boolean refused;
         private long pauseCeilingNanos = RETRY_BACKOFF_BASE.toNanos();
-        private ConsensusSession.LaneKey lane;
+        // In the order that the session admits them, see ConsensusSession#acquire.
+        private List<ConsensusSession.LaneKey> lanes = List.of();
         private ConsensusSession.Ticket ticket;
         private RuntimeException retainedError;
         private byte[] routingBody;
@@ -1771,6 +1815,12 @@ public class AsyncTcpConnection {
 
         TransientFailoverState(PartitionContext context) {
             this.context = context;
+        }
+
+        synchronized long retryPauseNanos(double draw) {
+            long ceiling = pauseCeilingNanos;
+            pauseCeilingNanos = Math.min(ceiling * 2, RETRY_BACKOFF_MAX.toNanos());
+            return (long) (ceiling * draw);
         }
 
         long lineage() {
@@ -1829,7 +1879,11 @@ public class AsyncTcpConnection {
                     return retainedError;
                 }
                 // Retaining wakes resolvers inline, so publish the guard before invoking callbacks without this lock.
-                retainedError = new IggyOperationException(IggyErrorCode.OPERATION_UNCERTAIN, retained.operationId());
+                retainedError = new IggyOperationException(
+                        retained.commitsOnRead()
+                                ? IggyErrorCode.FETCH_PROGRESS_UNCERTAIN
+                                : IggyErrorCode.OPERATION_UNCERTAIN,
+                        retained.operationId());
             }
             RuntimeException error = retained.retain();
             synchronized (this) {
@@ -1846,8 +1900,16 @@ public class AsyncTcpConnection {
             return committed;
         }
 
-        void setLane(ConsensusSession.LaneKey lane) {
-            this.lane = lane;
+        long replyCommit() {
+            return replyCommit;
+        }
+
+        void setLanes(List<ConsensusSession.LaneKey> lanes) {
+            this.lanes = lanes;
+        }
+
+        List<ConsensusSession.LaneKey> lanes() {
+            return lanes;
         }
 
         void setRoutingBody(byte[] routingBody) {

@@ -573,6 +573,10 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
                     }
                 }
                 let drained = batch.len();
+                let write_receipts: Vec<_> = batch
+                    .iter_mut()
+                    .filter_map(BusMessage::take_write_receipt)
+                    .collect();
                 // `drain(..)` consumes the batch in FIFO order while
                 // preserving the Vec's allocation for the next
                 // iteration; `into_iter()` would move the buffer out.
@@ -601,6 +605,9 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
                         "tls writer: flush failed"
                     );
                     return;
+                }
+                for receipt in write_receipts {
+                    receipt.complete();
                 }
             }
             PumpAction::Recv(Ok(Some(frame))) => {

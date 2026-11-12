@@ -44,7 +44,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 		ginkgo.Context("and tries to get non-existing stream", func() {
 			client := createAuthorizedConnection()
 
-			_, err := client.GetStream(context.Background(), randomU32Identifier())
+			_, err := client.GetStream(context.Background(), nonExistingStreamIdentifier(client))
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})

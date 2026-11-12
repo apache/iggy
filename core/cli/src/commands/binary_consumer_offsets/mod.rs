@@ -17,3 +17,13 @@
 
 pub mod get_consumer_offset;
 pub mod set_consumer_offset;
+
+use iggy_common::{Consumer, ConsumerKind};
+
+pub(crate) fn consumer_info(consumer: &Consumer) -> String {
+    match consumer.kind {
+        ConsumerKind::Consumer => format!("consumer with ID: {}", consumer.id),
+        ConsumerKind::ConsumerGroup => format!("consumer group with ID: {}", consumer.id),
+        ConsumerKind::ExternalGroup => format!("external group with ID: {}", consumer.id),
+    }
+}

@@ -19,9 +19,16 @@ import { deserializePartitionContext, PARTITION_CONTEXT_SIZE, type PartitionCont
 import { toDate } from '../serialize.utils.js';
 import type { ValueOf } from '../../type.utils.js';
 import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
+import { deserializeError } from '../error.utils.js';
 
 /** Default of `message_expiry` and `max_topic_size`: never expire, no cap. */
 const UNLIMITED = 0xffff_ffff_ffff_ffffn;
+
+/** Partition id, counters and context, before the two node lists. */
+const PARTITION_COUNTERS_SIZE = 40 + PARTITION_CONTEXT_SIZE;
+
+/** Smallest partition entry: the counters and two empty node lists. */
+const PARTITION_MIN_SIZE = PARTITION_COUNTERS_SIZE + 2;
 
 /**
  * Basic topic information without partition details.
@@ -68,7 +75,14 @@ export type Partition = {
   /** Total size of the partition in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the partition */
-  messagesCount: bigint
+  messagesCount: bigint,
+  /** Node ids that store the partition, in member order */
+  members: number[],
+  /**
+   * Node ids among `members` that the partition's primary last reported in
+   * sync and that are up. Empty until the primary first reports.
+   */
+  inSyncMembers: number[]
 };
 
 /** Topic with partition details */
@@ -186,24 +200,59 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
 
 /**
  * Deserializes a partition from a buffer.
+ * Layout: `[id:u32][created_at:u64][segments_count:u32][current_offset:u64]
+ * [size_bytes:u64][messages_count:u64][context:24]` then two node lists,
+ * members and in-sync members, each a `u8` count followed by that many `u8`
+ * node ids. The entry is 66 bytes plus one per listed node.
  *
  * @param p - Buffer containing serialized partition data
  * @param pos - Starting position in the buffer
  * @returns Object with bytes read and deserialized partition data
+ * @throws DeserializeError if the buffer ends inside the entry
  */
 export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized => {
+  if (p.length - pos < PARTITION_MIN_SIZE)
+    deserializeError('partition', pos, p.length, PARTITION_MIN_SIZE);
+
+  const start = pos;
+  const id = p.readUInt32LE(pos);
+  const createdAt = toDate(p.readBigUint64LE(pos + 4));
+  const segmentsCount = p.readUInt32LE(pos + 12);
+  const currentOffset = p.readBigUint64LE(pos + 16);
+  const sizeBytes = p.readBigUint64LE(pos + 24);
+  const messagesCount = p.readBigUint64LE(pos + 32);
+  const context = deserializePartitionContext(p, pos + 40);
+  pos += PARTITION_COUNTERS_SIZE;
+
+  const members = deserializeNodeIds(p, pos, 'partition members');
+  pos += 1 + members.length;
+  const inSyncMembers = deserializeNodeIds(p, pos, 'partition in-sync members');
+  pos += 1 + inSyncMembers.length;
+
   return {
-    bytesRead: 40 + PARTITION_CONTEXT_SIZE,
+    bytesRead: pos - start,
     data: {
-      id: p.readUInt32LE(pos),
-      createdAt: toDate(p.readBigUint64LE(pos + 4)),
-      segmentsCount: p.readUInt32LE(pos + 12),
-      currentOffset: p.readBigUint64LE(pos + 16),
-      sizeBytes: p.readBigUint64LE(pos + 24),
-      messagesCount: p.readBigUint64LE(pos + 32),
-      context: deserializePartitionContext(p, pos + 40),
+      id,
+      createdAt,
+      segmentsCount,
+      currentOffset,
+      sizeBytes,
+      messagesCount,
+      context,
+      members,
+      inSyncMembers,
     }
   }
+};
+
+/** Reads a `[count:u8][ids:count x u8]` node list at `pos`. */
+const deserializeNodeIds = (p: Buffer, pos: number, name: string): number[] => {
+  if (p.length - pos < 1)
+    deserializeError(name, pos, p.length, 1);
+  const count = p.readUInt8(pos);
+  if (p.length - pos - 1 < count)
+    deserializeError(name, pos, p.length, 1 + count, { count });
+  return Array.from(p.subarray(pos + 1, pos + 1 + count));
 };
 
 

@@ -104,11 +104,7 @@ macro_rules! impl_binary_client {
                 context: iggy_common::PartitionContext,
             ) -> Result<bytes::Bytes, iggy_common::IggyError> {
                 self.driver
-                    .send_raw(
-                        code,
-                        payload,
-                        (context != iggy_common::PartitionContext::default()).then_some(context),
-                    )
+                    .send_raw(code, payload, context.non_zero())
                     .await
             }
 
@@ -136,6 +132,42 @@ macro_rules! impl_binary_client {
                 context: Option<iggy_common::PartitionContext>,
             ) -> Result<bytes::Bytes, iggy_common::IggyError> {
                 self.driver.poll(request, context).await
+            }
+
+            async fn send_fetch_with_response(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::FetchMessagesRequest,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver.fetch_messages(request).await
+            }
+
+            async fn send_fetch_sections(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::FetchMessagesRequest,
+            ) -> Result<Vec<iggy_common::FetchedSection>, iggy_common::IggyError> {
+                self.driver.fetch_sections(request).await
+            }
+
+            async fn send_group_sync_with_commit(
+                &self,
+                payload: bytes::Bytes,
+            ) -> Result<(bytes::Bytes, u64), iggy_common::IggyError> {
+                self.driver.sync_group(payload).await
+            }
+
+            fn observe_metadata_commit(&self, commit: u64) {
+                self.driver.observe_metadata_commit(commit);
+            }
+
+            async fn send_poll_with_response_and_options(
+                &self,
+                request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+                context: Option<iggy_common::PartitionContext>,
+                options: Option<iggy_common::DeferredPollOptions>,
+            ) -> Result<bytes::Bytes, iggy_common::IggyError> {
+                self.driver
+                    .poll_with_options(request, context, options)
+                    .await
             }
 
             fn routed_partition_count(
@@ -258,6 +290,10 @@ macro_rules! impl_binary_client {
 
             fn sdk_version(&self) -> &'static str {
                 crate::SDK_VERSION
+            }
+
+            fn next_producer_id(&self) -> Result<u64, iggy_common::IggyError> {
+                self.driver.session().next_producer_id()
             }
         }
 

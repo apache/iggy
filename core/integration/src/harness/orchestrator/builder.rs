@@ -101,12 +101,6 @@ impl TestHarnessBuilder {
         self
     }
 
-    /// Configure the connectors runtime with default settings.
-    pub fn default_connectors_runtime(mut self) -> Self {
-        self.connectors_runtime_config = Some(ConnectorsRuntimeConfig::default());
-        self
-    }
-
     /// Configure the JWKS server.
     pub fn jwks(mut self, config: JwksConfig) -> Self {
         self.jwks_config = Some(config);

@@ -32,12 +32,17 @@ use iggy::prelude::*;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::dispatch::COMMAND_TABLE;
-use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::requests::messages::{
+    DeferredPollMessagesRequest, FetchMessagesRequest, FetchMessagesTarget,
+    GetPartitionRouteRequest, PollMessagesRequest,
+};
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
-use iggy_common::wire_conversions::identifier_to_wire;
-use iggy_common::{MetadataChangeGroups, VsrSessionControl};
+use iggy_common::wire_conversions::{
+    consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
+};
+use iggy_common::{DeferredPollOptions, MetadataChangeGroups, VsrSessionControl};
 use integration::harness::{TestHarness, login_root};
 
 const STREAM_NAME: &str = "auth-test-stream";
@@ -157,6 +162,11 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             code,
             JOIN_CONSUMER_GROUP_CODE | LEAVE_CONSUMER_GROUP_CODE | SYNC_CONSUMER_GROUP_CODE
         ) {
+            continue;
+        }
+        // The SDK refuses a raw cancel, because a cancel names a parked
+        // request by its id. The server `classify` test covers its auth gate.
+        if code == CANCEL_DEFERRED_REQUEST_CODE {
             continue;
         }
         // Special setup required
@@ -311,18 +321,52 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                     .await
                     .map(|_| ())
             }
+            // `poll_messages` sends the deferred poll, so the plain poll goes
+            // as a raw frame.
             POLL_MESSAGES_CODE => client
-                .poll_messages(
-                    &ctx.stream_id,
-                    &ctx.topic_id,
-                    Some(0),
-                    &ctx.consumer,
-                    &PollingStrategy::offset(0),
-                    1,
-                    false,
-                )
+                .send_binary_request(code, poll_request(&ctx).to_bytes())
                 .await
                 .map(|_| ()),
+            POLL_MESSAGES_DEFERRED_CODE => {
+                let options = DeferredPollOptions::default();
+                let request = DeferredPollMessagesRequest {
+                    poll: poll_request(&ctx),
+                    wait_us: options.max_wait.as_micros(),
+                    min_count: options.min_count,
+                    max_bytes: options.max_bytes,
+                    request_timeout_us: options.request_timeout.as_micros(),
+                };
+                client
+                    .send_binary_request(code, request.to_bytes())
+                    .await
+                    .map(|_| ())
+            }
+            FETCH_MESSAGES_CODE => {
+                let options = DeferredPollOptions::default();
+                let poll = poll_request(&ctx);
+                let request = FetchMessagesRequest {
+                    consumer: poll.consumer,
+                    stream_id: poll.stream_id,
+                    topic_id: poll.topic_id,
+                    wait_us: options.max_wait.as_micros(),
+                    request_timeout_us: options.request_timeout.as_micros(),
+                    min_count: options.min_count,
+                    count: poll.count,
+                    max_bytes: options.max_bytes,
+                    auto_commit: false,
+                    targets: vec![FetchMessagesTarget {
+                        partition_id: 0,
+                        strategy: poll.strategy,
+                        max_bytes: options.max_bytes,
+                        incarnation: 0,
+                        owner_generation: 0,
+                    }],
+                };
+                client
+                    .send_binary_request(code, request.to_bytes())
+                    .await
+                    .map(|_| ())
+            }
             // Consumer Offsets
             GET_CONSUMER_OFFSET_CODE => client
                 .get_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
@@ -362,6 +406,18 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
         };
 
         assert_unauthenticated(result, name);
+    }
+}
+
+fn poll_request(ctx: &TestContext) -> PollMessagesRequest {
+    PollMessagesRequest {
+        consumer: consumer_to_wire(&ctx.consumer).unwrap(),
+        stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
+        topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
+        partition_id: Some(0),
+        strategy: polling_strategy_to_wire(&PollingStrategy::offset(0)),
+        count: 1,
+        auto_commit: true,
     }
 }
 
@@ -421,11 +477,13 @@ async fn verify_auth_works(client: &IggyClient) {
         .poll_messages(
             &ctx.stream_id,
             &ctx.topic_id,
-            Some(0),
+            0,
             &ctx.consumer,
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll_messages");

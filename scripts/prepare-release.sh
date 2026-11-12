@@ -52,6 +52,7 @@ RELEASE_PATHS=(
   "Dockerfile"
   "LICENSE"
   "NOTICE"
+  "Package.swift"
   "about.hbs"
   "about.toml"
   "docker-compose.yml"
@@ -67,8 +68,21 @@ RELEASE_PATHS=(
   "web"
 )
 
+# PHP package archives exclude tests, but source releases need them.
+ARCHIVE_REPO=$(mktemp -d)
+trap 'rm -rf "$ARCHIVE_REPO"' EXIT
+git clone --quiet --bare --shared . "$ARCHIVE_REPO"
+mkdir -p "$ARCHIVE_REPO/info"
+cat > "$ARCHIVE_REPO/info/attributes" <<'EOF'
+foreign/php/Dockerfile.test -export-ignore
+foreign/php/docker-compose.test.yml -export-ignore
+foreign/php/phpunit.xml.dist -export-ignore
+foreign/php/tests -export-ignore
+foreign/php/tests/** -export-ignore
+EOF
+
 # Create tar using git archive for consistent output
-git archive \
+git --git-dir="$ARCHIVE_REPO" archive \
   --format=tar \
   --prefix="iggy-${VERSION}-src/" \
   -o "$RELEASE_DIR/$TAR_NAME" \

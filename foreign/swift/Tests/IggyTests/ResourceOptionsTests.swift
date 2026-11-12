@@ -86,7 +86,9 @@ struct ResourceOptionsTests {
         let constants = fixture.constants
         #expect(ProtocolVersion.current.packed == constants.protocolVersion.packed)
         #expect(ProtocolVersion.current.description == constants.protocolVersion.text)
-        #expect(constants.protocolVersionMin.packed == constants.protocolVersion.packed)
+        // The minimum stays behind while released clients still send the
+        // commands of the older patch.
+        #expect(constants.protocolVersionMin.packed <= constants.protocolVersion.packed)
 
         // Command and operation mirrors.
         for (name, entry) in constants.commandCodes {
@@ -298,7 +300,7 @@ struct ResourceOptionsTests {
         let topicCreate = TopicCreateOptions(
             partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .never, maxTopicSize: .bytes(1 << 30), segmentSizeBytes: 1 << 20,
             durability: .persisted, consumerOffsetDurability: .persisted, partitionResizePolicy: .fixed, messagesRequiredToSave: 10,
-            sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true)
+            sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true, replicationFactor: 3)
         #expect(unsetFields(streamCreate, except: ["raw"]).isEmpty)
         #expect(unsetFields(topicCreate, except: ["raw"]).isEmpty)
         #expect(Set(try streamCreate.toResourceOptions().keys) == creatable("stream"))

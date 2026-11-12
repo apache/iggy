@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE};
+use crate::codes::{
+    CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, LOGIN_REGISTER_CODE,
+    LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE, POLL_MESSAGES_DEFERRED_CODE,
+};
 use crate::consensus::{Command, HEADER_SIZE, Operation, RequestHeader};
 use crate::error::WireError;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -42,6 +45,29 @@ pub fn operation_for_code(code: u32) -> Operation {
 }
 
 impl RequestHeader {
+    /// A fire-and-forget cancellation for this deferred request. It must follow
+    /// the original frame on the same connection, so the server sees the request
+    /// queued or admitted when the cancellation arrives.
+    #[must_use]
+    pub fn deferred_cancellation(&self) -> Option<Self> {
+        if self.operation != Operation::NonReplicated
+            || !matches!(
+                u32::from_le_bytes(self.reserved),
+                POLL_MESSAGES_DEFERRED_CODE | FETCH_MESSAGES_CODE
+            )
+        {
+            return None;
+        }
+        Self::for_request(
+            CANCEL_DEFERRED_REQUEST_CODE,
+            self.client,
+            self.request,
+            self.session,
+            &[],
+        )
+        .ok()
+    }
+
     /// Builds the header a client sends for `code` with `payload`, given the
     /// identity the session assigned: `client`, `request` and `session`.
     ///
@@ -146,6 +172,25 @@ mod tests {
             u128::from(XxHash3_64::oneshot(&payload))
         );
         assert_eq!(header.reserved, [0; 4]);
+    }
+
+    #[test]
+    fn only_deferred_requests_get_a_cancellation() {
+        for code in [POLL_MESSAGES_DEFERRED_CODE, FETCH_MESSAGES_CODE] {
+            let request = RequestHeader::for_request(code, 1, 2, 3, &[7; 8]).unwrap();
+            let cancel = request.deferred_cancellation().unwrap();
+            assert_eq!(cancel.operation, Operation::NonReplicated);
+            assert_eq!(
+                cancel.reserved[NON_REPLICATED_CODE_RANGE],
+                CANCEL_DEFERRED_REQUEST_CODE.to_le_bytes()
+            );
+            assert_eq!((cancel.client, cancel.request, cancel.session), (1, 2, 3));
+            assert_eq!(cancel.size as usize, HEADER_SIZE);
+        }
+        for code in [PING_CODE, CANCEL_DEFERRED_REQUEST_CODE, SEND_MESSAGES_CODE] {
+            let request = RequestHeader::for_request(code, 1, 2, 3, &[]).unwrap();
+            assert!(request.deferred_cancellation().is_none(), "code {code}");
+        }
     }
 
     #[test]

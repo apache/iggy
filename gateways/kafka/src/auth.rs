@@ -21,7 +21,7 @@
 //! password are an Iggy username and password, so authenticating is forwarding them to an Iggy
 //! login and seeing whether it succeeds. `docs/AUTHENTICATION.md` has the reasoning.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -29,12 +29,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyError, Permissions, TcpClient,
-    TcpClientConfigBuilder, UserStatus,
+    TcpClientConfigBuilder, UserClient, UserInfoDetails, UserStatus,
 };
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
 
 use crate::bridge::config::{DEFAULT_IGGY_ADDR, IggyTls};
+use crate::bridge::nodes::{KnownNodes, is_unreachable};
 use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::sasl::PlainCredentials;
 
@@ -64,12 +65,12 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// would only hide the failure underneath one the client cannot see.
 const VERIFY_RECONNECTION_RETRIES: u32 = 0;
 
-/// Budget for tearing the verification client down again.
+/// Budget for signing the verification client out and tearing it down again.
 ///
 /// Deliberately far shorter than [`VERIFY_TIMEOUT`]. The authentication slot is already released by
 /// the time teardown runs, but every second here still comes out of the caller's own
-/// pre-authentication budget. Nothing is lost by cutting it short: dropping the client closes the
-/// socket regardless.
+/// pre-authentication budget. Little is lost by cutting it short: dropping the client closes the
+/// socket regardless, and Iggy ends a session that did not sign out when its lease runs out.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Delay imposed on a peer after its first rejected login, doubled on every further rejection.
@@ -194,16 +195,23 @@ pub enum AuthError {
 
 /// Who authenticated, and what Iggy already allows them to do.
 ///
-/// The permissions are a snapshot taken during the login that verified the credentials, not a live
-/// view. Refreshing them would mean either holding an Iggy session open per connection, which the
-/// authentication design rejects on cost, or keeping the password, which it rejects outright. A
-/// permission changed mid-connection is therefore invisible until the client reconnects, the same
-/// way Iggy's own data plane lags a revocation until the owning shard applies it.
+/// The permissions are a snapshot taken during the login that verified the credentials. Reading
+/// them again would mean either holding an Iggy session open per connection, which the
+/// authentication design rejects on cost, or keeping the password, which it rejects outright. So
+/// the connection applies the later changes that Iggy's metadata change log shows for the user
+/// instead (`PermissionFollow` in `server.rs`). When the bridge user cannot read that log, a
+/// permission changed mid-connection is invisible until the client reconnects.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPrincipal {
     pub username: String,
+    /// The Iggy user, as the change log names it. `None` for `ANONYMOUS`, and when the read of
+    /// the user failed.
+    pub user: Option<UserKey>,
     pub permissions: PrincipalPermissions,
-    /// Whether [`Self::permissions`] is a real answer or a fallback.
+    /// The topics that the principal's stream and topic grants let it read. Each commit checks
+    /// them.
+    pub topic_reads: Arc<TopicReads>,
+    /// Whether [`Self::permissions`] and [`Self::topic_reads`] are a real answer or a fallback.
     ///
     /// A read that failed after a successful login degrades to an empty set, which is
     /// indistinguishable on the wire from a principal that genuinely holds nothing. Silently
@@ -226,8 +234,35 @@ impl AuthenticatedPrincipal {
     pub fn anonymous() -> Self {
         Self {
             username: Self::ANONYMOUS.to_string(),
+            user: None,
             permissions: PrincipalPermissions::default(),
+            topic_reads: Arc::default(),
             permissions_known: true,
+        }
+    }
+
+    /// Whether this is [`Self::anonymous`]: a connection on a listener that authenticates no one.
+    /// A login whose user could not be read has no user either, but its permissions are unknown.
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        self.user.is_none() && self.permissions_known && self.username == Self::ANONYMOUS
+    }
+}
+
+/// One Iggy user. Iggy gives the id and name of a deleted user to new users, never its creation
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UserKey {
+    pub user_id: u32,
+    /// In microseconds.
+    pub created_at: u64,
+}
+
+impl From<&UserInfoDetails> for UserKey {
+    fn from(user: &UserInfoDetails) -> Self {
+        Self {
+            user_id: user.id,
+            created_at: user.created_at.as_micros(),
         }
     }
 }
@@ -289,6 +324,8 @@ pub trait PrincipalResolver: Send + Sync + std::fmt::Debug {
 pub struct IggyAuthenticator {
     address: String,
     tls: IggyTls,
+    /// The nodes a login dials after `address`. Empty unless the bridge shares its roster.
+    nodes: KnownNodes,
 }
 
 impl IggyAuthenticator {
@@ -306,7 +343,7 @@ impl IggyAuthenticator {
     ];
 
     #[must_use]
-    pub const fn new(address: String) -> Self {
+    pub fn new(address: String) -> Self {
         Self {
             address,
             tls: IggyTls {
@@ -314,7 +351,16 @@ impl IggyAuthenticator {
                 domain: String::new(),
                 ca_file: None,
             },
+            nodes: KnownNodes::default(),
         }
+    }
+
+    /// Dials `nodes` after the configured address, so that a login still succeeds while that
+    /// node is down. `main` passes the roster that the bridge keeps.
+    #[must_use]
+    pub fn with_nodes(mut self, nodes: KnownNodes) -> Self {
+        self.nodes = nodes;
+        self
     }
 
     #[must_use]
@@ -343,6 +389,38 @@ impl IggyAuthenticator {
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
         Ok(Self::new(address).with_tls(IggyTls::from_env()?))
     }
+
+    /// A client that dials `address` and signs in with `credentials`.
+    ///
+    /// A bare transport client, not an `IggyClient`. The wrapper starts a heartbeat the moment it
+    /// connects, and on a lockstep connection that ping queues the permission read behind it.
+    /// Nothing here needs a heartbeat anyway: the client lives for one login and one read.
+    fn verifier(
+        &self,
+        address: &str,
+        credentials: &PlainCredentials,
+    ) -> Result<TcpClient, IggyError> {
+        let auto_login = AutoLogin::Enabled(Credentials::UsernamePassword(
+            credentials.username.clone(),
+            credentials.password.clone(),
+        ));
+        let mut builder = TcpClientConfigBuilder::new()
+            .with_server_address(address.to_owned())
+            .with_auto_sign_in(auto_login)
+            .with_reconnection_max_retries(Some(VERIFY_RECONNECTION_RETRIES));
+        if self.tls.enabled {
+            builder = builder.with_tls_enabled(true);
+            if !self.tls.domain.is_empty() {
+                builder = builder.with_tls_domain(self.tls.domain.clone());
+            }
+            if let Some(ref ca_file) = self.tls.ca_file {
+                builder = builder.with_tls_ca_file(ca_file.clone());
+            }
+        }
+        builder
+            .build()
+            .and_then(|config| TcpClient::create(Arc::new(config)))
+    }
 }
 
 impl std::fmt::Display for IggyAuthenticator {
@@ -362,35 +440,33 @@ impl SaslAuthenticator for IggyAuthenticator {
         credentials: &PlainCredentials,
         slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
-        let auto_login = AutoLogin::Enabled(Credentials::UsernamePassword(
-            credentials.username.clone(),
-            credentials.password.clone(),
-        ));
-        // A bare transport client, not an `IggyClient`. The wrapper starts a heartbeat the moment it
-        // connects, and on a lockstep connection that ping queues the permission read behind it.
-        // Nothing here needs a heartbeat anyway: the client lives for one login and one read.
-        let mut builder = TcpClientConfigBuilder::new()
-            .with_server_address(self.address.clone())
-            .with_auto_sign_in(auto_login)
-            .with_reconnection_max_retries(Some(VERIFY_RECONNECTION_RETRIES));
-        if self.tls.enabled {
-            builder = builder.with_tls_enabled(true);
-            if !self.tls.domain.is_empty() {
-                builder = builder.with_tls_domain(self.tls.domain.clone());
+        // The configured node first, then the others. A node that answers ends the dial, whatever
+        // it says about the credentials, since every node would say the same.
+        let mut attempt = None;
+        for address in self.nodes.dial_order(&self.address) {
+            let client = self
+                .verifier(&address, credentials)
+                .map_err(|error| classify(&error))?;
+            let connected = tokio::time::timeout(VERIFY_TIMEOUT, client.connect()).await;
+            let answered =
+                matches!(&connected, Ok(result) if !result.as_ref().is_err_and(is_unreachable));
+            if answered {
+                self.nodes.mark_reachable(&address);
+            } else {
+                self.nodes.mark_unreachable(&address);
             }
-            if let Some(ref ca_file) = self.tls.ca_file {
-                builder = builder.with_tls_ca_file(ca_file.clone());
+            attempt = Some((client, connected));
+            if answered {
+                break;
             }
         }
-        let client = builder
-            .build()
-            .and_then(|config| TcpClient::create(Arc::new(config)))
-            .map_err(|error| classify(&error))?;
-
-        let connected = tokio::time::timeout(VERIFY_TIMEOUT, client.connect()).await;
+        let Some((client, connected)) = attempt else {
+            return Err(AuthError::Unavailable);
+        };
         // The password verify the slot bounds is done. Holding it across the permission read and
         // teardown would keep a slot busy for two more round trips per login.
         drop(slot);
+        let signed_in = matches!(connected, Ok(Ok(())));
         let outcome = match connected {
             Err(_elapsed) => Err(AuthError::Unavailable),
             Ok(Err(error)) => Err(classify(&error)),
@@ -402,27 +478,37 @@ impl SaslAuthenticator for IggyAuthenticator {
             Ok(Ok(())) => fetch_permissions(&client, &credentials.username).await,
         };
 
-        // Shut down rather than drop, so the socket closes cleanly and Iggy releases the session
-        // now instead of noticing the dead peer later.
+        // Sign out first: a shutdown only closes the socket, and Iggy keeps the session in its
+        // clients table until the lease runs out, 36 s by default. A full table refuses every new
+        // login, so a burst of Kafka logins would lock out the cluster's other clients. Then shut
+        // down rather than drop, so the socket closes cleanly.
         //
         // Both failure shapes are reported, and separately: the outer `Elapsed` and the inner
         // `IggyError` mean different things, and folding them together would log "timed out" for a
         // shutdown that failed immediately. Neither leaks the client, since dropping it closes the
         // socket regardless, but an invisible failure here would hide a real one.
-        match tokio::time::timeout(TEARDOWN_TIMEOUT, client.shutdown()).await {
+        let teardown = async {
+            if signed_in && let Err(error) = client.logout_user().await {
+                debug!(%error, "a credential-verification client did not sign out");
+            }
+            client.shutdown().await
+        };
+        match tokio::time::timeout(TEARDOWN_TIMEOUT, teardown).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 warn!(%error, "failed to shut down a credential-verification client");
             }
             Err(_elapsed) => {
-                warn!("timed out shutting down a credential-verification client");
+                warn!("timed out signing out and shutting down a credential-verification client");
             }
         }
 
-        outcome.map(|(permissions, read)| AuthenticatedPrincipal {
+        outcome.map(|(grants, user)| AuthenticatedPrincipal {
             username: credentials.username.clone(),
-            permissions,
-            permissions_known: read == PermissionRead::Resolved,
+            user,
+            permissions: grants.permissions,
+            topic_reads: grants.topic_reads,
+            permissions_known: user.is_some(),
         })
     }
 }
@@ -477,27 +563,18 @@ pub(crate) async fn resolve_principal(
         debug!(username, "the certificate names an inactive Iggy user");
         return Err(AuthError::Rejected);
     }
+    let grants = Grants::of(user.permissions.as_ref());
     Ok(AuthenticatedPrincipal {
         username: username.to_string(),
-        permissions: user
-            .permissions
-            .as_ref()
-            .map(PrincipalPermissions::from)
-            .unwrap_or_default(),
+        user: Some(UserKey::from(&user)),
+        permissions: grants.permissions,
+        topic_reads: grants.topic_reads,
         permissions_known: true,
     })
 }
 
-/// How the permission read after a login ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PermissionRead {
-    /// The record resolved, so the permissions are a real answer, possibly an empty one.
-    Resolved,
-    /// The read answered but gave no usable record.
-    Failed,
-}
-
-/// Reads the just-authenticated user's own record and projects its global permissions.
+/// Reads the just-authenticated user's own record: its global permissions, projected, and its
+/// key. The key is `None` when the read gave no usable record, so the permissions are a fallback.
 ///
 /// A missing record or absent permissions both yield an empty set rather than an error: the
 /// credentials were already accepted, so refusing the connection here would reject a valid login
@@ -505,13 +582,13 @@ enum PermissionRead {
 async fn fetch_permissions(
     client: &impl Client,
     username: &str,
-) -> Result<(PrincipalPermissions, PermissionRead), AuthError> {
+) -> Result<(Grants, Option<UserKey>), AuthError> {
     // Unreachable in practice: a username that reached a successful login is already inside
     // Identifier's own length bounds. Propagating rather than degrading is still the wrong shape
     // for this function, so it degrades like every other failure below.
     let Ok(identifier) = Identifier::named(username) else {
         warn!("authenticated, but the principal's name is not a valid Iggy identifier");
-        return Ok((PrincipalPermissions::default(), PermissionRead::Failed));
+        return Ok((Grants::default(), None));
     };
     // Deliberately not propagated as a failure. The credentials were already accepted by the login
     // above, so turning a stumble on this second round trip into a rejection would answer a correct
@@ -523,10 +600,8 @@ async fn fetch_permissions(
     // future would stop only the waiting, not the read, and leave a live session behind the slot
     // this login already gave back. The caller's pre-authentication budget still bounds the wait.
     let fetched = client.get_user(&identifier).await;
-    let mut read = PermissionRead::Resolved;
     let user = match fetched {
         Ok(None) => {
-            read = PermissionRead::Failed;
             // Distinct from an error: the login succeeded, so the account exists. A record that
             // resolves to nothing here means the read raced a deletion, and silently reporting an
             // empty ACL view for it would look identical to a principal with no grants.
@@ -535,7 +610,6 @@ async fn fetch_permissions(
         }
         Ok(user) => user,
         Err(error) => {
-            read = PermissionRead::Failed;
             warn!(%error, "authenticated, but could not read the principal's permissions");
             None
         }
@@ -544,12 +618,82 @@ async fn fetch_permissions(
     // A record that resolved but carries no permissions is a real answer: the principal holds
     // nothing. Only a read that did not resolve is unknown.
     Ok((
-        user.and_then(|user| user.permissions)
-            .as_ref()
-            .map(PrincipalPermissions::from)
-            .unwrap_or_default(),
-        read,
+        Grants::of(user.as_ref().and_then(|user| user.permissions.as_ref())),
+        user.as_ref().map(UserKey::from),
     ))
+}
+
+/// What Iggy lets a principal do, as far as the gateway checks it: the global permissions
+/// projected onto Kafka, and the topics that stream and topic grants let it read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grants {
+    pub permissions: PrincipalPermissions,
+    pub topic_reads: Arc<TopicReads>,
+}
+
+impl Grants {
+    /// The grants of a user's `permissions`. A user record without permissions grants nothing.
+    #[must_use]
+    pub fn of(permissions: Option<&Permissions>) -> Self {
+        permissions.map_or_else(Self::default, |permissions| Self {
+            permissions: principal_permissions(permissions),
+            topic_reads: Arc::new(TopicReads::of(permissions)),
+        })
+    }
+}
+
+/// The topics that a principal's stream and topic grants let it read, by Iggy's numeric ids.
+///
+/// Iggy creates a consumer group for a user that may read the topic: `create_consumer_group` is
+/// `get_topic` in `core/metadata/src/permissioner/permissioner_rules/`. A global grant covers
+/// every topic, and [`PrincipalPermissions::read_topics`] holds it. A stream grant covers the
+/// topics of its stream, and a topic grant its topic. Kafka has no resource above a topic, so only
+/// `OffsetCommit` reads these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TopicReads {
+    /// Streams whose every topic the principal may read.
+    streams: BTreeSet<usize>,
+    /// Topics the principal may read, as `(stream, topic)`.
+    topics: BTreeSet<(usize, usize)>,
+}
+
+impl TopicReads {
+    /// The stream and topic grants of `permissions`, with the flags that Iggy's `get_topic`
+    /// accepts.
+    #[must_use]
+    pub fn of(permissions: &Permissions) -> Self {
+        let mut reads = Self::default();
+        for (&stream, granted) in permissions.streams.iter().flatten() {
+            if granted.manage_stream
+                || granted.read_stream
+                || granted.manage_topics
+                || granted.read_topics
+            {
+                reads.streams.insert(stream);
+            }
+            for (&topic, granted) in granted.topics.iter().flatten() {
+                if granted.manage_topic || granted.read_topic {
+                    reads.topics.insert((stream, topic));
+                }
+            }
+        }
+        reads
+    }
+
+    /// Whether no stream or topic grant lets the principal read a topic.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty() && self.topics.is_empty()
+    }
+
+    /// Whether a grant lets the principal read topic `topic` of stream `stream`.
+    #[must_use]
+    pub fn covers(&self, stream: u32, topic: u32) -> bool {
+        let (Ok(stream), Ok(topic)) = (usize::try_from(stream), usize::try_from(topic)) else {
+            return false;
+        };
+        self.streams.contains(&stream) || self.topics.contains(&(stream, topic))
+    }
 }
 
 /// Projects Iggy's global permissions onto the subset that has a Kafka meaning.
@@ -557,24 +701,22 @@ async fn fetch_permissions(
 /// Stream flags fold into the topic ones because Kafka has no resource above a topic and every
 /// Kafka topic lives inside an Iggy stream, so a stream grant is in practice a grant over the
 /// topics a Kafka client can reach. `docs/ACL_MAPPING.md` has the full table.
-impl From<&Permissions> for PrincipalPermissions {
-    fn from(permissions: &Permissions) -> Self {
-        let global = &permissions.global;
-        // Iggy's enforcement is hierarchical, so a flag-for-flag copy describes a principal that
-        // cannot do things Iggy will in fact let it do. The rules are in
-        // `core/metadata/src/permissioner/permissioner_rules/`: polling is granted by any of the
-        // four read/manage flags on topics or streams, appending by either manage flag, and
-        // reading server state by either server flag. Mirroring that here is the difference
-        // between describing a consumer and describing a principal that appears unable to consume.
-        let manages = global.manage_topics || global.manage_streams;
-        let reads = global.read_topics || global.read_streams;
-        Self {
-            read_servers: global.read_servers || global.manage_servers,
-            read_topics: reads || manages,
-            manage_topics: manages,
-            poll_messages: global.poll_messages || reads || manages,
-            send_messages: global.send_messages || manages,
-        }
+pub(crate) const fn principal_permissions(permissions: &Permissions) -> PrincipalPermissions {
+    let global = &permissions.global;
+    // Iggy's enforcement is hierarchical, so a flag-for-flag copy describes a principal that
+    // cannot do things Iggy will in fact let it do. The rules are in
+    // `core/metadata/src/permissioner/permissioner_rules/`: polling is granted by any of the
+    // four read/manage flags on topics or streams, appending by either manage flag, and
+    // reading server state by either server flag. Mirroring that here is the difference
+    // between describing a consumer and describing a principal that appears unable to consume.
+    let manages = global.manage_topics || global.manage_streams;
+    let reads = global.read_topics || global.read_streams;
+    PrincipalPermissions {
+        read_servers: global.read_servers || global.manage_servers,
+        read_topics: reads || manages,
+        manage_topics: manages,
+        poll_messages: global.poll_messages || reads || manages,
+        send_messages: global.send_messages || manages,
     }
 }
 
@@ -602,6 +744,9 @@ fn classify(error: &IggyError) -> AuthError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use iggy::prelude::{StreamPermissions, TopicPermissions};
     use secrecy::SecretString;
     use serial_test::serial;
     use tokio::sync::Semaphore;
@@ -635,7 +780,7 @@ mod tests {
     fn given_only_read_topics_when_projected_should_still_be_able_to_poll() {
         let mut permissions = Permissions::default();
         permissions.global.read_topics = true;
-        let projected = PrincipalPermissions::from(&permissions);
+        let projected = principal_permissions(&permissions);
         assert!(
             projected.poll_messages,
             "read_topics grants polling in Iggy"
@@ -649,7 +794,7 @@ mod tests {
         // Managing streams grants appending and polling, and implies the topic-level reads.
         let mut permissions = Permissions::default();
         permissions.global.manage_streams = true;
-        let projected = PrincipalPermissions::from(&permissions);
+        let projected = principal_permissions(&permissions);
         assert!(projected.send_messages);
         assert!(projected.poll_messages);
         assert!(projected.manage_topics);
@@ -659,7 +804,7 @@ mod tests {
     fn given_only_manage_servers_when_projected_should_also_allow_describing_the_cluster() {
         let mut permissions = Permissions::default();
         permissions.global.manage_servers = true;
-        let projected = PrincipalPermissions::from(&permissions);
+        let projected = principal_permissions(&permissions);
         assert!(
             projected.read_servers,
             "managing implies reading, as the permissioner's own rule does"
@@ -668,8 +813,91 @@ mod tests {
 
     #[test]
     fn given_no_grants_when_projected_should_stay_empty() {
-        let projected = PrincipalPermissions::from(&Permissions::default());
+        let projected = principal_permissions(&Permissions::default());
         assert_eq!(projected, PrincipalPermissions::default());
+    }
+
+    /// The reads of a principal whose only grant is `granted` on stream 3.
+    fn on_stream(granted: StreamPermissions) -> TopicReads {
+        TopicReads::of(&Permissions {
+            streams: Some(BTreeMap::from([(3, granted)])),
+            ..Permissions::default()
+        })
+    }
+
+    /// The reads of a principal whose only grant is `granted` on topic 9 of stream 3.
+    fn on_topic(granted: TopicPermissions) -> TopicReads {
+        on_stream(StreamPermissions {
+            topics: Some(BTreeMap::from([(9, granted)])),
+            ..StreamPermissions::default()
+        })
+    }
+
+    /// Iggy's `get_topic`, which also decides `create_consumer_group`, accepts four flags on a
+    /// stream. Polling and sending let no one read a topic there.
+    #[test]
+    fn given_a_stream_grant_should_cover_every_topic_of_that_stream_only() {
+        let flags = [
+            StreamPermissions {
+                manage_stream: true,
+                ..StreamPermissions::default()
+            },
+            StreamPermissions {
+                read_stream: true,
+                ..StreamPermissions::default()
+            },
+            StreamPermissions {
+                manage_topics: true,
+                ..StreamPermissions::default()
+            },
+            StreamPermissions {
+                read_topics: true,
+                ..StreamPermissions::default()
+            },
+        ];
+        for granted in flags {
+            let reads = on_stream(granted.clone());
+            assert!(reads.covers(3, 1) && reads.covers(3, 9), "{granted:?}");
+            assert!(!reads.covers(4, 1), "{granted:?} is on stream 3 only");
+        }
+        let polls = on_stream(StreamPermissions {
+            poll_messages: true,
+            send_messages: true,
+            ..StreamPermissions::default()
+        });
+        assert!(polls.is_empty(), "polling and sending read no topic");
+    }
+
+    #[test]
+    fn given_a_topic_grant_should_cover_that_topic_only() {
+        let flags = [
+            TopicPermissions {
+                manage_topic: true,
+                ..TopicPermissions::default()
+            },
+            TopicPermissions {
+                read_topic: true,
+                ..TopicPermissions::default()
+            },
+        ];
+        for granted in flags {
+            let reads = on_topic(granted.clone());
+            assert!(reads.covers(3, 9), "{granted:?}");
+            assert!(!reads.covers(3, 8), "{granted:?} is on topic 9 only");
+            assert!(!reads.covers(4, 9), "topic 9 of stream 3, not of stream 4");
+        }
+        let polls = on_topic(TopicPermissions {
+            poll_messages: true,
+            send_messages: true,
+            ..TopicPermissions::default()
+        });
+        assert!(polls.is_empty(), "polling and sending read no topic");
+    }
+
+    #[test]
+    fn given_a_user_record_without_permissions_should_grant_nothing() {
+        assert_eq!(Grants::of(None), Grants::default());
+        assert!(Grants::of(None).topic_reads.is_empty());
     }
 
     #[test]

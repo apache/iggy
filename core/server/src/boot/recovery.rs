@@ -29,8 +29,8 @@ use crate::shell::{
 };
 use configs::server::ServerConfig;
 use consensus::{
-    ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, Sequencer, VsrConsensus,
-    VsrRestore, VsrState,
+    ClientTable, HistoryRecovery, JoinMode, LocalPipeline, PipelineEntry, ReplicaSet, Sequencer,
+    VsrConsensus, VsrRestore, VsrState,
 };
 use iggy_common::{
     EncryptorKind, IggyByteSize, IggyError, PartitionStats, ServerKeyContext, StreamEncryption,
@@ -46,6 +46,7 @@ use metadata::stm::stream::{Partition, Streams};
 use partitions::{IggyPartitions, PartitionsConfig, StreamKeyIdentity};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
+use shard::config::DeferredPollConfig;
 use shard::metrics::ShardMetrics;
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
@@ -106,6 +107,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     roster_cells: &RosterCells,
+    repair_memory: Arc<partitions::RepairMemoryBudget>,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
     let retired_key: iggy_common::HeaderKey =
@@ -171,7 +173,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
     }
     refuse_unreadable_topics(metadata.mux_stm.streams())?;
-    let partitions = IggyPartitions::with_capacity(
+    let partitions = IggyPartitions::with_repair_memory(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
@@ -187,6 +189,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             },
         },
         owned_partitions_capacity,
+        repair_memory,
     );
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
@@ -205,6 +208,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
             let mut encryption = None;
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
+                    if partition
+                        .replica_set(topology.replica_count)
+                        .member(topology.self_replica_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
                     let owning_shard =
                         calculate_shard_assignment(&namespace, u32::from(total_shards));
@@ -282,7 +292,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             topic_runtime,
             topology.cluster_id,
             topology.self_replica_id,
-            topology.replica_count,
+            partition_metadata.replica_set(topology.replica_count),
             Rc::clone(&bus),
             &partitions,
         )
@@ -355,7 +365,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
             Rc::clone(&bus),
         ),
         CoordinatorConfig {
-            skip_shard_zero_for_replicas: config.cluster.coordinator.skip_shard_zero_for_replicas,
             skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
         },
         metrics,
@@ -365,6 +374,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     .map_err(ServerError::ShardConstruction)?;
 
     let shard = Rc::new(built.shard);
+    shard.set_deferred_poll_config(deferred_poll_config(config));
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
@@ -475,6 +485,7 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
+const _: () = assert!(configs::cluster::MAX_CLUSTER_REPLICAS == consensus::REPLICAS_MAX);
 const _: () =
     assert!(configs::partition::DEFAULT_EVICTED_RING_CAPACITY == partitions::EVICTED_RING_CAPACITY);
 const _: () = assert!(
@@ -599,6 +610,18 @@ fn refuse_unreadable_topics(streams: &Streams) -> Result<(), ServerError> {
             source: Box::new(source),
         }),
         None => Ok(()),
+    }
+}
+
+/// The `[sharding]` deferred poll limits in the units the shard compares.
+fn deferred_poll_config(config: &ServerConfig) -> DeferredPollConfig {
+    let sharding = &config.sharding;
+    DeferredPollConfig {
+        max_wait_us: sharding.deferred_poll_max_wait.as_micros(),
+        max_pending: sharding.deferred_poll_max_pending,
+        max_pending_per_session: sharding.deferred_poll_max_pending_per_session,
+        max_read_bytes: sharding.deferred_poll_max_read_bytes.as_bytes_usize(),
+        max_inflight_bytes: sharding.deferred_poll_max_inflight_bytes.as_bytes_usize(),
     }
 }
 
@@ -767,7 +790,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
     let consensus = VsrConsensus::restored(
         topology.cluster_id,
         topology.self_replica_id,
-        replica_count,
+        ReplicaSet::all(replica_count),
         server_common::sharding::METADATA_GROUP,
         bus,
         // Request queue keeps the stock 2x ratio over the prepare queue
@@ -914,6 +937,15 @@ mod tests {
     use metadata::stm::StateMachine as _;
 
     const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+
+    #[test]
+    fn given_default_server_config_when_converting_deferred_poll_limits_should_match_shard_defaults()
+     {
+        assert_eq!(
+            deferred_poll_config(&ServerConfig::default()),
+            DeferredPollConfig::default()
+        );
+    }
     const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     #[test]
@@ -957,6 +989,7 @@ mod tests {
                         partition_id: 0,
                         consensus_group_id: 1,
                         initial_view: 0,
+                        members: Vec::new(),
                     }],
                 }
                 .to_bytes(),

@@ -28,7 +28,7 @@ inputs:
   node-version:
     description: "Node.js version used by the npm path"
     required: false
-    default: "23"
+    default: "24"
 
 runs:
   using: composite
@@ -70,10 +70,6 @@ runs:
     - name: Validate iggy-bench-dashboard bundle
       shell: bash
       run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/bench/dashboard/server/Cargo.toml
-
-    - name: Validate iggy-connect bundle
-      shell: bash
-      run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/connectors/runtime/Cargo.toml
 
     - name: Validate iggy-kafka-gateway bundle
       shell: bash

@@ -69,6 +69,18 @@ final class AsyncMutex: Sendable {
         }
     }
 
+    /// Takes the lock if it is free, without waiting. A free lock has no
+    /// waiters, as ``unlock()`` hands a held lock to the longest one.
+    func tryLock() -> Bool {
+        state.withLockedValue { state in
+            guard !state.locked else {
+                return false
+            }
+            state.locked = true
+            return true
+        }
+    }
+
     /// Hands the lock to the longest waiter, or frees it.
     func unlock() {
         let next = state.withLockedValue { state -> CheckedContinuation<Void, Error>? in

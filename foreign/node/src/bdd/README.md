@@ -33,6 +33,8 @@ The stream options feature also needs the server to run with encryption enabled 
 
 The metadata changes feature needs the same key and `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64`, so its expiry scenario can push a held cursor out of the change log.
 
+The deferred polling feature needs none of these server variables. To run only that feature, add `-- --tags @deferred-polling` to the command below.
+
 from [/foreign/node](../../) run
 
 ```bash

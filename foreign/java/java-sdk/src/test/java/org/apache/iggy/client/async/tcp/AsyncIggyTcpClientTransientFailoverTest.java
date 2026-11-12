@@ -25,6 +25,7 @@ import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -108,6 +109,17 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final Duration REFUSAL_HELD_AFTER = TEST_POLL_TIMEOUT.minus(REFUSAL_HOLD_WINDOW);
 
     private static final java.util.Map<Integer, Integer> REPLICA_IDS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    @Test
+    void shouldBackOffRefusalsWithIndependentCappedJitter() {
+        var state = new AsyncTcpConnection.TransientFailoverState();
+        for (long pauseMillis : new long[] {25, 50, 100, 200, 400, 500, 500}) {
+            assertThat(state.retryPauseNanos(0.5)).isEqualTo(TimeUnit.MILLISECONDS.toNanos(pauseMillis));
+        }
+        assertThat(state.retryPauseNanos(0)).isZero();
+        assertThat(new AsyncTcpConnection.TransientFailoverState().retryPauseNanos(0.5))
+                .isEqualTo(TimeUnit.MILLISECONDS.toNanos(25));
+    }
 
     @Test
     void shouldRetainUncertainMutationOutcomeAfterLaterRefusal() throws Exception {
@@ -952,6 +964,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     firstPoll.get(5, TimeUnit.SECONDS);
                     if (cancel) {
                         assertThat(result.cancel(false)).isTrue();
+                        // No reply proves the outcome of the cancelled poll, so it blocks its partition.
+                        var blocked = poll(client, Optional.empty(), true);
+                        assertServerError(blocked, IggyErrorCode.PARTITION_LANE_BLOCKED.getCode());
+                        client.abandonOperation(operationOf(blocked)).get(5, TimeUnit.SECONDS);
                         poll(client, Optional.empty(), true).get(5, TimeUnit.SECONDS);
                     } else {
                         result.get(5, TimeUnit.SECONDS);
@@ -1158,11 +1174,11 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 try {
                     client.connect().get(5, TimeUnit.SECONDS);
                     client.users().login("manual-user", "manual-password").get(5, TimeUnit.SECONDS);
-                    assertThatThrownBy(() -> poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
-                            .hasCauseInstanceOf(IggyServerException.class)
-                            .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
-                                    .isEqualTo(failure == -1 ? TRANSIENT_NOT_COMMITTED : failure));
+                    var lost = poll(client, Optional.of(0L), true);
+                    // The poll stores its offset, so an unknown outcome is uncertain progress.
+                    assertServerError(lost, IggyErrorCode.FETCH_PROGRESS_UNCERTAIN.getCode());
                     assertThat(polls).hasValue(1);
+                    client.abandonOperation(operationOf(lost)).get(5, TimeUnit.SECONDS);
                     client.users().updateUser(UserId.of(1L), RENAME_USER).get(5, TimeUnit.SECONDS);
                     client.users()
                             .changePassword(UserId.of("renamed-user"), "manual-password", "new-password")
@@ -1178,6 +1194,12 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 primary.get(5, TimeUnit.SECONDS);
             }
         }
+    }
+
+    /** The operation that a failed call names. */
+    static long operationOf(CompletableFuture<?> call) {
+        return call.handle((ignored, error) -> ((IggyOperationException) PollRouter.unwrap(error)).getOperationId())
+                .join();
     }
 
     static AsyncIggyTcpClient client(ServerSocket coordinator) {

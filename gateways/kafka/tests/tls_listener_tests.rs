@@ -138,7 +138,9 @@ impl PrincipalResolver for KnownUsers {
             .get(username)
             .map(|permissions| AuthenticatedPrincipal {
                 username: username.to_string(),
+                user: None,
                 permissions: *permissions,
+                topic_reads: Arc::default(),
                 permissions_known: true,
             })
             .ok_or(AuthError::Rejected)
@@ -176,7 +178,9 @@ impl PrincipalResolver for SlowUsers {
         tokio::time::sleep(self.delay).await;
         Ok(AuthenticatedPrincipal {
             username: username.to_string(),
+            user: None,
             permissions: topic_reader(),
+            topic_reads: Arc::default(),
             permissions_known: true,
         })
     }
@@ -197,7 +201,9 @@ impl SaslAuthenticator for FixedCredentials {
         if credentials.username == USERNAME && credentials.password.expose_secret() == PASSWORD {
             Ok(AuthenticatedPrincipal {
                 username: credentials.username.clone(),
+                user: None,
                 permissions: topic_reader(),
+                topic_reads: Arc::default(),
                 permissions_known: true,
             })
         } else {

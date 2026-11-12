@@ -53,7 +53,7 @@ class GlobalContext:
     last_topic_id: int | None = None
     last_topic_name: str | None = None
     last_topic_partitions: int | None = None
-    last_polled_messages: list[ReceiveMessage] | None = None
+    last_polled_messages: tuple[ReceiveMessage, ...] | None = None
     last_sent_message: str | None = None  # Store message payload as string
     last_raw_response: bytes | None = None
     last_raw_error: RuntimeError | None = None
@@ -81,6 +81,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "stream-options: shared stream option scenarios",
         "resource-options-patch: shared resource patch scenarios",
         "metadata-changes: shared metadata change log scenarios",
+        "deferred-polling: shared deferred polling scenarios",
         "serial: scenarios that must not share the server with other runs",
         "message-headers: scenarios that assert message headers",
         "describe-options: scenarios that assert the option catalog",

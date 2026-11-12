@@ -17,6 +17,8 @@
 **/node_modules
 **/.gradle
 /foreign/swift/.build
+/bdd/swift/**/.build
+/examples/swift/**/.build
 /foreign/java/**/build
 /bdd/java/build
 /examples/java/**/build
@@ -40,6 +42,5 @@
 !/target/debug/iggy
 !/target/debug/iggy-server
 !/target/debug/iggy-mcp
-!/target/debug/iggy-connectors
 /web/node_modules
 /web/dist
