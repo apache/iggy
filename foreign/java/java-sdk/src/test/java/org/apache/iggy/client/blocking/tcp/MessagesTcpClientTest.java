@@ -19,19 +19,38 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import org.apache.iggy.Iggy;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.MessagesClientBaseTest;
+import org.apache.iggy.client.blocking.reader.PartitionReader;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.PollOptions;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.math.BigInteger;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.iggy.TestConstants.PERSISTED_TOPIC_OPTIONS;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
@@ -39,6 +58,21 @@ import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class MessagesTcpClientTest extends MessagesClientBaseTest {
+
+    private static final Duration SHORT_WAIT = Duration.ofMillis(200);
+    private static final Duration LONG_WAIT = Duration.ofSeconds(10);
+    // Long enough for a wait to reach the server and park there.
+    private static final Duration PARK_DELAY = Duration.ofMillis(300);
+    // Far below the long wait, so a wait that a message or a cancel did not end fails it.
+    private static final Duration WAKE_BOUND = Duration.ofSeconds(2);
+    // The deferred polls and fetches that one client keeps in flight.
+    private static final int CLIENT_DEFERRED_SLOTS = 64;
+    // Server metrics with one series per shard.
+    private static final String PARKED_DEFERRED_REQUESTS = "deferred_poll_pending";
+    private static final String CANCELLED_DEFERRED_REQUESTS = "deferred_poll_cancelled_total";
+    private static final String METRICS_URL = "http://%s:%d/metrics";
+    private static final Duration METRICS_POLL_INTERVAL = Duration.ofMillis(50);
+    private static final HttpClient METRICS_CLIENT = HttpClient.newHttpClient();
 
     @Override
     protected IggyBaseClient getClient() {
@@ -51,6 +85,179 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
      * explicit partitions only), so messages with the same key must land on
      * the same partition.
      */
+
+    @Test
+    void shouldCancelAWaitingDeferredPollWithoutCommittingItsPartialBatch() throws InterruptedException {
+        setUpStreamAndTopic();
+        messagesClient.sendMessages(
+                STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("unseen")));
+        var asyncClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+        try {
+            asyncClient.connect().join();
+            asyncClient.users().login("iggy", "iggy").join();
+            var messages = asyncClient.messages();
+            var consumer = Consumer.of(0L);
+            messages.pollMessages(
+                            STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer, PollingStrategy.first(), 1L, false)
+                    .join();
+            Duration wait = Duration.ofMillis(500);
+            var pending = messages.pollMessagesDeferred(
+                    STREAM_NAME,
+                    TOPIC_NAME,
+                    Optional.of(0L),
+                    consumer,
+                    PollingStrategy.next(),
+                    2L,
+                    true,
+                    DeferredPollOptions.defaults().withMaxWait(wait).withMinCount(2));
+            Thread.sleep(wait.dividedBy(5).toMillis());
+            assertThat(pending.cancel(false)).isTrue();
+            Thread.sleep(wait.plusMillis(100).toMillis());
+
+            var polled = messages.pollMessages(
+                            STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer, PollingStrategy.next(), 1L, false)
+                    .join();
+            assertThat(polled.messages()).hasSize(1);
+            assertThat(new String(polled.messages().get(0).payload(), StandardCharsets.UTF_8))
+                    .isEqualTo("unseen");
+        } finally {
+            asyncClient.close().join();
+        }
+    }
+
+    @Test
+    void shouldReadEveryPartitionWithABlockingReader() {
+        setUpStream();
+        client.topics().createTopic(STREAM_NAME, TOPIC_NAME.getName(), 2L, PERSISTED_TOPIC_OPTIONS);
+        List<Long> partitions = List.of(1L, 0L);
+        for (long partition : partitions) {
+            messagesClient.sendMessages(
+                    STREAM_NAME,
+                    TOPIC_NAME,
+                    Partitioning.partitionId(partition),
+                    List.of(Message.of("partition " + partition)));
+        }
+        var asyncClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+        try {
+            asyncClient.connect().join();
+            asyncClient.users().login("iggy", "iggy").join();
+            Map<Long, List<String>> read = new HashMap<>();
+            try (PartitionReader reader = PartitionReader.build(asyncClient
+                    .reader(STREAM_NAME, TOPIC_NAME, Consumer.of(0L))
+                    .partitions(partitions)
+                    .start(PollingStrategy.first())
+                    .options(PollOptions.waitFor(SHORT_WAIT)))) {
+                while (read.size() < partitions.size()) {
+                    PolledMessages batch = reader.next();
+                    read.put(
+                            batch.partitionId(),
+                            batch.messages().stream()
+                                    .map(message -> new String(message.payload(), StandardCharsets.UTF_8))
+                                    .toList());
+                }
+            }
+
+            assertThat(read).isEqualTo(Map.of(0L, List.of("partition 0"), 1L, List.of("partition 1")));
+        } finally {
+            asyncClient.close().join();
+        }
+    }
+
+    @Test
+    void shouldSendWhileAProgressPollIsParkedOnThePartition() throws Exception {
+        setUpStreamAndTopic();
+        var asyncClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+        try {
+            asyncClient.connect().join();
+            asyncClient.users().login("iggy", "iggy").join();
+            var messages = asyncClient.messages();
+            var parked = messages.pollMessagesDeferred(
+                    STREAM_NAME,
+                    TOPIC_NAME,
+                    Optional.of(0L),
+                    Consumer.of(0L),
+                    PollingStrategy.next(),
+                    1L,
+                    true,
+                    DeferredPollOptions.defaults().withMaxWait(LONG_WAIT));
+            Thread.sleep(PARK_DELAY.toMillis());
+            assertThat(parked).isNotDone();
+
+            // A send that waits behind the parked poll of the same client ends only after the long wait.
+            messages.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("m")))
+                    .get(WAKE_BOUND.toMillis(), TimeUnit.MILLISECONDS);
+
+            assertThat(parked.get(WAKE_BOUND.toMillis(), TimeUnit.MILLISECONDS).messages())
+                    .extracting(message -> new String(message.payload(), StandardCharsets.UTF_8))
+                    .containsExactly("m");
+        } finally {
+            asyncClient.close().join();
+        }
+    }
+
+    @Test
+    void shouldFreeTheClientAndServerSlotsOfCancelledDeferredPolls() throws Exception {
+        setUpStreamAndTopic();
+        String token = accessToken();
+        var asyncClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+        try {
+            asyncClient.connect().join();
+            asyncClient.users().login("iggy", "iggy").join();
+            var messages = asyncClient.messages();
+            List<CompletableFuture<PolledMessages>> parked = new ArrayList<>();
+            for (int wait = 0; wait < CLIENT_DEFERRED_SLOTS; wait++) {
+                parked.add(messages.pollMessages(
+                        STREAM_NAME,
+                        TOPIC_NAME,
+                        0L,
+                        Consumer.of(0L),
+                        PollingStrategy.offset(BigInteger.ZERO),
+                        PollOptions.waitFor(LONG_WAIT).withCount(1)));
+            }
+            assertThat(awaitServerMetric(token, PARKED_DEFERRED_REQUESTS, CLIENT_DEFERRED_SLOTS))
+                    .as("deferred requests that the server parked")
+                    .isGreaterThanOrEqualTo(CLIENT_DEFERRED_SLOTS);
+            long cancelledBefore = serverMetric(token, CANCELLED_DEFERRED_REQUESTS);
+
+            assertThat(parked).allSatisfy(wait -> assertThat(wait.cancel(true)).isTrue());
+
+            // The server sends nothing back for a cancelled poll that stores nothing. It answers a poll whose time is
+            // up
+            // without a slot, and the client retries a refusal. So only the server metrics show that the cancel frames
+            // freed the server slots.
+            long cancelled =
+                    awaitServerMetric(token, CANCELLED_DEFERRED_REQUESTS, cancelledBefore + CLIENT_DEFERRED_SLOTS);
+            assertThat(cancelled - cancelledBefore)
+                    .as("deferred requests that the server cancelled")
+                    .isGreaterThanOrEqualTo(CLIENT_DEFERRED_SLOTS);
+            // The client holds at most this many deferred requests, so this poll starts in time only if every cancel
+            // freed its client slot.
+            assertThat(messages.pollMessages(
+                                    STREAM_NAME,
+                                    TOPIC_NAME,
+                                    0L,
+                                    Consumer.of(0L),
+                                    PollingStrategy.offset(BigInteger.ZERO),
+                                    PollOptions.waitFor(SHORT_WAIT).withCount(1))
+                            .get(WAKE_BOUND.toMillis(), TimeUnit.MILLISECONDS)
+                            .messages())
+                    .isEmpty();
+        } finally {
+            asyncClient.close().join();
+        }
+    }
 
     @Test
     void shouldRouteSameMessageKeyToSamePartition() {
@@ -90,5 +297,44 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
         assertThat(polledMessages.messages()).hasSize(1);
         assertThat(new String(polledMessages.messages().get(0).payload(), StandardCharsets.UTF_8))
                 .isEqualTo(text);
+    }
+
+    private static String accessToken() throws IOException {
+        try (var http = Iggy.httpClientBuilder()
+                .blocking()
+                .host(serverHost())
+                .port(serverHttpPort())
+                .build()) {
+            return http.users()
+                    .login("iggy", "iggy")
+                    .accessToken()
+                    .orElseThrow()
+                    .token();
+        }
+    }
+
+    private static long awaitServerMetric(String token, String name, long minimum)
+            throws IOException, InterruptedException {
+        long deadline = System.nanoTime() + WAKE_BOUND.toNanos();
+        long sum = serverMetric(token, name);
+        while (sum < minimum && System.nanoTime() < deadline) {
+            Thread.sleep(METRICS_POLL_INTERVAL.toMillis());
+            sum = serverMetric(token, name);
+        }
+        return sum;
+    }
+
+    /** The sum of a server metric over its series. */
+    private static long serverMetric(String token, String name) throws IOException, InterruptedException {
+        var request = HttpRequest.newBuilder(URI.create(METRICS_URL.formatted(serverHost(), serverHttpPort())))
+                .header("Authorization", "Bearer " + token)
+                .build();
+        var response = METRICS_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).as("metrics status").isEqualTo(HttpURLConnection.HTTP_OK);
+        return response.body()
+                .lines()
+                .filter(line -> line.startsWith(name + "{"))
+                .mapToLong(line -> Long.parseLong(line.substring(line.lastIndexOf(' ') + 1)))
+                .sum();
     }
 }

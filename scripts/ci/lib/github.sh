@@ -32,7 +32,8 @@ fi
 # HTTP error.
 github() {
   local method=$1 path=$2 data=${3:-} status
-  local args=(-sS -X "$method" -o "$TMP/github.json" -w '%{http_code}'
+  local args=(-sS --connect-timeout 10 --max-time 60 -X "$method"
+    -o "$TMP/github.json" -w '%{http_code}'
     -H 'Accept: application/vnd.github+json'
     -H 'X-GitHub-Api-Version: 2022-11-28')
   if [[ -n $GITHUB_API_TOKEN ]]; then

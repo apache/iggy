@@ -23,6 +23,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.Checkpoint;
 import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
@@ -57,7 +58,8 @@ public interface ConsumerOffsetsClient {
      * Stores a consumer offset fenced by the context its messages were polled with.
      * The server refuses the store once the partition incarnation or its owner has
      * changed, so an offset from an older incarnation never lands in a newer one.
-     * The client returns that refusal, 87 or 5009, and does not retry it.
+     * The client returns that refusal, 87 or 5009, and does not retry it. A context that
+     * is all zero counts as no context.
      */
     void storeConsumerOffset(
             StreamId streamId,
@@ -66,6 +68,15 @@ public interface ConsumerOffsetsClient {
             Consumer consumer,
             BigInteger offset,
             PartitionContext context);
+
+    /**
+     * Stores the offset of the message that {@code checkpoint} follows, under the history of its partition, so a store
+     * for a partition that was deleted and recreated since is refused.
+     */
+    default void storeConsumerPosition(StreamId streamId, TopicId topicId, Consumer consumer, Checkpoint checkpoint) {
+        storeConsumerOffset(
+                streamId, topicId, checkpoint.partitionId(), consumer, checkpoint.offset(), checkpoint.context());
+    }
 
     default Optional<ConsumerOffsetInfo> getConsumerOffset(
             Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId) {

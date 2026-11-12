@@ -19,11 +19,12 @@ use super::{CONVERGENCE_TIMEOUT, RETRY_INTERVAL};
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_common::Credentials;
-use integration::harness::TestHarness;
+use integration::harness::{TestHarness, fetch_sections};
 use secrecy::SecretString;
 use std::fs::{metadata, read_dir};
 use std::path::Path;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";
@@ -53,6 +54,9 @@ const MESSAGE_ON_DISK_SIZE: u64 =
     NG_BATCH_HEADER_SIZE + NG_MESSAGE_HEADER_SIZE + PAYLOAD_SIZE as u64;
 const INDEX_SIZE_PER_MSG: u64 = 24;
 const TOTAL_MESSAGES: u32 = 25;
+/// The default 1 MiB reply holds only part of the fixture. The server caps a reply at 16 MiB
+/// (`deferred_poll_max_read_bytes`), which holds all [`TOTAL_MESSAGES`].
+const POLL_ALL_MAX_BYTES: u32 = 16 * 1024 * 1024;
 
 /// 5 sealed segments (5 msgs each at 220304B on disk; the post-append size
 /// check seals at 1101520B >= 1MiB) + 1 empty active segment at offset 25.
@@ -258,11 +262,13 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .poll_messages(
             &stream_ident,
             &topic_ident,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::next(),
-            100,
-            false,
+            PollOptions {
+                count: 100,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -457,6 +463,82 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
 
 /// Single consumer group barrier with message-by-message progression.
 ///
+pub async fn run_fetch_after_retention(harness: &TestHarness) {
+    const MAX_WAIT: Duration = Duration::from_secs(2);
+    const EARLY_TOLERANCE: Duration = Duration::from_millis(100);
+    let client = harness.root_client().await.unwrap();
+    let stream = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic = client
+        .create_topic(&stream_id, TOPIC_NAME, &layout_topic_options())
+        .await
+        .unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    send_messages(&client, &stream_id, &topic_id, TOTAL_MESSAGES).await;
+    let path = partition_path(&harness.server().data_path(), stream.id, topic.id);
+    let retained_start = u64::from(TOTAL_MESSAGES);
+    let layout = get_sorted_segment_offsets(&path);
+    assert_eq!(
+        layout.last(),
+        Some(&retained_start),
+        "the fixture leaves an empty active segment"
+    );
+    client
+        .delete_segments(&stream_id, &topic_id, PARTITION_ID, u32::MAX)
+        .await
+        .unwrap();
+    await_segment_layout(&path, &[retained_start]).await;
+
+    let consumer = Consumer::default();
+    let sections = fetch_sections(
+        &client,
+        &stream_id,
+        &topic_id,
+        &[(PARTITION_ID, PollingStrategy::offset(0))],
+        &consumer,
+        PollOptions {
+            count: 1,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(sections.len(), 1, "the expired start must be advanced once");
+    let section = &sections[0];
+    assert_eq!(section.next_offset, retained_start);
+    assert!(section.decode().unwrap().messages.is_empty());
+    let started = Instant::now();
+    let continued = fetch_sections(
+        &client,
+        &stream_id,
+        &topic_id,
+        &[(
+            PARTITION_ID,
+            PollingStrategy::continuation(
+                PARTITION_ID,
+                PollingKind::Offset,
+                section.next_offset,
+                section.context,
+            ),
+        )],
+        &consumer,
+        PollOptions {
+            count: 1,
+            ..PollOptions::wait(MAX_WAIT.into())
+        },
+    )
+    .await
+    .unwrap();
+    assert!(continued.is_empty());
+    assert!(
+        started.elapsed() >= MAX_WAIT - EARLY_TOLERANCE,
+        "the continued fetch must park at the retained start instead of busy-looping"
+    );
+}
+
 /// Polls one message at a time (next + auto_commit), attempts delete_segments(u32::MAX) after
 /// each poll. Verifies that each sealed segment is released exactly when the committed offset
 /// reaches its end_offset — not one message earlier, not one later.
@@ -496,11 +578,17 @@ pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
     let mut consumer = client
         .consumer_group("test_group", STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
         .create_consumer_group_if_not_exists()
-        .auto_join_consumer_group()
         .polling_strategy(PollingStrategy::next())
-        .batch_length(1)
+        .poll_options(PollOptions {
+            count: 1,
+            commit: CommitPolicy::Auto(AutoCommit {
+                interval: None,
+                every: Some(CommitEvery::Message),
+                after: CommitAfter::Delivery,
+            }),
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     consumer.init().await.unwrap();
 
@@ -639,11 +727,13 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
     let mut fast_consumer = client
         .consumer_group("fast_group", STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
         .create_consumer_group_if_not_exists()
-        .auto_join_consumer_group()
         .polling_strategy(PollingStrategy::offset(0))
-        .batch_length(TOTAL_MESSAGES)
+        .poll_options(PollOptions {
+            count: TOTAL_MESSAGES,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .build();
     fast_consumer.init().await.unwrap();
 
@@ -659,6 +749,10 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         }
         assert_eq!(consumed, TOTAL_MESSAGES);
     }
+
+    // Stop polling before restarts so teardown cannot cancel a group rejoin.
+    fast_consumer.shutdown().await.unwrap();
+    drop(fast_consumer);
 
     let fast_group_details = client
         .get_consumer_group(
@@ -824,8 +918,6 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
     await_segment_layout(&partition_path, &active_only).await;
     assert_no_orphaned_segment_files(&partition_path, 1).await;
 
-    // Cleanup: drop high-level consumer, delete stream resources
-    drop(fast_consumer);
     client
         .delete_topic(&stream_ident, &topic_ident)
         .await
@@ -1031,11 +1123,14 @@ async fn poll_all_offsets(
         .poll_messages(
             stream_ident,
             topic_ident,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &consumer,
             &PollingStrategy::offset(0),
-            TOTAL_MESSAGES * 2,
-            false,
+            PollOptions {
+                count: TOTAL_MESSAGES * 2,
+                max_bytes: POLL_ALL_MAX_BYTES,
+                ..PollOptions::default()
+            },
         )
         .await
         .map(|polled| polled.messages.iter().map(|m| m.header.offset).collect())

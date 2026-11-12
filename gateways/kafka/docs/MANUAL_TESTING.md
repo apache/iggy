@@ -98,6 +98,8 @@ docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 \
 | S4 | No credentials | `docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 -L` | No metadata served; client suggests SASL may be required | Pass |
 | S5 | Java client | see below | Authenticates, and lists `SaslHandshake(17): 0 to 1 [usable: 1]` and `SaslAuthenticate(36): 0 to 2 [usable: 2]` | Pass |
 | S6 | Feature off | restart without `IGGY_KAFKA_SASL_ENABLED`, rerun S1 | Client reports no broker SASL support; plaintext `-L` still served | Pass |
+| S7 | kafka-python 2.0.2 | see below | Produces 10 records and reads them back in a group. With the password `WRONG`, it ends with `NoBrokersAvailable` | Pass |
+| S8 | Sarama 1.40.1 | see below | Produces 10 records and reads them back. With the password `WRONG`, it ends with `client has run out of available brokers to talk to: EOF` | Pass |
 
 S5 is the case that matters most, because the Java client negotiates `SaslAuthenticate` **v2**, the
 compact framing no other case here exercises, and it sends `ApiVersions` both before and after
@@ -110,9 +112,37 @@ sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="iggy" password="iggy";
 EOF
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
 ```
+
+S7 and S8 send `SaslHandshake` v0 and then the token in a bare frame with no request header
+(KIP-152). kafka-python 2.0.2 always does this, and Sarama does it by default up to 1.40.1. Both
+cases produce, so add `IGGY_KAFKA_BRIDGE_ENABLED=true IGGY_KAFKA_IGGY_USERNAME=iggy
+IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway in
+terminal 2. kafka-python 2.0.2 needs Python 3.11 or older:
+
+```bash
+uv venv --python 3.11 /tmp/kafka-python-2.0.2
+uv pip install --python /tmp/kafka-python-2.0.2/bin/python kafka-python==2.0.2
+/tmp/kafka-python-2.0.2/bin/python - <<'EOF'
+from kafka import KafkaConsumer, KafkaProducer
+common = dict(bootstrap_servers="127.0.0.1:9095", security_protocol="SASL_PLAINTEXT",
+              sasl_mechanism="PLAIN", sasl_plain_username="iggy", sasl_plain_password="iggy")
+producer = KafkaProducer(**common)
+for i in range(10):
+    producer.send("v0-kafka-python", f"kafka-python {i}".encode()).get(timeout=10)
+producer.close()
+consumer = KafkaConsumer("v0-kafka-python", group_id="v0", auto_offset_reset="earliest",
+                         consumer_timeout_ms=15000, **common)
+print(len(list(consumer)), "records read")
+EOF
+```
+
+For S8, a Go program on `github.com/IBM/sarama v1.40.1` does the same. It sets
+`config.Net.SASL.Version = sarama.SASLHandshakeV0`, sends 10 records with a `SyncProducer`, and
+reads them back with `ConsumePartition` from `OffsetOldest`. With `RUST_LOG=debug`, the gateway logs
+`SASL mechanism negotiated` with `api_version=0` for each connection of both clients.
 
 ### Category T — ACL view
 
@@ -141,7 +171,7 @@ Then list each principal's ACLs with the real admin client, swapping the usernam
 
 ```bash
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-acls.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-acls.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties --list
 ```
 
@@ -217,7 +247,7 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://
 ```
 
 `KC` below is `docker run --rm --network host -v /tmp/certs:/certs:ro edenhill/kcat:1.7.1`, and
-`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:3.9.0`.
+`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:4.4.0`.
 
 | ID | Test | Command | Pass criteria | Last run |
 | ---- | ------ | --------- | --------------- | ---------- |
@@ -311,6 +341,44 @@ Run it four ways, with `CA_FILE=/tmp/certs/ca.pem` exported: `go run . 127.0.0.1
 and certificate runs also list `User:iggy`'s bindings, and the last reports the broker closing the
 connection during `ApiVersions`.
 
+### Category V — Node failover in a 3-node cluster
+
+Run against a 3-node Iggy cluster, because a single node has no partition primaries to move. A
+partition primary is the node that orders the writes of a partition. `scripts/cluster-failover.sh`
+starts 3 Iggy nodes and one gateway on 127.0.0.1, and creates a topic with 6 partitions. Each node
+holds the primary of 2 partitions. Through the gateway, `kafka-producer-perf-test.sh` sends 2000
+records a second, and a `kafka-verifiable-consumer.sh` group reads them.
+
+Under this load, the script stops a node that holds partition primaries and restarts it. Then it
+does the same to the metadata primary. At the end, `tests/java/ReadYourCommitsProbe.java` commits an
+offset in each partition and reads it back at once, 300 times. The gateway's node is a backup for 4
+of the 6 partitions. Since the fix for [#4409](https://github.com/apache/iggy/issues/4409), offset
+reads go to the partition primary. If a backup answers one instead, the probe gets a wrong offset.
+
+The script needs Linux, Docker, jq, perl and a JDK 17 or later. A run takes about 5 minutes:
+
+```bash
+cargo build --release --bin iggy-server
+cargo build --release -p iggy-gateway-kafka --bin iggy-gateway-kafka --example partition_routes
+docker pull apache/kafka:4.4.0
+./gateways/kafka/scripts/cluster-failover.sh /tmp/failover-term
+STOP_SIGNAL=KILL ./gateways/kafka/scripts/cluster-failover.sh /tmp/failover-kill
+```
+
+The work dir keeps every log. To print the report of a run again, run `cluster-failover.sh --report
+<work dir>`. For each phase, the report shows the slowest send, the time until sends recovered and
+the client retries. It also counts how often the gateway's Iggy session dialed another node.
+
+| ID | Test | Command | Pass criteria | Last run |
+| ---- | ------ | --------- | --------------- | ---------- |
+| V1 | Graceful stop | `cluster-failover.sh` | Prints `pass` and exits 0. No record is missing, and no offset reads back wrong | Pass |
+| V2 | Crash | `STOP_SIGNAL=KILL cluster-failover.sh` | Same as V1 | Pass |
+
+In the last runs, the gateway's session stayed on its node, and the producer got no error. A stop
+paused sends for about 5 s. Then new partition primaries took over, and sends continued. After a
+restart, the restarted node caught up for up to 25 s, and sends through the gateway were slow in
+that time.
+
 ### Category A — Smoke tests (must pass before check-in)
 
 The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:9092` (a real Kafka
@@ -338,9 +406,13 @@ unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists
 
 For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-message-gen send --host 127.0.0.1:9093` with `--version N`.
 
+`kafka-protocol` 0.18 encodes ApiVersions only up to v4, so `kafka-message-gen` writes the v5
+request itself. To check v5 with a real client, run `kafka-broker-api-versions.sh` from
+`apache/kafka:4.4.0`. It prints `ApiVersions(18): 0 to 5 [usable: 5]`.
+
 | API key | Name | Min | Max | Test versions |
 | --------- | ------ | ----- | ----- | --------------- |
-| 18 | ApiVersions | 0 | 3 | −1, 0, 3, 4 |
+| 18 | ApiVersions | 0 | 5 | −1, 0, 5, 6 |
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
@@ -570,7 +642,7 @@ build a version-correct response against, so it closes the connection rather tha
 ### Response header rules
 
 Header version selection now delegates entirely to `kafka_protocol::messages::ApiKey` (see
-`src/protocol/header.rs`) - there is no lookup table in this codebase to consult.
+`core/kafka_wire/src/header.rs`) - there is no lookup table in this codebase to consult.
 
 | API key | Request flexible? | Response header version |
 | --------- | -------------------- | ------------------------- |

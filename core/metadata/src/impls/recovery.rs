@@ -773,6 +773,7 @@ where
             })?;
             if mux_stm.namespace_revision() == request.namespace_revision {
                 client_table.finalize_session(request.identity);
+                mux_stm.record_retirement_debt(&request.debt, header.op);
             }
             change_log.append(header, Vec::new())?;
             last_applied_op = Some(header.op);
@@ -2008,6 +2009,7 @@ mod tests {
             let body = FinalizeSessionRequest {
                 identity,
                 namespace_revision: reported_revision,
+                debt: Vec::new(),
             }
             .to_bytes();
             let mut prepare = make_prepare(SNAPSHOT_OP + 1, body.len());
@@ -2711,6 +2713,7 @@ mod tests {
                             partition_id,
                             consensus_group_id: u64::from(partition_id) + 1,
                             initial_view: 0,
+                            members: Vec::new(),
                         })
                         .collect(),
                 }

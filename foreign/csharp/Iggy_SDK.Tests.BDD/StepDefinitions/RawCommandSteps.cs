@@ -47,6 +47,21 @@ public class RawCommandSteps
         }
     }
 
+    [When(@"I send a raw command with code (\d+) and an empty payload to replica (\d+)")]
+    public async Task WhenISendARawCommandToAReplica(uint code, byte replica)
+    {
+        try
+        {
+            _context.LastRawResponse = await _context.IggyClient.SendBinaryRequestToReplicaAsync(code, [], replica);
+            _context.LastRawError = null;
+        }
+        catch (Exception error)
+        {
+            _context.LastRawResponse = null;
+            _context.LastRawError = error;
+        }
+    }
+
     [Then(@"the raw command should succeed with an empty response")]
     public void ThenTheRawCommandShouldSucceedWithAnEmptyResponse()
     {
@@ -67,5 +82,13 @@ public class RawCommandSteps
         _context.LastRawResponse.ShouldBeNull();
         var error = _context.LastRawError.ShouldBeOfType<IggyInvalidStatusCodeException>();
         error.StatusCode.ShouldBe(3);
+    }
+
+    [Then(@"the raw command should fail with an invalid identifier error")]
+    public void ThenTheRawCommandShouldFailWithAnInvalidIdentifierError()
+    {
+        _context.LastRawResponse.ShouldBeNull();
+        var error = _context.LastRawError.ShouldBeOfType<IggyInvalidStatusCodeException>();
+        error.StatusCode.ShouldBe(6);
     }
 }

@@ -28,7 +28,10 @@ import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -80,7 +83,7 @@ class ConsensusSessionTest {
         long deadline = System.nanoTime() + DEADLINE;
         try {
             var ticket = session.acquire(
-                            ConsensusSession.LaneKey.METADATA,
+                            List.of(ConsensusSession.LaneKey.METADATA),
                             true,
                             VsrHeaders.HEADER_SIZE,
                             deadline,
@@ -105,18 +108,18 @@ class ConsensusSessionTest {
         EmbeddedChannel channel = new EmbeddedChannel();
         var lane = new ConsensusSession.LaneKey(7, 1);
         var first = session.acquire(
-                        lane, true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop())
+                        List.of(lane), true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop())
                 .join();
         first.startWrite();
-        var second =
-                session.acquire(lane, true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop());
-        var third =
-                session.acquire(lane, true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop());
-        var fourth =
-                session.acquire(lane, true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop());
+        var second = session.acquire(
+                List.of(lane), true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop());
+        var third = session.acquire(
+                List.of(lane), true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop());
+        var fourth = session.acquire(
+                List.of(lane), true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop());
         try {
             var independent = session.acquire(
-                            new ConsensusSession.LaneKey(8, 1),
+                            List.of(new ConsensusSession.LaneKey(8, 1)),
                             true,
                             VsrHeaders.HEADER_SIZE,
                             System.nanoTime() + DEADLINE,
@@ -144,6 +147,150 @@ class ConsensusSessionTest {
         }
     }
 
+    /**
+     * A fetch takes the progress lanes of all its partitions together. It waits behind the requests ahead of it on any
+     * of them, and a later store on one of them waits behind the fetch.
+     */
+    @Test
+    void shouldAdmitAFetchAfterTheRequestsAheadOfItOnEachOfItsLanes() {
+        ConsensusSession session = new ConsensusSession();
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var first = new ConsensusSession.LaneKey(7, 1, true);
+        var second = new ConsensusSession.LaneKey(7, 2, true);
+        var poll = session.acquire(
+                        List.of(second),
+                        false,
+                        VsrHeaders.HEADER_SIZE,
+                        System.nanoTime() + DEADLINE,
+                        channel.eventLoop())
+                .join();
+        var fetch = session.acquire(
+                List.of(first, second),
+                false,
+                VsrHeaders.HEADER_SIZE,
+                System.nanoTime() + DEADLINE,
+                channel.eventLoop());
+        var store = session.acquire(
+                List.of(first), true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop());
+        try {
+            assertThat(fetch).isNotDone();
+            assertThat(store).isNotDone();
+
+            poll.complete();
+
+            assertThat(fetch).isDone();
+            assertThat(store).isNotDone();
+            fetch.join().complete();
+            assertThat(store).isDone();
+            store.join().complete();
+        } finally {
+            fetch.cancel(false);
+            store.cancel(false);
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldNameARetainedPartitionAndReleaseEarlierAdmissionsUntilRepair() {
+        ConsensusSession session = new ConsensusSession();
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var first = new ConsensusSession.LaneKey(7, 1, true);
+        var second = new ConsensusSession.LaneKey(7, 0xffff_ffffL, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var holder = session.acquire(List.of(second), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            long operation = Long.MIN_VALUE;
+            freezeAndSend(holder, operation);
+            var fetch = session.acquire(
+                    List.of(first, second), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var earlier = session.acquire(List.of(first), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(fetch).isNotDone();
+            assertThat(earlier).isNotDone();
+
+            holder.retain();
+
+            assertThatThrownBy(fetch::join)
+                    .hasCauseInstanceOf(IggyOperationException.class)
+                    .satisfies(error -> {
+                        var blocked = (IggyOperationException) error.getCause();
+                        assertThat(blocked.getErrorCode()).isEqualTo(IggyErrorCode.LANE_BLOCKED);
+                        assertThat(blocked.getOperationId()).isEqualTo(operation);
+                        assertThat(blocked.getPartitionId()).hasValue(second.partition());
+                        assertThat(blocked.getReason()).isEqualTo("Operation " + Long.toUnsignedString(operation));
+                    });
+            assertThat(earlier).isDone();
+            earlier.join().complete();
+            assertThat(session.resume(operation, deadline, channel.eventLoop()).join())
+                    .isSameAs(holder);
+            holder.complete();
+            var repaired = session.acquire(
+                    List.of(first, second), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(repaired).isDone();
+            repaired.join().complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    /**
+     * Two fetches that name the same partitions in opposite orders both get their lanes, one after the other, because
+     * every request takes its lanes in ascending partition order.
+     */
+    @Test
+    void shouldAdmitFetchesThatNameTheirPartitionsInOppositeOrders() {
+        ConsensusSession session = new ConsensusSession();
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var first = new ConsensusSession.LaneKey(7, 1, true);
+        var second = new ConsensusSession.LaneKey(7, 2, true);
+        var firstHolder = session.acquire(
+                        List.of(first),
+                        false,
+                        VsrHeaders.HEADER_SIZE,
+                        System.nanoTime() + DEADLINE,
+                        channel.eventLoop())
+                .join();
+        var secondHolder = session.acquire(
+                        List.of(second),
+                        false,
+                        VsrHeaders.HEADER_SIZE,
+                        System.nanoTime() + DEADLINE,
+                        channel.eventLoop())
+                .join();
+        var ascending = session.acquire(
+                List.of(first, second),
+                false,
+                VsrHeaders.HEADER_SIZE,
+                System.nanoTime() + DEADLINE,
+                channel.eventLoop());
+        var descending = session.acquire(
+                List.of(second, first),
+                false,
+                VsrHeaders.HEADER_SIZE,
+                System.nanoTime() + DEADLINE,
+                channel.eventLoop());
+        try {
+            firstHolder.complete();
+            secondHolder.complete();
+
+            assertThat(ascending).isDone();
+            assertThat(descending).isNotDone();
+            ascending.join().complete();
+            assertThat(descending).isDone();
+            descending.join().complete();
+        } finally {
+            ascending.cancel(false);
+            descending.cancel(false);
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
     @Test
     void shouldKeepRetainedLaneBlockedWhileAnotherPartitionProgresses() {
         ConsensusSession session = new ConsensusSession();
@@ -152,14 +299,19 @@ class ConsensusSessionTest {
         try {
             var lane = new ConsensusSession.LaneKey(7, 1);
             var ticket = session.acquire(
-                            lane, true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop())
+                            List.of(lane),
+                            true,
+                            VsrHeaders.HEADER_SIZE,
+                            System.nanoTime() + DEADLINE,
+                            channel.eventLoop())
                     .join();
             freezeAndSend(ticket, 9);
             var uncertain = (IggyOperationException) ticket.retain();
             assertThat(uncertain.getOperationId()).isEqualTo(9);
             assertThat(uncertain.getErrorCode()).isEqualTo(IggyErrorCode.OPERATION_UNCERTAIN);
+            assertThat(uncertain.getPartitionId()).isEmpty();
             assertThatThrownBy(() -> session.acquire(
-                                    lane,
+                                    List.of(lane),
                                     true,
                                     VsrHeaders.HEADER_SIZE,
                                     System.nanoTime() + DEADLINE,
@@ -169,7 +321,7 @@ class ConsensusSessionTest {
                     .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
                             .isEqualTo(IggyErrorCode.LANE_BLOCKED));
             var independent = session.acquire(
-                            new ConsensusSession.LaneKey(8, 1),
+                            List.of(new ConsensusSession.LaneKey(8, 1)),
                             true,
                             VsrHeaders.HEADER_SIZE,
                             System.nanoTime() + DEADLINE,
@@ -181,7 +333,11 @@ class ConsensusSessionTest {
                     .isSameAs(ticket);
             ticket.complete();
             var next = session.acquire(
-                            lane, true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop())
+                            List.of(lane),
+                            true,
+                            VsrHeaders.HEADER_SIZE,
+                            System.nanoTime() + DEADLINE,
+                            channel.eventLoop())
                     .join();
             next.complete();
         } finally {
@@ -198,7 +354,7 @@ class ConsensusSessionTest {
         EmbeddedChannel channel = new EmbeddedChannel();
         try {
             var ticket = session.acquire(
-                            ConsensusSession.LaneKey.METADATA,
+                            List.of(ConsensusSession.LaneKey.METADATA),
                             true,
                             VsrHeaders.HEADER_SIZE,
                             System.nanoTime() + DEADLINE,
@@ -210,13 +366,13 @@ class ConsensusSessionTest {
             session.abandon(9);
             long before = session.currentRequestId();
             CompletableFuture<ConsensusSession.Ticket> cancelled = session.acquire(
-                    ConsensusSession.LaneKey.METADATA,
+                    List.of(ConsensusSession.LaneKey.METADATA),
                     true,
                     VsrHeaders.HEADER_SIZE,
                     System.nanoTime() + DEADLINE,
                     channel.eventLoop());
             CompletableFuture<ConsensusSession.Ticket> queued = session.acquire(
-                    ConsensusSession.LaneKey.METADATA,
+                    List.of(ConsensusSession.LaneKey.METADATA),
                     true,
                     VsrHeaders.HEADER_SIZE,
                     System.nanoTime() + DEADLINE,
@@ -242,7 +398,11 @@ class ConsensusSessionTest {
         try {
             var lane = new ConsensusSession.LaneKey(7, 1);
             var poll = session.acquire(
-                            lane, false, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop())
+                            List.of(lane),
+                            false,
+                            VsrHeaders.HEADER_SIZE,
+                            System.nanoTime() + DEADLINE,
+                            channel.eventLoop())
                     .join();
             freezeAndSend(poll, 9);
             assertThat(((org.apache.iggy.exception.IggyServerException) poll.retain()).getRawErrorCode())
@@ -250,7 +410,156 @@ class ConsensusSessionTest {
             assertOperationError(
                     session.resume(9, System.nanoTime() + DEADLINE, channel.eventLoop()),
                     IggyErrorCode.OPERATION_NOT_RETAINED);
-            session.acquire(lane, true, VsrHeaders.HEADER_SIZE, System.nanoTime() + DEADLINE, channel.eventLoop())
+            session.acquire(
+                            List.of(lane),
+                            true,
+                            VsrHeaders.HEADER_SIZE,
+                            System.nanoTime() + DEADLINE,
+                            channel.eventLoop())
+                    .join()
+                    .complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldAdmitProducersWhileAnOffsetStoreWaitsForProgressAndRemoveBothCancelledAdmissions() {
+        ConsensusSession session = new ConsensusSession();
+        session.configurePendingOperations(1, VsrHeaders.HEADER_SIZE);
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var mutation = new ConsensusSession.LaneKey(7, 1);
+        var progress = new ConsensusSession.LaneKey(7, 1, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var poll = session.acquire(List.of(progress), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            var store = session.acquire(List.of(progress), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(store).isNotDone();
+            var producer =
+                    session.acquire(List.of(mutation), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(producer).isDone();
+
+            poll.complete();
+            var laterProducer =
+                    session.acquire(List.of(mutation), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var offsetRead =
+                    session.acquire(List.of(progress), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(store).isNotDone();
+            assertThat(laterProducer).isNotDone();
+            assertThat(offsetRead).isNotDone();
+            producer.join().complete();
+            assertThat(store).isDone();
+            assertThat(laterProducer).isNotDone();
+            assertThat(offsetRead).isNotDone();
+            store.join().complete();
+            laterProducer.join().complete();
+            offsetRead.join().complete();
+
+            var blockedMutation = session.acquire(
+                            List.of(mutation), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            var cancelledStore =
+                    session.acquire(List.of(progress), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var queuedRead =
+                    session.acquire(List.of(progress), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var queuedProducer =
+                    session.acquire(List.of(mutation), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(queuedRead).isNotDone();
+            assertThat(queuedProducer).isNotDone();
+            cancelledStore.cancel(false);
+            assertThat(queuedRead).isDone();
+            queuedRead.join().complete();
+            blockedMutation.complete();
+            queuedProducer.join().complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldKeepBothOffsetLanesUntilAnAbandonedReplayEnds() {
+        ConsensusSession session = new ConsensusSession();
+        session.configurePendingOperations(1, 2L * VsrHeaders.HEADER_SIZE);
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var mutation = new ConsensusSession.LaneKey(7, 1);
+        var progress = new ConsensusSession.LaneKey(7, 1, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var store = session.acquire(List.of(progress), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            freezeAndSend(store, 9);
+            store.retain();
+            for (var lane : new ConsensusSession.LaneKey[] {mutation, progress}) {
+                assertOperationError(
+                        session.acquire(
+                                List.of(lane), lane == mutation, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop()),
+                        IggyErrorCode.LANE_BLOCKED);
+            }
+            assertThat(session.resume(9, deadline, channel.eventLoop()).join()).isSameAs(store);
+            ByteBuf alias = store.frame();
+            session.abandon(9);
+            var poll = session.acquire(List.of(progress), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var send = session.acquire(List.of(mutation), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(poll).isNotDone();
+            assertThat(send).isNotDone();
+            var independent = session.acquire(
+                    List.of(new ConsensusSession.LaneKey(8, 1)),
+                    true,
+                    VsrHeaders.HEADER_SIZE,
+                    deadline,
+                    channel.eventLoop());
+            assertThat(independent).isDone();
+            independent.join().complete();
+            store.complete();
+            poll.join().complete();
+            send.join().complete();
+            assertThat(alias.refCnt()).isPositive();
+            alias.release();
+            store.finishWrite();
+            session.acquire(List.of(mutation), true, 2L * VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join()
+                    .complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void shouldAllowProgressPastARetainedSendAndReleaseBothOffsetLanesOnReset() {
+        ConsensusSession session = new ConsensusSession();
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var mutation = new ConsensusSession.LaneKey(7, 1);
+        var progress = new ConsensusSession.LaneKey(7, 1, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        try {
+            var send = session.acquire(List.of(mutation), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            freezeAndSend(send, 9);
+            send.retain();
+            var poll = session.acquire(List.of(progress), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            assertThat(poll).isDone();
+            poll.join().complete();
+            assertOperationError(
+                    session.acquire(List.of(progress), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop()),
+                    IggyErrorCode.LANE_BLOCKED);
+            session.abandon(9);
+            var store = session.acquire(List.of(progress), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            freezeAndSend(store, 10);
+            store.retain();
+            session.reset();
+            session.bind(43);
+            session.acquire(List.of(progress), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join()
+                    .complete();
+            session.acquire(List.of(mutation), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
                     .join()
                     .complete();
         } finally {
@@ -412,7 +721,7 @@ class ConsensusSessionTest {
 
     private static CompletableFuture<ConsensusSession.Ticket> acquireMutation(
             ConsensusSession session, EmbeddedChannel channel, ConsensusSession.LaneKey lane, long bytes) {
-        return session.acquire(lane, true, bytes, System.nanoTime() + DEADLINE, channel.eventLoop());
+        return session.acquire(List.of(lane), true, bytes, System.nanoTime() + DEADLINE, channel.eventLoop());
     }
 
     /** Replays a retained write and keeps the outcome that its replay proved. */
@@ -432,7 +741,7 @@ class ConsensusSessionTest {
     private static ConsensusSession.Ticket retainWrite(
             ConsensusSession session, EmbeddedChannel channel, long requestId) {
         var ticket = session.acquire(
-                        ConsensusSession.LaneKey.METADATA,
+                        List.of(ConsensusSession.LaneKey.METADATA),
                         true,
                         VsrHeaders.HEADER_SIZE,
                         System.nanoTime() + DEADLINE,
@@ -448,6 +757,111 @@ class ConsensusSessionTest {
                 .hasCauseInstanceOf(IggyOperationException.class)
                 .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
                         .isEqualTo(code));
+    }
+
+    @Test
+    void shouldKeepEveryUnknownFetchTargetAndItsBudgetAcrossSessionReset() {
+        ConsensusSession session = new ConsensusSession();
+        session.configurePendingOperations(1, VsrHeaders.HEADER_SIZE);
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var first = new ConsensusSession.LaneKey(7, 1, true);
+        var second = new ConsensusSession.LaneKey(7, 0xffff_ffffL, true);
+        var independent = new ConsensusSession.LaneKey(7, 3, true);
+        long deadline = System.nanoTime() + DEADLINE;
+        long operation = Long.MIN_VALUE;
+        try {
+            var ticket = session.acquire(
+                            List.of(first, second), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            ticket.reserveFetch();
+            freezeAndSend(ticket, operation);
+            var waitingFirst =
+                    session.acquire(List.of(first), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+            var waitingSecond =
+                    session.acquire(List.of(second), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop());
+
+            session.reset();
+            session.bind(43);
+
+            assertOperationError(waitingFirst, IggyErrorCode.PARTITION_LANE_BLOCKED);
+            assertOperationError(waitingSecond, IggyErrorCode.PARTITION_LANE_BLOCKED);
+            assertThat(session.unresolvedFetch().getOperationId()).isEqualTo(operation);
+            assertOperationError(
+                    session.resume(operation, deadline, channel.eventLoop()), IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+            session.acquire(List.of(second), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop(), true)
+                    .join()
+                    .complete();
+            session.acquire(
+                            List.of(new ConsensusSession.LaneKey(8, 1, true)),
+                            false,
+                            VsrHeaders.HEADER_SIZE,
+                            deadline,
+                            channel.eventLoop())
+                    .join()
+                    .complete();
+            var fresh = session.acquire(
+                            List.of(independent), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            assertThatThrownBy(fresh::reserveFetch)
+                    .isInstanceOfSatisfying(
+                            IggyServerException.class,
+                            error -> assertThat(error.getErrorCode()).isEqualTo(IggyErrorCode.TRANSIENT_NOT_ACCEPTED));
+            session.abandon(operation);
+            fresh.reserveFetch();
+            fresh.complete();
+            assertThat(session.unresolvedFetch()).isNull();
+            var next = session.acquire(
+                            List.of(first, second), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            next.reserveFetch();
+            next.complete();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldKeepOnlyUncertainSectionsWhenExplicitSessionIsolationEndsAClassifiedFetch(boolean partial) {
+        ConsensusSession session = new ConsensusSession();
+        session.bind(42);
+        EmbeddedChannel channel = new EmbeddedChannel();
+        var lane = new ConsensusSession.LaneKey(7, 1, true);
+        var second = new ConsensusSession.LaneKey(7, 2, true);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        try {
+            var ticket = session.acquire(
+                            List.of(lane, second), false, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join();
+            ticket.reserveFetch();
+            freezeAndSend(ticket, 9);
+            ticket.settleFetch(partial ? List.of(2L) : List.of());
+
+            assertThat(ticket.retain())
+                    .isInstanceOfSatisfying(
+                            IggyServerException.class,
+                            error -> assertThat(error.getErrorCode()).isEqualTo(IggyErrorCode.TRANSIENT_NOT_COMMITTED));
+            session.reset();
+            session.bind(43);
+
+            session.acquire(List.of(lane), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop())
+                    .join()
+                    .complete();
+            if (partial) {
+                assertOperationError(
+                        session.acquire(List.of(second), true, VsrHeaders.HEADER_SIZE, deadline, channel.eventLoop()),
+                        IggyErrorCode.PARTITION_LANE_BLOCKED);
+                assertOperationError(
+                        session.resume(9, deadline, channel.eventLoop()), IggyErrorCode.FETCH_PROGRESS_UNCERTAIN);
+                session.abandon(9);
+            }
+            assertThat(session.unresolvedFetch()).isNull();
+        } finally {
+            session.reset();
+            channel.finishAndReleaseAll();
+        }
     }
 
     private static void freezeAndSend(ConsensusSession.Ticket ticket, long requestId) {

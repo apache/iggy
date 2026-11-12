@@ -24,17 +24,18 @@ name: PR Description
 # on any PR. A gap fails this check and the job summary names each missing
 # part. Plain pattern checks, no model.
 #
-# Skipped for bots, drafts, and authors with write access (OWNER, MEMBER,
-# COLLABORATOR).
+# Skipped for bots and drafts. The script also passes authors with write or
+# admin access, which it reads from the collaborator permission endpoint,
+# because author_association reports MEMBER for every apache org member.
 #
-# SECURITY: checks out only the check script and lib/init.sh, from the base
+# SECURITY: checks out only the check script and its lib files, from the base
 # commit, without persisted credentials. PR code is never checked out or
 # executed. Read-only token.
 
 on:
   pull_request:
     branches: [master]
-    types: [opened, edited, reopened, ready_for_review]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
@@ -45,8 +46,6 @@ jobs:
     if: |
       github.event.pull_request.draft == false
       && github.event.pull_request.user.type != 'Bot'
-      && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
-      && (github.event.action != 'edited' || github.event.changes.body)
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 2
     steps:
@@ -64,4 +63,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: scripts/ci/pr-description-check.sh --pr "$PR_NUMBER"
+        run: scripts/ci/pr-description-check.sh --pr "$PR_NUMBER" --skip-writers

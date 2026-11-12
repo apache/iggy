@@ -18,8 +18,9 @@
 //! One-stop construction for an [`IggyShard`] plus, on shard 0 only, its
 //! associated [`ShardZeroCoordinator`].
 //!
-//! The coordinator owns shard-0's round-robin state for replica and
-//! client placement. Cluster-wide `replica_id -> owning_shard` routing
+//! The coordinator owns shard-0's round-robin state for client
+//! placement. Replica links go to the owner shard that the link
+//! placement names. Cluster-wide `replica_id -> owning_shard` routing
 //! flows through the cluster-shared [`message_bus::ReplicaOwnerTable`],
 //! stamped by the owning shard's installer and CAS-cleared on disconnect.
 //!
@@ -184,6 +185,23 @@ where
                     },
                 )
             }));
+
+        // Report every replica link close to shard 0, whose bundle of the
+        // peer tears down. Shard 0 reports to its own inbox as well, so its
+        // bus never holds a closure that owns the bus. A dropped report is
+        // covered by the next reconnect sweep, which finds the link missing.
+        if let Some(to_shard_zero) = self.senders.first().cloned() {
+            let metrics_for_close = self.metrics.clone();
+            self.bus.set_connection_lost_fn(Rc::new(move |link| {
+                let frame = ShardFrame::lifecycle(LifecycleFrame::ReplicaLinkClosed { link });
+                if let Err(err) = to_shard_zero.try_send(frame) {
+                    metrics_for_close.record_frame_drop(
+                        frame_drop_variant::REPLICA_LINK_CLOSED,
+                        classify_try_send_err(&err),
+                    );
+                }
+            }));
+        }
 
         // On shard 0: build the coordinator BEFORE the shard, so the
         // coordinator can be passed to `IggyShard::new` as a ctor arg.

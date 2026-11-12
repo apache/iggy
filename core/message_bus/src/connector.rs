@@ -18,35 +18,43 @@
 //! Outbound replica connector.
 //!
 //! Runs only on shard 0. For each peer replica with `peer_id > self_id` the
-//! connector dials at startup and re-dials on a periodic sweep. After a
-//! successful TCP connect the connector hands the raw stream to the
-//! `on_dialed` callback supplied by the shard bootstrap, which duplicates
-//! the fd and ships it to the owning shard via the inter-shard channel
-//! (see `shard::coordinator::ShardZeroCoordinator`). No byte is written
-//! here: the dialer half of the handshake (plaintext `ReplicaHello`, or
-//! the 3-message mutual MAC exchange when `cluster.auth.enabled` is set -
-//! see [`crate::replica::handshake`]) runs on the owning shard.
+//! connector dials every missing link of the peer's bundle at startup and
+//! re-dials on a periodic sweep. After a successful TCP connect the
+//! connector hands the raw stream to the `on_dialed` callback supplied by
+//! the shard bootstrap, with the link and the shard that owns it; the
+//! callback duplicates the fd and ships it to that shard via the
+//! inter-shard channel (see `shard::coordinator::ShardZeroCoordinator`).
+//! No byte is written here: the placement preamble and the dialer half of
+//! the handshake (plaintext `ReplicaHello`, or the 3-message mutual MAC
+//! exchange when `cluster.auth.enabled` is set - see
+//! [`crate::replica::handshake`]) run on the owning shard.
+//!
+//! Each sweep first refreshes the bundle of every peer, in both roles, so
+//! a bundle that stays incomplete past `handshake_grace` tears down, and a
+//! link of an old epoch gets its close request again (see
+//! [`crate::replica::bundle`]).
 //!
 //! Because delegation returns before the handshake completes, the sweep
 //! consults the shard-0 pending-dial set
 //! (`IggyMessageBus::check_dial_pending`) in addition to the owner table:
-//! the callback marks a peer pending after a successful delegation and
+//! the callback marks a link pending after a successful delegation and
 //! the owning shard's handshake-outcome ack clears it, with a
 //! deadline-based expiry as the lost-ack backstop. Without it the next
-//! sweep would redial a peer whose handshake is still in flight.
+//! sweep would redial a link whose handshake is still in flight.
 
-use crate::DialedReplicaFn;
 use crate::IggyMessageBus;
 use crate::lifecycle::ShutdownToken;
+use crate::replica::links::peer_slot;
+use crate::{DialedReplicaFn, ReplicaLinkId};
 use compio::net::TcpStream;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{debug, info};
 
-/// Dial every peer with `peer_id > self_id` once, then launch a periodic
-/// sweep in the background. The periodic task handle is tracked on the bus
-/// so graceful shutdown can await it.
+/// Dial every link to every peer with `peer_id > self_id` once, then launch
+/// a periodic sweep in the background. The periodic task handle is tracked
+/// on the bus so graceful shutdown can await it.
 #[allow(clippy::future_not_send)]
 pub async fn start(
     bus: &Rc<IggyMessageBus>,
@@ -76,40 +84,29 @@ pub async fn start(
 
 #[allow(clippy::future_not_send)]
 async fn connect_all(
-    bus: &Rc<IggyMessageBus>,
+    bus: &IggyMessageBus,
     self_id: u8,
     peers: &[(u8, SocketAddr)],
     on_dialed: &DialedReplicaFn,
     connect_timeout: Duration,
 ) {
-    let dials = peers.iter().filter_map(|&(peer_id, addr)| {
-        if peer_id <= self_id {
-            return None;
-        }
-        // Skip peers that already have a live mapping on this cluster.
-        // `replicas().contains` covers single-shard deployments where the
-        // connection lives on shard 0; `owning_shard` covers multi-shard
-        // deployments where the fd was delegated to a peer shard.
-        // `check_dial_pending` covers the window between a successful
-        // delegation and the owning shard's handshake outcome, during
-        // which neither table has an entry yet - redialing there would
-        // open a second connection to the same peer whose install CAS
-        // winners can differ per side, churning both. Either hit means
-        // this peer needs no dial this sweep. The per-peer
-        // `owning_shard` CAS in `install_replica_conn` arbitrates any
-        // remaining cross-shard inbound install race.
-        if bus.replicas().contains(peer_id)
-            || bus.owning_shard(peer_id).is_some()
-            || bus.check_dial_pending(peer_id)
-        {
-            debug!(
-                replica = peer_id,
-                "skip reconnect: peer already registered or handshake pending"
-            );
-            return None;
-        }
-        Some(connect_one(peer_id, addr, on_dialed, connect_timeout))
-    });
+    for &(peer_id, _) in peers {
+        bus.refresh_replica_bundle(peer_id);
+    }
+    // `replica_links_to_dial` skips links that are installed or whose
+    // delegated handshake is still in flight (`check_dial_pending`):
+    // redialing there would open a second connection for the same link.
+    // The owner-table claim in `install_replica_conn` refuses any that
+    // still gets through.
+    let dials = peers
+        .iter()
+        .filter(|&&(peer_id, _)| peer_id > self_id)
+        .flat_map(|&(peer_id, addr)| {
+            bus.replica_links_to_dial(peer_id)
+                .into_iter()
+                .map(move |link| (link, addr))
+        })
+        .map(|(link, addr)| connect_one(bus, self_id, link, addr, on_dialed, connect_timeout));
     // Dial concurrently so one unreachable peer's connect latency does not
     // stall the rest. The futures share one task, so the `on_dialed`
     // delegations never overlap. Inbound vs outbound never collide for
@@ -120,7 +117,7 @@ async fn connect_all(
 
 #[allow(clippy::future_not_send)]
 async fn periodic_reconnect(
-    bus: &Rc<IggyMessageBus>,
+    bus: &IggyMessageBus,
     self_id: u8,
     peers: Vec<(u8, SocketAddr)>,
     on_dialed: DialedReplicaFn,
@@ -133,7 +130,7 @@ async fn periodic_reconnect(
     debug!("replica reconnect periodic task exiting");
 }
 
-/// Dial a single peer and hand the raw stream to `on_dialed` on success.
+/// Dial one link and hand the raw stream to `on_dialed` on success.
 ///
 /// Connect failures are logged and swallowed; VSR tolerates missing
 /// peers and the periodic sweep retries. The handshake (and its
@@ -145,29 +142,55 @@ async fn periodic_reconnect(
 /// retries the heartbeat timeout depends on.
 #[allow(clippy::future_not_send)]
 async fn connect_one(
-    peer_id: u8,
+    bus: &IggyMessageBus,
+    self_id: u8,
+    link: ReplicaLinkId,
     addr: SocketAddr,
     on_dialed: &DialedReplicaFn,
     connect_timeout: Duration,
 ) {
+    let peer_id = link.replica;
     let stream = match compio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            debug!(replica = peer_id, %addr, "connect failed: {e}");
+            debug!(replica = peer_id, link = link.link, %addr, "connect failed: {e}");
             return;
         }
         Err(_) => {
-            debug!(replica = peer_id, %addr, ?connect_timeout, "connect timed out");
+            debug!(
+                replica = peer_id,
+                link = link.link,
+                %addr,
+                ?connect_timeout,
+                "connect timed out"
+            );
             return;
         }
     };
+    // A bundle that tore down during the connect wants this link in a new
+    // epoch; the next sweep dials it.
+    if !bus.wants_replica_dial(link) {
+        debug!(
+            replica = peer_id,
+            link = link.link,
+            epoch = link.epoch,
+            "bundle moved on during the connect, dropping the dialed link"
+        );
+        return;
+    }
     if let Err(e) = stream.set_nodelay(true) {
         debug!(replica = peer_id, %addr, "set_nodelay failed: {e}");
     }
+    let owner = bus
+        .link_layout()
+        .link_owner(link.link, peer_slot(self_id, peer_id));
     info!(
         replica = peer_id,
+        link = link.link,
+        epoch = link.epoch,
+        owner,
         %addr,
-        "dialed peer replica, delegating fd"
+        "dialed peer replica link, delegating fd"
     );
-    on_dialed(stream, peer_id);
+    on_dialed(stream, link, owner);
 }

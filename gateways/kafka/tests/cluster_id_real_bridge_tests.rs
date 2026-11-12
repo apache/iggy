@@ -15,29 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The cluster id stored in a real, spawned `iggy-server`: loaded by the bridge, and reported by
-//! the compiled gateway binary in Metadata and `DescribeCluster` across a restart.
+//! The cluster id stored in a real, spawned `iggy-server`: loaded by the bridge, reported by the
+//! compiled gateway binary in Metadata and `DescribeCluster` across a restart, and compared with
+//! the cluster that an `ApiVersions` v5 request names (KIP-1242).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::join_all;
 use iggy::prelude::{
     Consumer, Durability, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, MessageClient,
-    Partitioning, Permissions, PollingStrategy, StreamClient, StreamCreateOptions,
+    Partitioning, Permissions, PollOptions, PollingStrategy, StreamClient, StreamCreateOptions,
     StreamPermissions, TopicClient, TopicCreateOptions, UserClient, UserCreateOptions, UserStatus,
 };
 use kafka_protocol::messages::{DescribeClusterResponse, MetadataResponse};
 use kafka_protocol::protocol::Decodable;
 use secrecy::SecretString;
 use serial_test::serial;
+use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::{
     BridgeError, CLUSTER_ID_TOPIC, IggyBridge, TopicMapping, cluster_id_stream,
 };
 use iggy_gateway_kafka::cluster_id::ClusterId;
-use iggy_gateway_kafka::protocol::api::{API_KEY_DESCRIBE_CLUSTER, API_KEY_METADATA};
+use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
+use iggy_gateway_kafka::protocol::api::{
+    API_KEY_API_VERSIONS, API_KEY_DESCRIBE_CLUSTER, API_KEY_METADATA, BrokerAdvertise, Brokers,
+    ConnectionState, ERROR_NONE, ERROR_REBOOTSTRAP_REQUIRED, GatewayState,
+    handle_connection_request,
+};
 
 #[path = "common/codec.rs"]
 mod codec;
@@ -47,11 +55,14 @@ mod gateway_process;
 mod iggy_server;
 #[path = "common/tcp.rs"]
 mod tcp;
+#[path = "common/wire.rs"]
+mod wire;
 
-use codec::Encoder;
+use codec::{Decoder, Encoder};
 use gateway_process::TestGateway;
 use iggy_server::{TestServer, raw_client};
 use tcp::round_trip;
+use wire::build_api_versions_v5_request;
 
 const DEFAULT_STREAM: &str = "kafka";
 
@@ -121,11 +132,13 @@ async fn stored_ids(server: &TestServer, default_stream: &str) -> Vec<String> {
         .poll_messages(
             &Identifier::named(&cluster_id_stream(default_stream)).expect("stream name"),
             &Identifier::named(CLUSTER_ID_TOPIC).expect("topic name"),
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            100,
-            false,
+            PollOptions {
+                count: 100,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll the id topic");
@@ -431,4 +444,54 @@ async fn given_the_gateway_binary_when_restarted_should_report_the_same_id() {
 
     assert_eq!(before, after);
     assert_eq!(stored_ids(&server, DEFAULT_STREAM).await, vec![before]);
+}
+
+/// Bridged gateways share the cluster id stored in Iggy, so one of several still compares the
+/// cluster that a KIP-1242 client names, and sends a client of another cluster back to its
+/// bootstrap servers.
+#[tokio::test]
+#[serial]
+async fn given_several_bridged_gateways_when_a_client_names_another_cluster_should_rebootstrap() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = connect(&server).await;
+    let cluster_id = bridge.load_cluster_id().await.expect("load");
+    let state = GatewayState::new(
+        Some(Arc::new(bridge)),
+        8 * 1024 * 1024,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+    )
+    .with_cluster_id(cluster_id.clone())
+    .with_node_id(2);
+    let endpoint = |node: i32| BrokerAdvertise {
+        host: format!("gateway-{node}.example"),
+        port: 9092,
+    };
+    let connection =
+        ConnectionState::for_listener(endpoint(2), false, false).with_brokers(Arc::new(Brokers {
+            node_id: 2,
+            peers: vec![(1, endpoint(1)), (3, endpoint(3))],
+        }));
+
+    for (named_cluster, expected) in [
+        (cluster_id.to_string(), ERROR_NONE),
+        (ClusterId::random().to_string(), ERROR_REBOOTSTRAP_REQUIRED),
+    ] {
+        let response = handle_connection_request(
+            &state,
+            &connection,
+            None,
+            API_KEY_API_VERSIONS,
+            5,
+            build_api_versions_v5_request(Some(&named_cluster), 2),
+        )
+        .await
+        .expect_response("ApiVersions answers");
+        assert_eq!(
+            Decoder::new(response).read_i16().unwrap(),
+            expected,
+            "cluster {named_cluster}, stored {cluster_id}"
+        );
+    }
 }

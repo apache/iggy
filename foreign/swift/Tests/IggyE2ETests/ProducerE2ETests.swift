@@ -38,7 +38,7 @@ struct ProducerE2ETests {
             #expect(response.confirmations.map(\.partitionID) == [1, 1, 1])
             #expect(response.confirmations.map(\.baseOffset) == [0, 2, 4])
             let polled = try await client.pollMessages(
-                streamID: stream, topicID: try Identifier(named: name), partitionID: 1, strategy: .first, count: 10, autoCommit: false)
+                streamID: stream, topicID: try Identifier(named: name), partitionID: 1, strategy: .first, options: PollOptions(count: 10))
             #expect(polled.messages.map(\.payloadString) == (0..<5).map { "message \($0)" })
             await producer.shutdown()
         }
@@ -57,7 +57,7 @@ struct ProducerE2ETests {
             }
             await producer.shutdown()
             let polled = try await client.pollMessages(
-                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .first, count: 10, autoCommit: false)
+                streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, strategy: .first, options: PollOptions(count: 10))
             #expect(polled.messages.count == 6)
             #expect(polled.messages.first?.payloadString == "batch 0 0")
             #expect(polled.messages.last?.payloadString == "batch 2 1")

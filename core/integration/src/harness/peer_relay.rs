@@ -22,7 +22,9 @@
 //! peer's real replica port, and the relay forwards to that port. A link is
 //! cut while either of its ends is isolated: it drops its live connections
 //! and closes new ones, so both sides see the connection end at once (a
-//! reset partition, not a silent drop).
+//! reset partition, not a silent drop). A link can also drop one live
+//! connection and stay up, the way one of several replica links to a peer
+//! fails.
 
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +66,8 @@ struct Link {
 struct LinkState {
     cut: AtomicBool,
     notify: Notify,
+    /// Wakes one live connection, which closes.
+    drop_one: Notify,
 }
 
 impl PeerRelays {
@@ -150,6 +154,19 @@ impl PeerRelays {
         self.set_node_links(node, false)
     }
 
+    /// Closes one live connection that node `from` dialed to peer `to`. The
+    /// link stays up, so the redial goes through.
+    pub(crate) fn drop_connection(&self, from: usize, to: usize) -> Result<(), TestBinaryError> {
+        let link = self
+            .links
+            .iter()
+            .find(|link| link.from == from && link.to == to)
+            .ok_or(TestBinaryError::MissingServer)?;
+        link.state.drop_one.notify_one();
+        info!(from, to, "dropped one peer connection");
+        Ok(())
+    }
+
     fn set_node_links(&self, node: usize, cut: bool) -> Result<(), TestBinaryError> {
         if node >= self.node_count {
             return Err(TestBinaryError::MissingServer);
@@ -218,8 +235,8 @@ async fn relay(listener: TcpListener, target: SocketAddr, state: Arc<LinkState>)
     }
 }
 
-/// Copies both ways until one side closes or the link is cut; the drop on
-/// return closes both sockets.
+/// Copies both ways until one side closes, the link is cut or this
+/// connection is dropped; the drop on return closes both sockets.
 async fn forward(mut inbound: TcpStream, mut outbound: TcpStream, state: Arc<LinkState>) {
     let cut = state.notify.notified();
     tokio::pin!(cut);
@@ -232,6 +249,7 @@ async fn forward(mut inbound: TcpStream, mut outbound: TcpStream, state: Arc<Lin
     tokio::select! {
         _ = copy_bidirectional(&mut inbound, &mut outbound) => {}
         _ = &mut cut => {}
+        _ = state.drop_one.notified() => {}
     }
 }
 
@@ -329,6 +347,32 @@ mod tests {
         echo_round_trip(&mut healed, b"after").await;
 
         assert!(relays.cut_node(3).is_err());
+    }
+
+    #[tokio::test]
+    async fn given_two_connections_when_one_is_dropped_should_keep_the_other_and_the_link() {
+        let echo = echo_server().await;
+        let relays = PeerRelays::bind(LOOPBACK, &[echo, echo]).expect("bind the relays");
+        let mut first = connect(&relays, 0, 1).await;
+        echo_round_trip(&mut first, b"first").await;
+        let mut second = connect(&relays, 0, 1).await;
+        echo_round_trip(&mut second, b"second").await;
+
+        relays.drop_connection(0, 1).expect("drop one connection");
+        let first_ended = timeout(PROMPTLY, async {
+            tokio::select! {
+                () = ends_promptly(&mut first) => true,
+                () = ends_promptly(&mut second) => false,
+            }
+        })
+        .await
+        .expect("one connection ends");
+        let survivor = if first_ended { &mut second } else { &mut first };
+        echo_round_trip(survivor, b"still up").await;
+        let mut redialed = connect(&relays, 0, 1).await;
+        echo_round_trip(&mut redialed, b"link up").await;
+
+        assert!(relays.drop_connection(0, 2).is_err());
     }
 
     #[tokio::test]

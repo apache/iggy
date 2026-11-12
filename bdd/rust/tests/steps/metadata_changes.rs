@@ -102,9 +102,7 @@ pub async fn then_followed_kinds(world: &mut GlobalContext, kinds: String) {
         if page.has_more {
             continue;
         }
-        let names_stream =
-            |record: &&MetadataChangeRecord| change_stream_id(record) == Some(stream_id);
-        if records.iter().filter(names_stream).count() >= expected.len() {
+        if records_of_stream(&records, stream_id).len() >= expected.len() {
             break;
         }
         sleep(FOLLOW_INTERVAL).await;
@@ -113,10 +111,7 @@ pub async fn then_followed_kinds(world: &mut GlobalContext, kinds: String) {
         let group = record.change.group().expect("known group");
         assert!(world.last_change_groups.contains(&group), "{record:?}");
     }
-    let mine: Vec<MetadataChangeRecord> = records
-        .into_iter()
-        .filter(|record| change_stream_id(record) == Some(stream_id))
-        .collect();
+    let mine = records_of_stream(&records, stream_id);
     let kinds: Vec<MetadataChangeKind> = mine
         .iter()
         .filter_map(|record| record.change.kind())
@@ -323,6 +318,31 @@ fn followed_stream_options(world: &GlobalContext, kind: &str) -> ResourceOptions
     options.clone()
 }
 
+/// The followed records of this scenario's stream. A freed stream id can name
+/// a later stream, so when the records show a creation of `stream_id`, only the
+/// records of its last creation, matched by the op that created the stream,
+/// count.
+fn records_of_stream(
+    records: &[MetadataChangeRecord],
+    stream_id: u32,
+) -> Vec<MetadataChangeRecord> {
+    let created_op = records
+        .iter()
+        .rev()
+        .find_map(|record| match &record.change {
+            MetadataChange::StreamCreated(stream) if stream.stream_id == stream_id => {
+                Some(stream.stream_created_op)
+            }
+            _ => None,
+        });
+    records
+        .iter()
+        .filter(|record| change_stream_id(record) == Some(stream_id))
+        .filter(|record| created_op.is_none_or(|op| change_stream_created_op(record) == Some(op)))
+        .cloned()
+        .collect()
+}
+
 const fn change_stream_id(record: &MetadataChangeRecord) -> Option<u32> {
     match &record.change {
         MetadataChange::StreamCreated(stream) | MetadataChange::StreamUpdated(stream) => {
@@ -334,6 +354,21 @@ const fn change_stream_id(record: &MetadataChangeRecord) -> Option<u32> {
         }
         MetadataChange::TopicDeleted(topic) => Some(topic.stream_id),
         MetadataChange::PartitionsChanged(partitions) => Some(partitions.stream_id),
+        _ => None,
+    }
+}
+
+const fn change_stream_created_op(record: &MetadataChangeRecord) -> Option<u64> {
+    match &record.change {
+        MetadataChange::StreamCreated(stream) | MetadataChange::StreamUpdated(stream) => {
+            Some(stream.stream_created_op)
+        }
+        MetadataChange::StreamDeleted(stream) => Some(stream.stream_created_op),
+        MetadataChange::TopicCreated(topic) | MetadataChange::TopicUpdated(topic) => {
+            Some(topic.stream_created_op)
+        }
+        MetadataChange::TopicDeleted(topic) => Some(topic.stream_created_op),
+        MetadataChange::PartitionsChanged(partitions) => Some(partitions.stream_created_op),
         _ => None,
     }
 }

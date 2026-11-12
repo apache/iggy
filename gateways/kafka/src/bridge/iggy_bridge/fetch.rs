@@ -20,44 +20,77 @@
 //! Separate from `produce.rs` so the two never edit one file.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use iggy::prelude::{
-    Client, Consumer, IggyClient, IggyError, MessageClient, Partition, PolledMessages,
-    PollingStrategy, TopicClient,
+    Client, Consumer, IggyClient, IggyError, MIN_DEFERRED_POLL_MAX_BYTES, MessageClient, Partition,
+    PollOptions, PolledMessages, PollingStrategy, TopicClient,
 };
+use iggy_common::with_binary_deadline;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout_at};
 
 use super::offsets::high_watermark;
 use super::{
-    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, permit_by,
+    IggyBridge, REQUEST_TIMEOUT, SDK_STOP_ROOM, TopicTarget, connect_client, permit_by,
     sign_out_and_shut_down,
 };
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 
-/// Fetch reads that poll at once. Each has its own Iggy client, so a poll that Iggy holds up
-/// stalls only its own slot, and only until the request deadline.
-const FETCH_SLOTS: usize = 4;
+/// The byte cap of a poll of one message: the smallest Iggy takes. The first message comes
+/// whatever its size, and a larger cap only makes its owner reserve more read budget.
+#[allow(clippy::cast_possible_truncation)]
+pub const ONE_MESSAGE_MAX_BYTES: u32 = MIN_DEFERRED_POLL_MAX_BYTES as u32;
 
-/// The Fetch read slots, with a client for each.
+/// Re-checks that run at once on one slot's client. With the polls of the request that holds the
+/// slot, they stay well below the 64 requests that the SDK keeps in flight per client. A poll past
+/// those would wait for a place and could run out of its time.
+const RECHECKS_PER_SLOT: usize = 32;
+
+/// The Fetch read slots, with a client for each. A slot reads for one request at a time.
 pub(super) struct FetchPool {
     permits: Arc<Semaphore>,
     /// The clients of the free slots.
     idle: Mutex<Vec<LazyClient>>,
-    /// Every slot's client, for `close`.
+    /// Every slot's client, for `close` and for re-checks.
     all: Vec<LazyClient>,
+    /// The re-check places of each slot's client, in the order of `all`.
+    rechecks: Vec<Arc<Semaphore>>,
+    /// The slot whose client the next re-check tries first.
+    next_recheck: AtomicUsize,
 }
 
 impl FetchPool {
-    pub(super) fn new() -> Self {
-        let all: Vec<LazyClient> = (0..FETCH_SLOTS).map(|_| LazyClient::default()).collect();
+    pub(super) fn new(slots: NonZeroUsize) -> Self {
+        let slots = slots.get();
+        let all: Vec<LazyClient> = (0..slots).map(|_| LazyClient::default()).collect();
         Self {
-            permits: Arc::new(Semaphore::new(FETCH_SLOTS)),
+            permits: Arc::new(Semaphore::new(slots)),
             idle: Mutex::new(all.clone()),
             all,
+            rechecks: (0..slots)
+                .map(|_| Arc::new(Semaphore::new(RECHECKS_PER_SLOT)))
+                .collect(),
+            next_recheck: AtomicUsize::new(0),
         }
+    }
+
+    /// A slot's client with a re-check place free, and that place. The slots take turns, so a
+    /// slot that lost its link to a node does not re-check every partition of that node. `None`
+    /// if every place is taken.
+    fn recheck_place(&self) -> Option<RecheckPlace> {
+        let first = self.next_recheck.fetch_add(1, Ordering::Relaxed);
+        (0..self.all.len()).find_map(|turn| {
+            let slot = first.wrapping_add(turn) % self.all.len();
+            let permit = Arc::clone(&self.rechecks[slot]).try_acquire_owned().ok()?;
+            Some(RecheckPlace {
+                client: FetchClient(self.all[slot].clone()),
+                _permit: permit,
+            })
+        })
     }
 
     /// A free slot. `None` if none frees before `deadline`: a poll started then would time out at
@@ -85,9 +118,8 @@ impl FetchPool {
 /// An Iggy client that connects at its first call, so a bridge that never needs it opens no
 /// extra connection.
 ///
-/// The SDK cannot cancel a call. One given up on can hold the connection until the SDK's 30 s
-/// read deadline, and every later call on it waits behind. So a call that times out takes the
-/// client with it, and the next call connects a new one.
+/// A call through [`Self::until`] that times out takes the client with it, and the next call
+/// connects a new one. Fetch and `ListOffsets` polls keep theirs. See [`IggyBridge::poll_in`].
 #[derive(Clone, Default)]
 pub(super) struct LazyClient(Arc<AsyncMutex<Option<Arc<IggyClient>>>>);
 
@@ -232,6 +264,31 @@ pub struct FetchSlot {
     _permit: OwnedSemaphorePermit,
 }
 
+impl FetchSlot {
+    /// The slot's client, for the polls that its request runs at once.
+    pub(crate) fn client(&self) -> FetchClient {
+        FetchClient(self.client.clone())
+    }
+}
+
+/// The client of one read slot. Polls on it share one connection.
+#[derive(Clone)]
+pub struct FetchClient(LazyClient);
+
+/// One re-check place on a slot's client. Dropping it frees the place.
+///
+/// A re-check runs beside the requests, so it holds no read slot, only this place.
+pub struct RecheckPlace {
+    client: FetchClient,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl RecheckPlace {
+    pub(crate) const fn client(&self) -> &FetchClient {
+        &self.client
+    }
+}
+
 impl Drop for FetchSlot {
     fn drop(&mut self) {
         // Before the permit goes, so the next holder finds a client.
@@ -312,8 +369,15 @@ impl FromIterator<(u32, PartitionProbe)> for TopicProbe {
 
 impl IggyBridge {
     /// A Fetch read slot, with its own client. `None` if none frees by `deadline`.
+    ///
+    /// Connects the slot's client first, by `deadline`, so a slow sign-in never counts against
+    /// the deadline of one poll. A connect that fails is left to the first poll, which reports it.
     pub(crate) async fn fetch_slot(&self, deadline: Instant) -> Option<FetchSlot> {
-        self.fetch_pool.take(deadline).await
+        let slot = self.fetch_pool.take(deadline).await?;
+        if let Ok(Err(error)) = timeout_at(deadline, slot.client.connected(&self.config)).await {
+            tracing::debug!(%error, "a Fetch read slot could not connect to Iggy");
+        }
+        Some(slot)
     }
 
     /// Probes every partition of the topic `kafka_topic` maps to, with one `get_topic` call, or
@@ -365,87 +429,61 @@ impl IggyBridge {
             .collect())
     }
 
-    /// Reads up to `count` messages of `partition`, from `offset` on, with the client of `slot`.
-    /// Hands the slot back with the result. `None` if no result comes by `deadline`.
-    ///
-    /// A plain consumer without auto commit, so Iggy stores no offset. Always the request's
-    /// offset, never `Next`.
-    ///
-    /// The errors are those of [`Self::probe`]. A partition the topic lacks is
-    /// [`BridgeError::Iggy`] here. The poll stops at `deadline` too, so a result that comes then
-    /// is [`BridgeError::Timeout`], and the slot connects a new client for its next poll.
-    pub(crate) async fn poll(
-        self: &Arc<Self>,
-        slot: FetchSlot,
-        kafka_topic: &str,
-        partition: u32,
-        offset: u64,
-        count: u32,
-        deadline: Instant,
-    ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
-        self.poll_by(
-            slot,
-            kafka_topic,
-            partition,
-            PollingStrategy::offset(offset),
-            count,
-            deadline,
-        )
-        .await
+    /// A place for one re-check on a slot's client, beside the requests. `None` if every slot's
+    /// places are taken.
+    pub(crate) fn recheck_place(&self) -> Option<RecheckPlace> {
+        self.fetch_pool.recheck_place()
     }
 
-    /// [`Self::poll`] with any polling strategy, so `ListOffsets` can read by timestamp or the
-    /// last record through the same slots.
-    pub(crate) async fn poll_by(
-        self: &Arc<Self>,
-        slot: FetchSlot,
+    /// Reads up to `options.count` messages and `options.max_bytes` bytes of `partition` by
+    /// `strategy`, with `client`.
+    ///
+    /// A plain consumer without auto commit, so Iggy stores no offset. Never `Next`.
+    ///
+    /// The SDK gets the deadline too, so a poll that gets no answer ends inside the SDK: it marks
+    /// the route of the partition as failed, and the next poll on the client looks the route up
+    /// again. Cut off from outside, the SDK would send every later poll to a node that stopped.
+    /// The client stays, since polls share its connection and the SDK drops a late reply.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::probe`]. A partition the topic lacks is [`BridgeError::Iggy`] here.
+    /// [`BridgeError::Timeout`] if no answer comes by `deadline`.
+    pub(crate) async fn poll_in(
+        &self,
+        client: &FetchClient,
         kafka_topic: &str,
         partition: u32,
         strategy: PollingStrategy,
-        count: u32,
-        deadline: Instant,
-    ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
-        let (bridge, client, topic) = (
-            Arc::clone(self),
-            slot.client.clone(),
-            kafka_topic.to_owned(),
-        );
-        let poll = async move {
-            bridge
-                .poll_with(&client, &topic, partition, &strategy, count, deadline)
-                .await
-        };
-        in_slot(slot, deadline, poll).await
-    }
-
-    async fn poll_with(
-        &self,
-        client: &LazyClient,
-        kafka_topic: &str,
-        partition: u32,
-        strategy: &PollingStrategy,
-        count: u32,
+        options: PollOptions,
         deadline: Instant,
     ) -> Result<PolledMessages, BridgeError> {
         let target = self.topic_target(kafka_topic)?;
         let consumer = Consumer::default();
-        let poll = |connected: Arc<IggyClient>| async move {
+        let sdk_deadline = deadline
+            .checked_sub(SDK_STOP_ROOM)
+            .filter(|stop| *stop > Instant::now())
+            .unwrap_or(deadline);
+        let poll = async {
+            let connected = client.0.connected(&self.config).await?;
             connected
                 .poll_messages(
                     &target.stream_id,
                     &target.topic_id,
-                    Some(partition),
+                    partition,
                     &consumer,
-                    strategy,
-                    count,
-                    false,
+                    &strategy,
+                    options,
                 )
                 .await
                 .map_err(BridgeError::Iggy)
         };
-        // The SDK replays a poll that Iggy refuses for up to 30 s. Stop with the request, so the
-        // slot frees.
-        client.until(&self.config, deadline, poll).await
+        match timeout_at(deadline, with_binary_deadline(sdk_deadline, poll)).await {
+            // The SDK ends a poll with no answer as a lost link or a refusal, at its deadline.
+            Ok(Err(_)) if Instant::now() >= sdk_deadline => Err(BridgeError::Timeout),
+            Ok(polled) => polled,
+            Err(_elapsed) => Err(BridgeError::Timeout),
+        }
     }
 }
 
@@ -587,12 +625,14 @@ mod tests {
         assert!(Arc::ptr_eq(&kept, &new));
     }
 
+    const SLOTS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
     #[tokio::test]
     async fn given_every_slot_taken_when_one_is_dropped_should_hand_its_client_to_the_next_read() {
-        let pool = Arc::new(FetchPool::new());
+        let pool = Arc::new(FetchPool::new(SLOTS));
         let soon = || Instant::now() + Duration::from_millis(20);
         let mut taken = Vec::new();
-        for _ in 0..FETCH_SLOTS {
+        for _ in 0..SLOTS.get() {
             taken.push(pool.take(soon()).await.expect("a free slot"));
         }
         for (index, slot) in taken.iter().enumerate() {
@@ -618,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_passed_deadline_when_a_slot_is_free_should_take_none_and_keep_its_client() {
-        let pool = Arc::new(FetchPool::new());
+        let pool = Arc::new(FetchPool::new(SLOTS));
         let held = unconnected();
         for client in &pool.all {
             client.hold(Arc::clone(&held)).await;
@@ -631,6 +671,64 @@ mod tests {
         assert!(pool.take(soon).await.is_some(), "the slot stayed free");
     }
 
+    #[tokio::test]
+    async fn given_a_slot_whose_client_never_connected_when_taken_should_dial_before_any_poll() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local listener");
+        let address = listener.local_addr().expect("its address").to_string();
+        let bridge = IggyBridge::offline_at(&address);
+        let dialed = tokio::spawn(async move { listener.accept().await.is_ok() });
+
+        let taken = bridge
+            .fetch_slot(Instant::now() + Duration::from_millis(300))
+            .await
+            .is_some();
+
+        assert!(taken, "a failed connect still hands the slot over");
+        let dialed = tokio::time::timeout(Duration::from_secs(1), dialed).await;
+        assert!(
+            matches!(dialed, Ok(Ok(true))),
+            "the slot dials when taken, so a sign-in never spends a poll's time"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_re_checks_when_placed_should_take_turns_over_the_slots_and_stop_when_all_are_taken()
+     {
+        let pool = FetchPool::new(SLOTS);
+        let slot_of = |place: &RecheckPlace| {
+            pool.all
+                .iter()
+                .position(|client| Arc::ptr_eq(&client.0, &place.client.0.0))
+                .expect("a slot's client")
+        };
+        let first = pool.recheck_place().expect("a free place");
+        let second = pool.recheck_place().expect("a free place");
+        assert_ne!(
+            slot_of(&first),
+            slot_of(&second),
+            "the next re-check tries the next slot first"
+        );
+
+        let mut held = vec![first, second];
+        while let Some(place) = pool.recheck_place() {
+            held.push(place);
+        }
+        assert_eq!(held.len(), SLOTS.get() * RECHECKS_PER_SLOT);
+        for slot in 0..SLOTS.get() {
+            let on_slot = held.iter().filter(|place| slot_of(place) == slot).count();
+            assert_eq!(on_slot, RECHECKS_PER_SLOT, "slot {slot}");
+        }
+
+        let freed = held.pop().expect("a place to free");
+        let slot = slot_of(&freed);
+        drop(freed);
+        let again = pool.recheck_place().expect("the freed place");
+        assert_eq!(slot_of(&again), slot);
+        drop((again, held));
+    }
+
     fn partition(current_offset: u64, messages_count: u64, size: u64) -> Partition {
         Partition {
             id: 0,
@@ -640,6 +738,8 @@ mod tests {
             size: IggyByteSize::from(size),
             messages_count,
             context: iggy::prelude::PartitionContext::default(),
+            members: Vec::new(),
+            in_sync_members: Vec::new(),
         }
     }
 

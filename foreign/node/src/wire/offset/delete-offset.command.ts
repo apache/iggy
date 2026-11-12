@@ -28,7 +28,9 @@ import { COMMAND_CODE } from '../command.code.js';
  * optional partition context. Without a context the client takes the one its
  * cached route reports: after another client deletes and recreates the
  * partition, one delete can fail with 87 (5009 for a group consumer). The
- * failed route is dropped and the next call routes again.
+ * failed route is dropped and the next call routes again. A context that is
+ * all zero counts as none. A context of incarnation 0 takes the incarnation of
+ * the route once and keeps its owner generation and metadata op.
  */
 export type DeleteOffset = GetOffset & {
   /** Context of the poll the delete belongs to (`PollMessagesResponse.context`) */

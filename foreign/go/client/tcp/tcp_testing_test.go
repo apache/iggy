@@ -20,7 +20,6 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
-	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -30,6 +29,7 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
+	"github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/require"
 )
@@ -166,34 +166,9 @@ func bindReplyFrame(userID uint32, session uint64) []byte {
 }
 
 // clusterMetadataFrame builds a cluster roster where the node at leaderIndex
-// is the healthy leader.
+// is the healthy leader, through the shared fakevsr builder.
 func clusterMetadataFrame(t *testing.T, leaderIndex int, addresses ...string) []byte {
-	t.Helper()
-
-	metadata := iggcon.ClusterMetadata{Name: "test-cluster"}
-	for index, address := range addresses {
-		host, port, err := net.SplitHostPort(address)
-		require.NoError(t, err)
-		tcpPort, err := net.LookupPort("tcp", port)
-		require.NoError(t, err)
-
-		role := iggcon.RoleFollower
-		if index == leaderIndex {
-			role = iggcon.RoleLeader
-		}
-		metadata.Nodes = append(metadata.Nodes, iggcon.ClusterNode{
-			ReplicaID: uint8(index),
-			Name:      host,
-			IP:        host,
-			Role:      role,
-			Status:    iggcon.Healthy,
-			Endpoints: iggcon.TransportEndpoints{Tcp: uint16(tcpPort)},
-		})
-	}
-
-	body, err := metadata.MarshalBinary()
-	require.NoError(t, err)
-	return replyFrame(vsr.OperationNonReplicated, body)
+	return fakevsr.ClusterMetadataFrame(t, leaderIndex, addresses...)
 }
 
 // echoReplyRequest stamps the request id into a reply frame the way the
@@ -241,35 +216,25 @@ func versionInfoEnd(t *testing.T, payload []byte) int {
 	return offset
 }
 
-// readRequest reads one complete frame from conn.
+// readRequest reads one complete frame from conn through the shared
+// fakevsr reader, adapting the result to the request type the assertions
+// use.
 func readRequest(conn net.Conn) (request, error) {
-	var read request
-	if _, err := io.ReadFull(conn, read.header[:]); err != nil {
-		return read, err
-	}
-	size := binary.LittleEndian.Uint32(read.header[frameOffsetSize:])
-	if size > vsr.HeaderSize {
-		read.payload = make([]byte, int(size)-vsr.HeaderSize)
-		if _, err := io.ReadFull(conn, read.payload); err != nil {
-			return read, err
-		}
-	}
-	return read, nil
+	read, err := fakevsr.ReadRequest(conn)
+	return request{header: read.Header, payload: read.Payload}, err
 }
 
 // fakeServer answers frames from a handler and records what it was asked.
 type fakeServer struct {
 	mtx      sync.Mutex
 	requests []request
-	done     chan struct{}
 }
 
 // serve reads frames off conn until it closes, answering each with the frame
 // the handler returns. A nil answer leaves the request unanswered.
 func serve(conn net.Conn, handler func(index int, read request) []byte) *fakeServer {
-	server := &fakeServer{done: make(chan struct{})}
+	server := &fakeServer{}
 	go func() {
-		defer close(server.done)
 		for index := 0; ; index++ {
 			read, err := readRequest(conn)
 			if err != nil {
@@ -298,25 +263,46 @@ func (s *fakeServer) recorded() []request {
 	return append([]request(nil), s.requests...)
 }
 
+// The partition history and the metadata op that servePartitionOperations routes to.
+const (
+	routedIncarnation = 17
+	routedMetadataOp  = 100
+)
+
+// servePartitionOperations routes each partition to replica 0 and answers the
+// other requests with handler. As the server does, it refuses a poll, an
+// offset write or a lookup that names no history.
 func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index int, read request) []byte, partitionsCount ...uint32) *fakeServer {
 	t.Helper()
 	return serve(conn, func(index int, read request) []byte {
-		switch read.code() {
-		case uint32(command.GetPartitionRouteCode):
-			body := binary.LittleEndian.AppendUint64(nil, 17)
-			body = binary.LittleEndian.AppendUint64(body, 100)
-			body = binary.LittleEndian.AppendUint32(body, 0)
+		// Only a request that is not replicated carries its command code.
+		code, operation := command.Code(read.code()), read.operation()
+		fenced := code == command.PollMessagesCode || code == command.PollMessagesDeferredCode || code == command.GetOffsetCode ||
+			operation == vsr.OperationStoreConsumerOffset || operation == vsr.OperationDeleteConsumerOffset
+		switch {
+		case fenced && read.incarnation() == 0:
+			return statusReplyFrame(operation, uint32(ierror.HistoryUnavailableCode), nil)
+		case code == command.GetPartitionRouteCode:
 			count := uint32(1)
 			if len(partitionsCount) != 0 {
 				count = partitionsCount[0]
 			}
-			body = binary.LittleEndian.AppendUint32(body, count)
-			body = append(body, 0)
-			return replyFrame(vsr.OperationNonReplicated, body)
+			return partitionRouteFrame(routedIncarnation, count)
 		default:
 			return handler(index, read)
 		}
 	})
+}
+
+// partitionRouteFrame answers a route lookup with the partition history
+// incarnation at routedMetadataOp, on replica 0.
+func partitionRouteFrame(incarnation uint64, partitionsCount uint32) []byte {
+	body := binary.LittleEndian.AppendUint64(nil, incarnation)
+	body = binary.LittleEndian.AppendUint64(body, routedMetadataOp)
+	body = binary.LittleEndian.AppendUint32(body, 0)
+	body = binary.LittleEndian.AppendUint32(body, partitionsCount)
+	body = append(body, 0)
+	return replyFrame(vsr.OperationNonReplicated, body)
 }
 
 // newPipeClient builds a client wired to one end of an in-memory pipe, with a

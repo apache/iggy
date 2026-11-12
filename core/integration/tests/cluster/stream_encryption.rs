@@ -374,11 +374,13 @@ async fn all_streams_poll(client: &IggyClient, payload_tag: &str) -> bool {
             .poll_messages(
                 &Identifier::named(name).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                100,
-                false,
+                PollOptions {
+                    count: 100,
+                    ..PollOptions::default()
+                },
             )
             .await
         else {

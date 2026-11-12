@@ -18,9 +18,10 @@
 
 # Check that a PR description has a linked issue (or N/A), a description of
 # the change, and test notes, the three things PULL_REQUEST_TEMPLATE.md asks
-# for. It looks for the content anywhere in the body, so a free-form
-# description passes when it covers all three. Plain pattern checks, no
-# model. Used by .github/workflows/pr-description.yml and runnable by hand.
+# for. Test notes are read from the "Local Execution" section when the body
+# has one. Otherwise it looks for the content anywhere in the body, so a
+# free-form description passes when it covers all three, with an explicit
+# statement of how it was tested. Plain pattern checks, no model. Used by .github/workflows/pr-description.yml and runnable by hand.
 # Read-only: it never changes anything on GitHub.
 #
 # Exits 1 and names each missing part when the description has gaps. In
@@ -29,6 +30,9 @@
 # Usage:
 #   scripts/ci/pr-description-check.sh --pr 1234
 #   scripts/ci/pr-description-check.sh --pr 1234 --repo owner/name
+#
+# --skip-writers passes PRs whose author has write or admin access. The
+# workflow uses it. If the access lookup fails, the check runs.
 #
 # Requires curl and jq.
 #
@@ -41,16 +45,18 @@ set -euo pipefail
 # shellcheck source-path=SCRIPTDIR
 source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 
-USAGE="Usage: pr-description-check.sh --pr <number> [--repo owner/name]"
+USAGE="Usage: pr-description-check.sh --pr <number> [--repo owner/name] [--skip-writers]"
 
 PR=""
 REPO="${GITHUB_REPOSITORY:-apache/iggy}"
+SKIP_WRITERS=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pr) PR="${2:-}"; shift 2 || shift ;;
     --pr=*) PR="${1#*=}"; shift ;;
     --repo) REPO="${2:-}"; shift 2 || shift ;;
     --repo=*) REPO="${1#*=}"; shift ;;
+    --skip-writers) SKIP_WRITERS=true; shift ;;
     -h|--help) echo "$USAGE"; exit 0 ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
@@ -68,6 +74,18 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/github.sh"
 
 github GET "/repos/$REPO/pulls/$PR" > "$TMP/pr.json"
 
+if [[ $SKIP_WRITERS == true ]]; then
+  AUTHOR=$(jq -r '.user.login' "$TMP/pr.json")
+  if ACCESS=$(github GET "/repos/$REPO/collaborators/$AUTHOR/permission"); then
+    if [[ $(jq -r '.permission' <<<"$ACCESS") =~ ^(write|admin)$ ]]; then
+      echo "$AUTHOR has write access, skipping the check"
+      exit 0
+    fi
+  else
+    echo "Could not read $AUTHOR's access, running the check"
+  fi
+fi
+
 # jq regexes anchor ^ and $ to the whole string, so line-based checks split
 # the body into lines first.
 FOUND=$(jq -r '
@@ -82,6 +100,9 @@ FOUND=$(jq -r '
   | ($body
      | capture("(?:\\A|\\n)##[ \\t]+Which issue does this PR address\\?[ \\t]*\\n(?<s>[\\s\\S]*?)(?=\\n##[ \\t]|\\z)").s
      // "") as $issue
+  | ($body
+     | capture("(?:\\A|\\n)##[ \\t]+Local Execution[ \\t]*\\n(?<s>[\\s\\S]*?)(?=\\n##[ \\t]|\\z)").s
+     // null) as $local
   | ($body | split("\n") | map(select(test("^\\s*#") | not)) | join(" ")
      | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "")) as $prose
   # An explicit "N/A" or "None" under the issue heading is an answer.
@@ -94,7 +115,13 @@ FOUND=$(jq -r '
     (if ($prose | length) < 100
      then "Describe why the change is needed and what it changes."
      else empty end),
-    (if ($body | test("\\b(tested|tests? pass|passed|passing|ran|run locally|pre-commit|prek|cargo (test|nextest|clippy)|go test|pytest|npm test|dotnet test|mvn|gradlew?|verified|verification|nothing to run)\\b"; "i") | not)
+    # The Local Execution section, when present, must say how the change was
+    # tested. Without it, a passing mention of a tool elsewhere is not enough,
+    # so the body needs an explicit testing statement.
+    (if (if $local != null
+         then $local | test("\\b(tested|tests? pass|passed|passing|ran|run locally|pre-commit|prek|cargo (test|nextest|clippy)|go test|pytest|npm test|dotnet test|mvn|gradlew?|verified|verification|nothing to run)\\b"; "i")
+         else $body | test("\\b(tested|tests? (pass|passed|passing)|verified|ran (the |all )?(tests?|it|them|locally|cargo|go test|pytest|npm|dotnet|mvn|gradlew?|prek|pre-commit)|run locally|nothing to run)\\b"; "i")
+         end | not)
      then "Say how you tested the change locally, under \"Local Execution\": passed or not passed, and whether pre-commit hooks ran."
      else empty end)
 ' "$TMP/pr.json")

@@ -2127,6 +2127,7 @@ fn assignments(count: u32, first_group: u64) -> Vec<CreatedPartitionAssignment> 
             partition_id,
             consensus_group_id: first_group + u64::from(partition_id),
             initial_view: 0,
+            members: Vec::new(),
         })
         .collect()
 }

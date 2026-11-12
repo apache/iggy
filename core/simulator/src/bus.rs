@@ -27,7 +27,8 @@ use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
     BusMessage, ClientConnectionLostFn, ConnectionInstaller, ConnectionPermit, ConnectionRegistry,
-    InstanceToken, MessageBus, ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
+    InstanceToken, MessageBus, ReplicaHandshakeDoneFn, ReplicaLinkId, SendError,
+    SharedTlsServerConfig,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
@@ -273,6 +274,11 @@ impl MessageBus for SimOutbox {
     fn monotonic_now(&self) -> Instant {
         self.timer.monotonic_now()
     }
+
+    fn monotonic_micros(&self) -> u64 {
+        u64::try_from(Duration::from_nanos(self.timer.now().as_nanos()).as_micros())
+            .unwrap_or(u64::MAX)
+    }
 }
 
 /// Newtype wrapper for shared [`SimOutbox`] that implements [`MessageBus`]
@@ -335,6 +341,10 @@ impl MessageBus for SharedSimOutbox {
     fn monotonic_now(&self) -> Instant {
         self.0.monotonic_now()
     }
+
+    fn monotonic_micros(&self) -> u64 {
+        self.0.monotonic_micros()
+    }
 }
 
 /// The router's dispatch/pump impl block requires `ConnectionInstaller`
@@ -342,11 +352,13 @@ impl MessageBus for SharedSimOutbox {
 /// simulator delivers messages as in-memory frames, never as delegated
 /// fds, so the install surface is unreachable: fd installs panic loudly
 /// if a future change ever routes a connection-setup frame into the sim,
-/// while the shard-0 bookkeeping acks are harmless no-ops.
+/// while the shard-0 bookkeeping acks and link closes are harmless no-ops.
 impl ConnectionInstaller for SharedSimOutbox {
     fn install_replica_inbound_fd(
         &self,
         _fd: DupedFd,
+        _link: ReplicaLinkId,
+        _deadline: Instant,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
@@ -356,16 +368,20 @@ impl ConnectionInstaller for SharedSimOutbox {
     fn install_replica_outbound_fd(
         &self,
         _fd: DupedFd,
-        _replica_id: u8,
+        _link: ReplicaLinkId,
         _on_message: MessageHandler,
         _on_done: ReplicaHandshakeDoneFn,
     ) {
         panic!("simulator has no fd transfer: replica outbound install is unreachable");
     }
 
-    fn release_replica_handshake_slot(&self, _slot: u64) {}
+    fn replica_inbound_handshake_done(&self, _slot: u64, _link: ReplicaLinkId) {}
 
-    fn clear_replica_dial_pending(&self, _replica_id: u8) {}
+    fn replica_outbound_handshake_done(&self, _link: ReplicaLinkId) {}
+
+    fn replica_link_closed(&self, _link: ReplicaLinkId) {}
+
+    fn close_replica_link(&self, _link: ReplicaLinkId) {}
 
     fn install_client_fd(
         &self,

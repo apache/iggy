@@ -187,11 +187,14 @@ async fn stop_on_offset_write_without_descriptor(harness: &mut TestHarness, writ
                 client.poll_messages(
                     &stream_id,
                     &topic_id,
-                    Some(PARTITION_ID),
+                    PARTITION_ID,
                     &consumer,
                     &PollingStrategy::offset(0),
-                    1,
-                    true,
+                    PollOptions {
+                        count: 1,
+                        commit: CommitPolicy::OnRead,
+                        ..PollOptions::default()
+                    },
                 ),
             )
             .await
@@ -229,11 +232,13 @@ async fn stop_on_offset_write_without_descriptor(harness: &mut TestHarness, writ
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll after the restart");

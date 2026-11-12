@@ -41,6 +41,12 @@ namespace Apache.Iggy.Tests.MapperTests;
 
 public sealed class BinaryMapper
 {
+    /// <summary>
+    ///     The partition record the Rust encoder pins in get_topic.rs, so every SDK decodes the same bytes.
+    /// </summary>
+    private const string PinnedPartitionHex =
+        "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000000000000000650000000000000003010304020104";
+
     [Theory]
     [InlineData(null)]
     [InlineData("null")]
@@ -279,17 +285,22 @@ public sealed class BinaryMapper
             sizeBytes, messagesCount, createdAt2,
             BinaryFactory.CreateOptionEntry(2, "message_expiry", 12, BitConverter.GetBytes((ulong)messageExpiry)),
             BinaryFactory.CreateOptionEntry(2, "max_topic_size", 12, BitConverter.GetBytes(maxTopicSize)));
-
-        var combinedPayload = new byte[topicPayload.Length];
-        topicPayload.CopyTo(combinedPayload.AsSpan());
+        byte[] payload =
+        [
+            ..topicPayload,
+            ..Enumerable.Range(0, (int)partitionsCount).SelectMany(partitionId =>
+                BinaryFactory.CreatePartitionPayload((uint)partitionId, createdAt2, 1, 0, 0, 0,
+                    new PartitionContext(1, 0, 2), [0], [0]))
+        ];
 
         // Act
-        var response = Mappers.BinaryMapper.MapTopic(combinedPayload);
+        var response = Mappers.BinaryMapper.MapTopic(payload);
 
         // Assert
         Assert.NotNull(response);
         Assert.Equal(messagesCount, response.MessagesCount);
         Assert.Equal(partitionsCount, response.PartitionsCount);
+        Assert.Equal((int)partitionsCount, response.Partitions!.Count());
         Assert.Equal(sizeBytes, response.Size);
         Assert.Equal(topicId, response.Id);
         Assert.Equal(topicName, response.Name);
@@ -301,14 +312,13 @@ public sealed class BinaryMapper
     [Fact]
     public void MapTopic_ReadsAPartitionRecordWithItsContext()
     {
-        var (topicId, partitionsCount, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
             TopicFactory.CreateTopicResponseFields();
         var context = new PartitionContext(17, 9, 52);
         byte[] payload =
         [
-            ..BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName, sizeBytes, messagesCount,
-                createdAt),
-            ..BinaryFactory.CreatePartitionPayload(3, createdAt, 7, 101, 2048, 102, context)
+            ..BinaryFactory.CreateTopicPayload(topicId, 1, topicName, sizeBytes, messagesCount, createdAt),
+            ..BinaryFactory.CreatePartitionPayload(3, createdAt, 7, 101, 2048, 102, context, [0, 1, 2], [0])
         ];
 
         var response = Mappers.BinaryMapper.MapTopic(payload);
@@ -324,18 +334,120 @@ public sealed class BinaryMapper
     }
 
     [Fact]
+    public void MapTopic_DecodesThePinnedPartitionVector()
+    {
+        var partitionBytes = Convert.FromHexString(PinnedPartitionHex);
+        byte[] payload = [.. PinnedTopicHeader(1), .. partitionBytes];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(71, partitionBytes.Length);
+        Assert.Equal(partitionBytes, PinnedPartition(1, [1, 3, 4], [1, 4]));
+        var partition = Assert.Single(response.Partitions!);
+        Assert.Equal(1u, partition.Id);
+        Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(1_710_000_000), partition.CreatedAt);
+        Assert.Equal(2u, partition.SegmentsCount);
+        Assert.Equal(99ul, partition.CurrentOffset);
+        Assert.Equal(1024ul, partition.Size);
+        Assert.Equal(100ul, partition.MessagesCount);
+        Assert.Equal(new PartitionContext(23, 0, 101), partition.Context);
+        Assert.Equal(new byte[] { 1, 3, 4 }, partition.Members);
+        Assert.Equal(new byte[] { 1, 4 }, partition.InSyncMembers);
+    }
+
+    [Fact]
+    public void MapTopic_DecodesAPartitionWithEmptyNodeLists()
+    {
+        var pinned = Convert.FromHexString(PinnedPartitionHex);
+        byte[] partitionBytes = [.. pinned[..64], 0, 0];
+        byte[] payload = [.. PinnedTopicHeader(1), .. partitionBytes];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(66, partitionBytes.Length);
+        var partition = Assert.Single(response.Partitions!);
+        Assert.Equal(1u, partition.Id);
+        Assert.Equal(new PartitionContext(23, 0, 101), partition.Context);
+        Assert.Empty(partition.Members);
+        Assert.Empty(partition.InSyncMembers);
+    }
+
+    [Fact]
+    public void MapTopic_AdvancesByTheLengthEachPartitionTakes()
+    {
+        byte[] payload =
+        [
+            ..PinnedTopicHeader(3),
+            ..PinnedPartition(1, [1, 3, 4], [1, 4]),
+            ..PinnedPartition(2, [], []),
+            ..PinnedPartition(3, [0, 1, 2], [0])
+        ];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        var partitions = response.Partitions!.ToList();
+        Assert.Equal([1u, 2u, 3u], partitions.Select(partition => partition.Id));
+        Assert.All(partitions, partition => Assert.Equal(100ul, partition.MessagesCount));
+        Assert.All(partitions, partition => Assert.Equal(new PartitionContext(23, 0, 101), partition.Context));
+        Assert.Equal(new byte[] { 1, 3, 4 }, partitions[0].Members);
+        Assert.Equal(new byte[] { 1, 4 }, partitions[0].InSyncMembers);
+        Assert.Empty(partitions[1].Members);
+        Assert.Empty(partitions[1].InSyncMembers);
+        Assert.Equal(new byte[] { 0, 1, 2 }, partitions[2].Members);
+        Assert.Equal(new byte[] { 0 }, partitions[2].InSyncMembers);
+    }
+
+    [Fact]
+    public void MapTopic_WithAPartitionCutShort_Throws()
+    {
+        var header = PinnedTopicHeader(1);
+        byte[] payload = [.. header, .. Convert.FromHexString(PinnedPartitionHex)];
+
+        for (var length = header.Length; length < payload.Length; length++)
+        {
+            var truncated = payload[..length];
+            Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(truncated));
+        }
+    }
+
+    [Fact]
+    public void MapTopic_WithFewerPartitionsThanItsCount_Throws()
+    {
+        byte[] payload =
+        [
+            ..PinnedTopicHeader(2),
+            ..PinnedPartition(1, [1, 3, 4], [1, 4]),
+            ..PinnedPartition(2, [1, 3, 4], [1, 4])[..70]
+        ];
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(payload));
+    }
+
+    private static byte[] PinnedTopicHeader(uint partitionsCount)
+    {
+        return BinaryFactory.CreateTopicPayload(7, partitionsCount, "replicated", 2048, 300, 1_710_000_000_000);
+    }
+
+    /// <summary>The counters of <see cref="PinnedPartitionHex" /> under its own id and node lists.</summary>
+    private static byte[] PinnedPartition(uint id, byte[] members, byte[] inSyncMembers)
+    {
+        return BinaryFactory.CreatePartitionPayload(id, 1_710_000_000_000, 2, 99, 1024, 100,
+            new PartitionContext(23, 0, 101), members, inSyncMembers);
+    }
+
+    [Fact]
     public void MapTopic_WithAnOptionOfAnUnknownKind_KeepsTheOtherEntries()
     {
         // Arrange: an option kind a newer server may introduce, between two this build knows.
         const byte stringKind = 2;
         const byte unknownKind = 200;
-        var (topicId, partitionsCount, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
             TopicFactory.CreateTopicResponseFields();
         var options = new List<byte>();
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "segment_size", stringKind, "1GB"u8.ToArray()));
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "future_option", unknownKind, [0xAA, 0xBB]));
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "preallocate_segments", 3, [1]));
-        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName,
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName,
             sizeBytes, messagesCount, createdAt, options.ToArray());
 
         // Act

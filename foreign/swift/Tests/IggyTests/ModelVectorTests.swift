@@ -130,7 +130,7 @@ struct ModelVectorTests {
             partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .after(.seconds(604_800)),
             maxTopicSize: .bytes(1_073_741_824), segmentSizeBytes: 1_048_576, durability: .persisted,
             consumerOffsetDurability: .replicated, messagesRequiredToSave: 7, sizeOfMessagesRequiredToSaveBytes: 4096,
-            preallocateSegments: false)
+            preallocateSegments: false, replicationFactor: 2)
         #expect(try create.encode() == golden.bytes("options.topic_create.full"))
         let update = TopicUpdateOptions(messageExpiry: .never, maxTopicSize: .unlimited)
         #expect(try OptionsBlock.encode(update.toPatch().set) == golden.bytes("options.topic_update.full"))

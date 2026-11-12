@@ -75,7 +75,6 @@ AREA_LABELS='{
   "PHP SDK": "php",
   "CLI": "tui",
   "Web UI": "web",
-  "Connectors": "connectors",
   "MCP server": "mcp",
   "Configuration": "config",
   "Wire protocol / API": "api",
@@ -108,9 +107,8 @@ if [[ ! $ISSUE =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-# Annotations in Actions, plain lines elsewhere. Messages can carry model
-# text, so each stays on one line: a line starting with "::" would run as a
-# workflow command.
+# Annotations in Actions, plain lines elsewhere. Each message stays on one
+# line. Raw model text goes through model_text, never into these directly.
 info() {
   local msg="$*"
   msg=${msg//$'\r'/ }
@@ -125,6 +123,16 @@ warning() {
   else
     msg=${msg//$'\r'/ }
     echo "warning: ${msg//$'\n'/ }"
+  fi
+}
+
+# Raw model text for a log line. Workflow commands can be parsed anywhere in
+# a log line, so in Actions the text is left out and only its length is given.
+model_text() {
+  if [[ -n ${GITHUB_ACTIONS:-} ]]; then
+    echo "(${#1} characters, not shown in Actions; run with --dry-run to see it)"
+  else
+    echo "$1"
   fi
 }
 
@@ -228,12 +236,12 @@ model_labels() {
       end
   ' <<<"$text")
   if [[ $(jq 'has("error")' <<<"$result") == true ]]; then
-    warning "model reply was not JSON: $(jq -r .error <<<"$result")"
+    warning "model reply was not JSON: $(model_text "$(jq -r .error <<<"$result")")"
     return
   fi
   LABELS=$(jq -c .labels <<<"$result")
   if [[ $LABELS == '[]' ]]; then
-    info "model suggested no allowed labels: $(jq -r .text <<<"$result")"
+    info "model suggested no allowed labels: $(model_text "$(jq -r .text <<<"$result")")"
   else
     info "model ($model) suggested: $(jq -r '.labels | join(", ")' <<<"$result")"
   fi
@@ -248,6 +256,15 @@ if [[ $LABELS != '[]' ]]; then
 else
   info "no mappable area selected in the form"
   model_labels
+  if [[ $LABELS != '[]' ]]; then
+    # The model call can take a while. Drop its labels if someone labeled or
+    # edited the issue in the meantime, so they are judged on the new state.
+    SNAPSHOT='{title, body, labels: ([.labels[]?.name] | sort)}'
+    if [[ $(jq -c "$SNAPSHOT" <<<"$ISSUE_JSON") != $(github GET "$ISSUE_PATH" | jq -c "$SNAPSHOT") ]]; then
+      info "issue changed while the model ran, not adding its labels"
+      exit 0
+    fi
+  fi
 fi
 
 if [[ $LABELS == '[]' ]]; then

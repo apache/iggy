@@ -23,6 +23,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.Checkpoint;
 import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
@@ -79,7 +80,10 @@ public interface ConsumerOffsetsClient {
      * Stores a consumer offset fenced by the context its messages were polled with.
      * The server refuses the store once the partition incarnation or its owner has
      * changed, so an offset from an older incarnation never lands in a newer one.
-     * The client returns that refusal, 87 or 5009, and does not retry it.
+     * The client returns that refusal, 87 or 5009, and does not retry it. A context
+     * with incarnation 0 names no history, so the store takes the incarnation of the
+     * partition route once, and keeps the owner and op of the context. An empty
+     * context takes the whole context of the route: its incarnation, owner 0 and op.
      *
      * @param streamId The stream identifier
      * @param topicId The topic identifier
@@ -106,6 +110,16 @@ public interface ConsumerOffsetsClient {
      * @param consumerId The consumer identifier (numeric ID)
      * @return A CompletableFuture containing the consumer offset info if it exists
      */
+    /**
+     * Stores the offset of the message that {@code checkpoint} follows, under the history of its partition, so a store
+     * for a partition that was deleted and recreated since is refused.
+     */
+    default CompletableFuture<Void> storeConsumerPosition(
+            StreamId streamId, TopicId topicId, Consumer consumer, Checkpoint checkpoint) {
+        return storeConsumerOffset(
+                streamId, topicId, checkpoint.partitionId(), consumer, checkpoint.offset(), checkpoint.context());
+    }
+
     default CompletableFuture<Optional<ConsumerOffsetInfo>> getConsumerOffset(
             Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId) {
         return getConsumerOffset(StreamId.of(streamId), TopicId.of(topicId), partitionId, Consumer.of(consumerId));

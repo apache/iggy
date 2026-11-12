@@ -104,6 +104,13 @@ async fn given_topic_scope_when_describing_options_should_list_the_catalog(harne
     assert_eq!(flags("max_topic_size"), (true, true, false, false));
     assert_eq!(flags("compression_algorithm"), (false, false, false, false));
     assert_eq!(flags("segment_size"), (false, false, false, false));
+    // The default replication factor is the server's `"all"`: every node.
+    let nodes = u32::try_from(harness.cluster_size()).unwrap();
+    let replication_factor = specs
+        .iter()
+        .find(|spec| spec.key == "replication_factor")
+        .unwrap();
+    assert_eq!(replication_factor.default_value, nodes.to_le_bytes());
 }
 
 #[iggy_harness]
@@ -190,11 +197,13 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
         .poll_messages(
             &stream,
             &topic,
-            Some(0),
+            0,
             &Consumer::new(Identifier::numeric(1).unwrap()),
             &PollingStrategy::offset(0),
-            10,
-            false,
+            PollOptions {
+                count: 10,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap();

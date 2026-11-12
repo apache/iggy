@@ -34,6 +34,7 @@ final class SensitiveParameterTest extends TestCase
             'connection string' => ['fromConnectionString', 'connection_string'],
             'password' => ['loginUser', 'password'],
             'raw binary payload' => ['sendBinaryRequest', 'payload'],
+            'raw binary payload to a replica' => ['sendBinaryRequestToReplica', 'payload'],
             'stream key' => ['createStream', 'encryption_key'],
             'fingerprinted key' => ['encryptionKeyFingerprint', 'key'],
             'raw stream options' => ['createStream', 'raw'],
@@ -49,7 +50,7 @@ final class SensitiveParameterTest extends TestCase
         return [
             'createStream' => ['createStream', 2, static fn (IggyClient $client, array $raw) => $client->createStream('never-sent', null, $raw, 'unexpected')],
             'updateStream' => ['updateStream', 3, static fn (IggyClient $client, array $raw) => $client->updateStream('never-sent', null, [], $raw, null, 'unexpected')],
-            'createTopic' => ['createTopic', 13, static fn (IggyClient $client, array $raw) => $client->createTopic('never-sent', 'never-sent', 1, null, null, null, null, null, null, null, null, null, null, $raw, 'unexpected')],
+            'createTopic' => ['createTopic', 14, static fn (IggyClient $client, array $raw) => $client->createTopic('never-sent', 'never-sent', 1, null, null, null, null, null, null, null, null, null, null, null, $raw, 'unexpected')],
             'updateTopic' => ['updateTopic', 6, static fn (IggyClient $client, array $raw) => $client->updateTopic('never-sent', 'never-sent', null, null, null, [], $raw, null, 'unexpected')],
         ];
     }

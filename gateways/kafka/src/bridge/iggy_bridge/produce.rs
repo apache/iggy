@@ -26,13 +26,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::future::join_all;
-use iggy::prelude::{IggyClient, IggyError, IggyMessage, MessageClient, Partitioning};
+use iggy::prelude::{
+    BatchProducer, IggyClient, IggyError, IggyMessage, MessageClient, Partitioning,
+};
+use iggy_common::{binary_operation_deadline, with_binary_deadline};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 
 use super::fetch::LazyClient;
-use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker};
+use super::{
+    IggyBridge, SDK_STOP_ROOM, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker,
+};
 use crate::bridge::config::{IggyBridgeConfig, ProduceSessionLimits};
 use crate::bridge::error::BridgeError;
 
@@ -63,6 +68,16 @@ pub enum Producer {
     Id { id: i64, user: Option<String> },
     /// The Kafka connection, for a producer without such an id.
     Connection(u64),
+}
+
+/// The messages of one partition, sent to Iggy in one request.
+#[derive(Debug)]
+pub struct PartitionBatch {
+    /// Passes through unchanged: Kafka and Iggy both count partitions from 0.
+    pub partition: u32,
+    /// The id, epoch and first sequence of an idempotent Kafka producer.
+    pub producer: Option<BatchProducer>,
+    pub messages: Vec<IggyMessage>,
 }
 
 /// One Iggy client. One request holds its turn at a time, so the sends on it reach Iggy in order.
@@ -346,6 +361,13 @@ impl IggyBridge {
         self.config.max_message_size.saturating_sub(SEND_FRAME_ROOM)
     }
 
+    /// Whether a batch of an idempotent Kafka producer carries its producer to Iggy. See
+    /// [`IggyBridgeConfig::idempotent_producers`](crate::bridge::IggyBridgeConfig::idempotent_producers).
+    #[must_use]
+    pub const fn writes_producers(&self) -> bool {
+        self.config.idempotent_producers
+    }
+
     /// The turn of `producer` on its session. `None` if it does not free by `deadline`: an
     /// earlier request of the producer, or a send that outlived one, still holds it.
     ///
@@ -365,20 +387,25 @@ impl IggyBridge {
         self.produce_pool.forget(&Producer::Connection(connection));
     }
 
-    /// Appends `messages` to `partition` of `target` on the session of `turn`, and returns the
+    /// Appends `batch` to its partition of `target` on the session of `turn`, and returns the
     /// base offset. Hands `turn` and `kept` back with it.
     ///
-    /// `partition` passes through unchanged: both systems count from 0. The server rejects a
-    /// partition the topic lacks, so no round trip checks first.
+    /// With a producer, the batch carries the Kafka producer's id, epoch and first sequence, and
+    /// the partition writes it once. A resend of a batch it holds answers the first offset.
+    ///
+    /// The server rejects a partition the topic lacks, so no round trip checks first.
     ///
     /// `Ok(None)`: committed, but the server named no offset (a duplicate request, or a journal
     /// entry that is gone). Do not retry it.
     ///
+    /// The SDK stops the send by `deadline`, so no attempt of it starts after the request
+    /// answered, and a client retry is the only copy of a send that never went out.
+    ///
     /// A send still running at `deadline` keeps `turn` and `kept`, and hands back `None` for
     /// them. So the producer's later requests answer 7 meanwhile and cannot overtake it, and what
-    /// `kept` reserves for `messages` stays reserved. Other producers send on.
+    /// `kept` reserves for the messages stays reserved. Other producers send on.
     ///
-    /// Such a send drops `messages` and `kept` when it ends, at `SLOT_LIMIT` at the latest. Cut
+    /// Such a send drops the messages and `kept` when it ends, at `SLOT_LIMIT` at the latest. Cut
     /// off there, it keeps `turn` until its connection is closed.
     ///
     /// # Errors
@@ -386,16 +413,21 @@ impl IggyBridge {
     /// [`BridgeError::Timeout`] if `deadline` passes. The send may have landed.
     /// [`BridgeError::SendLost`] if the connection broke during the send. It may have landed.
     /// [`BridgeError::Iggy`] if the session cannot connect, if the stream, topic or partition is
-    /// missing, or if the send is too large.
+    /// missing, or if the send is too large. Also when the SDK stopped the send at `deadline`:
+    /// `OperationUncertain` if it went out, so it may have landed, and its refusal if it did not.
     pub async fn send_records<K: Send + 'static>(
         &self,
         turn: ProduceTurn,
         kept: K,
         target: &TopicTarget,
-        partition: u32,
-        mut messages: Vec<IggyMessage>,
+        batch: PartitionBatch,
         deadline: Instant,
     ) -> (Result<Option<u64>, BridgeError>, Option<(ProduceTurn, K)>) {
+        let PartitionBatch {
+            partition,
+            producer,
+            mut messages,
+        } = batch;
         let session = Arc::clone(&turn.seat.session);
         let connect = self.produce_pool.client_of(&session, &self.config);
         let client = match timeout_at(deadline, connect).await {
@@ -408,7 +440,13 @@ impl IggyBridge {
             return (Err(BridgeError::Timeout), Some((turn, kept)));
         }
         let (stream_id, topic_id) = (target.stream_id.clone(), target.topic_id.clone());
-        let recovery_deadline = (Instant::now() + SLOT_LIMIT).into_std();
+        // With less than the room left, the SDK keeps the whole deadline, and the send answers 7.
+        // Never past the SDK's own limit, which `SLOT_LIMIT` counts on.
+        let sdk_deadline = deadline
+            .checked_sub(SDK_STOP_ROOM)
+            .filter(|stop| *stop > Instant::now())
+            .unwrap_or(deadline)
+            .min(binary_operation_deadline());
         let send = async move {
             // Owns the messages, so a send cut off at the limit drops them.
             let send = {
@@ -416,18 +454,40 @@ impl IggyBridge {
                 async move {
                     let partitioning = Partitioning::partition_id(partition);
                     loop {
-                        match client
-                            .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
-                            .await
-                        {
+                        let sent = match producer {
+                            Some(producer) => {
+                                client
+                                    .send_producer_messages(
+                                        &stream_id,
+                                        &topic_id,
+                                        partition,
+                                        producer,
+                                        &mut messages,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                client
+                                    .send_messages(
+                                        &stream_id,
+                                        &topic_id,
+                                        &partitioning,
+                                        &mut messages,
+                                    )
+                                    .await
+                            }
+                        };
+                        match sent {
                             Err(IggyError::LaneBlocked(operation)) => {
-                                resolve_blocker(&client, operation, recovery_deadline).await?;
+                                resolve_blocker(&client, operation, sdk_deadline.into_std())
+                                    .await?;
                             }
                             result => return result,
                         }
                     }
                 }
             };
+            let send = with_binary_deadline(sdk_deadline, send);
             within_slot_limit(&session, &client, kept, send).await
         };
         // The SDK cannot cancel a send. One that outlives this call keeps the turn in its task,
@@ -578,8 +638,11 @@ mod tests {
                     .expect("a free turn"),
                 7,
                 &target,
-                0,
-                Vec::new(),
+                PartitionBatch {
+                    partition: 0,
+                    producer: None,
+                    messages: Vec::new(),
+                },
                 Instant::now(),
             )
             .await;

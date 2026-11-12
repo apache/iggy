@@ -65,9 +65,9 @@ runs:
         # Shards download the build artifact. Metadata-only tasks need no target cache.
         read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test') && 'false' || 'true' }}
         save-cache: ${{ inputs.save-cache }}
-        # Artifact builders do not pull test containers. Keep cleanup on the
-        # test shards and other disk-heavy jobs.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        # Artifact builders do not pull test containers. Test shards have ~78 GB
+        # free when tests start and use ~15 GB, so the cleanup costs minutes.
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -134,7 +134,7 @@ runs:
       run: cargo fmt --all -- --check
       shell: bash
 
-    # clippy-macos-aarch64 runs the same lint on macos-14. Code behind
+    # clippy-macos-aarch64 runs the same lint on macos-15. Code behind
     # cfg(target_os) splits is dead to the Linux leg, so its warnings would
     # otherwise reach master unseen.
     - name: Cargo clippy
@@ -248,7 +248,7 @@ runs:
           TEST_ARCHIVE_ARGS=(-E "$ARCHIVE_FILTER")
         fi
 
-        # SDKs need only server/CLI. Keep Rust-only binaries and plugins with their tests.
+        # SDKs need only server/CLI. Keep Rust-only binaries with their tests.
         BUILD_RUNTIME=false
         if [[ "$RUNTIME_SCOPE" == workspace ]]; then
           BUILD_RUNTIME=true
@@ -262,6 +262,7 @@ runs:
         fi
 
         : > "$ARTIFACT_DIR/runtime-files"
+        KAFKA_MESSAGE_GEN=""
         if [[ "$BUILD_RUNTIME" == true ]]; then
           # Match the cache producer's dependency features even for affected-package runs.
           cargo build --locked --workspace --exclude server --exclude iggy-cli \
@@ -276,12 +277,16 @@ runs:
           jq -r --arg scope "$RUNTIME_SCOPE" --argjson packages "$RUNTIME_PACKAGE_IDS" '
             select(.reason == "compiler-artifact") |
             select($scope == "workspace" or (.package_id as $id | $packages | index($id))) |
-            (select(.target.kind | index("bin")) | .executable // empty),
-            (select(.target.crate_types | index("cdylib")) | .filenames[] | select(endswith(".so")))' \
+            select(.target.kind | index("bin")) | .executable // empty' \
             "$ARTIFACT_DIR/build.jsonl" | sort -u | \
             while IFS= read -r artifact; do
               realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
             done > "$ARTIFACT_DIR/runtime-files"
+          # Fixture generation reuses this binary: `cargo run -p` would resolve
+          # features for that one package and rebuild the crates under it.
+          KAFKA_MESSAGE_GEN=$(jq -r '
+            select(.reason == "compiler-artifact" and .target.name == "kafka-message-gen") |
+            .executable // empty' "$ARTIFACT_DIR/build.jsonl")
           rm "$ARTIFACT_DIR/build.jsonl"
         fi
         tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
@@ -338,7 +343,7 @@ runs:
         fi
         printf '%s\n' "$NEEDS_KAFKA_FIXTURES" > "$ARTIFACT_DIR/kafka-fixtures"
         if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
-          ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
+          KAFKA_MESSAGE_GEN="$KAFKA_MESSAGE_GEN" ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
           tar --zstd -cf "$ARTIFACT_DIR/kafka-fixtures.tar.zst" gateways/kafka/tools/kafka-tool/kafka_messages
         fi
 
@@ -391,13 +396,15 @@ runs:
           # naming the feature under test instead of naming the pull. The suite runs its
           # containers with --pull never, so a failed pull here makes it skip, which the guard
           # above turns into a job failure that names the missing image.
-          # Read the tags out of the suite itself; hardcoding them here lets a bump in the test
+          # Read the tags out of the suites themselves; hardcoding them here lets a bump in a test
           # desync silently, which pre-pulls the superseded image and puts the real one back
-          # inside the budget this block exists to avoid.
-          E2E_IMAGES=$(grep -oP '^const (KCAT|KAFKA)_IMAGE: &str = "\K[^"]+' \
-            gateways/kafka/tests/kafka_client_e2e_tests.rs)
+          # inside the budget this block exists to avoid. The failover suite runs the same
+          # clients against a cluster. `KAFKA_4_0_IMAGE` and `KAFKA_3_9_IMAGE` match too.
+          E2E_IMAGES=$(grep -ohP '^const (KCAT|KAFKA)\w*_IMAGE: &str = "\K[^"]+' \
+            gateways/kafka/tests/kafka_client_e2e_tests.rs \
+            gateways/kafka/tests/cluster_failover_tests.rs | sort -u)
           if [[ -z "$E2E_IMAGES" ]]; then
-            echo "::warning::could not read client image tags from kafka_client_e2e_tests.rs; skipping pre-pull"
+            echo "::warning::could not read client image tags from the Kafka client suites; skipping pre-pull"
           fi
           for image in $E2E_IMAGES; do
             timeout 300 docker pull -q "$image" \
@@ -416,8 +423,6 @@ runs:
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
         fi
 
-        # Doris requires this host setting before its testcontainers fixture starts.
-        sudo sysctl -w vm.max_map_count=2000000 || true
         NO_TESTS=fail
         if [[ "$TEST_SCOPE" == "packages" ]]; then
           # BDD targets require features, so a BDD-only scope can contain no runnable tests.
@@ -428,12 +433,23 @@ runs:
         tar --zstd -xf "$ARTIFACT_DIR/nextest.tar.zst"
         tar --zstd -xf "$ARTIFACT_DIR/runtime.tar.zst"
         ./scripts/ci/restore-runtime.sh "$RUNNER_TEMP/rust-runtime"
+        echo "Disk space before tests:"
+        df -h /
+        # The after-test report must survive a failing run: a full disk is one
+        # way to fail.
+        nextest_status=0
+        # slice deals the filtered test list round-robin, so neighbouring slow
+        # tests such as the per-transport variants of one scenario land on
+        # different shards. hash placement can stack them on one shard.
         cargo nextest run \
           --cargo-metadata target/nextest/cargo-metadata.json \
           --binaries-metadata target/nextest/binaries-metadata.json \
           --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
           --no-fail-fast --no-tests="$NO_TESTS" --profile ci \
-          --partition "hash:${PARTITION_INDEX}/${PARTITION_COUNT}"
+          --partition "slice:${PARTITION_INDEX}/${PARTITION_COUNT}" || nextest_status=$?
+        echo "Disk space after tests:"
+        df -h /
+        exit "$nextest_status"
       shell: bash
 
     # Compare the shared HEAD runtime with a separately built baseline server.
