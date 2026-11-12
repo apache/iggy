@@ -12800,6 +12800,138 @@ mod unservable_op_view_change_tests {
         }
     }
 
+    /// A backup can learn that an op committed before its prepare arrives, and
+    /// its vote names a commit only up to its head. When the replicas that held
+    /// the op lose it, a view starts without the op. That backup must not lead
+    /// the view: its commit point names an op that no replica can supply, and a
+    /// primary takes no request while it has committed ops left to apply.
+    #[test]
+    fn given_a_backup_that_knows_a_lost_commit_when_the_group_restarts_should_commit_a_new_send() {
+        const PRIMARY: u8 = 0;
+        /// Gets the commit number and never the prepare. Candidate of the view
+        /// after the one that `PRIMARY` leads.
+        const KNOWER: u8 = 1;
+        const ACKER: u8 = 2;
+        let namespace = namespace();
+        let (mut sim, client) = cluster(SEED);
+        sim.register_client_with_primary(&client);
+        sim.set_partition_durability(namespace, iggy_common::Durability::Replicated);
+        sim.seed_stream_topic_partition(namespace);
+        for replica in &sim.replicas {
+            materialise_partition(replica, namespace, sim.consumer_offsets_max);
+        }
+        step_until(&mut sim, "the fresh group never elected replica 0", |sim| {
+            group(sim, PRIMARY)
+                .is_some_and(|group| group.status == Status::Normal && group.is_primary)
+        });
+        let first_view = group(&sim, PRIMARY).unwrap().view;
+
+        // The prepare reaches the acker only. The commit heartbeat reaches both.
+        for holder in [PRIMARY, ACKER] {
+            set_link_drops(&mut sim, holder, KNOWER, Some(is_group_prepare));
+            set_link_drops(&mut sim, KNOWER, holder, Some(is_group_repair_request));
+        }
+        let reply = send(&mut sim, &client, PRIMARY, b"lost");
+        assert_eq!(reply.header().status, 0);
+        let lost_op = reply.header().commit;
+        let held_before = lost_op - 1;
+        step_until(&mut sim, "the backup never learned of the commit", |sim| {
+            group(sim, KNOWER).is_some_and(|group| group.commit_max == lost_op)
+        });
+        assert_eq!(
+            group(&sim, KNOWER).map(|group| group.head),
+            Some(held_before),
+            "the backup must know the commit of op {lost_op} without the prepare"
+        );
+
+        // Both holders lose power before their WALs sync the op.
+        for holder in [PRIMARY, ACKER] {
+            sim.replica_crash(holder);
+        }
+        for holder in [PRIMARY, ACKER] {
+            sim.replica_restart_losing_unsynced_messages(holder);
+            set_link_drops(&mut sim, holder, KNOWER, None);
+            set_link_drops(&mut sim, KNOWER, holder, None);
+        }
+        step_until(
+            &mut sim,
+            "a restarted replica never rebuilt the group",
+            |sim| every_group(sim, |_| true),
+        );
+        for holder in [PRIMARY, ACKER] {
+            assert_eq!(
+                group(&sim, holder).map(|group| group.head),
+                Some(held_before),
+                "replica {holder} must restart without op {lost_op}"
+            );
+        }
+
+        let leader = (0..SETTLE_STEPS)
+            .find_map(|_| {
+                sim.step();
+                REPLICAS.into_iter().find(|&replica| {
+                    settled_above(&sim, replica, first_view, true)
+                        && admits_requests(&sim, replica)
+                        && REPLICAS
+                            .into_iter()
+                            .any(|backup| settled_above(&sim, backup, first_view, false))
+                })
+            })
+            .unwrap_or_else(|| panic!("no view started without op {lost_op}: {:?}", groups(&sim)));
+
+        let reply = send(&mut sim, &client, leader, PAYLOAD);
+        assert_eq!(
+            reply.header().status,
+            0,
+            "replica {leader} leads the view and refused a send: {:?}",
+            groups(&sim)
+        );
+        assert_eq!(
+            reply.header().commit,
+            lost_op,
+            "the send must take the number of the op the group lost"
+        );
+        step_until(&mut sim, "a replica never applied the send", |sim| {
+            every_group(sim, |group| {
+                group.status == Status::Normal && group.commit_min == lost_op
+            })
+        });
+        let journaled = |replica: u8| {
+            sim.partition_journaled_header(usize::from(replica), namespace, lost_op)
+                .map(|header| header.checksum)
+        };
+        assert!(journaled(leader).is_some());
+        for replica in REPLICAS {
+            assert_eq!(
+                journaled(replica),
+                journaled(leader),
+                "replica {replica} journals another prepare at op {lost_op} than the primary"
+            );
+        }
+    }
+
+    /// Send `payload` to `replica` and step until its reply arrives. A commit can
+    /// wait for a resend of the prepare, which takes more steps than
+    /// `tests::submit_and_wait_for_reply` allows.
+    fn send(
+        sim: &mut Simulator,
+        client: &SimClient,
+        replica: u8,
+        payload: &'static [u8],
+    ) -> Message<ReplyHeader> {
+        sim.discover_partition_contexts(client);
+        let send = client.send_messages(namespace(), &[Bytes::from_static(payload)]);
+        let request = send.header().request;
+        sim.submit_request(client.client_id(), replica, send.into_generic());
+        (0..SETTLE_STEPS)
+            .find_map(|_| {
+                sim.step()
+                    .into_iter()
+                    .find(|reply| reply.header().request == request)
+            })
+            .unwrap_or_else(|| panic!("replica {replica} never answered a send: {:?}", groups(sim)))
+    }
+
     fn namespace() -> IggyNamespace {
         IggyNamespace::new(1, 1, 0)
     }
@@ -12813,6 +12945,7 @@ mod unservable_op_view_change_tests {
         is_primary: bool,
         head: u64,
         commit_min: u64,
+        commit_max: u64,
         untrusted_log: bool,
     }
 
@@ -12828,6 +12961,7 @@ mod unservable_op_view_change_tests {
             is_primary: consensus.is_primary(),
             head: consensus.sequencer().current_sequence(),
             commit_min: consensus.commit_min(),
+            commit_max: consensus.commit_max(),
             untrusted_log: consensus.has_untrusted_log(),
         })
     }

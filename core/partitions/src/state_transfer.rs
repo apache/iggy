@@ -2653,15 +2653,17 @@ where
         // it persists ignores the record, see `restore_offset_frontier`. A
         // replica that itself waits for a transfer skipped its WAL replay and
         // can read as empty while its WAL holds prepares, so it never serves.
-        let empty_group_of_two = self.consensus().replica_count() == 2
-            && !self.materialization_missing
-            && self.held_offset_frontier() == 0
-            && ConsumerKind::ALL
-                .into_iter()
-                .all(|kind| self.durable_consumer_offsets.count(kind) == 0);
+        let empty_group_of_two = || {
+            self.consensus().replica_count() == 2
+                && !self.materialization_missing
+                && self.held_offset_frontier() == 0
+                && ConsumerKind::ALL
+                    .into_iter()
+                    .all(|kind| self.durable_consumer_offsets.count(kind) == 0)
+        };
         if self.consensus().commit_max() == 0
             && self.installed_frontier.is_none()
-            && !empty_group_of_two
+            && !empty_group_of_two()
         {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
@@ -4142,7 +4144,12 @@ where
                 }
                 InstallFilePhase::CommitOffsets { start, end } => {
                     for write in &install.planned_offsets[start..end] {
-                        self.publish_transferred_offset(write);
+                        self.publish_persisted_offset(
+                            write.kind,
+                            write.id,
+                            write.value,
+                            write.path.clone(),
+                        );
                         install.offset_dirs_changed[write.kind.index()] = true;
                     }
                     InstallPhase::CommitOffsets(end)
@@ -4347,28 +4354,31 @@ where
         }
     }
 
-    pub(crate) fn publish_transferred_offset(&self, write: &PlannedOffsetWrite) {
-        let entry = ConsumerOffset::new(write.kind, write.id, write.value, write.path.clone());
-        match write.kind {
+    /// Publish an offset whose file at `path` already holds `value`. An install
+    /// and the boot clamp both end a file write with it.
+    pub(crate) fn publish_persisted_offset(
+        &self,
+        kind: ConsumerKind,
+        id: u32,
+        value: u64,
+        path: String,
+    ) {
+        let entry = ConsumerOffset::new(kind, id, value, path);
+        match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().insert(write.id as usize, entry);
+                self.consumer_offsets.pin().insert(id as usize, entry);
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
                     .pin()
-                    .insert(ConsumerGroupId(write.id as usize), entry);
+                    .insert(ConsumerGroupId(id as usize), entry);
             }
             // Recorded below: the durable table is the only store of an external offset.
             ConsumerKind::ExternalGroup => {}
         }
-        self.durable_consumer_offsets.record_explicit(
-            write.kind,
-            write.id,
-            write.value,
-            write.value,
-        );
-        self.consumer_offset_capacity_for(write.kind)
-            .clear_stranded(write.id);
+        self.durable_consumer_offsets
+            .record_explicit(kind, id, value, value);
+        self.consumer_offset_capacity_for(kind).clear_stranded(id);
     }
 
     fn publish_installed_state(&mut self, install: &mut PendingInstall) {

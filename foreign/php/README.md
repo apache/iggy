@@ -447,7 +447,9 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   once. Its `lost` holds the first and last offset of those messages as `[first, last]`.
   This error stops nothing and needs no seek. A seek after it drops the batch that
   follows the range. If the reader stopped the partition, the error that stopped it
-  comes after that batch.
+  comes after that batch. Earlier versions gave this error a `skip` after the range.
+  Code that handles `FetchProgressUncertain` with `abandonOperation()` and a `seek()`
+  must now check `lost` first and do neither for this error.
 - Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered

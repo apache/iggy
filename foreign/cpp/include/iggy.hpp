@@ -6052,7 +6052,10 @@ class ReadException final : public IggyException {
     /**
      * @return True when the reader stopped the partition after six refusals
      *         in a row that a retry does not change, such as `unauthorized`.
-     *         Only a Seek() of the partition reads it again.
+     *         Only a Seek() of the partition reads it again. While a lost
+     *         read is still pending, such a stop arrives as
+     *         `fetch_progress_uncertain` (14010) with an empty Lost(), and
+     *         this flag is then false.
      */
     [[nodiscard]] bool IsLastingRefusal() const noexcept { return lasting_refusal_; }
 
@@ -6072,6 +6075,8 @@ class ReadException final : public IggyException {
 
     friend class PartitionReader;
     friend class IggyConsumer;
+    // The unit tests have no server to fail a read, so they build one through this class.
+    friend class ReadExceptionTestPeer;
 
     std::optional<std::uint32_t> partition_id_;
     // Shared, so that copying the exception cannot throw.

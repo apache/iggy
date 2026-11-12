@@ -702,7 +702,9 @@ reader raises `FetchProgressUncertain` (14010) once. Its `lost` holds the first
 and last offset of those messages as `(first, last)`. This error stops nothing
 and needs no seek. A seek after it drops the batch that follows the range. If
 the reader stopped the partition, the error that stopped it comes after that
-batch.
+batch. Earlier versions gave this error a `skip` after the range. Code that
+handles `FetchProgressUncertain` with an abandon and a `seek()` must now check
+`lost` first and do neither for this error.
 
 ## Interpreter Exit
 

@@ -30,7 +30,7 @@ use crate::offset_storage::{
     persist_offset_with_storage,
 };
 use crate::segment_recovery::{PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment};
-use crate::state_transfer::{OFFSET_PERSIST_CONCURRENCY, PlannedOffsetWrite};
+use crate::state_transfer::OFFSET_PERSIST_CONCURRENCY;
 use crate::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig, Segment};
 use compio::fs::create_dir_all;
 use compio::io::AsyncWriteAtExt;
@@ -44,7 +44,7 @@ use server_common::sharding::IggyNamespace;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Create the on-disk directory hierarchy for a partition.
 ///
@@ -474,6 +474,21 @@ async fn clamp_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
             .cloned()
             .collect()
     };
+    if !past_space.is_empty() {
+        // A crash can persist an offset ahead of the data that survives it (offsets
+        // are stored eagerly, messages flush later). Left there, its consumer skips
+        // the messages that take those offsets next. One line for the partition:
+        // every consumer can stand past a lost tail.
+        warn!(
+            stream_id = namespace.stream_id(),
+            topic_id = namespace.topic_id(),
+            partition_id = namespace.partition_id(),
+            offsets = past_space.len(),
+            ?last_offset,
+            "recovered offsets ahead of partition data; clamping each to the last offset, or \
+             removing it when the partition holds none"
+        );
+    }
     let clamp_error =
         |kind: ConsumerKind, path: &str, source| PartitionRecoveryError::ConsumerOffsetClamp {
             consumer_kind: kind.as_str(),
@@ -483,7 +498,7 @@ async fn clamp_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
             path: path.to_owned(),
             source: Box::new(source),
         };
-    let mut changed_dirs = [false; ConsumerKind::COUNT];
+    let mut changed_files: [Option<&str>; ConsumerKind::COUNT] = [None; ConsumerKind::COUNT];
     // Each clamp persists its own file. In series, a partition whose consumers
     // all stood at the lost tail delays boot by one file sync per consumer.
     for batch in past_space.chunks(OFFSET_PERSIST_CONCURRENCY) {
@@ -494,16 +509,21 @@ async fn clamp_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
         });
         for (offset, clamped) in futures::future::join_all(clamps).await {
             clamped.map_err(|source| clamp_error(offset.kind, &offset.path, source))?;
-            changed_dirs[offset.kind.index()] = true;
+            changed_files[offset.kind.index()] = Some(&offset.path);
         }
     }
-    for (kind, changed) in ConsumerKind::ALL.into_iter().zip(changed_dirs) {
-        if changed && let Some(directory) = partition.consumer_offsets_dir(kind) {
-            storage
-                .sync_directory(Path::new(directory))
-                .await
-                .map_err(|_| clamp_error(kind, directory, IggyError::CannotSyncFile))?;
-        }
+    for (kind, changed_file) in ConsumerKind::ALL.into_iter().zip(changed_files) {
+        let Some(changed_file) = changed_file else {
+            continue;
+        };
+        // A changed file is durable only once its directory is synced.
+        let directory = partition
+            .consumer_offsets_dir(kind)
+            .ok_or_else(|| clamp_error(kind, changed_file, IggyError::CannotSyncFile))?;
+        storage
+            .sync_directory(Path::new(directory))
+            .await
+            .map_err(|_| clamp_error(kind, directory, IggyError::CannotSyncFile))?;
     }
     Ok(())
 }
@@ -517,10 +537,7 @@ async fn clamp_recovered_offset<S: DurableStorage, B: MessageBus>(
     offset: &ConsumerOffset,
     last_offset: Option<u64>,
 ) -> Result<(), IggyError> {
-    // A crash can persist an offset ahead of the data that survives it (offsets
-    // are stored eagerly, messages flush later). Left there, its consumer skips
-    // the messages that take those offsets next.
-    warn!(
+    debug!(
         stream_id = namespace.stream_id(),
         topic_id = namespace.topic_id(),
         partition_id = namespace.partition_id(),
@@ -528,8 +545,7 @@ async fn clamp_recovered_offset<S: DurableStorage, B: MessageBus>(
         consumer_id = offset.consumer_id,
         recovered_offset = offset.offset.load(Ordering::Relaxed),
         ?last_offset,
-        "recovered offset ahead of partition data; clamping to the last offset, or removing \
-         it when the partition holds none"
+        "clamping a recovered offset ahead of partition data"
     );
     // A descriptor cached by a replayed store would keep writing the replaced inode.
     partition.retire_consumer_offset_file(&offset.path);
@@ -539,12 +555,12 @@ async fn clamp_recovered_offset<S: DurableStorage, B: MessageBus>(
         return Ok(());
     };
     persist_offset_with_storage(storage, &offset.path, last_offset, true).await?;
-    partition.publish_transferred_offset(&PlannedOffsetWrite {
-        kind: offset.kind,
-        id: offset.consumer_id,
-        path: offset.path.clone(),
-        value: last_offset,
-    });
+    partition.publish_persisted_offset(
+        offset.kind,
+        offset.consumer_id,
+        last_offset,
+        offset.path.clone(),
+    );
     Ok(())
 }
 

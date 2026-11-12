@@ -109,8 +109,9 @@ pub enum MergeOutcome {
         undecided_op: u64,
     },
     /// Every replica reported and an op is still neither provably dead nor
-    /// recoverable. No further message changes that: data loss already happened,
-    /// and truncating here would turn it from detected into silent. Not returned
+    /// recoverable. Data loss already happened, and truncating here would turn it
+    /// from detected into silent. Only a real vote that replaces an empty one
+    /// (see [`dvc_record`]) gives a later merge more to decide on. Not returned
     /// for an op that [`MergeQuorums::unservable_discards`] discards.
     Deadlocked {
         /// The op that cannot be decided.
@@ -1600,16 +1601,18 @@ mod tests {
         }
     }
 
+    /// Keeps a rejected discard rule out of the merge: "a sender whose `log_view`
+    /// is below the header's `view` never acknowledged the op". A resend stamps
+    /// the frame with the view of its sender, so a stored header carries the view
+    /// of the transmission that delivered it, not the view that created the
+    /// prepare. The rule would discard the committed op below.
     #[test]
     fn given_an_inherited_prepare_restamped_by_a_later_view_when_its_first_ackers_lost_it_should_keep_the_op()
      {
         // Replica 0 prepared op 3 in view 0, replicas 1 and 2 acknowledged it, and
-        // it committed. View 3 inherited the op, and a resend stamps the frame
-        // with the sender's view: a stored header carries the view of the
-        // transmission that delivered it, not the view that created the prepare.
-        // Replica 4 keeps that copy. Replicas 0, 1 and 2 never entered view 3 and
-        // restarted without the op, so a `log_view` below the header's `view` is
-        // no proof that a sender never acknowledged the op.
+        // it committed. View 3 inherited the op and resent it, and replica 4 keeps
+        // that copy. Replicas 0, 1 and 2 never entered view 3 and restarted
+        // without the op.
         let committed = suffix_headers(2, 2, 0);
         let restamped = PrepareHeader {
             view: 3,

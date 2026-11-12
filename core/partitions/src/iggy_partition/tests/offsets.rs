@@ -544,6 +544,36 @@ async fn given_offset_file_that_cannot_be_rewritten_when_recovered_past_the_end_
     assert_eq!(persisted_offset(&consumer_file), Some(1_000));
 }
 
+/// The clamp promises that each changed file and its directory are durable on return, so it
+/// fails for a changed file whose kind has no directory to sync.
+#[compio::test]
+async fn given_a_clamped_offset_of_a_kind_without_a_directory_when_clamping_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let consumer_file = dir.path().join("7").to_string_lossy().into_owned();
+    persist_offset(&consumer_file, 1_000, true).await.unwrap();
+    let (partition, _) = recording_partition();
+    partition.consumer_offsets.pin().insert(
+        7,
+        ConsumerOffset::new(ConsumerKind::Consumer, 7, 1_000, consumer_file.clone()),
+    );
+
+    let Err(error) =
+        crate::partition_storage::clamp_consumer_offsets(&partition, IggyNamespace::new(1, 1, 0))
+            .await
+    else {
+        panic!("a clamp that cannot sync the directory of a changed file must fail");
+    };
+
+    assert!(
+        matches!(
+            &error,
+            crate::PartitionRecoveryError::ConsumerOffsetClamp { path, .. }
+                if *path == consumer_file
+        ),
+        "{error:?}"
+    );
+}
+
 /// Recover the offsets under `config` into a new partition whose committed messages end at
 /// `last_offset`, or which holds nothing.
 async fn recover_offsets_at(

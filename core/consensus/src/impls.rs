@@ -5292,6 +5292,27 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        // A commit number can reach a backup before its prepare does, and a vote
+        // reports a commit only up to the head of its sender (`dvc_commit`). When
+        // the replicas that held the op lost it, the merge ends below a commit
+        // that this replica knows. No replica can supply the ops between, so as
+        // primary it would never apply up to `commit_max`, and a primary takes
+        // no request before that. Its heartbeats would keep the backups in the
+        // view. Refuse instead: the status timeout votes to leave the view, and
+        // a replica that does not know the op can lead the next one.
+        // `handle_start_view` applies the same rule to a backup.
+        if merged.op_head < self.commit_max() {
+            tracing::error!(
+                replica = self.replica,
+                view = self.view.get(),
+                op_head = merged.op_head,
+                commit_max = self.commit_max(),
+                "view change cannot start: the merged log ends below an op that this replica \
+                 knows as committed; refusing the view"
+            );
+            return Vec::new();
+        }
+
         // Quorum closed now the merge decided: re-merging after parking could
         // produce a different log than the one already being repaired toward.
         self.do_view_change_quorum.set(true);
@@ -11617,6 +11638,73 @@ mod adopted_view_claim_tests {
         );
         assert!(elect.is_primary_elect());
         assert!(elect.view_log_unproven());
+
+        // Known gap: the start takes the merged head as it is and compares
+        // nothing with the commit point, so the view opens below the checkpoint.
+        let actions = elect.start_pending_view(plane);
+        assert!(
+            matches!(
+                actions.first(),
+                Some(VsrAction::SendStartView { op: HEAD, .. })
+            ),
+            "view {MERGED_VIEW} must start from the parked log: {actions:?}"
+        );
+        assert_eq!(elect.sequencer().current_sequence(), HEAD);
+        assert_eq!(elect.commit_min(), PASSED);
+    }
+
+    /// A commit number can reach a backup before its prepare does, and a vote
+    /// reports a commit only up to the head of its sender. When the replicas
+    /// that held the op lost it, the merge ends below a commit that this replica
+    /// knows. As primary it could never apply up to that `commit_max`, and a
+    /// primary takes no request before it does.
+    #[test]
+    fn given_a_known_commit_above_the_merged_head_when_the_merge_decides_should_not_lead_the_view()
+    {
+        const LOST: u64 = HEAD;
+        let history = history_in(PARTITION_GROUP);
+        let plane = plane_of(PARTITION_GROUP);
+        let candidate = backup_in(PARTITION_GROUP, OLD_VIEW, OLD_VIEW, LOST - 1, LOST - 1);
+        candidate.set_local_dvc_suffix(held(&history, LOST - 2, LOST - 1));
+        // A heartbeat of the old primary that overtook the prepare.
+        candidate.advance_commit_max(LOST);
+        candidate.enter_view_change(
+            plane,
+            MERGED_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        let restarted_without_the_op = StoredDvc {
+            replica: OLD_PRIMARY,
+            log_view: OLD_VIEW,
+            op: LOST - 1,
+            commit: LOST - 2,
+            suffix: held(&history, LOST - 2, LOST - 1),
+            untrusted_log: false,
+        };
+        let vote = dvc_of(&candidate);
+        assert_eq!(
+            (vote.op, vote.commit),
+            (LOST - 1, LOST - 1),
+            "the vote cannot name the commit of op {LOST}"
+        );
+        for dvc in [vote, restarted_without_the_op] {
+            assert!(dvc_record(
+                &mut candidate.do_view_change_from_all_replicas.borrow_mut(),
+                dvc
+            ));
+        }
+
+        assert!(candidate.complete_view_change_as_primary(plane).is_empty());
+
+        assert!(
+            !candidate.view_log_is_pending(),
+            "the replica parked a log that ends at op {}, below op {LOST} that it knows as \
+             committed",
+            LOST - 1
+        );
+        assert!(!candidate.is_primary_elect());
+        assert_eq!(candidate.status(), Status::ViewChange);
+        assert_eq!(candidate.commit_max(), LOST);
     }
 
     #[test]

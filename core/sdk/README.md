@@ -535,7 +535,9 @@ catch-up. The reader then returns one `FetchProgressUncertain` error for that pa
 first and last offset of those messages in `lost`. This error stops nothing and has no `skip`, so
 it needs no `seek`. The batch that the reader holds after the range comes next, and a `seek` before
 the application takes that batch drops it. If the reader stopped the partition, the error that
-stopped it comes after that batch.
+stopped it comes after that batch. Earlier versions gave this error a `skip` after the range. Code
+that handles `FetchProgressUncertain` with an abandon and a `seek` must now check `lost` first and
+do neither for this error.
 `close()` and `shutdown()` cancel each `OnRead` read in flight on TCP, QUIC and
 WebSocket and take its one reply, which tells what the server stored, so a read that waits on the
 server ends at once. Over HTTP, which has no cancel, they wait until the deadline of the read. Then
