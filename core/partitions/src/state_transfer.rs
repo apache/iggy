@@ -2788,7 +2788,7 @@ where
         // awaits, and the yields inside `hash_segment_range` move the reactor,
         // not this shard's consensus ticks. A cold pass over multi-GiB
         // retention therefore silences every group on this core for its whole
-        // duration, past `heartbeat_timeout`, on the node that by construction
+        // duration, past `commit_busy_heartbeat_timeout`, on the node that by construction
         // is the primary of those groups.
         //
         // Bounded per round instead. The memo carries partial progress, so a
@@ -5130,7 +5130,7 @@ pub(crate) const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 ///
 /// A BYTE budget standing in for a time bound, so the margin is storage-class
 /// specific: 256 MiB is roughly a quarter second on commodity `NVMe` against
-/// the shipped 5 s `heartbeat_timeout`, but about 2 s on a throttled cloud
+/// the shipped 5 s `commit_busy_heartbeat_timeout`, but about 2 s on a throttled cloud
 /// volume at 125 MB/s baseline, which is most of that window. Sized for the
 /// slower case still leaving room, and large enough that ordinary retention
 /// finishes in one round. An elapsed-time clamp would bound it properly on

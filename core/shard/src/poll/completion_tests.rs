@@ -35,9 +35,9 @@ use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{
-    AckLevel, CommitHeader, RepairRangeReplyHeader, ReplyHeader, RequestPreparesHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
-    StartViewChangeHeader, StateTransferTargetHeader, WireConsumer,
+    AckLevel, CommitEntry, CommitHeader, HeartbeatState, RepairRangeReplyHeader, ReplyHeader,
+    RequestPreparesHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, StartViewChangeHeader, StateTransferTargetHeader, WireConsumer,
 };
 use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier, WireName,
@@ -70,6 +70,7 @@ use super::test_support::{
     PollTestMetadata, delete_history, install_group_owner, partition_with_messages,
     partition_with_messages_at_revision, partitions_config,
 };
+use crate::commit_batch::encode_commit_batch;
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
@@ -2248,18 +2249,26 @@ fn primary_commit(
     view: u32,
     commit: u64,
 ) -> Message<CommitHeader> {
-    Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-        |_, header: &mut CommitHeader| {
-            header.command = Command::Commit;
-            header.cluster = 1;
-            header.replica = replica;
-            header.view = view;
-            header.commit = commit;
-            header.group = namespace.inner();
-            header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-            header.seal();
-        },
-    )
+    primary_commit_at(namespace, 0, replica, view, commit)
+}
+
+fn primary_commit_at(
+    namespace: IggyNamespace,
+    incarnation: u64,
+    replica: u8,
+    view: u32,
+    commit: u64,
+) -> Message<CommitHeader> {
+    let entry = CommitEntry::new(
+        namespace.inner(),
+        incarnation,
+        view,
+        commit,
+        0,
+        HeartbeatState::Busy,
+        replica,
+    );
+    encode_commit_batch(1, replica, &[entry]).unwrap()
 }
 
 /// Restart the lagging replica's transfer against `peer` after a re-arm.
@@ -2869,12 +2878,12 @@ async fn given_a_heartbeat_of_another_incarnation_when_it_names_a_newer_primary_
         )
     };
     assert_ne!(own_view_primary, heard_primary);
-    let stale = primary_commit(namespace, heard_primary, HEARD_VIEW, 5).transmute_header(
-        |heartbeat, header: &mut CommitHeader| {
-            *header = heartbeat;
-            header.partition_incarnation = hosted_incarnation + 1;
-            header.seal();
-        },
+    let stale = primary_commit_at(
+        namespace,
+        hosted_incarnation + 1,
+        heard_primary,
+        HEARD_VIEW,
+        5,
     );
 
     owner.on_commit(&stale).await;

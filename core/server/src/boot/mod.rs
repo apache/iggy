@@ -59,7 +59,9 @@ use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topolo
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::server_error::ServerError;
-use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
+use crate::shell::{
+    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
+};
 use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
@@ -397,7 +399,7 @@ pub fn bootstrap(
     if config.cluster.enabled && config.cluster.nodes.len() > 1 {
         metadata_applied_frontier = metadata_applied_frontier.with_partition_freshness(
             std::time::Instant::now(),
-            config.cluster.heartbeat_timeout.get_duration(),
+            config.cluster.commit_busy_heartbeat_timeout.get_duration(),
         );
     }
     let metadata_applied_frontier = Arc::new(metadata_applied_frontier);
@@ -575,6 +577,7 @@ async fn shard_main(
         replica_count: topology.replica_count,
         auth: load_replica_auth(config).map(Rc::new),
         tls: load_replica_tls_ctx(config, &topology)?.map(Rc::new),
+        heartbeat: heartbeat_timings(config),
     });
 
     let drain_timeout = config.sharding.shutdown_drain_timeout.get_duration();

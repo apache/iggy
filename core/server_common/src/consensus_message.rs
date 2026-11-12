@@ -792,14 +792,10 @@ impl MessageBag {
                 let header = message.header();
                 (header.operation(), header.group)
             }
-            Self::Commit(message) => {
-                let header = message.header();
-                (header.operation(), header.group)
-            }
-            Self::CommitReply(message) => {
-                let header = message.header();
-                (header.operation(), header.group)
-            }
+            // A batch names one group per entry. The router splits it by
+            // entry before it routes, so this frame-level answer is unused.
+            Self::Commit(message) => (message.header().operation(), METADATA_GROUP),
+            Self::CommitReply(message) => (message.header().operation(), METADATA_GROUP),
             Self::PrepareProgress(message) => {
                 let header = message.header();
                 (header.operation(), header.group)
@@ -858,8 +854,6 @@ impl MessageBag {
             Self::StartViewChange(message) => message.as_generic(),
             Self::DoViewChange(message) => message.as_generic(),
             Self::StartView(message) => message.as_generic(),
-            Self::Commit(message) => message.as_generic(),
-            Self::CommitReply(message) => message.as_generic(),
             Self::PrepareProgress(message) => message.as_generic(),
             Self::RequestStartView(message) => message.as_generic(),
             Self::RequestPrepares(message) => message.as_generic(),
@@ -868,7 +862,10 @@ impl MessageBag {
             Self::StateTransferTarget(message) => message.as_generic(),
             Self::RequestStateChunk(message) => message.as_generic(),
             Self::StateChunk(message) => message.as_generic(),
-            Self::Request(_)
+            // A batch holds entries of many groups. The shard checks each entry.
+            Self::Commit(_)
+            | Self::CommitReply(_)
+            | Self::Request(_)
             | Self::RepairPrepare(_)
             | Self::ForwardRegister(_)
             | Self::ForwardRegisterResult(_)
@@ -1177,7 +1174,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sharding::IggyNamespace;
     use iggy_binary_protocol::{
         ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader, HEADER_SIZE,
         Operation, PrimaryRebalanceKind, ReplyHeader, RequestHeader, frame_checksum_bytes,
@@ -1505,24 +1501,6 @@ mod tests {
         assert_ne!(bag.routing().1, METADATA_GROUP);
     }
 
-    #[test]
-    fn given_heartbeat_replies_when_classifying_links_should_preserve_their_group() {
-        for group in [METADATA_GROUP, IggyNamespace::new(1, 1, 0).inner()] {
-            let reply = Message::<CommitReplyHeader>::new(HEADER_SIZE).transmute_header(
-                |_, header: &mut CommitReplyHeader| {
-                    header.command = Command::CommitReply;
-                    header.size = u32::try_from(HEADER_SIZE).unwrap();
-                    header.group = group;
-                    header.timestamp_monotonic = 1;
-                    header.seal();
-                },
-            );
-            let bag = MessageBag::try_from(reply.into_generic()).unwrap();
-            assert!(!MessageBag::routes_to_metadata(bag.command()));
-            assert_eq!(bag.routing().1, group);
-        }
-    }
-
     fn primary_rebalance_frame(kind: PrimaryRebalanceKind) -> Message<PrimaryRebalanceHeader> {
         Message::<PrimaryRebalanceHeader>::new(HEADER_SIZE).transmute_header(
             |_, header: &mut PrimaryRebalanceHeader| {
@@ -1808,8 +1786,6 @@ mod tests {
             Command::StartViewChange,
             Command::DoViewChange,
             Command::StartView,
-            Command::Commit,
-            Command::CommitReply,
         ] {
             let bag = dispatch(cmd, 256).expect("dispatch");
             assert_eq!(bag.command(), cmd, "round-trip for {cmd:?}");
@@ -1818,22 +1794,25 @@ mod tests {
     }
 
     // MessageBag dispatch must enforce per-typed validate()
-    // (Commit size != 256, Register with session != 0, etc.)
+    // (a batch size that does not match its entry count, Register with
+    // session != 0, etc.)
 
     #[test]
-    fn messagebag_dispatch_commit_with_invalid_size_returns_err() {
-        // `CommitHeader::validate` rejects size != 256. Use size 300 (> header
-        // size) with a 512-byte buffer so the frame clears generic parse and the
-        // `size` floor, reaching typed dispatch. A size below the header size is
-        // now rejected earlier by the floor (see
-        // `try_from_owned_size_below_header_size_returns_err`).
-        let owned = header_bytes_sized(Command::Commit, 300, 512);
-        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
-        let result = MessageBag::try_from(generic);
-        assert!(matches!(
-            result,
-            Err(ConsensusError::CommitInvalidSize(300))
-        ));
+    fn given_batch_size_not_matching_entry_count_when_dispatching_should_refuse_frame() {
+        for command in [Command::Commit, Command::CommitReply] {
+            // A header-only frame carries a count of zero, as a revision 1
+            // Commit does at that offset.
+            assert!(matches!(
+                dispatch(command, 256),
+                Err(ConsensusError::InvalidField(_))
+            ));
+            let owned = header_bytes_sized(command, 300, 512);
+            let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+            assert!(matches!(
+                MessageBag::try_from(generic),
+                Err(ConsensusError::InvalidField(_))
+            ));
+        }
     }
 
     #[test]

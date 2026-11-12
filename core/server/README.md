@@ -230,7 +230,7 @@ Requests queued behind the ones a connection runs are capped at 1024 frames and 
 
 On a multi-replica node, client partition requests require recent metadata quorum
 evidence before namespace lookup and authorization. The evidence lasts
-`K = cluster.heartbeat_timeout + 3 seconds` (8 seconds by default); expired or
+`K = cluster.commit_busy_heartbeat_timeout + 3 seconds` (8 seconds by default); expired or
 absent evidence yields 58. A primary credits answered probes while ready. A
 backup credits only a probe from its current metadata primary whose advertised
 commit covers the adopted view's head and is already applied locally. Commit
@@ -252,7 +252,7 @@ Message and size counters in stream, topic and system stats (`get_stream`,
 `get_topic`, `get_stats` and the list forms) are counted per node. A node that
 is not the partition primary learns of a commit from the next prepare or from
 the periodic commit broadcast. It counts the message only then. While the
-cluster is idle, its counters can lag by up to `cluster.commit_broadcast_interval`.
+cluster is idle, its counters can lag by up to `cluster.commit_busy_heartbeat_interval`.
 
 ### Sessions and retry receipts
 

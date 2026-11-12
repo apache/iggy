@@ -52,7 +52,7 @@ const STREAM_NAME: &str = "staggered-bootstrap-stream";
 const TOPIC_NAME: &str = "staggered-bootstrap-topic";
 const PARTITION_ID: u32 = 0;
 
-/// Long enough for replicas 1 and 2 to miss `cluster.heartbeat_timeout` (5s by
+/// Long enough for replicas 1 and 2 to miss `cluster.commit_busy_heartbeat_timeout` (5s by
 /// default) and conclude an election without replica 0.
 const ELECTION_SETTLE: Duration = Duration::from_secs(15);
 /// Long enough for the late replica 0 to probe for the live view and rejoin.

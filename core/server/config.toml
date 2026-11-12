@@ -338,7 +338,7 @@ enabled = true
 # The consumer groups of an ended session rebalance, and its client must log
 # in again. Each new primary grants a fresh timeout. Incomplete client lists
 # defer expiry across the cluster until a full timeout has passed without an
-# incomplete report. 1.2 x interval must exceed cluster.heartbeat_timeout when
+# incomplete report. 1.2 x interval must exceed cluster.commit_busy_heartbeat_timeout when
 # clustering is enabled, and three consumer_group.heartbeat_interval periods
 # plus two gather (3s) and send (100ms) deadlines, allowing one missed report.
 # So interval must exceed (3 x consumer_group.heartbeat_interval + 6.2s) / 1.2:
@@ -497,24 +497,41 @@ name = "iggy-cluster"
 # whole ticks: values are rounded down to a multiple of 10ms, and anything under
 # 10ms is raised to a single tick rather than firing sooner.
 
-# Liveness window for a consensus primary and its replication quorum (duration).
-# Backups vote after primary silence. A primary without heartbeat replies from
-# a quorum relinquishes leadership. Heartbeat replies require a coordinated
-# node upgrade; mixed versions cannot sustain a primary's quorum checks.
-# Raise it on oversubscribed hosts where scheduling stalls fake primary
-# death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
-# primary signals liveness through its commit broadcast, and the window must
-# span several broadcasts so one delayed broadcast never trips an election.
-# On Linux it is also the TCP_USER_TIMEOUT of every replica link: sent data
-# or keepalive probes that stay unacknowledged this long close the link.
-heartbeat_timeout = "5s"
+# The primary of each consensus group sends Commit heartbeats to its backups,
+# batched per peer node. All nodes of a cluster must use the same five values
+# below, or the replica handshake rejects the link. The node does not boot
+# unless these rules hold:
+#   commit_heartbeat_grid is a whole multiple of the 10ms shard tick.
+#   commit_busy_heartbeat_interval is a whole multiple of commit_heartbeat_grid.
+#   commit_busy_heartbeat_timeout >= max(2s, 4x commit_busy_heartbeat_interval).
+#   commit_idle_heartbeat_interval is a whole multiple of
+#   commit_busy_heartbeat_interval.
+#   max(commit_idle_heartbeat_timeout, commit_busy_heartbeat_timeout) >= 4x
+#   commit_idle_heartbeat_interval.
+#   commit_busy_heartbeat_timeout >= 4x commit_idle_heartbeat_interval.
 
-# How often the primary broadcasts its commit point to every backup (duration).
-# This is the cluster's liveness signal: each broadcast resets every backup's
-# heartbeat_timeout window and carries the latest commit point forward. Must be
-# nonzero and, with heartbeat_timeout, satisfy heartbeat_timeout >= 4x this
-# value. Drives the consensus CommitMessage timer.
-commit_broadcast_interval = "500ms"
+# Interval between grid ticks (duration). Heartbeats join a batch only on grid
+# ticks.
+commit_heartbeat_grid = "100ms"
+
+# Interval between the heartbeats of a busy group (duration). A group is busy
+# while its commit point moves.
+commit_busy_heartbeat_interval = "500ms"
+
+# How long the backups of a busy group wait for a heartbeat before they vote
+# for a new primary (duration). It is also the quiet time before a group turns
+# idle, and the quorum window of a busy primary: a primary without heartbeat
+# replies from a quorum in this window steps down. On Linux it is also the
+# TCP_USER_TIMEOUT of every replica link.
+commit_busy_heartbeat_timeout = "5s"
+
+# Interval between the heartbeats of an idle group (duration). The metadata
+# group never turns idle.
+commit_idle_heartbeat_interval = "1s"
+
+# How long the backups of an idle group wait for a heartbeat (duration). They
+# wait the larger of this value and commit_busy_heartbeat_timeout.
+commit_idle_heartbeat_timeout = "12s"
 
 # How often the primary retransmits prepares that backups have not yet acked
 # (duration). Lower values recover faster from a dropped prepare at the cost of
