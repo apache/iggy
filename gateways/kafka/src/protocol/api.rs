@@ -26,11 +26,13 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{OwnedMutexGuard, Semaphore};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::cluster_id::ClusterId;
+use crate::coordinator::{Coordination, Placement};
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember, MAX_CLIENT_ID_BYTES};
 use crate::protocol::acl::{
@@ -129,6 +131,10 @@ impl Default for BrokerAdvertise {
 /// The node id of a gateway that `IGGY_KAFKA_NODE_ID` does not set.
 pub const DEFAULT_NODE_ID: u16 = 1;
 
+/// The first stand-in node id in a replica list: 65536, one past the largest node id a gateway can
+/// take, since `IGGY_KAFKA_NODE_ID` is a `u16`.
+pub const FIRST_STAND_IN_REPLICA: i32 = 1 << 16;
+
 /// The gateways that one listener lists in Metadata. A gateway alone lists itself, as node 1.
 #[derive(Debug, Clone)]
 pub struct Brokers {
@@ -161,6 +167,28 @@ impl Brokers {
         listed
     }
 
+    /// `count` node ids for the replicas of a partition, and never fewer than one: this gateway
+    /// first, then the next gateways in node id order, wrapping round. A factor above the number
+    /// of gateways is filled with stand-in ids from [`FIRST_STAND_IN_REPLICA`], which no gateway
+    /// can take. A client reads a stand-in as a replica on a broker that is not up, and reads the
+    /// factor from the length of the list.
+    #[must_use]
+    pub fn replicas(&self, count: u32) -> Vec<i32> {
+        let wanted = usize::try_from(count).unwrap_or(usize::MAX).max(1);
+        let mut ids: Vec<i32> = self.peers.iter().map(|(node, _)| *node).collect();
+        ids.push(self.node_id);
+        ids.sort_unstable();
+        let own = ids
+            .iter()
+            .position(|node| *node == self.node_id)
+            .unwrap_or(0);
+        ids.rotate_left(own);
+        ids.truncate(wanted);
+        let stand_ins = (FIRST_STAND_IN_REPLICA..).take(wanted.saturating_sub(ids.len()));
+        ids.extend(stand_ins);
+        ids
+    }
+
     /// The gateway that coordinates every consumer group: the lowest node id. Every gateway names
     /// the same one, so the members of a group never split over two coordinators.
     #[must_use]
@@ -177,6 +205,49 @@ impl Brokers {
         self.peers
             .first()
             .is_none_or(|(node, _)| *node > self.node_id)
+    }
+
+    /// The gateways that `placement` counts as live, in node id order, with `own` as the
+    /// endpoint of this one.
+    #[must_use]
+    pub fn live<'a>(
+        &'a self,
+        own: &'a BrokerAdvertise,
+        placement: &Placement,
+    ) -> Vec<(i32, &'a BrokerAdvertise)> {
+        self.listed(own)
+            .into_iter()
+            .filter(|(node, _)| u16::try_from(*node).is_ok_and(|node| placement.is_live(node)))
+            .collect()
+    }
+
+    /// `node_id` when this listener lists it, else this gateway, so an answer never names a
+    /// broker it does not list.
+    #[must_use]
+    pub fn listed_or_own(&self, node_id: u16) -> i32 {
+        let node_id = i32::from(node_id);
+        if self.peers.iter().any(|(node, _)| *node == node_id) {
+            node_id
+        } else {
+            self.node_id
+        }
+    }
+
+    /// The endpoint this listener lists for `node_id`, with `own` as this gateway's.
+    #[must_use]
+    pub fn endpoint<'a>(
+        &'a self,
+        own: &'a BrokerAdvertise,
+        node_id: u16,
+    ) -> Option<&'a BrokerAdvertise> {
+        let node_id = i32::from(node_id);
+        if node_id == self.node_id {
+            return Some(own);
+        }
+        self.peers
+            .iter()
+            .find(|(node, _)| *node == node_id)
+            .map(|(_, endpoint)| endpoint)
     }
 }
 
@@ -247,13 +318,19 @@ pub struct GatewayState {
     /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
     /// proof that no record matches. Only the first of a spell warns.
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, what the Iggy polls of Fetch and `ListOffsets` showed: how
+    /// long the next poll may take, and whether the partition stalled. Shared, so the consumers
+    /// of a partition whose node stopped do not each spend a read slot waiting for it. In an
+    /// `Arc`, since a re-check reports after its request ended.
+    pub(crate) poll_records: Arc<Mutex<fetch::PollRecords>>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
     /// Held by `CreatePartitions` from reading a topic's partition count until its write is
     /// settled, and by `CreateTopics` and `DeleteTopics` around their writes. Iggy adds a number
     /// of partitions, Kafka asks for a count to reach, and two requests that read the same count
-    /// would otherwise both add and overshoot it. Per process: other gateways and direct Iggy
-    /// clients are not behind it.
+    /// would otherwise both add and overshoot it. Per process: direct Iggy clients are not
+    /// behind it, and other gateways only while no controller is known, since with the
+    /// coordinator log only the controller serves these requests.
     pub(crate) partition_growth: Arc<tokio::sync::Mutex<()>>,
     /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
     /// the one stored in Iggy.
@@ -263,6 +340,9 @@ pub struct GatewayState {
     pub node_id: i32,
     /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
     pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
+    /// Present while the gateways share the groups through the coordinator log. It names the
+    /// coordinator of each group, the leader of each partition and the controller.
+    pub coordination: Option<Arc<Coordination>>,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -276,6 +356,16 @@ const PRODUCE_LARGE: usize = 4;
 const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
 
 impl GatewayState {
+    /// Whether this gateway gave out `producer_id` lately, so Produce may key an Iggy session on
+    /// it. With a bridge the ids come from Iggy. Without one, from the local allocator.
+    #[must_use]
+    pub(crate) fn issued_producer_id(&self, producer_id: i64) -> bool {
+        self.bridge.as_ref().map_or_else(
+            || self.producer_ids.issued(producer_id),
+            |bridge| bridge.issued_producer_id(producer_id),
+        )
+    }
+
     #[must_use]
     pub fn new(
         bridge: Option<Arc<IggyBridge>>,
@@ -296,12 +386,46 @@ impl GatewayState {
             groups,
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
+            poll_records: Arc::default(),
             probe_board: ProbeBoard::default(),
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
             node_id: i32::from(DEFAULT_NODE_ID),
             auto_topic_creation: None,
+            coordination: None,
         }
+    }
+
+    /// Who leads each partition now. This gateway leads everything without the coordinator log.
+    #[must_use]
+    pub fn placement(&self) -> Placement {
+        self.coordination.as_ref().map_or_else(
+            || Placement::alone(u16::try_from(self.node_id).unwrap_or(DEFAULT_NODE_ID)),
+            |coordination| coordination.placement(),
+        )
+    }
+
+    /// Hands this gateway's groups to the other gateways, when it shares them, giving up on Iggy
+    /// at `until`. A shutdown calls it before its drain, so its group requests send their clients
+    /// to the new coordinators.
+    pub async fn hand_over_groups(&self, until: Instant) {
+        if let Some(coordination) = &self.coordination {
+            coordination.shutdown(until).await;
+        }
+    }
+
+    /// Signs the coordinator log's clients out of Iggy, after [`Self::hand_over_groups`].
+    pub async fn close_coordination(&self) {
+        if let Some(coordination) = &self.coordination {
+            coordination.close().await;
+        }
+    }
+
+    /// Shares the groups with the other gateways through `coordination`.
+    #[must_use]
+    pub fn with_coordination(mut self, coordination: Arc<Coordination>) -> Self {
+        self.coordination = Some(coordination);
+        self
     }
 
     /// Turns on Kafka's `auto.create.topics.enable` behaviour for `Metadata` when `config` says
@@ -574,19 +698,15 @@ pub fn supported_max_version(api_key: i16) -> Option<i16> {
 /// open, the answer a real broker gives on a PLAINTEXT listener. Keeping them out of the firewall
 /// table means dispatch never serves them on its own.
 ///
-/// `SaslHandshake` is pinned to v1 on both ends. v0 selects the headerless token framing (KIP-152)
-/// that the frame reader cannot parse, so advertising it would invite exactly the shape this
-/// gateway refuses.
+/// `SaslHandshake` v0 selects a bare token with no request header after it (KIP-152), and v1 a
+/// token in a `SaslAuthenticate` request. The connection loop serves both.
 static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
     ApiVersionRange {
-        // Advertised from v0 even though only v1 is accepted, the same split
-        // [`advertised_min_version`] already applies to Produce. librdkafka gates its whole
-        // SASL-handshake feature on `SaslHandshake` v0 appearing in the advertisement
-        // (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so advertising v1
-        // alone makes it report "SASL Handshake not supported by broker" and give up before it
-        // ever sends one. It then picks v1 anyway, because `SaslAuthenticate` being advertised is
-        // what selects the KIP-152 framing. A client that really only knows v0 still gets
-        // `UNSUPPORTED_VERSION` and a closed connection from the state machine.
+        // librdkafka gates its whole SASL-handshake feature on `SaslHandshake` v0 appearing in the
+        // advertisement (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so
+        // advertising v1 alone makes it report "SASL Handshake not supported by broker" and give
+        // up before it ever sends one. It then picks v1, because `SaslAuthenticate` being
+        // advertised is what selects the KIP-152 framing.
         api_key: API_KEY_SASL_HANDSHAKE,
         min_version: 0,
         max_version: 1,

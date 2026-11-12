@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, SemaphorePermit, broadcast};
 use tokio::task::JoinSet;
-use tokio::time::{timeout, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -39,8 +39,9 @@ use tracing_subscriber::filter::LevelFilter;
 use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
 };
-use crate::bridge::IggyBridge;
+use crate::bridge::{IggyBridge, PermissionBoard, UserAccess};
 use crate::cluster_id::ClusterId;
+use crate::coordinator::{Coordination, CoordinationConfig};
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{BrokerEntry, ListenerConfig, SecurityProtocol, check_brokers, peers_of};
@@ -48,22 +49,28 @@ use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
     Brokers, ConnectionState, DEFAULT_KAFKA_PORT, DEFAULT_NODE_ID, ERROR_ILLEGAL_SASL_STATE,
     ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION,
-    GatewayState, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter,
-    decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key,
-    handle_connection_request, respond_describe_acls_error, sasl_authenticate_outcome,
-    sasl_handshake_outcome,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM, GatewayState, HandleOutcome,
+    SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter, decode_sasl_auth_bytes,
+    decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
+    respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
 };
 use crate::protocol::auto_topic_creation::{self, AutoTopicCreationConfig};
+use crate::protocol::bounds_guard::MAX_SASL_AUTH_BYTES;
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
-    SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState, parse_plain,
+    RAW_TOKEN_ACCEPTED, SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction,
+    SaslState, parse_plain,
 };
 use crate::tls::{IdentityError, TlsConfig, TlsState};
 
 const READ_CHUNK: usize = 65536;
 const GATEWAY_LOG_TARGET: &str = env!("CARGO_CRATE_NAME");
+
+/// How long a start tries again to set up the coordinator log while Iggy is not ready, and the
+/// pause between tries. The same as for the bridge's connect in `main.rs`.
+const COORDINATION_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+const COORDINATION_STARTUP_RETRY: Duration = Duration::from_secs(1);
 
 /// Builds the log filter, forcing the Iggy SDK quiet unless the operator asked otherwise.
 ///
@@ -173,6 +180,14 @@ pub struct GatewayConfig {
     /// Every gateway in front of the Iggy cluster, this one included (`IGGY_KAFKA_BROKERS`).
     /// Empty for a gateway alone.
     pub brokers: Vec<BrokerEntry>,
+    /// Whether the gateways share the consumer groups through the coordinator log in Iggy
+    /// (`IGGY_KAFKA_COORDINATOR_LOG`). Off here by default. `load_config` in `main.rs` makes it
+    /// [`CoordinatorLog::Preferred`] when the bridge is on, `IGGY_KAFKA_BROKERS` lists the
+    /// gateways and the variable is unset.
+    pub coordinator_log: CoordinatorLog,
+    /// How the coordinator log behaves. `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES` sets its offsets
+    /// retention.
+    pub coordination: CoordinationConfig,
 }
 
 impl Default for GatewayConfig {
@@ -196,8 +211,23 @@ impl Default for GatewayConfig {
             auto_topic_creation: AutoTopicCreationConfig::default(),
             node_id: DEFAULT_NODE_ID,
             brokers: Vec::new(),
+            coordinator_log: CoordinatorLog::Off,
+            coordination: CoordinationConfig::default(),
         }
     }
+}
+
+/// Whether the gateways share the consumer groups through the coordinator log. The log needs the
+/// bridge, and a bridge user that may read Iggy's metadata change log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorLog {
+    /// This gateway keeps its groups in memory alone.
+    Off,
+    /// On while the bridge can read the change log. Without it, the gateway runs as with
+    /// [`Self::Off`] and warns, so a bridge user that lacks `manage_servers` keeps working.
+    Preferred,
+    /// On. The gateway does not start when the bridge cannot read the change log.
+    Required,
 }
 
 impl GatewayConfig {
@@ -521,7 +551,7 @@ impl KafkaGateway {
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
         let cluster_id = self.cluster_id().await?;
-        let state = Arc::new(self.shared_state(cluster_id, &cancel)?);
+        let state = Arc::new(self.shared_state(cluster_id, &cancel).await?);
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
             resolver,
@@ -571,9 +601,9 @@ impl KafkaGateway {
             },
         };
         // The accept loops stop first, so no connection is spawned after the drain starts waiting.
-        cancel.cancel();
+        // Aborted, not cancelled: the connections still answer while the drain hands groups over.
         accept_loops.shutdown().await;
-        drain(&tracker, &cancel, drain_timeout).await;
+        drain(&state, &tracker, &cancel, drain_timeout).await;
         // After the drain, so no connection starts one after it, and before `run` returns, so
         // none still runs when the bridge signs out.
         state
@@ -583,13 +613,13 @@ impl KafkaGateway {
     }
 
     /// The state every connection of [`Self::run`] shares. The group coordinator stops with
-    /// `cancel`.
-    fn shared_state(
+    /// `cancel`. With the coordinator log, the groups are shared with the other gateways.
+    async fn shared_state(
         &self,
         cluster_id: ClusterId,
         cancel: &CancellationToken,
     ) -> Result<GatewayState> {
-        GatewayState::new(
+        let mut state = GatewayState::new(
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.instance_id,
@@ -597,7 +627,77 @@ impl KafkaGateway {
         )
         .with_cluster_id(cluster_id)
         .with_node_id(self.config.node_id)
-        .with_auto_topic_creation(self.config.auto_topic_creation)
+        .with_auto_topic_creation(self.config.auto_topic_creation)?;
+        if let Some(coordination) = self.start_coordination(&state.groups).await? {
+            state = state.with_coordination(coordination);
+        }
+        Ok(state)
+    }
+
+    /// Starts coordinating `groups` with the other gateways, when the coordinator log is on. A
+    /// failure that a retry can fix is retried for up to [`COORDINATION_STARTUP_LIMIT`], as
+    /// `main.rs` retries the bridge's connect.
+    async fn start_coordination(
+        &self,
+        groups: &GroupCoordinator,
+    ) -> Result<Option<Arc<Coordination>>> {
+        if self.config.coordinator_log == CoordinatorLog::Off {
+            return Ok(None);
+        }
+        let Some(bridge) = &self.bridge else {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "the coordinator log needs the bridge; set IGGY_KAFKA_BRIDGE_ENABLED=true, or \
+                 set IGGY_KAFKA_COORDINATOR_LOG=false"
+                    .into(),
+            ));
+        };
+        let give_up = Instant::now() + COORDINATION_STARTUP_LIMIT;
+        if self.config.coordinator_log == CoordinatorLog::Preferred
+            && bridge.follows_change_log(give_up).await == Some(false)
+        {
+            if self.config.coordination.offsets_retention.is_some() {
+                return Err(KafkaProtocolError::InvalidConfig(
+                    "IGGY_KAFKA_OFFSETS_RETENTION_MINUTES needs the coordinator log, which needs \
+                     the bridge's Iggy user to read Iggy's metadata change log: grant that user \
+                     (IGGY_KAFKA_IGGY_USERNAME) the manage_servers permission, or leave the \
+                     variable unset"
+                        .into(),
+                ));
+            }
+            warn!(
+                "the bridge's Iggy user cannot read Iggy's metadata change log, so this gateway \
+                 runs without the coordinator log, as with IGGY_KAFKA_COORDINATOR_LOG=false: \
+                 the gateway with the lowest node id coordinates every group. To share the \
+                 groups, grant the bridge's Iggy user (IGGY_KAFKA_IGGY_USERNAME) the \
+                 manage_servers permission and restart every gateway"
+            );
+            return Ok(None);
+        }
+        loop {
+            // Its own token, not the drain's: the shutdown hands the groups over before the drain.
+            let started = Coordination::start(
+                bridge,
+                groups.clone(),
+                self.config.node_id,
+                self.config.coordination,
+                CancellationToken::new(),
+            )
+            .await;
+            match started {
+                Ok(coordination) => return Ok(Some(coordination)),
+                Err(error)
+                    if error.is_retriable()
+                        && Instant::now() + COORDINATION_STARTUP_RETRY < give_up =>
+                {
+                    warn!(
+                        "cannot set up the coordinator log yet, retrying in \
+                         {COORDINATION_STARTUP_RETRY:?}: {error}"
+                    );
+                    tokio::time::sleep(COORDINATION_STARTUP_RETRY).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.
@@ -917,17 +1017,32 @@ async fn serve_connection(stream: TcpStream, connection: Connection) {
     }
 }
 
-/// Cancel in-flight connections, close the tracker to new spawns, and wait for tasks to finish
-/// (bounded by `deadline`). Cancellation is what actually drops idle sockets; `tracker.wait`
-/// alone would leave tasks parked in `read_frame` until `idle_timeout`.
-async fn drain(tracker: &TaskTracker, cancel: &CancellationToken, deadline: Duration) {
+/// Hand the groups to the other gateways, cancel in-flight connections, close the tracker to new
+/// spawns, and wait for tasks to finish, all within `deadline`. The groups go first, so their
+/// requests in flight send their clients to the new coordinators. Cancellation is what actually
+/// drops idle sockets; `tracker.wait` alone would leave tasks parked in `read_frame` until
+/// `idle_timeout`.
+async fn drain(
+    state: &GatewayState,
+    tracker: &TaskTracker,
+    cancel: &CancellationToken,
+    deadline: Duration,
+) {
+    // One deadline for every step, so an Iggy node that does not answer the handover cannot keep
+    // the connections open past it.
+    let until = Instant::now() + deadline;
+    state.hand_over_groups(until).await;
     cancel.cancel();
     tracker.close();
-    if timeout(deadline, tracker.wait()).await.is_err() {
+    if timeout_at(until, tracker.wait()).await.is_err() {
         warn!(
             ?deadline,
             "shutdown drain deadline exceeded; remaining connection tasks will be dropped with the runtime"
         );
+    }
+    // Last, since no connection uses the coordinator log any more.
+    if timeout_at(until, state.close_coordination()).await.is_err() {
+        debug!("the coordinator log clients did not sign out within the shutdown drain deadline");
     }
 }
 
@@ -1044,25 +1159,19 @@ async fn route_frame(
             .await
         }
         SaslAction::AcceptHandshake(mechanism) => {
-            debug!(%peer, %mechanism, "SASL mechanism negotiated");
-            *sasl_state = SaslState::AwaitToken(mechanism);
-            sasl_handshake_outcome(req.request_api_version, ERROR_NONE, false)
+            let api_version = req.request_api_version;
+            debug!(%peer, %mechanism, api_version, "SASL mechanism negotiated");
+            *sasl_state = SaslState::awaiting_token(mechanism, api_version);
+            sasl_handshake_outcome(api_version, ERROR_NONE, false)
         }
         SaslAction::RejectMechanism => sasl_handshake_outcome(
             req.request_api_version,
             ERROR_UNSUPPORTED_SASL_MECHANISM,
             true,
         ),
-        // v0 is the one refusable handshake version that still has an encodable response shape,
-        // so it gets a real UNSUPPORTED_VERSION. Anything above the ceiling has no schema at the
-        // version the client asked for, and a body shaped for a different one would be misparsed.
-        SaslAction::RejectHandshakeVersion => {
-            if req.request_api_version < SASL_HANDSHAKE_VERSION {
-                sasl_handshake_outcome(req.request_api_version, ERROR_UNSUPPORTED_VERSION, true)
-            } else {
-                HandleOutcome::Close
-            }
-        }
+        // No schema exists at the version the client asked for, and a body shaped for another
+        // version would be misparsed.
+        SaslAction::RejectHandshakeVersion => HandleOutcome::Close,
         SaslAction::RejectAuthenticateVersion => {
             debug!(
                 %peer,
@@ -1165,6 +1274,8 @@ where
         peer: &peer,
         cancel: &cancel,
     };
+    let mut permissions =
+        PermissionFollow::new(state.bridge.as_deref(), certificate_name.is_some());
     let mut principal = if let Some(username) = certificate_name {
         let Some(resolved) = resolve_certificate_principal(&ctx, &username).await else {
             return Ok(());
@@ -1182,49 +1293,38 @@ where
         } else {
             config.pre_auth_timeout
         };
+        // A bare token gets the cap of a token, so the reader never buffers more than one holds.
+        let frame_cap = if sasl_state.awaits_raw_token() {
+            MAX_SASL_AUTH_BYTES
+        } else {
+            config.max_frame_size
+        };
         let Some(frame) =
-            read_next_frame(&mut stream, &config, idle_budget, &peer, &cancel).await?
+            read_next_frame(&mut stream, &config, frame_cap, idle_budget, &peer, &cancel).await?
         else {
             return Ok(());
         };
 
-        if frame.len() < 8 {
-            return Err(KafkaWireError::BufferUnderflow {
-                needed: 8,
-                remaining: frame.len(),
+        // After a v0 handshake, the frame is the bare token, with no request header to parse.
+        if sasl_state.awaits_raw_token() {
+            if !authenticate_raw_token(&ctx, &mut stream, &frame, &mut principal, &mut permissions)
+                .await?
+            {
+                return Ok(());
             }
-            .into());
+            sasl_state = SaslState::Authenticated;
+            continue;
         }
-        let api_key = i16::from_be_bytes([frame[0], frame[1]]);
-        let api_version = i16::from_be_bytes([frame[2], frame[3]]);
-        let req_hdr_ver = request_header_version(api_key, api_version);
-        let resp_hdr_ver = response_header_version(api_key, api_version);
 
-        // `request_header_version` only ever returns 1 or 2, both of which `RequestHeader`
-        // supports, so `decode` cannot fail on the version argument itself; any error here is a
-        // malformed header and closes the connection.
-        let mut body = frame;
-        let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
-            .map_err(|e| KafkaWireError::Malformed(e.to_string()))?;
-
-        debug!(
-            %peer,
-            api_key = req.request_api_key,
-            api_version = req.request_api_version,
-            correlation_id = req.correlation_id,
-            client_id = req.client_id.as_deref().unwrap_or(""),
-            "received request"
-        );
-        connection_state.note_client_id(req.client_id.as_deref());
-        // A group request can park for a whole rebalance timeout. `client_id` and the tagged
-        // fields are views into the frame, so keeping them would pin the frame for that long
-        // after the handler has let go of its own copy.
-        req.client_id = None;
-        req.unknown_tagged_fields.clear();
-
-        // `RequestHeader::decode` advances `body` past the header fields it consumed via
-        // `Buf::advance`, so `body` is already exactly the request payload.
+        let (req, resp_hdr_ver, body) = decode_request(frame, &peer, connection_state)?;
+        let Some(revision) = permissions.apply(principal.as_mut(), &peer) else {
+            return Ok(());
+        };
+        let signed_in = principal.is_some();
         let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
+        if !signed_in && principal.is_some() {
+            permissions.signed_in(revision);
+        }
         if dispatch_outcome(
             &mut stream,
             &peer,
@@ -1238,6 +1338,149 @@ where
         {
             return Ok(());
         }
+    }
+}
+
+/// Verifies the bare token that follows a v0 handshake (KIP-152), and answers it if it is valid.
+///
+/// `false` closes the connection. A bare token has no answer that can carry an error, so a broker
+/// closes the connection on every failure, and the client reports the close as one.
+async fn authenticate_raw_token<S: AsyncWrite + Unpin>(
+    ctx: &ConnectionContext<'_>,
+    stream: &mut S,
+    token: &[u8],
+    principal: &mut Option<AuthenticatedPrincipal>,
+    permissions: &mut PermissionFollow<'_>,
+) -> Result<bool> {
+    let Some(revision) = permissions.apply(principal.as_mut(), ctx.peer) else {
+        return Ok(false);
+    };
+    let signed_in = principal.is_some();
+    let TokenCheck::Accepted(authenticated) = verify_plain(ctx, token).await else {
+        return Ok(false);
+    };
+    send_raw_token_accepted(stream, ctx.config.write_timeout).await?;
+    *principal = Some(authenticated);
+    if !signed_in {
+        permissions.signed_in(revision);
+    }
+    Ok(true)
+}
+
+/// Decodes the request header at the start of `frame`. Returns the header, the version of the
+/// response header that answers it, and the request body after the header.
+fn decode_request(
+    frame: Bytes,
+    peer: &SocketAddr,
+    connection_state: &ConnectionState,
+) -> Result<(RequestHeader, i16, Bytes)> {
+    if frame.len() < 8 {
+        return Err(KafkaWireError::BufferUnderflow {
+            needed: 8,
+            remaining: frame.len(),
+        }
+        .into());
+    }
+    let api_key = i16::from_be_bytes([frame[0], frame[1]]);
+    let api_version = i16::from_be_bytes([frame[2], frame[3]]);
+    let req_hdr_ver = request_header_version(api_key, api_version);
+    let resp_hdr_ver = response_header_version(api_key, api_version);
+
+    // `request_header_version` only ever returns 1 or 2, both of which `RequestHeader`
+    // supports, so `decode` cannot fail on the version argument itself; any error here is a
+    // malformed header and closes the connection.
+    let mut body = frame;
+    let mut req = RequestHeader::decode(&mut body, req_hdr_ver)
+        .map_err(|e| KafkaWireError::Malformed(e.to_string()))?;
+
+    debug!(
+        %peer,
+        api_key = req.request_api_key,
+        api_version = req.request_api_version,
+        correlation_id = req.correlation_id,
+        client_id = req.client_id.as_deref().unwrap_or(""),
+        "received request"
+    );
+    connection_state.note_client_id(req.client_id.as_deref());
+    // A group request can park for a whole rebalance timeout. `client_id` and the tagged
+    // fields are views into the frame, so keeping them would pin the frame for that long
+    // after the handler has let go of its own copy.
+    req.client_id = None;
+    req.unknown_tagged_fields.clear();
+    // `RequestHeader::decode` advances `body` past the header fields it consumed via
+    // `Buf::advance`, so `body` is already exactly the request payload.
+    Ok((req, resp_hdr_ver, body))
+}
+
+/// One connection's place on the bridge's [`PermissionBoard`], which the change log keeps.
+struct PermissionFollow<'a> {
+    board: Option<&'a PermissionBoard>,
+    /// The board's revision that the principal's permissions are as new as.
+    seen: u64,
+    /// Whether the principal is an Iggy user. `ANONYMOUS` names none, so no change applies to it.
+    follows: bool,
+}
+
+impl<'a> PermissionFollow<'a> {
+    fn new(bridge: Option<&'a IggyBridge>, follows: bool) -> Self {
+        let board = bridge.map(IggyBridge::permission_board);
+        Self {
+            board,
+            seen: board.map_or(0, PermissionBoard::revision),
+            follows,
+        }
+    }
+
+    /// Applies to `principal` what the change log said of its Iggy user since the last call. The
+    /// board's revision from before that. `None` when the user was deleted or is no longer
+    /// active: the connection then closes, as Iggy ends the sessions of such a user.
+    fn apply(
+        &mut self,
+        principal: Option<&mut AuthenticatedPrincipal>,
+        peer: &SocketAddr,
+    ) -> Option<u64> {
+        let Some(board) = self.board else {
+            return Some(0);
+        };
+        let revision = board.revision();
+        let Some(principal) = principal.filter(|_| self.follows) else {
+            return Some(revision);
+        };
+        match board.changed_since(principal.user, &principal.username, &mut self.seen) {
+            Some(UserAccess::Active(grants)) => {
+                principal.permissions = grants.permissions;
+                principal.topic_reads = grants.topic_reads;
+                principal.permissions_known = true;
+            }
+            Some(UserAccess::Revoked) => {
+                info!(
+                    %peer,
+                    username = principal.username,
+                    "the Iggy user was deleted, deactivated or renamed; closing its connection"
+                );
+                return None;
+            }
+            None => {}
+        }
+        // The read at login failed. No revoke of a user of that name came since, so the newest
+        // active one is the user that signed in.
+        if principal.user.is_none()
+            && !principal.permissions_known
+            && let Some((user, grants)) = board.active_user(&principal.username)
+        {
+            principal.user = Some(user);
+            principal.permissions = grants.permissions;
+            principal.topic_reads = grants.topic_reads;
+            principal.permissions_known = true;
+        }
+        Some(revision)
+    }
+
+    /// A login set the principal. Changes after `revision`, from before the login, apply to it,
+    /// so a change while the login ran does too.
+    const fn signed_in(&mut self, revision: u64) {
+        self.follows = true;
+        self.seen = revision;
     }
 }
 
@@ -1310,28 +1553,57 @@ async fn authenticate_token(
             None,
         )
     };
-
-    let Some(authenticator) = ctx.authenticator else {
-        // Unreachable: `run` refuses to start in this combination. Fail closed anyway, since the
-        // alternative is admitting an unauthenticated connection.
-        error!(%peer, "SASL is enabled but no authenticator is configured");
-        return failed();
-    };
     let Ok(auth_bytes) = decode_sasl_auth_bytes(api_version, body) else {
         debug!(%peer, "malformed SaslAuthenticate token");
         return failed();
     };
-    let Ok(credentials) = parse_plain(&auth_bytes) else {
+    match verify_plain(ctx, &auth_bytes).await {
+        TokenCheck::Accepted(authenticated) => (
+            sasl_authenticate_outcome(api_version, ERROR_NONE, false),
+            Some(authenticated),
+        ),
+        // A rejection is the client's problem and is terminal, so it earns a parseable 58.
+        TokenCheck::Rejected => failed(),
+        // Kafka clients treat 58 as fatal and surface it to the application, so answering with it
+        // would turn a momentary Iggy blip, an overload or a throttle into a permanent
+        // authentication error for credentials that may be correct. Closing without a body reads
+        // as a transport failure instead, which is retriable, and still tells the client nothing
+        // about whether the account exists.
+        TokenCheck::Dropped => (HandleOutcome::Close, None),
+    }
+}
+
+/// What a PLAIN token earned.
+enum TokenCheck {
+    Accepted(AuthenticatedPrincipal),
+    /// The token is malformed, or Iggy rejected its credentials.
+    Rejected,
+    /// Nothing says that the credentials are wrong: the peer is throttled, no slot came free, a
+    /// budget ran out, the gateway shuts down or Iggy is unreachable.
+    Dropped,
+}
+
+/// Verifies the PLAIN token `auth_bytes` against Iggy, within the pre-authentication budget. Both
+/// token framings come here: a `SaslAuthenticate` request, and a bare frame after a v0 handshake.
+async fn verify_plain(ctx: &ConnectionContext<'_>, auth_bytes: &[u8]) -> TokenCheck {
+    let peer = ctx.peer;
+    let Some(authenticator) = ctx.authenticator else {
+        // Unreachable: `run` refuses to start in this combination. Fail closed anyway, since the
+        // alternative is admitting an unauthenticated connection.
+        error!(%peer, "SASL is enabled but no authenticator is configured");
+        return TokenCheck::Rejected;
+    };
+    let Ok(credentials) = parse_plain(auth_bytes) else {
         debug!(%peer, "malformed PLAIN initial response");
-        return failed();
+        return TokenCheck::Rejected;
     };
 
-    // Checked before a slot is taken, so a throttled peer costs neither a slot nor a hash. Closed
-    // rather than answered 58 for the same reason an overload is: the client would treat 58 as
-    // fatal, and a correct password retried after the delay must still get through.
+    // Checked before a slot is taken, so a throttled peer costs neither a slot nor a hash. Not a
+    // rejection, for the same reason that an overload is not one: a correct password retried
+    // after the delay must still get through.
     if ctx.failed_logins.is_blocked(peer.ip()) {
         debug!(%peer, "SASL authentication refused: peer is throttled after a rejected login");
-        return (HandleOutcome::Close, None);
+        return TokenCheck::Dropped;
     }
 
     // The connection loop only watches the shutdown token between frames, so a verification in
@@ -1339,45 +1611,49 @@ async fn authenticate_token(
     let verified = tokio::select! {
         () = ctx.cancel.cancelled() => {
             debug!(%peer, "SASL authentication abandoned by shutdown");
-            return (HandleOutcome::Close, None);
+            return TokenCheck::Dropped;
         }
         verified = within_auth_budget(ctx, ctx.auth_slots, "SASL authentication", |slot| {
             authenticator.authenticate(&credentials, slot)
         }) => verified,
     };
-
+    // Overloaded or timed out. Nothing here says the credentials were wrong.
     let Some(result) = verified else {
-        // Overloaded or timed out. Close rather than answer 58: a Kafka client treats that code as
-        // fatal and surfaces it to the application, and nothing here says the credentials were
-        // wrong. A close reads as a transport failure, which is retriable.
-        return (HandleOutcome::Close, None);
+        return TokenCheck::Dropped;
     };
 
     match result {
         Ok(authenticated) => {
             debug!(%peer, "SASL authentication succeeded");
             ctx.failed_logins.record_success(peer.ip());
-            (
-                sasl_authenticate_outcome(api_version, ERROR_NONE, false),
-                Some(authenticated),
-            )
+            TokenCheck::Accepted(authenticated)
         }
-        // A rejection is the client's problem and is terminal, so it earns a parseable 58.
         Err(AuthError::Rejected) => {
             debug!(%peer, "SASL authentication rejected");
             ctx.failed_logins.record_rejection(peer.ip());
-            failed()
+            TokenCheck::Rejected
         }
-        // An outage is not. Kafka clients treat 58 as fatal and surface it to the application, so
-        // answering with it would turn a momentary Iggy blip into a permanent authentication error
-        // for credentials that were always correct. Closing without a body reads as a transport
-        // failure instead, which is retriable, and still tells the client nothing about whether
-        // the account exists.
         Err(AuthError::Unavailable) => {
             warn!(%peer, "SASL authentication could not be completed; Iggy is unreachable");
-            (HandleOutcome::Close, None)
+            TokenCheck::Dropped
         }
     }
+}
+
+/// Answers an accepted bare token with [`RAW_TOKEN_ACCEPTED`].
+async fn send_raw_token_accepted<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    write_timeout: Duration,
+) -> Result<()> {
+    // The flush matters on TLS, for the same reason as in `send_response`.
+    let write = async {
+        stream.write_all(&RAW_TOKEN_ACCEPTED).await?;
+        stream.flush().await
+    };
+    timeout(write_timeout, write)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
+    Ok(())
 }
 
 /// Answers `DescribeAcls` from the permissions captured when this connection authenticated.
@@ -1512,10 +1788,12 @@ fn illegal_state_outcome(
     }
 }
 
-/// Returns `Ok(None)` when shutdown cancellation wins; `Ok(Some(frame))` on a full frame.
+/// Returns `Ok(None)` when shutdown cancellation wins; `Ok(Some(frame))` on a full frame of at
+/// most `max_frame_size` bytes.
 async fn read_next_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     config: &GatewayConfig,
+    max_frame_size: usize,
     idle_timeout: Duration,
     peer: &SocketAddr,
     cancel: &CancellationToken,
@@ -1527,7 +1805,7 @@ async fn read_next_frame<S: AsyncRead + Unpin>(
         }
         result = read_frame(
             stream,
-            config.max_frame_size,
+            max_frame_size,
             idle_timeout,
             config.read_timeout,
         ) => match result {

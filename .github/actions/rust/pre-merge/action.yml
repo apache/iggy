@@ -134,7 +134,7 @@ runs:
       run: cargo fmt --all -- --check
       shell: bash
 
-    # clippy-macos-aarch64 runs the same lint on macos-14. Code behind
+    # clippy-macos-aarch64 runs the same lint on macos-15. Code behind
     # cfg(target_os) splits is dead to the Linux leg, so its warnings would
     # otherwise reach master unseen.
     - name: Cargo clippy
@@ -248,7 +248,7 @@ runs:
           TEST_ARCHIVE_ARGS=(-E "$ARCHIVE_FILTER")
         fi
 
-        # SDKs need only server/CLI. Keep Rust-only binaries and plugins with their tests.
+        # SDKs need only server/CLI. Keep Rust-only binaries with their tests.
         BUILD_RUNTIME=false
         if [[ "$RUNTIME_SCOPE" == workspace ]]; then
           BUILD_RUNTIME=true
@@ -277,8 +277,7 @@ runs:
           jq -r --arg scope "$RUNTIME_SCOPE" --argjson packages "$RUNTIME_PACKAGE_IDS" '
             select(.reason == "compiler-artifact") |
             select($scope == "workspace" or (.package_id as $id | $packages | index($id))) |
-            (select(.target.kind | index("bin")) | .executable // empty),
-            (select(.target.crate_types | index("cdylib")) | .filenames[] | select(endswith(".so")))' \
+            select(.target.kind | index("bin")) | .executable // empty' \
             "$ARTIFACT_DIR/build.jsonl" | sort -u | \
             while IFS= read -r artifact; do
               realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
@@ -397,13 +396,15 @@ runs:
           # naming the feature under test instead of naming the pull. The suite runs its
           # containers with --pull never, so a failed pull here makes it skip, which the guard
           # above turns into a job failure that names the missing image.
-          # Read the tags out of the suite itself; hardcoding them here lets a bump in the test
+          # Read the tags out of the suites themselves; hardcoding them here lets a bump in a test
           # desync silently, which pre-pulls the superseded image and puts the real one back
-          # inside the budget this block exists to avoid.
-          E2E_IMAGES=$(grep -oP '^const (KCAT|KAFKA)_IMAGE: &str = "\K[^"]+' \
-            gateways/kafka/tests/kafka_client_e2e_tests.rs)
+          # inside the budget this block exists to avoid. The failover suite runs the same
+          # clients against a cluster. `KAFKA_4_0_IMAGE` and `KAFKA_3_9_IMAGE` match too.
+          E2E_IMAGES=$(grep -ohP '^const (KCAT|KAFKA)\w*_IMAGE: &str = "\K[^"]+' \
+            gateways/kafka/tests/kafka_client_e2e_tests.rs \
+            gateways/kafka/tests/cluster_failover_tests.rs | sort -u)
           if [[ -z "$E2E_IMAGES" ]]; then
-            echo "::warning::could not read client image tags from kafka_client_e2e_tests.rs; skipping pre-pull"
+            echo "::warning::could not read client image tags from the Kafka client suites; skipping pre-pull"
           fi
           for image in $E2E_IMAGES; do
             timeout 300 docker pull -q "$image" \
@@ -422,8 +423,6 @@ runs:
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
         fi
 
-        # Doris requires this host setting before its testcontainers fixture starts.
-        sudo sysctl -w vm.max_map_count=2000000 || true
         NO_TESTS=fail
         if [[ "$TEST_SCOPE" == "packages" ]]; then
           # BDD targets require features, so a BDD-only scope can contain no runnable tests.

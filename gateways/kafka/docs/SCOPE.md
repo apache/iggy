@@ -50,12 +50,12 @@ it knows the server supports flexible encoding.
 
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
-| 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
-| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+. With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
+| 18 | ApiVersions | 0 | 5 | 0, 1, 2, 3, 4, 5 | Advertise supported ranges; flexible encoding at v3+. v5 names the cluster and the node that the client wants to reach (KIP-1242), see [Java clients](#java-clients) |
+| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+. Each partition lists as many gateways as replicas as the replication factor of the topic ([`CONFIGS.md`](CONFIGS.md#replicas-in-metadata)). With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST, a timestamp and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
-| 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default at every version |
+| 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default at every version. Stores `retention.ms`, `retention.bytes`, `segment.bytes` and the replication factor. Accepts any `cleanup.policy`, and a policy without `delete` keeps every record. Accepts any valid value of the keys Iggy ignores, and only the default of `message.timestamp.type`. Accepts `min.insync.replicas` up to the majority of the factor, and `max.message.bytes` up to the largest batch. `flush.messages=1` or `flush.ms=0` makes the topic `persisted`. v5 returns the configs and the replication factor of the new topic. See [`CONFIGS.md`](CONFIGS.md) |
 | 20 | DeleteTopics | 1 | 5 | 1, 2, 3, 4, 5 | With a bridge: deletes the Iggy topic, never the backing stream (see `BRIDGE_MAPPING.md`). Without one: stub returns `NOT_CONTROLLER` (41). v6 (topic-id-based) not advertised - this bridge has no topic-id concept |
 | 37 | CreatePartitions | 0 | 3 | 0, 1, 2, 3 | With a bridge: adds partitions to the Iggy topic through `create_partitions`; a count at or below the current one answers `INVALID_PARTITIONS` (37). Without one: stub returns `NOT_CONTROLLER` (41). Flexible encoding at v2+ |
 | 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
@@ -67,11 +67,11 @@ it knows the server supports flexible encoding.
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
 | 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator. A group that is not there but holds offsets in Iggy is `Empty`. Any other missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v5+ |
 | 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator, plus the groups that hold offsets in Iggy as `Empty` (see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)). v4+ state filter and v5 type filter. Flexible encoding at v3+ |
-| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
-| 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and leaves out `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
-| 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
+| 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | A producer id at epoch 0, from Iggy with a bridge. A `transactional_id` gets `UNSUPPORTED_VERSION` (35). Flexible encoding at v2+ |
+| 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic and broker resources. A topic returns every Kafka 4.4 key but `cleanup.policy`. A broker returns a fixed set for this gateway. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
+| 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Replaces the stored `retention.ms` and `retention.bytes`, as Kafka replaces the whole set. Keeps a `segment.bytes` that it leaves out. A `cleanup.policy` without `delete` keeps every record. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
 | 42 | DeleteGroups | 0 | 2 | 0, 1, 2 | With a bridge: deletes a group without members, with its offsets in Iggy. While it has members: `NON_EMPTY_GROUP` (68). When it does not exist: `GROUP_ID_NOT_FOUND` (69). Flexible encoding at v2. v3 adds an error message that `kafka-protocol` cannot encode yet |
-| 44 | IncrementalAlterConfigs | 0 | 1 | 0, 1 | Persists `retention.ms` only, one operation per entry; `APPEND` and `SUBTRACT` are refused. Flexible encoding at v1. See [`CONFIGS.md`](CONFIGS.md) |
+| 44 | IncrementalAlterConfigs | 0 | 1 | 0, 1 | Sets and resets `retention.ms` and `retention.bytes`, one operation per entry. A `cleanup.policy` without `delete` keeps every record. `APPEND` and `SUBTRACT` apply only to list keys. Flexible encoding at v1. See [`CONFIGS.md`](CONFIGS.md) |
 | 47 | OffsetDelete | 0 | 0 | 0 | With a bridge: deletes offsets of a group. `GROUP_SUBSCRIBED_TO_TOPIC` (86) for a topic that a member subscribes to. See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md). v1 is not in a Kafka release |
 | 60 | DescribeCluster | 0 | 2 | 0, 1, 2 | The [cluster id](#cluster-id) and the broker Metadata advertises on the same listener. The controller endpoint type gets `MISMATCHED_ENDPOINT_TYPE` (114) and an unknown one `UNSUPPORTED_ENDPOINT_TYPE` (115). `cluster_authorized_operations` stays unset, so a Java client reads it as null. Flexible encoding at every version |
 
@@ -98,7 +98,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 14 | SyncGroup | 0–5 | v4 |
 | 15 | DescribeGroups | 0–6 | v5 |
 | 16 | ListGroups | 0–5 | v3 |
-| 18 | ApiVersions | 0–3 | v3 |
+| 18 | ApiVersions | 0–5 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
 | 20 | DeleteTopics | 1–5 | v4 |
 | 22 | InitProducerId | 0–5 | v2 |
@@ -109,6 +109,22 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 44 | IncrementalAlterConfigs | 0–1 | v1 |
 | 47 | OffsetDelete | 0 | never |
 | 60 | DescribeCluster | 0–2 | v0 |
+
+### Java clients
+
+Java clients from Kafka 3.0 to 3.8 open ApiVersions at v3. Clients from 3.9 to 4.3 open it at
+v4, and 4.4 clients open it at v5. The gateway serves each of these versions, so no client asks
+again at a lower version (KIP-511). CI runs the Java clients of Kafka 3.9.2, 4.0.2 and 4.4.0.
+
+v5 adds the cluster and the node that the client wants to reach (KIP-1242). Java clients from
+4.4 and franz-go from 1.22.0 send them. A v5 request that names only one of the two gets
+`INVALID_REQUEST` (42), as from a Kafka 4.4 broker. If the node or the cluster is not this
+gateway's, the gateway answers `REBOOTSTRAP_REQUIRED` (129). The client then starts again from its
+bootstrap servers. Gateways without the bridge each draw their own cluster id, so when
+`IGGY_KAFKA_BROKERS` lists several of them, the gateway compares only the node.
+
+`kafka-protocol` 0.18 stops at ApiVersions v4, so `iggy_kafka_wire::api_versions` decodes the two
+v5 fields. The v5 response has no new field, so the v4 encoder writes it.
 
 ### Cluster id
 
@@ -443,9 +459,11 @@ below it are still open for the issues that build on top of it.
     and the Java client use - fail identically and permanently once the cluster's total partition
     count crosses the trip point, since that size is the catalog's own, not anything the
     requesting client chose or can shrink.
-- [x] Several gateways as brokers (`IGGY_KAFKA_BROKERS`): Metadata lists every gateway, and
-      each one leads every partition it reports. Leaders spread over the gateways, one
-      controller, and a coordinator per group are later work (#4515).
+- [x] Several gateways as brokers (`IGGY_KAFKA_BROKERS`): Metadata lists every live gateway.
+      With the coordinator log, a hash of each partition names its leader, the owner of log
+      partition 0 is the controller, and each group has one coordinator that another gateway
+      takes over when it stops (#4515, `docs/CONSUMER_GROUPS.md`). Without it, each gateway
+      leads every partition it reports.
 - [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
       against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
       not reproduced or root-caused against the current `kafka_protocol`-based decode path in this
@@ -476,9 +494,11 @@ below it are still open for the issues that build on top of it.
     (`ListOffsets` carries no `timeout_ms` field in any version this gateway supports, so this is a
     fixed ceiling, not a client-honored one), applied per topic rather than once around the whole
     batch: a topic already resolved when the deadline arrives keeps its real answer, and the
-    not-yet-started topics answer `REQUEST_TIMED_OUT`. Each record lookup by time also gets at
-    most a quarter of that deadline, and answers `REQUEST_TIMED_OUT` past it, so one stalled
-    partition leaves time for the rest.
+    not-yet-started topics answer `REQUEST_TIMED_OUT`. The record lookups by time run up to 8 at
+    once, each with the time of a Fetch poll. They start only in the first 2 s, and the request
+    waits no longer for them. One with no answer by then answers `REQUEST_TIMED_OUT`, so stalled
+    partitions leave time for the rest. A partition that stalls answers `NOT_LEADER_OR_FOLLOWER`
+    with no lookup, as in Fetch.
 - [x] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, shared topic probes, paged polls per partition with
       records, and a wait of up to `max_wait_ms` (max 18 s) when there are none. Only codes the
@@ -527,7 +547,8 @@ InitProducerId and idempotent producers
 
 - [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
       transactional request is refused
-- [ ] Deduplicate an idempotent producer's retries. Delivery stays at-least-once until then
+- [x] Write each batch of an idempotent producer once, with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`
+      ([#4513](https://github.com/apache/iggy/issues/4513)). Iggy partitions keep the producer state
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).

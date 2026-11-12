@@ -107,6 +107,35 @@ public sealed class HttpPartitionContextTests
     }
 
     [Fact]
+    public async Task given_a_fully_zero_caller_context_when_polling_should_send_none()
+    {
+        var handler = new TopicHandler(Original);
+        var client = Client(handler);
+
+        await client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), PartitionId, Consumer.New(1),
+            PollingStrategy.Next().WithContext(default), 10, false, TestContext.Current.CancellationToken);
+
+        Assert.DoesNotContain("&context=", handler.PollQuery);
+    }
+
+    /// <summary>
+    ///     HTTP has no route to take an incarnation from, and a drop would remove the owner fence, so the server gets
+    ///     the context and refuses it with status 87.
+    /// </summary>
+    [Fact]
+    public async Task given_a_caller_context_of_incarnation_0_with_an_owner_when_polling_should_send_it_as_it_is()
+    {
+        var handler = new TopicHandler(Original);
+        var client = Client(handler);
+        var context = new PartitionContext(0, 9, 100);
+
+        await client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), PartitionId, Consumer.New(1),
+            PollingStrategy.Next().WithContext(context), 10, false, TestContext.Current.CancellationToken);
+
+        Assert.Contains($"&context={Uri.EscapeDataString(ContextJson(context))}", handler.PollQuery);
+    }
+
+    [Fact]
     public async Task given_a_strategy_per_partition_when_polling_a_partition_should_poll_with_its_strategy()
     {
         var handler = new TopicHandler(Original);
@@ -137,6 +166,23 @@ public sealed class HttpPartitionContextTests
             TestContext.Current.CancellationToken));
 
         Assert.Empty(handler.PollQuery);
+    }
+
+    /// <summary>A server older than the node lists omits them, which reads as empty.</summary>
+    [Fact]
+    public async Task given_topic_details_with_node_lists_when_reading_the_topic_should_map_them()
+    {
+        var handler = new TopicHandler(Original);
+        var client = Client(handler);
+
+        var topic = await client.GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(2),
+            TestContext.Current.CancellationToken);
+
+        var partitions = topic!.Partitions!.ToList();
+        Assert.Empty(partitions[0].Members);
+        Assert.Empty(partitions[0].InSyncMembers);
+        Assert.Equal(new byte[] { 0, 1, 2 }, partitions[1].Members);
+        Assert.Equal(new byte[] { 0 }, partitions[1].InSyncMembers);
     }
 
     private static HttpMessageStream Client(TopicHandler handler)
@@ -242,7 +288,9 @@ public sealed class HttpPartitionContextTests
                            "current_offset": 0,
                            "size": "0 B",
                            "messages_count": 0,
-                           "context": {{ContextJson(context)}}
+                           "context": {{ContextJson(context)}},
+                           "members": [0, 1, 2],
+                           "in_sync_members": [0]
                          }
                        ]
                      }

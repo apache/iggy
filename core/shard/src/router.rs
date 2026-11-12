@@ -324,7 +324,7 @@ where
         SB: 'static,
     {
         let _completion_pump = self.poll_completions.pump_guard();
-        let _deferred_pump = self.deferred_polls.pump_guard();
+        let _deferred_pump = self.deferred_polls.pump_guard(self.id, &self.senders);
         self.plane.partitions().set_io_notifier(
             self.partition_io.notifier(),
             self.partition_io.limits.bytes_max(),
@@ -386,6 +386,9 @@ where
         let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
         loop {
             self.service_deferred_polls().await;
+            // Here and not at the end of the turn: an idle owner would hold
+            // the pushes of this turn until its next event or tick.
+            self.flush_readiness_pushes();
             let next_deadline = self.deferred_polls.earliest_deadline();
             if next_deadline != armed_deadline {
                 armed_deadline = next_deadline;
@@ -417,6 +420,7 @@ where
                     // offers live on every shard that hosts a serving group --
                     // parked behind the shard-0 gate they would never expire.
                     self.expire_idle_state_transfer_offers();
+                    self.serve_parked_partition_transfer_requests().await;
                     // A drain completes without an event, so a pending
                     // revocation wakes the reconciler each tick. A published
                     // fence wakes it once, and retries of an unpublished one
@@ -431,7 +435,8 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
-                    self.deferred_polls.maintenance();
+                    self.tick_deferred_polls();
+                    self.sweep_readiness_watches();
                     consensus_tick.set(rearm_tick());
                     self.process_loopback(&mut loopback_buf).await;
                 }
@@ -524,7 +529,11 @@ where
                 () = poll_fn(|context| {
                     self.plane.partitions().register_loopback_waker(context.waker());
                     self.partition_io.register_waker(context.waker());
-                    if self.has_pending_loopback(&loopback_buf) || self.partition_io.has_ready() {
+                    self.served_reads.register_waker(context.waker());
+                    if self.has_pending_loopback(&loopback_buf)
+                        || self.partition_io.has_ready()
+                        || self.served_reads.has_landed()
+                    {
                         Poll::Ready(())
                     } else {
                         Poll::Pending
@@ -535,10 +544,13 @@ where
                 }
             }
             self.service_partition_io().await;
+            // After every event, as partition I/O, so a busy inbox cannot
+            // starve the serves that wait for a disk read.
+            self.serve_landed_read().await;
         }
 
         self.poll_completions.close();
-        self.deferred_polls.close();
+        self.deferred_polls.close(self.id, &self.senders);
 
         // A stop can win the select immediately after a frame fenced a
         // partition, before the next tick observes it. Preserve that fault so
@@ -1035,11 +1047,24 @@ where
             } => {
                 self.on_partition_read(namespace, read, reply).await;
             }
-            LifecycleFrame::ReadinessWait { wait, reply } => {
-                self.admit_readiness_wait(wait, &reply);
+            LifecycleFrame::ReadinessWait { wait, reply, watch } => {
+                self.admit_readiness_wait(*wait, &reply, watch);
             }
             LifecycleFrame::ReadinessCancel { waiter } => {
                 self.cancel_readiness_wait(waiter);
+            }
+            LifecycleFrame::ReadinessUpdate { from, states } => {
+                self.apply_readiness_update(from, states);
+            }
+            LifecycleFrame::ReadinessUnwatch { from, watches } => {
+                self.unwatch_readiness(from, watches);
+            }
+            LifecycleFrame::ReadinessInterest {
+                from,
+                watches,
+                parked,
+            } => {
+                self.set_readiness_interest(from, watches, parked);
             }
             LifecycleFrame::PartitionSubmit {
                 request,
@@ -1071,9 +1096,12 @@ where
                     );
                 }
             }
-            LifecycleFrame::PartitionPlacementViews(reports) => {
+            LifecycleFrame::PartitionPlacementViews(reports, statuses) => {
                 if self.id == 0 {
                     self.plane.metadata().observe_partition_views(&reports);
+                    self.partition_status_outbox
+                        .record(&statuses, self.bus.monotonic_now());
+                    self.record_partition_statuses(&statuses);
                 } else {
                     self.metrics.record_frame_drop(
                         frame_drop_variant::PARTITION_PLACEMENT_VIEWS,

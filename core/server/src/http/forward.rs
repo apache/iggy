@@ -111,7 +111,7 @@ use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use server_common::sharding::IggyNamespace;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::PartitionReadReply;
 use tracing::{debug, warn};
 
 use crate::dispatch::reads::hold_for_frontier;
@@ -992,8 +992,8 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
         Ok(bearer) => bearer,
         Err(error) => return CustomError::from(error).into_response(),
     };
-    let deferred =
-        request.method() == Method::GET && request.uri().path().ends_with("/messages/deferred");
+    let deferred = (request.method() == Method::GET || request.method() == Method::POST)
+        && request.uri().path().ends_with("/messages/deferred");
     let request_budget = if deferred {
         let query = match axum::extract::Query::<DeferredPollQuery>::try_from_uri(request.uri()) {
             Ok(query) => query.0,
@@ -1525,11 +1525,7 @@ async fn partition_primary(
     namespace: IggyNamespace,
 ) -> Option<PartitionPrimary> {
     state.metrics.partition_primary_probes.inc();
-    match state
-        .shard
-        .partition_read(namespace, PartitionRead::Primary)
-        .await?
-    {
+    match crate::namespace::partition_primary(&state.shard, namespace).await? {
         PartitionReadReply::Primary { view, primary } => Some(PartitionPrimary {
             view,
             replica: primary,
@@ -2316,6 +2312,7 @@ mod tests {
         roster.enabled = true;
         roster.nodes.push(
             ResolvedClusterNode::try_from(ClusterNodeConfig {
+                rack: None,
                 name: "primary".to_owned(),
                 ip: address.ip().to_string(),
                 advertised_address: None,
@@ -2419,7 +2416,7 @@ mod tests {
             "the poll waits for its partition"
         );
         let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-            read: PartitionRead::UnboundPollOnPrimary { metadata, .. },
+            read: shard::PartitionRead::UnboundPollOnPrimary { metadata, .. },
             reply,
             ..
         })) = shard_inbox.try_recv()
@@ -2432,6 +2429,7 @@ mod tests {
                 fragments: Vec::new().into(),
                 current_offset: 0,
                 encryptor: None,
+                next_offset: None,
             })
             .expect("the poll waits for its reply");
         assert_eq!(

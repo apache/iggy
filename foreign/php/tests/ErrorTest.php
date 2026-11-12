@@ -18,12 +18,12 @@
 
 declare(strict_types=1);
 
-use Iggy\AutoCommit;
 use Iggy\Client as IggyClient;
 use Iggy\Exception\AuthenticationException;
 use Iggy\Exception\ConnectionException;
 use Iggy\Exception\IggyException;
 use Iggy\Exception\NotFoundException;
+use Iggy\Exception\ReadException;
 use Iggy\Exception\TransientException;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
@@ -89,6 +89,12 @@ final class ErrorTest extends TestCase
         assert_true(is_subclass_of(TransientException::class, IggyException::class));
     }
 
+    #[TestDox('Read exceptions share the Iggy exception base class')]
+    public function testReadExceptionUsesIggyBase(): void
+    {
+        assert_true(is_subclass_of(ReadException::class, IggyException::class));
+    }
+
     #[TestDox('Callback exceptions are rethrown without changing their PHP type')]
     public function testCallbackExceptionIsRethrownAsOriginalException(): void
     {
@@ -106,22 +112,7 @@ final class ErrorTest extends TestCase
                 [new SendMessage('callback exception payload')],
             );
 
-            $consumer = $client->consumerGroup(
-                $consumerName,
-                $streamName,
-                $topicName,
-                0,
-                PollingStrategy::next(),
-                10,
-                AutoCommit::disabled(),
-                true,
-                true,
-                null,
-                null,
-                null,
-                null,
-                false,
-            );
+            $consumer = $client->consumerGroup($consumerName, $streamName, $topicName, PollingStrategy::next());
 
             $throwable = assert_throws(
                 static fn () => $consumer->consumeMessages(

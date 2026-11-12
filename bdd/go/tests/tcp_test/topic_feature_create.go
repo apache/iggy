@@ -49,9 +49,8 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 
 		ginkgo.Context("and tries to create topic for a non existing stream", func() {
 			client := createAuthorizedConnection()
-			streamId := createRandomUInt32()
 			name := createRandomString(32)
-			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			streamIdentifier := nonExistingStreamIdentifier(client)
 			partitions := uint32(2)
 			expiry := iggcon.Millisecond
 			maxTopicSize := uint64(math.MaxUint64)

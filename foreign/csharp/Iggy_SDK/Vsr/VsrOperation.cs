@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Vsr;
@@ -70,7 +71,8 @@ internal enum VsrOperation : byte
     RetireSession = 166,
     InstallConsumerGroupOwner = 167,
     TransitionPartitionHistory = 168,
-    RetireConsumerGroupOwners = 169
+    RetireConsumerGroupOwners = 169,
+    StateMachineCommand = 170
 }
 
 internal static class VsrOperations
@@ -163,10 +165,17 @@ internal static class VsrOperations
         }
 
         // A poll that auto-commits moves the consumer offset server-side, so a reply lost after the commit
-        // would make the replay start past a batch the caller never saw. auto_commit is the last body byte.
-        if (code is CommandCodes.POLL_MESSAGES_CODE)
+        // would make the replay start past a batch the caller never saw. auto_commit is the last byte of a
+        // PollMessages body, which a deferred poll extends.
+        if (code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_DEFERRED_CODE)
         {
-            return body.Length > 0 && body[^1] == 0;
+            var tail = code == CommandCodes.POLL_MESSAGES_DEFERRED_CODE ? TcpContracts.DEFERRED_POLL_TAIL_SIZE : 0;
+            return body.Length > tail && body[^(tail + 1)] == 0;
+        }
+
+        if (code == CommandCodes.FETCH_MESSAGES_CODE)
+        {
+            return !TcpContracts.FetchAutoCommits(body);
         }
 
         // Everything else non-replicated is replay-safe only if this build knows it to be a read. An unmapped
@@ -205,7 +214,8 @@ internal static class VsrOperations
     internal static bool IsInternal(this VsrOperation operation)
     {
         return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
-            || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners;
+            || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners
+                or VsrOperation.StateMachineCommand;
     }
 
     /// <summary>

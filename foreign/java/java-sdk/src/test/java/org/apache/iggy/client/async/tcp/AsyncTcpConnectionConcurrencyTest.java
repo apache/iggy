@@ -47,6 +47,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -312,7 +313,7 @@ class AsyncTcpConnectionConcurrencyTest {
                 var lane = new ConsensusSession.LaneKey(1, 0);
                 owner.configurePendingOperations(1, frameBytes);
                 ConsensusSession.Ticket ticket = owner.acquire(
-                                lane,
+                                List.of(lane),
                                 true,
                                 frameBytes,
                                 System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
@@ -344,7 +345,7 @@ class AsyncTcpConnectionConcurrencyTest {
                 owner.abandon(OPERATION_ID);
                 assertThat(frame.refCnt()).isZero();
                 owner.acquire(
-                                lane,
+                                List.of(lane),
                                 true,
                                 frameBytes,
                                 System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200),
@@ -472,10 +473,10 @@ class AsyncTcpConnectionConcurrencyTest {
 
                 var firstState = new AsyncTcpConnection.TransientFailoverState(
                         new PartitionContext(BigInteger.valueOf(7), BigInteger.ZERO, BigInteger.ONE));
-                firstState.setLane(new ConsensusSession.LaneKey(7, 3));
+                firstState.setLanes(List.of(new ConsensusSession.LaneKey(7, 3)));
                 var secondState = new AsyncTcpConnection.TransientFailoverState(
                         new PartitionContext(BigInteger.valueOf(8), BigInteger.ZERO, BigInteger.ONE));
-                secondState.setLane(new ConsensusSession.LaneKey(8, 4));
+                secondState.setLanes(List.of(new ConsensusSession.LaneKey(8, 4)));
                 CompletableFuture<ByteBuf> first = connection.sendRouted(
                         SEND_MESSAGES_CODE,
                         sendMessagesPayload(3),

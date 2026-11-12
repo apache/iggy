@@ -134,6 +134,7 @@ pub enum ControlActionKind {
     RebuildPipeline,
     CommitJournal,
     SendCommit,
+    SendCommitReply,
 }
 
 impl ControlActionKind {
@@ -150,6 +151,7 @@ impl ControlActionKind {
             Self::RebuildPipeline => "rebuild_pipeline",
             Self::CommitJournal => "commit_journal",
             Self::SendCommit => "send_commit",
+            Self::SendCommitReply => "send_commit_reply",
         }
     }
 }
@@ -420,6 +422,14 @@ impl ControlActionLogEvent {
                 target_replica: target,
                 op: None,
                 commit: Some(commit),
+                untrusted_log: None,
+            },
+            VsrAction::SendCommitReply { target, .. } => Self {
+                replica,
+                action: ControlActionKind::SendCommitReply,
+                target_replica: Some(target),
+                op: None,
+                commit: None,
                 untrusted_log: None,
             },
         }
@@ -774,6 +784,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
         Operation::DeleteConsumerOffset => "delete_consumer_offset",
+        Operation::StateMachineCommand => "state_machine_command",
     }
 }
 

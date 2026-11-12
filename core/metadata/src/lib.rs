@@ -25,7 +25,7 @@ pub mod stm;
 
 // The node-wide read frontier the read gates park on; minted by the bootstrap
 // before any shard exists, so it is named outside `impls::`.
-pub use applied_frontier::{AppliedFrontier, Reached};
+pub use applied_frontier::{AppliedFrontier, PartitionRecovery, Reached};
 
 // Re-export IggyMetadata for use in other modules
 pub use impls::metadata::{

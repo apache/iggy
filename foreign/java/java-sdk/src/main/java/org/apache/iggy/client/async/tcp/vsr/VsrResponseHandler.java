@@ -90,9 +90,8 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 VsrHeaders.readRequestOperation(requestFrame),
                 VsrHeaders.readRequestId(requestFrame),
                 RequestIdentity.from(requestFrame));
-        if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()) {
-            pending.maxResponseBody =
-                    requestFrame.getUnsignedIntLE(requestFrame.writerIndex() - Long.BYTES - Integer.BYTES);
+        if (commandCode == CommandCode.Messages.POLL_DEFERRED.getValue()
+                || commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
             pending.cancellation = new byte[VsrHeaders.HEADER_SIZE];
             requestFrame.getBytes(requestFrame.readerIndex(), pending.cancellation);
             ByteBuffer.wrap(pending.cancellation)
@@ -255,6 +254,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 && resultCode != VsrHeaders.ERROR_TRANSIENT_NOT_ACCEPTED
                 && resultCode != IggyErrorCode.NOT_PRIMARY.getCode()
                 && resultCode != IggyErrorCode.DEFERRED_POLL_CAPACITY_EXCEEDED.getCode();
+        pending.replyCommit = frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET);
         recordSessionReply(frame, pending, operation, resultCode, bodyStart, bodyLength);
         if (resultCode != 0) {
             throw IggyServerException.fromTcpResponse(resultCode, new byte[0]);
@@ -269,7 +269,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         synchronized (session) {
             if (pending.identity.matches(session)) {
                 if (pending.committed && advancesMetadata(operation)) {
-                    session.observeMetadata(frame.getLongLE(frame.readerIndex() + VsrHeaders.REPLY_COMMIT_OFFSET));
+                    session.observeMetadata(pending.replyCommit);
                 }
                 if (resultCode == 0) {
                     applySessionEffects(frame, operation, bodyStart, bodyLength);
@@ -365,6 +365,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private final RequestIdentity identity;
         private long maxResponseBody = Integer.MAX_VALUE;
         private volatile boolean committed;
+        private volatile long replyCommit;
         private volatile boolean failedByLink;
         private volatile boolean detachedSession;
         private volatile boolean keepsLineage;
@@ -382,6 +383,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         public boolean isCommitted() {
             return committed;
+        }
+
+        /** The metadata commit that the answering replica names in the reply header. */
+        public long replyCommit() {
+            return replyCommit;
         }
 
         /**
@@ -423,6 +429,21 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         /** Marks the logout that a sign-in sends first, so that its reply keeps the lineage that the sign-in began. */
         public void keepLineage() {
             keepsLineage = true;
+        }
+
+        /** Bounds the reply body, before the request is written, to what the request asked for. */
+        public void limitResponseBody(long bytes) {
+            maxResponseBody = bytes;
+        }
+
+        /**
+         * Asks the server to stop a request that stores offsets, and keeps the request registered: the server answers
+         * it once, refused when the cancel won, or with what it read and stored.
+         */
+        public synchronized void cancelOnServer(Channel channel) {
+            if (!future.isDone()) {
+                abandon(channel);
+            }
         }
     }
 

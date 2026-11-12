@@ -38,7 +38,7 @@ use iggy_gateway_kafka::listener::{
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
-use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -195,6 +195,8 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_INSTANCE_ID",
     "IGGY_KAFKA_NODE_ID",
     "IGGY_KAFKA_BROKERS",
+    "IGGY_KAFKA_COORDINATOR_LOG",
+    "IGGY_KAFKA_OFFSETS_RETENTION_MINUTES",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
@@ -380,6 +382,11 @@ fn load_config() -> Result<GatewayConfig, String> {
              Iggy cluster needs its own value, or they hand out colliding producer ids"
         );
     }
+    config.coordinator_log = load_coordinator_log(&config, bridge_enabled()?)?;
+    if let Some(raw) = env_var("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES") {
+        config.coordination.offsets_retention =
+            Some(load_offsets_retention(&raw, config.coordinator_log)?);
+    }
     config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
     if config.auto_topic_creation.enabled {
         info!(
@@ -394,6 +401,58 @@ fn load_config() -> Result<GatewayConfig, String> {
     )?;
 
     Ok(config)
+}
+
+/// Whether the gateways share their groups through the coordinator log. On by default when
+/// `IGGY_KAFKA_BROKERS` lists the gateways and the bridge is on, unless the bridge user cannot
+/// read Iggy's metadata change log. Set on, the log needs that.
+fn load_coordinator_log(
+    config: &GatewayConfig,
+    bridge_enabled: bool,
+) -> Result<CoordinatorLog, String> {
+    let Some(raw) = env_var("IGGY_KAFKA_COORDINATOR_LOG") else {
+        let preferred = bridge_enabled && !config.brokers.is_empty();
+        return Ok(if preferred {
+            CoordinatorLog::Preferred
+        } else {
+            CoordinatorLog::Off
+        });
+    };
+    let enabled = parse_bool("IGGY_KAFKA_COORDINATOR_LOG", &raw)?;
+    if enabled && !bridge_enabled {
+        return Err("IGGY_KAFKA_COORDINATOR_LOG needs IGGY_KAFKA_BRIDGE_ENABLED=true".to_string());
+    }
+    if !enabled && config.brokers.len() > 1 {
+        warn!(
+            "IGGY_KAFKA_COORDINATOR_LOG is false while IGGY_KAFKA_BROKERS lists several \
+             gateways: the gateway with the lowest node id coordinates every group, and its \
+             groups do not move when it stops"
+        );
+    }
+    Ok(if enabled {
+        CoordinatorLog::Required
+    } else {
+        CoordinatorLog::Off
+    })
+}
+
+/// `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES`, Kafka's `offsets.retention.minutes`. Only the
+/// coordinator log knows when a group last committed, so without it no offset expires, and the
+/// variable is refused rather than ignored: here, and by a gateway that falls back to running
+/// without the log.
+fn load_offsets_retention(raw: &str, log: CoordinatorLog) -> Result<Duration, String> {
+    if log == CoordinatorLog::Off {
+        return Err(
+            "IGGY_KAFKA_OFFSETS_RETENTION_MINUTES needs the coordinator log, since without it no \
+             offset expires: set IGGY_KAFKA_COORDINATOR_LOG=true, or leave the variable unset"
+                .to_string(),
+        );
+    }
+    let minutes: u64 = parse_positive("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", raw)?;
+    minutes
+        .checked_mul(60)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES {minutes} is too large"))
 }
 
 /// This gateway's node id and the list of every gateway, from `IGGY_KAFKA_NODE_ID` and
@@ -695,6 +754,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serial_test::serial;
 
     use iggy_gateway_kafka::listener::SecurityProtocol;
@@ -920,6 +981,61 @@ mod tests {
                 &[("IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED", "yes")],
                 "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
             ),
+        ];
+        for (vars, named) in cases {
+            let error = load_with(vars)
+                .err()
+                .unwrap_or_else(|| panic!("{vars:?} must be refused"));
+            assert!(error.contains(named), "{vars:?}: {error}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn given_an_offsets_retention_with_the_coordinator_log_should_read_it_in_minutes() {
+        let config = load_with(&[
+            ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+            ("IGGY_KAFKA_COORDINATOR_LOG", "true"),
+            ("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "90"),
+        ])
+        .expect("a retention with the log loads");
+        assert_eq!(
+            config.coordination.offsets_retention,
+            Some(Duration::from_mins(90))
+        );
+
+        let unset = load_with(&[
+            ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+            ("IGGY_KAFKA_COORDINATOR_LOG", "true"),
+        ])
+        .expect("the log loads without a retention");
+        assert_eq!(unset.coordination.offsets_retention, None);
+        assert_eq!(
+            unset.coordination.retention(),
+            Duration::from_hours(24 * 7),
+            "Kafka's offsets.retention.minutes default"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_an_invalid_offsets_retention_when_loading_config_should_refuse_and_name_it() {
+        fn with_log(minutes: &str) -> [(&'static str, &str); 3] {
+            [
+                ("IGGY_KAFKA_BRIDGE_ENABLED", "true"),
+                ("IGGY_KAFKA_COORDINATOR_LOG", "true"),
+                ("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", minutes),
+            ]
+        }
+        let overflow = u64::MAX.to_string();
+        let cases: [(&[(&str, &str)], &str); 4] = [
+            (
+                &[("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES", "60")],
+                "IGGY_KAFKA_COORDINATOR_LOG=true",
+            ),
+            (&with_log("0"), "greater than 0"),
+            (&with_log("a week"), "IGGY_KAFKA_OFFSETS_RETENTION_MINUTES"),
+            (&with_log(&overflow), "too large"),
         ];
         for (vars, named) in cases {
             let error = load_with(vars)

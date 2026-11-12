@@ -24,7 +24,7 @@ namespace Apache.Iggy.Consumers;
 /// <summary>
 ///     Represents a message whose payload was deserialized directly from rented memory. The rented buffer has
 ///     already been returned to the pool by the time this message is yielded, so only the header, user headers,
-///     and the deserialized <see cref="Data" /> are available; the raw payload bytes are not retained.
+///     and the deserialized <see cref="Data" /> are available. The raw payload bytes are not retained.
 /// </summary>
 /// <typeparam name="T">The deserialized payload type.</typeparam>
 public sealed class ReceivedMessage<T>
@@ -55,11 +55,13 @@ public sealed class ReceivedMessage<T>
     public uint PartitionId { get; init; }
 
     /// <summary>
-    ///     The partition incarnation and owner of the poll that delivered this message. Pass it to
-    ///     <see cref="IggyConsumer.StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> to commit
-    ///     the message after later polls.
+    ///     The partition incarnation and owner of the read that delivered this message. <see cref="Checkpoint" />
+    ///     carries it, so a commit after a change of the partition history fails.
     /// </summary>
     public PartitionContext Context { get; init; }
+
+    /// <summary>The position after this message, to commit it with <see cref="IggyConsumer.CommitAsync" />.</summary>
+    public Checkpoint? Checkpoint { get; init; }
 
     /// <summary>
     ///     The status of the message (Success, DeserializationFailed).
@@ -93,11 +95,13 @@ public class ReceivedMessage
     public uint PartitionId { get; init; }
 
     /// <summary>
-    ///     The partition incarnation and owner of the poll that delivered this message. Pass it to
-    ///     <see cref="IggyConsumer.StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> to commit
-    ///     the message after later polls.
+    ///     The partition incarnation and owner of the read that delivered this message. <see cref="Checkpoint" />
+    ///     carries it, so a commit after a change of the partition history fails.
     /// </summary>
     public PartitionContext Context { get; init; }
+
+    /// <summary>The position after this message, to commit it with <see cref="IggyConsumer.CommitAsync" />.</summary>
+    public Checkpoint? Checkpoint { get; init; }
 
     /// <summary>
     ///     The status of the message (Success, DeserializationFailed)

@@ -38,9 +38,18 @@ import java.util.Optional;
  * After a positive wait ends, the server still needs {@link #REPLY_MARGIN} for
  * the final read and the reply, so the budget must cover both.
  *
+ * <p>The client retries a poll that a node refused as not the primary, as not
+ * accepted or as over its poll capacity only while more than
+ * {@link #REPLY_MARGIN} of {@code requestTimeout} is left. So a poll without a
+ * wait whose {@code requestTimeout} is {@link #REPLY_MARGIN} or less gets no
+ * such retry: the first such refusal ends it, as not accepted or with the
+ * capacity refusal.
+ *
  * <p>{@code maxBytes} bounds the encoded response body, including the 40-byte
  * poll prefix and all batch framing, but excluding the 256-byte transport
  * header. It is not a payload-only limit, and not a bound on server disk work.
+ * A first message larger than it comes alone in the reply, up to
+ * {@link #MAX_RECORD_SIZE}.
  * The smallest limit, {@link #MIN_MAX_BYTES}, adds one batch header and one
  * message header to the prefix, the least room any message needs.
  *
@@ -72,6 +81,20 @@ public record DeferredPollOptions(Duration maxWait, long minCount, long maxBytes
             + DeferredPollOptions.BATCH_HEADER_SIZE
             + DeferredPollOptions.BATCH_MESSAGE_HEADER_SIZE;
 
+    /**
+     * Mirrors {@code MAX_RECORD_SIZE}: the largest record of one message in a read reply, with its batch and message
+     * headers. A read returns a first record up to this size even above its {@code maxBytes}, so every reply limit of
+     * the client holds it.
+     */
+    public static final long MAX_RECORD_SIZE = DeferredPollOptions.BATCH_HEADER_SIZE
+            + DeferredPollOptions.BATCH_MESSAGE_HEADER_SIZE
+            + DeferredPollOptions.MAX_PAYLOAD_SIZE
+            + DeferredPollOptions.MAX_USER_HEADERS_SIZE;
+
+    /** The largest poll reply body that holds one record of {@link #MAX_RECORD_SIZE}. */
+    public static final long MAX_RECORD_POLL_REPLY_SIZE =
+            DeferredPollOptions.POLL_RESPONSE_HEADER_SIZE + MAX_RECORD_SIZE;
+
     public static final Duration DEFAULT_MAX_WAIT = Duration.ofSeconds(1);
     public static final long DEFAULT_MIN_COUNT = 1;
     public static final long DEFAULT_MAX_BYTES = 1024L * 1024L;
@@ -88,6 +111,8 @@ public record DeferredPollOptions(Duration maxWait, long minCount, long maxBytes
 
     private static final long BATCH_HEADER_SIZE = 256;
     private static final long BATCH_MESSAGE_HEADER_SIZE = 48;
+    private static final long MAX_PAYLOAD_SIZE = 64_000_000;
+    private static final long MAX_USER_HEADERS_SIZE = 100_000;
 
     public DeferredPollOptions {
         requireMicrosecondDuration(maxWait, "maxWait");

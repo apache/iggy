@@ -70,14 +70,17 @@ internal sealed class ConsumerGroupClientState
     }
 
     /// <summary>
-    ///     Replaces a group's cached assignment. A generation change is a rebalance, so the round-robin cursor
-    ///     restarts rather than carrying an index that meant something else.
+    ///     Replaces a group's cached assignment, and returns whether its generation or partitions differ from the
+    ///     cached one, or none was cached. A generation change is a rebalance, so the round-robin cursor restarts
+    ///     rather than carrying an index that meant something else.
     /// </summary>
-    internal void SetAssignment(GroupKey key, ulong generation, IReadOnlyList<uint> partitions)
+    internal bool SetAssignment(GroupKey key, ulong generation, IReadOnlyList<uint> partitions)
     {
         lock (_gate)
         {
-            if (!_assignments.TryGetValue(key, out var assignment))
+            var changed = !_assignments.TryGetValue(key, out var assignment)
+                          || assignment.Generation != generation || !assignment.Partitions.SequenceEqual(partitions);
+            if (assignment is null)
             {
                 assignment = new GroupAssignment();
                 _assignments[key] = assignment;
@@ -91,6 +94,7 @@ internal sealed class ConsumerGroupClientState
             assignment.Generation = generation;
             assignment.Partitions = partitions;
             assignment.RefreshAt = Environment.TickCount64 + AssignmentRefreshMs;
+            return changed;
         }
     }
 
@@ -99,6 +103,21 @@ internal sealed class ConsumerGroupClientState
         lock (_gate)
         {
             _assignments.Remove(key);
+        }
+    }
+
+    /// <summary>
+    ///     Makes the next poll or assignment read sync first, but keeps the cached assignment for
+    ///     <see cref="SetAssignment" /> to compare with. Without it, every resync reports a change.
+    /// </summary>
+    internal void ExpireAssignment(GroupKey key)
+    {
+        lock (_gate)
+        {
+            if (_assignments.TryGetValue(key, out var assignment))
+            {
+                assignment.RefreshAt = long.MinValue;
+            }
         }
     }
 
@@ -119,6 +138,17 @@ internal sealed class ConsumerGroupClientState
             assignment.Cursor = assignment.Cursor == int.MaxValue ? 0 : assignment.Cursor + 1;
 
             return assignment.Partitions[index];
+        }
+    }
+
+    /// <summary>
+    ///     The assigned partitions of a group, in assignment order, or an empty list when nothing is cached.
+    /// </summary>
+    internal IReadOnlyList<uint> AssignedPartitions(GroupKey key)
+    {
+        lock (_gate)
+        {
+            return _assignments.TryGetValue(key, out var assignment) ? assignment.Partitions : [];
         }
     }
 

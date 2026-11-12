@@ -28,7 +28,8 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::batch::{
-    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, calculate_batch_checksum,
+    BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, BatchHeader, BatchProducer,
+    calculate_batch_checksum,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::*;
@@ -48,7 +49,9 @@ use iggy_binary_protocol::primitives::user_headers::encode_user_headers;
 use iggy_binary_protocol::requests::consumer_groups::*;
 use iggy_binary_protocol::requests::consumer_offsets::*;
 use iggy_binary_protocol::requests::messages::{
-    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    DeferredPollMessagesRequest, FetchMessagesRequest, FetchMessagesTarget,
+    GetPartitionRouteRequest, MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US,
+    MIN_DEFERRED_POLL_MAX_BYTES, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -71,6 +74,7 @@ use iggy_binary_protocol::responses::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
+    FetchMessagesResponse, FetchMessagesSection, FetchMessagesSectionHeader,
     PartitionRouteResponse, PollMessagesResponseHeader, SendMessagesConfirmationResponse,
     SendMessagesResponse,
 };
@@ -96,8 +100,8 @@ use iggy_binary_protocol::{
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
-    CompressionAlgorithm, Durability, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
-    MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
+    CompressionAlgorithm, DeferredPollOptions, Durability, IggyByteSize, IggyDuration, IggyError,
+    IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
     RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions, StreamEncryptionKey,
     StreamUpdateOptions, TopicCreateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
     stream_key_fingerprint,
@@ -106,6 +110,11 @@ use secrecy::SecretString;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use twox_hash::{XxHash3_64, XxHash32};
+
+/// The SDK sends `sdkVersion` in every login handshake, so the handshake
+/// vectors take it from the Swift source instead of a copy that a version
+/// bump would leave behind.
+const IGGY_SWIFT_SOURCE: &str = include_str!("../../../Sources/Iggy/Iggy.swift");
 
 /// Hash and error tables are maps keyed by length and code, so each entry is
 /// one line of the pretty-printed fixture and the file stays reviewable.
@@ -208,8 +217,19 @@ fn version_info() -> ClientVersionInfo {
     ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: name("swift-sdk"),
-        sdk_version: name("0.1.4"),
+        sdk_version: name(swift_sdk_version()),
     }
+}
+
+fn swift_sdk_version() -> &'static str {
+    IGGY_SWIFT_SOURCE
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("public static let sdkVersion = \"")?
+                .strip_suffix('"')
+        })
+        .expect("Iggy.swift declares sdkVersion")
 }
 
 fn sample_permissions() -> WirePermissions {
@@ -737,6 +757,107 @@ fn main() {
             auto_commit: false,
         },
     );
+    let deferred_poll = PollMessagesRequest {
+        consumer: WireConsumer::consumer_group(numeric(7)),
+        stream_id: numeric(1),
+        topic_id: named("orders"),
+        partition_id: Some(3),
+        strategy: WirePollingStrategy::next(),
+        count: 100,
+        auto_commit: true,
+    };
+    let defaults = DeferredPollOptions::default();
+    add(
+        &mut vectors,
+        "request.poll_messages_deferred",
+        &DeferredPollMessagesRequest {
+            poll: deferred_poll.clone(),
+            wait_us: defaults.max_wait.as_micros(),
+            min_count: defaults.min_count,
+            max_bytes: defaults.max_bytes,
+            request_timeout_us: defaults.request_timeout.as_micros(),
+        },
+    );
+    add(
+        &mut vectors,
+        "request.poll_messages_deferred.limits",
+        &DeferredPollMessagesRequest {
+            poll: deferred_poll.clone(),
+            wait_us: MAX_DEFERRED_POLL_WAIT_US,
+            min_count: deferred_poll.count,
+            max_bytes: MIN_DEFERRED_POLL_MAX_BYTES as u32,
+            request_timeout_us: MAX_DEFERRED_POLL_TIMEOUT_US,
+        },
+    );
+    // The vectors of `wire.md`: an `Offset` and a `Next` target, then a read
+    // section and a `NotPrimary` section.
+    let fetch_target = |partition_id, strategy| FetchMessagesTarget {
+        partition_id,
+        strategy,
+        max_bytes: 524_288,
+        incarnation: 3,
+        owner_generation: 9,
+    };
+    let fetch_request = FetchMessagesRequest {
+        consumer: WireConsumer::consumer_group(numeric(7)),
+        stream_id: numeric(1),
+        topic_id: named("orders"),
+        wait_us: 5_000_000,
+        request_timeout_us: 6_000_000,
+        min_count: 1,
+        count: 100,
+        max_bytes: 1_048_576,
+        auto_commit: true,
+        targets: vec![
+            fetch_target(1, WirePollingStrategy::offset(41)),
+            fetch_target(2, WirePollingStrategy::next()),
+        ],
+    };
+    add(&mut vectors, "request.fetch_messages", &fetch_request);
+    {
+        let record = batch_record(
+            1,
+            41,
+            1_700_000_000_000_100,
+            1_700_000_000_000_000,
+            &[frame(1, 0, 0, b"hello", &[])],
+        );
+        let section = |partition_id, status, records: &[u8]| FetchMessagesSectionHeader {
+            partition_id,
+            status,
+            current_offset: 0,
+            messages_count: 0,
+            context: PartitionContext::default(),
+            next_offset: 0,
+            records_len: u32::try_from(records.len()).expect("fixture records fit a section"),
+        };
+        let response = FetchMessagesResponse {
+            sections: vec![
+                FetchMessagesSection {
+                    header: FetchMessagesSectionHeader {
+                        current_offset: 41,
+                        messages_count: 1,
+                        context: PartitionContext {
+                            incarnation: 3,
+                            owner_generation: 9,
+                            metadata_op: 12,
+                        },
+                        next_offset: 42,
+                        ..section(1, 0, &record)
+                    },
+                    records: &record,
+                },
+                FetchMessagesSection {
+                    header: section(2, IggyError::NotPrimary.as_code(), &[]),
+                    records: &[],
+                },
+            ],
+        };
+        vectors.insert(
+            "response.fetch_messages".to_owned(),
+            hex(&response.to_bytes().expect("the fixture table is valid")),
+        );
+    }
     add(
         &mut vectors,
         "request.get_partition_route",
@@ -1061,6 +1182,59 @@ fn main() {
             &[],
         ))),
     );
+    let deferred_payload = DeferredPollMessagesRequest {
+        poll: deferred_poll,
+        wait_us: defaults.max_wait.as_micros(),
+        min_count: defaults.min_count,
+        max_bytes: defaults.max_bytes,
+        request_timeout_us: defaults.request_timeout.as_micros(),
+    }
+    .to_bytes();
+    let mut deferred_request = request_header(
+        POLL_MESSAGES_DEFERRED_CODE,
+        client_id,
+        6,
+        99,
+        &deferred_payload,
+    );
+    PartitionContext {
+        incarnation: 17,
+        owner_generation: 9,
+        metadata_op: 52,
+    }
+    .stamp(&mut deferred_request);
+    vectors.insert(
+        "vsr.request.poll_messages_deferred".to_owned(),
+        hex(bytemuck::bytes_of(&deferred_request)),
+    );
+    vectors.insert(
+        "vsr.request.cancel_deferred".to_owned(),
+        hex(bytemuck::bytes_of(
+            &deferred_request
+                .deferred_cancellation()
+                .expect("a deferred poll has a cancellation"),
+        )),
+    );
+    // Each target carries its own fence, so the header of a fetch carries none.
+    let fetch_request = request_header(
+        FETCH_MESSAGES_CODE,
+        client_id,
+        7,
+        99,
+        &fetch_request.to_bytes(),
+    );
+    vectors.insert(
+        "vsr.request.fetch_messages".to_owned(),
+        hex(bytemuck::bytes_of(&fetch_request)),
+    );
+    vectors.insert(
+        "vsr.request.cancel_fetch".to_owned(),
+        hex(bytemuck::bytes_of(
+            &fetch_request
+                .deferred_cancellation()
+                .expect("a fetch has a cancellation"),
+        )),
+    );
     vectors.insert(
         "vsr.request.unknown_code".to_owned(),
         hex(bytemuck::bytes_of(&request_header(
@@ -1175,6 +1349,8 @@ fn main() {
             current_offset: 99,
             size_bytes: 1024,
             messages_count: 100,
+            members: vec![0, 1, 2],
+            in_sync_members: vec![0, 1],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1184,6 +1360,8 @@ fn main() {
             current_offset: 0,
             size_bytes: 0,
             messages_count: 0,
+            members: vec![1, 2, 0],
+            in_sync_members: vec![],
         },
         PartitionResponse {
             context: Default::default(),
@@ -1193,6 +1371,8 @@ fn main() {
             current_offset: 7,
             size_bytes: 512,
             messages_count: 8,
+            members: vec![2, 0, 1],
+            in_sync_members: vec![2],
         },
     ];
     add(
@@ -1632,6 +1812,23 @@ fn main() {
         }
         .encode(&mut empty);
         vectors.insert("response.poll_messages.empty".to_owned(), hex(&empty));
+
+        // A batch of an idempotent producer.
+        let mut record = batch_record(7, 200, 7_000, 3_000, &[frame(21, 0, 0, b"k", &[])]);
+        let mut header = BatchHeader::decode(&record).expect("a batch header");
+        header.producer = Some(BatchProducer::new(4_000, 3, 17).expect("a producer"));
+        header.batch_checksum = calculate_batch_checksum(&header, &record[BATCH_HEADER_SIZE..]);
+        header.encode_into(&mut record[..BATCH_HEADER_SIZE]);
+        let mut produced = BytesMut::new();
+        PollMessagesResponseHeader {
+            context: Default::default(),
+            partition_id: 7,
+            current_offset: 200,
+            messages_count: 1,
+        }
+        .encode(&mut produced);
+        produced.put_slice(&record);
+        vectors.insert("response.poll_messages.producer".to_owned(), hex(&produced));
     }
     add(
         &mut vectors,
@@ -1660,6 +1857,7 @@ fn main() {
         messages_required_to_save: Some(7),
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),
+        replication_factor: Some(2),
         raw: BTreeMap::new(),
     };
     add(

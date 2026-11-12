@@ -91,6 +91,26 @@ jobs:
         with:
           download-deps: "false"
 
+      - name: Setup Swift for examples
+        id: setup-swift
+        if: matrix.task == 'examples-swift'
+        uses: ./.github/actions/utils/setup-swift
+        with:
+          cache-key: "examples"
+          package-path: "examples/swift/getting-started"
+
+      # Built before the server starts, so each example run only executes.
+      - name: Build Swift examples
+        if: matrix.task == 'examples-swift'
+        run: swift build --package-path examples/swift/getting-started -Xswiftc -warnings-as-errors
+
+      - name: Save Swift build directory
+        if: matrix.task == 'examples-swift' && steps.setup-swift.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: examples/swift/getting-started/.build
+          key: ${{ steps.setup-swift.outputs.cache-key }}
+
       - name: Test Go examples
         if: matrix.task == 'examples-go'
         working-directory: examples/go
@@ -110,20 +130,13 @@ jobs:
 
       - name: Setup Python
         if: matrix.task == 'examples-python'
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.11"
 
       - name: Setup uv
         if: matrix.task == 'examples-python'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-
-      - name: Cache uv
-        if: matrix.task == 'examples-python'
-        uses: actions/cache@v6.1.0
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - name: Build PHP extension for examples
         if: matrix.task == 'examples-php'
@@ -177,6 +190,10 @@ jobs:
       - name: Run Java examples
         if: matrix.task == 'examples-java'
         run: ./scripts/run-examples-from-readme.sh --language java
+
+      - name: Run Swift examples
+        if: matrix.task == 'examples-swift'
+        run: ./scripts/run-examples-from-readme.sh --language swift
 
       - name: Upload reports
         if: always()

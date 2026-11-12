@@ -29,6 +29,7 @@
 //! (`i32::MIN`): there is no group ACL bitfield to report, and any other value fails the
 //! encoder below v3.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -108,14 +109,32 @@ pub async fn handle(
     } else {
         Absent::Dead
     };
+    // With the coordinator log, a group whose members are gone can hold offsets there alone.
+    let mut logged = HashSet::new();
+    if let Some(coordination) = &state.coordination {
+        for (group_id, group) in group_ids.iter().zip(&described) {
+            if group.is_none() && coordination.holds(group_id).await {
+                logged.insert(group_id.as_str());
+            }
+        }
+    }
     let groups = group_ids
         .iter()
         .zip(described)
         .map(|(group_id, group)| {
-            group.map_or_else(
-                || absent.answer(api_version, group_id),
-                |group| described_group(api_version, group),
-            )
+            // Kafka answers a group of another coordinator per group, and the admin client
+            // asks that one.
+            if let Err(code) = state.groups.serves(group_id) {
+                return error_group(api_version, group_id, code, None);
+            }
+            match group {
+                Some(group) => described_group(api_version, group),
+                None if logged.contains(group_id.as_str()) => described_group(
+                    api_version,
+                    GroupDescription::offsets_only(group_id.clone()),
+                ),
+                None => absent.answer(api_version, group_id),
+            }
         })
         .collect();
     respond_or_close(encode_response(api_version, groups), "DescribeGroups")

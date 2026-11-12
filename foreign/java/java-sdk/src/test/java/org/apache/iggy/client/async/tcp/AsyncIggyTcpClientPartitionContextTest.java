@@ -26,6 +26,7 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -39,7 +40,10 @@ import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.math.BigInteger;
@@ -93,12 +97,13 @@ class AsyncIggyTcpClientPartitionContextTest {
     private static final int PARTITION_NOT_OWNED = 5009;
     private static final int ASSIGNED_PARTITION = 7;
     private static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
-    private static final int RESYNC_REQUIRED_PARTITION = -1;
     // An offset write status of the fake primary: the write is stored.
     private static final int STORED = 0;
     private static final long ROUTE_INCARNATION = 1;
     private static final PartitionContext CALLER_CONTEXT =
             new PartitionContext(BigInteger.valueOf(41), BigInteger.valueOf(42), BigInteger.valueOf(43));
+    private static final PartitionContext CALLER_CONTEXT_WITHOUT_INCARNATION =
+            new PartitionContext(BigInteger.ZERO, BigInteger.valueOf(9), BigInteger.valueOf(100));
 
     @Test
     void shouldKeepCoordinatorWhenAPlainPollIsCanceledDuringContextDiscovery() throws Exception {
@@ -431,8 +436,14 @@ class AsyncIggyTcpClientPartitionContextTest {
         }
     }
 
-    @Test
-    void shouldKeepTheCallerPollContextWhenAPrimaryPollIsRerouted() throws Exception {
+    /**
+     * A reroute keeps the context of the first attempt. The server refuses incarnation 0, so a context with incarnation
+     * 0 takes the incarnation of the first route, and a context that is all zero takes the whole context of that route.
+     */
+    @ParameterizedTest
+    @MethodSource("callerPollContexts")
+    void shouldKeepTheCallerPollContextWhenAPrimaryPollIsRerouted(
+            PartitionContext caller, PartitionContext sent, boolean deferred) throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
                 ServerSocket primarySocket = new ServerSocket(0, 4, loopback)) {
@@ -463,7 +474,8 @@ class AsyncIggyTcpClientPartitionContextTest {
                 if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
                 }
-                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)
+                        || request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
                     stamped.add(stampedContext(request));
                     return polls.incrementAndGet() == 1
                             ? Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED)
@@ -475,18 +487,31 @@ class AsyncIggyTcpClientPartitionContextTest {
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
                 client.login().get(5, TimeUnit.SECONDS);
-                pollPartition(client, PollingStrategy.next().withContext(CALLER_CONTEXT))
+                PollingStrategy strategy = PollingStrategy.next().withContext(caller);
+                (deferred ? pollPartitionDeferred(client, strategy) : pollPartition(client, strategy))
                         .get(5, TimeUnit.SECONDS);
                 assertThat(routes).hasValue(2);
                 pollPartition(client, PollingStrategy.next()).get(5, TimeUnit.SECONDS);
                 assertThat(routes).hasValue(2);
-                assertThat(stamped).containsExactly(CALLER_CONTEXT, CALLER_CONTEXT, routeContext(2));
+                assertThat(stamped).containsExactly(sent, sent, routeContext(2));
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
             coordinator.get(5, TimeUnit.SECONDS);
             primary.get(5, TimeUnit.SECONDS);
         }
+    }
+
+    static List<Arguments> callerPollContexts() {
+        PartitionContext filled = new PartitionContext(
+                routeContext(1).incarnation(),
+                CALLER_CONTEXT_WITHOUT_INCARNATION.ownerGeneration(),
+                CALLER_CONTEXT_WITHOUT_INCARNATION.metadataOp());
+        return List.of(
+                Arguments.of(CALLER_CONTEXT, CALLER_CONTEXT, false),
+                Arguments.of(PartitionContext.EMPTY, routeContext(1), false),
+                Arguments.of(CALLER_CONTEXT_WITHOUT_INCARNATION, filled, false),
+                Arguments.of(CALLER_CONTEXT_WITHOUT_INCARNATION, filled, true));
     }
 
     @Test
@@ -620,13 +645,11 @@ class AsyncIggyTcpClientPartitionContextTest {
         }
     }
 
+    /** A 106 names one partition, so the client refuses a deferred group poll without one, as the server would. */
     @Test
-    void shouldReduceDeferredPollBudgetsWhenAGroupResyncStartsAnotherAttempt() throws Exception {
+    void shouldRefuseADeferredGroupPollWithoutAPartitionBeforeSendingIt() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
-            AtomicInteger syncs = new AtomicInteger();
-            List<Long> waits = new CopyOnWriteArrayList<>();
-            List<Long> budgets = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
@@ -635,52 +658,27 @@ class AsyncIggyTcpClientPartitionContextTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GROUP_SYNC_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(
-                            OPERATION_NON_REPLICATED,
-                            Unpooled.buffer()
-                                    .writeLongLE(syncs.incrementAndGet())
-                                    .writeIntLE(1)
-                                    .writeIntLE(0));
-                }
-                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(
-                            OPERATION_NON_REPLICATED,
-                            pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION));
-                }
-                if (request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
-                    ByteBuffer body = ByteBuffer.wrap(request.body()).order(ByteOrder.LITTLE_ENDIAN);
-                    waits.add(body.getLong(body.limit() - DEFERRED_PARAMETERS_BYTES));
-                    budgets.add(body.getLong(body.limit() - Long.BYTES));
-                    return Response.success(
-                            OPERATION_NON_REPLICATED, emptyPoll(waits.size() == 1 ? RESYNC_REQUIRED_PARTITION : 0));
-                }
                 throw new IllegalStateException("Unexpected coordinator request: " + request);
             });
             AsyncIggyTcpClient client = client(coordinatorSocket);
-            var options = DeferredPollOptions.defaults();
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
                 client.login().get(5, TimeUnit.SECONDS);
-                client.messages()
-                        .pollMessagesDeferred(
-                                StreamId.of(1L),
-                                TopicId.of(1L),
-                                Optional.empty(),
-                                Consumer.group(ConsumerId.of(7L)),
-                                PollingStrategy.next(),
-                                1L,
-                                false,
-                                options)
-                        .get(5, TimeUnit.SECONDS);
-                assertThat(syncs).hasValue(2);
-                assertThat(waits).hasSize(2);
-                assertThat(waits.get(0)).isLessThan(options.maxWaitMicros());
-                assertThat(waits.get(1)).isLessThan(waits.get(0));
-                assertThat(budgets.get(1)).isLessThan(budgets.get(0));
-                assertThat(budgets.get(0) - waits.get(0))
-                        .isEqualTo(options.requestTimeoutMicros() - options.maxWaitMicros());
-                assertThat(budgets.get(1) - waits.get(1)).isEqualTo(budgets.get(0) - waits.get(0));
+
+                assertThatThrownBy(() -> client.messages()
+                                .pollMessagesDeferred(
+                                        StreamId.of(1L),
+                                        TopicId.of(1L),
+                                        Optional.empty(),
+                                        Consumer.group(ConsumerId.of(7L)),
+                                        PollingStrategy.next(),
+                                        1L,
+                                        false,
+                                        DeferredPollOptions.defaults()))
+                        .isInstanceOfSatisfying(IggyValidationException.class, error -> {
+                            assertThat(error.getRawErrorCode()).isEqualTo(IggyErrorCode.INVALID_COMMAND.getCode());
+                            assertThat(error.getMessage()).contains("partition reader");
+                        });
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
@@ -840,6 +838,43 @@ class AsyncIggyTcpClientPartitionContextTest {
         }
     }
 
+    /**
+     * The server refuses an offset write that names incarnation 0. So a caller context without one takes the
+     * incarnation of the route once and keeps its owner and op, and the attempt after a reroute names the same history.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldFillTheRouteIncarnationOfAnOffsetWriteContextWithoutOneOnce(boolean delete) throws Exception {
+        try (OffsetCluster cluster = new OffsetCluster(1, TRANSIENT_NOT_ACCEPTED, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                CompletableFuture<Void> write = delete
+                        ? ((ConsumerOffsetsTcpClient) client.consumerOffsets())
+                                .deleteConsumerOffset(
+                                        StreamId.of(1L),
+                                        TopicId.of(1L),
+                                        0L,
+                                        Consumer.of(7L),
+                                        CALLER_CONTEXT_WITHOUT_INCARNATION)
+                        : storeOffset(client, 1, CALLER_CONTEXT_WITHOUT_INCARNATION);
+                write.get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.routings).hasSize(2);
+            PartitionContext filled = new PartitionContext(
+                    BigInteger.valueOf(ROUTE_INCARNATION),
+                    CALLER_CONTEXT_WITHOUT_INCARNATION.ownerGeneration(),
+                    CALLER_CONTEXT_WITHOUT_INCARNATION.metadataOp());
+            assertThat(cluster.primaryWrites)
+                    .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
+                    .containsExactly(filled, filled);
+        }
+    }
+
     @Test
     void shouldNumberPrimaryOffsetWritesFromTheCoordinatorSession() throws Exception {
         try (OffsetCluster cluster = new OffsetCluster(1, HISTORY_UNAVAILABLE, STORED)) {
@@ -920,10 +955,47 @@ class AsyncIggyTcpClientPartitionContextTest {
         }
     }
 
+    @Test
+    void shouldDeleteTheReaderOffsetWithItsCapturedContext() throws Exception {
+        try (OffsetCluster cluster = new OffsetCluster(1, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                ((ConsumerOffsetsTcpClient) client.consumerOffsets())
+                        .deleteConsumerOffset(StreamId.of(1L), TopicId.of(1L), 0L, Consumer.of(7L), CALLER_CONTEXT)
+                        .get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.primaryWrites)
+                    .extracting(Request::operation)
+                    .containsExactly(OPERATION_DELETE_CONSUMER_OFFSET);
+            assertThat(cluster.primaryWrites)
+                    .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
+                    .containsExactly(CALLER_CONTEXT);
+        }
+    }
+
     private static CompletableFuture<PolledMessages> pollPartition(
             AsyncIggyTcpClient client, PollingStrategy strategy) {
         return client.messages()
                 .pollMessages(StreamId.of(1L), TopicId.of(1L), Optional.of(0L), Consumer.of(7L), strategy, 1L, false);
+    }
+
+    private static CompletableFuture<PolledMessages> pollPartitionDeferred(
+            AsyncIggyTcpClient client, PollingStrategy strategy) {
+        return client.messages()
+                .pollMessagesDeferred(
+                        StreamId.of(1L),
+                        TopicId.of(1L),
+                        Optional.of(0L),
+                        Consumer.of(7L),
+                        strategy,
+                        1L,
+                        false,
+                        DeferredPollOptions.defaults());
     }
 
     private static CompletableFuture<PolledMessages> pollGroup(AsyncIggyTcpClient client, PollingStrategy strategy) {

@@ -71,10 +71,6 @@ runs:
       shell: bash
       run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/bench/dashboard/server/Cargo.toml
 
-    - name: Validate iggy-connect bundle
-      shell: bash
-      run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/connectors/runtime/Cargo.toml
-
     - name: Validate iggy-kafka-gateway bundle
       shell: bash
       run: ./scripts/ci/third-party-licenses.sh --validate --manifest gateways/kafka/Cargo.toml

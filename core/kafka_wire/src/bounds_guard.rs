@@ -108,7 +108,7 @@ pub const GUARDED_RANGES: &[ApiVersionRange] = &[
     range(API_KEY_DESCRIBE_GROUPS, 0, 6),
     range(API_KEY_LIST_GROUPS, 0, 5),
     range(API_KEY_SASL_HANDSHAKE, 0, 1),
-    range(API_KEY_API_VERSIONS, 0, 3),
+    range(API_KEY_API_VERSIONS, 0, 5),
     range(API_KEY_CREATE_TOPICS, 2, 5),
     range(API_KEY_DELETE_TOPICS, 1, 5),
     range(API_KEY_INIT_PRODUCER_ID, 0, 5),
@@ -959,6 +959,8 @@ pub fn validate_init_producer_id_shape(version: i16, body: &Bytes) -> Result<()>
 /// Mirrors the field order `ApiVersionsRequest::decode` walks. v0-2 have an empty body (no
 /// length-prefixed fields to bound), so this is a no-op below v3.
 ///
+/// For v5 it follows [`crate::api_versions::decode_request`], because the codec stops at v4.
+///
 /// # Errors
 ///
 /// Returns an error when a declared string length cannot fit in the bytes remaining in the
@@ -975,6 +977,11 @@ pub fn validate_api_versions_shape(version: i16, body: &Bytes) -> Result<()> {
     let mut c = ShapeCursor::new(body.clone(), usize::MAX);
     c.compact_string(false)?;
     c.compact_string(false)?;
+    if version >= 5 {
+        // `ClusterId` and `NodeId` (KIP-1242).
+        c.compact_string(true)?;
+        let _node_id = c.read_i32()?;
+    }
     c.tagged_fields()?;
     Ok(())
 }
@@ -1493,7 +1500,10 @@ pub fn validate_offset_delete_shape(
 /// `max_frame_size`, before a header is even decoded, so an unauthenticated peer can still make
 /// the gateway hold that much. What this cap bounds is everything downstream of the guard: what
 /// reaches `parse_plain`, and what a future mechanism would carry into a credential exchange.
-const MAX_SASL_AUTH_BYTES: usize = 4096;
+///
+/// A bare token after a `SaslHandshake` v0 gets the same cap. There the frame reader applies it,
+/// so such a token is never buffered past it.
+pub const MAX_SASL_AUTH_BYTES: usize = 4096;
 
 /// Mirrors the field order `DescribeConfigsRequest::decode` walks.
 ///
@@ -1714,9 +1724,8 @@ pub fn validate_describe_cluster_shape(version: i16, body: &Bytes) -> Result<()>
 
 /// `SaslHandshake` carries one non-nullable string, the mechanism name.
 ///
-/// The message is never flexible, so v0 and v1 share this shape, and both are walked: the
-/// connection loop reads the mechanism name out of every handshake body before the SASL state
-/// machine decides, and it is that decision, not this guard, that refuses v0.
+/// The message is never flexible, so v0 and v1 share this shape. The connection loop reads the
+/// mechanism name out of every handshake body before the SASL state machine decides.
 ///
 /// # Errors
 ///

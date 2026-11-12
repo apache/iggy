@@ -51,6 +51,7 @@ pub mod sync_group;
 pub(crate) mod topic_config;
 
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -61,7 +62,7 @@ use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
 
-use crate::auth::AuthenticatedPrincipal;
+use crate::auth::{AuthenticatedPrincipal, TopicReads};
 use crate::bridge::BridgeError;
 use crate::error::Result;
 use crate::protocol::api::{
@@ -71,7 +72,7 @@ use crate::protocol::api::{
     API_KEY_HEARTBEAT, API_KEY_INCREMENTAL_ALTER_CONFIGS, API_KEY_INIT_PRODUCER_ID,
     API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH,
-    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState, ERROR_INVALID_REQUEST,
+    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, Brokers, ConnectionState, ERROR_INVALID_REQUEST,
     ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
     supported_max_version,
 };
@@ -124,13 +125,17 @@ pub async fn dispatch(
         API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
         API_KEY_METADATA => metadata::handle(state, connection, principal, api_version, body).await,
-        API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
+        API_KEY_OFFSET_COMMIT => {
+            offset_commit::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
-        API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
-        API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
-        API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
+        API_KEY_API_VERSIONS => api_versions::handle(state, connection, api_version, body).await,
+        API_KEY_CREATE_TOPICS => create_topics::handle(state, connection, api_version, body).await,
+        API_KEY_DELETE_TOPICS => {
+            delete_topics::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_CREATE_PARTITIONS => {
-            create_partitions::handle(state, principal, api_version, body).await
+            create_partitions::handle(state, connection, principal, api_version, body).await
         }
         API_KEY_DESCRIBE_CONFIGS => describe_configs::handle(state, api_version, body).await,
         API_KEY_ALTER_CONFIGS => alter_configs::handle(state, principal, api_version, body).await,
@@ -162,6 +167,20 @@ pub async fn dispatch(
     }
 }
 
+/// Whether another gateway that `brokers` lists is the controller. Kafka admin clients send
+/// `CreateTopics`, `DeleteTopics` and `CreatePartitions` to the controller, and retry on
+/// `NOT_CONTROLLER` after a Metadata refresh. One controller keeps two requests from adding
+/// partitions to one topic at once. While no gateway is known as controller, or the controller is
+/// not listed, each gateway serves the request: Metadata then names this gateway, and a client
+/// told to look elsewhere would come back here until it times out.
+pub(crate) fn another_controller(state: &GatewayState, brokers: &Brokers) -> bool {
+    state.coordination.as_ref().is_some_and(|coordination| {
+        coordination
+            .controller()
+            .is_some_and(|node_id| brokers.listed_or_own(node_id) != brokers.node_id)
+    })
+}
+
 /// Whether a request carries a transactional id, which this gateway never serves.
 ///
 /// An empty id reads as absent: `kafka_protocol` decodes a null wire string to `None` but its
@@ -191,6 +210,40 @@ fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> b
         return false;
     }
     principal.permissions.manage_topics
+}
+
+/// The topics a principal may commit offsets to. See [`commit_access`].
+#[derive(Debug, Clone)]
+pub(crate) enum CommitAccess {
+    /// Every topic.
+    Any,
+    /// The topics that these stream and topic grants cover.
+    Scoped(Arc<TopicReads>),
+    /// No topic.
+    Never,
+}
+
+/// Where `principal` may commit offsets. `None` means no listener of this gateway names principals,
+/// and `ANONYMOUS` comes from a listener that authenticates no one. Both commit anywhere.
+///
+/// Kafka asks for `READ` on the group. Iggy creates a consumer group only for a user that may read
+/// the topic: a read or manage permission on topics or streams, globally (`read_topics`, which
+/// `DescribeAcls` shows as that `READ`), on the topic's stream, or on the topic. Every commit asks
+/// for the same, so whether it may store does not depend on whether the group exists yet. A
+/// principal whose permissions were never read commits nowhere.
+fn commit_access(principal: Option<&AuthenticatedPrincipal>) -> CommitAccess {
+    let Some(principal) = principal.filter(|principal| !principal.is_anonymous()) else {
+        return CommitAccess::Any;
+    };
+    if !principal.permissions_known {
+        CommitAccess::Never
+    } else if principal.permissions.read_topics {
+        CommitAccess::Any
+    } else if principal.topic_reads.is_empty() {
+        CommitAccess::Never
+    } else {
+        CommitAccess::Scoped(Arc::clone(&principal.topic_reads))
+    }
 }
 
 /// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.

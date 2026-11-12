@@ -317,6 +317,13 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_preallocate_segments = false;
             ffi_options.preallocate_segments     = false;
         }
+        if (auto value = options.ReplicationFactor()) {
+            ffi_options.has_replication_factor = true;
+            ffi_options.replication_factor     = *value;
+        } else {
+            ffi_options.has_replication_factor = false;
+            ffi_options.replication_factor     = 0;
+        }
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options), error_info));
     });
 }
@@ -455,13 +462,20 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
 void IggyBlockingClient::StoreConsumerPosition(const Consumer &consumer,
                                                const Identifier &stream,
                                                const Identifier &topic,
-                                               const std::uint32_t partition_id,
-                                               const std::uint64_t offset,
-                                               const PartitionContext &context) {
-    RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id, offset,
-                            &context](ffi::ErrorInfo &error_info) {
-        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
-                                          consumer.Id().ToFfi(), offset, context.ToFfi(), error_info);
+                                               const Checkpoint &checkpoint) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
+        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
+                                          consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
+    });
+}
+
+void IggyBlockingClient::DeleteConsumerPosition(const Consumer &consumer,
+                                                const Identifier &stream,
+                                                const Identifier &topic,
+                                                const Checkpoint &checkpoint) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, &checkpoint](ffi::ErrorInfo &error_info) {
+        Handle()->delete_consumer_position(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
+                                           consumer.Id().ToFfi(), *checkpoint.inner_, error_info);
     });
 }
 

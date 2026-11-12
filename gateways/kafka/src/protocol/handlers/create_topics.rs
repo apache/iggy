@@ -21,8 +21,11 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 use iggy::prelude::IggyError;
+use iggy_common::MAX_REPLICATION_FACTOR;
 use kafka_protocol::messages::create_topics_request::{CreatableReplicaAssignment, CreatableTopic};
-use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
+use kafka_protocol::messages::create_topics_response::{
+    CreatableTopicConfigs, CreatableTopicResult,
+};
 use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse};
 use kafka_protocol::protocol::StrBytes;
 
@@ -30,22 +33,25 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::bridge::{
-    BridgeError, DEFAULT_TOPIC_PARTITIONS, IggyBridge, MAX_TOPIC_PARTITIONS, TopicCreationOutcome,
+    BridgeError, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicSettings, MAX_TOPIC_PARTITIONS,
+    TopicConfigSnapshot, TopicCreationOutcome,
 };
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
-    ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
+    API_KEY_CREATE_TOPICS, ApiVersionRange, ConnectionState, ERROR_INVALID_CONFIG,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
+use crate::protocol::handlers::topic_config::keys::{ConfigContext, topic_entries};
 use crate::protocol::handlers::topic_config::{
-    MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
+    MAX_CONFIG_TOPICS, find_duplicate_names, log_compaction, log_retention_below_segment,
+    plan_create, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, respond_or_close, unsupported_version_response,
+    another_controller, clamp_request_timeout, decode_guarded, encode_message,
+    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -54,7 +60,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 5,
 };
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
         return handle_versioned_request(
             API_KEY_CREATE_TOPICS,
@@ -90,6 +101,12 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             );
         }
     };
+    if another_controller(state, &connection.brokers) {
+        return respond_or_close(
+            encode_inner(api_version, &req.topics, ERROR_NOT_CONTROLLER),
+            "CreateTopics",
+        );
+    }
 
     let topic_names: Vec<&str> = req.topics.iter().map(|topic| topic.name.as_str()).collect();
     let duplicate_names = find_duplicate_names(topic_names.iter().copied());
@@ -123,14 +140,19 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     }
 
     let deadline = Instant::now() + clamp_request_timeout(req.timeout_ms);
+    let request = TopicsRequest {
+        api_version,
+        validate_only: req.validate_only,
+        node_id: state.node_id,
+        context: ConfigContext::of(bridge, state.max_frame_size),
+    };
     let results = create_all_topics(
         bridge,
         &state.partition_growth,
         &req.topics,
         &duplicate_names,
-        req.validate_only,
+        &request,
         deadline,
-        state.node_id,
     )
     .await;
     let resp = CreateTopicsResponse::default().with_topics(results);
@@ -159,9 +181,8 @@ async fn create_all_topics(
     partition_growth: &Mutex<()>,
     topics: &[CreatableTopic],
     duplicate_names: &HashSet<&str>,
-    validate_only: bool,
+    request: &TopicsRequest<'_>,
     deadline: Instant,
-    node_id: i32,
 ) -> Vec<CreatableTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
     let mut deadline_exceeded = false;
@@ -192,7 +213,7 @@ async fn create_all_topics(
             continue;
         }
 
-        let create = create_one_topic(bridge, partition_growth, topic, validate_only, node_id);
+        let create = create_one_topic(bridge, partition_growth, topic, request);
         let result = match tokio::time::timeout_at(deadline, create).await {
             Ok(result) => result,
             Err(_elapsed) => {
@@ -236,41 +257,63 @@ async fn create_one_topic(
     bridge: &IggyBridge,
     partition_growth: &Mutex<()>,
     topic: &CreatableTopic,
-    validate_only: bool,
-    node_id: i32,
+    request: &TopicsRequest<'_>,
 ) -> CreatableTopicResult {
     let result = CreatableTopicResult::default()
         .with_name(topic.name.clone())
         .with_error_message(None);
     let kafka_topic = topic.name.as_str();
 
-    let partition_count = match local_shape_error(topic, node_id) {
-        Ok(count) => count,
-        Err((error_code, error_message)) => {
-            return match bridge.get_kafka_topic(kafka_topic).await {
-                Ok(Some(_existing)) => result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS),
-                // A failed existence probe doesn't get to mask a real, independently-valid
-                // rejection - the request has a local defect either way.
-                Ok(None) | Err(_) => result
-                    .with_error_code(error_code)
-                    .with_error_message(error_message),
-            };
-        }
-    };
+    let (partition_count, settings) =
+        match local_shape_error(topic, request.node_id, &request.context) {
+            Ok(planned) => planned,
+            Err((error_code, error_message)) => {
+                return match bridge.get_kafka_topic(kafka_topic).await {
+                    Ok(Some(_existing)) => result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS),
+                    // A failed existence probe doesn't get to mask a real, independently-valid
+                    // rejection - the request has a local defect either way.
+                    Ok(None) | Err(_) => result
+                        .with_error_code(error_code)
+                        .with_error_message(error_message),
+                };
+            }
+        };
 
-    let success = || {
+    // Kafka reports the factor the topic got. A real create gets it from Iggy. A `validate_only`
+    // answer and a replayed create take the default the gateway read last for -1, and report -1
+    // only before the first read.
+    let success = |stored_factor: Option<u32>| {
+        let replication_factor = stored_factor
+            .and_then(|factor| i16::try_from(factor).ok())
+            .unwrap_or(topic.replication_factor);
+        // Only v5 carries the configs, so an older answer does not build them.
+        let configs = (request.api_version >= 5)
+            .then(|| created_configs(&request.context, partition_count, &settings, stored_factor));
         result
             .clone()
             .with_error_code(ERROR_NONE)
             .with_num_partitions(i32::try_from(partition_count).unwrap_or(i32::MAX))
-            .with_replication_factor(1)
+            .with_replication_factor(replication_factor)
+            .with_configs(configs)
     };
+    let requested_or_default = settings
+        .replication_factor
+        .or(request.context.default_replication_factor);
 
-    if validate_only {
+    if request.validate_only {
         return match bridge.get_kafka_topic(kafka_topic).await {
             Ok(Some(_existing)) => result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS),
-            Ok(None) => success(),
-            Err(err) => bridge_error_result(result, kafka_topic, &err),
+            Ok(None) => beyond_the_cluster(topic.replication_factor, bridge.iggy_node_count())
+                .map_or_else(
+                    || success(requested_or_default),
+                    |reason| {
+                        result
+                            .clone()
+                            .with_error_code(ERROR_INVALID_REPLICATION_FACTOR)
+                            .with_error_message(Some(StrBytes::from(reason)))
+                    },
+                ),
+            Err(err) => bridge_error_result(result, kafka_topic, &err, None),
         };
     }
 
@@ -278,7 +321,7 @@ async fn create_one_topic(
     // a topic created under that name from appearing between its read and its write.
     let _growth = partition_growth.lock().await;
     match bridge
-        .create_kafka_topic(kafka_topic, partition_count)
+        .create_kafka_topic_with(kafka_topic, partition_count, &settings)
         .await
     {
         // The second arm: the write committed on its first attempt, the SDK's own reconnect path
@@ -286,33 +329,137 @@ async fn create_one_topic(
         // `to_kafka_error_code`'s shared mapping deliberately doesn't special-case this - it's a
         // write-only fact, checked here, at the one write this bridge makes, rather than assumed
         // true for the reads that share that mapping too.
-        Ok(TopicCreationOutcome::Created)
-        | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => success(),
+        Ok(TopicCreationOutcome::Created { replication_factor }) => {
+            log_created(kafka_topic, &settings);
+            success(replication_factor)
+        }
+        Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
+            log_created(kafka_topic, &settings);
+            success(requested_or_default)
+        }
         Ok(TopicCreationOutcome::AlreadyExists) => {
             result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS)
         }
-        Err(err) => bridge_error_result(result, kafka_topic, &err),
+        Err(err) => bridge_error_result(
+            result,
+            kafka_topic,
+            &err,
+            Some((topic.replication_factor, bridge.iggy_node_count())),
+        ),
+    }
+}
+
+/// What one `CreateTopics` request asks of each of its topics, beside the topic itself.
+struct TopicsRequest<'a> {
+    api_version: i16,
+    validate_only: bool,
+    node_id: i32,
+    context: ConfigContext<'a>,
+}
+
+/// Logs what a created topic does differently from what its request asked.
+fn log_created(kafka_topic: &str, settings: &KafkaTopicSettings) {
+    log_compaction(kafka_topic, settings.cleanup_policy, true);
+    if let Some(below) = settings.retention_below_segment() {
+        log_retention_below_segment(kafka_topic, below);
     }
 }
 
 /// `configs`-then-shape local validation, bundled so [`create_one_topic`] can probe existence
-/// once, only on the rejection path. Returns `(error_code, error_message)` rather than a whole
-/// [`CreatableTopicResult`] to keep this `Result`'s `Err` arm small (`clippy::result_large_err`);
-/// the caller already holds the shared `name`/base fields to rebuild the full result from.
+/// once, only on the rejection path. Returns the partition count and the settings the configs
+/// name, or `(error_code, error_message)` rather than a whole [`CreatableTopicResult`] to keep
+/// this `Result`'s `Err` arm small (`clippy::result_large_err`); the caller already holds the
+/// shared `name`/base fields to rebuild the full result from.
+///
+/// `min.insync.replicas` is checked against the factor the topic gets: the one it asks for, else
+/// the default that the gateway read last.
 fn local_shape_error(
     topic: &CreatableTopic,
     node_id: i32,
-) -> core::result::Result<u32, (i16, Option<StrBytes>)> {
-    if !topic.configs.is_empty() {
-        return Err((
-            ERROR_INVALID_CONFIG,
-            Some(StrBytes::from(
-                "CreateTopics does not apply per-topic configs. Set retention.ms with AlterConfigs"
-                    .to_string(),
-            )),
-        ));
+    context: &ConfigContext<'_>,
+) -> core::result::Result<(u32, KafkaTopicSettings), (i16, Option<StrBytes>)> {
+    let replication_factor = u32::try_from(topic.replication_factor)
+        .ok()
+        .filter(|factor| *factor > 0);
+    let settings = plan_create(
+        topic
+            .configs
+            .iter()
+            .map(|config| (config.name.as_str(), config.value.as_deref())),
+        context,
+        replication_factor.or(context.default_replication_factor),
+    )
+    .map_err(|fault| (ERROR_INVALID_CONFIG, Some(StrBytes::from(fault.message()))))?;
+    let partition_count = validate_create_topic_shape(topic, node_id).map_err(|code| {
+        let reason = (code == ERROR_INVALID_REPLICATION_FACTOR)
+            .then(|| StrBytes::from(replication_factor_reason(topic.replication_factor, None)));
+        (code, reason)
+    })?;
+    let settings = KafkaTopicSettings {
+        replication_factor,
+        ..settings
+    };
+    Ok((partition_count, settings))
+}
+
+/// Kafka's reason for a replication factor it refuses, with Iggy's bounds in place of the broker
+/// count: 1 to 32 nodes, and at most every node of the cluster. `node_count` is the cluster size
+/// when the gateway knows it.
+fn replication_factor_reason(requested: i16, node_count: Option<usize>) -> String {
+    if requested < 1 {
+        return "Replication factor must be larger than 0, or -1 to use the default value."
+            .to_string();
     }
-    validate_create_topic_shape(topic, node_id).map_err(|code| (code, None))
+    let unable = format!("Unable to replicate the partition {requested} time(s)");
+    if u32::try_from(requested).is_ok_and(|factor| factor > MAX_REPLICATION_FACTOR) {
+        return format!(
+            "{unable}: Iggy keeps each partition on at most {MAX_REPLICATION_FACTOR} nodes."
+        );
+    }
+    node_count.map_or_else(
+        || format!("{unable}: Iggy refused a replication factor above its node count."),
+        |count| {
+            format!(
+                "{unable}: The target replication factor of {requested} cannot be reached \
+                 because only {count} Iggy node(s) are in the cluster."
+            )
+        },
+    )
+}
+
+/// The reason a replication factor exceeds the `node_count` nodes of the Iggy cluster, or `None`
+/// when it fits or the count is unknown. Only `validate_only` asks, because a real create gets the
+/// answer from Iggy, which knows a node that joined since the last roster read.
+fn beyond_the_cluster(requested: i16, node_count: Option<usize>) -> Option<String> {
+    let count = node_count?;
+    (usize::try_from(requested).is_ok_and(|factor| factor > count))
+        .then(|| replication_factor_reason(requested, Some(count)))
+}
+
+/// The configs of the new topic that a v5 response carries, as a describe of it reports them.
+/// `replication_factor` is the factor the topic got, when the gateway knows it.
+fn created_configs(
+    context: &ConfigContext<'_>,
+    partition_count: u32,
+    settings: &KafkaTopicSettings,
+    replication_factor: Option<u32>,
+) -> Vec<CreatableTopicConfigs> {
+    let options = settings.create_options(partition_count, context.defaults);
+    let created = TopicConfigSnapshot {
+        replication_factor,
+        ..TopicConfigSnapshot::created_with(&options)
+    };
+    topic_entries(&created, context, None)
+        .into_iter()
+        .map(|entry| {
+            CreatableTopicConfigs::default()
+                .with_name(StrBytes::from_static_str(entry.name))
+                .with_value(entry.value.map(StrBytes::from))
+                .with_read_only(entry.read_only)
+                .with_config_source(entry.source)
+                .with_is_sensitive(false)
+        })
+        .collect()
 }
 
 /// Maps a bridge failure to a Kafka result, logging the real cause server-side.
@@ -331,9 +478,23 @@ fn bridge_error_result(
     result: CreatableTopicResult,
     kafka_topic: &str,
     err: &BridgeError,
+    replication: Option<(i16, Option<usize>)>,
 ) -> CreatableTopicResult {
     let error_code = err.to_kafka_error_code();
     match err {
+        BridgeError::Iggy(IggyError::InvalidReplicationFactor) => {
+            tracing::debug!(
+                kafka_topic,
+                "CreateTopics: Iggy refused the replication factor"
+            );
+            let reason = replication.map_or_else(
+                || "Iggy refused the replication factor".to_string(),
+                |(requested, node_count)| replication_factor_reason(requested, node_count),
+            );
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(reason)))
+        }
         BridgeError::InvalidKafkaTopicName { reason, .. } => {
             tracing::debug!(
                 kafka_topic,
@@ -430,13 +591,12 @@ fn validate_create_topic_shape(
         return Err(ERROR_INVALID_PARTITIONS);
     }
 
-    // Exactly 1, not merely positive: Metadata names one replica per partition, this gateway,
-    // the same ceiling the manual-assignment branch above already
-    // enforces per partition (`assignment_replicas_are_valid`). A real single-broker Kafka
-    // controller rejects `replication_factor > 1` the same way (`ReplicationControlManager`) -
-    // accepting it here and silently reporting back `1` (`success()`, below) would tell the
-    // client its request succeeded as sent when it didn't.
-    if topic.replication_factor != -1 && topic.replication_factor != 1 {
+    // Iggy stores the factor (#4692): 1 to 32 nodes. It refuses a factor above its node count
+    // itself, as Kafka's controller refuses one above its broker count.
+    if topic.replication_factor != -1
+        && !u32::try_from(topic.replication_factor)
+            .is_ok_and(|factor| (1..=MAX_REPLICATION_FACTOR).contains(&factor))
+    {
         return Err(ERROR_INVALID_REPLICATION_FACTOR);
     }
 
@@ -536,8 +696,10 @@ fn encode_inner(version: i16, topics: &[CreatableTopic], forced_error: i16) -> R
 #[cfg(test)]
 mod tests {
     use kafka_protocol::messages::TopicName;
+    use kafka_protocol::messages::create_topics_request::CreatableTopicConfig;
 
     use super::*;
+    use crate::bridge::TopicDefaults;
 
     /// The node id of the gateway under test.
     const NODE_ID: i32 = 1;
@@ -566,6 +728,78 @@ mod tests {
         CreatableReplicaAssignment::default()
             .with_partition_index(partition_index)
             .with_broker_ids(broker_ids.into_iter().map(BrokerId).collect())
+    }
+
+    fn with_config(topic: CreatableTopic, name: &str, value: &str) -> CreatableTopic {
+        let config = CreatableTopicConfig::default()
+            .with_name(StrBytes::from(name.to_string()))
+            .with_value(Some(StrBytes::from(value.to_string())));
+        topic.with_configs(vec![config])
+    }
+
+    /// The context of a gateway with the default 8 MiB frame and `default_replication_factor`.
+    fn context(
+        defaults: &TopicDefaults,
+        default_replication_factor: Option<u32>,
+    ) -> ConfigContext<'_> {
+        ConfigContext {
+            defaults,
+            max_message_bytes: 8 * 1024 * 1024,
+            default_replication_factor,
+        }
+    }
+
+    /// [`local_shape_error`] on a gateway that has not read the default replication factor yet.
+    fn shape(
+        topic: &CreatableTopic,
+    ) -> core::result::Result<(u32, KafkaTopicSettings), (i16, Option<StrBytes>)> {
+        local_shape_error(topic, NODE_ID, &context(&TopicDefaults::default(), None))
+    }
+
+    #[test]
+    fn given_min_insync_replicas_should_check_it_against_the_factor_the_topic_gets() {
+        let asked = with_config(creatable_topic(1, 3), "min.insync.replicas", "3");
+        let (code, message) = shape(&asked).expect_err("above the majority of 3");
+        assert_eq!(code, ERROR_INVALID_CONFIG);
+        assert!(
+            message
+                .as_ref()
+                .is_some_and(|text| text.as_str().contains("accepts at most 2")),
+            "{message:?}"
+        );
+        let defaulted = with_config(creatable_topic(1, -1), "min.insync.replicas", "2");
+        assert!(shape(&defaulted).is_ok(), "the default factor is not known");
+        let defaults = TopicDefaults::default();
+        assert!(
+            local_shape_error(&defaulted, NODE_ID, &context(&defaults, Some(1))).is_err(),
+            "a default factor of 1 has a majority of 1"
+        );
+    }
+
+    #[test]
+    fn given_a_refused_config_and_a_bad_shape_should_answer_the_config_first() {
+        let topic = with_config(
+            creatable_topic(0, 1),
+            "message.timestamp.type",
+            "LogAppendTime",
+        );
+        let (code, message) = shape(&topic).expect_err("refused");
+        assert_eq!(code, ERROR_INVALID_CONFIG);
+        assert!(
+            message
+                .as_ref()
+                .is_some_and(|text| text.as_str().contains("accepts only CreateTime")),
+            "{message:?}"
+        );
+    }
+
+    #[test]
+    fn given_valid_configs_should_plan_the_settings_with_the_partition_count() {
+        let topic = with_config(creatable_topic(3, 1), "retention.ms", "60000");
+        let (count, settings) = shape(&topic).expect("valid");
+        assert_eq!(count, 3);
+        assert!(settings.message_expiry.is_some());
+        assert_eq!(settings.retention_bytes, None);
     }
 
     #[test]
@@ -661,15 +895,57 @@ mod tests {
     }
 
     #[test]
-    fn replication_factor_above_one_is_rejected_even_though_positive() {
-        // This gateway advertises exactly one broker - the manual-assignment branch already
-        // rejects a multi-replica assignment (`manual_assignment_with_a_duplicated_replica_is_rejected`);
-        // the equivalent numeric-field request must be rejected the same way, not merely
-        // accepted-and-silently-downgraded.
-        let topic = creatable_topic(1, 3);
+    fn given_a_replication_factor_iggy_can_store_should_accept_it() {
+        for factor in [1, 2, 3, 32] {
+            assert_eq!(
+                validate_create_topic_shape(&creatable_topic(1, factor), NODE_ID),
+                Ok(1),
+                "{factor}"
+            );
+        }
         assert_eq!(
-            validate_create_topic_shape(&topic, NODE_ID),
+            validate_create_topic_shape(&creatable_topic(1, 33), NODE_ID),
             Err(ERROR_INVALID_REPLICATION_FACTOR)
+        );
+    }
+
+    #[test]
+    fn given_a_replication_factor_should_plan_it_for_iggy_or_take_the_server_default() {
+        let (_, stored) = shape(&creatable_topic(2, 3)).expect("valid");
+        assert_eq!(stored.replication_factor, Some(3));
+        let (_, default) = shape(&creatable_topic(2, -1)).expect("valid");
+        assert_eq!(default.replication_factor, None);
+        let (code, reason) = shape(&creatable_topic(2, 40)).expect_err("above 32");
+        assert_eq!(code, ERROR_INVALID_REPLICATION_FACTOR);
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "Unable to replicate the partition 40 time(s): Iggy keeps each partition on at \
+                 most 32 nodes."
+            )
+        );
+        let (_, reason) = shape(&creatable_topic(2, 0)).expect_err("zero");
+        assert_eq!(
+            reason.as_deref(),
+            Some("Replication factor must be larger than 0, or -1 to use the default value.")
+        );
+    }
+
+    #[test]
+    fn given_a_replication_factor_above_the_node_count_should_name_the_cluster_size() {
+        assert_eq!(beyond_the_cluster(3, Some(3)), None);
+        assert_eq!(beyond_the_cluster(-1, Some(1)), None);
+        assert_eq!(
+            beyond_the_cluster(3, None),
+            None,
+            "unknown size: Iggy decides"
+        );
+        assert_eq!(
+            beyond_the_cluster(3, Some(1)).as_deref(),
+            Some(
+                "Unable to replicate the partition 3 time(s): The target replication factor of 3 \
+                 cannot be reached because only 1 Iggy node(s) are in the cluster."
+            )
         );
     }
 

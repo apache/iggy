@@ -24,6 +24,7 @@ use iggy_common::wire_conversions::user_headers_to_wire;
 use iggy_examples::shared::codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
 
 pub const CONSUMER_NAME: &str = "example-consumer";
+const PARTITION_ID: u32 = 0;
 
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {
@@ -38,7 +39,8 @@ async fn main() -> Result<(), IggyError> {
 
     // Configure a consumer, to read the compressed messages that were previously written to the server (using ../producer/main.rs).
     let mut consumer = client
-        .consumer(CONSUMER_NAME, STREAM_NAME, TOPIC_NAME, 0)?
+        .consumer(CONSUMER_NAME, STREAM_NAME, TOPIC_NAME)?
+        .partitions([PARTITION_ID])
         .build();
     consumer.init().await?;
 
