@@ -1891,7 +1891,16 @@ where
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
-        if !self.materialization_missing {
+        self.restore_recovered_log_view(persistence, !self.materialization_missing);
+        Ok(())
+    }
+
+    fn restore_recovered_log_view(
+        &mut self,
+        persistence: &PartitionPersistence,
+        restore_certificate: bool,
+    ) {
+        if restore_certificate {
             match persistence.certified_log_view() {
                 Some(view) if view >= self.consensus.log_view() => {
                     if view > self.consensus.view() {
@@ -1906,7 +1915,6 @@ where
             }
         }
         self.recovered_unproven = persistence.head() > 0;
-        Ok(())
     }
 
     pub const fn requires_state_transfer(&self) -> bool {
@@ -3283,25 +3291,13 @@ where
     #[cfg(feature = "simulator")]
     pub fn attach_simulated_persistence(&mut self, persistence: Rc<PartitionPersistence>) {
         // New empty WALs carry view zero; positive certificates belong to recovered history.
-        if self.recovered_log_view.is_none()
+        let empty_wal = self.recovered_log_view.is_none()
             && persistence.head() == 0
-            && matches!(persistence.certified_log_view(), None | Some(0))
-        {
+            && matches!(persistence.certified_log_view(), None | Some(0));
+        if empty_wal {
             persistence.certify_log_view(self.consensus.log_view(), 0, 0);
-        } else {
-            match persistence.certified_log_view() {
-                Some(view) if view >= self.consensus.log_view() => {
-                    if view > self.consensus.view() {
-                        self.consensus.set_view(view);
-                    }
-                    self.consensus.set_log_view(view);
-                }
-                _ => {
-                    self.materialization_missing = true;
-                    self.ensure_materialization_recovery();
-                }
-            }
         }
+        self.restore_recovered_log_view(&persistence, !empty_wal);
         if !self.materialization_missing && persistence.recovered_frontier() {
             self.consensus.set_recovery_election_allowed(true);
         }
