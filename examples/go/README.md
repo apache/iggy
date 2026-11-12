@@ -82,6 +82,8 @@ Environment variables:
 
 The producer creates the stream and topic if they are missing and keeps them after it exits, so running it again against the same server succeeds. It addresses the stream and topic by name. On a fresh server, the first stream created takes ID `0`, which the getting-started examples expect, so run this producer after them or on a separate fresh server.
 
+The producer looks up the stream and topic before it creates them. A user without create permission therefore needs read and send permission on an existing stream and topic, like with the Rust and Python producers.
+
 ```bash
 go run ./sink-data-producer/main.go
 ```

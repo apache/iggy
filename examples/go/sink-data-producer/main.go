@@ -89,10 +89,10 @@ func run() error {
 		return fmt.Errorf("build identifier for topic %q: %w", topic, err)
 	}
 
-	if err := ensureStream(ctx, cli, stream); err != nil {
+	if err := ensureStream(ctx, cli, streamID, stream); err != nil {
 		return err
 	}
-	if err := ensureTopic(ctx, cli, streamID, stream, topic); err != nil {
+	if err := ensureTopic(ctx, cli, streamID, topicID, stream, topic); err != nil {
 		return err
 	}
 
@@ -139,8 +139,17 @@ type Record struct {
 	Message   string    `json:"message"`
 }
 
-func ensureStream(ctx context.Context, cli iggcon.Client, stream string) error {
-	_, err := cli.CreateStream(ctx, stream, nil)
+func ensureStream(ctx context.Context, cli iggcon.Client, streamID iggcon.Identifier, stream string) error {
+	_, err := cli.GetStream(ctx, streamID)
+	switch {
+	case err == nil:
+		log.Printf("Stream %q already exists, reusing it.", stream)
+		return nil
+	case !errors.Is(err, ierror.ErrStreamIdNotFound):
+		return fmt.Errorf("get stream %q: %w", stream, err)
+	}
+
+	_, err = cli.CreateStream(ctx, stream, nil)
 	switch {
 	case err == nil:
 		log.Printf("Stream %q was created.", stream)
@@ -153,8 +162,17 @@ func ensureStream(ctx context.Context, cli iggcon.Client, stream string) error {
 	}
 }
 
-func ensureTopic(ctx context.Context, cli iggcon.Client, streamID iggcon.Identifier, stream, topic string) error {
-	_, err := cli.CreateTopic(ctx, streamID, topic, nil)
+func ensureTopic(ctx context.Context, cli iggcon.Client, streamID, topicID iggcon.Identifier, stream, topic string) error {
+	_, err := cli.GetTopic(ctx, streamID, topicID)
+	switch {
+	case err == nil:
+		log.Printf("Topic %q already exists in stream %q, reusing it.", topic, stream)
+		return nil
+	case !errors.Is(err, ierror.ErrTopicIdNotFound):
+		return fmt.Errorf("get topic %q in stream %q: %w", topic, stream, err)
+	}
+
+	_, err = cli.CreateTopic(ctx, streamID, topic, nil)
 	switch {
 	case err == nil:
 		log.Printf("Topic %q was created in stream %q.", topic, stream)
