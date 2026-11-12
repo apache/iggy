@@ -58,7 +58,7 @@ fn given_idle_partitions_on_a_shard_when_counting_heap_should_stay_within_the_id
     let bus = Rc::new(IggyMessageBus::new(0));
     let (partitions, live) = live_bytes_during(|| {
         let partitions = IggyPartitions::with_capacity(ShardId::new(0), config(), PARTITIONS)
-            .with_repair_rings(Rc::new(RepairRingBudget::new(u64::MAX)));
+            .with_repair_rings(Rc::new(RepairRingBudget::new(usize::MAX)));
         for index in 0..PARTITIONS {
             let namespace = IggyNamespace::new(1, 1, index);
             partitions.insert(namespace, idle_partition(namespace, &bus));

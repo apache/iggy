@@ -1163,13 +1163,23 @@ evicted_ring_capacity = 65536
 # or RSS.
 evicted_ring_bytes_max = "64 MiB"
 
-# Node-wide budget for the evicted rings of all partitions: the batches they
-# hold in memory plus 288 bytes for each op whose batch they released to its
-# segment. Each shard gets an equal share, because a shard can shed only its
-# own rings. Past its share, a shard first releases the oldest batches across
-# its partitions to their segments, then drops the oldest released ops. Every
-# ring keeps its newest entry, so a shard with many written partitions can
-# stay above its share by those entries. Must be > 0.
+# Node-wide budget for the memory that the evicted rings of all partitions
+# allocate: the buffer of each batch they hold in memory, and 288 bytes for
+# each slot of the ops whose batch they released to its segment. A batch
+# counts for its whole buffer, which is a multiple of 4 KiB, so a small batch
+# costs far more here than its length. Each shard gets an equal share,
+# because a shard can shed only its own rings. Must be > 0, and the share
+# must be at least 1 byte.
+# Past its share, a shard releases batches to their segments, from the rings
+# that grew earliest, until its rings are one eighth under the share. With no
+# batch left to release, it drops the oldest entries of those rings until it
+# is back within the share. A dropped entry sends a lagging replica to state
+# transfer. Every ring keeps its newest entry. When those entries alone
+# exceed the share, every ring holds that entry only, and the server logs a
+# warning.
+# partition_repair_ring_budget_bytes, partition_repair_ring_charged_bytes and
+# partition_repair_ring_floor_bytes report the share of a shard, what its
+# rings charge to it, and what their newest entries take of it.
 evicted_ring_node_bytes_max = "4 GiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer

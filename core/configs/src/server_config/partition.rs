@@ -282,11 +282,14 @@ pub struct PartitionConfig {
     #[config_env(leaf)]
     pub evicted_ring_bytes_max: IggyByteSize,
 
-    /// Node-wide budget for the evicted rings of all partitions: the batches
-    /// they hold in memory plus 288 bytes per batch they released to its
-    /// segment. Split evenly across the shards, because a shard can shed only
-    /// its own rings. Past its share a shard releases the oldest batches, then
-    /// drops the oldest entries. Every ring keeps its newest entry. Must be > 0.
+    /// Node-wide budget for the memory that the evicted rings of all
+    /// partitions allocate: the buffer of each batch they hold in memory,
+    /// and 288 bytes for each slot of the batches they released to their
+    /// segments. Split evenly across the shards, because a shard can shed
+    /// only its own rings ([`Self::evicted_ring_shard_bytes_max`]). Past its
+    /// share a shard releases the oldest batches of the rings that grew
+    /// earliest, then drops their oldest entries. Every ring keeps its
+    /// newest entry. Must be > 0, and must leave each shard at least 1 byte.
     #[serde(default = "default_evicted_ring_node_bytes_max")]
     #[config_env(leaf)]
     pub evicted_ring_node_bytes_max: IggyByteSize,
@@ -425,6 +428,15 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         Ok(())
+    }
+}
+
+impl PartitionConfig {
+    /// The part of [`Self::evicted_ring_node_bytes_max`] that each of
+    /// `shards` shards sheds its rings against.
+    #[must_use]
+    pub fn evicted_ring_shard_bytes_max(&self, shards: u16) -> u64 {
+        self.evicted_ring_node_bytes_max.as_bytes_u64() / u64::from(shards).max(1)
     }
 }
 
@@ -704,6 +716,22 @@ mod tests {
             ..PartitionConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_node_ring_budget_when_split_should_give_each_shard_an_equal_share() {
+        const NODE_BYTES: u64 = 1024;
+        let config = PartitionConfig {
+            evicted_ring_node_bytes_max: IggyByteSize::from(NODE_BYTES),
+            ..PartitionConfig::default()
+        };
+        assert_eq!(config.evicted_ring_shard_bytes_max(1), NODE_BYTES);
+        assert_eq!(config.evicted_ring_shard_bytes_max(4), NODE_BYTES / 4);
+        assert_eq!(
+            config.evicted_ring_shard_bytes_max(2048),
+            0,
+            "more shards than bytes leaves a share of nothing"
+        );
     }
 
     #[test]

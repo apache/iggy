@@ -41,7 +41,7 @@ pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
-pub use repair_memory::{RepairMemoryBudget, RepairRingBudget};
+pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
 mod remote_segments;
 pub use remote_segments::{RemoteObjects, RemoteRange, RemoteSegments};
 mod object_delete;

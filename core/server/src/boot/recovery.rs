@@ -173,7 +173,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
     }
     refuse_unreadable_topics(metadata.mux_stm.streams())?;
-    let partitions = IggyPartitions::with_repair_memory(
+    let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
@@ -189,12 +189,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
             },
         },
         owned_partitions_capacity,
-        repair_memory,
     )
+    .with_repair_memory(repair_memory)
     .with_repair_rings(Rc::new(RepairRingBudget::new(
-        // A shard can shed only its own rings, so each takes an equal share.
-        config.partition.evicted_ring_node_bytes_max.as_bytes_u64()
-            / u64::from(total_shards).max(1),
+        // A share past the address space bounds nothing, as `usize::MAX` does.
+        usize::try_from(config.partition.evicted_ring_shard_bytes_max(total_shards))
+            .unwrap_or(usize::MAX),
     )));
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 

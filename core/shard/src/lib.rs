@@ -9791,7 +9791,9 @@ where
                 }
             }
         }
-        partitions.shed_repair_rings();
+        if let Some(shed) = partitions.shed_repair_rings() {
+            self.metrics.record_repair_ring_shed(&shed);
+        }
         self.drive_replication(namespace_scratch).await;
         self.metrics.record_persistence(&persistence_metrics);
         self.partition_io.record_metrics(&self.metrics);
@@ -18654,7 +18656,7 @@ mod partition_placement_tests {
         };
         let partitions = match repair_memory {
             Some(budget) => {
-                IggyPartitions::with_repair_memory(ShardId::new(shard_id), config, 0, budget)
+                IggyPartitions::new(ShardId::new(shard_id), config).with_repair_memory(budget)
             }
             None => IggyPartitions::new(ShardId::new(shard_id), config),
         };
