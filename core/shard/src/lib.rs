@@ -5463,9 +5463,6 @@ where
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state);
         }
-        // The retained log stands in for the chain and the WAL that the loader
-        // recovers.
-        let log_recovered = retained.is_some();
         // Retained log before the frontier restore, so the restore maxes against
         // the offsets the log proved rather than the zeroes of an empty one.
         // `restore_offset_frontier` takes each counter's own max against what is
@@ -5487,7 +5484,7 @@ where
         // a divergent copy of that rule cannot catch a violation of it. Without
         // the restore at all, a simulator replica rebuilt against a retained
         // store resumes minting at 0 while its group is at N.
-        partition.restore_offset_frontier(recovered_state, log_recovered);
+        partition.restore_offset_frontier(recovered_state);
         partition.attach_simulated_persistence(persistence);
         partition.consensus().resume_adopted_view();
         // Match production's solo reservation handling. A replicated WAL may

@@ -2650,10 +2650,9 @@ where
         // receiver's own refusals stay the guard for what it still holds: its
         // sized segments, its stored consumer offsets and a WAL that names a
         // commit. Its superblock record is no guard: a group that acks before
-        // it persists ignores the record once boot recovered a log, see
-        // `restore_offset_frontier`. A replica that itself waits for a
-        // transfer skipped its WAL replay and can read as empty while its WAL
-        // holds prepares, so it never serves.
+        // it persists ignores the record, see `restore_offset_frontier`. A
+        // replica that itself waits for a transfer skipped its WAL replay and
+        // can read as empty while its WAL holds prepares, so it never serves.
         let empty_group_of_two = self.consensus().replica_count() == 2
             && !self.materialization_missing
             && self.held_offset_frontier() == 0

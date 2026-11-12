@@ -272,7 +272,7 @@ fn given_a_restored_counter_above_an_empty_chain_when_reanchoring_should_plant_a
     let mut partition = solo_recording_partition();
     let recovered = recorded_state(0, 65_537);
     partition.set_superblock(Rc::new(RecordingSuperblock::default()), Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), false);
+    partition.restore_offset_frontier(Some(&recovered));
     assert_eq!(partition.mint_frontier(), 65_537);
     assert_eq!(
         partition.log.segments().len(),
@@ -310,7 +310,7 @@ fn given_a_restored_counter_above_a_sized_tail_when_reanchoring_should_seal_and_
     partition.offset.store(9, Ordering::Release);
     partition.dirty_offset.store(9, Ordering::Relaxed);
     let recovered = recorded_state(10, 65_547);
-    partition.restore_offset_frontier(Some(&recovered), true);
+    partition.restore_offset_frontier(Some(&recovered));
     assert_eq!(partition.mint_frontier(), 65_547);
 
     partition.reanchor_in_memory_to_mint_frontier(IggyByteSize::from(1024 * 1024));

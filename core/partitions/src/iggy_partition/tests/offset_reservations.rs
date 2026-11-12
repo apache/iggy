@@ -328,7 +328,7 @@ fn given_a_reservation_seeded_boot_when_ticking_should_extend_before_the_first_p
     let mut partition = solo_recording_partition();
     let recovered = recorded_state(0, 65_537);
     partition.set_superblock(Rc::new(RecordingSuperblock::default()), Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), false);
+    partition.restore_offset_frontier(Some(&recovered));
     assert_eq!(partition.mint_frontier(), 65_537);
     assert!(
         partition.needs_offset_reservation_extension(),
@@ -371,7 +371,7 @@ fn given_a_recorded_reservation_when_solo_should_seed_the_append_counter() {
     let store = Rc::new(RecordingSuperblock::default());
 
     partition.set_superblock(store.clone(), None);
-    partition.restore_offset_frontier(None, false);
+    partition.restore_offset_frontier(None);
     assert_eq!(
         partition.mint_frontier(),
         0,
@@ -382,7 +382,7 @@ fn given_a_recorded_reservation_when_solo_should_seed_the_append_counter() {
     // block, and no message ever reached a segment, so the frontier is 0.
     let recovered = recorded_state(0, 65_537);
     partition.set_superblock(store, Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), false);
+    partition.restore_offset_frontier(Some(&recovered));
     assert_eq!(
         partition.mint_frontier(),
         65_537,
@@ -406,7 +406,7 @@ fn given_a_recorded_reservation_when_replicated_should_not_seed_the_append_count
     assert!(partition.consensus().replica_count() > 1);
     let recovered = recorded_state(0, 70_000);
     partition.set_superblock(Rc::new(RecordingSuperblock::default()), Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), false);
+    partition.restore_offset_frontier(Some(&recovered));
     assert_eq!(
         partition.mint_frontier(),
         0,
@@ -423,26 +423,43 @@ fn given_persisted_singleton_when_restoring_should_use_the_frontier_without_a_re
     });
     let recovered = recorded_state(40, 70_000);
     partition.set_superblock(Rc::new(RecordingSuperblock::default()), Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), false);
+    partition.restore_offset_frontier(Some(&recovered));
     assert_eq!(partition.offset_frontier(), 40);
     assert_eq!(partition.mint_frontier(), 40);
 }
 
-/// With no recovered log the committed frontier still seeds both counters of
-/// a replicated group: a rebuilt replica has nothing else to anchor its chain.
+/// With no recovered log the record still seeds both counters of a persisted
+/// group: a rebuilt replica has nothing else to anchor its chain. A group that
+/// acks before it persists takes neither. Its record can name offsets that the
+/// group lost, and a rebuilt replica at them refuses every state transfer of a
+/// group that resumed below.
 #[test]
-fn given_a_recorded_frontier_when_replicated_should_seed_both_counters() {
-    let mut partition = partition_at_view(1, 1);
-    assert!(partition.consensus().replica_count() > 1);
-    let recovered = recorded_state(40, 70_000);
-    partition.set_superblock(Rc::new(RecordingSuperblock::default()), Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), false);
-    assert_eq!(partition.offset_frontier(), 40);
-    assert_eq!(
-        partition.mint_frontier(),
-        40,
-        "the reservation is ignored here, so the append point is the frontier"
-    );
+fn given_a_recorded_frontier_when_a_wider_group_restores_without_a_log_should_seed_only_a_persisted_durability_group()
+ {
+    for (durability, seeded_frontier) in [
+        (iggy_common::Durability::Persisted, 40),
+        (iggy_common::Durability::Replicated, 0),
+    ] {
+        let mut partition = partition_at_view(1, 1);
+        partition.set_runtime_options(TopicRuntimeOptions {
+            durability,
+            ..TopicRuntimeOptions::default()
+        });
+        assert!(partition.consensus().replica_count() > 1);
+        let recovered = recorded_state(40, 70_000);
+        partition.set_superblock(Rc::new(RecordingSuperblock::default()), Some(&recovered));
+        partition.restore_offset_frontier(Some(&recovered));
+        assert_eq!(
+            partition.offset_frontier(),
+            seeded_frontier,
+            "{durability:?}"
+        );
+        assert_eq!(
+            partition.mint_frontier(),
+            seeded_frontier,
+            "{durability:?}: the reservation is ignored here, so the append point is the frontier"
+        );
+    }
 }
 
 const RECOVERED_TAIL: u64 = 9;
@@ -466,7 +483,7 @@ fn restore_recovered_log_under_higher_frontier(
     partition.recovered_durable_offset = Some(RECOVERED_TAIL);
     let recovered = recorded_state(RECORDED_FRONTIER, 0);
     partition.set_superblock(Rc::new(RecordingSuperblock::default()), Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), true);
+    partition.restore_offset_frontier(Some(&recovered));
 }
 
 /// A group that acks before it persists can record a frontier over a tail
@@ -621,7 +638,7 @@ async fn given_a_flushed_partition_when_collapsing_should_drop_the_reservation_t
     let recovered = recorded_state(25, 25);
     let mut restarted = solo_recording_partition();
     restarted.set_superblock(store.clone(), Some(&recovered));
-    restarted.restore_offset_frontier(Some(&recovered), false);
+    restarted.restore_offset_frontier(Some(&recovered));
     assert_eq!(
         restarted.mint_frontier(),
         25,
@@ -680,7 +697,7 @@ async fn given_an_unspent_reservation_when_collapsing_should_leave_it_standing()
     let recovered = recorded_state(0, 65_537);
     let mut partition = solo_recording_partition();
     partition.set_superblock(store.clone(), Some(&recovered));
-    partition.restore_offset_frontier(Some(&recovered), false);
+    partition.restore_offset_frontier(Some(&recovered));
 
     assert!(partition.collapse_superblock_intent().is_none());
     assert_eq!(
@@ -694,7 +711,7 @@ async fn given_an_unspent_reservation_when_collapsing_should_leave_it_standing()
     // crashed incarnation confirmed.
     let mut restarted = solo_recording_partition();
     restarted.set_superblock(store, Some(&recovered));
-    restarted.restore_offset_frontier(Some(&recovered), false);
+    restarted.restore_offset_frontier(Some(&recovered));
     assert_eq!(restarted.mint_frontier(), 65_537);
 }
 

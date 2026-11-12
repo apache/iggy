@@ -1890,6 +1890,20 @@ impl Simulator {
         Some(partition.log.journal().inner.repair_headers_in(ops))
     }
 
+    /// The header of the prepare a replica journals at `op`, body included, or
+    /// `None` when it journals no such prepare or does not host the namespace.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn partition_journaled_header(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        op: u64,
+    ) -> Option<PrepareHeader> {
+        self.partition_journaled_headers(replica_idx, namespace, op..=op)?
+            .remove(&op)
+    }
+
     /// Consensus view for a replica's partition-plane group, or `None` if that
     /// replica does not host the namespace.
     #[must_use]
@@ -12618,7 +12632,7 @@ mod unservable_op_view_change_tests {
                     "a send no backup received was answered: {:?}",
                     replies[0].header()
                 );
-                journaled(&sim, OLD_PRIMARY, unservable_op)
+                sim.partition_journaled_header(usize::from(OLD_PRIMARY), namespace, unservable_op)
             })
             .expect("the primary must journal the send");
 
@@ -12638,7 +12652,8 @@ mod unservable_op_view_change_tests {
             },
         );
         assert!(
-            journaled(&sim, HEADER_HOLDER, unservable_op).is_none(),
+            sim.partition_journaled_header(usize::from(HEADER_HOLDER), namespace, unservable_op)
+                .is_none(),
             "the backup must hold op {unservable_op} as a header only"
         );
         assert!(
@@ -12849,12 +12864,6 @@ mod unservable_op_view_change_tests {
             .metadata()
             .applied_frontier()
             .partition_requests_allowed(sim.outboxes[replica].monotonic_now())
-    }
-
-    /// The header of `op` if the replica journals its prepare, body included.
-    fn journaled(sim: &Simulator, replica: u8, op: u64) -> Option<PrepareHeader> {
-        sim.partition_journaled_headers(usize::from(replica), namespace(), op..=op)?
-            .remove(&op)
     }
 
     fn step_until(sim: &mut Simulator, what: &str, reached: impl Fn(&Simulator) -> bool) {
@@ -18339,7 +18348,9 @@ mod empty_view_log_tests {
             sim.step();
             leads_a_later_view(&sim, PEER, namespace)
                 && normal_view(&sim, OLD_PRIMARY, namespace) == normal_view(&sim, PEER, namespace)
-                && journaled(&sim, OLD_PRIMARY, namespace, 1).is_none()
+                && sim
+                    .partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
+                    .is_none()
         });
         assert!(
             adopted,
@@ -18379,7 +18390,9 @@ mod empty_view_log_tests {
         let started = (0..ELECTION_STEPS).any(|_| {
             sim.step();
             leads_a_later_view(&sim, OLD_PRIMARY, namespace)
-                && journaled(&sim, OLD_PRIMARY, namespace, 1).is_none()
+                && sim
+                    .partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
+                    .is_none()
         });
         assert!(
             started,
@@ -18418,11 +18431,12 @@ mod empty_view_log_tests {
         let stranded = (0..SETUP_TOTAL_STEPS)
             .find_map(|_| {
                 sim.step();
-                journaled(&sim, OLD_PRIMARY, namespace, 1)
+                sim.partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
             })
             .expect("the primary journals the send as op 1");
         assert!(
-            journaled(&sim, PEER, namespace, 1).is_none(),
+            sim.partition_journaled_header(usize::from(PEER), namespace, 1)
+                .is_none(),
             "the op reached the backup"
         );
         (sim, client, namespace, stranded)
@@ -18463,10 +18477,13 @@ mod empty_view_log_tests {
             "a replica never applied the committed send: {:?}",
             states(sim, namespace)
         );
-        let first_op = journaled(sim, OLD_PRIMARY, namespace, 1).map(|header| header.checksum);
+        let first_op = sim
+            .partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
+            .map(|header| header.checksum);
         assert_eq!(
             first_op,
-            journaled(sim, PEER, namespace, 1).map(|header| header.checksum),
+            sim.partition_journaled_header(usize::from(PEER), namespace, 1)
+                .map(|header| header.checksum),
             "the replicas hold different entries at op 1"
         );
         assert!(
@@ -18508,18 +18525,6 @@ mod empty_view_log_tests {
         sim.partition_consensus_state(usize::from(replica), namespace)
             .filter(|state| matches!(state.status, Status::Normal))
             .map(|state| state.view)
-    }
-
-    /// The header `replica` holds at `op`, if it holds one.
-    fn journaled(
-        sim: &Simulator,
-        replica: u8,
-        namespace: IggyNamespace,
-        op: u64,
-    ) -> Option<PrepareHeader> {
-        sim.partition_journaled_headers(usize::from(replica), namespace, op..=op)?
-            .get(&op)
-            .copied()
     }
 
     /// The consensus state of both replicas, for a failure message.

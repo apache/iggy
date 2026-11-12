@@ -893,12 +893,7 @@ fn restore_partition_offsets(
     // it is the only carrier left when the segments that named the frontier are
     // gone (an all-GC'd origin's install, a crash inside the swap window), and
     // taking the max means real recovered data always wins.
-    //
-    // An empty chain and a WAL anchored at 0 still count as a recovered log:
-    // a multi-replica group that acks before it persists then starts where
-    // that log ends, not at the frontier.
-    let log_recovered = partition.log.has_segments() || segment_checkpoint.is_some();
-    partition.restore_offset_frontier(recovered_state, log_recovered);
+    partition.restore_offset_frontier(recovered_state);
 }
 
 /// Recover this partition's persisted segment chain, stamping each segment
@@ -1181,7 +1176,11 @@ pub async fn build_partition_fresh(
     // source of truth. Closing it needs the runtime fence to persist the
     // frontier before quarantining, and the boot-path chain refusal to carry
     // the refused chain's max `end_offset` on its error.
-    partition.restore_offset_frontier(recovered_state.as_ref(), false);
+    //
+    // A multi-replica group that acks before it persists takes no anchor: its
+    // record can name offsets that the group lost, and a rebuild anchored at
+    // them refuses every state transfer below them.
+    partition.restore_offset_frontier(recovered_state.as_ref());
 
     recover_consumer_offsets(&mut partition, partitions_config, namespace).await?;
     ensure_initial_segment(&mut partition, partitions_config, namespace, false).await?;
@@ -2413,14 +2412,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = solo_config(&root);
         let namespace = IggyNamespace::new(1, 1, 0);
-        let mut messages = IggyMessages::with_capacity(1);
-        messages.push(IggyMessage {
-            header: IggyMessageHeader::default(),
-            payload: Bytes::from_static(b"retained-tail"),
-            user_headers: None,
+        let mut parent = 0;
+        let prepares = [0, 1].map(|offset| {
+            let prepare = send_prepare(&config, offset + 1, parent, offset);
+            parent = prepare.header().checksum;
+            prepare
         });
-        let mut batch = SendMessagesOwned::from_messages(namespace, &messages).unwrap();
-        let segment_size = IggyByteSize::from(batch.header.total_size() as u64);
+        let tail_body = prepares[1].as_slice()[size_of::<PrepareHeader>()..].to_vec();
+        // One batch fills a segment, so the second batch starts the next one.
+        let segment_size = IggyByteSize::from(tail_body.len() as u64);
         let runtime = TopicRuntimeOptions {
             durability: iggy_common::Durability::Persisted,
             segment_size: Some(segment_size),
@@ -2449,32 +2449,7 @@ mod tests {
         let mut journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
             .await
             .unwrap();
-        let mut parent = 0;
-        let mut tail_body = Vec::new();
-        for offset in 0..2 {
-            batch.header.base_offset = offset;
-            batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
-            let total = size_of::<PrepareHeader>() + batch.header.total_size();
-            let mut prepare = Message::<PrepareHeader>::new(total);
-            let body = &mut prepare.as_mut_slice()[size_of::<PrepareHeader>()..];
-            batch.header.encode_into(body);
-            body[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
-            tail_body = body.to_vec();
-            let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
-                header.command = Command::Prepare;
-                header.operation = Operation::SendMessages;
-                header.cluster = CLUSTER;
-                header.group = namespace.inner();
-                header.op = offset + 1;
-                header.retry_capacity = u32::try_from(config.partition.dedup_clients_max).unwrap();
-                header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
-                header.session = 1;
-                header.request = offset + 1;
-                header.parent = parent;
-                header.size = u32::try_from(total).unwrap();
-                header.checksum = header.identity_checksum();
-            });
-            parent = prepare.header().checksum;
+        for prepare in prepares {
             journal.append(prepare.into_frozen()).await.unwrap();
         }
         let mut protection = OFFSETS_MAGIC.to_vec();
@@ -3012,41 +2987,80 @@ mod tests {
         );
     }
 
-    /// A rebuild recovers no log, so the recorded frontier stays its only
-    /// anchor on a multi-replica group too.
+    /// Boot moves a refused chain of a wider group aside, and the rebuilt
+    /// replica waits for a state transfer. A persisted group anchors the
+    /// rebuild at its recorded frontier. A group that acks before it persists
+    /// must not: its record can name offsets that a crash took from every
+    /// member, and a replica at them refuses every offer of a group that
+    /// resumed below, so a group of two never commits again.
     #[compio::test]
-    async fn given_a_recorded_frontier_when_building_a_replicated_durability_group_fresh_should_anchor_at_the_frontier()
+    async fn given_a_recorded_frontier_when_rebuilding_a_refused_chain_of_a_wider_group_should_anchor_only_a_persisted_durability_group()
      {
         const FRONTIER: u64 = 13;
-        let root = tempfile::tempdir().expect("tempdir");
-        let config = solo_config(&root);
-        let dir = config.get_partition_path(1, 1, 0);
-        let (store, recovered) = open_partition_superblock(&dir, test_identity(), 0)
-            .await
-            .expect("open a fresh partition superblock");
-        assert!(recovered.is_none());
-        store
-            .write(
-                &VsrState {
-                    commit_max: 0,
-                    offset_frontier: FRONTIER,
-                    ..recorded_state(0, 0)
-                }
-                .to_bytes(),
-            )
-            .await
-            .expect("record the frontier");
-        drop(store);
+        for (durability, anchor) in [
+            (iggy_common::Durability::Persisted, FRONTIER),
+            (iggy_common::Durability::Replicated, 0),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let config = solo_config(&root);
+            let partitions_config = solo_partitions_config(&config);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            let dir = config.get_partition_path(1, 1, 0);
+            drop(build_incarnation(&config, 0, 0).await);
+            // Without a WAL that owns the tail, an empty segment below another
+            // one is a chain that boot refuses.
+            std::fs::remove_dir_all(Path::new(&dir).join("prepares-0")).expect("remove the WAL");
+            std::fs::File::create(partitions_config.get_messages_path(1, 1, 0, 1))
+                .expect("second empty segment log");
+            let (store, _) = open_partition_superblock(&dir, test_identity(), 0)
+                .await
+                .expect("open the partition superblock");
+            store
+                .write(
+                    &VsrState {
+                        commit_max: 0,
+                        offset_frontier: FRONTIER,
+                        ..recorded_state(0, 0)
+                    }
+                    .to_bytes(),
+                )
+                .await
+                .expect("record the frontier");
+            drop(store);
 
-        let partition = build_incarnation(&config, 0, 0).await;
+            let partitions = solo_partitions(&config);
+            let partition = Box::pin(load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+                TopicRuntimeOptions {
+                    durability,
+                    ..TopicRuntimeOptions::default()
+                },
+                CLUSTER,
+                REPLICA,
+                ReplicaSet::all(REPLICAS),
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            ))
+            .await
+            .expect("boot rebuilds the refused chain")
+            .expect("the rebuilt partition");
 
-        assert_eq!(partition.mint_frontier(), FRONTIER);
-        assert_eq!(partition.offset_frontier(), FRONTIER);
-        assert_eq!(
-            partition.log.active_segment().start_offset,
-            FRONTIER,
-            "the chain must be planted where the counters resume"
-        );
+            assert!(
+                std::fs::metadata(format!("{dir}.fenced.0")).is_ok(),
+                "{durability:?}: boot did not refuse the chain, so this is not a rebuild"
+            );
+            assert!(partition.requires_state_transfer(), "{durability:?}");
+            assert_eq!(partition.offset_frontier(), anchor, "{durability:?}");
+            assert_eq!(partition.mint_frontier(), anchor, "{durability:?}");
+            assert_eq!(
+                partition.log.active_segment().start_offset,
+                anchor,
+                "{durability:?}: the chain must be planted where the counters resume"
+            );
+        }
     }
 
     /// A stored consumer offset can name a message that only the WAL holds.

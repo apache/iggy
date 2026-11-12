@@ -306,7 +306,7 @@ async fn given_a_saturated_reservation_when_restored_should_keep_refusing_the_te
     let recovered = recorded_state(0, u64::MAX);
     partition.set_superblock(store.clone(), Some(&recovered));
     partition.set_offset_reservation_lease(test_lease(16));
-    partition.restore_offset_frontier(Some(&recovered), false);
+    partition.restore_offset_frontier(Some(&recovered));
 
     assert_eq!(
         partition.mint_frontier(),

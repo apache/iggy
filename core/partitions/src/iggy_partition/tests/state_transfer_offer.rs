@@ -447,6 +447,53 @@ async fn given_waiting_backup_of_two_when_its_wal_names_a_commit_above_the_offer
     );
 }
 
+/// A group that acks before it persists can record a frontier over a tail that
+/// a crash then takes from both members, so the group resumes below the
+/// record. A backup whose chain boot refused is rebuilt and waits for a
+/// transfer. A counter at the record makes it refuse every offer of that
+/// group, and the primary commits nothing without this backup. The rebuild
+/// takes no counter from the record, so the backup installs.
+#[compio::test]
+async fn given_rebuilt_backup_of_two_when_its_record_names_a_frontier_above_the_offer_should_install()
+ {
+    const RECORDED_FRONTIER: u64 = 13;
+    // Each op of the offer is a send of one message.
+    const OFFER_COMMIT: u64 = 10;
+    const OFFER_FRONTIER: u64 = OFFER_COMMIT;
+    let directory = tempfile::tempdir().unwrap();
+    let partition_dir = directory.path().to_string_lossy().into_owned();
+    let (mut backup, _) = recording_partition_at(1, 2);
+    backup.runtime_options.durability = iggy_common::Durability::Replicated;
+    backup.set_partition_dir(partition_dir.clone());
+    set_offset_dirs_under(&mut backup, directory.path());
+    crate::state_transfer::mark_materialization_missing(&partition_dir, 0)
+        .await
+        .unwrap();
+    // The order of a rebuild: restore the counters, then open the WAL.
+    backup.restore_offset_frontier(Some(&recorded_state(RECORDED_FRONTIER, 0)));
+    backup.open_persistence().await.unwrap();
+    assert!(backup.requires_state_transfer());
+
+    let last = checksummed_segment_prepare(OFFER_COMMIT, 0, OFFER_FRONTIER - 1, b"last");
+    let offer = crate::state_transfer::ConsumerOffsetsWire {
+        dedup_capacity: consensus::CLIENTS_TABLE_MAX,
+        prepare_checksum: Some(last.header().checksum),
+        checkpoint_prepare: last.as_slice().to_vec(),
+        next_offset: OFFER_FRONTIER,
+        ..Default::default()
+    };
+    let installed = backup
+        .install_state_transfer(&repair_config(), OFFER_COMMIT, Vec::new(), &offer.encode())
+        .await;
+
+    assert!(
+        installed.is_ok(),
+        "the rebuilt backup refused the offer of its group: {installed:?}"
+    );
+    assert!(!backup.requires_state_transfer());
+    assert_eq!(backup.offset_frontier(), OFFER_FRONTIER);
+}
+
 /// In a group of three the other members can commit without the requester,
 /// and a primary that knows nothing would hand it an empty log, so the
 /// refusal stays.

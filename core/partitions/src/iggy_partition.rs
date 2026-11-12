@@ -2946,21 +2946,21 @@ where
     /// all-GC'd origin, a crash inside the install's swap window, the
     /// fence-and-rebuild path, which needs no crash at all, and a crash while
     /// acked messages were still resident in the journal). A solo group that
-    /// restarts its counter mints those offsets a second time, and a rebuild
-    /// that recovered no log has nothing else to anchor its chain to.
+    /// restarts its counter mints those offsets a second time, and a rebuilt
+    /// replica of a persisted group has nothing else to anchor its chain to.
     ///
-    /// A multi-replica group that acks before it persists ignores the record
-    /// once boot recovered a log (`log_recovered`: a segment chain or a WAL
-    /// segment anchor, even an empty one). The record can name the offsets of
-    /// a tail this replica lost in a crash, and the replica can use none of
-    /// them: its WAL only extends its own segment tail, and a backup refuses a
-    /// batch whose `base_offset` does not continue its own counter. A counter
-    /// below the group is a lag there. Repair journals the missing ops at the
-    /// offsets the group stamped and raises the counter with them. When no
-    /// member kept those ops, the group reuses their offsets. The same holds
-    /// for a replica that then awaits a state transfer, which boot learns only
-    /// when it opens the WAL: the record does not make it refuse an offer
-    /// below the recorded frontier.
+    /// A multi-replica group that acks before it persists ignores the record.
+    /// A crash can take from every member a tail that the record names, and
+    /// the group then reuses those offsets. A replica that recovered a log
+    /// resumes where that log ends: its WAL only extends its own segment
+    /// tail, and a backup refuses a batch whose `base_offset` does not
+    /// continue its own counter. A rebuilt replica recovered no log and
+    /// awaits a state transfer. A counter at the record makes that replica
+    /// refuse every offer of a group that resumed below the record, and a
+    /// group of two then never commits again, because a waiting replica
+    /// acknowledges nothing. A counter below the group is a lag there: repair
+    /// journals the missing ops at the offsets the group stamped and raises
+    /// the counter with them, and an install takes the frontier of its offer.
     ///
     /// A persisted group keeps the raise. Its record never names an offset
     /// that the group lost: a replica acknowledges a persisted send only once
@@ -2992,16 +2992,11 @@ where
     /// simulator share one implementation. A copy in the harness was a copy of
     /// the max rule that had lost the max, in the one place built to catch
     /// violations of it.
-    pub fn restore_offset_frontier(
-        &mut self,
-        recovered: Option<&consensus::VsrState>,
-        log_recovered: bool,
-    ) {
+    pub fn restore_offset_frontier(&mut self, recovered: Option<&consensus::VsrState>) {
         let Some(state) = recovered else {
             return;
         };
-        if log_recovered && self.consensus.replica_count() > 1 && !self.durability().is_persisted()
-        {
+        if self.consensus.replica_count() > 1 && !self.durability().is_persisted() {
             return;
         }
         let frontier = state.offset_frontier;
