@@ -3305,6 +3305,7 @@ where
         if !self.materialization_missing && persistence.recovered_frontier() {
             self.consensus.set_recovery_election_allowed(true);
         }
+        self.recovered_unproven = persistence.head() > 0;
         self.persistence = Some(persistence);
         self.start_persistence();
     }
