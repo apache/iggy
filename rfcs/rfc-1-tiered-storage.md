@@ -599,7 +599,17 @@ Two follow-ups are planned on top of this RFC: partitions that follow another cl
 a cluster in another datacenter serves that data from object storage, and a topic mode with the
 semantics of Redpanda's cloud topics: a write is acknowledged once its data is in object storage,
 the VSR log still orders it, and any cluster that can read the bucket can serve it. Neither is
-designed here, and neither commits to Redpanda's mechanism. This RFC keeps both possible:
+designed here, and neither commits to Redpanda's mechanism.
+
+The first is settled as far as it constrains this RFC. Each cluster has a bucket of its own and is
+the only writer under its prefix. A cluster that follows another reads that cluster's prefix, and
+nothing else connects the two: no data is replicated between clusters and none is copied between
+buckets. A followed partition is a log of its own at the origin's offsets, next to the following
+cluster's writable log of the same topic. The two are never merged and never ordered against each
+other, so both clusters accept writes without coordinating. A follower learns what it can read from
+the manifest alone, so it sees a segment once that segment is sealed, stored and listed there.
+
+This RFC keeps both follow-ups possible:
 
 - **Recorded prefixes.** Keys come from the prefix each chain file records, so a partition can name
   objects it did not upload under its own ids, as a follower or a restored partition must.
@@ -607,7 +617,8 @@ designed here, and neither commits to Redpanda's mechanism. This RFC keeps both 
   cluster's prefix and runs none of the primary's store duties: no uploads, deletions, front
   truncations or sweeps.
 - **The manifest as a contract.** It lists the floor, the trim point and the remote segments with
-  their checksums, in a versioned format.
+  their checksums, in a versioned format. A follower trusts nothing else: an object that no manifest
+  lists is not committed data.
 - **Both objects per segment.** The floor covers a segment only once its `.index` object is stored
   too, since a reader without the uploader's local index needs it.
 - **Ranges, not segments.** A remote source in the poll plan names an object and a byte range in
@@ -617,11 +628,12 @@ designed here, and neither commits to Redpanda's mechanism. This RFC keeps both 
   partition state-machine facility serve any later mode.
 
 Left to the follow-ups: retention that accounts for followers, since the deletion grace covers
-in-cluster readers only; missing objects that are transient under asynchronous bucket replication
-rather than lost; stream keys for encrypted topics read by another cluster; the live tail a follower
-needs before a segment seals; and the object-storage write path, its acknowledgement latency and how
-its data becomes per-partition objects, including whether that data lands as this RFC's segment
-objects, sharing one read path, retention and manifest, or in a format of its own.
+in-cluster readers only; stream keys for encrypted topics read by another cluster; consumer
+positions that move with a failover between clusters, one per origin log; how far a follower lags,
+which the seal and upload delay bounds here and only the object-storage write path lowers; and that
+write path itself, its acknowledgement latency and how its data becomes per-partition objects,
+including whether that data lands as this RFC's segment objects, sharing one read path, retention
+and manifest, or in a format of its own.
 
 ### Configuration
 
