@@ -289,6 +289,12 @@ where
     /// Commit point the recovered WAL names. Entries at or below it are
     /// committed history, so a fence neither holds them back nor proves them.
     recovered_commit: u64,
+    /// Commit point the WAL names on a replica that booted awaiting a state
+    /// transfer. Boot skipped the replay, so the journal is empty and
+    /// `commit_min` reads 0 while the WAL still holds those ops. Above 0 it
+    /// proves that the group committed an op, which an offer at op 0 would
+    /// erase.
+    pub(crate) unreplayed_commit: u64,
     /// First op of a broken fenced window the I/O lane is truncating. The fence's
     /// follow-up runs when that truncation lands.
     unproven_drop_from: Option<u64>,
@@ -961,6 +967,7 @@ where
             view_fence: None,
             recovered_unproven: false,
             recovered_commit: 0,
+            unreplayed_commit: 0,
             unproven_drop_from: None,
             proof_walk: (0, 0),
             proof_walk_memory: None,
@@ -1803,14 +1810,20 @@ where
             self.consensus.set_recovery_election_allowed(true);
         }
         self.workerless_offset_files.clear();
+        let checkpoint = persistence.checkpoint_op();
+        let head = persistence.head();
+        let mut commit = prepares
+            .iter()
+            .filter(|message| message.header().op != checkpoint)
+            .fold(checkpoint, |commit, message| {
+                commit.max(message.header().commit.min(head))
+            });
         if self.materialization_missing {
+            self.unreplayed_commit = commit;
             self.persistence = Some(persistence);
             self.consensus.resume_adopted_view();
             return Ok(());
         }
-        let checkpoint = persistence.checkpoint_op();
-        let head = persistence.head();
-        let mut commit = checkpoint;
         for message in prepares {
             let header = *message.header();
             if header.op == checkpoint {
@@ -1820,7 +1833,6 @@ where
                     .restore_checkpoint_prepare(checkpoint, message.into_frozen());
                 continue;
             }
-            commit = commit.max(header.commit.min(head));
             if header.operation == Operation::SendMessages {
                 self.append_repaired_send_messages(message).await?;
             } else {
@@ -2933,10 +2945,30 @@ where
     /// restart below where the group already is (a transfer install of an
     /// all-GC'd origin, a crash inside the install's swap window, the
     /// fence-and-rebuild path, which needs no crash at all, and a crash while
-    /// acked messages were still resident in the journal). Restarting the
-    /// counter is not a lag -- replicas re-stamp `base_offset` from it and
-    /// recompute `batch_checksum` over the result, so the next replicated
-    /// prepare would persist different bytes here than on every peer, silently.
+    /// acked messages were still resident in the journal). A solo group that
+    /// restarts its counter mints those offsets a second time, and a rebuilt
+    /// replica of a persisted group has nothing else to anchor its chain to.
+    ///
+    /// A multi-replica group that acks before it persists ignores the record.
+    /// A crash can take from every member a tail that the record names, and
+    /// the group then reuses those offsets. A replica that recovered a log
+    /// resumes where that log ends: its WAL only extends its own segment
+    /// tail, and a backup refuses a batch whose `base_offset` does not
+    /// continue its own counter. A rebuilt replica recovered no log and
+    /// awaits a state transfer. A counter at the record makes that replica
+    /// refuse every offer of a group that resumed below the record, and a
+    /// group of two then never commits again, because a waiting replica
+    /// acknowledges nothing. A counter below the group is a lag there: repair
+    /// journals the missing ops at the offsets the group stamped and raises
+    /// the counter with them, and an install takes the frontier of its offer.
+    ///
+    /// A persisted group keeps the raise. Its record never names an offset
+    /// that the group lost: a replica acknowledges a persisted send only once
+    /// its own WAL holds it durably, and the record takes the committed
+    /// counter or the frontier of an installed offer, never an uncommitted
+    /// counter. A record writer that breaks this, or a quorum that loses
+    /// durable data, leaves the counter above the group, and the group stalls
+    /// on the batch check above instead of handing those offsets out twice.
     ///
     /// The two counters are seeded separately, because the record carries two
     /// bounds. `offset_frontier` is what messages reached, so it seeds the
@@ -2949,8 +2981,8 @@ where
     /// The reservation is SOLO ONLY and applies to weaker durability. Persisted
     /// topics recover exact append positions from their prepare WAL. Advancing
     /// them to a reservation before replay would strand the retained segment tail.
-    /// A backup mints nothing: it re-stamps what
-    /// the primary sends and rejects anything that does not continue its own
+    /// A backup mints nothing: it journals what
+    /// the primary stamped and rejects anything that does not continue its own
     /// counter, so an append point a lease block above its group would have every
     /// peer refuse the batch. A replicated group is also less exposed, since an
     /// ack there means a quorum journaled the batch and the hole needs a
@@ -2964,6 +2996,9 @@ where
         let Some(state) = recovered else {
             return;
         };
+        if self.consensus.replica_count() > 1 && !self.durability().is_persisted() {
+            return;
+        }
         let frontier = state.offset_frontier;
         let reserved = if self.consensus.replica_count() == 1 && !self.durability().is_persisted() {
             state.offset_reserved
@@ -3924,9 +3959,7 @@ where
         self.consumer_offset_dirs = dirs.map(Some);
     }
 
-    /// Seed committed membership from one recovered offset file. The logical
-    /// value may be clamped to the recovered message frontier while the file
-    /// high-water retains the value read from disk.
+    /// Seed committed membership from one recovered offset file.
     pub fn seed_recovered_consumer_offset(
         &self,
         kind: ConsumerKind,
@@ -3942,22 +3975,21 @@ where
         );
     }
 
-    /// Lower the logical value of a recovered offset that lies past the partition's offset space,
-    /// keeping the high-water read from its file.
-    pub fn clamp_recovered_consumer_offset(
-        &self,
-        kind: ConsumerKind,
-        consumer_id: u32,
-        committed_offset: u64,
-    ) {
-        if let Some(state) = self.durable_consumer_offsets.get(kind, consumer_id) {
-            self.durable_consumer_offsets.record_explicit(
-                kind,
-                consumer_id,
-                committed_offset,
-                state.persisted_high_water,
-            );
+    /// Drop a recovered offset whose file boot removed, as if it had never been loaded.
+    pub(crate) fn forget_recovered_consumer_offset(&self, kind: ConsumerKind, consumer_id: u32) {
+        match kind {
+            ConsumerKind::Consumer => {
+                self.consumer_offsets.pin().remove(&(consumer_id as usize));
+            }
+            ConsumerKind::ConsumerGroup => {
+                self.consumer_group_offsets
+                    .pin()
+                    .remove(&ConsumerGroupId(consumer_id as usize));
+            }
+            // The durable table below is the only store of an external offset.
+            ConsumerKind::ExternalGroup => {}
         }
+        self.durable_consumer_offsets.remove(kind, consumer_id);
     }
 
     pub fn seed_stranded_consumer_offset(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
@@ -4181,7 +4213,7 @@ where
         outcome
     }
 
-    fn retire_consumer_offset_file(&self, path: &str) {
+    pub(crate) fn retire_consumer_offset_file(&self, path: &str) {
         if let Some(persistence) = &self.persistence {
             persistence.retire_offset_file(path);
         } else {
@@ -9841,9 +9873,10 @@ where
         self.history_is_busy() || self.transition.is_some()
     }
 
-    /// An installed snapshot replaces the history the recovered commit point named.
+    /// An installed snapshot replaces the history that the WAL commit points named.
     pub(crate) const fn forget_recovered_commit(&mut self) {
         self.recovered_commit = 0;
+        self.unreplayed_commit = 0;
     }
 
     /// Whether a fenced walk still has recovered committed ops to take.
