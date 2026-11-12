@@ -29,17 +29,18 @@ name: PR Triage Apply
 #   labels. This is the pattern ASF Infra requires in place of
 #   pull_request_target (https://infra.apache.org/github-actions-policy.html).
 #
+# pr-triage-reconcile.yml also starts it through workflow_dispatch for a PR
+# whose opening it never saw, and a maintainer can do the same by hand.
+#
 # Two jobs:
 #   resolve  reads the numeric ids out of the artifact, checks the collect
 #            run really belongs to the claimed PR, and outputs the PR number
 #            and the trigger ids. A comment or review with no command and no
-#            changes_requested state stops here. One run per collect run,
-#            never serialised.
-#   apply    is serialised per PR through a job-level concurrency group
-#            keyed on the resolved PR number. It re-fetches the trigger
-#            object and the PR's live state from the API and applies the
-#            labels, so two runs for the same PR can never interleave their
-#            reads and writes.
+#            changes_requested state stops here. Never serialised.
+#   apply    holds the repository-wide label lock shared with PR Skill
+#            Review Post and pr-triage-reconcile.yml, so no two label
+#            writers interleave. It re-fetches the trigger object and the
+#            PR's live state from the API and applies the labels.
 #
 # Comment commands (parsed line-by-line in PR comments and review bodies):
 #   /request-review @u [@u2 ...]   — request review from one or more
@@ -87,12 +88,17 @@ name: PR Triage Apply
 #                             manual triage. A good first issue PR that passes
 #                             gets a note for maintainers if its author has
 #                             other PRs open
+# A pull_request workflow does not run while a PR has a merge conflict, so
+# a PR opened with one is never seen opening. An open, non-draft PR that has
+# never carried an S-* label is treated as just opened: it gets the issue
+# check and the prolific author check, but no welcome. A PR opened as a
+# draft is checked again when it first gets an S-* label, because nothing
+# records that its opening check ran.
 # Then every apply run, whatever triggered it, converges the PR's S-*
 # labels on its live state:
 #   closed or draft        -> remove both S-* labels, then stop
 #   open, no S-* present   -> add S-waiting-on-review
-# so a run that arrives after the PR changed, or one that displaced a
-# pending run in the per-PR concurrency group, still leaves the labels
+# so a run that arrives after the PR changed still leaves the labels
 # right. The pull_request action from the collector then only selects:
 #   opened (non-draft)     -> unless the author has repo write access, post
 #                             a one-time welcome comment listing the triage
@@ -104,7 +110,8 @@ name: PR Triage Apply
 # PRs the collector never saw.
 #
 # SECURITY:
-# - workflow_run is the ONLY trigger here.
+# - workflow_run is the trigger for events. workflow_dispatch needs write
+#   access to start and takes only a PR number, checked to be numeric.
 # - No actions/checkout of any ref. PR-controlled code is never executed.
 # - The default GITHUB_TOKEN is never written to outputs, env files, or
 #   passed to user-supplied programs. The workflow only calls the GitHub
@@ -118,8 +125,9 @@ name: PR Triage Apply
 #   resolve job reads only numeric ids and the event action from it. On
 #   the pull_request path it checks the claimed PR's head repository and
 #   branch against the ones GitHub recorded for the collect run; on the
-#   pull_request_review path the review must belong to the claimed PR and
-#   be as new as the run. The apply job re-fetches the author, association,
+#   pull_request_review path the review must belong to the claimed PR, be
+#   as new as the run, and the run must have fired on the reviewed commit
+#   or the PR's current head. The apply job re-fetches the author, association,
 #   body, review state and PR state from the API, which a fork cannot
 #   forge. See
 #   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
@@ -128,6 +136,11 @@ on:
   workflow_run:
     workflows: ["PR Triage Collect"]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR to converge, with the opening checks if it never had an S-* label
+        required: true
 
 permissions:
   pull-requests: write
@@ -137,18 +150,9 @@ permissions:
   # artifact uploaded by the upstream PR Triage Collect run via run-id.
   actions: read
 
-concurrency:
-  # Shared with PR Skill Review Post: neither whole-label replacement may
-  # overwrite an addition made by the other workflow. The PR number is not
-  # available on workflow_run until the artifact has been resolved.
-  group: pr-label-writes-${{ github.repository }}
-  cancel-in-progress: false
-  # Retain pending open events and commands instead of replacing them.
-  queue: max
-
 jobs:
   resolve:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-slim
     timeout-minutes: 5
     outputs:
@@ -159,6 +163,7 @@ jobs:
       lifecycle_action: ${{ steps.resolve.outputs.lifecycle_action }}
     steps:
       - name: Download triage event artifact
+        if: github.event_name == 'workflow_run'
         uses: actions/download-artifact@v8
         with:
           name: triage-event
@@ -169,9 +174,11 @@ jobs:
       - name: Resolve the trigger from the API
         id: resolve
         env:
-          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          UPSTREAM_EVENT: ${{ github.event_name == 'workflow_dispatch' && 'workflow_dispatch' || github.event.workflow_run.event }}
+          DISPATCH_PR: ${{ inputs.pr_number }}
           HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_CREATED: ${{ github.event.workflow_run.created_at }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -197,8 +204,12 @@ jobs:
           # on, and does not depend on the commits endpoint, which stops at
           # 250 commits. On a pull_request_review run GitHub records the
           # base repository as head_repository and the branch name is the
-          # fork's to choose, so neither is checked there; the review must
-          # instead belong to the claimed PR and be as new as the run.
+          # fork's to choose, so neither is checked there. The review must
+          # instead belong to the claimed PR and be as new as the run, and
+          # HEAD_SHA, the commit GitHub ran collect on, must be the reviewed
+          # commit or the PR's current head. A fork's own copy of collect
+          # only runs on a commit of the fork's PR, so it cannot carry a
+          # review of another PR.
           #
           # The case below routes on UPSTREAM_EVENT, which GitHub sets from
           # the collect run itself, not from the artifact. GitHub only runs
@@ -210,7 +221,7 @@ jobs:
           # rejected.
           payload=( payload/*.json )
           f="${payload[0]:-}"
-          if [[ -z "$f" ]]; then
+          if [[ -z "$f" && "$UPSTREAM_EVENT" != workflow_dispatch ]]; then
             echo "triage payload not found under payload/" >&2
             ls -la payload/ >&2 || true
             exit 1
@@ -278,8 +289,7 @@ jobs:
               require_num "$cid" comment_id
               c="$(gh_api "repos/${REPO}/issues/comments/${cid}")"
               # Most PR comments carry no command. Stop them here rather
-              # than start the serialised job: a run that never enters the
-              # per-PR group cannot displace a pending lifecycle run.
+              # than queue for the label lock.
               if ! has_command "$(jq -r '.body // ""' <<<"$c")"; then
                 echo "comment ${cid} has no command, skipping"
                 echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -322,6 +332,14 @@ jobs:
                 echo "review ${rid} was submitted at ${sub} and the collect run created at ${RUN_CREATED}, outside the allowed window" >&2
                 exit 1
               fi
+              # A reply in an outdated thread carries the old commit, so the
+              # PR's current head is accepted too.
+              reviewed="$(jq -r '.commit_id // ""' <<<"$r")"
+              live="$(gh_api "repos/${REPO}/pulls/${cpr}" | jq -r '.head.sha // ""')"
+              if [[ -z "$HEAD_SHA" || ( "$HEAD_SHA" != "$reviewed" && "$HEAD_SHA" != "$live" ) ]]; then
+                echo "collect ran on ${HEAD_SHA}, which is neither the reviewed commit ${reviewed} nor the head ${live} of PR ${cpr}" >&2
+                exit 1
+              fi
               # An approve or comment-only review with no command has nothing
               # to apply; see the issue_comment path.
               if ! has_command "$(jq -r '.body // ""' <<<"$r")" \
@@ -352,6 +370,11 @@ jobs:
               require_head "$cpr"
               pr="$cpr"
               ;;
+            workflow_dispatch)
+              # Only someone with write access, or pr-triage-reconcile.yml,
+              # can start this.
+              pr="$DISPATCH_PR"
+              ;;
             *)
               echo "unexpected upstream event: ${UPSTREAM_EVENT}" >&2
               exit 1
@@ -375,28 +398,25 @@ jobs:
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-slim
     timeout-minutes: 5
-    # Serialised per PR. The group is keyed on the PR number the resolve job
-    # verified against the collect run's head, so a forged payload cannot
-    # park a run in another PR's group. cancel-in-progress: false keeps the
-    # active run; GitHub still replaces a pending run with the latest
-    # arrival, so under N rapid triggers on one PR the active run and the
-    # latest land and anything queued between them is dropped. That is safe
-    # because every run first converges the S-* labels on the PR's live
-    # state and /ready and /author are idempotent. /request-review is the
-    # only non-idempotent command: a three-comment burst inside one run's
-    # lifetime lands at most two of them.
+    # Shared with PR Skill Review Post and pr-triage-reconcile.yml: no
+    # whole-label replacement may overwrite another writer's change. Held by
+    # this job only, so resolving artifacts and skipping no-op triggers never
+    # wait on it.
     concurrency:
-      group: pr-triage-apply-pr-${{ needs.resolve.outputs.pr_number }}
+      group: pr-label-writes-${{ github.repository }}
       cancel-in-progress: false
+      # Keep every pending run instead of replacing it.
+      queue: max
     steps:
       - name: Dispatch
+        id: dispatch
         uses: actions/github-script@v9
         env:
           COMMENT_ID: ${{ needs.resolve.outputs.comment_id }}
           REVIEW_ID: ${{ needs.resolve.outputs.review_id }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
           LIFECYCLE_ACTION: ${{ needs.resolve.outputs.lifecycle_action }}
-          TRIAGE_EVENT_NAME: ${{ github.event.workflow_run.event }}
+          TRIAGE_EVENT_NAME: ${{ github.event_name == 'workflow_dispatch' && 'workflow_dispatch' || github.event.workflow_run.event }}
         with:
           script: |
             const LABEL_REVIEW = 'S-waiting-on-review';
@@ -425,7 +445,8 @@ jobs:
             }
 
             // The upstream trigger: issue_comment, pull_request_review or
-            // pull_request, from GitHub's own workflow_run context.
+            // pull_request from GitHub's own workflow_run context, or
+            // workflow_dispatch.
             const eventName = process.env.TRIAGE_EVENT_NAME;
 
             // Welcome comment posted once when a non-draft PR is opened.
@@ -530,16 +551,12 @@ jobs:
             // -> just clear both S-*). One primitive for both so a label
             // DELETE pair can never resurrect a cleared S-* on a closed PR.
             //
-            // The apply job is serialised per PR, so two runs for one PR
-            // never interleave. The single PUT still matters: it cannot be
-            // observed half-done and cannot fabricate a both-labels state.
-            //
-            // The list+setLabels pair is not atomic against unrelated
-            // mutators, so a label added by another workflow between our
-            // list and our setLabels would be overwritten. Acceptable: the
-            // other label writers (pr-triage-reconcile.yml, the stale bot)
-            // converge on the same live state, so a lost add is redone on
-            // their next pass.
+            // The apply job holds the shared label lock, so no other
+            // whole-label writer interleaves. The single PUT still matters:
+            // it cannot be observed half-done and cannot fabricate a
+            // both-labels state. The stale bot and the unmark workflow only
+            // add or remove S-stale, so a change of theirs between the list
+            // and the PUT is lost and redone on their next pass.
             //
             // Pagination is mandatory: an unpaginated per_page: 100 fetch
             // on a PR carrying more than 100 labels would silently drop
@@ -848,11 +865,10 @@ jobs:
 
             // ----- live state -----
             // The trigger may be minutes old by the time this run gets the
-            // per-PR slot, and the lifecycle action came from a forgeable
+            // label lock, and the lifecycle action came from a forgeable
             // artifact, so every run reads the PR's live state and acts on
             // that. The S-* labels are converged first, whatever the
-            // trigger: a run that displaced a pending close or draft run in
-            // the concurrency group still leaves them right.
+            // trigger.
             let pr;
             try {
               ({ data: pr } = await withRetry(() => github.rest.pulls.get({
@@ -891,19 +907,42 @@ jobs:
 
             // ----- issue check on open -----
             // Runs before the convergence because it applies to drafts too:
-            // opening a draft still claims the issue. ready_for_review is
-            // not checked, so the issue line and assignment are judged only
-            // as the PR opened. Only a confirmed contributor is checked:
-            // closing a maintainer's PR on a failed lookup is worse than
-            // missing one. A close made with GITHUB_TOKEN never reaches the
-            // collector, so closeIfIssueCheckFails clears the S-* labels
-            // itself.
+            // opening a draft still claims the issue. Only a confirmed
+            // contributor is checked: closing a maintainer's PR on a failed
+            // lookup is worse than missing one. A close made with
+            // GITHUB_TOKEN never reaches the collector, so
+            // closeIfIssueCheckFails clears the S-* labels itself.
             const lifecycleAction = eventName === 'pull_request'
               ? process.env.LIFECYCLE_ACTION : '';
+            // An open PR that never carried an S-* label was opened while
+            // conflicted, so its opening checks never ran. Checked only when
+            // no S-* label is present, which is rare.
+            const neverHadState = async () => {
+              const events = await withRetry(() => github.paginate(
+                github.rest.issues.listEvents,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  per_page: 100,
+                },
+              ), 'listEvents');
+              return !events.some(e => e.event === 'labeled'
+                && e.label && (e.label.name === LABEL_REVIEW || e.label.name === LABEL_AUTHOR));
+            };
+            const missedOpening = lifecycleAction !== 'opened'
+              && pr.state === 'open' && !pr.draft && !hasState
+              && await neverHadState();
+            const opening = lifecycleAction === 'opened' || missedOpening;
+            if (missedOpening) {
+              core.info('PR never carried an S-* label, running the opening checks');
+            }
+            // Read by the prolific author step.
+            core.setOutput('opening', String(opening));
             // A human author's write access, checked once on open for both
             // the issue check and the welcome: true, false, or null when
             // the lookup failed.
-            const access = lifecycleAction === 'opened' && pr.state === 'open'
+            const access = opening && pr.state === 'open'
                 && prAuthor && !prAuthorIsBot
               ? await writeAccess(prAuthor)
               : null;
@@ -937,6 +976,9 @@ jobs:
             }
 
             // ----- pull_request lifecycle -----
+            if (eventName === 'workflow_dispatch') {
+              return;
+            }
             if (eventName === 'pull_request') {
               const action = process.env.LIFECYCLE_ACTION;
               // Welcome comment only on the initial non-draft open,
@@ -1034,6 +1076,40 @@ jobs:
             if (!COMMAND_RE.test(body) && !reviewWantsAuthor) {
               core.info('no command in body and no actionable review state, skipping');
               return;
+            }
+
+            // A review is applied once, by the run its own submission
+            // started. Skip it when its author or a committer has given a
+            // later command on this PR, so a rerun or a replay cannot undo
+            // that reversal.
+            if (eventName === 'pull_request_review') {
+              const submitted = Date.parse(trigger.submitted_at);
+              const reviewer = (trigger.user && trigger.user.login) || '';
+              const counts = (item, at) => Date.parse(at) > submitted
+                && (COMMAND_RE.test(item.body || '') || item.state === 'CHANGES_REQUESTED')
+                && ((item.user && item.user.login) === reviewer
+                    || COMMITTER_ASSOCS.has(item.author_association));
+              const [reviews, comments] = await Promise.all([
+                withRetry(() => github.paginate(github.rest.pulls.listReviews, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                  per_page: 100,
+                }), 'listReviews'),
+                withRetry(() => github.paginate(github.rest.issues.listComments, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  since: trigger.submitted_at,
+                  per_page: 100,
+                }), 'listComments'),
+              ]);
+              const later = reviews.find(r => r.id !== reviewId && counts(r, r.submitted_at))
+                || comments.find(c => counts(c, c.created_at));
+              if (later) {
+                core.info(`review ${reviewId} superseded by a later command from ${later.user.login}, skipping`);
+                return;
+              }
             }
 
             // Bot-suffixed accounts (e.g. dependabot[bot]) cannot drive
@@ -1235,7 +1311,7 @@ jobs:
             }
 
       - name: Label prolific author on open
-        if: needs.resolve.outputs.lifecycle_action == 'opened'
+        if: steps.dispatch.outputs.opening == 'true'
         env:
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
         uses: actions/github-script@v9

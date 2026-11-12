@@ -25,18 +25,23 @@ name: PR Triage Reconcile
 # default branch with a write token and applies the same rules from the
 # PRs' live state:
 #   closed or draft with an S-* label      -> remove both S-* labels
-#   open, non-draft, no S-* label          -> add S-waiting-on-review
-#   open with S-stale and a push, reopen or ready_for_review after the
-#   label was added                        -> remove S-stale
+#   open, non-draft, no S-* label, but had one before
+#                                          -> add S-waiting-on-review
+#   open, non-draft, never had an S-* label
+#                                          -> start pr-triage-apply.yml for
+#                                             it, which runs the opening
+#                                             checks before adding the label
+#   open with S-stale and a reopen, ready_for_review, or a head other than
+#   the one stale-prs.yml recorded         -> remove S-stale
 # Comments and reviews fire issue_comment / pull_request_review whatever
 # the merge state, so those paths need no catch-up. The welcome comment is
 # not reconciled: it cannot tell a conflicted first open from a PR that
 # never qualified.
 #
-# Everything here is idempotent, so overlapping with an apply run is
-# harmless: both converge on the same live state. Note that this makes
-# "every open non-draft PR carries an S-* label" an enforced invariant:
-# removing both by hand lasts until the next run.
+# The job holds the label lock shared with pr-triage-apply.yml and PR Skill
+# Review Post, so it never reads labels that another writer is changing.
+# Note that this makes "every open non-draft PR carries an S-* label" an
+# enforced invariant: removing both by hand lasts until the next run.
 #
 # SECURITY: schedule and workflow_dispatch only, no actions/checkout, no
 # PR content is executed. The workflow only calls the GitHub REST API via
@@ -51,15 +56,17 @@ permissions:
   pull-requests: write
   issues: write
   contents: read
-
-concurrency:
-  group: pr-triage-reconcile
-  cancel-in-progress: false
+  # To start pr-triage-apply.yml for a PR whose opening it never saw.
+  actions: write
 
 jobs:
   reconcile:
     runs-on: ubuntu-slim
     timeout-minutes: 10
+    concurrency:
+      group: pr-label-writes-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
     steps:
       - name: Reconcile lifecycle labels
         uses: actions/github-script@v9
@@ -148,6 +155,25 @@ jobs:
                 return;
               }
               if (hasState) return;
+              const events = await withRetry(() => github.paginate(
+                github.rest.issues.listEvents,
+                { owner, repo, issue_number: n, per_page: 100 },
+              ), `listEvents #${n}`);
+              const hadState = events.some(e => e.event === 'labeled'
+                && e.label && (e.label.name === LABEL_REVIEW || e.label.name === LABEL_AUTHOR));
+              if (!hadState) {
+                // Opened while conflicted, so the opening checks never ran.
+                // pr-triage-apply.yml runs them and adds the label. A
+                // dispatch made with GITHUB_TOKEN does start a run.
+                await withRetry(() => github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: 'pr-triage-apply.yml',
+                  ref: defaultBranch,
+                  inputs: { pr_number: String(n) },
+                }), `dispatch apply #${n}`);
+                core.info(`#${n}: never had an S-* label, started PR Triage Apply`);
+                return;
+              }
               await withRetry(() => github.rest.issues.addLabels({
                 owner, repo, issue_number: n, labels: [LABEL_REVIEW],
               }), `addLabels #${n}`);
@@ -157,10 +183,11 @@ jobs:
             // Activity after the last S-stale labelling that the collector
             // could not have seen. reopened, ready_for_review and
             // head_ref_force_pushed carry timestamps on the timeline. A
-            // plain push does not: its committed entries carry git dates,
-            // so the head commit's committer date stands in for it, and a
-            // rebase or a new commit moves that forward.
+            // plain push does not, and its commits carry git dates that can
+            // be older than the label, so a push is found by comparing the
+            // head with the one stale-prs.yml recorded in its stale comment.
             const ACTIVITY = new Set(['reopened', 'ready_for_review', 'head_ref_force_pushed']);
+            const HEAD_MARKER_RE = /<!-- iggy-stale-head:([0-9a-f]{40}) -->/;
             const unmarkStale = async (n) => {
               const pr = await livePr(n);
               if (!pr || pr.state !== 'open') return;
@@ -188,11 +215,27 @@ jobs:
                 }
               }
               if (!why) {
-                const { data: head } = await withRetry(() => github.rest.repos.getCommit({
-                  owner, repo, ref: pr.head.sha,
-                }), `getCommit #${n}`);
-                const committed = head.commit && head.commit.committer && head.commit.committer.date;
-                if (committed && Date.parse(committed) > markedAt) why = 'push';
+                // The stale comment is posted with the label. Only the bot's
+                // own comment counts, and only one from this labelling.
+                const comments = await withRetry(() => github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner, repo, issue_number: n, per_page: 100,
+                    since: new Date(markedAt - 5 * 60 * 1000).toISOString(),
+                  },
+                ), `listComments #${n}`);
+                const recorded = comments
+                  .filter(c => c.user && c.user.login === 'github-actions[bot]'
+                    && Date.parse(c.created_at) >= markedAt - 5 * 60 * 1000)
+                  .map(c => (c.body || '').match(HEAD_MARKER_RE))
+                  .filter(Boolean)
+                  .map(m => m[1])
+                  .pop();
+                if (!recorded) {
+                  core.info(`#${n}: no recorded head for ${LABEL_STALE}, leaving it`);
+                  return;
+                }
+                if (recorded !== pr.head.sha) why = 'push';
               }
               if (!why) return;
               try {
@@ -205,6 +248,11 @@ jobs:
               }
               core.info(`#${n}: removed ${LABEL_STALE} (${why})`);
             };
+
+            const { data: repoInfo } = await withRetry(() => github.rest.repos.get({
+              owner, repo,
+            }), 'repos.get');
+            const defaultBranch = repoInfo.default_branch;
 
             // A comma in label: is OR; advanced search allows the grouped OR.
             const stateCandidates = [

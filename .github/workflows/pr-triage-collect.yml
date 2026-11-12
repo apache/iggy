@@ -39,8 +39,9 @@ name: PR Triage Collect
 # take only numeric ids and the event action from the artifact, check the
 # action against a fixed list, check on pull_request that the claimed PR's
 # head is the repository and branch this run fired on and on
-# pull_request_review that the review is on the claimed PR and as new as the
-# run, and re-fetch everything else from the API.
+# pull_request_review that the review is on the claimed PR, as new as the
+# run, and on the commit this run fired on or the PR's current head, and
+# re-fetch everything else from the API.
 
 on:
   issue_comment:
