@@ -54,6 +54,12 @@ impl PartitionContext {
         header.owner_generation = self.owner_generation;
         header.minimum_metadata_op = self.metadata_op;
     }
+
+    /// `None` for the zero context. It names no history, so it counts as no context.
+    #[must_use]
+    pub fn non_zero(self) -> Option<Self> {
+        (self != Self::default()).then_some(self)
+    }
 }
 
 impl WireEncode for PartitionContext {

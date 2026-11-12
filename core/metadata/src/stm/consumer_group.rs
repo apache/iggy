@@ -36,7 +36,7 @@ use crate::stm::result::{
     ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult, JoinConsumerGroupResult,
     LeaveConsumerGroupResult,
 };
-use crate::stm::stream::{Partition, StreamsInner};
+use crate::stm::stream::{Partition, PartitionChangeKind, StreamsInner};
 use bytes::Bytes;
 
 use bytes::{BufMut, BytesMut};
@@ -652,10 +652,14 @@ impl StateHandler for DeleteConsumerGroupRequest {
         // A finalized deletion applies at its completion op. A sibling group
         // created after the intent can hold a later op than the intent.
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
-        // Bump the partition-shaping revision so the reconciler's fast-skip
-        // doesn't pass over the delete: it reclaims the group's leftover
-        // offsets on the topic's surviving partitions.
+        // Each partition of the topic gets a change, so the reconciler
+        // reclaims the group's leftover offsets on it.
         state.revision = state.revision.wrapping_add(1);
+        state.record_topic_partition_changes(
+            stream_id,
+            topic_id,
+            PartitionChangeKind::ConsumerGroupDeleted,
+        );
         // The dropped group may have held pending revocations.
         state.recompute_consumer_group_metadata();
         let (requested_op, actor) = state.deletion_origin();
@@ -958,7 +962,9 @@ impl StateHandler for RemoveConsumerGroupMembersRequest {
                     }
                 }
             }
-            // Only perturb the reconciler when a membership actually changed.
+            // Bump only when a membership actually changed. `revision` stamps
+            // the incarnation of every later partition, so every replica must
+            // bump at the same ops.
             if any_removed {
                 state.revision = state.revision.wrapping_add(1);
                 state.recompute_consumer_group_metadata();
@@ -1306,7 +1312,7 @@ impl ConsumerGroupSnapshot {
 mod tests {
     use super::*;
     use crate::stm::snapshot::Snapshotable;
-    use crate::stm::stream::Streams;
+    use crate::stm::stream::{PartitionChange, Streams};
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::partitions::{
         CreatePartitionsRequest, CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
@@ -1318,6 +1324,7 @@ mod tests {
     };
     use iggy_binary_protocol::{WireName, WireOptions};
     use iggy_common::IggyTimestamp;
+    use server_common::sharding::IggyNamespace;
 
     #[test]
     fn given_balanced_owners_when_fourth_member_joins_should_move_only_three_partitions() {
@@ -1919,6 +1926,44 @@ mod tests {
         );
         assert_eq!(streams.consumer_group_session(CLIENT), Some(11));
         assert_eq!(streams.consumer_group_session(OTHER), None);
+    }
+
+    /// The final delete of a group records one change per partition of its
+    /// topic, so each owner reclaims the group's offsets without a walk.
+    #[test]
+    fn given_group_delete_when_it_finalizes_should_record_a_change_per_topic_partition() {
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        let before = state.revision;
+        let delete = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(0),
+        };
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(apply.code, 0);
+
+        let changes: Vec<_> = state
+            .recent_partition_changes
+            .since(before)
+            .expect("the feed holds the delete")
+            .copied()
+            .collect();
+        assert_eq!(
+            changes,
+            [(
+                state.revision,
+                PartitionChange {
+                    namespace: IggyNamespace::new(0, 0, 0),
+                    created_revision: state.items[0].topics[0].partitions[0].created_revision,
+                    kind: PartitionChangeKind::ConsumerGroupDeleted,
+                }
+            )]
+        );
     }
 
     #[test]

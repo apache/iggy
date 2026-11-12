@@ -21,7 +21,7 @@
 //! password are an Iggy username and password, so authenticating is forwarding them to an Iggy
 //! login and seeing whether it succeeds. `docs/AUTHENTICATION.md` has the reasoning.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -208,7 +208,10 @@ pub struct AuthenticatedPrincipal {
     /// the user failed.
     pub user: Option<UserKey>,
     pub permissions: PrincipalPermissions,
-    /// Whether [`Self::permissions`] is a real answer or a fallback.
+    /// The topics that the principal's stream and topic grants let it read. Each commit checks
+    /// them.
+    pub topic_reads: Arc<TopicReads>,
+    /// Whether [`Self::permissions`] and [`Self::topic_reads`] are a real answer or a fallback.
     ///
     /// A read that failed after a successful login degrades to an empty set, which is
     /// indistinguishable on the wire from a principal that genuinely holds nothing. Silently
@@ -233,8 +236,16 @@ impl AuthenticatedPrincipal {
             username: Self::ANONYMOUS.to_string(),
             user: None,
             permissions: PrincipalPermissions::default(),
+            topic_reads: Arc::default(),
             permissions_known: true,
         }
+    }
+
+    /// Whether this is [`Self::anonymous`]: a connection on a listener that authenticates no one.
+    /// A login whose user could not be read has no user either, but its permissions are unknown.
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        self.user.is_none() && self.permissions_known && self.username == Self::ANONYMOUS
     }
 }
 
@@ -492,10 +503,11 @@ impl SaslAuthenticator for IggyAuthenticator {
             }
         }
 
-        outcome.map(|(permissions, user)| AuthenticatedPrincipal {
+        outcome.map(|(grants, user)| AuthenticatedPrincipal {
             username: credentials.username.clone(),
             user,
-            permissions,
+            permissions: grants.permissions,
+            topic_reads: grants.topic_reads,
             permissions_known: user.is_some(),
         })
     }
@@ -551,14 +563,12 @@ pub(crate) async fn resolve_principal(
         debug!(username, "the certificate names an inactive Iggy user");
         return Err(AuthError::Rejected);
     }
+    let grants = Grants::of(user.permissions.as_ref());
     Ok(AuthenticatedPrincipal {
         username: username.to_string(),
         user: Some(UserKey::from(&user)),
-        permissions: user
-            .permissions
-            .as_ref()
-            .map(principal_permissions)
-            .unwrap_or_default(),
+        permissions: grants.permissions,
+        topic_reads: grants.topic_reads,
         permissions_known: true,
     })
 }
@@ -572,13 +582,13 @@ pub(crate) async fn resolve_principal(
 async fn fetch_permissions(
     client: &impl Client,
     username: &str,
-) -> Result<(PrincipalPermissions, Option<UserKey>), AuthError> {
+) -> Result<(Grants, Option<UserKey>), AuthError> {
     // Unreachable in practice: a username that reached a successful login is already inside
     // Identifier's own length bounds. Propagating rather than degrading is still the wrong shape
     // for this function, so it degrades like every other failure below.
     let Ok(identifier) = Identifier::named(username) else {
         warn!("authenticated, but the principal's name is not a valid Iggy identifier");
-        return Ok((PrincipalPermissions::default(), None));
+        return Ok((Grants::default(), None));
     };
     // Deliberately not propagated as a failure. The credentials were already accepted by the login
     // above, so turning a stumble on this second round trip into a rejection would answer a correct
@@ -608,12 +618,82 @@ async fn fetch_permissions(
     // A record that resolved but carries no permissions is a real answer: the principal holds
     // nothing. Only a read that did not resolve is unknown.
     Ok((
-        user.as_ref()
-            .and_then(|user| user.permissions.as_ref())
-            .map(principal_permissions)
-            .unwrap_or_default(),
+        Grants::of(user.as_ref().and_then(|user| user.permissions.as_ref())),
         user.as_ref().map(UserKey::from),
     ))
+}
+
+/// What Iggy lets a principal do, as far as the gateway checks it: the global permissions
+/// projected onto Kafka, and the topics that stream and topic grants let it read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grants {
+    pub permissions: PrincipalPermissions,
+    pub topic_reads: Arc<TopicReads>,
+}
+
+impl Grants {
+    /// The grants of a user's `permissions`. A user record without permissions grants nothing.
+    #[must_use]
+    pub fn of(permissions: Option<&Permissions>) -> Self {
+        permissions.map_or_else(Self::default, |permissions| Self {
+            permissions: principal_permissions(permissions),
+            topic_reads: Arc::new(TopicReads::of(permissions)),
+        })
+    }
+}
+
+/// The topics that a principal's stream and topic grants let it read, by Iggy's numeric ids.
+///
+/// Iggy creates a consumer group for a user that may read the topic: `create_consumer_group` is
+/// `get_topic` in `core/metadata/src/permissioner/permissioner_rules/`. A global grant covers
+/// every topic, and [`PrincipalPermissions::read_topics`] holds it. A stream grant covers the
+/// topics of its stream, and a topic grant its topic. Kafka has no resource above a topic, so only
+/// `OffsetCommit` reads these.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TopicReads {
+    /// Streams whose every topic the principal may read.
+    streams: BTreeSet<usize>,
+    /// Topics the principal may read, as `(stream, topic)`.
+    topics: BTreeSet<(usize, usize)>,
+}
+
+impl TopicReads {
+    /// The stream and topic grants of `permissions`, with the flags that Iggy's `get_topic`
+    /// accepts.
+    #[must_use]
+    pub fn of(permissions: &Permissions) -> Self {
+        let mut reads = Self::default();
+        for (&stream, granted) in permissions.streams.iter().flatten() {
+            if granted.manage_stream
+                || granted.read_stream
+                || granted.manage_topics
+                || granted.read_topics
+            {
+                reads.streams.insert(stream);
+            }
+            for (&topic, granted) in granted.topics.iter().flatten() {
+                if granted.manage_topic || granted.read_topic {
+                    reads.topics.insert((stream, topic));
+                }
+            }
+        }
+        reads
+    }
+
+    /// Whether no stream or topic grant lets the principal read a topic.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty() && self.topics.is_empty()
+    }
+
+    /// Whether a grant lets the principal read topic `topic` of stream `stream`.
+    #[must_use]
+    pub fn covers(&self, stream: u32, topic: u32) -> bool {
+        let (Ok(stream), Ok(topic)) = (usize::try_from(stream), usize::try_from(topic)) else {
+            return false;
+        };
+        self.streams.contains(&stream) || self.topics.contains(&(stream, topic))
+    }
 }
 
 /// Projects Iggy's global permissions onto the subset that has a Kafka meaning.
@@ -664,6 +744,9 @@ fn classify(error: &IggyError) -> AuthError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use iggy::prelude::{StreamPermissions, TopicPermissions};
     use secrecy::SecretString;
     use serial_test::serial;
     use tokio::sync::Semaphore;
@@ -732,6 +815,89 @@ mod tests {
     fn given_no_grants_when_projected_should_stay_empty() {
         let projected = principal_permissions(&Permissions::default());
         assert_eq!(projected, PrincipalPermissions::default());
+    }
+
+    /// The reads of a principal whose only grant is `granted` on stream 3.
+    fn on_stream(granted: StreamPermissions) -> TopicReads {
+        TopicReads::of(&Permissions {
+            streams: Some(BTreeMap::from([(3, granted)])),
+            ..Permissions::default()
+        })
+    }
+
+    /// The reads of a principal whose only grant is `granted` on topic 9 of stream 3.
+    fn on_topic(granted: TopicPermissions) -> TopicReads {
+        on_stream(StreamPermissions {
+            topics: Some(BTreeMap::from([(9, granted)])),
+            ..StreamPermissions::default()
+        })
+    }
+
+    /// Iggy's `get_topic`, which also decides `create_consumer_group`, accepts four flags on a
+    /// stream. Polling and sending let no one read a topic there.
+    #[test]
+    fn given_a_stream_grant_should_cover_every_topic_of_that_stream_only() {
+        let flags = [
+            StreamPermissions {
+                manage_stream: true,
+                ..StreamPermissions::default()
+            },
+            StreamPermissions {
+                read_stream: true,
+                ..StreamPermissions::default()
+            },
+            StreamPermissions {
+                manage_topics: true,
+                ..StreamPermissions::default()
+            },
+            StreamPermissions {
+                read_topics: true,
+                ..StreamPermissions::default()
+            },
+        ];
+        for granted in flags {
+            let reads = on_stream(granted.clone());
+            assert!(reads.covers(3, 1) && reads.covers(3, 9), "{granted:?}");
+            assert!(!reads.covers(4, 1), "{granted:?} is on stream 3 only");
+        }
+        let polls = on_stream(StreamPermissions {
+            poll_messages: true,
+            send_messages: true,
+            ..StreamPermissions::default()
+        });
+        assert!(polls.is_empty(), "polling and sending read no topic");
+    }
+
+    #[test]
+    fn given_a_topic_grant_should_cover_that_topic_only() {
+        let flags = [
+            TopicPermissions {
+                manage_topic: true,
+                ..TopicPermissions::default()
+            },
+            TopicPermissions {
+                read_topic: true,
+                ..TopicPermissions::default()
+            },
+        ];
+        for granted in flags {
+            let reads = on_topic(granted.clone());
+            assert!(reads.covers(3, 9), "{granted:?}");
+            assert!(!reads.covers(3, 8), "{granted:?} is on topic 9 only");
+            assert!(!reads.covers(4, 9), "topic 9 of stream 3, not of stream 4");
+        }
+        let polls = on_topic(TopicPermissions {
+            poll_messages: true,
+            send_messages: true,
+            ..TopicPermissions::default()
+        });
+        assert!(polls.is_empty(), "polling and sending read no topic");
+    }
+
+    #[test]
+    fn given_a_user_record_without_permissions_should_grant_nothing() {
+        assert_eq!(Grants::of(None), Grants::default());
+        assert!(Grants::of(None).topic_reads.is_empty());
     }
 
     #[test]

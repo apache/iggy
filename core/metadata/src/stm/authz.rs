@@ -452,7 +452,8 @@ pub(crate) fn authorize(
         | Operation::RewrapStreamKeys
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
-        | Operation::RetireConsumerGroupOwners => None,
+        | Operation::RetireConsumerGroupOwners
+        | Operation::StateMachineCommand => None,
     }
 }
 

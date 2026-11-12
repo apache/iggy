@@ -23,6 +23,7 @@ import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.FetchedMessages;
+import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.partition.PartitionContext;
 
@@ -55,10 +56,34 @@ public interface ReaderTransport {
     CompletableFuture<List<FetchedMessages>> read(
             Map<Long, PollingStrategy> targets, long count, boolean commit, DeferredPollOptions options);
 
-    /** Stores {@code offset} of {@code partition} under the history of {@code context}. */
+    /**
+     * Polls {@code partition} from {@code strategy} of any kind, without a store. A fetch takes only an offset or the
+     * next offset, so the reader finds the offset of a timestamp or of the last messages with this poll first.
+     */
+    CompletableFuture<PolledMessages> poll(
+            long partition, PollingStrategy strategy, long count, DeferredPollOptions options);
+
+    /**
+     * Polls {@code partition} as {@link #poll} does, but reads only the context of the reply. It decodes no message, so
+     * a message that does not decode cannot fail it.
+     */
+    CompletableFuture<PartitionContext> pollContext(
+            long partition, PollingStrategy strategy, long count, DeferredPollOptions options);
+
+    /**
+     * Stores {@code offset} of {@code partition} under the history of {@code context}. An empty context, also of a
+     * delete, takes the context of the partition route: its incarnation, owner 0 and metadata op. Another context with
+     * incarnation 0 takes only the incarnation of the route.
+     */
     CompletableFuture<Void> store(long partition, BigInteger offset, PartitionContext context);
 
     CompletableFuture<Void> delete(long partition, PartitionContext context);
+
+    /**
+     * The highest metadata op that the replies of the client reported as committed: the reply that bound its session
+     * and every reply of a replicated metadata command. A write without a context names it as its minimum metadata op.
+     */
+    BigInteger metadataWatermark();
 
     /** The offset that the server holds for {@code partition}. */
     CompletableFuture<Optional<ConsumerOffsetInfo>> storedOffset(long partition);

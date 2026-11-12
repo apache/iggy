@@ -65,10 +65,14 @@ export type SendCommandOptions = {
   deadline?: number,
   /**
    * Partition context of a poll, an offset store or delete, or a send to an
-   * explicit partition, taken from an earlier reply. It replaces the context
+   * explicit partition, taken from an earlier reply. A context that is all
+   * zero counts as none. Any other context replaces the context
    * the client would capture, stays on every retry, and is never refreshed
    * after a history refusal (87): work from one partition incarnation must
-   * not land in another.
+   * not land in another. A group offset store or delete with owner generation
+   * 0 binds to the owner installed when it is sent: it names at least the last
+   * metadata op that the client saw, and the server binds owner 0 only to an
+   * owner installed by that op.
    */
   context?: PartitionContext,
   /**
@@ -138,6 +142,8 @@ export type RawClient = {
   on: (ev: string, cb: (e?: unknown) => void) => void
   /** Registers a one-time event listener */
   once: (ev: string, cb: (e?: unknown) => void) => void
+  /** Removes an event listener */
+  off?: (ev: string, cb: (e?: unknown) => void) => void
   /** Returns the underlying readable stream */
   getReadStream: () => Readable
 }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Kafka 3.9 `AdminClient` describe/alter against the gateway, on the host JDK.
+//! Kafka 4.4 `AdminClient` describe/alter against the gateway, on the host JDK.
 //!
 //! The docker `--network host` suite cannot reach a loopback gateway from macOS.
 //! This test publishes nothing into a container: it binds `127.0.0.1` and runs
@@ -131,8 +131,8 @@ fn try_output_bounded(command: &mut Command, what: &str) -> Result<Output, Strin
 
 const JARS: &[(&str, &str)] = &[
     (
-        "kafka-clients-3.9.0.jar",
-        "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.9.0/kafka-clients-3.9.0.jar",
+        "kafka-clients-4.4.0.jar",
+        "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.4.0/kafka-clients-4.4.0.jar",
     ),
     (
         "slf4j-api-1.7.36.jar",
@@ -143,21 +143,21 @@ const JARS: &[(&str, &str)] = &[
         "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/1.7.36/slf4j-simple-1.7.36.jar",
     ),
     (
-        "lz4-java-1.8.0.jar",
-        "https://repo1.maven.org/maven2/org/lz4/lz4-java/1.8.0/lz4-java-1.8.0.jar",
+        "lz4-java-1.11.2.jar",
+        "https://repo1.maven.org/maven2/at/yawk/lz4/lz4-java/1.11.2/lz4-java-1.11.2.jar",
     ),
     (
-        "snappy-java-1.1.10.5.jar",
-        "https://repo1.maven.org/maven2/org/xerial/snappy/snappy-java/1.1.10.5/snappy-java-1.1.10.5.jar",
+        "snappy-java-1.1.10.7.jar",
+        "https://repo1.maven.org/maven2/org/xerial/snappy/snappy-java/1.1.10.7/snappy-java-1.1.10.7.jar",
     ),
     (
-        "zstd-jni-1.5.6-4.jar",
-        "https://repo1.maven.org/maven2/com/github/luben/zstd-jni/1.5.6-4/zstd-jni-1.5.6-4.jar",
+        "zstd-jni-1.5.7-17.jar",
+        "https://repo1.maven.org/maven2/com/github/luben/zstd-jni/1.5.7-17/zstd-jni-1.5.7-17.jar",
     ),
 ];
 
 fn jar_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-3.9-admin-jars")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-4.4-admin-jars")
 }
 
 fn ensure_jars(dir: &Path) -> Result<(), String> {
@@ -232,7 +232,7 @@ async fn spawn_gateway(server: &TestServer) -> SocketAddr {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
+async fn kafka_4_admin_client_describes_and_alters_topic_configs() {
     if java_missing() {
         return;
     }
@@ -312,6 +312,18 @@ async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
     );
     assert!(
         text.contains("incremental_delete_retention.ms=-1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("broker_auto.create.topics.enable=false broker_min.insync.replicas=1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("created_retention.bytes=1073741824 source=DYNAMIC_TOPIC_CONFIG"),
+        "{text}"
+    );
+    assert!(
+        text.contains("compacted_retention.ms=-1 replication_factor=1"),
         "{text}"
     );
 }

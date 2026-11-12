@@ -305,7 +305,7 @@ repos:
     hooks:
       - id: helmfmt
         name: helmfmt
-        entry: helmfmt --check helm/charts/iggy
+        entry: bash -c 'for chart in helm/charts/*/; do helmfmt --check "$chart" || exit 1; done'
         language: system
         files: ^helm/charts/.*/templates/.*\.(yaml|tpl)$
         pass_filenames: false
@@ -314,12 +314,12 @@ repos:
         name: yamllint (helm)
         entry: yamllint -c helm/charts/iggy/.yamllint.yml
         language: system
-        files: ^helm/charts/iggy/(values\.yaml|Chart\.yaml)$
+        files: ^helm/charts/[^/]+/(values\.yaml|Chart\.yaml)$
         pass_filenames: true
 
       - id: helm-docs
         name: helm-docs
-        entry: bash -c 'cd helm/charts/iggy && helm-docs'
+        entry: bash -c 'for chart in helm/charts/*/; do (cd "$chart" && helm-docs) || exit 1; done'
         language: system
-        files: ^helm/charts/iggy/(values\.yaml|README\.md\.gotmpl)$
+        files: ^helm/charts/[^/]+/(values\.yaml|Chart\.yaml|README\.md\.gotmpl)$
         pass_filenames: false
