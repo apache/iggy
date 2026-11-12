@@ -794,6 +794,25 @@ impl ShardMetrics {
             .inc_by(shed.entries_dropped as u64);
     }
 
+    /// Snapshot of what [`Self::record_repair_ring_shed`] published: the
+    /// totals the sheds took, and the usage of the last one. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn repair_ring_shed_value(&self) -> partitions::RepairRingShed {
+        let gauge = |gauge: &Gauge| usize::try_from(gauge.get()).unwrap_or(usize::MAX);
+        let counter = |counter: &Counter| usize::try_from(counter.get()).unwrap_or(usize::MAX);
+        partitions::RepairRingShed {
+            bodies_released: counter(&self.partition_repair_ring_bodies_released),
+            entries_dropped: counter(&self.partition_repair_ring_entries_dropped),
+            usage: partitions::RepairRingUsage {
+                budget_bytes: gauge(&self.partition_repair_ring_budget_bytes),
+                charged_bytes: gauge(&self.partition_repair_ring_charged_bytes),
+                floor_bytes: gauge(&self.partition_repair_ring_floor_bytes),
+            },
+        }
+    }
+
     /// Count consumer offset capacity denials from explicit client requests
     /// and automatic commit admission during poll completion.
     pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {

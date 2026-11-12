@@ -89,7 +89,10 @@ mod descriptor_exhaustion_vsr;
 // sample picks up writes the server cannot charge.
 mod disk_usage;
 mod general;
+// Boot gives every shard its share of the node repair ring budget, and the
+// shard tick reports it.
 mod partitions_limit_vsr;
+mod repair_ring_budget;
 // The expired-token cleaner deletes under the reserved client id, and later
 // writes must still commit behind that delete.
 mod personal_access_token_cleaner_vsr;

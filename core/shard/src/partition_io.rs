@@ -1248,10 +1248,11 @@ mod tests {
         let bus = Rc::new(IggyMessageBus::new(0));
         let targets = record_transfer_targets(&bus);
         connect_replica_on(&bus, TRANSFER_REQUESTER, 1);
-        let (mut owner, _sender) = test_owner_with_repair_memory(
+        let (mut owner, _sender) = test_owner_with_repair_budgets(
             &bus,
             None,
             Some(Arc::new(partitions::RepairMemoryBudget::new(BUDGET))),
+            None,
         );
         owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -9439,6 +9440,96 @@ mod tests {
         );
     }
 
+    /// Past the ring budget of its shard, the tick releases the bodies that
+    /// segments hold, and the gauges report where it left the budget. A
+    /// backup that asks for the released ops still gets each one, read back
+    /// from the segment file.
+    #[compio::test]
+    async fn given_rings_past_the_shard_budget_when_the_shard_ticks_should_release_bodies_and_serve_them_from_segments()
+     {
+        const HEAD: u64 = 4;
+        /// Partitions whose ring holds ops `1..=HEAD`.
+        const WRITTEN: usize = 2;
+        /// The buffer of a one-message prepare, which a ring charges for its
+        /// body.
+        const BODY_BUFFER_BYTES: usize = 4096;
+        /// Room for the newest body of each ring and the headers of the
+        /// released ones, not for one more body.
+        const RING_BUDGET_BYTES: usize = (WRITTEN + 1) * BODY_BUFFER_BYTES;
+        /// The second tick finds the shard within its budget.
+        const TICKS: usize = 2;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = capture_sent_frames(&bus);
+        connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+        let budget = Rc::new(partitions::RepairRingBudget::new(RING_BUDGET_BYTES));
+        let (owner, _sender) =
+            test_owner_with_repair_budgets(&bus, None, None, Some(Rc::clone(&budget)));
+        let directory = tempfile::tempdir().unwrap();
+        let mut written = Vec::with_capacity(WRITTEN);
+        for partition_id in 0..WRITTEN {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            let prepares = primary_prepares(&bus, namespace, HEAD).await;
+            let segment_directory = directory.path().join(partition_id.to_string());
+            std::fs::create_dir(&segment_directory).unwrap();
+            let (backup, log_path) =
+                journaling_backup(&bus, namespace, &prepares, &segment_directory).await;
+            let positions = write_bodies_to_segment(&log_path, &prepares);
+            backup
+                .log
+                .journal()
+                .inner
+                .evict_prefix_located(prepares.len(), |op| first_segment_body(&positions, op));
+            owner.plane.partitions().remove(&namespace).unwrap();
+            owner.plane.partitions().insert(namespace, backup);
+            written.push((namespace, prepares));
+        }
+        let grown = budget.usage();
+        assert!(
+            grown.charged_bytes > grown.budget_bytes,
+            "the rings must start past the budget: {grown:?}"
+        );
+
+        for _ in 0..TICKS {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        }
+
+        let shed = owner.metrics.repair_ring_shed_value();
+        assert_eq!(
+            shed.usage,
+            budget.usage(),
+            "the gauges report the budget as the tick left it"
+        );
+        assert!(
+            shed.usage.charged_bytes <= shed.usage.budget_bytes.max(shed.usage.floor_bytes),
+            "the tick left the rings past the budget: {:?}",
+            shed.usage
+        );
+        assert_eq!(
+            shed.entries_dropped, 0,
+            "the shed dropped an entry while a body was left to release"
+        );
+        let mut released = 0;
+        for (namespace, prepares) in &written {
+            let partition = owner.plane.partitions().get_by_ns(namespace).unwrap();
+            let journal = &partition.log.journal().inner;
+            released += (1..=HEAD)
+                .filter(|&op| {
+                    journal.repair_entry(op).is_none() && journal.evicted_header(op).is_some()
+                })
+                .count();
+            assert_eq!(
+                repair_answers(&owner, &sent, *namespace, 1, prepares).await,
+                (1..=HEAD)
+                    .map(|op| (Command::RepairPrepare, op))
+                    .chain([(Command::RepairDone, HEAD)])
+                    .collect::<Vec<_>>(),
+                "partition {namespace:?} serves every op, released or not"
+            );
+        }
+        assert!(released > 0, "no ring holds an op without its body");
+        assert_eq!(shed.bodies_released, released);
+    }
+
     /// Asks `owner` for ops `from_op..` of `prepares` as the primary of
     /// [`REPAIR_VIEW`], serves the reads that land, and returns what
     /// [`sent_answers`] finds.
@@ -9749,27 +9840,14 @@ mod tests {
         #[allow(clippy::future_not_send)]
         async fn new(head: u64) -> Self {
             let bus = Rc::new(IggyMessageBus::new(0));
-            let sent = Rc::new(RefCell::new(Vec::new()));
-            let captured = Rc::clone(&sent);
-            bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
-                captured.borrow_mut().push(
-                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
-                        .unwrap(),
-                );
-                Ok(())
-            }));
+            let sent = capture_sent_frames(&bus);
             connect_replica_on(&bus, REPAIR_PRIMARY, 1);
             let (owner, sender) = test_owner(&bus, None);
             let namespace = IggyNamespace::new(0, 0, 0);
             let prepares = primary_prepares(&bus, namespace, head).await;
-            let mut donor =
-                repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            donor.set_repair(None);
             let directory = tempfile::tempdir().unwrap();
-            let (log_path, _) = attach_segment_files(&mut donor, directory.path(), false).await;
-            for prepare in &prepares {
-                donor.on_replicate(prepare.clone()).await;
-            }
+            let (donor, log_path) =
+                journaling_backup(&bus, namespace, &prepares, directory.path()).await;
             let positions = release_bodies_to_segment(&donor, &log_path, &prepares);
             owner.plane.partitions().remove(&namespace).unwrap();
             owner.plane.partitions().insert(namespace, donor);
@@ -9799,12 +9877,57 @@ mod tests {
         }
     }
 
+    /// Every frame the shard on `bus` sends to a claimed replica.
+    fn capture_sent_frames(bus: &IggyMessageBus) -> Rc<RefCell<Vec<Message<GenericHeader>>>> {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap(),
+            );
+            Ok(())
+        }));
+        sent
+    }
+
+    /// A backup of [`REPAIR_VIEW`] that journaled `prepares` over segment
+    /// files in `directory`, with the path of its log file.
+    #[allow(clippy::future_not_send)]
+    async fn journaling_backup(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        prepares: &[Message<PrepareHeader>],
+        directory: &Path,
+    ) -> (IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>, PathBuf) {
+        let mut backup =
+            repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        backup.set_repair(None);
+        let (log_path, _) = attach_segment_files(&mut backup, directory, false).await;
+        for prepare in prepares {
+            backup.on_replicate(prepare.clone()).await;
+        }
+        (backup, log_path)
+    }
+
     /// Writes the bodies of `prepares`, which `donor` journaled, back to back
     /// into the log file of the first segment at `log_path`, and releases
     /// them there with [`release_bodies`]. Returns the position of each body
     /// in the file.
     fn release_bodies_to_segment(
         donor: &IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        log_path: &Path,
+        prepares: &[Message<PrepareHeader>],
+    ) -> BTreeMap<u64, u64> {
+        let positions = write_bodies_to_segment(log_path, prepares);
+        release_bodies(donor, prepares, |op| first_segment_body(&positions, op));
+        positions
+    }
+
+    /// Writes the bodies of `prepares` back to back into the log file of the
+    /// first segment at `log_path`, and returns the position of each body in
+    /// the file.
+    fn write_bodies_to_segment(
         log_path: &Path,
         prepares: &[Message<PrepareHeader>],
     ) -> BTreeMap<u64, u64> {
@@ -9815,15 +9938,20 @@ mod tests {
             segment.extend_from_slice(&prepare.as_slice()[size_of::<PrepareHeader>()..]);
         }
         std::fs::write(log_path, &segment).unwrap();
-        release_bodies(donor, prepares, |op| {
-            positions
-                .get(&op)
-                .map(|&position| partitions::BodyPosition {
-                    segment_start: 0,
-                    position,
-                })
-        });
         positions
+    }
+
+    /// Where the log file of the first segment holds the body of `op`.
+    fn first_segment_body(
+        positions: &BTreeMap<u64, u64>,
+        op: u64,
+    ) -> Option<partitions::BodyPosition> {
+        positions
+            .get(&op)
+            .map(|&position| partitions::BodyPosition {
+                segment_start: 0,
+                position,
+            })
     }
 
     /// Moves `prepares`, which `donor` journaled, into its evicted ring with
@@ -10609,13 +10737,14 @@ mod tests {
         bus: &B,
         store: Option<&Rc<HeldSuperblock>>,
     ) -> (IoTestShard<B>, TaggedSender) {
-        test_owner_with_repair_memory(bus, store, None)
+        test_owner_with_repair_budgets(bus, store, None, None)
     }
 
-    fn test_owner_with_repair_memory<B: MessageBus + Clone + 'static>(
+    fn test_owner_with_repair_budgets<B: MessageBus + Clone + 'static>(
         bus: &B,
         store: Option<&Rc<HeldSuperblock>>,
         repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
+        repair_rings: Option<Rc<partitions::RepairRingBudget>>,
     ) -> (IoTestShard<B>, TaggedSender) {
         let shard_id = ShardId::new(0);
         let config = PartitionsConfig {
@@ -10627,10 +10756,13 @@ mod tests {
             key_context: Arc::default(),
             path_layout: PartitionPathLayout::default(),
         };
-        let partitions = match repair_memory {
-            Some(budget) => IggyPartitions::new(shard_id, config).with_repair_memory(budget),
-            None => IggyPartitions::new(shard_id, config),
-        };
+        let mut partitions = IggyPartitions::new(shard_id, config);
+        if let Some(budget) = repair_memory {
+            partitions = partitions.with_repair_memory(budget);
+        }
+        if let Some(budget) = repair_rings {
+            partitions = partitions.with_repair_rings(budget);
+        }
         let routes = PapayaShardsTable::new();
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
