@@ -48,6 +48,7 @@ pub mod ext_auth_server;
 mod fixture;
 pub mod handle;
 mod helpers;
+pub mod log_capture;
 mod orchestrator;
 mod peer_relay;
 mod port_reserver;
@@ -66,6 +67,7 @@ pub use handle::{
     StopOutcome,
 };
 pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
+pub use port_reserver::SinglePortReserver;
 pub use traits::{IggyServerDependent, Restartable, TestBinary};
 
 pub use helpers::{

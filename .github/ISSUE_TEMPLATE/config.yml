@@ -20,6 +20,9 @@ contact_links:
   - name: Design Discussion
     url: https://github.com/apache/iggy/discussions
     about: For bigger features or ideas that need design discussion before becoming an issue.
+  - name: Connectors
+    url: https://github.com/apache/iggy-connectors/issues
+    about: Report connector bugs and request connector features in apache/iggy-connectors.
   - name: Support & Chat
     url: https://discord.gg/apache-iggy
     about: Ask questions on Discord.

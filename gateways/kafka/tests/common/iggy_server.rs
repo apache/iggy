@@ -34,8 +34,8 @@ use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilde
 use secrecy::SecretString;
 
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, KnownNodes, ProduceSessionLimits,
-    TopicMapping,
+    DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, KnownNodes,
+    ProduceSessionLimits, TopicDefaults, TopicMapping,
 };
 
 /// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
@@ -401,10 +401,12 @@ impl TestServer {
             topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            fetch_slots: DEFAULT_FETCH_SLOTS,
             tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
             idempotent_producers: true,
             nodes: KnownNodes::default(),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 }
@@ -669,10 +671,12 @@ impl TestCluster {
             topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            fetch_slots: DEFAULT_FETCH_SLOTS,
             tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
             idempotent_producers: true,
             nodes: KnownNodes::default(),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 }

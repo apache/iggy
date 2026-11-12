@@ -21,6 +21,7 @@
 
 use arc_swap::ArcSwap;
 use nix::sys::resource::{Resource, getrlimit};
+use server_common::DISK_USAGE;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -67,12 +68,12 @@ struct HostIdentity {
 impl HostIdentity {
     fn probe() -> Self {
         Self {
-            hostname: SysinfoSystem::host_name().unwrap_or_else(|| "unknown_hostname".to_owned()),
-            os_name: SysinfoSystem::name().unwrap_or_else(|| "unknown_os_name".to_owned()),
+            hostname: SysinfoSystem::host_name().unwrap_or_else(|_| "unknown_hostname".to_owned()),
+            os_name: SysinfoSystem::name().unwrap_or_else(|_| "unknown_os_name".to_owned()),
             os_version: SysinfoSystem::long_os_version()
-                .unwrap_or_else(|| "unknown_os_version".to_owned()),
+                .unwrap_or_else(|_| "unknown_os_version".to_owned()),
             kernel_version: SysinfoSystem::kernel_version()
-                .unwrap_or_else(|| "unknown_kernel_version".to_owned()),
+                .unwrap_or_else(|_| "unknown_kernel_version".to_owned()),
         }
     }
 }
@@ -107,7 +108,7 @@ pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Resul
     } else {
         sysinfo_print_interval.min(OPEN_FILES_SCAN_INTERVAL)
     };
-    let mut system = SysinfoSystem::new();
+    let mut system = SysinfoSystem::new().map_err(io::Error::other)?;
     let initial = SystemStats::capture(&mut system, 0, true);
     let mut open_files_count = initial.open_files_count;
     PUBLISHED_STATS.store(Arc::new(initial));
@@ -138,9 +139,15 @@ impl SystemStats {
     fn capture(sys: &mut SysinfoSystem, previous_open_files: u64, scan_open_files: bool) -> Self {
         let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
         let probe = SystemProbe::capture(sys);
-        let disk = STATS_DATA_PATH
-            .get()
-            .and_then(|path| fs2::statvfs(path).ok());
+        // Each sample also re-bases the disk usage estimate the write sites
+        // charge, and the first one, taken before the shards start, seeds it.
+        let disk = STATS_DATA_PATH.get().and_then(|path| {
+            DISK_USAGE.rebase(|| {
+                let stats = fs2::statvfs(path).ok()?;
+                let used_bytes = stats.total_space().saturating_sub(stats.free_space());
+                Some((stats, used_bytes))
+            })
+        });
         Self {
             process_id: probe.process_id,
             cpu_usage: probe.cpu_usage,
@@ -176,7 +183,7 @@ mod tests {
 
     #[test]
     fn given_completed_sample_when_reading_stats_should_reuse_it() {
-        let mut system = SysinfoSystem::new();
+        let mut system = SysinfoSystem::new().expect("sysinfo supports this platform");
         let sample = SystemStats::capture(&mut system, 0, true);
         assert_eq!(sample.process_id, std::process::id());
         assert!(sample.total_memory > 0);

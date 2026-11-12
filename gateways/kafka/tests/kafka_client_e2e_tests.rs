@@ -56,8 +56,8 @@ use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, KnownNodes,
-    ProduceSessionLimits, TopicMapping,
+    DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
+    KnownNodes, ProduceSessionLimits, TopicDefaults, TopicMapping,
 };
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol, parse_brokers};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
@@ -82,7 +82,12 @@ use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use server::{spawn_gateway as spawn_listeners, spawn_test_server_with_authenticator};
 
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
-const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
+/// The newest Kafka release: the Java tools of every test that names no other image.
+const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
+/// The oldest Kafka 4 release, for the one test that runs both ends of the Kafka 4 range.
+const KAFKA_4_0_IMAGE: &str = "apache/kafka:4.0.2";
+/// The newest Kafka 3 release, for the one test of a Kafka 3 client.
+const KAFKA_3_9_IMAGE: &str = "apache/kafka:3.9.2";
 const ROOT_USER: &str = "iggy";
 const ROOT_PASSWORD: &str = "iggy";
 /// Password for every non-root principal these tests create.
@@ -432,10 +437,12 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
         idempotent_producers: true,
         nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     };
     IggyBridge::connect(config)
         .await
@@ -1037,6 +1044,107 @@ async fn given_the_java_client_should_authenticate_and_list_the_sasl_apis() {
     );
 }
 
+/// Java clients 4.0 to 4.3 open `ApiVersions` at v4, and 4.4 clients at v5 (KIP-1242). Each finds
+/// its version in the advertisement, so neither asks again at v3 (KIP-511). The oldest Kafka 4
+/// client then produces and reads back in a group, as the newest one does in the other tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_4_0_and_4_4_clients_should_use_their_own_api_versions_and_serve_records() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    if image_missing(KAFKA_4_0_IMAGE) {
+        return;
+    }
+    let bootstrap = gateway.to_string();
+    for (image, usable) in [(KAFKA_4_0_IMAGE, 4), (KAFKA_IMAGE, 5)] {
+        assert_usable_api_versions(image, &bootstrap, usable);
+    }
+    produce_and_read_back_in_a_group(KAFKA_4_0_IMAGE, &bootstrap, "kafka-4-0");
+}
+
+/// Java clients 3.0 to 3.8 open `ApiVersions` at v3, and 3.9 clients at v4, as 4.0 to 4.3 do. The
+/// newest Kafka 3 client finds v4 in the advertisement, then produces and reads back in a group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_kafka_3_9_client_should_use_api_versions_v4_and_serve_records() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    if image_missing(KAFKA_3_9_IMAGE) {
+        return;
+    }
+    let bootstrap = gateway.to_string();
+    assert_usable_api_versions(KAFKA_3_9_IMAGE, &bootstrap, 4);
+    produce_and_read_back_in_a_group(KAFKA_3_9_IMAGE, &bootstrap, "kafka-3-9");
+}
+
+/// Whether to skip because `image` is not pulled. [`ready_server`] checks the images that every
+/// test needs, and this one the image of a single test.
+fn image_missing(image: &str) -> bool {
+    !image_present(image)
+        && skip(&format!(
+            "client image {image} is not pulled; run `docker pull {image}`"
+        ))
+}
+
+/// The Java client of `image` lists the gateway's `ApiVersions` range and uses v`usable` of it.
+fn assert_usable_api_versions(image: &str, bootstrap: &str, usable: i16) {
+    let versions = run_client(
+        image,
+        &[
+            "/opt/kafka/bin/kafka-broker-api-versions.sh",
+            "--bootstrap-server",
+            bootstrap,
+        ],
+        &[],
+    )
+    .expect_ran("java client api-versions");
+    assert!(
+        versions.contains(&format!("ApiVersions(18): 0 to 5 [usable: {usable}]")),
+        "{image} must use ApiVersions v{usable}, got: {versions}"
+    );
+}
+
+/// Writes two records to `TOPIC` with the console producer of `image`, and reads them back with
+/// its console consumer in `group`.
+fn produce_and_read_back_in_a_group(image: &str, bootstrap: &str, group: &str) {
+    let produce = format!(
+        "printf 'k1:alpha\\nk2:beta\\n' | /opt/kafka/bin/kafka-console-producer.sh \
+         --bootstrap-server {bootstrap} --topic {TOPIC} --property parse.key=true \
+         --property key.separator=: --producer-property max.block.ms=20000"
+    );
+    let produced =
+        run_client(image, &["sh", "-c", &produce], &[]).expect_ran("java console producer");
+    assert!(
+        !produced.contains("ERROR"),
+        "the producer of {image} must send, got: {produced}"
+    );
+    let consumed = run_client(
+        image,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            bootstrap,
+            "--topic",
+            TOPIC,
+            "--group",
+            group,
+            "--from-beginning",
+            "--max-messages",
+            "2",
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer in a group");
+    assert!(
+        consumed.contains("k1\talpha") && consumed.contains("k2\tbeta"),
+        "the consumer of {image} must read both records, got: {consumed}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_distinct_principals_when_listing_acls_should_describe_each_differently() {
     // The spec's category T procedure. Root alone proves nothing about the mapping, because it
@@ -1315,9 +1423,289 @@ async fn given_kafka_configs_sh_when_adding_then_deleting_retention_should_round
     )
     .expect_ran("kafka-configs.sh --describe after --delete-config");
     assert!(
-        described_after.contains("retention.ms=-1 sensitive=false"),
-        "a deleted retention.ms reads as never expire, got: {described_after}"
+        described_after.contains(&format!("Dynamic configs for topic {TOPIC} are:")),
+        "kafka-configs.sh must describe the topic, got: {described_after}"
     );
+    assert!(
+        !described_after.contains("retention.ms="),
+        "a deleted retention.ms is back at its default, which is not a dynamic config, got: \
+         {described_after}"
+    );
+}
+
+/// `kafka-topics.sh --create --config` sends the configs on `CreateTopics`. Iggy stores
+/// `retention.ms`, `retention.bytes` and `segment.bytes`, the gateway accepts the other keys at
+/// the values it reports, and `retention.bytes` stays per partition when the topic grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_with_configs_should_store_them_per_partition() {
+    const CONFIGURED: &str = "configured-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            CONFIGURED,
+            "--partitions",
+            "2",
+            "--config",
+            "retention.ms=60000",
+            "--config",
+            "retention.bytes=134217728",
+            "--config",
+            "segment.bytes=67108864",
+            "--config",
+            "cleanup.policy=delete",
+            "--config",
+            "min.insync.replicas=1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config");
+    assert!(
+        created.contains(&format!("Created topic {CONFIGURED}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+
+    let describe_topic = || {
+        kafka_configs(
+            gateway,
+            &[
+                "--describe",
+                "--entity-type",
+                "topics",
+                "--entity-name",
+                CONFIGURED,
+            ],
+        )
+        .expect_ran("kafka-configs.sh --describe")
+    };
+    let described = describe_topic();
+    for stored in [
+        "retention.ms=60000 sensitive=false",
+        "retention.bytes=134217728 sensitive=false",
+        "segment.bytes=67108864 sensitive=false",
+    ] {
+        assert!(
+            described.contains(stored),
+            "the describe must show {stored}, got: {described}"
+        );
+    }
+    assert!(
+        !described.contains("min.insync.replicas="),
+        "a key at its default is not a dynamic config, got: {described}"
+    );
+
+    let grown = kafka_topics(
+        gateway,
+        &["--alter", "--topic", CONFIGURED, "--partitions", "4"],
+    )
+    .expect_ran("kafka-topics.sh --alter --partitions");
+    assert!(
+        !grown.to_lowercase().contains("error"),
+        "the topic must grow, got: {grown}"
+    );
+    let described_after = describe_topic();
+    assert!(
+        described_after.contains("retention.bytes=134217728 sensitive=false"),
+        "each new partition keeps the same retention.bytes, got: {described_after}"
+    );
+
+    let under_min_isr = kafka_topics(gateway, &["--describe", "--under-min-isr-partitions"])
+        .expect_ran("kafka-topics.sh --describe --under-min-isr-partitions");
+    assert!(
+        !under_min_isr.contains("Exception"),
+        "the tool reads min.insync.replicas of every topic, got: {under_min_isr}"
+    );
+}
+
+/// Kafka accepts a `retention.bytes` below one segment, and so does the gateway. Iggy keeps the
+/// newest sealed segment of each partition and refuses a topic cap below one segment, so the
+/// topic of one partition reports one segment of 1 GiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_with_a_retention_below_one_segment_should_keep_one() {
+    const SMALL: &str = "small-retention-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            SMALL,
+            "--config",
+            "retention.bytes=1048576",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config retention.bytes=1048576");
+    assert!(
+        created.contains(&format!("Created topic {SMALL}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            SMALL,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe");
+    assert!(
+        described.contains("retention.bytes=1073741824 sensitive=false"),
+        "Iggy keeps one segment of the partition, got: {described}"
+    );
+}
+
+/// `kafka-topics.sh --create --config cleanup.policy=compact`, as Kafka Connect and Schema
+/// Registry create their topics. Iggy does not compact, so the topic keeps every record, and the
+/// gateway does not report the policy. Keys that change nothing a client sees are accepted, while
+/// a replication factor above the one Iggy node and `LogAppendTime` are refused with the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_a_compacted_topic_should_keep_every_record() {
+    const COMPACTED: &str = "compacted-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            COMPACTED,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+            "--config",
+            "cleanup.policy=compact",
+            "--config",
+            "retention.ms=60000",
+            "--config",
+            "min.insync.replicas=1",
+            "--config",
+            "compression.type=lz4",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config cleanup.policy=compact");
+    assert!(
+        created.contains(&format!("Created topic {COMPACTED}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+
+    let described = kafka_topics(gateway, &["--describe", "--topic", COMPACTED])
+        .expect_ran("kafka-topics.sh --describe");
+    assert!(
+        described.contains("ReplicationFactor: 1"),
+        "the describe must show the stored factor, got: {described}"
+    );
+    let configs = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            COMPACTED,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe");
+    assert!(
+        configs.contains("retention.ms=-1 sensitive=false"),
+        "a compacted topic never expires, got: {configs}"
+    );
+    assert!(
+        !configs.contains("cleanup.policy") && !configs.contains("min.insync.replicas"),
+        "the policy is not stored, and min.insync.replicas reports the majority as a default, \
+         got: {configs}"
+    );
+
+    let refused_factor = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-factor",
+            "--replication-factor",
+            "2",
+        ],
+    )
+    .text();
+    assert!(
+        refused_factor.contains("only 1 Iggy node(s) are in the cluster"),
+        "a factor above the node count must be refused with its reason, got: {refused_factor}"
+    );
+    let refused_timestamps = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-timestamps",
+            "--config",
+            "message.timestamp.type=LogAppendTime",
+        ],
+    )
+    .text();
+    assert!(
+        refused_timestamps.contains("accepts only CreateTime"),
+        "LogAppendTime must be refused with its reason, got: {refused_timestamps}"
+    );
+    let refused_min_isr = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-min-isr",
+            "--config",
+            "min.insync.replicas=2",
+        ],
+    )
+    .text();
+    assert!(
+        refused_min_isr.contains("accepts at most 1"),
+        "Iggy commits on a majority of one node, got: {refused_min_isr}"
+    );
+}
+
+/// `kafka-configs.sh --describe --entity-type brokers` reads a BROKER resource, as the Strimzi
+/// Topic Operator does at startup for `auto.create.topics.enable` and `min.insync.replicas`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_configs_sh_when_describing_the_broker_should_report_the_gateway_settings() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "brokers",
+            "--entity-name",
+            "1",
+            "--all",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe --entity-type brokers --all");
+    for setting in [
+        "auto.create.topics.enable=false",
+        "min.insync.replicas=1",
+        "log.retention.ms=-1",
+        "num.partitions=1",
+        "default.replication.factor=1",
+    ] {
+        assert!(
+            described.contains(setting),
+            "the broker describe must show {setting}, got: {described}"
+        );
+    }
 }
 
 /// #3546's own acceptance criterion: `kafka-topics.sh` must work against the gateway for create
@@ -2326,10 +2714,12 @@ async fn tls_stack() -> Option<TlsStack> {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         produce_sessions: ProduceSessionLimits::default(),
         tls: IggyTls::default(),
         idempotent_producers: true,
         nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     })
     .await
     .expect("the bridge connects to a ready server");

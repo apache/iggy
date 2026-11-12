@@ -66,6 +66,12 @@ class MessagesHttpClientSendContextTest {
     private static final String POLL_MESSAGES = "GET /streams/1/topics/2/messages";
     private static final String POST_DEFERRED_POLL = "POST /streams/1/topics/2/messages/deferred";
     private static final String DELETE_STREAM = "DELETE /streams/1";
+    private static final String STORE_OFFSET = "PUT /streams/1/topics/2/consumer-offsets";
+    private static final org.apache.iggy.consumergroup.Consumer CONSUMER =
+            org.apache.iggy.consumergroup.Consumer.of(7L);
+    // A context with incarnation 0 that names an owner and an op, which the server refuses with HistoryUnavailable.
+    private static final PartitionContext ZERO_INCARNATION =
+            new PartitionContext(BigInteger.ZERO, BigInteger.valueOf(9), BigInteger.valueOf(100));
     private static final int TRANSIENT_NOT_COMMITTED = 57;
     private static final int FETCH_PROGRESS_UNCERTAIN = 14010;
     private static final int HISTORY_UNAVAILABLE = 87;
@@ -301,6 +307,38 @@ class MessagesHttpClientSendContextTest {
         }
     }
 
+    /** A poll context that is all zero counts as no context. Any other context goes as it is. */
+    @Test
+    void shouldPollWithAContextThatIsAllZeroAsWithoutAContext() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            poll(client, PollingStrategy.offset(BigInteger.valueOf(5)).withContext(PartitionContext.EMPTY));
+            poll(client, PollingStrategy.offset(BigInteger.valueOf(5)).withContext(ZERO_INCARNATION));
+
+            assertThat(server.requests).containsExactly(POLL_MESSAGES, POLL_MESSAGES);
+            assertThat(queryParameter(server.polls.get(0), "context")).isEmpty();
+            assertThat(queryParameter(server.polls.get(1), "context").map(MAPPER::readTree))
+                    .contains(MAPPER.readTree("{\"incarnation\": 0, \"owner_generation\": 9, \"metadata_op\": 100}"));
+        }
+    }
+
+    /** An offset store context that is all zero counts as no context. Any other context goes as it is. */
+    @Test
+    void shouldStoreWithAContextThatIsAllZeroAsWithoutAContext() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            var offsets = client.consumerOffsets();
+            offsets.storeConsumerOffset(STREAM, TOPIC, Optional.of(3L), CONSUMER, BigInteger.ONE);
+            offsets.storeConsumerOffset(STREAM, TOPIC, 3L, CONSUMER, BigInteger.ONE, PartitionContext.EMPTY);
+            offsets.storeConsumerOffset(STREAM, TOPIC, 3L, CONSUMER, BigInteger.ONE, ZERO_INCARNATION);
+
+            assertThat(server.requests).containsExactly(STORE_OFFSET, STORE_OFFSET, STORE_OFFSET);
+            assertThat(server.stores.get(1)).isEqualTo(server.stores.get(0));
+            assertThat(server.stores.get(2).get("context"))
+                    .isEqualTo(MAPPER.readTree("{\"incarnation\": 0, \"owner_generation\": 9, \"metadata_op\": 100}"));
+        }
+    }
+
     private static void send(IggyHttpClient client, Partitioning partitioning) {
         client.messages().sendMessages(STREAM, TOPIC, partitioning, List.of(Message.of("payload")));
     }
@@ -353,6 +391,7 @@ class MessagesHttpClientSendContextTest {
         private final List<String> requests = new CopyOnWriteArrayList<>();
         private final List<JsonNode> sends = new CopyOnWriteArrayList<>();
         private final List<String> polls = new CopyOnWriteArrayList<>();
+        private final List<JsonNode> stores = new CopyOnWriteArrayList<>();
         // Answers given in place of the server's, one per request.
         private final Queue<HttpHandler> scriptedAnswers = new ConcurrentLinkedQueue<>();
         private volatile long epoch = 1;
@@ -393,6 +432,9 @@ class MessagesHttpClientSendContextTest {
             requests.add(request);
             if (request.equals(POLL_MESSAGES) || request.equals(POST_DEFERRED_POLL)) {
                 polls.add(exchange.getRequestURI().getRawQuery());
+            }
+            if (request.equals(STORE_OFFSET)) {
+                stores.add(MAPPER.readTree(body));
             }
             HttpHandler scripted = scriptedAnswers.poll();
             if (scripted != null) {

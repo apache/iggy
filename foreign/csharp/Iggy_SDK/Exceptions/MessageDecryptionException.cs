@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
+
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
@@ -43,6 +45,9 @@ public sealed class MessageDecryptionException : Exception
     ///     before decryption. Null for a message of a JSON reply over HTTP, which carries no records.
     /// </summary>
     public byte[]? Record { get; }
+
+    /// <summary>The context of the poll reply over TCP that carried the message. Null for any other reply.</summary>
+    internal PartitionContext? Context { get; set; }
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="MessageDecryptionException" /> class.

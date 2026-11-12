@@ -58,7 +58,8 @@ public interface ConsumerOffsetsClient {
      * Stores a consumer offset fenced by the context its messages were polled with.
      * The server refuses the store once the partition incarnation or its owner has
      * changed, so an offset from an older incarnation never lands in a newer one.
-     * The client returns that refusal, 87 or 5009, and does not retry it.
+     * The client returns that refusal, 87 or 5009, and does not retry it. A context that
+     * is all zero counts as no context.
      */
     void storeConsumerOffset(
             StreamId streamId,

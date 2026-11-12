@@ -165,11 +165,12 @@ pub struct ShardingConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub shutdown_join_timeout: IggyDuration,
-    /// Safety-tick cadence for the partition reconciliation loop; the
-    /// reconciler also wakes immediately on every
-    /// `LifecycleFrame::MetadataCommitTick` from shard 0. This periodic
-    /// fallback covers dropped wake-ups (the wake channel is capacity-1)
-    /// and the initial post-bootstrap convergence window. Values above
+    /// Tick cadence for the partition reconciliation loop. The reconciler
+    /// also wakes immediately on every `LifecycleFrame::MetadataCommitTick`
+    /// from shard 0. The tick retries partitions that a pass left unfinished
+    /// (a backed-off build, an incomplete trim), checks local changes that no
+    /// commit announces, ages parked requests, and covers dropped wake-ups
+    /// (the wake channel is capacity-1). Values above
     /// [`RECONCILE_PERIODIC_INTERVAL_MAX`] are rejected by the validator.
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]

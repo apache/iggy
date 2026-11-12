@@ -165,6 +165,22 @@ export const serializeHeaderKey = (key: HeaderKey): Buffer => {
  */
 export const serializeHeader = (key: HeaderKey, v: BinaryHeaderValue) => {
   const bKey = serializeHeaderKey(key);
+  for (const [field, kind, bytes] of [
+    ["key", key.kind, bKey],
+    ["value", v.kind, v.value],
+  ] as const) {
+    if (bytes.length < 1 || bytes.length > 255) {
+      throw new Error(
+        `Invalid header ${field} length: ${bytes.length}, must be between 1 and 255`,
+      );
+    }
+    const size = expectedSize(kind);
+    if (size !== -1 && bytes.length !== size) {
+      throw new Error(
+        `Invalid header ${field} size for kind ${kind}: expected ${size}, got ${bytes.length}`,
+      );
+    }
+  }
   const keyHeader = Buffer.alloc(5);
   keyHeader.writeUInt8(key.kind);
   keyHeader.writeUInt32LE(bKey.length, 1);

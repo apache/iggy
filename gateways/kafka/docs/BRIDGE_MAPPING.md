@@ -352,12 +352,14 @@ as an empty one, and the probe cannot tell them apart without a server-side sign
 time in that window still polls, and answers `-1` only when the polls come back empty as well. A
 reset by time there then moves to LATEST.
 
-Lookups by time run one partition at a time and reuse one Fetch read slot, however many
-partitions the request names. A poll that times out frees its slot as it stops, so for a moment
-the request can hold a second one. Each lookup gets a quarter of the request deadline, capped by
-the deadline itself. One whose time has already passed answers `REQUEST_TIMED_OUT` (7) without
-taking or using a slot, and one that does not finish in time answers 7 too. Clients retry 7.
-Repeated entries for one partition and time are looked up once.
+The lookups by time of one request share one Fetch read slot, however many partitions the request
+names, and up to 8 run at once. Each poll gets the time of a Fetch poll, 2 s or more for a
+partition whose pages took long. Lookups start only in the first 2 s after the request takes its
+slot. The request waits no longer for them, apart from a partition whose pages took long. A lookup
+with no answer by then answers `REQUEST_TIMED_OUT` (7). Clients retry 7. A poll with no
+answer in its time stalls its partition, as in Fetch. The lookups of a stalled partition answer
+`NOT_LEADER_OR_FOLLOWER` (6) with no poll until a re-check answers. Repeated entries for one
+partition and time are looked up once.
 
 ### Header order
 
@@ -496,12 +498,14 @@ topic costs CPU on the read path and saves bytes on the wire to the consumer.
 
 Default: always emit uncompressed, and revisit when a benchmark says it matters.
 
-### Not asked here
+### Topic configuration
 
-A Kafka `retention.ms` topic config could map onto Iggy's `message_expiry` at creation time.
-`ensure_stream_and_topic` leaves topics on the server default, which never expires. That belongs
-to CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), which owns topic
-configuration, rather than to the record mapping.
+Topic configuration is not part of the record mapping. `CreateTopics` maps `retention.ms` onto
+Iggy's `message_expiry`, `retention.bytes` onto `max_topic_size` times the partition count, and
+`segment.bytes` onto `segment_size`. The Kafka replication factor is Iggy's `replication_factor`.
+`flush.messages=1` or `flush.ms=0` makes the messages `persisted`. A `cleanup.policy` without
+`delete` gives the topic no expiry and no size cap, because Iggy does not compact. See
+[`CONFIGS.md`](CONFIGS.md).
 
 ## References
 

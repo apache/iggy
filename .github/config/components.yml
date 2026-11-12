@@ -194,6 +194,14 @@ components:
     paths:
       - "core/kafka_wire/**"
 
+  # Object store interfaces behind tiered storage. Listed on its own so a change
+  # confined to the crate still starts the Rust jobs.
+  rust-object-store:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/object_store/**"
+
   # Main Rust workspace testing
   rust:
     depends_on:
@@ -206,10 +214,10 @@ components:
       - "rust-cluster"
       - "rust-simulator"
       - "rust-kafka-wire"
+      - "rust-object-store"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"
-      - "rust-connectors"
       - "rust-mcp"
       - "rust-integration"
       - "rust-gateway"
@@ -247,14 +255,6 @@ components:
       - "rust-sdk"
     paths:
       - "core/bench/**"
-
-  # Connectors runtime
-  rust-connectors:
-    depends_on:
-      - "rust-sdk"
-      - "rust-configs"
-    paths:
-      - "core/connectors/**"
 
   # MCP AI component
   rust-mcp:
@@ -357,6 +357,8 @@ components:
       - "foreign/swift/**"
       - "bdd/swift/**"
       - "examples/swift/**"
+      - "Package.swift"
+      - ".spi.yml"
     tasks: ["lint", "test", "build", "build-macos", "golden", "e2e"]
 
   # Shared BDD infrastructure that affects all BDD tests
@@ -607,6 +609,8 @@ components:
       - ".github/config/components.yml"
       - "scripts/ci/restore-runtime.sh"
       - "scripts/ci/test-runtime-artifacts.py"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"

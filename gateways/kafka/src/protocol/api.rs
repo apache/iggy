@@ -131,6 +131,10 @@ impl Default for BrokerAdvertise {
 /// The node id of a gateway that `IGGY_KAFKA_NODE_ID` does not set.
 pub const DEFAULT_NODE_ID: u16 = 1;
 
+/// The first stand-in node id in a replica list: 65536, one past the largest node id a gateway can
+/// take, since `IGGY_KAFKA_NODE_ID` is a `u16`.
+pub const FIRST_STAND_IN_REPLICA: i32 = 1 << 16;
+
 /// The gateways that one listener lists in Metadata. A gateway alone lists itself, as node 1.
 #[derive(Debug, Clone)]
 pub struct Brokers {
@@ -161,6 +165,28 @@ impl Brokers {
         listed.push((self.node_id, own));
         listed.sort_by_key(|(node, _)| *node);
         listed
+    }
+
+    /// `count` node ids for the replicas of a partition, and never fewer than one: this gateway
+    /// first, then the next gateways in node id order, wrapping round. A factor above the number
+    /// of gateways is filled with stand-in ids from [`FIRST_STAND_IN_REPLICA`], which no gateway
+    /// can take. A client reads a stand-in as a replica on a broker that is not up, and reads the
+    /// factor from the length of the list.
+    #[must_use]
+    pub fn replicas(&self, count: u32) -> Vec<i32> {
+        let wanted = usize::try_from(count).unwrap_or(usize::MAX).max(1);
+        let mut ids: Vec<i32> = self.peers.iter().map(|(node, _)| *node).collect();
+        ids.push(self.node_id);
+        ids.sort_unstable();
+        let own = ids
+            .iter()
+            .position(|node| *node == self.node_id)
+            .unwrap_or(0);
+        ids.rotate_left(own);
+        ids.truncate(wanted);
+        let stand_ins = (FIRST_STAND_IN_REPLICA..).take(wanted.saturating_sub(ids.len()));
+        ids.extend(stand_ins);
+        ids
     }
 
     /// The gateway that coordinates every consumer group: the lowest node id. Every gateway names
@@ -292,6 +318,11 @@ pub struct GatewayState {
     /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
     /// proof that no record matches. Only the first of a spell warns.
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, what the Iggy polls of Fetch and `ListOffsets` showed: how
+    /// long the next poll may take, and whether the partition stalled. Shared, so the consumers
+    /// of a partition whose node stopped do not each spend a read slot waiting for it. In an
+    /// `Arc`, since a re-check reports after its request ended.
+    pub(crate) poll_records: Arc<Mutex<fetch::PollRecords>>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
     /// Held by `CreatePartitions` from reading a topic's partition count until its write is
@@ -355,6 +386,7 @@ impl GatewayState {
             groups,
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
+            poll_records: Arc::default(),
             probe_board: ProbeBoard::default(),
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
@@ -666,19 +698,15 @@ pub fn supported_max_version(api_key: i16) -> Option<i16> {
 /// open, the answer a real broker gives on a PLAINTEXT listener. Keeping them out of the firewall
 /// table means dispatch never serves them on its own.
 ///
-/// `SaslHandshake` is pinned to v1 on both ends. v0 selects the headerless token framing (KIP-152)
-/// that the frame reader cannot parse, so advertising it would invite exactly the shape this
-/// gateway refuses.
+/// `SaslHandshake` v0 selects a bare token with no request header after it (KIP-152), and v1 a
+/// token in a `SaslAuthenticate` request. The connection loop serves both.
 static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
     ApiVersionRange {
-        // Advertised from v0 even though only v1 is accepted, the same split
-        // [`advertised_min_version`] already applies to Produce. librdkafka gates its whole
-        // SASL-handshake feature on `SaslHandshake` v0 appearing in the advertisement
-        // (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so advertising v1
-        // alone makes it report "SASL Handshake not supported by broker" and give up before it
-        // ever sends one. It then picks v1 anyway, because `SaslAuthenticate` being advertised is
-        // what selects the KIP-152 framing. A client that really only knows v0 still gets
-        // `UNSUPPORTED_VERSION` and a closed connection from the state machine.
+        // librdkafka gates its whole SASL-handshake feature on `SaslHandshake` v0 appearing in the
+        // advertisement (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so
+        // advertising v1 alone makes it report "SASL Handshake not supported by broker" and give
+        // up before it ever sends one. It then picks v1, because `SaslAuthenticate` being
+        // advertised is what selects the KIP-152 framing.
         api_key: API_KEY_SASL_HANDSHAKE,
         min_version: 0,
         max_version: 1,

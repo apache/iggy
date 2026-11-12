@@ -148,8 +148,10 @@ struct CommandCodeTests {
     }
 
     @Test func serverOrderedOperationsAreInternal() {
-        let partitionFences: [ConsensusOperation] = [.retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners]
-        for operation in partitionFences {
+        let serverOrderedPartitionOperations: [ConsensusOperation] = [
+            .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners, .stateMachineCommand,
+        ]
+        for operation in serverOrderedPartitionOperations {
             #expect(operation.isInternal)
             #expect(operation.isPartition)
             #expect(!operation.isMetadata)

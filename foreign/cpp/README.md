@@ -146,10 +146,11 @@ reader.Close();
 - `Next` waits up to its timeout and returns `std::nullopt` when the time runs out.
 - `Commit` stores a checkpoint that the reader delivered, and under `CommitPolicy::Auto` `Mark` counts one for the policy to store.
 - `Seek` moves a partition to a `PollingStrategy`, or to a `Continuation` of that partition.
-- A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it.
+- C++ cannot cancel `Commit` and `Seek`, so each one ends at a deadline 10 s after its start. The `Commit` and `Seek` of an `IggyConsumer` do the same.
+- A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it. A lost read can commit messages that the reader cannot read again. Then the reader throws `fetch_progress_uncertain` once. `Lost()` holds the first and last offset of those messages, and `Skip()` the continuation after them.
 - `Close` stops the reader, and a second `Close` does nothing. Destroying a reader without `Close` moves no offset back and does not leave the group.
 
-A consumer group reader joins its group in `Reader` and leaves it in `Close`.
+A consumer group reader joins its group in `Reader` and leaves it in `Close`. A group create or join with an unknown outcome throws its error, and the next `Reader` or `GroupConsumer` joins again. A join that landed keeps its member in the group until the session ends.
 
 `IggyBlockingClient::StandaloneConsumer` and `GroupConsumer` build an `IggyConsumer`, which hands over one `ReceivedMessage` at a time through a reader, with the commit policy of the `PollOptions` of its `ConsumerOptions`. A standalone consumer reads the partitions of its options. A group consumer creates its group when it is missing, joins it, and leaves it in `Close`.
 
