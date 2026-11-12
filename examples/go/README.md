@@ -1,6 +1,6 @@
 # Iggy Examples
 
-This directory contains a getting-started producer and consumer using the Go SDK over TCP, with optional TLS, a consumer-group reader, and a multi-tenant producer and consumer. To learn more about building applications with Iggy, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
+This directory contains a getting-started producer and consumer using the Go SDK over TCP, with optional TLS, a consumer-group reader, a multi-tenant producer and consumer, and a sink data producer. To learn more about building applications with Iggy, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
 
 ## Running Examples
 
@@ -63,6 +63,28 @@ go run ./multi-tenant/consumer/main.go
 The producer creates `tenant_<n>_stream` with an `events` topic and a `tenant_<n>_producer` user that may only read and send to that stream, sends messages as each tenant, and then asks for another tenant's stream to show the server refusing it. The consumer adds a read-only `tenant_<n>_consumer` user per tenant, reads every stream as that tenant, and makes the same refused request.
 
 Both read the tenant count from `TENANTS_COUNT` (default `3`). Streams, topics and users are reused when they already exist and their permissions are rewritten, so running either program twice against the same server succeeds instead of panicking.
+
+### Sink Data Producer
+
+Populates an Iggy topic with JSON records so that a sink connector has data to read. The producer sends 100 batches of 100 to 499 records each, logs the total and exits.
+
+Each record contains: `user_id`, `user_type`, `email`, `source`, `state`, `created_at` and `message`. The fields match the Rust and Python sink data producers, so one connector configuration works for every SDK.
+
+Default stream: `qw` | Default topic: `records`
+
+Environment variables:
+
+- `IGGY_STREAM` - stream name (default: `qw`)
+- `IGGY_TOPIC` - topic name (default: `records`)
+- `IGGY_ADDRESS` - server address (default: `127.0.0.1:8090`)
+- `IGGY_USERNAME` - authentication username (default: `iggy`)
+- `IGGY_PASSWORD` - authentication password (default: `iggy`)
+
+The producer creates the stream and topic if they are missing and keeps them after it exits, so running it again against the same server succeeds. It addresses the stream and topic by name. On a fresh server, the first stream created takes ID `0`, which the getting-started examples expect, so run this producer after them or on a separate fresh server.
+
+```bash
+go run ./sink-data-producer/main.go
+```
 
 ## TLS Examples
 
