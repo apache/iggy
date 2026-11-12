@@ -25,31 +25,43 @@ mod pages;
 use dioxus::prelude::*;
 
 use crate::auth::Session;
-use crate::pages::{DashboardLayout, Messages, NotFound, SignIn, StreamPage, Streams, TopicPage};
+pub use crate::route::Route;
 
 const STYLESHEET: Asset = asset!("/assets/main.css");
 const FAVICON: Asset = asset!("/assets/favicon.svg");
 const LOGO: Asset = asset!("/assets/iggy-apache-darkbg.svg");
 
-#[derive(Debug, Clone, PartialEq, Routable)]
-#[rustfmt::skip]
-pub enum Route {
-    #[redirect("/", || Route::SignIn {})]
-    #[route("/auth/sign-in")]
-    SignIn {},
-    #[layout(DashboardLayout)]
-        #[redirect("/dashboard", || Route::Streams {})]
-        #[route("/dashboard/streams")]
-        Streams {},
-        #[route("/dashboard/streams/:stream_id")]
-        StreamPage { stream_id: u32 },
-        #[route("/dashboard/streams/:stream_id/topics/:topic_id")]
-        TopicPage { stream_id: u32, topic_id: u32 },
-        #[route("/dashboard/streams/:stream_id/topics/:topic_id/partitions/:partition_id/messages?:offset")]
-        Messages { stream_id: u32, topic_id: u32, partition_id: u32, offset: Option<u64> },
-    #[end_layout]
-    #[route("/:..segments")]
-    NotFound { segments: Vec<String> },
+// The `Routable` derive of dioxus 0.7.10 builds calls that take a value of an
+// empty error enum, and Rust 1.100 reports such a call as unreachable. An allow
+// on the enum does not reach derive output, so the module carries it.
+#[allow(unreachable_code)]
+mod route {
+    use dioxus::prelude::*;
+
+    use crate::pages::{
+        DashboardLayout, Messages, NotFound, SignIn, StreamPage, Streams, TopicPage,
+    };
+
+    #[derive(Debug, Clone, PartialEq, Routable)]
+    #[rustfmt::skip]
+    pub enum Route {
+        #[redirect("/", || Route::SignIn {})]
+        #[route("/auth/sign-in")]
+        SignIn {},
+        #[layout(DashboardLayout)]
+            #[redirect("/dashboard", || Route::Streams {})]
+            #[route("/dashboard/streams")]
+            Streams {},
+            #[route("/dashboard/streams/:stream_id")]
+            StreamPage { stream_id: u32 },
+            #[route("/dashboard/streams/:stream_id/topics/:topic_id")]
+            TopicPage { stream_id: u32, topic_id: u32 },
+            #[route("/dashboard/streams/:stream_id/topics/:topic_id/partitions/:partition_id/messages?:offset")]
+            Messages { stream_id: u32, topic_id: u32, partition_id: u32, offset: Option<u64> },
+        #[end_layout]
+        #[route("/:..segments")]
+        NotFound { segments: Vec<String> },
+    }
 }
 
 /// Starts the app in the browser. The binary is a thin wrapper so that tools

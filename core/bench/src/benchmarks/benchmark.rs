@@ -190,8 +190,7 @@ pub trait Benchmarkable: Send {
         let rate_limit = self
             .args()
             .rate_limit()
-            .map(|rl| format!(" global rate limit: {rl}/s"))
-            .unwrap_or_default();
+            .map_or_default(|rl| format!(" global rate limit: {rl}/s"));
 
         format!("{message_size}{messages_per_batch}{data}{rate_limit}")
     }

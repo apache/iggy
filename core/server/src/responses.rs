@@ -180,7 +180,7 @@ where
         let tokens = users
             .personal_access_tokens
             .get(&user_id)
-            .map(|pats| {
+            .map_or_default(|pats| {
                 pats.values()
                     .filter_map(|pat| {
                         Some(PersonalAccessTokenResponse {
@@ -189,8 +189,7 @@ where
                         })
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         GetPersonalAccessTokensResponse { tokens }
     })
 }
@@ -234,7 +233,7 @@ where
     let consumer_groups = sessions
         .borrow()
         .get_session(transport_client_id)
-        .map(|(vsr_client_id, _)| {
+        .map_or_default(|(vsr_client_id, _)| {
             shard
                 .plane
                 .metadata()
@@ -242,7 +241,6 @@ where
                 .streams()
                 .consumer_group_memberships(vsr_client_id)
         })
-        .unwrap_or_default()
         .into_iter()
         .map(
             |(stream_id, topic_id, group_id)| ConsumerGroupInfoResponse {
