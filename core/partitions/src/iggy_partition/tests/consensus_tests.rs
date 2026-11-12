@@ -868,6 +868,134 @@ async fn given_committed_prepare_when_retransmitted_should_ack_only_matching_his
     }
 }
 
+/// A ring past its byte cap keeps a committed op as a header only, with the
+/// body in its segment. The primary of a later view can still need the ack
+/// of this backup for that op, and only for the prepare that was committed.
+#[compio::test]
+async fn given_released_committed_prepare_when_retransmitted_should_ack_only_the_same_prepare() {
+    const LATER_VIEW: u32 = 3;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut config = repair_config();
+    config.path_layout.streams_root = root.path().to_string_lossy().into_owned();
+    let directory = std::path::PathBuf::from(config.get_partition_path(1, 1, 0));
+    std::fs::create_dir_all(&directory).unwrap();
+    let (mut partition, _) = recording_partition_at(1, 3);
+    let sent = partition.consensus().message_bus().sent_to_replicas.clone();
+    partition.set_partition_dir(directory.to_string_lossy().into_owned());
+    partition.runtime_options.durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+    partition.open_persistence().await.unwrap();
+    partition.log.retire_front().unwrap();
+    partition.install_empty_segment(&config, 0).await.unwrap();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    // No room for a body, so only the newest one stays in memory.
+    partition
+        .log
+        .journal()
+        .inner
+        .set_ring_caps(crate::EVICTED_RING_CAPACITY, 1);
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+
+    let released = checksummed_segment_prepare(1, 0, 0, b"released");
+    let in_memory = checksummed_segment_prepare(2, released.header().checksum, 1, b"in memory");
+    let mut writer = hold_wal_writer(&persistence);
+    for prepare in [&released, &in_memory] {
+        partition.on_replicate(prepare.clone()).await;
+        writer.await;
+        writer = hold_wal_writer(&persistence);
+        commit_on_heartbeat(&mut partition, &config, prepare.header().op).await;
+        settle_partition_io(&mut partition, &config).await;
+    }
+    writer.await;
+    let journal = &partition.log.journal().inner;
+    assert!(
+        journal.evicted_header(1).is_some() && journal.repair_entry(1).is_none(),
+        "the ring keeps op 1 as a header only"
+    );
+    assert!(
+        journal.repair_entry(2).is_some(),
+        "the ring keeps the newest body"
+    );
+
+    // Replica 0 leads the later view and resends what it still has to commit.
+    // The backup made that view durable when it adopted it.
+    partition.consensus.set_view(LATER_VIEW);
+    partition.consensus.set_log_view(LATER_VIEW);
+    if !partition.persist_superblock_if_needed().await {
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+    }
+    assert!(
+        partition.persist_superblock_if_needed().await,
+        "the later view is durable before the retransmits"
+    );
+    let resent = |prepare: &Message<PrepareHeader>| {
+        prepare
+            .clone()
+            .transmute_header(|original, header: &mut PrepareHeader| {
+                *header = original;
+                header.view = LATER_VIEW;
+            })
+    };
+    let acknowledged = || -> Vec<(u64, u128)> {
+        sent.borrow_mut()
+            .drain(..)
+            .filter_map(|(_, frame)| {
+                bytemuck::checked::try_from_bytes::<PrepareOkHeader>(frame.as_slice())
+                    .ok()
+                    .filter(|header| header.command == Command::PrepareOk)
+                    .map(|header| (header.op, header.prepare_checksum))
+            })
+            .collect()
+    };
+    sent.borrow_mut().clear();
+
+    for (prepare, body) in [(&in_memory, "in memory"), (&released, "in its segment")] {
+        partition.on_replicate(resent(prepare)).await;
+        assert_eq!(
+            acknowledged(),
+            vec![(prepare.header().op, prepare.header().checksum)],
+            "a committed retransmit must be acknowledged when its body is {body}"
+        );
+    }
+
+    let other_batch = checksummed_segment_prepare(1, 0, 0, b"replaced");
+    assert_eq!(other_batch.header(), released.header());
+    let mut corrupt_body = released.clone();
+    let last_payload_byte = corrupt_body.as_slice().len() - 1;
+    corrupt_body.as_mut_slice()[last_payload_byte] ^= 1;
+    let other_request =
+        released
+            .clone()
+            .transmute_header(|original, header: &mut PrepareHeader| {
+                *header = original;
+                header.request += 1;
+                header.checksum = header.identity_checksum();
+            });
+    let mut padded = released.as_slice().to_vec();
+    padded.push(0);
+    let trailing_byte =
+        Message::<PrepareHeader>::try_from(Owned::copy_from_slice(&padded)).unwrap();
+    for (prepare, difference) in [
+        (&other_batch, "another batch under the same header"),
+        (&corrupt_body, "a body that fails its checksum"),
+        (&other_request, "another header over the same body"),
+        (&trailing_byte, "a byte after the prepare"),
+    ] {
+        partition.on_replicate(resent(prepare)).await;
+        assert!(
+            acknowledged().is_empty(),
+            "a retransmit with {difference} must not be acknowledged"
+        );
+    }
+}
+
 #[compio::test]
 async fn live_retransmits_fill_an_announced_gap_only_after_the_matching_prefix() {
     for durability in [

@@ -22,6 +22,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::partition_journal::SegmentReference;
 use journal::{Journal, Storage};
 use server_common::{
+    Message,
     iobuf::{Frozen, IOV_MAX, Owned},
     send_messages::{
         self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice, decode_prepare_slice_trusted,
@@ -158,6 +159,23 @@ impl EvictedHeader {
             ));
         }
         Ok(prepare.into())
+    }
+
+    /// Whether `retransmit` is the prepare this entry keeps the header of.
+    /// Only the view may differ. No bytes are left in memory to compare the
+    /// body with, so it must pass its own checksums and carry the checksum
+    /// of the released batch.
+    #[must_use]
+    pub(crate) fn matches_retransmit(&self, retransmit: &Message<PrepareHeader>) -> bool {
+        let header = retransmit.header();
+        let frame = retransmit.as_slice();
+        PrepareHeader {
+            view: header.view,
+            ..self.header
+        } == *header
+            && frame.len() == header.size as usize
+            && decode_prepare_slice(frame)
+                .is_ok_and(|batch| batch.header.batch_checksum == self.batch_checksum)
     }
 
     /// Start offset of the segment whose log file holds the body.
