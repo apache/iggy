@@ -124,6 +124,7 @@ pub struct ReadException {
     partition_id: Option<u32>,
     skip: Option<PollingStrategy>,
     lasting_refusal: bool,
+    lost: Option<(u64, u64)>,
 }
 
 #[php_impl]
@@ -135,7 +136,8 @@ impl ReadException {
     }
 
     /// For a message that does not decode: the continuation after it. The reader reads the
-    /// message again until a seek of its partition to this continuation skips it.
+    /// message again until a seek of its partition to this continuation skips it. Null for
+    /// every other error.
     #[php(getter)]
     pub fn skip(&self) -> Option<PollingStrategy> {
         self.skip.clone()
@@ -146,6 +148,28 @@ impl ReadException {
     #[php(getter, change_case = "snake_case")]
     pub fn is_lasting_refusal(&self) -> bool {
         self.lasting_refusal
+    }
+
+    /// For messages that a lost read committed and that the reader could not read again: their
+    /// first and last offset, as [first, last]. The code is then FetchProgressUncertain
+    /// (14010). Null for every other error. This error stops nothing and needs no seek. A
+    /// batch that the reader holds after the range comes next, and a seek before the
+    /// application takes it drops it. If the reader stopped the partition, the error that
+    /// stopped it comes after that batch.
+    #[php(getter)]
+    pub fn lost(&self) -> Option<Vec<u64>> {
+        self.lost.map(|(first, last)| vec![first, last])
+    }
+}
+
+impl From<&ReadError> for ReadException {
+    fn from(error: &ReadError) -> Self {
+        Self {
+            partition_id: error.partition_id,
+            skip: error.skip.map(PollingStrategy::from),
+            lasting_refusal: error.is_lasting_refusal(),
+            lost: error.lost.as_ref().map(|lost| (*lost.start(), *lost.end())),
+        }
     }
 }
 
@@ -173,11 +197,7 @@ impl IntoPhpException for ReadError {
     fn into_php_exception(self) -> PhpException {
         let message = self.to_string();
         let code = self.error.as_code() as i32;
-        let exception = ReadException {
-            partition_id: self.partition_id,
-            lasting_refusal: self.is_lasting_refusal(),
-            skip: self.skip.map(PollingStrategy::from),
-        };
+        let exception = ReadException::from(&self);
 
         thrown(
             error_object(&self.error)
@@ -360,6 +380,7 @@ impl From<&IggyError> for PhpExceptionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy::prelude::PollingStrategy as RustPollingStrategy;
 
     #[test]
     fn pending_operation_errors_preserve_exact_identity_and_kind() {
@@ -394,5 +415,29 @@ mod tests {
             }
         }
         assert!(PendingOperationException::from_error(&IggyError::InvalidCommand).is_none());
+    }
+
+    #[test]
+    fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
+        const PARTITION_ID: u32 = 7;
+        const OPERATION_ID: u64 = 42;
+        const FIRST: u64 = 4;
+        const LAST: u64 = 9;
+        let mut error = ReadError::new(
+            Some(PARTITION_ID),
+            IggyError::FetchProgressUncertain(OPERATION_ID),
+        );
+        error.lost = Some(FIRST..=LAST);
+
+        let exception = ReadException::from(&error);
+
+        assert_eq!(exception.partition_id(), Some(PARTITION_ID));
+        assert!(exception.skip().is_none());
+        assert_eq!(exception.lost(), Some(vec![FIRST, LAST]));
+        let mut undecoded = ReadError::new(Some(PARTITION_ID), IggyError::CannotReadMessage);
+        undecoded.skip = Some(RustPollingStrategy::offset(LAST + 1));
+        let other = ReadException::from(&undecoded);
+        assert!(other.skip().is_some());
+        assert_eq!(other.lost(), None, "only a lost range carries offsets");
     }
 }

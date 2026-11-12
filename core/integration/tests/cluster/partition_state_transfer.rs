@@ -307,6 +307,61 @@ async fn given_evicted_ring_wider_than_repair_chunk_when_node_restarts_with_data
     restart_lagging_node_and_await_install(harness).await;
 }
 
+/// A replica that awaits a transfer acknowledges nothing, and a pair commits
+/// nothing without it. With nothing committed, only a transfer of the empty
+/// state ends that wait.
+#[iggy_harness(cluster_nodes = 2, server(sharding.cpu_allocation = "0..1"))]
+async fn given_a_pair_with_nothing_committed_when_one_replica_loses_its_partition_should_install_an_empty_transfer_and_commit_a_send(
+    harness: &mut TestHarness,
+) {
+    const WIPED_NODE: usize = 1;
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
+    seed_topic(&client, None, None).await;
+    drop(client);
+    sleep(Duration::from_secs(1)).await;
+
+    harness.stop_node(WIPED_NODE).expect("stop node 1");
+    let segment = walk(&harness.node(WIPED_NODE).data_path(), &mut |path| {
+        is_segment_log(path)
+    })
+    .expect("node 1 holds the first segment of the partition");
+    // The node keeps its record of the partition, so it returns as a member
+    // that lost its history and awaits a transfer.
+    std::fs::remove_dir_all(segment.parent().expect("partition directory"))
+        .expect("remove the partition directory of node 1");
+    harness.restart_node(WIPED_NODE).expect("restart node 1");
+
+    await_marker(harness, WIPED_NODE, INSTALL_MARKER).await;
+    let deadline = Instant::now() + TRANSFER_BUDGET;
+    loop {
+        if let Some(client) = connect_any(harness, &[0, WIPED_NODE]).await {
+            let mut messages =
+                vec![IggyMessage::from_str("after-the-empty-transfer").expect("message")];
+            if client
+                .send_messages(
+                    &Identifier::named(STREAM_NAME).expect("stream identifier"),
+                    &Identifier::named(TOPIC_NAME).expect("topic identifier"),
+                    &Partitioning::partition_id(PARTITION_ID),
+                    &mut messages,
+                )
+                .await
+                .is_ok()
+                && poll_count(&client, 1).await == Ok(1)
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no send committed on the pair after node 1 installed the empty transfer"
+        );
+        sleep(MARKER_POLL).await;
+    }
+}
+
 #[iggy_harness(
     cluster_nodes = 5,
     server(

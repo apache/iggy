@@ -41,7 +41,7 @@ use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{
     Aes256GcmEncryptor, ClientError, EncryptorKind, MetadataChangesQuery,
-    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions,
+    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions, TransportProtocol,
 };
 use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
@@ -95,6 +95,7 @@ use iggy_cli::commands::{
     },
 };
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{Level, event};
 
@@ -310,6 +311,8 @@ fn get_command(
                 poll_args.consumer.clone(),
                 poll_args.show_headers,
                 poll_args.output_file.clone(),
+                poll_args.consumer_group.clone(),
+                poll_args.follow,
             )),
         },
         Command::ConsumerOffset(command) => match command {
@@ -408,6 +411,14 @@ async fn run() -> Result<(), IggyCmdError> {
     let cli_options = merged_args.cli;
 
     validate_transport(&iggy_args.transport)?;
+    if let Command::Message(MessageAction::Poll(poll_args)) = &command {
+        poll_args.validate()?;
+        if poll_args.consumer_group.is_some()
+            && TransportProtocol::from_str(&iggy_args.transport) == Ok(TransportProtocol::Http)
+        {
+            return Err(anyhow::anyhow!("--consumer-group is not supported over HTTP").into());
+        }
+    }
     let server_address = iggy_args
         .get_server_address()
         .ok_or_else(|| ClientError::InvalidTransport(iggy_args.transport.clone()))?;
@@ -457,9 +468,12 @@ async fn run() -> Result<(), IggyCmdError> {
     } else {
         println!("Executing {}", command.explain());
     }
-    command.execute_cmd(&client).await?;
+    command.execute_with_iggy_client(&client).await?;
 
-    credentials.logout_user().await?;
+    tokio::select! {
+        logout = credentials.logout_user() => logout?,
+        _ = tokio::signal::ctrl_c() => std::process::exit(130),
+    }
 
     Ok(())
 }

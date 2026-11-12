@@ -5747,7 +5747,8 @@ enum class CommitPolicy : std::uint8_t {
     /**
      * The server stores the offset of the last message of each read as part of the read, in one round trip. While the
      * primary stays up a message is delivered at most once. A failover before the store replicates can deliver the
-     * last batch again.
+     * last batch again. A reader stores the offsets of the batches that it reads ahead, so a crash loses the batches
+     * that the application did not take: up to the effective prefetch budget, which holds at least 32 batches.
      */
     OnRead = 1,
     /** A reader stores the latest counted position, as its AutoCommit says. A one-shot poll refuses it. */
@@ -6044,19 +6045,44 @@ class ReadException final : public IggyException {
 
     /**
      * @return For a message that does not decode, the continuation after it,
-     *         to pass to PartitionReader::Seek(), otherwise `nullptr`.
+     *         to pass to PartitionReader::Seek(). Otherwise `nullptr`.
      */
     [[nodiscard]] const ::iggy::Continuation *Skip() const noexcept { return skip_.get(); }
+
+    /**
+     * @return True when the reader stopped the partition after six refusals
+     *         in a row that a retry does not change, such as `unauthorized`.
+     *         Only a Seek() of the partition reads it again. While a lost
+     *         read is still pending, such a stop arrives as
+     *         `fetch_progress_uncertain` (14010) with an empty Lost(), and
+     *         this flag is then false.
+     */
+    [[nodiscard]] bool IsLastingRefusal() const noexcept { return lasting_refusal_; }
+
+    /**
+     * @return For messages that a lost read committed and that the reader
+     *         could not read again, their first and last offset, with the
+     *         error `fetch_progress_uncertain`. Otherwise `std::nullopt`.
+     *         This error stops nothing and needs no Seek(). A batch that the
+     *         reader holds after the range comes next, and a Seek() before
+     *         the application takes it drops it. If the reader stopped the
+     *         partition, the error that stopped it comes after that batch.
+     */
+    [[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>> Lost() const noexcept { return lost_; }
 
   private:
     ReadException(const std::string &message, ffi::ReadErrorInfo &error);
 
     friend class PartitionReader;
     friend class IggyConsumer;
+    // The unit tests have no server to fail a read, so they build one through this class.
+    friend class ReadExceptionTestPeer;
 
     std::optional<std::uint32_t> partition_id_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const ::iggy::Continuation> skip_;
+    bool lasting_refusal_;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> lost_;
 };
 
 /**
@@ -6085,13 +6111,15 @@ class ReaderOptions final {
         return *this;
     }
 
-    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    /** @param prefetch_bytes Requested encoded bytes in flight and queued. Default 16 MiB. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ReaderOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
         prefetch_bytes_ = prefetch_bytes;
         return *this;
     }
 
-    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    /** @param prefetch_messages Requested messages in flight and queued. Default 16,000. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ReaderOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
         prefetch_messages_ = prefetch_messages;
         return *this;
@@ -6173,6 +6201,10 @@ class PartitionReader final {
 
     /**
      * @brief Stores the offset of a checkpoint that this reader delivered.
+     *
+     * C++ cannot cancel the call, so it ends at a deadline 10 s after its
+     * start: after a refusal for an earlier owner (5009), the read of the new
+     * owner retries only until then, and the call throws the refusal.
      * @throws IggyException with CommitPolicy::OnRead, for a checkpoint this
      *         reader did not deliver, and for a failed store.
      */
@@ -6188,10 +6220,13 @@ class PartitionReader final {
      * @brief Sets the next read position of a partition and drops its queued batches.
      *
      * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
-     * offset before it, so a restart resumes at the new position. Every other
-     * seek stores nothing.
+     * offset before it, so a restart resumes at the new position. A seek to
+     * offset 0 or PollingStrategy::First() deletes the stored offset, and a
+     * seek to a timestamp stores the offset before the first message at the
+     * timestamp, if there is one. Every other seek stores nothing. The call
+     * ends at a deadline 10 s after its start, as Commit() does.
      * @throws IggyException for a partition this reader does not read, and for
-     *         a failed store, after which nothing moved.
+     *         a failed read, lookup, store or delete, after which nothing moved.
      */
     void Seek(std::uint32_t partition_id, const PollingStrategy &start);
 
@@ -6271,13 +6306,15 @@ class ConsumerOptions final {
         return *this;
     }
 
-    /** @param prefetch_bytes Encoded bytes of the requests in flight and the queued batches. Default 16 MiB. */
+    /** @param prefetch_bytes Requested encoded bytes in flight and queued. Default 16 MiB. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ConsumerOptions &SetPrefetchBytes(std::uint32_t prefetch_bytes) noexcept {
         prefetch_bytes_ = prefetch_bytes;
         return *this;
     }
 
-    /** @param prefetch_messages Messages in flight and queued. Default: the larger of 16,000 and the count. */
+    /** @param prefetch_messages Requested messages in flight and queued. Default 16,000. The Rust reader raises
+     * the effective budget to at least 32 full batches and preserves larger budgets. */
     ConsumerOptions &SetPrefetchMessages(std::uint32_t prefetch_messages) noexcept {
         prefetch_messages_ = prefetch_messages;
         return *this;
@@ -6329,6 +6366,9 @@ class IggyConsumer final {
 
     /**
      * @brief Stores the offset of a checkpoint that this consumer handed over.
+     *
+     * The call ends at a deadline 10 s after its start, as
+     * PartitionReader::Commit() does.
      * @throws IggyException with CommitPolicy::OnRead and for a failed store.
      */
     void Commit(const Checkpoint &checkpoint);
@@ -6343,10 +6383,14 @@ class IggyConsumer final {
      * @brief Sets the next read position of a partition.
      *
      * With CommitPolicy::OnRead, a seek to an offset above 0 first stores the
-     * offset before it, so a restart resumes at the new position. Every other
-     * seek stores nothing.
+     * offset before it, so a restart resumes at the new position. A seek to
+     * offset 0 or PollingStrategy::First() deletes the stored offset, and a
+     * seek to a timestamp stores the offset before the first message at the
+     * timestamp, if there is one. Every other seek stores nothing. The call
+     * ends at a deadline 10 s after its start, as Commit() does.
      * @throws IggyException for a partition this consumer does not read, and
-     *         for a failed store, after which nothing moved.
+     *         for a failed read, lookup, store or delete, after which nothing
+     *         moved.
      */
     void Seek(std::uint32_t partition_id, const PollingStrategy &start);
     void Seek(std::uint32_t partition_id, const Continuation &continuation);

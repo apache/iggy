@@ -79,12 +79,15 @@ internal static class MockFrames
     /// <summary>How many messages the golden batch holds.</summary>
     internal const uint GOLDEN_BATCH_MESSAGES = 2;
 
+    /// <summary>The context of the route that <see cref="Answer" /> serves.</summary>
+    internal static readonly PartitionContext AnsweredRoute = new(17, 0, 1);
+
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
     {
         if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
         {
-            return RouteReply(request, new PartitionContext(17, 0, 1), 0);
+            return RouteReply(request, AnsweredRoute, 0);
         }
         if (request.Code == BIND_SESSION_CODE)
         {
