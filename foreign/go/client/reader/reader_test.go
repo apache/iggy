@@ -1711,6 +1711,95 @@ func TestPartitionReader_ReportsOnceThePartOfALostRangeThatTheHistoryNoLongerHol
 	}
 }
 
+// Only a seek resumes a stopped partition, and it drops what the reader holds
+// of the partition. So a refusal that stops the partition during the read
+// again of what a lost reply stored comes last. First the reader reports the
+// part of the range that it did not read again and hands over the batch read
+// after the range. The read again names the history of the batch that showed
+// the range, so one refusal as history unavailable stops the partition.
+func TestPartitionReader_ReportsALostRangeAndHandsOverItsBatchBeforeTheRefusalThatStopsThePartitionUnderOnRead(t *testing.T) {
+	const interval = 10 * time.Millisecond
+	for _, test := range []struct {
+		name string
+		// again holds the offsets that the read again returns before the refusals.
+		again []uint64
+		// refusal answers the read again refusals times in a row, which stops the partition.
+		refusal  error
+		refusals int
+		lost     OffsetRange
+	}{
+		{"whole_range", nil, ierror.ErrUnauthorized, lastingRefusalsBeforeStop, OffsetRange{First: 2, Last: 4}},
+		{"rest_of_the_range", []uint64{2, 3}, ierror.ErrUnauthorized, lastingRefusalsBeforeStop, OffsetRange{First: 4, Last: 4}},
+		{"lost_history", nil, ierror.ErrHistoryUnavailable, 1, OffsetRange{First: 2, Last: 4}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newFakeClient()
+			reader := memberWith(t, client, []uint32{1}, WithPollOptions(withCommit(waitOneSecond, iggcon.OnReadCommit())),
+				WithRetryInterval(interval))
+			polled := nextInBackground(reader)
+			client.nextRead(t).answer(section(1, 0, 1))
+			require.NoError(t, (<-polled).err)
+			polled = nextInBackground(reader)
+			client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+			client.nextRead(t).answer(section(1, 5, 6))
+			if test.again != nil {
+				client.nextRead(t).answer(section(1, test.again...))
+				result := <-polled
+				require.NoError(t, result.err)
+				require.Equal(t, test.again, offsets(result.polled))
+				polled = nextInBackground(reader)
+			}
+			for range test.refusals {
+				refused := client.nextRead(t)
+				require.False(t, refused.commit)
+				require.Equal(t, test.lost.First, refused.targets[0].Strategy.Value)
+				refused.answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: test.refusal})
+			}
+
+			err := (<-polled).err
+			require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
+			var report *ReadError
+			require.ErrorAs(t, err, &report)
+			assert.Equal(t, &test.lost, report.Lost)
+			assert.Equal(t, []uint64{5, 6}, offsets(next(t, reader)), "the batch read after the range comes before the refusal")
+			require.ErrorIs(t, (<-nextInBackground(reader)).err, test.refusal)
+			nextInBackground(reader)
+			assert.True(t, client.readsNothingFor(300*time.Millisecond), "the partition stays stopped")
+			require.NoError(t, reader.Seek(context.Background(), 1, iggcon.NextPollingStrategy()))
+			assert.True(t, client.nextRead(t).commit, "a seek resumes the partition")
+		})
+	}
+}
+
+// A refusal as history unavailable stops a partition whose position came from
+// a read, as after a seek to the continuation of a batch. During the read
+// again of what a lost reply stored, the reader reports the range before that
+// refusal too. The lost read took every message of the partition here, so no
+// batch was read after the range.
+func TestPartitionReader_ReportsALostRangeBeforeTheHistoryRefusalThatStopsThePartitionUnderOnRead(t *testing.T) {
+	client := newFakeClient()
+	reader := standalone(t, client, withCommit(waitOneSecond, iggcon.OnReadCommit()), 1)
+	polled := nextInBackground(reader)
+	client.nextRead(t).answer(section(1, 0, 1))
+	first := <-polled
+	require.NoError(t, first.err)
+	position, _ := first.polled.Continuation()
+	require.NoError(t, reader.Seek(context.Background(), 1, position))
+	polled = nextInBackground(reader)
+	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	client.nextRead(t).answer(iggcon.FetchMessagesSection{PartitionId: 1, Context: testContext, CurrentOffset: 4, NextOffset: 5})
+	again := client.nextRead(t)
+	require.False(t, again.commit)
+	again.answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrHistoryUnavailable})
+
+	err := (<-polled).err
+	require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
+	var report *ReadError
+	require.ErrorAs(t, err, &report)
+	assert.Equal(t, &OffsetRange{First: 2, Last: 4}, report.Lost)
+	require.ErrorIs(t, (<-nextInBackground(reader)).err, ierror.ErrHistoryUnavailable)
+}
+
 // A member refused as not the owner keeps the position of the partition and
 // reads it again without its owner generation, since a new session installs
 // the owner under a new one.
