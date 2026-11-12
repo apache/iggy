@@ -1147,6 +1147,41 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// A gap read that the server refuses with `historyUnavailable` stops
+    /// its partition. The reader first throws the gap as lost and delivers
+    /// the batch after it. Only then it throws the refusal, so the seek that
+    /// resumes the partition drops no batch.
+    @Test func aLostHistoryThatStopsAGapReadReportsTheGapAndHandsOverTheBatchFirst() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 6])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.pollMessagesDeferred.rawValue, !polledStrategy(request).autoCommit else {
+                return nil
+            }
+            return .status(IggyErrorCode.historyUnavailable.rawValue)
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        topic.loseReplies(1)
+
+        let lost = try #require(await readError(reader), "the gap of the partition that stopped was not reported")
+        #expect(lost.partitionID == 1 && lost.error.code == .fetchProgressUncertain)
+        #expect(lost.lost == 2...3 && !lost.stopsPartition)
+        #expect(try await batches(reader, 1) == [[4, 5]])
+        let refusal = try #require(await readError(reader), "the refusal that stopped the partition was not reported")
+        #expect(refusal.partitionID == 1 && refusal.error.code == .historyUnavailable)
+        #expect(refusal.stopsPartition && refusal.lost == nil)
+        topic.append(2, to: 1)
+        try await Task.sleep(for: quietPeriod)
+        #expect(topic.stored[1] == 5, "the stopped partition read on without a seek")
+        try await reader.seek(partitionID: 1, to: .next)
+        #expect(try await batches(reader, 1) == [[6, 7]])
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// The fail-fast reply of the server tells nothing about a message of a
     /// section that did not decode. The reader reports nothing, reads the
     /// same message again after the retry interval and delivers it.

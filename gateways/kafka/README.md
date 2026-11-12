@@ -2,9 +2,9 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
 
-> **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
+> **Stub warning:** with the bridge on (the default), Produce, Fetch, ListOffsets, Metadata,
 > CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and
-> IncrementalAlterConfigs use Iggy. With the bridge off (the default), those ten are stubs:
+> IncrementalAlterConfigs use Iggy. With `IGGY_KAFKA_BRIDGE_ENABLED=false`, those ten are stubs:
 > Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics,
 > DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs answer
 > `NOT_CONTROLLER` (41), and Metadata reports every requested topic unknown. **CreateTopics,
@@ -34,7 +34,7 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > a read permission before you upgrade. Iggy's `metadata.partitions_max` defaults to 0
 > (unlimited), so set it before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
-> InitProducerId does real work too. With the bridge, Iggy builds the producer id. With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, each partition also writes each batch of an idempotent producer once. Without the bridge, the gateway allocates the id, so a stock idempotent producer still starts.
+> InitProducerId does real work too. With the bridge, Iggy builds the producer id, and each partition writes each batch of an idempotent producer once (`IGGY_KAFKA_IDEMPOTENT_PRODUCERS`, on by default). Without the bridge, the gateway allocates the id, so a stock idempotent producer still starts.
 >
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
 > `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
@@ -52,11 +52,47 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > external group consumer kind ([#4392](https://github.com/apache/iggy/pull/4392)) before the first
 > commit. In a partly upgraded cluster, one commit can make a partition stop committing.
 
+## Defaults changed after 0.2.0
+
+Two defaults changed, so that a gateway with only the Iggy address and password keeps a stock
+Kafka producer in order:
+
+| Variable | 0.2.0 | Now |
+| --- | --- | --- |
+| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` (stub mode) | `true`. Stub mode needs `false`, and warns |
+| `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `false` | `true` |
+
+With the bridge on, the gateway needs `IGGY_KAFKA_IGGY_PASSWORD` and an Iggy address that it can
+reach. Without them, it exits at start. In a container, the default address `127.0.0.1:8090` is
+the container itself. For stub mode, set `IGGY_KAFKA_BRIDGE_ENABLED=false`.
+
+SASL stays off by default. So with the bridge on, every client that reaches the port acts as the
+bridge's Iggy user (see the warning at the top). Turn on SASL, or keep the port private.
+
+Before you upgrade the gateway, upgrade every Iggy client that polls its topics to the 0.10.0
+release. In that release, the Rust SDK is 0.12.0, the Python SDK 0.10.0, the CLI 0.15.0 and the
+connectors runtime 0.6.0. Builds from before that release refuse a batch that carries a
+producer. Builds of the C++,
+PHP and Swift SDKs from before it refuse such a batch too. If you cannot upgrade a client, set
+`IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`.
+
+Offsets now expire in a deployment with the coordinator log, which is on by default with
+`IGGY_KAFKA_BROKERS`. The offsets of a group without members go 7 days after its last commit or
+after its last member left, whichever is later. The new `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES` sets
+the time. A gateway without the log keeps them, as 0.2.0 did.
+
+`IGGY_KAFKA_TOPIC_RETENTION_MS` is new. While it is unset, a topic that the gateway creates keeps
+its records forever, as in 0.2.0, and the gateway warns at startup.
+
 ## Run
 
 ```bash
-cargo run -p iggy-gateway-kafka
+IGGY_KAFKA_IGGY_PASSWORD=<root password> cargo run -p iggy-gateway-kafka
 ```
+
+The gateway connects to Iggy at `127.0.0.1:8090` as the user `iggy`. Without
+`IGGY_KAFKA_IGGY_PASSWORD`, it exits at start. To run it without Iggy, in stub mode, set
+`IGGY_KAFKA_BRIDGE_ENABLED=false`.
 
 Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 
@@ -82,14 +118,34 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_INSTANCE_ID` | `IGGY_KAFKA_NODE_ID`, else `0` | This gateway's number among the gateways fronting one Iggy cluster. Without the bridge, it is the high half of every producer id `InitProducerId` hands out, so give every gateway its own value. With the bridge, Iggy builds the ids, and this value does not change them. Unset, it follows `IGGY_KAFKA_NODE_ID`. A single gateway can leave both unset. |
 | `IGGY_KAFKA_NODE_ID` | `1` | This gateway's broker id in Metadata, 0 to 65535. Beside each Iggy node, use that node's replica id. Required with `IGGY_KAFKA_BROKERS` |
 | `IGGY_KAFKA_BROKERS` | unset | Every gateway in front of the Iggy cluster, this one included, as `id@host:port` entries separated by commas. With several listeners, one `id@PROTOCOL://host:port` entry per gateway and listener. Give every gateway the same list. See [Several gateways](#several-gateways-4515) |
-| `IGGY_KAFKA_COORDINATOR_LOG` | `true` with `IGGY_KAFKA_BROKERS` and the bridge, else `false` | Share the consumer groups through the coordinator log in Iggy (`true` or `false`). Needs the bridge, and `manage_servers` on the bridge's Iggy user. Setup tries again for up to 60 s while Iggy does not answer. See [Several gateways](#several-gateways-4515) |
+| `IGGY_KAFKA_COORDINATOR_LOG` | Unset: on with `IGGY_KAFKA_BROKERS` and the bridge, else off | Share the consumer groups through the coordinator log in Iggy (`true` or `false`). Needs the bridge, and `manage_servers` on the bridge's Iggy user. With `true`, a gateway whose bridge user lacks `manage_servers` does not start. Unset, it runs without the log and warns. Only the log keeps commit times, so a gateway without it never expires offsets. Setup tries again for up to 60 s while Iggy does not answer. See [Several gateways](#several-gateways-4515) |
 | `IGGY_KAFKA_OFFSETS_RETENTION_MINUTES` | `10080` (7 days) | The Kafka setting `offsets.retention.minutes`: how long the offsets of a group without members stay after its last commit, or after its last member left when that is later. The gateway then deletes them in Iggy and in the coordinator log. Give every gateway the same value. Without the coordinator log, also when the gateway falls back to running without it, the gateway refuses the variable, because only the log keeps commit times. See [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits) |
-| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
+| `IGGY_KAFKA_BRIDGE_ENABLED` | `true` | Connect the Iggy bridge at startup. `false` is stub mode: every API answers with its stub, the gateway stores nothing and warns, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. If Iggy does not answer, startup tries again 1 s after each failed connect, for up to 60 s, and then the gateway stops. A wrong password or a missing permission stops it at once. It never falls back to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` | `false` | Kafka's `auto.create.topics.enable`: a `Metadata` lookup of a missing topic creates it ([Auto topic creation](#auto-topic-creation)). Needs `IGGY_KAFKA_BRIDGE_ENABLED=true`. Off by default, unlike Kafka |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` | `1` | Partitions of an auto-created topic, at most 1000. Only read while auto-creation is on, and refused otherwise |
+| `IGGY_KAFKA_HTTP_ADDR` | unset (the image sets `0.0.0.0:9096`) | IP and port of the HTTP endpoint of `/metrics`, `/ready` and `/live`. Unset means no endpoint. It has no authentication, so bind it where only a scraper and an orchestrator reach it. See [Metrics and health](#metrics-and-health) |
+
+## Metrics and health
+
+With `IGGY_KAFKA_HTTP_ADDR` set, the gateway serves three paths over HTTP:
+
+| Path | Answer |
+| --- | --- |
+| `/metrics` | Prometheus metrics in the OpenMetrics text format: requests, latency and error codes per Kafka API, connections per listener and closed connections per cause, slot use, Produce sends in doubt, consumer groups, and the coordinator partitions that the gateway serves |
+| `/ready` | 200 while the listeners accept and the bridge reaches Iggy. 503 with the reason while the gateway starts, while it drains at shutdown, and from about 5 s after it loses Iggy |
+| `/live` | 200 while the process answers. Iggy out of reach does not change it |
+
+The endpoint starts before the bridge connects, so an orchestrator sees the gateway live and not
+ready while it waits for Iggy. `iggy-gateway-kafka --check-ready` and `--check-live` ask `/ready`
+or `/live` at `IGGY_KAFKA_HTTP_ADDR` and exit 0 on 200, for a container health check.
+
+Each closed Kafka connection is counted by its cause. A cause that someone must act on, such as an
+oversized frame, a timeout or a failed login, logs at warn, at most 5 lines per cause each 10 s. A
+client that closes its connection logs at debug. See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)
+for every metric, the readiness rules and the causes.
 
 ## Docker image
 
@@ -111,9 +167,38 @@ docker pull apache/iggy-kafka-gateway:edge
 ```
 
 With the image's default listener, set `IGGY_KAFKA_ADVERTISED_HOST` to a host reachable by
-Kafka clients; see [Run](#run). Produce and Fetch need `IGGY_KAFKA_BRIDGE_ENABLED=true`
-and the Iggy connection settings. The [Compose quick start](#quick-start-docker-compose)
-sets both the advertised address and the bridge configuration.
+Kafka clients. See [Run](#run). The bridge is on by default, so also set the Iggy address and
+password. Without them, the gateway exits at start. In the container, the default address
+`127.0.0.1:8090` is the container itself:
+
+```bash
+docker run --rm -p 9093:9093 \
+  -e IGGY_KAFKA_ADVERTISED_HOST=127.0.0.1 \
+  -e IGGY_KAFKA_IGGY_ADDR=<iggy host>:8090 \
+  -e IGGY_KAFKA_IGGY_PASSWORD=<iggy password> \
+  apache/iggy-kafka-gateway:edge
+```
+
+For stub mode, set `IGGY_KAFKA_BRIDGE_ENABLED=false` in place of the two Iggy variables. The
+[Compose quick start](#quick-start-docker-compose) sets both the advertised address and the bridge
+configuration.
+
+The image runs as user and group 10001, and the gateway writes no file, so a read-only root file
+system works. It exposes 9093 (Kafka) and 9096 (`/metrics`, `/ready`, `/live`, set by
+`IGGY_KAFKA_HTTP_ADDR`). Its `HEALTHCHECK` runs `iggy-gateway-kafka --check-live`, so a tool that
+restarts unhealthy containers does not restart every gateway while Iggy is down. Use
+`--check-ready` where a dependency must wait for Iggy, as `docker-compose.yml` does.
+
+Upgrading from an image before 0.2.1:
+
+- The gateway runs as user 10001, not root. A TLS key or certificate bind-mounted from the host
+  must be readable by that user. A root-only `0600` key stops the gateway at startup. Kubernetes
+  and Docker secret mounts are not affected.
+- The image no longer has `nc`. A health check that runs `nc -z` stays unhealthy. Run
+  `/iggy-gateway-kafka --check-ready` instead.
+
+On Kubernetes, the [`iggy-kafka-gateway` chart](../../helm/charts/iggy-kafka-gateway) runs N gateways
+as a StatefulSet beside an Iggy server or cluster, with probes on `/live` and `/ready`.
 
 ## Quick start (Docker Compose)
 
@@ -192,7 +277,8 @@ docker compose exec iggy-server /usr/local/bin/iggy --username iggy \
   --password iggy-gateway-quickstart message poll kafka orders 0 --offset 0 --message-count 1
 ```
 
-**Ports**: gateway `9093` (Kafka wire, the one a client dials), Iggy `8090` (TCP, `iggy` CLI/SDK),
+**Ports**: gateway `9093` (Kafka wire, the one a client dials) and `9096` (`/metrics`, `/ready`,
+`/live`), Iggy `8090` (TCP, `iggy` CLI/SDK),
 `3000`/`8080`/`8092` (Iggy HTTP/QUIC/WebSocket, unused by the gateway itself but published for
 direct Iggy inspection).
 
@@ -260,7 +346,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 ## Design decisions
 
 - [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
-- [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
+- [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and how an idempotent producer writes each batch once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
 - [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and which gateway coordinates a group
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
@@ -269,17 +355,18 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 
 ### Delivery guarantees
 
-With the bridge and `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, an idempotent Kafka producer writes
-each batch once. The Java producer is idempotent by default. Each batch carries the producer id, the
+With the bridge and `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` on (the default), an idempotent Kafka
+producer writes each batch once. The Java producer is idempotent by default. Each batch carries the producer id, the
 epoch and the sequence of its first record. The Iggy partition writes a batch of one producer once.
 A resend answers the offset of the first write. That holds through any gateway, and across a
 gateway restart.
 
-The switch is off by default. Released builds of the gateway, of the Rust SDK and of every client
-that embeds it cannot read a batch that carries a producer, and older Iggy nodes cannot store it.
-Upgrade every Iggy node, every gateway and every consumer of the topics first, then turn it on.
-While it is off, an idempotent producer gets at-least-once delivery. So does a producer that keeps
-an id from an older gateway, until it restarts.
+The switch is on by default. Builds from before the Iggy 0.10.0 release cannot read a batch that
+carries a producer. These are the gateway, the Rust SDK before 0.12.0 and every client that embeds
+it, and the Swift SDK. Older Iggy nodes cannot store it. Upgrade every consumer of the topics before you
+run this gateway, or set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`. While it is off, an idempotent
+producer gets at-least-once delivery. So does a producer that keeps an id from an older gateway,
+until it restarts.
 
 A producer without idempotence gets at-least-once delivery. A retry that follows a network timeout
 writes the record twice. The partition keeps the last 5 batches of each producer, and at most 4096
@@ -346,6 +433,7 @@ Run one gateway beside each Iggy node, and list every gateway in the clients'
 IGGY_KAFKA_NODE_ID=1 \
 IGGY_KAFKA_BROKERS=0@gateway-0:9093,1@gateway-1:9093,2@gateway-2:9093 \
 IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+IGGY_KAFKA_IGGY_PASSWORD=<root password> \
 cargo run -p iggy-gateway-kafka
 ```
 
@@ -415,8 +503,8 @@ cargo run -p iggy-gateway-kafka
   nodes. The bridge itself needs that address at startup. To start while that node is down,
   point it at a load balancer in front of the cluster. A DNS name with one record per node can
   bind a client's first link to the wrong node (not tested).
-- With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true` on every gateway, an idempotent producer that moves
-  to another gateway still writes each batch once.
+- With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` on every gateway (the default), an idempotent producer
+  that moves to another gateway still writes each batch once.
 - With TLS to Iggy, the SDK dials each node at the address the roster advertises, so each
   node's certificate must name that address, or set `IGGY_KAFKA_IGGY_TLS_DOMAIN`.
 
@@ -431,6 +519,7 @@ one.
 IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://0.0.0.0:9094,SASL_SSL://0.0.0.0:9095 \
   IGGY_KAFKA_ADVERTISED_LISTENERS=SSL://kafka.example.com:9094,SASL_SSL://kafka.example.com:9095 \
   IGGY_KAFKA_TLS_CERT_FILE=/etc/iggy/kafka.pem IGGY_KAFKA_TLS_KEY_FILE=/etc/iggy/kafka.key \
+  IGGY_KAFKA_IGGY_PASSWORD=<root password> \
   cargo run -p iggy-gateway-kafka
 ```
 
@@ -518,7 +607,8 @@ mapping table and no credential store in the gateway: create an Iggy user for ea
 and point the client at it. Credentials are verified against `IGGY_KAFKA_IGGY_ADDR`.
 
 ```bash
-IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 cargo run -p iggy-gateway-kafka
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+  IGGY_KAFKA_IGGY_PASSWORD=<root password> cargo run -p iggy-gateway-kafka
 ```
 
 Transport security to Iggy is configured separately from the Kafka side, because the two protect
@@ -606,8 +696,8 @@ One partition, one Iggy send. Each partition answers for itself.
 | Topics | Creates none. Missing: 3. Bad name: 17. |
 | `timeout_ms` | Honored, max 20 s. The Iggy send stops by then too. Past it: 7. A send that never went out: 6. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
-| Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). Goes to Iggy with the batch only with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, and only an id that a gateway got from Iggy. |
-| Producer epoch, sequence | With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, go to Iggy with the batch. A resend answers the first offset. A gap: 45. An older epoch: 47. A producer that the partition does not hold, above sequence 0: 59. Off (the default): not checked, so a resend can write twice. |
+| Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). Goes to Iggy with the batch unless `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`, and only an id that a gateway got from Iggy. |
+| Producer epoch, sequence | Go to Iggy with the batch, unless `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`. A resend answers the first offset. A gap: 45. An older epoch: 47. A producer that the partition does not hold, above sequence 0: 59. With `false`: not checked, so a resend can write twice. |
 | Producer id with a negative epoch or sequence | 87. |
 | Timestamps over about 71 min apart | Clamped into one send. `kafka.ts` keeps the real one. |
 | Several batches in one partition | 87, as Kafka. |
@@ -743,8 +833,8 @@ Limits:
 | `IGGY_KAFKA_FETCH_SLOTS` | `4` | Fetch requests that read from Iggy at once, each on an Iggy client of its own. From `1` to `256`, since each client takes an Iggy session |
 | `IGGY_KAFKA_PRODUCE_SESSIONS` | `256` | Producers that get an Iggy client of their own. The rest share one. `0`: all share one |
 | `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` | `600` | An unused Produce client closes after this long |
-| `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `false` | `true` passes the producer of an idempotent batch to Iggy, so each batch lands once. Turn it on after every Iggy node, gateway and consumer of the topics is upgraded. See [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) |
-| `IGGY_KAFKA_TOPIC_RETENTION_MS` | `-1` | Kafka's `log.retention.ms`: the `retention.ms` of each topic the gateway creates without one. `-1` never expires. Kafka's default is 7 days, `604800000`. Give every gateway the same value. See [docs/CONFIGS.md](docs/CONFIGS.md) |
+| `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `true` | Passes the producer of an idempotent batch to Iggy, so each batch lands once. Iggy clients from before the 0.10.0 release cannot poll such a batch, so upgrade every consumer of the topics first, or set `false`. See [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) |
+| `IGGY_KAFKA_TOPIC_RETENTION_MS` | `-1` | Kafka's `log.retention.ms`: the `retention.ms` of each topic the gateway creates without one. `-1` never expires. Kafka's default is 7 days, `604800000`. While the variable is unset, the gateway warns at startup. Give every gateway the same value. See [docs/CONFIGS.md](docs/CONFIGS.md) |
 | `IGGY_KAFKA_TOPIC_RETENTION_BYTES` | `-1` | Kafka's `log.retention.bytes`: the `retention.bytes` of each partition of a topic the gateway creates without one. `-1` caps nothing. Otherwise at least `1073741824`, the largest Iggy segment. Give every gateway the same value |
 | `IGGY_KAFKA_TOPIC_DURABILITY` | `replicated` | Iggy durability of the messages and consumer offsets of each topic the gateway creates: `replicated` or `persisted`. `flush.messages=1` or `flush.ms=0` on a create makes the messages `persisted`. Give every gateway the same value |
 
@@ -937,9 +1027,9 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
   `Admin.createPartitions` report a `TimeoutException`, and the caller must retry.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
-- Order: with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true`, an idempotent producer keeps its order. The
-  partition refuses a batch that does not follow with 45, and the producer sends it again. With
-  the switch off (the default), every producer, the idempotent Java default too, needs
+- Order: with `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` on (the default), an idempotent producer keeps its
+  order. The partition refuses a batch that does not follow with 45, and the producer sends it
+  again. With the switch off, every producer, the idempotent Java default too, needs
   `max.in.flight.requests.per.connection=1` or `retries=0`. Otherwise a retried batch can land
   after later ones.
 - Order after a 7: the send can still run. A producer with a producer id waits behind it on any

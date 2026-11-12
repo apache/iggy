@@ -200,7 +200,7 @@ pub async fn handle(
             .flat_map(|topic| &topic.partition_responses)
             .any(|partition| partition.error_code != ERROR_NONE);
         return if failed {
-            HandleOutcome::Close
+            HandleOutcome::UnacknowledgedProduceFailed
         } else {
             HandleOutcome::NoResponse
         };
@@ -221,7 +221,7 @@ fn stub_outcome(api_version: i16, request: &ProduceRequest) -> HandleOutcome {
 /// Answers 7 for every partition. `acks=0` has no response to carry it, so that closes instead.
 fn timed_out(api_version: i16, request: &ProduceRequest) -> HandleOutcome {
     if request.acks == ACKS_NONE {
-        HandleOutcome::Close
+        HandleOutcome::UnacknowledgedProduceFailed
     } else {
         respond_or_close(
             encode_uniform_response(api_version, request, ERROR_REQUEST_TIMED_OUT),
@@ -1217,7 +1217,10 @@ mod tests {
             "it must not overtake that send"
         );
         assert!(
-            handled(&state, &connection, ACKS_NONE).await.is_close(),
+            matches!(
+                handled(&state, &connection, ACKS_NONE).await,
+                HandleOutcome::UnacknowledgedProduceFailed
+            ),
             "acks=0 has no response to carry the 7"
         );
     }
