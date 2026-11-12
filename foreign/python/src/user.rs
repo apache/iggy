@@ -243,3 +243,17 @@ impl UserInfoDetails {
         options_by_provenance(py, &self.inner.options, false)
     }
 }
+
+/// A personal access token. The token value itself is returned only once,
+/// when the token is created, so it is not part of this info.
+#[derive(PartialEq)]
+#[gen_stub_pyclass]
+#[pyclass(eq, frozen)]
+pub struct PersonalAccessTokenInfo {
+    /// The unique name of the token.
+    #[pyo3(get)]
+    pub(crate) name: String,
+    /// Expiry in microseconds since the Unix epoch, `None` for a token that never expires.
+    #[pyo3(get)]
+    pub(crate) expiry: Option<u64>,
+}
