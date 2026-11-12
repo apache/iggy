@@ -528,10 +528,16 @@ and it holds the reads of the partition as a `seek` does. Once `shutdown()` star
 fails with `InvalidConfiguration`, unless its write already started: `shutdown()` waits for that
 write.
 If the reader cannot read again the messages that a lost read stored, those messages are lost.
-That has three causes. A rebalance moved the partition to another member before the catch-up. The
+That has four causes. A rebalance moved the partition to another member before the catch-up. The
 partition no longer holds the messages, for example after retention deleted them. Lasting refusals
-stopped the partition during the catch-up. The reader then returns one `FetchProgressUncertain`
-error for that partition, with the first and last offset of those messages in `lost`.
+stopped the partition during the catch-up. The server lost the history of the partition during the
+catch-up. The reader then returns one `FetchProgressUncertain` error for that partition, with the
+first and last offset of those messages in `lost`. This error stops nothing and has no `skip`, so
+it needs no `seek`. The batch that the reader holds after the range comes next, and a `seek` before
+the application takes that batch drops it. If the reader stopped the partition, the error that
+stopped it comes after that batch. Earlier versions gave this error a `skip` after the range. Code
+that handles `FetchProgressUncertain` with an abandon and a `seek` must now check `lost` first and
+do neither for this error.
 `close()` and `shutdown()` cancel each `OnRead` read in flight on TCP, QUIC and
 WebSocket and take its one reply, which tells what the server stored, so a read that waits on the
 server ends at once. Over HTTP, which has no cancel, they wait until the deadline of the read. Then
