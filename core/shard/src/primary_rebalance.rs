@@ -1296,7 +1296,7 @@ fn partition_ready<B: MessageBus, SB: SuperblockStore>(
     probe: &PrimaryRebalanceHeader,
 ) -> bool {
     partition_history_ready(partition, probe)
-        && partition.repair.is_none()
+        && partition.repair().is_none()
         && partition.consensus().commit_min() >= probe.commit
         && partition.consensus().commit_min() == partition.consensus().commit_max()
         && !partition.history_is_busy()

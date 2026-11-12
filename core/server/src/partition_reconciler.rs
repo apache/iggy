@@ -5823,7 +5823,7 @@ mod tests {
             let partition = partitions
                 .get_mut_by_ns(&ns)
                 .expect("partition is materialised");
-            partition.repair = Some(Box::new(RepairSession {
+            partition.set_repair(Some(RepairSession {
                 nonce: NONCE,
                 view: 0,
                 from_op: 1,
@@ -5874,7 +5874,7 @@ mod tests {
             assert_eq!(partition.consensus().commit_min(), 7);
             partition.consensus().advance_commit_max(8);
             partition.recovered_durable_offset = Some(10);
-            let repair = partition.repair.as_mut().expect("repair remains armed");
+            let repair = partition.repair_mut().expect("repair remains armed");
             repair.floor = Some(5);
         }
 
@@ -5902,7 +5902,7 @@ mod tests {
                         .plane
                         .partitions()
                         .get_by_ns(&ns)
-                        .is_some_and(|partition| partition.repair.is_none())
+                        .is_some_and(|partition| partition.repair().is_none())
                     {
                         break;
                     }
@@ -5919,7 +5919,7 @@ mod tests {
             .expect("partition survives the reply");
         assert_eq!(partition.consensus().commit_min(), 8);
         assert!(
-            partition.repair.is_none(),
+            partition.repair().is_none(),
             "a walk that reached the fetch ceiling leaves nothing to request"
         );
     }

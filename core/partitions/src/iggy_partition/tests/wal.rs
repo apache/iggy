@@ -426,7 +426,7 @@ async fn given_a_dropped_session_when_its_prefix_read_runs_should_stop_without_f
     );
     let held = directory.path().join("held.log");
     std::fs::write(&held, &body[..prefix_len]).unwrap();
-    partition.transfer = Some(Box::new(crate::state_transfer::PartitionTransferSession {
+    partition.set_transfer(Some(crate::state_transfer::PartitionTransferSession {
         nonce: 1,
         peer: 0,
         commit_op: 0,
@@ -452,15 +452,14 @@ async fn given_a_dropped_session_when_its_prefix_read_runs_should_stop_without_f
         "the pull must wait for the read"
     );
     let Some(crate::state_transfer::PrefixSeed::Reading { read, .. }) = partition
-        .transfer
-        .as_ref()
+        .transfer()
         .and_then(|session| session.seed.as_ref())
     else {
         panic!("the read must start");
     };
     let landed = Rc::clone(&read.result);
 
-    partition.transfer = None;
+    partition.set_transfer(None);
     for _ in 0..REACTOR_TURNS_MAX {
         if landed.borrow().is_some() {
             break;
@@ -487,7 +486,7 @@ fn fetching_with_a_landed_prefix_read() -> IggyPartition<RecordingBus> {
     partition
         .consensus()
         .set_state_transfer_stage(consensus::StateTransferStage::Fetching);
-    partition.transfer = Some(Box::new(crate::state_transfer::PartitionTransferSession {
+    partition.set_transfer(Some(crate::state_transfer::PartitionTransferSession {
         nonce: 1,
         peer: 0,
         commit_op: 0,

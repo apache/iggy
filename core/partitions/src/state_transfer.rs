@@ -2685,7 +2685,7 @@ where
             // simulator models partition state transfer.
             return Err(PartitionTransferUnavailable::NoPartitionDir);
         }
-        if self.repair.is_some() {
+        if self.repair().is_some() {
             return Err(PartitionTransferUnavailable::RepairInProgress);
         }
         // A primary by index over an empty log passes every gate above yet can
@@ -3316,18 +3316,14 @@ where
     /// while the scan runs, because the pull waits for it. The call that
     /// finds the scan landed returns what it reused.
     pub fn drive_reuse_scan(&mut self) -> Poll<Option<ReusedSegments>> {
-        let Some(scan) = self
-            .transfer
-            .as_ref()
-            .and_then(|session| session.scan.as_ref())
-        else {
+        let Some(scan) = self.transfer().and_then(|session| session.scan.as_ref()) else {
             return Poll::Ready(None);
         };
         let Some(scanned) = scan.result.borrow_mut().take() else {
             return Poll::Pending;
         };
         let reused = self.accept_reuse_scan(scanned);
-        let Some(session) = self.transfer.as_mut() else {
+        let Some(session) = self.transfer_mut() else {
             return Poll::Ready(None);
         };
         let segments = ReusedSegments::new(&session.artifacts, &reused);
@@ -3336,10 +3332,9 @@ where
             session.artifacts[index as usize] = TransferArtifact::Staged(meta);
         }
         let seed = self
-            .transfer
-            .as_ref()
+            .transfer()
             .and_then(|session| self.plan_prefix_seed(&session.artifacts));
-        if let Some(session) = self.transfer.as_mut() {
+        if let Some(session) = self.transfer_mut() {
             session.seed = seed;
         }
         // The I/O turn that reports a landed scan leaves the ready queue ahead
@@ -3468,7 +3463,7 @@ where
     /// pump. A failed read leaves the artifact to a whole pull.
     pub fn drive_prefix_seed(&mut self) -> bool {
         let namespace_raw = self.namespace().inner();
-        let Some(session) = self.transfer.as_mut() else {
+        let Some(session) = self.transfer_mut() else {
             return false;
         };
         let next = session
@@ -3498,7 +3493,7 @@ where
                     self.spawn_local_work(prefix_read_stopped, move |cancelled| async move {
                         read_segment_prefix(&log_path, entry, len, &cancelled).await
                     });
-                if let Some(session) = self.transfer.as_mut() {
+                if let Some(session) = self.transfer_mut() {
                     session.seed = Some(PrefixSeed::Reading { artifact, read });
                 }
                 true
@@ -4651,7 +4646,7 @@ where
         self.pending_owner_install.set(None);
         self.owner_install_barrier = 0;
         self.observed_view = self.consensus().view();
-        self.repair = None;
+        self.set_repair(None);
         self.forget_recovered_commit();
         self.transfer_offer_cache.borrow_mut().take();
     }
@@ -4679,7 +4674,7 @@ where
         self.stats.zero_out_all();
         self.stats.increment_segments_count(1);
         self.stats.set_current_offset(end);
-        self.repair = None;
+        self.set_repair(None);
         self.transfer_offer_cache.borrow_mut().take();
     }
 

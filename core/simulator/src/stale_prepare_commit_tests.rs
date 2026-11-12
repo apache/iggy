@@ -502,8 +502,7 @@ fn repair_session(
         .partitions()
         .get_by_ns(&namespace)
         .expect("replica hosts the group")
-        .repair
-        .as_deref()
+        .repair()
         .copied()
 }
 

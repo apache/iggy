@@ -884,7 +884,7 @@ mod tests {
                 let mut partition =
                     repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
                 partition.set_created_revision(INCARNATION);
-                partition.repair = None;
+                partition.set_repair(None);
                 partitions.insert(namespace, partition);
                 let message = if command == Command::Commit {
                     MessageBag::Commit(
@@ -1708,7 +1708,7 @@ mod tests {
                 let mut partition =
                     repairing_replica(&bus, namespace, (REPAIR_PRIMARY, 3), REQUESTER, 0, 0);
                 partition.set_created_revision(INCARNATION);
-                partition.repair = None;
+                partition.set_repair(None);
                 partitions.insert(namespace, partition);
                 macro_rules! request {
                     ($header:ty, $variant:ident $(, $field:ident = $value:expr)*) => {
@@ -1797,7 +1797,7 @@ mod tests {
                     repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
                 partition.set_created_revision(INCARNATION);
                 if matches!(command, Command::StateTransferTarget | Command::StateChunk) {
-                    partition.repair = None;
+                    partition.set_repair(None);
                     partition
                         .consensus()
                         .set_state_transfer_stage(StateTransferStage::AwaitingTarget);
@@ -1806,7 +1806,7 @@ mod tests {
                             .consensus()
                             .set_state_transfer_stage(StateTransferStage::Fetching);
                     }
-                    partition.transfer = Some(Box::new(PartitionTransferSession {
+                    partition.set_transfer(Some(PartitionTransferSession {
                         nonce: NONCE,
                         peer: REPAIR_PRIMARY,
                         commit_op: 0,
@@ -1874,13 +1874,13 @@ mod tests {
                 let partition = partitions.get_by_ns(&namespace).unwrap();
                 if incoming == INCARNATION {
                     match command {
-                        Command::RepairDone => assert!(partition.repair.is_none()),
+                        Command::RepairDone => assert!(partition.repair().is_none()),
                         Command::RangeEvicted => {
-                            assert_eq!(partition.repair.as_ref().unwrap().floor, Some(1));
+                            assert_eq!(partition.repair().unwrap().floor, Some(1));
                         }
-                        Command::StateTransferTarget => assert!(partition.transfer.is_none()),
+                        Command::StateTransferTarget => assert!(partition.transfer().is_none()),
                         Command::StateChunk => assert_eq!(
-                            partition.transfer.as_ref().unwrap().artifacts[0]
+                            partition.transfer().unwrap().artifacts[0]
                                 .pending()
                                 .unwrap()
                                 .buf,
@@ -1897,9 +1897,9 @@ mod tests {
                         "foreign {command:?} sent a follow-up"
                     );
                     if matches!(command, Command::RepairDone | Command::RangeEvicted) {
-                        assert_eq!(partition.repair.as_ref().unwrap().floor, None);
+                        assert_eq!(partition.repair().unwrap().floor, None);
                     } else {
-                        let transfer = partition.transfer.as_ref().unwrap();
+                        let transfer = partition.transfer().unwrap();
                         assert_eq!(transfer.idle_ticks, IDLE_TICKS);
                         assert_eq!(transfer.artifacts[0].pending().unwrap().buf, [] as [u8; 0]);
                     }
@@ -2929,12 +2929,12 @@ mod tests {
                     partition.begin_shutdown_io();
                 }
                 assert!(!owner.arm_partition_transfer(partition, 0, 0).await);
-                assert!(partition.transfer.is_none());
+                assert!(partition.transfer().is_none());
                 assert!(partition.transfer_rearm.is_none());
                 partition
                     .consensus()
                     .set_state_transfer_stage(StateTransferStage::Fetching);
-                partition.transfer = Some(Box::new(PartitionTransferSession {
+                partition.set_transfer(Some(PartitionTransferSession {
                     nonce: NONCE,
                     peer: 0,
                     commit_op: offer.commit_op,
@@ -2959,7 +2959,7 @@ mod tests {
                     partition.consensus().state_transfer_stage(),
                     StateTransferStage::Fetching
                 );
-                let transfer = partition.transfer.as_ref().unwrap();
+                let transfer = partition.transfer().unwrap();
                 assert_eq!(transfer.nonce, NONCE);
                 assert_eq!(transfer.artifacts[0].pending().unwrap().buf, *bytes);
                 assert!(
@@ -3046,7 +3046,7 @@ mod tests {
                     .unwrap();
                 let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
                 owner.partition_io.dispatch(slot, captured, &captured_bus);
-                partition.repair = Some(Box::new(RepairSession {
+                partition.set_repair(Some(RepairSession {
                     nonce: 1,
                     view: 1,
                     from_op: 1,
@@ -3120,7 +3120,7 @@ mod tests {
         owner.partition_io.dispatch(slot, captured, &captured_bus);
         let partitions = owner.plane.partitions();
         let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-        partition.repair = Some(Box::new(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: 1,
             view: partition.consensus().view(),
             from_op: 1,
@@ -3136,7 +3136,7 @@ mod tests {
             partition.complete_repair(partitions.config()).await,
             RepairConclusion::InProgress
         );
-        assert!(partition.repair.is_some());
+        assert!(partition.repair().is_some());
         let task = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
         task.await;
         assert_eq!(
@@ -3151,7 +3151,7 @@ mod tests {
             partition.complete_repair(partitions.config()).await,
             RepairConclusion::Done
         );
-        assert!(partition.repair.is_none());
+        assert!(partition.repair().is_none());
         assert_eq!(partition.consensus().commit_min(), 0);
         assert_eq!(owner.partition_io.charged.get(), 0);
     }
@@ -3769,7 +3769,7 @@ mod tests {
                 peer: 0,
                 after_ticks: u32::from(repair_finished),
             });
-            partition.repair = repair_finished.then_some(Box::new(partitions::RepairSession {
+            partition.set_repair(repair_finished.then_some(partitions::RepairSession {
                 nonce: 1,
                 view: 0,
                 from_op: 1,
@@ -3787,7 +3787,7 @@ mod tests {
 
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             assert_eq!(partition.consensus().is_transferring(), commit_max > 0);
-            assert_eq!(partition.transfer.is_some(), commit_max > 0);
+            assert_eq!(partition.transfer().is_some(), commit_max > 0);
             assert!(partition.transfer_rearm.is_none());
         }
     }
@@ -3810,7 +3810,7 @@ mod tests {
         for _ in 0..=REPAIR_MAX_STALL_RETRIES {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
-            peers.push(partition.repair.as_ref().map(|session| session.peer));
+            peers.push(partition.repair().map(|session| session.peer));
         }
 
         let mut expected = vec![Some(REPAIR_PRIMARY); REPAIR_MAX_STALL_RETRIES as usize];
@@ -3878,7 +3878,7 @@ mod tests {
             let partition = partitions.get_by_ns(&namespace).unwrap();
             assert_eq!(partition.consensus().commit_min(), 0);
             assert_eq!(
-                partition.repair.as_ref().map(|session| session.peer),
+                partition.repair().map(|session| session.peer),
                 Some(REPAIR_PRIMARY),
                 "round {round} rotated a served session away while its own walk was paused"
             );
@@ -3917,7 +3917,7 @@ mod tests {
         let mut served = Message::<PrepareHeader>::new(frozen.len());
         served.as_mut_slice().copy_from_slice(frozen.as_slice());
         let mut backup = repairing_backup(&bus, namespace, 0, 0);
-        backup.repair.as_mut().unwrap().fetch_to_op = FETCH_TO_OP;
+        backup.repair_mut().unwrap().fetch_to_op = FETCH_TO_OP;
         backup.on_replicate(served).await;
         assert!(backup.log.journal().inner.holds_op(1));
         assert_eq!(backup.consensus().commit_max(), 0);
@@ -3927,7 +3927,7 @@ mod tests {
         for _ in 0..=REPAIR_MAX_STALL_RETRIES {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let partition = partitions.get_by_ns(&namespace).unwrap();
-            peers.push(partition.repair.as_ref().map(|session| session.peer));
+            peers.push(partition.repair().map(|session| session.peer));
         }
 
         let budget = REPAIR_MAX_STALL_RETRIES as usize;
@@ -4202,7 +4202,7 @@ mod tests {
         partitions.remove(&namespace).unwrap();
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition.set_created_revision(INCARNATION);
         partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
         partition
@@ -4211,7 +4211,7 @@ mod tests {
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::Fetching);
-        partition.transfer = Some(Box::new(PartitionTransferSession {
+        partition.set_transfer(Some(PartitionTransferSession {
             nonce: NONCE,
             peer: REPAIR_PRIMARY,
             commit_op: 0,
@@ -4249,8 +4249,7 @@ mod tests {
             let Some(PrefixSeed::Reading { read, .. }) = &partitions
                 .get_by_ns(&namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
                 .seed
             else {
@@ -4314,8 +4313,7 @@ mod tests {
         let session = partitions
             .get_by_ns(&namespace)
             .unwrap()
-            .transfer
-            .as_ref()
+            .transfer()
             .unwrap();
         assert!(
             matches!(session.artifacts[0], TransferArtifact::Staged(_)),
@@ -4343,14 +4341,14 @@ mod tests {
         partitions.remove(&namespace).unwrap();
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::AwaitingTarget);
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::Fetching);
-        partition.transfer = Some(Box::new(PartitionTransferSession {
+        partition.set_transfer(Some(PartitionTransferSession {
             nonce: 1,
             peer: REPAIR_PRIMARY,
             commit_op: 0,
@@ -4388,8 +4386,7 @@ mod tests {
             partitions
                 .get_by_ns(&namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
                 .seed
                 .is_none(),
@@ -4422,8 +4419,7 @@ mod tests {
             partitions
                 .get_by_ns(&receiver.namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
         };
 
         stall_rounds(&receiver.owner, receiver.namespace, bound as usize).await;
@@ -4507,8 +4503,7 @@ mod tests {
         *partitions
             .get_by_ns(&receiver.namespace)
             .unwrap()
-            .transfer
-            .as_ref()
+            .transfer()
             .unwrap()
             .scan
             .as_ref()
@@ -4538,8 +4533,7 @@ mod tests {
             partitions
                 .get_by_ns(&receiver.namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
                 .artifacts[0],
             TransferArtifact::Staged(_)
@@ -4558,8 +4552,7 @@ mod tests {
             partitions
                 .get_by_ns(&receiver.namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
         };
 
@@ -4623,7 +4616,7 @@ mod tests {
         type Setup = fn(&mut IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>);
         let cases: [(&str, u64, Setup); 4] = [
             ("an uncommitted suffix", LAGGING_COMMIT_MIN, |partition| {
-                if let Some(session) = partition.repair.as_mut() {
+                if let Some(session) = partition.repair_mut() {
                     session.fetch_to_op = session.commit_to_op + SUFFIX_OPS;
                 }
             }),
@@ -4637,7 +4630,7 @@ mod tests {
                 partition.consensus().begin_state_transfer_await();
             }),
             ("a transfer session", LAGGING_COMMIT_MAX, |partition| {
-                partition.transfer = Some(Box::new(PartitionTransferSession {
+                partition.set_transfer(Some(PartitionTransferSession {
                     nonce: TRANSFER_NONCE,
                     peer: REPAIR_PRIMARY,
                     commit_op: 0,
@@ -4653,7 +4646,7 @@ mod tests {
         ];
         let transfer_state = |partition: &IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>| {
             (
-                partition.transfer.as_ref().map(|session| session.nonce),
+                partition.transfer().map(|session| session.nonce),
                 partition.consensus().state_transfer_stage(),
                 partition.transfer_rearm.is_some(),
             )
@@ -4727,9 +4720,9 @@ mod tests {
         let recovery = |namespace: &IggyNamespace| {
             let partition = partitions.get_by_ns(namespace).unwrap();
             (
-                partition.transfer.as_ref().map(|session| session.peer),
+                partition.transfer().map(|session| session.peer),
                 partition.transfer_rearm.is_some(),
-                partition.repair.as_ref().map(|session| session.peer),
+                partition.repair().map(|session| session.peer),
                 partition.consensus().state_transfer_stage(),
             )
         };
@@ -4856,7 +4849,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let applied = usize::try_from(APPLIED).unwrap();
         let mut backup = repairing_backup(&bus, namespace, 0, 0);
-        backup.repair = None;
+        backup.set_repair(None);
         for prepare in &prepares[..applied] {
             backup.on_replicate(prepare.clone()).await;
         }
@@ -4866,7 +4859,7 @@ mod tests {
             .await;
         assert_eq!(backup.consensus().commit_min(), APPLIED);
         backup.consensus().advance_commit_max(HEAD);
-        backup.repair = Some(Box::new(RepairSession {
+        backup.set_repair(Some(RepairSession {
             nonce: NONCE,
             view: REPAIR_VIEW,
             from_op: APPLIED + 1,
@@ -4903,8 +4896,7 @@ mod tests {
         let transfer_nonce = {
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             partition
-                .transfer
-                .as_ref()
+                .transfer()
                 .expect("the floor the peer evicted past arms a transfer")
                 .nonce
         };
@@ -4925,7 +4917,7 @@ mod tests {
             .await;
         {
             let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
-            assert!(partition.transfer.is_none());
+            assert!(partition.transfer().is_none());
             assert!(partition.transfer_rearm.is_some());
             for prepare in &prepares[applied..] {
                 partition.on_replicate(prepare.clone()).await;
@@ -5088,7 +5080,7 @@ mod tests {
 
         let mut observed = Vec::with_capacity(expected.len());
         for _ in 0..expected.len() {
-            let holds_session = partitions.get_by_ns(&namespace).unwrap().repair.is_some();
+            let holds_session = partitions.get_by_ns(&namespace).unwrap().repair().is_some();
             owner
                 .partition_repairs_inflight
                 .set(OTHER_SESSIONS + usize::from(holds_session));
@@ -5125,7 +5117,7 @@ mod tests {
         let waiting = partitions
             .get_mut_by_ns(&namespaces[PARTITION_REPAIRS_INFLIGHT_MAX])
             .unwrap();
-        waiting.repair = None;
+        waiting.set_repair(None);
         // Past its debounce, so only the ceiling holds it back.
         waiting.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
         // The tally that arming the inserted sessions would have published.
@@ -5135,14 +5127,7 @@ mod tests {
         let session_peers = || {
             namespaces
                 .iter()
-                .filter_map(|namespace| {
-                    partitions
-                        .get_by_ns(namespace)
-                        .unwrap()
-                        .repair
-                        .as_deref()
-                        .copied()
-                })
+                .filter_map(|namespace| partitions.get_by_ns(namespace).unwrap().repair().copied())
                 .map(|session| session.peer)
                 .collect::<Vec<_>>()
         };
@@ -5190,7 +5175,7 @@ mod tests {
                     after_ticks: REARM_BACKOFF_TICKS,
                 });
             } else {
-                backup.repair = None;
+                backup.set_repair(None);
                 backup.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
             }
             partitions.insert(namespace, backup);
@@ -5204,7 +5189,7 @@ mod tests {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let live = namespaces
                 .iter()
-                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair.is_some())
+                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair().is_some())
                 .count();
             assert_eq!(
                 owner.partition_repairs_inflight.get(),
@@ -5215,7 +5200,7 @@ mod tests {
                 live <= PARTITION_REPAIRS_INFLIGHT_MAX,
                 "sweep {sweep}: {live}"
             );
-            waiting_armed |= partitions.get_by_ns(&waiting).unwrap().repair.is_some();
+            waiting_armed |= partitions.get_by_ns(&waiting).unwrap().repair().is_some();
         }
         assert!(
             waiting_armed,
@@ -5243,7 +5228,7 @@ mod tests {
                     assert!(!backup.burn_repair_attempt());
                 }
             } else {
-                backup.repair = None;
+                backup.set_repair(None);
                 backup.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
             }
             partitions.insert(namespace, backup);
@@ -5255,7 +5240,7 @@ mod tests {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let live = namespaces
                 .iter()
-                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair.is_some())
+                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair().is_some())
                 .count();
             assert_eq!(live, PARTITION_REPAIRS_INFLIGHT_MAX, "sweep {sweep}");
             assert_eq!(
@@ -5274,8 +5259,7 @@ mod tests {
                 let peer = partitions
                     .get_by_ns(namespace)
                     .unwrap()
-                    .repair
-                    .as_ref()
+                    .repair()
                     .map(|session| session.peer);
                 assert_eq!(peer, expected, "sweep {sweep}, group {index}");
             }
@@ -5316,11 +5300,11 @@ mod tests {
             for _ in 0..consensus::STATE_TRANSFER_MAX_STALL_RETRIES {
                 assert!(!backup.burn_transfer_attempt());
             }
-            backup.transfer.as_mut().unwrap().idle_ticks = retry_ticks - 1;
+            backup.transfer_mut().unwrap().idle_ticks = retry_ticks - 1;
             partitions.insert(transferring, backup);
             let waiting = namespaces[PARTITION_REPAIRS_INFLIGHT_MAX];
             let mut late = repairing_backup(&bus, waiting, LAGGING_COMMIT_MIN, LAGGING_COMMIT_MAX);
-            late.repair = None;
+            late.set_repair(None);
             late.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
             partitions.insert(waiting, late);
             owner.partition_repairs_inflight.set(OTHER_SESSIONS);
@@ -5329,7 +5313,7 @@ mod tests {
                 assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
                 let live = namespaces
                     .iter()
-                    .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair.is_some())
+                    .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair().is_some())
                     .count();
                 assert_eq!(
                     live, PARTITION_REPAIRS_INFLIGHT_MAX,
@@ -5343,9 +5327,9 @@ mod tests {
                 let abandoned = partitions.get_by_ns(&transferring).unwrap();
                 assert_eq!(
                     (
-                        abandoned.repair.is_some(),
+                        abandoned.repair().is_some(),
                         abandoned.transfer_rearm.is_some(),
-                        partitions.get_by_ns(&waiting).unwrap().repair.is_some(),
+                        partitions.get_by_ns(&waiting).unwrap().repair().is_some(),
                     ),
                     (false, true, true),
                     "(abandoned group repairs, its re-arm waits, waiting group repairs) at \
@@ -5373,7 +5357,7 @@ mod tests {
             assert!(!backup.burn_repair_attempt());
         }
         backup.note_repair_rotation();
-        backup.repair.as_mut().unwrap().peer = REPAIR_NEXT_PEER;
+        backup.repair_mut().unwrap().peer = REPAIR_NEXT_PEER;
         backup.consensus().begin_state_transfer_await();
 
         assert!(
@@ -5381,12 +5365,12 @@ mod tests {
                 .arm_partition_transfer(&mut backup, REPAIR_PRIMARY, 0)
                 .await
         );
-        assert!(backup.repair.is_none());
+        assert!(backup.repair().is_none());
         assert_eq!(backup.repair_rotations(), 0);
         owner
             .abandon_or_rearm_partition_transfer(&mut backup, REPAIR_PRIMARY)
             .await;
-        assert!(backup.repair.is_none());
+        assert!(backup.repair().is_none());
         let rearm = backup.transfer_rearm.as_mut().unwrap();
         rearm.after_ticks = REARM_BACKOFF_TICKS;
         let rearm_peer = rearm.peer;
@@ -5440,7 +5424,7 @@ mod tests {
             (
                 journal.resident_count(),
                 journal.last_op(),
-                partition.transfer.is_some(),
+                partition.transfer().is_some(),
             )
         };
         let converted = recovery();
@@ -5458,7 +5442,7 @@ mod tests {
         for refusal in 1..=REFUSALS {
             let (peer, nonce) = {
                 let partition = partitions.get_by_ns(&namespace).unwrap();
-                let transfer = partition.transfer.as_ref().unwrap();
+                let transfer = partition.transfer().unwrap();
                 (transfer.peer, transfer.nonce)
             };
             owner
@@ -5487,7 +5471,12 @@ mod tests {
                     floor += FRAMES_ABOVE_FLOOR;
                     serve_above_floor(&owner, namespace, request, floor, &prepares).await;
                 }
-                if partitions.get_by_ns(&namespace).unwrap().transfer.is_some() {
+                if partitions
+                    .get_by_ns(&namespace)
+                    .unwrap()
+                    .transfer()
+                    .is_some()
+                {
                     break;
                 }
                 assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
@@ -5530,7 +5519,7 @@ mod tests {
         let partitions = owner.plane.partitions();
         let transfer = {
             let partition = partitions.get_by_ns(&namespace).unwrap();
-            let transfer = partition.transfer.as_ref().unwrap();
+            let transfer = partition.transfer().unwrap();
             (transfer.peer, transfer.nonce)
         };
         owner
@@ -5590,7 +5579,7 @@ mod tests {
         owner.set_repair_gap_debounce_ticks(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
         let namespace = IggyNamespace::new(0, 0, 0);
         let mut backup = repairing_backup(&bus, namespace, 0, HEAD);
-        backup.repair = None;
+        backup.set_repair(None);
         backup.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
             peer: REPAIR_PRIMARY,
             after_ticks: REARM_BACKOFF_TICKS,
@@ -5644,8 +5633,7 @@ mod tests {
         let session = partitions
             .get_by_ns(&namespace)
             .unwrap()
-            .repair
-            .as_deref()
+            .repair()
             .copied()
             .unwrap();
         serve_above_floor(
@@ -5657,7 +5645,11 @@ mod tests {
         )
         .await;
         assert!(
-            partitions.get_by_ns(&namespace).unwrap().transfer.is_some(),
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .transfer()
+                .is_some(),
             "the evicted floor arms a transfer"
         );
         (owner, sender)
@@ -5812,7 +5804,7 @@ mod tests {
         let [served, backed_up, next] =
             [0, 1, 2].map(|partition_id| IggyNamespace::new(0, 0, partition_id));
         let mut backup = repairing_backup(&bus, backed_up, 0, 0);
-        backup.repair = None;
+        backup.set_repair(None);
         owner.plane.partitions().insert(backed_up, backup);
         serve_partition_offer(&owner, served.inner(), false);
         let request =
@@ -6875,7 +6867,7 @@ mod tests {
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut partition = repairing_replica(&bus, namespace, (REPAIR_PRIMARY, 3), 0, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition.set_created_revision(INCARNATION);
         crate::refresh_partition_dvc_suffix(&partition);
         for prepare in &prepares {
@@ -6960,7 +6952,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -6991,7 +6983,7 @@ mod tests {
         while partition.consensus().view_log_unproven() {
             let request = requests.borrow_mut().pop().unwrap_or_else(|| {
                 panic!("missing repair request after {rounds} rounds; hole={:?}, session={:?}, transfer={:?}",
-                    partition.consensus().view_log_repair_op(), partition.repair,
+                    partition.consensus().view_log_repair_op(), partition.repair(),
                     partition.consensus().state_transfer_stage());
             });
             let request = request.header();
@@ -7046,7 +7038,7 @@ mod tests {
                 );
                 owner.on_repair_range_reply(&foreign_reply).await;
                 assert_eq!(partition.consensus().commit_min(), before);
-                assert_eq!(partition.repair.as_deref().copied().unwrap().floor, None);
+                assert_eq!(partition.repair().copied().unwrap().floor, None);
                 assert_eq!(
                     requests.borrow().len(),
                     requested,
@@ -7133,7 +7125,7 @@ mod tests {
                 0,
                 0,
             );
-            partition.repair = None;
+            partition.set_repair(None);
             if let Some((directory, store)) = persisted {
                 partition.set_partition_dir(directory.to_str().unwrap().to_owned());
                 Box::pin(partition.open_persistence()).await.unwrap();
@@ -7460,7 +7452,7 @@ mod tests {
             .await
             .expect("dropping the held op must prove the adopted log");
         let partition = backup.partition(namespace);
-        assert!(partition.repair.is_none());
+        assert!(partition.repair().is_none());
         assert_eq!(
             partition.log.journal().inner.last_op(),
             (!head_committed).then_some(ADOPTED_HEAD)
@@ -7572,7 +7564,7 @@ mod tests {
         assert!(elect_partition().consensus().is_primary_elect());
         // The IO lane truncates the replaced op, then the elect fetches the merged one.
         let truncating = async {
-            while elect_partition().repair.is_none() {
+            while elect_partition().repair().is_none() {
                 elect.step(&mut scratch).await;
             }
         };
@@ -7907,7 +7899,7 @@ mod tests {
             .await;
         assert!(elect_consensus().is_primary_elect());
         let fetching = async {
-            while elect_partition().repair.is_none() {
+            while elect_partition().repair().is_none() {
                 elect.step(&mut scratch).await;
             }
         };
@@ -7980,7 +7972,7 @@ mod tests {
             .await;
 
         let merging = async {
-            while backup.partition(namespace).repair.is_none() {
+            while backup.partition(namespace).repair().is_none() {
                 backup.step(&mut scratch).await;
             }
         };
@@ -8029,7 +8021,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8056,7 +8048,7 @@ mod tests {
         let proof_op = {
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             assert!(
-                partition.repair.is_none(),
+                partition.repair().is_none(),
                 "the ceiling must refuse the edge arm"
             );
             assert_eq!(partition.consensus().commit_min(), APPLIED);
@@ -8076,7 +8068,7 @@ mod tests {
         );
         let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert_eq!(
-            partition.repair.as_ref().map(|session| session.from_op),
+            partition.repair().map(|session| session.from_op),
             Some(proof_op)
         );
     }
@@ -8091,7 +8083,7 @@ mod tests {
     ) {
         let mut partition =
             repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8320,7 +8312,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in &prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8595,7 +8587,7 @@ mod tests {
     ) {
         let mut partition =
             repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8659,7 +8651,7 @@ mod tests {
             let prepares = primary_prepares(&bus, namespace, LOCAL_HEAD).await;
             let mut partition =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            partition.repair = None;
+            partition.set_repair(None);
             for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
                 partition.on_replicate(prepare.clone()).await;
             }
@@ -8740,7 +8732,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares.iter().take(usize::try_from(FIRST_HEAD).unwrap()) {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8931,7 +8923,7 @@ mod tests {
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut donor = repairing_replica(&bus, namespace, (DONOR, REPLICAS), REPAIR_PRIMARY, 0, 0);
-        donor.repair = None;
+        donor.set_repair(None);
         for prepare in prepares {
             donor.on_replicate(prepare).await;
         }
@@ -9396,7 +9388,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut donor =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        donor.repair = None;
+        donor.set_repair(None);
         let directory = tempfile::tempdir().unwrap();
         let (first_path, _) = attach_segment_files(&mut donor, directory.path(), false).await;
         for prepare in &prepares {
@@ -9541,7 +9533,7 @@ mod tests {
             let prepares = sized_primary_prepares(&bus, namespace, HEAD, payload_bytes).await;
             let mut donor =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            donor.repair = None;
+            donor.set_repair(None);
             for prepare in &prepares {
                 donor.on_replicate(prepare.clone()).await;
             }
@@ -9643,7 +9635,7 @@ mod tests {
             0,
             0,
         );
-        backup.repair = None;
+        backup.set_repair(None);
         let partitions = backup_owner.plane.partitions();
         partitions.remove(&namespace).unwrap();
         partitions.insert(namespace, backup);
@@ -9713,7 +9705,7 @@ mod tests {
             "a round that brought ops below the hole pulls the next window at once"
         );
         assert!(backup.log.journal().inner.holds_op(hole));
-        assert!(backup.transfer.is_none());
+        assert!(backup.transfer().is_none());
         assert_eq!(
             backup.consensus().state_transfer_stage(),
             consensus::StateTransferStage::Idle
@@ -9772,7 +9764,7 @@ mod tests {
             let prepares = primary_prepares(&bus, namespace, head).await;
             let mut donor =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            donor.repair = None;
+            donor.set_repair(None);
             let directory = tempfile::tempdir().unwrap();
             let (log_path, _) = attach_segment_files(&mut donor, directory.path(), false).await;
             for prepare in &prepares {
@@ -9882,7 +9874,7 @@ mod tests {
             "the abandoned op committed"
         );
         assert!(!partition.log.journal().inner.holds_op(STALE_SHAPE_OP));
-        let session = partition.repair.as_deref().copied().unwrap();
+        let session = partition.repair().copied().unwrap();
         assert_eq!(session.peer, STALE_SHAPE_PRIMARY);
         assert_ne!(session.nonce, STALE_SHAPE_NONCE);
         let request = requests.borrow_mut().pop().expect("a re-request");
@@ -9912,8 +9904,7 @@ mod tests {
         let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert_eq!(
             partition
-                .repair
-                .as_ref()
+                .repair()
                 .map(|standing| (standing.peer, standing.nonce)),
             Some((session.peer, session.nonce))
         );
@@ -9949,7 +9940,7 @@ mod tests {
             .await;
         assert_eq!(partition.consensus().commit_min(), STALE_SHAPE_COMMITTED);
         assert!(!partition.log.journal().inner.holds_op(STALE_SHAPE_OP));
-        let session = partition.repair.as_deref().copied().unwrap();
+        let session = partition.repair().copied().unwrap();
         assert_eq!(
             (session.peer, session.nonce),
             (STALE_SHAPE_PRIMARY, STALE_SHAPE_NONCE)
@@ -9990,7 +9981,7 @@ mod tests {
         let checksum = |prepare: Message<PrepareHeader>| Some(prepare.header().checksum);
         let mut partition =
             repairing_replica(&bus, namespace, (REQUESTER, REPLICAS), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for op in 1..=APPLIED {
             partition.on_replicate(canonical(op)).await;
         }
@@ -10012,7 +10003,7 @@ mod tests {
             .await;
         let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
         assert!(partition.consensus().view_log_unproven());
-        let session = partition.repair.as_mut().unwrap();
+        let session = partition.repair_mut().unwrap();
         session.peer = OLD_PEER;
         session.nonce = OLD_NONCE;
         requests.borrow_mut().clear();
@@ -10038,7 +10029,7 @@ mod tests {
         assert_eq!(held(4), checksum(branch(4)));
         assert_eq!(held(5), None);
         assert_eq!(held(HEAD), None);
-        let session = partition.repair.as_deref().copied().unwrap();
+        let session = partition.repair().copied().unwrap();
         assert_eq!(session.peer, PRIMARY);
         assert_ne!(session.nonce, OLD_NONCE);
         // The branch's op 4 is held below the hole, so the window starts above it.
@@ -10057,8 +10048,7 @@ mod tests {
             .await;
         assert_eq!(
             partition
-                .repair
-                .as_ref()
+                .repair()
                 .map(|standing| (standing.peer, standing.nonce)),
             Some((session.peer, session.nonce))
         );
@@ -10248,7 +10238,7 @@ mod tests {
         let prepares = primary_prepares(bus, namespace, head).await;
         let mut partition =
             repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         if journaled {
             for prepare in &prepares {
                 partition.on_replicate(prepare.clone()).await;
@@ -10309,7 +10299,7 @@ mod tests {
             let prepare = prepares.into_iter().next().unwrap();
             let mut partition =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            partition.repair = None;
+            partition.set_repair(None);
             if held {
                 partition.on_replicate(prepare.clone()).await;
             }
@@ -10458,7 +10448,7 @@ mod tests {
             0,
             0,
         );
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in &prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -10483,7 +10473,7 @@ mod tests {
         assert_eq!(partition.consensus().commit_min(), STALE_SHAPE_COMMITTED);
         assert!(!partition.consensus().view_log_unproven());
         partition.consensus().advance_commit_max(STALE_SHAPE_OP);
-        partition.repair = Some(Box::new(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: STALE_SHAPE_NONCE,
             view: STALE_SHAPE_VIEW,
             from_op: STALE_SHAPE_OP,
@@ -10748,7 +10738,7 @@ mod tests {
             consensus,
             IggyByteSize::from(SEGMENT_BYTES),
         );
-        partition.repair = Some(Box::new(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: 1,
             view: REPAIR_VIEW,
             from_op: commit_min + 1,
@@ -10908,7 +10898,7 @@ mod tests {
         partitions.remove(&namespace).unwrap();
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition.set_created_revision(SCANNING_INCARNATION);
         partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
         partition
@@ -10917,7 +10907,7 @@ mod tests {
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::Fetching);
-        partition.transfer = Some(Box::new(PartitionTransferSession {
+        partition.set_transfer(Some(PartitionTransferSession {
             nonce: SCANNING_NONCE,
             peer: REPAIR_PRIMARY,
             commit_op: 0,
@@ -10962,7 +10952,7 @@ mod tests {
                 .plane
                 .partitions()
                 .get_by_ns(&namespace)
-                .and_then(|partition| partition.transfer.as_ref())
+                .and_then(|partition| partition.transfer())
                 .is_some_and(|session| session.spill.is_some());
             if !pending {
                 return;
@@ -10988,8 +10978,8 @@ mod tests {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             observed.push((
-                partition.repair.as_ref().map(|session| session.peer),
-                partition.transfer.as_ref().map(|session| session.peer),
+                partition.repair().map(|session| session.peer),
+                partition.transfer().map(|session| session.peer),
             ));
         }
         observed
