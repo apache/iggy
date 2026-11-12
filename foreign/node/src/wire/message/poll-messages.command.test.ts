@@ -19,21 +19,30 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { describe, it } from 'node:test';
+import { EMPTY_PARTITION_CONTEXT } from '../vsr/header.js';
 import type {
   CommandResponse,
-  RawClient
+  RawClient,
+  SendCommandOptions
 } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError } from '../error.utils.js';
+import { LaneBlockedError, OPERATION_TIMEOUT_MS, OperationUncertainError } from '../../client/client.operation.js';
 import { Consumer } from '../offset/offset.utils.js';
 import {
   PollingStrategy
 } from './poll.utils.js';
 import {
+  DEFAULT_DEFERRED_POLL_OPTIONS, DEFERRED_POLL_OFFSET, DEFERRED_POLL_OPTIONS_SIZE, type DeferredPollOptions
+} from './deferred-poll.utils.js';
+import {
   NO_ASSIGNED_PARTITION,
+  POLL_MESSAGES,
   pollMessages,
   type PollMessages
 } from './poll-messages.command.js';
+
+const UNAUTHENTICATED = 40;
 
 const response = (data: Buffer): CommandResponse => ({
   status: 0,
@@ -58,7 +67,7 @@ const pollResponse = (
   partitionId: number,
   count = 0
 ): CommandResponse => {
-  const data = Buffer.alloc(16);
+  const data = Buffer.alloc(40);
   data.writeUInt32LE(partitionId, 0);
   data.writeBigUInt64LE(0n, 4);
   data.writeUInt32LE(count, 12);
@@ -81,15 +90,15 @@ const stubClient = (
 ): {
   client: RawClient,
   emitter: EventEmitter,
-  commands: { command: number, payload: Buffer }[]
+  commands: { command: number, payload: Buffer, options?: SendCommandOptions }[]
 } => {
   const emitter = new EventEmitter();
-  const commands: { command: number, payload: Buffer }[] = [];
+  const commands: { command: number, payload: Buffer, options?: SendCommandOptions }[] = [];
   const client = {
     protocol: 'vsr',
     isAuthenticated: true,
-    sendCommand: async (command: number, payload: Buffer) => {
-      commands.push({ command, payload });
+    sendCommand: async (command: number, payload: Buffer, options?: SendCommandOptions) => {
+      commands.push({ command, payload, options });
       onCommand?.(command, emitter);
       const next = responses.shift();
       if (!next)
@@ -179,6 +188,7 @@ describe('VSR consumer-group polling', () => {
       await pollMessages(async () => client)(groupRequest),
       {
         partitionId: NO_ASSIGNED_PARTITION,
+        context: EMPTY_PARTITION_CONTEXT,
         currentOffset: 0n,
         count: 0,
         messages: []
@@ -187,6 +197,25 @@ describe('VSR consumer-group polling', () => {
     assert.deepEqual(
       commands.map(({ command }) => command),
       [COMMAND_CODE.SyncGroup]
+    );
+  });
+
+  it('resynchronizes an empty assignment on the next poll', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, []),
+      assignment(4n, [7]),
+      pollResponse(7)
+    ]);
+    const poll = pollMessages(async () => client);
+    assert.equal((await poll(groupRequest)).partitionId, NO_ASSIGNED_PARTITION);
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
     );
   });
 
@@ -254,7 +283,7 @@ describe('VSR consumer-group polling', () => {
       (command, emitter) => {
         if (command === COMMAND_CODE.PollMessages && resetPending) {
           resetPending = false;
-          emitter.emit('sessionReset');
+          emitter.emit('sessionReset', true);
         }
       }
     );
@@ -276,13 +305,78 @@ describe('VSR consumer-group polling', () => {
     );
   });
 
+  it('returns the refused sign-in of a poll that starts signed out', async () => {
+    let resetPending = true;
+    const refusal = new ResponseError(COMMAND_CODE.SyncGroup, UNAUTHENTICATED);
+    const { client, commands } = stubClient([refusal], (_command, emitter) => {
+      // The sign-in that the first command waits for resets a session that was not signed in.
+      if (resetPending) {
+        resetPending = false;
+        emitter.emit('sessionReset', false);
+      }
+    });
+    client.isAuthenticated = false;
+
+    await assert.rejects(pollMessages(async () => client)(groupRequest), (error: unknown) => error === refusal);
+    assert.deepEqual(commands.map(({ command }) => command), [COMMAND_CODE.SyncGroup]);
+  });
+
+  it('retries a poll that starts signed out when the session it signed in to ends', async () => {
+    let sessionEnded = false;
+    const { client, commands } = stubClient(
+      [
+        assignment(1n, [4]),
+        new Error('connection closed while waiting for response'),
+        response(Buffer.alloc(0)),
+        response(Buffer.alloc(0)),
+        assignment(2n, [7]),
+        pollResponse(7)
+      ],
+      (command, emitter) => {
+        if (!client.isAuthenticated) {
+          // The sign-in that the first command waits for resets a session that was not signed in.
+          emitter.emit('sessionReset', false);
+          client.isAuthenticated = true;
+        } else if (command === COMMAND_CODE.PollMessages && !sessionEnded) {
+          sessionEnded = true;
+          emitter.emit('sessionReset', true);
+        }
+      }
+    );
+    client.isAuthenticated = false;
+
+    assert.equal((await pollMessages(async () => client)(groupRequest)).partitionId, 7);
+    assert.deepEqual(commands.map(({ command }) => command), [
+      COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages, COMMAND_CODE.SyncGroup,
+      COMMAND_CODE.JoinGroup, COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages
+    ]);
+  });
+
+  it('bounds the retries after session ends by one deadline for the whole call', async (context) => {
+    // Each attempt takes a third of the deadline, so the third one ends at it.
+    const attempts = 3;
+    const sessionEnds = attempts + 1;
+    context.mock.timers.enable({ apis: ['Date'] });
+    const deadline = Date.now() + OPERATION_TIMEOUT_MS;
+    const refusal = () => new ResponseError(COMMAND_CODE.SyncGroup, UNAUTHENTICATED);
+    const { client, commands } = stubClient(Array.from({ length: sessionEnds }, refusal), (_command, emitter) => {
+      if (commands.length <= sessionEnds) emitter.emit('sessionReset', true);
+      context.mock.timers.tick(OPERATION_TIMEOUT_MS / attempts);
+    });
+
+    await assert.rejects(pollMessages(async () => client)(groupRequest),
+      (error: unknown) => error instanceof ResponseError && error.errorCode === UNAUTHENTICATED);
+    assert.equal(commands.length, attempts);
+    assert.ok(commands.every(({ options }) => options?.deadline === deadline));
+  });
+
   it('does not replay an ambiguous auto-commit poll when its coordinator also resets', async () => {
     const { client, commands } = stubClient([
       assignment(1n, [4]),
       new ResponseError(COMMAND_CODE.PollMessages, 57)
     ], (command, emitter) => {
       if (command === COMMAND_CODE.PollMessages)
-        emitter.emit('sessionReset');
+        emitter.emit('sessionReset', true);
     });
     await assert.rejects(pollMessages(async () => client)({ ...groupRequest, autocommit: true }),
       (error: unknown) => error instanceof ResponseError && error.errorCode === 57);
@@ -302,6 +396,7 @@ describe('VSR consumer-group polling', () => {
       await pollMessages(async () => client)(groupRequest),
       {
         partitionId: NO_ASSIGNED_PARTITION,
+        context: EMPTY_PARTITION_CONTEXT,
         currentOffset: 0n,
         count: 0,
         messages: []
@@ -313,6 +408,39 @@ describe('VSR consumer-group polling', () => {
         .map(({ payload }) => payload.readUInt32LE(20)),
       [1, 2]
     );
+  });
+
+  it('resolves its uncertain join before synchronizing the group again', async () => {
+    const operationId = 17n;
+    const { client, commands } = stubClient([
+      response(Buffer.alloc(0)),
+      new OperationUncertainError(operationId, new Error('lost join reply')),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+    const resolutions: bigint[] = [];
+    client.resolveOperation = async (id) => {
+      resolutions.push(id);
+      if (resolutions.length === 1)
+        throw new OperationUncertainError(id, new Error('lost resolve reply'));
+    };
+    const poll = pollMessages(async () => client);
+    await assert.rejects(poll(groupRequest), OperationUncertainError);
+    await assert.rejects(poll(groupRequest), OperationUncertainError);
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.deepEqual(resolutions, [operationId, operationId]);
+    assert.deepEqual(commands.map(({ command }) => command), [
+      COMMAND_CODE.SyncGroup, COMMAND_CODE.JoinGroup,
+      COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages
+    ]);
+  });
+
+  it('leaves a join blocked by an unrelated operation for the caller to resolve', async () => {
+    const { client } = stubClient([
+      response(Buffer.alloc(0)), new LaneBlockedError(18n)
+    ]);
+    client.resolveOperation = async () => { assert.fail('must not resolve an unrelated operation'); };
+    await assert.rejects(pollMessages(async () => client)(groupRequest), LaneBlockedError);
   });
 
   it('rejoins when a cached poll reports a missing member', async () => {
@@ -433,4 +561,149 @@ describe('VSR consumer-group polling', () => {
     );
     assert.equal(held, false);
   });
+});
+
+describe('VSR poll context', () => {
+  const context = { incarnation: 7n, ownerGeneration: 8n, metadataOp: 9n };
+
+  it('passes the caller context with an explicit partition poll', async () => {
+    const { client, commands } = stubClient([pollResponse(4)]);
+    await pollMessages(async () => client)({ ...groupRequest, partitionId: 4, context });
+    assert.deepEqual(commands.map(({ options }) => options?.context), [context]);
+  });
+
+  it('passes the caller context with the partition a group poll selects', async () => {
+    const { client, commands } = stubClient([assignment(1n, [4]), pollResponse(4)]);
+    await pollMessages(async () => client)({ ...groupRequest, context });
+    assert.deepEqual(commands.map(({ options }) => options?.context), [undefined, context]);
+  });
+
+  it('surfaces stale ownership under a caller context and resynchronizes next time', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, [4]),
+      new ResponseError(COMMAND_CODE.PollMessages, 5009),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+    const poll = pollMessages(async () => client);
+    await assert.rejects(poll({ ...groupRequest, context }), (error: unknown) =>
+      error instanceof ResponseError && error.errorCode === 5009);
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
+  });
+
+  it('resynchronizes stale ownership under a context that is all zero and polls again, as without a context',
+    async () => {
+      const { client, commands } = stubClient([
+        assignment(1n, [4]),
+        new ResponseError(COMMAND_CODE.PollMessages, 5009),
+        assignment(2n, [7]),
+        pollResponse(7)
+      ]);
+      const polled = await pollMessages(async () => client)({ ...groupRequest, context: EMPTY_PARTITION_CONTEXT });
+      assert.deepEqual(
+        [polled.partitionId, commands.map(({ command }) => command)],
+        [7, [COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages, COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages]]
+      );
+    });
+});
+
+describe('deferred poll encoding', () => {
+  // Bodies of the Rust encoder for group 7, stream 1, topic "orders",
+  // partition 3, Next, count 100 and auto-commit, with the default options.
+  const POLL_BODY = '0201040700000001040100000002066f726465727301030000000500000000000000006400000001';
+  const DEFERRED_POLL_BODY = '0201040700000001040100000002066f72646572730103000000050000000000000000' +
+    '640000000140420f00000000000100000000001000c0d8a70000000000';
+  const golden: PollMessages = {
+    streamId: 1,
+    topicId: 'orders',
+    consumer: Consumer.Group(7),
+    partitionId: 3,
+    pollingStrategy: PollingStrategy.Next,
+    count: 100,
+    autocommit: true
+  };
+
+  const wireOptions = (deferred: Partial<DeferredPollOptions>) => {
+    const body = POLL_MESSAGES.serialize({ ...golden, deferred });
+    const at = body.length - DEFERRED_POLL_OPTIONS_SIZE;
+    return {
+      wait: body.readBigUInt64LE(at + DEFERRED_POLL_OFFSET.wait),
+      minCount: body.readUInt32LE(at + DEFERRED_POLL_OFFSET.minCount),
+      maxBytes: body.readUInt32LE(at + DEFERRED_POLL_OFFSET.maxBytes),
+      timeout: body.readBigUInt64LE(at + DEFERRED_POLL_OFFSET.requestTimeout)
+    };
+  };
+
+  it('encodes the golden plain poll body', () => {
+    assert.equal(POLL_MESSAGES.serialize(golden).toString('hex'), POLL_BODY);
+  });
+
+  it('encodes the golden deferred poll body with the default options', () => {
+    assert.equal(POLL_MESSAGES.serialize({ ...golden, deferred: {} }).toString('hex'), DEFERRED_POLL_BODY);
+    assert.equal(
+      POLL_MESSAGES.serialize({ ...golden, deferred: DEFAULT_DEFERRED_POLL_OPTIONS }).toString('hex'),
+      DEFERRED_POLL_BODY
+    );
+  });
+
+  // The Rust SDK checks the minimum count first, then the wait and the
+  // request timeout, then the byte limit.
+  const refusals: [string, Partial<DeferredPollOptions>, number][] = [
+    ['a minimum count of 0', { minCount: 0 }, 4009],
+    ['a minimum count above the poll count', { minCount: 101 }, 4009],
+    ['a minimum count of 0 with a wait above 600 s', { minCount: 0, maxWait: 600_001 }, 4009],
+    ['a wait above 600 s', { maxWait: 600_001, requestTimeout: 630_000 }, 3],
+    ['a negative wait', { maxWait: -1 }, 3],
+    ['a fractional wait', { maxWait: 1.5 }, 3],
+    ['a request timeout of 0', { maxWait: 0, requestTimeout: 0 }, 3],
+    ['a request timeout above 630 s', { requestTimeout: 630_001 }, 3],
+    ['a request timeout without 1 s after the wait', { maxWait: 1_000, requestTimeout: 1_999 }, 3],
+    ['a wait above 600 s with a byte limit below one message', { maxWait: 600_001, maxBytes: 343 }, 3],
+    ['a byte limit below one message', { maxBytes: 343 }, 80],
+    ['a byte limit above u32', { maxBytes: 2 ** 32 }, 80]
+  ];
+  for (const [name, deferred, code] of refusals)
+    it(`refuses ${name} with ${code} before anything is sent`, () => {
+      assert.throws(() => POLL_MESSAGES.serialize({ ...golden, deferred }), (error: unknown) =>
+        error instanceof ResponseError &&
+        error.commandCode === COMMAND_CODE.PollMessagesDeferred &&
+        error.errorCode === code);
+    });
+
+  it('accepts each option at its limits', () => {
+    assert.deepEqual(wireOptions({ maxWait: 0, requestTimeout: 1, minCount: 100, maxBytes: 344 }),
+      { wait: 0n, minCount: 100, maxBytes: 344, timeout: 1_000n });
+    assert.deepEqual(wireOptions({ maxWait: 600_000, requestTimeout: 630_000, maxBytes: 0xFFFF_FFFF }),
+      { wait: 600_000_000n, minCount: 1, maxBytes: 0xFFFF_FFFF, timeout: 630_000_000n });
+    assert.deepEqual(wireOptions({ maxWait: 1_000, requestTimeout: 2_000 }),
+      { wait: 1_000_000n, minCount: 1, maxBytes: 1_048_576, timeout: 2_000_000n });
+  });
+
+  it('sends a deferred poll of one partition as command 106 with the signal of the caller', async () => {
+    const signal = new AbortController().signal;
+    const { client, commands } = stubClient([pollResponse(3)]);
+    await pollMessages(async () => client)({ ...golden, deferred: {}, signal });
+    assert.deepEqual(
+      commands.map(({ command, payload, options }) => [command, payload.toString('hex'), options?.signal]),
+      [[COMMAND_CODE.PollMessagesDeferred, DEFERRED_POLL_BODY, signal]]
+    );
+  });
+
+  it('refuses a deferred consumer-group poll without a partition with 3 before anything is sent, and names the reader',
+    async () => {
+      const { client, commands } = stubClient([]);
+      await assert.rejects(pollMessages(async () => client)({ ...golden, partitionId: null, deferred: {} }),
+        (error: unknown) => error instanceof ResponseError && error.commandCode === COMMAND_CODE.PollMessagesDeferred &&
+          error.errorCode === 3 && error.message.includes('message.reader'));
+      assert.deepEqual(commands, []);
+    });
 });

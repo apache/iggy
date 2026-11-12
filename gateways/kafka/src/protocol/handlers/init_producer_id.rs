@@ -1,0 +1,259 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! `InitProducerId` (API key 22).
+//!
+//! A Java producer sets `enable.idempotence=true` without being asked (KIP-679, default since
+//! Kafka 3.0) and sends this before its first record, so answering it is what lets a stock
+//! producer start against this gateway at all.
+//!
+//! With a bridge, the id comes from Iggy, which makes it unique across the cluster, and the
+//! partitions write each batch of the producer once. Without one, the gateway's own allocator
+//! gives the id, and Produce uses it only to pick the producer's Iggy session. See
+//! `docs/IDEMPOTENCE.md`.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+use kafka_protocol::messages::{InitProducerIdRequest, InitProducerIdResponse, ProducerId};
+
+use crate::error::Result;
+use crate::protocol::api::{
+    API_KEY_INIT_PRODUCER_ID, ApiVersionRange, ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+};
+use crate::protocol::bounds_guard::validate_init_producer_id_shape;
+use crate::protocol::handlers::{
+    decode_guarded, decode_request, encode_message, is_transactional, respond_or_close,
+};
+
+pub const RANGE: ApiVersionRange = ApiVersionRange {
+    api_key: API_KEY_INIT_PRODUCER_ID,
+    min_version: 0,
+    max_version: 5,
+};
+
+/// Width of the per-instance counter. The remaining 16 bits of the non-negative range carry the
+/// instance number, and bit 63 stays clear because `producer_id` is an `i64` whose `-1` means
+/// "no producer id".
+const COUNTER_BITS: u32 = 47;
+const MAX_COUNTER: u64 = (1 << COUNTER_BITS) - 1;
+
+/// The epoch every new id starts at. An idempotent Java producer moves to the next epoch by
+/// itself, and a new epoch starts its sequences at 0, which the partitions accept.
+const PRODUCER_EPOCH: i16 = 0;
+
+/// Hands out producer ids that are unique across gateway instances sharing one Iggy cluster.
+///
+/// `instance_id` is configured (`IGGY_KAFKA_INSTANCE_ID`), not drawn at startup: a random 16-bit
+/// value collides at even odds around 300 instances.
+///
+/// The counter starts at the wall clock in milliseconds, not at 0. Kafka keys a producer on
+/// `(producer_id, producer_epoch)` and the epoch is always 0 here, so a counter restarting at 0
+/// would hand a restarted gateway's producers the pairs its previous run gave out. Seeding from
+/// the clock keeps every new id above the old ones unless the previous run averaged more than one
+/// allocation per millisecond of its uptime, the clock stepped back across the restart, or the
+/// clock reads before the Unix epoch and seeds 0. Nothing is persisted.
+///
+/// Only a gateway without a bridge gives out these ids, and it writes nothing. Older gateways
+/// gave them out with a bridge too, so Produce writes an id without the Iggy mark as a plain
+/// batch (see `bridge::iggy_producer_id`).
+#[derive(Debug)]
+pub struct ProducerIdAllocator {
+    instance_id: u16,
+    /// The first counter of this run.
+    first_counter: u64,
+    next_counter: AtomicU64,
+}
+
+impl ProducerIdAllocator {
+    #[must_use]
+    pub fn new(instance_id: u16) -> Self {
+        let first_counter = clock_counter();
+        Self {
+            instance_id,
+            first_counter,
+            next_counter: AtomicU64::new(first_counter),
+        }
+    }
+
+    /// Whether this run gave out `producer_id`. An id a client made up, or one from before a
+    /// restart or from another gateway, is not.
+    pub(crate) fn issued(&self, producer_id: i64) -> bool {
+        let Ok(id) = u64::try_from(producer_id) else {
+            return false;
+        };
+        let given_out = self.first_counter..self.next_counter.load(Ordering::Relaxed);
+        id >> COUNTER_BITS == u64::from(self.instance_id) && given_out.contains(&(id & MAX_COUNTER))
+    }
+
+    /// The next id for this instance, or `None` once its counter space is spent.
+    pub(crate) fn allocate(&self) -> Option<i64> {
+        let counter = self.next_counter.fetch_add(1, Ordering::Relaxed);
+        if counter > MAX_COUNTER {
+            return None;
+        }
+        i64::try_from((u64::from(self.instance_id) << COUNTER_BITS) | counter).ok()
+    }
+}
+
+/// Answers with a new producer id at epoch 0.
+///
+/// A request that names its current id and epoch (KIP-360) also gets a new id: Kafka does the
+/// same for a producer without a transactional id.
+pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+    let req = match decode_request(
+        API_KEY_INIT_PRODUCER_ID,
+        api_version,
+        body,
+        |v, b| decode_guarded::<InitProducerIdRequest>(v, b, validate_init_producer_id_shape),
+        encode_error_response,
+        "InitProducerId",
+    ) {
+        Ok(req) => req,
+        Err(outcome) => return outcome,
+    };
+    let encoded = match &state.bridge {
+        Some(bridge) if !is_transactional(req.transactional_id.as_ref()) => {
+            match bridge.next_producer_id().await {
+                Ok(producer_id) => encode_inner(api_version, ERROR_NONE, producer_id),
+                // Retriable, so the producer asks again. Not 15 or 16: those send a Java
+                // producer to look for a transaction coordinator, which this gateway has none of.
+                Err(error) => {
+                    tracing::warn!(%error, "could not get a producer id from Iggy");
+                    encode_error_response(api_version, ERROR_COORDINATOR_LOAD_IN_PROGRESS)
+                }
+            }
+        }
+        _ => encode_response(api_version, &req, &state.producer_ids),
+    };
+    respond_or_close(encoded, "InitProducerId")
+}
+
+/// `InitProducerId` response carrying `error_code` and no usable producer id.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_error_response(version: i16, error_code: i16) -> Result<Bytes> {
+    encode_inner(version, error_code, -1)
+}
+
+/// Allocate a producer id, or refuse a transactional request with `UNSUPPORTED_VERSION` (35).
+///
+/// 35 is the code the Java producer's `InitProducerIdHandler.handleResponse` cannot recover
+/// from; a retriable code would leave `initTransactions()` looping forever instead of failing.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_response(
+    version: i16,
+    req: &InitProducerIdRequest,
+    allocator: &ProducerIdAllocator,
+) -> Result<Bytes> {
+    if is_transactional(req.transactional_id.as_ref()) {
+        return encode_error_response(version, ERROR_UNSUPPORTED_VERSION);
+    }
+    let Some(producer_id) = allocator.allocate() else {
+        tracing::error!(
+            "producer id space exhausted; restart the gateway with a free IGGY_KAFKA_INSTANCE_ID"
+        );
+        return encode_error_response(version, ERROR_UNKNOWN_SERVER_ERROR);
+    };
+    encode_inner(version, ERROR_NONE, producer_id)
+}
+
+/// Milliseconds since the Unix epoch, capped at [`MAX_COUNTER`] so a far-future clock spends the
+/// counter space instead of bleeding into the instance bits. A clock before the epoch reads as 0.
+fn clock_counter() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    u64::try_from(millis).map_or(MAX_COUNTER, |millis| millis.min(MAX_COUNTER))
+}
+
+fn encode_inner(version: i16, error_code: i16, producer_id: i64) -> Result<Bytes> {
+    let resp = InitProducerIdResponse::default()
+        .with_error_code(error_code)
+        .with_producer_id(ProducerId(producer_id))
+        .with_producer_epoch(PRODUCER_EPOCH);
+    encode_message(&resp, version, 32)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{COUNTER_BITS, MAX_COUNTER, ProducerIdAllocator};
+
+    #[test]
+    fn given_a_fresh_allocator_when_allocating_twice_should_return_distinct_ids() {
+        let allocator = ProducerIdAllocator::new(0);
+        let first = allocator.allocate().expect("first id");
+        let second = allocator.allocate().expect("second id");
+        assert!(first >= 0 && second >= 0);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn given_an_instance_id_when_allocating_should_place_it_above_the_counter() {
+        let allocator = ProducerIdAllocator::new(0xBEEF);
+        let id = allocator.allocate().expect("id");
+        assert_eq!(id >> COUNTER_BITS, 0xBEEF);
+    }
+
+    #[test]
+    fn given_a_restarted_allocator_when_allocating_should_start_above_the_previous_run() {
+        let previous_run = ProducerIdAllocator::new(0);
+        let last_of_previous_run = previous_run.allocate().expect("previous run id");
+        thread::sleep(Duration::from_millis(2));
+        let restarted = ProducerIdAllocator::new(0);
+        let first_after_restart = restarted.allocate().expect("restarted id");
+        assert!(
+            first_after_restart > last_of_previous_run,
+            "a restart must not replay a (producer_id, epoch 0) pair a live producer still holds"
+        );
+    }
+
+    #[test]
+    fn given_an_id_when_checked_should_be_issued_only_if_this_run_gave_it_out() {
+        let allocator = ProducerIdAllocator::new(3);
+        let id = allocator.allocate().expect("id");
+
+        assert!(allocator.issued(id));
+        assert!(!allocator.issued(id + 1), "not given out yet");
+        assert!(!allocator.issued(id - 1), "from before this run");
+        assert!(!allocator.issued(-1), "no producer id");
+        assert!(
+            !ProducerIdAllocator::new(4).issued(id),
+            "another gateway's id"
+        );
+    }
+
+    #[test]
+    fn given_a_spent_counter_when_allocating_should_refuse_instead_of_bleeding_into_the_instance() {
+        let allocator = ProducerIdAllocator::new(1);
+        allocator.next_counter.store(MAX_COUNTER, Ordering::Relaxed);
+        let last = allocator.allocate().expect("last id of the counter space");
+        assert_eq!(last >> COUNTER_BITS, 1);
+        assert_eq!(allocator.allocate(), None);
+    }
+}

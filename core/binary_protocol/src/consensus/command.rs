@@ -83,6 +83,21 @@ pub enum Command {
     // the connection it owns.
     ForwardLogout = 28,
     ForwardLogoutResult = 29,
+
+    // Backups report transport-bound sessions to the metadata primary. No reply.
+    ConsumerSessionHeartbeat = 30,
+    SessionRetirementProgress = 31,
+
+    // A backup relays a partition completion to the metadata primary, which
+    // may hold no replica of that partition. No reply: the commit replicates
+    // back.
+    ForwardCompletion = 32,
+
+    // Fresh metadata and partition readiness for primary rebalancing.
+    PrimaryRebalance = 33,
+    SegmentDelete = 34,
+    CommitReply = 35,
+    PrepareProgress = 36,
 }
 
 // SAFETY: Command is #[repr(u8)] with no padding bytes.
@@ -93,7 +108,7 @@ unsafe impl CheckedBitPattern for Command {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= Self::ForwardLogoutResult as u8
+        *bits <= Self::PrepareProgress as u8
     }
 }
 
@@ -114,8 +129,7 @@ mod tests {
 
     #[test]
     fn replica_auth_commands_are_valid_bit_patterns() {
-        // Locks the is_valid_bit_pattern bump: 14..=29 parse, 30 still rejects.
-        for command in 14u8..=29 {
+        for command in 14u8..=36 {
             let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
             buf.resize(256, 0);
             buf[60] = command;
@@ -123,7 +137,7 @@ mod tests {
         }
         let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
         buf.resize(256, 0);
-        buf[60] = 30;
+        buf[60] = 37;
         assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_err());
     }
 }

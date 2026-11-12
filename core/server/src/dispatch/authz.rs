@@ -28,11 +28,11 @@
 use std::rc::Rc;
 
 use consensus::MetadataHandle;
+use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -47,9 +47,25 @@ use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
+use server_common::sharding::IggyNamespace;
 
-use crate::responses::{resolve_stream_id, resolve_topic_id};
 use crate::shell::{ShellBus, ShellShard};
+
+/// Run a read's `rule` only while the connection's session is still attached.
+///
+/// The funnel resolves the acting user before the read starts, and the session
+/// can end during any await of the read. A read runs this before its first
+/// await and again after its last one, before it builds the reply.
+pub(in crate::dispatch) fn authorize_attached(
+    attachment: Option<&SessionAttachment>,
+    rule: impl FnOnce() -> Result<(), IggyError>,
+) -> Result<(), IggyError> {
+    match attachment {
+        Some(attachment) if attachment.is_valid() => rule(),
+        Some(_) => Err(IggyError::StaleClient),
+        None => Err(IggyError::Unauthenticated),
+    }
+}
 
 /// Authorize a partition-plane op on its resolved (stream, topic) for the
 /// acting user, returning the deny status code or `None` to proceed. The
@@ -102,21 +118,28 @@ where
                 | Operation::RemoveConsumerGroupMember
                 | Operation::CompleteConsumerGroupRevocation
                 | Operation::TruncatePartition
+                | Operation::FinalizeSession
+                | Operation::RetireSession
+                | Operation::CompleteLifecycle
+                | Operation::RewrapStreamKeys
+                | Operation::TransitionPartitionHistory
+                | Operation::InstallConsumerGroupOwner
+                | Operation::RetireConsumerGroupOwners
+                | Operation::StateMachineCommand
                 | Operation::CreateStream
-                | Operation::UpdateStream
+                | Operation::UpdateStreamResolved
                 | Operation::DeleteStream
-                | Operation::PurgeStream
                 | Operation::CreateTopic
-                | Operation::UpdateTopic
+                | Operation::UpdateTopicResolved
                 | Operation::DeleteTopic
-                | Operation::PurgeTopic
                 | Operation::CreatePartitions
                 | Operation::DeletePartitions
                 | Operation::DeleteSegments
                 | Operation::CreateConsumerGroup
                 | Operation::DeleteConsumerGroup
                 | Operation::CreateUser
-                | Operation::UpdateUser
+                | Operation::UpdateUserResolved
+                | Operation::UpdateResource
                 | Operation::DeleteUser
                 | Operation::ChangePassword
                 | Operation::UpdatePermissions
@@ -154,7 +177,8 @@ where
 /// Authorize a partition-plane non-replicated read (poll / consumer-offset) on
 /// (stream, topic). `None` proceeds (allowed, or a resolution miss the caller's
 /// own not-found path handles); `Some(status)` denies. A `None` user id fails
-/// closed.
+/// closed. Because a miss proceeds, the check after the read is
+/// [`authorize_served_partition_read`].
 pub(in crate::dispatch) fn authorize_partition_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
@@ -172,7 +196,12 @@ where
     let Some(user_id) = user_id else {
         return Some(IggyError::Unauthenticated.as_code());
     };
-    let (stream_id, topic_id) = resolve_topic_scope(shard, stream_id, topic_id)?;
+    let (stream_id, topic_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .resolve_topic_ids(stream_id, topic_id)?;
     shard
         .plane
         .metadata()
@@ -181,6 +210,90 @@ where
         .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
         .err()
         .map(|error| error.as_code())
+}
+
+/// Authorize a partition read again after its owner answered, before the
+/// reply is built. While the read waits, the session can end, a grant can be
+/// revoked, and the stream or topic can be renamed, deleted or recreated. The
+/// request's identifiers may then resolve to nothing or to another entity, so
+/// the rule runs on the namespace the read resolved. A partition that no longer
+/// holds `incarnation`, the history the read was fenced to, fails closed as not
+/// accepted.
+pub(in crate::dispatch) fn authorize_served_partition_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    attachment: Option<&SessionAttachment>,
+    namespace: IggyNamespace,
+    incarnation: u64,
+    rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    authorize_served_topic_read(shard, attachment, namespace, rule)?;
+    authorize_served_incarnation(shard, namespace, incarnation)
+}
+
+/// The session and permission half of [`authorize_served_partition_read`]. A
+/// fetch runs it once, because all of its partitions share one stream and
+/// topic.
+pub(in crate::dispatch) fn authorize_served_topic_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    attachment: Option<&SessionAttachment>,
+    namespace: IggyNamespace,
+    rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    authorize_attached(attachment, || {
+        authorize_uid(
+            shard,
+            attachment.map(SessionAttachment::user_id),
+            |permissioner, user_id| {
+                rule(
+                    permissioner,
+                    user_id,
+                    namespace.stream_id(),
+                    namespace.topic_id(),
+                )
+            },
+        )
+    })
+}
+
+/// The history half of [`authorize_served_partition_read`], which a fetch
+/// runs for each of its sections.
+pub(in crate::dispatch) fn authorize_served_incarnation<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    incarnation: u64,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let current = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .created_revision_for_namespace(namespace);
+    if current == Some(incarnation) {
+        Ok(())
+    } else {
+        Err(IggyError::TransientNotAccepted)
+    }
 }
 
 /// Authorize a non-replicated read routed through `build_non_replicated_response`
@@ -261,9 +374,6 @@ where
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_consumer_groups,
         ),
-        // No on-demand flush primitive exists, and flush has no HTTP route, so
-        // this arm is the only thing answering `FeatureUnavailable` for it.
-        FLUSH_UNSAVED_BUFFER_CODE => Err(IggyError::FeatureUnavailable),
         // A replicated code smuggled inside a `NonReplicated` header keeps the
         // builder's `FeatureUnavailable`; a table-listed code with no arm above
         // and an unknown code are both refused as `InvalidCommand`. The builder
@@ -333,7 +443,13 @@ where
     let Ok(request) = T::decode_from(body) else {
         return Ok(());
     };
-    let Some(stream_id) = resolve_stream_scope(shard, stream_id(&request)) else {
+    let Some(stream_id) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .resolve_stream_id(stream_id(&request))
+    else {
         return Ok(());
     };
     authorize_uid(shard, user_id, |permissioner, uid| {
@@ -363,53 +479,17 @@ where
         return Ok(());
     };
     let (stream_id, topic_id) = ids(&request);
-    let Some((stream_id, topic_id)) = resolve_topic_scope(shard, stream_id, topic_id) else {
-        return Ok(());
-    };
-    authorize_uid(shard, user_id, |permissioner, uid| {
-        rule(permissioner, uid, stream_id, topic_id)
-    })
-}
-
-/// Resolve a wire stream identifier to its committed slab id, or `None` on a
-/// miss (the gate then falls through to the builder's not-found reply).
-fn resolve_stream_scope<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-) -> Option<usize>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard
+    let Some((stream_id, topic_id)) = shard
         .plane
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| resolve_stream_id(inner, stream_id))
-}
-
-/// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
-/// either misses.
-fn resolve_topic_scope<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-) -> Option<(usize, usize)>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let stream_id = resolve_stream_id(inner, stream_id)?;
-        let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
-        Some((stream_id, topic_id))
+        .resolve_topic_ids(stream_id, topic_id)
+    else {
+        return Ok(());
+    };
+    authorize_uid(shard, user_id, |permissioner, uid| {
+        rule(permissioner, uid, stream_id, topic_id)
     })
 }
 
@@ -419,17 +499,18 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
-        ATTACH_CONSUMER_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-        GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE,
-        GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
-        LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
-        LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
-        SYNC_CONSUMER_GROUP_CODE,
+        BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CREATE_STREAM_CODE, FETCH_MESSAGES_CODE,
+        GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+        GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE,
+        LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
+        LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
+        POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
     /// A code no `COMMAND_TABLE` entry claims.
     const UNKNOWN_CODE: u32 = 9999;
+    const RETIRED_WAIT_FOR_MESSAGES_CODE: u32 = 107;
 
     /// The gate's answer as the wire sees it: status 0 allows, anything else
     /// is the deny code stamped into `ReplyHeader.status`.
@@ -472,7 +553,6 @@ mod tests {
         let allow = Verdict::Allow;
         let unauthenticated = Verdict::Deny(IggyError::Unauthenticated.as_code());
         let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
-        let feature_unavailable = Verdict::Deny(IggyError::FeatureUnavailable.as_code());
         vec![
             (PING_CODE, invalid_command, invalid_command),
             (GET_STATS_CODE, unauthenticated, allow),
@@ -493,26 +573,18 @@ mod tests {
                 invalid_command,
             ),
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
+            (BIND_SESSION_CODE, invalid_command, invalid_command),
+            (GET_PARTITION_ROUTE_CODE, invalid_command, invalid_command),
             (
-                ATTACH_CONSUMER_SESSION_CODE,
+                POLL_MESSAGES_DEFERRED_CODE,
                 invalid_command,
                 invalid_command,
             ),
-            (GET_POLL_ROUTING_CODE, invalid_command, invalid_command),
+            (FETCH_MESSAGES_CODE, invalid_command, invalid_command),
             (
-                POLL_MESSAGES_ON_PRIMARY_CODE,
+                CANCEL_DEFERRED_REQUEST_CODE,
                 invalid_command,
                 invalid_command,
-            ),
-            (
-                GET_CONSUMER_OFFSET_ROUTING_CODE,
-                invalid_command,
-                invalid_command,
-            ),
-            (
-                FLUSH_UNSAVED_BUFFER_CODE,
-                feature_unavailable,
-                feature_unavailable,
             ),
             (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
             (GET_STREAM_CODE, allow, allow),
@@ -528,6 +600,7 @@ mod tests {
                 invalid_command,
             ),
             (DESCRIBE_OPTIONS_CODE, unauthenticated, allow),
+            (GET_METADATA_CHANGES_CODE, invalid_command, invalid_command),
         ]
     }
 
@@ -570,18 +643,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_code_is_refused_as_invalid_command() {
-        assert!(
-            lookup_command(UNKNOWN_CODE).is_none(),
-            "test needs a code absent from COMMAND_TABLE"
-        );
+    fn unknown_or_retired_code_is_refused_as_invalid_command() {
         let shard = gate_shard();
         let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
-        assert_eq!(gate(&shard, UNKNOWN_CODE, None), invalid_command);
-        assert_eq!(
-            gate(&shard, UNKNOWN_CODE, Some(DEFAULT_ROOT_USER_ID)),
-            invalid_command
-        );
+        for code in [UNKNOWN_CODE, RETIRED_WAIT_FOR_MESSAGES_CODE] {
+            assert!(
+                lookup_command(code).is_none(),
+                "test needs a code absent from COMMAND_TABLE"
+            );
+            assert_eq!(gate(&shard, code, None), invalid_command);
+            assert_eq!(
+                gate(&shard, code, Some(DEFAULT_ROOT_USER_ID)),
+                invalid_command
+            );
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-gateway-kafka"
-version = "0.1.0"
+version = "0.2.0"
 description = "Kafka wire protocol gateway foundation for Apache Iggy"
 edition = "2024"
 license = "Apache-2.0"
@@ -33,13 +33,22 @@ name = "iggy-gateway-kafka"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 iggy = { workspace = true }
-# Broker-role only: decodes requests and encodes responses. Default features also pull in
-# client-role codec paths and compression codecs (gzip/lz4/snappy/zstd) this gateway never
-# uses, since RecordBatch payloads stay opaque `Bytes` here.
-kafka-protocol = { workspace = true }
+# `with_binary_deadline`, which hands a Produce request's deadline to the SDK. The prelude does not
+# export it.
+iggy_common = { workspace = true }
+iggy_kafka_wire = { workspace = true }
+# The codec features stay on for the encoder, which the batch tests use to build fixtures.
+kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true }
+rustls = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 socket2 = { workspace = true }
@@ -53,16 +62,35 @@ tokio = { workspace = true, features = [
     "sync",
     "signal",
 ] }
+tokio-rustls = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
+# Partition route requests for `examples/partition_routes.rs`, and the Iggy request frames that a
+# test relay holds back.
+iggy_binary_protocol = { workspace = true }
+# The client half, so a test encodes requests and decodes responses the way a consumer does.
+kafka-protocol = { workspace = true, features = ["client"] }
+# Certificates for the TLS listener tests, minted per test so nothing in the tree expires.
+rcgen = { workspace = true }
+# Reads the JSON events that kafka-verifiable-consumer.sh prints.
+serde_json = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "test-util",
+] }
 
 [lints.clippy]
 enum_glob_use = "deny"

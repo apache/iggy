@@ -18,14 +18,14 @@ under the License.
 -->
 
 <script lang="ts">
-  import Icon from '$lib/components/Icon.svelte';
+  import Icon from '#lib/components/Icon.svelte';
   import { goto } from '$app/navigation';
   import { twMerge } from 'tailwind-merge';
   import { page } from '$app/state';
-  import { openModal } from '$lib/components/Modals/AppModals.svelte';
-  import Button from '$lib/components/Button.svelte';
+  import { openModal } from '#lib/components/Modals/AppModals.svelte';
+  import Button from '#lib/components/Button.svelte';
 
-  import { typedRoute } from '$lib/types/appRoutes';
+  import { typedRoute } from '#lib/types/appRoutes.js';
   import { onMount } from 'svelte';
   import { resolve } from '$app/paths';
 
@@ -41,11 +41,8 @@ under the License.
   let filteredData = $derived(data.streams.filter((stream) => stream.name.includes(searchQuery)));
 
   onMount(() => {
-    if (
-      data.streams.length > 0 &&
-      page.url.pathname === resolve(typedRoute('/dashboard/streams'))
-    ) {
-      goto(resolve(typedRoute(`/dashboard/streams/${data.streams[0].id}`)));
+    if (data.streams.length > 0 && page.url.pathname === resolve(typedRoute('dashboard/streams'))) {
+      goto(resolve(typedRoute(`dashboard/streams/${data.streams[0].id}`)));
     }
   });
 </script>
@@ -72,7 +69,7 @@ under the License.
         {@const isActive = page.params.streamId === id.toString()}
         <li class="last:mb-6">
           <a
-            href={resolve(typedRoute(`/dashboard/streams/${id}`))}
+            href={resolve(typedRoute(`dashboard/streams/${id}`))}
             class={twMerge(
               'flex w-full flex-col border-b gap-1 px-5 py-2 transition-colors  outline-hidden dark:text-white hoverable',
               isActive && 'bg-shade-l300 dark:bg-shade-d300'

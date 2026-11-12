@@ -17,30 +17,37 @@
 
 //! The wire failure channels and the one send exit for host-built frames.
 //!
-//! Every frame the dispatch host builds, success or rejection, leaves through
-//! [`send_host_frame`], so the send-failure log has one shape. Which channel a
+//! Every frame the dispatch host sends for a request, its own success or
+//! rejection or a reply relayed from the shard that committed the request,
+//! leaves through [`send_host_frame`] to the [`ClientOrigin`] captured when the
+//! request arrived, so the send-failure log has one shape. Which channel a
 //! failure rides is a wire contract with the SDK:
 //!
 //! | channel | carrier | when |
 //! |---|---|---|
-//! | [`FrameChannel::TypedDeny`] | Reply, nonzero status + empty body, or a result-framed rejection body | rejections that must unblock the SDK's lockstep request slot: checksum, authz, pre-consensus rewrite, unknown or unsupported non-replicated code, unbound non-PING read, transient replay hints |
+//! | [`FrameChannel::TypedDeny`] | Reply, nonzero status + empty body, or a result-framed rejection body | rejections that must unblock the SDK's lockstep request slot: checksum, undeclared operation byte, authz, pre-consensus rewrite, unknown or unsupported non-replicated code, unbound non-PING read, transient replay hints |
 //! | [`FrameChannel::Eviction`] | session-terminal Eviction frame with a typed reason | the client must register again: `NoSession`, `MalformedLogin`, heartbeat and login evictions. The reason rides the channel label, since one `context` covers four of them |
 //! | [`FrameChannel::ResyncSentinel`] | status-0 poll reply, body carries `RESYNC_REQUIRED_PARTITION_SENTINEL` | a fenced consumer-group poll: the consumer must re-sync its assignment; HTTP mirrors it as `resync_required_polled_messages` in `crate::http::wire` |
-//! | [`FrameChannel::EmptyFrame`] | status 0 with the 16-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
+//! | [`FrameChannel::EmptyFrame`] | status 0 with the 40-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
 //! | [`FrameChannel::Reply`] | status-0 success frame | host-built success replies: login/register, ping, logout, non-replicated read bodies, committed metadata replies |
-//! | silent drop | no frame | one deliberate case, a transient consensus submit failure: the SDK read-timeout replays the same request id, and a synthesized failure could contradict a write that commits moments later. A header `RequestHeader::validate` rejected also drops, but that one is a GAP, not a contract - the fields decode, so a deny could be echoed under the transport id, and the client instead waits out its read timeout |
+//! | silent drop | no frame | one case. A header `RequestHeader::validate` rejection is a GAP, not a contract - the fields decode, so a deny can be echoed under the transport id, and the client instead waits out its read timeout. A metadata submit or a relayed partition write (`relay_partition_reply`) without a verdict is not silent: it answers `TransientNotCommitted` on `TypedDeny`, which licenses only a replay of the same request id, so it cannot contradict a write that commits moments later |
 //! | HTTP status | HTTP status code | the HTTP spine maps the same rejections in `crate::http::error`; it never rides these frames |
 //!
 //! The last two send nothing, so [`FrameChannel`] has no variant for them.
 //!
-//! Scope: the table covers `crate::dispatch` only. Two neighbours answer on
-//! their own paths by design - the partitions engine builds and sends
-//! produce/poll replies, and the shard crate builds client-shaped denies of
-//! its own (`IggyShard::deny_partition_request_transient` and
-//! `stage_transient_deny`, both `TypedDeny`-shaped, the latter shedding the
-//! frame outright when its lifecycle queue is full).
+//! Scope: the table covers `crate::dispatch` only. Two neighbours build
+//! frames of their own by design - the partitions engine builds produce/poll
+//! replies, and the shard crate builds client-shaped denies
+//! (`IggyShard::deny_partition_request_transient` and `stage_transient_deny`,
+//! both `TypedDeny`-shaped, the latter shedding the frame outright when its
+//! lifecycle queue is full). A frame for a client request returns here over
+//! the request's own channel and leaves through [`send_host_frame`]. On the
+//! production bus, a frame they send by client id alone reaches neither a
+//! client socket nor an HTTP reply slot: both need the installation captured
+//! at admission, so the send fails with `ClientNotFound`.
 
-use crate::responses::{NonReplicatedResponse, build_deny_reply, current_metadata_commit};
+use crate::reply_frame::{build_deny_reply, current_metadata_commit};
+use crate::responses::NonReplicatedResponse;
 use crate::rewrite::RewriteStage;
 use crate::shell::{ShellBus, ShellShard};
 use bytes::Bytes;
@@ -48,14 +55,19 @@ use consensus::{
     EvictionContext, MetadataHandle, build_eviction_message,
     build_incompatible_protocol_eviction_message, build_result_rejection_reply,
 };
-use iggy_binary_protocol::{EvictionReason, PrepareHeader, RoutedRequestHeader};
+use iggy_binary_protocol::{
+    EvictionReason, HEADER_SIZE, Operation, PrepareHeader, ReplyHeader, RequestHeader,
+    RoutedRequestHeader,
+};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::BusMessage;
+use message_bus::{BusMessage, InstanceToken, SendError};
 use server_common::Message;
+use shard::metrics::{frame_drop_reason, frame_drop_variant};
+use std::mem::offset_of;
 use std::rc::Rc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Labels the channel a host-built frame rides, for the send-failure log.
 /// The taxonomy, including the two channels that never construct a frame,
@@ -85,21 +97,113 @@ impl std::fmt::Display for FrameChannel {
     }
 }
 
-/// The one send exit for host-built client frames. Best-effort: a failed
-/// send means the connection is gone (or its queue is full), and there is
-/// nothing left to reply on, so the error is logged and dropped. `frame` is
-/// any bus message: a contiguous frozen frame or the vectored poll reply.
+/// The connection a request arrived on: its transport client id and the
+/// installation the bus served it with at arrival.
+///
+/// Every frame for the request goes to that installation, never by client id.
+/// A reply can outlive its connection, for example a write that commits after
+/// the client went away, and must then be dropped rather than reach, or close
+/// on a full queue, a later connection under the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientOrigin {
+    pub id: u128,
+    instance: Option<InstanceToken>,
+    /// The connection's drain took the request from its queue, so a frame
+    /// for it waits for room in a full reply queue.
+    queued: bool,
+    /// The monotonic time the frame arrived, where its client's timeout runs from.
+    arrived_us: u64,
+}
+
+impl ClientOrigin {
+    /// The installation serving `id` on this shard's bus now. With none, every
+    /// frame for the request is dropped.
+    pub fn capture<B: ShellBus>(bus: &B, id: u128) -> Self {
+        Self {
+            id,
+            instance: bus.client_instance(id),
+            queued: false,
+            arrived_us: bus.monotonic_micros(),
+        }
+    }
+
+    pub(in crate::dispatch) const fn arrived_us(self) -> u64 {
+        self.arrived_us
+    }
+
+    /// This origin for a request that the connection's drain runs. The drain
+    /// runs at most `client_queue_capacity` request tasks and answers one
+    /// frame itself at a time, so the replies that wait for room are bounded.
+    pub(in crate::dispatch) const fn queued(self) -> Self {
+        Self {
+            queued: true,
+            ..self
+        }
+    }
+}
+
+/// The one send exit for client frames. Best-effort: a failed send means the
+/// connection is gone, and there is nothing left to reply on, so the error is
+/// logged, counted and dropped. `frame` is any bus message: a contiguous
+/// frozen frame or the vectored poll reply.
+///
+/// A frame for a queued request waits for room in a full reply queue, so a
+/// client that reads its replies keeps its connection. A queue that stays full
+/// for `message_bus.client_write_stall_timeout` closes it. Any other frame, the
+/// overflow deny and the heartbeat eviction included, closes the connection
+/// on a full queue: nothing bounds how many of them could wait.
 #[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn send_host_frame<B: ShellBus>(
-    bus: &B,
-    transport_client_id: u128,
+pub(in crate::dispatch) async fn send_host_frame<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    origin: ClientOrigin,
     frame: impl Into<BusMessage>,
     channel: FrameChannel,
     context: &'static str,
-) {
-    if let Err(send_error) = bus.send_to_client(transport_client_id, frame).await {
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let sent = if origin.queued {
+        shard
+            .bus
+            .send_to_client_instance_waiting(origin.id, origin.instance, frame.into())
+            .await
+    } else {
+        shard
+            .bus
+            .send_to_client_instance(origin.id, origin.instance, frame.into())
+            .await
+    };
+    let Err(send_error) = sent else {
+        return;
+    };
+    let reason = if matches!(send_error, SendError::Backpressure) {
+        frame_drop_reason::FULL
+    } else {
+        frame_drop_reason::DELIVERY_FAILED
+    };
+    shard
+        .metrics()
+        .record_frame_drop(frame_drop_variant::CLIENT_REPLY, reason);
+    if matches!(
+        send_error,
+        SendError::ClientNotFound(_) | SendError::ConnectionClosed
+    ) {
+        // Request tasks outlive their connection, and each one fails here: on
+        // its closed queue until the connection is uninstalled, then by id.
+        debug!(
+            transport_client_id = origin.id,
+            error = %send_error,
+            channel = %channel,
+            context,
+            "host frame target is gone"
+        );
+    } else {
         warn!(
-            transport_client_id,
+            transport_client_id = origin.id,
             error = %send_error,
             channel = %channel,
             context,
@@ -117,7 +221,7 @@ pub(in crate::dispatch) async fn send_host_frame<B: ShellBus>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     status: u32,
 ) where
@@ -128,10 +232,10 @@ pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let commit = current_metadata_commit(shard);
-    let reply = build_deny_reply(request_header, transport_client_id, 0, commit, status);
+    let reply = build_deny_reply(request_header, origin.id, 0, commit, status);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         "request_denial",
@@ -145,7 +249,7 @@ pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     status: u32,
 ) where
@@ -155,13 +259,75 @@ pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let reply = build_deny_reply(request_header, transport_client_id, 0, 0, status);
+    let reply = build_deny_reply(request_header, origin.id, 0, 0, status);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         "unbound_request_denial",
+    )
+    .await;
+}
+
+/// Deny a request whose operation byte this build does not declare with
+/// `InvalidCommand`. Silence would stall the client's lockstep connection.
+///
+/// `request_header` is raw because no typed header can hold the byte.
+/// `Operation::Reserved` stands in for it while the echo is built, and the
+/// reply gets the original byte back, because clients match a reply by
+/// operation and request id. No checksum covers the byte, since `ReplyHeader`
+/// is not frame-sealed. `validate` is skipped: it refuses `Reserved` and a
+/// zero `client`, and the reply echoes neither. Session and commit stay 0 as
+/// in [`send_unbound_deny_reply`], because the transport may be unbound.
+#[allow(clippy::future_not_send)]
+pub(in crate::dispatch) async fn send_undeclared_operation_deny<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    origin: ClientOrigin,
+    mut request_header: [u8; HEADER_SIZE],
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let operation_offset = offset_of!(RequestHeader, operation);
+    let operation = request_header[operation_offset];
+    request_header[operation_offset] = Operation::Reserved as u8;
+    let request_header =
+        match bytemuck::checked::try_pod_read_unaligned::<RoutedRequestHeader>(&request_header) {
+            Ok(request_header) => request_header,
+            Err(error) => {
+                warn!(
+                    transport_client_id = origin.id,
+                    operation,
+                    error = %error,
+                    "dropping client request with invalid header"
+                );
+                return;
+            }
+        };
+    warn!(
+        transport_client_id = origin.id,
+        operation, "denying client request whose operation this build does not declare"
+    );
+    let reply = build_deny_reply(
+        &request_header,
+        origin.id,
+        0,
+        0,
+        IggyError::InvalidCommand.as_code(),
+    );
+    // Generic before the write: the typed view panics on an undeclared byte.
+    let mut reply = reply.into_generic();
+    reply.as_mut_slice()[offset_of!(ReplyHeader, operation)] = operation;
+    send_host_frame(
+        shard,
+        origin,
+        reply.into_frozen(),
+        FrameChannel::TypedDeny,
+        "undeclared_operation_denial",
     )
     .await;
 }
@@ -174,7 +340,7 @@ pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
 pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RoutedRequestHeader>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     status: u32,
 ) where
     B: ShellBus,
@@ -192,8 +358,8 @@ pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
         status,
     );
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         "non_replicated_denial",
@@ -208,7 +374,7 @@ pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_pre_consensus_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     error: &IggyError,
     stage: RewriteStage,
@@ -221,23 +387,17 @@ pub(in crate::dispatch) async fn send_pre_consensus_deny<B, MJ, S, SB>(
 {
     let context = stage.as_str();
     warn!(
-        transport_client_id,
+        transport_client_id = origin.id,
         error = %error,
         operation = ?request_header.operation,
         context,
         "denying request pre-consensus"
     );
     let commit = current_metadata_commit(shard);
-    let reply = build_deny_reply(
-        request_header,
-        transport_client_id,
-        0,
-        commit,
-        error.as_code(),
-    );
+    let reply = build_deny_reply(request_header, origin.id, 0, commit, error.as_code());
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         context,
@@ -253,7 +413,7 @@ pub(in crate::dispatch) async fn send_pre_consensus_deny<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_result_rejection<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     error: &IggyError,
     context: &'static str,
@@ -267,8 +427,8 @@ pub(in crate::dispatch) async fn send_result_rejection<B, MJ, S, SB>(
     let commit = current_metadata_commit(shard);
     let reply = build_result_rejection_reply(request_header, commit, error.as_code());
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::TypedDeny,
         context,
@@ -287,7 +447,7 @@ pub(in crate::dispatch) async fn send_result_rejection<B, MJ, S, SB>(
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn send_eviction<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     vsr_client_id: u128,
     reason: EvictionReason,
     context: &'static str,
@@ -313,8 +473,8 @@ pub(in crate::dispatch) async fn send_eviction<B, MJ, S, SB>(
         _ => build_eviction_message(ctx, vsr_client_id, reason),
     };
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         eviction.into_generic().into_frozen(),
         FrameChannel::Eviction(reason),
         context,
@@ -330,7 +490,7 @@ pub(in crate::dispatch) async fn send_eviction<B, MJ, S, SB>(
 pub(in crate::dispatch) async fn send_non_replicated_bytes<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RoutedRequestHeader>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     bytes: Bytes,
     channel: FrameChannel,
     context: &'static str,
@@ -349,8 +509,8 @@ pub(in crate::dispatch) async fn send_non_replicated_bytes<B, MJ, S, SB>(
         commit,
     );
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         channel,
         context,
@@ -358,272 +518,520 @@ pub(in crate::dispatch) async fn send_non_replicated_bytes<B, MJ, S, SB>(
     .await;
 }
 
-// Byte snapshots pinning each channel's frame to the pre-refactor inline
-// construction. What they hold is that routing a rejection through this
-// module changed no byte a client sees: same command, same status, same
-// header echo, same body length per channel. They are NOT the wire
-// contract - a deliberate protocol change updates them.
+// Shape tests for the host frame exits: each pins the contract a client
+// decodes (status, body shape, identity, commit stamp), never the raw bytes.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::handle_client_request;
+    use crate::dispatch::partition::empty_poll_fallback;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestShard, request_message, test_shard,
+        FIRST_BOOT, SpyBus, TestShard, UNDECLARED_OPERATION, request_message, test_shard,
     };
-    use crate::responses::build_empty_reply;
+    use crate::dispatch::{ClientDrain, ClientRequestQueues, handle_client_request};
     use crate::session_manager::SessionManager;
     use configs::server::ServerConfig;
-    use iggy_binary_protocol::Operation;
+    use consensus::{LocalPipeline, VsrConsensus};
     use iggy_binary_protocol::codes::PING_CODE;
+    use iggy_binary_protocol::consensus::REJECTION_SECTION_LEN;
+    use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
+    use iggy_binary_protocol::{
+        Command, ConsensusHeader, EvictionHeader, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
+        Operation, ReplyHeader, result_code,
+    };
     use iggy_common::RESYNC_REQUIRED_PARTITION_SENTINEL;
     use std::cell::RefCell;
+    use std::mem::size_of;
     use std::sync::Arc;
 
     const TRANSPORT: u128 = 42;
     const VSR_CLIENT: u128 = 7;
     const SESSION: u64 = 3;
     const REQUEST: u64 = 5;
+    /// Nonzero, so a stamped frontier is distinguishable from a withheld one.
+    const COMMIT: u64 = 11;
+    /// Nonzero, so an echoed stamp is distinguishable from a zeroed field.
+    const REQUEST_CHECKSUM: u128 = 0x0123_4567_89AB_CDEF;
+    /// Send-failure log label only; no exit reads it.
+    const CONTEXT: &str = "shape_test";
+    /// Consensus context the eviction shard stamps, spelled out so the
+    /// assertion does not read it back from the object under test. Replica is
+    /// 2 rather than 1 so all three differ: equal values would hide a builder
+    /// that stamps the cluster into the replica field, or the zeroed fallback.
+    const EVICTION_CLUSTER: u128 = 1;
+    const EVICTION_VIEW: u32 = 0;
+    const EVICTION_REPLICA: u8 = 2;
 
-    fn snapshot_shard() -> (SpyBus, Rc<TestShard>) {
+    /// A shard whose metadata commit frontier sits at `COMMIT`.
+    fn shard_at_commit() -> (SpyBus, Rc<TestShard>) {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        metadata_consensus(&shard).advance_commit_max(COMMIT);
+        shard.plane.metadata().advance_applied_frontier(COMMIT);
         (bus, shard)
     }
 
-    fn sole_client_frame(bus: &SpyBus) -> (u128, Vec<u8>) {
+    fn metadata_consensus(shard: &TestShard) -> &VsrConsensus<SpyBus, LocalPipeline> {
+        shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("test shard carries metadata consensus")
+    }
+
+    /// The one frame on the bus, decoded as `H` and passed through its own
+    /// header validation. Every host frame targets the transport connection
+    /// and declares its own length.
+    fn sole_frame_to_transport<H: ConsensusHeader>(bus: &SpyBus) -> (H, Vec<u8>) {
         let replies = bus.client_replies.borrow();
         assert_eq!(replies.len(), 1, "expected exactly one client-bound frame");
-        replies[0].clone()
+        let (target, frame) = &replies[0];
+        assert_eq!(
+            *target, TRANSPORT,
+            "the frame must go to the transport connection"
+        );
+        let header_bytes = frame
+            .get(..size_of::<H>())
+            .expect("frame holds a full header");
+        let header = bytemuck::checked::try_pod_read_unaligned::<H>(header_bytes)
+            .expect("client frame decodes into the expected header");
+        header
+            .validate()
+            .expect("host frame passes its own header validation");
+        assert_eq!(
+            header.size() as usize,
+            frame.len(),
+            "size must cover the whole frame"
+        );
+        (header, frame[size_of::<H>()..].to_vec())
     }
 
     fn poll_request() -> Message<RoutedRequestHeader> {
         request_message(Operation::NonReplicated, VSR_CLIENT, SESSION, REQUEST, &[])
     }
 
-    /// The 16-byte empty `PolledMessages` body exactly as the pre-refactor
-    /// `partition::empty_polled_messages_body` built it.
-    fn old_empty_polled_messages_body(partition_id: u32) -> Bytes {
-        let mut body = Vec::with_capacity(16);
-        body.extend_from_slice(&partition_id.to_le_bytes());
-        body.extend_from_slice(&0u64.to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes());
-        Bytes::from(body)
-    }
-
-    fn old_eviction_context(shard: &Rc<TestShard>) -> EvictionContext {
-        shard.plane.metadata().consensus.as_ref().map_or(
-            EvictionContext {
-                cluster: 0,
-                view: 0,
-                replica: 0,
-            },
-            EvictionContext::from_consensus,
-        )
-    }
-
-    #[compio::test]
-    async fn snapshot_typed_deny_commit_stamped_frame_unchanged() {
-        let (bus, shard) = snapshot_shard();
-        let request = poll_request();
-        let status = IggyError::Unauthenticated.as_code();
-        let old = build_deny_reply(
-            request.header(),
-            TRANSPORT,
-            0,
-            current_metadata_commit(&shard),
-            status,
-        )
-        .into_generic();
-
-        send_deny_reply(&shard, TRANSPORT, request.header(), status).await;
-
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
-    }
-
-    #[compio::test]
-    async fn snapshot_typed_deny_unbound_frame_unchanged() {
-        let (bus, shard) = snapshot_shard();
-        let request = poll_request();
-        let status = IggyError::Unauthenticated.as_code();
-        let old = build_deny_reply(request.header(), TRANSPORT, 0, 0, status).into_generic();
-
-        send_unbound_deny_reply(&shard, TRANSPORT, request.header(), status).await;
-
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
-    }
-
-    #[compio::test]
-    async fn snapshot_typed_deny_non_replicated_frame_unchanged() {
-        let (bus, shard) = snapshot_shard();
-        let request = poll_request();
-        let status = IggyError::Unauthenticated.as_code();
-        let old = build_deny_reply(
-            request.header(),
-            request.header().client,
-            request.header().session,
-            current_metadata_commit(&shard),
-            status,
-        )
-        .into_generic();
-
-        send_non_replicated_deny(&shard, &request, TRANSPORT, status).await;
-
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
-    }
-
-    #[compio::test]
-    async fn snapshot_typed_deny_result_framed_frame_unchanged() {
-        let (bus, shard) = snapshot_shard();
-        let request = poll_request();
-        let code = IggyError::TransientNotAccepted;
-        let old = build_result_rejection_reply(
-            request.header(),
-            current_metadata_commit(&shard),
-            code.as_code(),
-        )
-        .into_generic();
-
-        send_result_rejection(&shard, TRANSPORT, request.header(), &code, "snapshot").await;
-
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
-    }
-
-    #[compio::test]
-    async fn snapshot_eviction_frame_unchanged() {
-        let (bus, shard) = snapshot_shard();
-        let ctx = old_eviction_context(&shard);
-
-        // Old `send_unauthenticated_eviction`: reason NoSession, client id =
-        // the transport id.
-        let old = build_eviction_message(ctx, TRANSPORT, EvictionReason::NoSession).into_generic();
-        send_eviction(
-            &shard,
-            TRANSPORT,
-            TRANSPORT,
-            EvictionReason::NoSession,
-            "snapshot",
-        )
-        .await;
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
-        bus.client_replies.borrow_mut().clear();
-
-        // Old `send_login_eviction`: reason MalformedLogin, client id = the
-        // request's VSR client id.
-        let old =
-            build_eviction_message(ctx, VSR_CLIENT, EvictionReason::MalformedLogin).into_generic();
-        send_eviction(
-            &shard,
-            TRANSPORT,
-            VSR_CLIENT,
-            EvictionReason::MalformedLogin,
-            "snapshot",
-        )
-        .await;
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
-        bus.client_replies.borrow_mut().clear();
-
-        // Old `send_login_eviction` on `IncompatibleProtocol`: the protocol
-        // window rides the frame, client id = the request's VSR client id.
-        let old = build_incompatible_protocol_eviction_message(ctx, VSR_CLIENT).into_generic();
-        send_eviction(
-            &shard,
-            TRANSPORT,
-            VSR_CLIENT,
-            EvictionReason::IncompatibleProtocol,
-            "snapshot",
-        )
-        .await;
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
-    }
-
-    /// The HTTP mirror (`resync_required_polled_messages` in
-    /// `crate::http::wire`) is a JSON DTO, not a wire frame, so the shared
-    /// contract asserted here is the sentinel constant itself; the DTO's own
-    /// test pins its `partition_id` to the same constant.
-    #[compio::test]
-    async fn snapshot_resync_sentinel_frame_unchanged() {
-        let (bus, shard) = snapshot_shard();
-        let request = poll_request();
-        let body = old_empty_polled_messages_body(RESYNC_REQUIRED_PARTITION_SENTINEL);
+    /// The echo every request-correlated Reply carries.
+    fn assert_echoes_request(header: &ReplyHeader, request: &RoutedRequestHeader) {
+        assert_eq!(header.command, Command::Reply, "must ride a Reply frame");
+        assert_eq!(header.request, request.request, "must echo the request id");
         assert_eq!(
-            body[..4],
-            RESYNC_REQUIRED_PARTITION_SENTINEL.to_le_bytes(),
-            "sentinel poll body must lead with the re-sync sentinel partition id"
+            header.operation, request.operation,
+            "must echo the request operation"
         );
-        let old = NonReplicatedResponse::Bytes(body.clone())
-            .into_reply(
-                request.header(),
-                request.header().client,
-                request.header().session,
-                current_metadata_commit(&shard),
-            )
-            .into_generic();
+    }
 
-        send_non_replicated_bytes(
+    /// The typed deny shape: the request's own Reply, nonzero status, no body.
+    fn assert_typed_deny(
+        header: &ReplyHeader,
+        body: &[u8],
+        request: &RoutedRequestHeader,
+        status: u32,
+    ) {
+        assert_echoes_request(header, request);
+        assert_eq!(
+            header.status, status,
+            "the status carries the typed error code"
+        );
+        assert_ne!(
+            header.status, 0,
+            "a deny must never read as a committed ack"
+        );
+        assert!(body.is_empty(), "a deny reply carries no body");
+    }
+
+    /// Send one eviction and decode it. The bus is cleared first so each
+    /// reason is inspected on its own.
+    async fn evict(
+        bus: &SpyBus,
+        shard: &Rc<TestShard>,
+        vsr_client: u128,
+        reason: EvictionReason,
+    ) -> EvictionHeader {
+        bus.client_replies.borrow_mut().clear();
+        send_eviction(
+            shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            vsr_client,
+            reason,
+            CONTEXT,
+        )
+        .await;
+        let (header, _) = sole_frame_to_transport::<EvictionHeader>(bus);
+        // Literals, not `metadata_consensus(shard)`: reading the context back
+        // from the source the builder read it from cannot catch a mis-mapped
+        // field. `test_shard(.., 1, 3, ..)` seeds cluster 1, view 0, replica 1.
+        assert_eq!(
+            (header.cluster, header.view, header.replica),
+            (EVICTION_CLUSTER, EVICTION_VIEW, EVICTION_REPLICA),
+            "the metadata shard stamps its live consensus context"
+        );
+        header
+    }
+
+    #[compio::test]
+    async fn typed_deny_must_echo_the_request_with_nonzero_status_and_no_body() {
+        let (bus, shard) = shard_at_commit();
+        let request = poll_request();
+        let status = IggyError::Unauthenticated.as_code();
+
+        send_deny_reply(
             &shard,
-            &request,
-            TRANSPORT,
-            body,
-            FrameChannel::ResyncSentinel,
-            "poll_messages",
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.header(),
+            status,
         )
         .await;
 
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_typed_deny(&header, &body, request.header(), status);
+        assert_eq!(
+            header.client, TRANSPORT,
+            "a pre-plane deny answers under the transport id"
+        );
+        assert_eq!(header.op, 0, "a pre-plane deny has no session to stamp");
+        assert_eq!(
+            header.commit, COMMIT,
+            "a bound deny stamps the live metadata commit"
+        );
     }
 
-    /// The PING reply is the one host-built success Reply the funnel serves
-    /// without a consensus round; the old side is the frame the reads
-    /// router's PING arm built inline before the exit existed.
     #[compio::test]
-    async fn snapshot_reply_frame_unchanged() {
-        let (bus, shard) = snapshot_shard();
+    async fn unbound_deny_must_not_disclose_the_commit_frontier() {
+        let (bus, shard) = shard_at_commit();
+        let request = poll_request();
+        let status = IggyError::Unauthenticated.as_code();
+
+        send_unbound_deny_reply(
+            &shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.header(),
+            status,
+        )
+        .await;
+
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_typed_deny(&header, &body, request.header(), status);
+        assert_eq!(
+            header.client, TRANSPORT,
+            "an unbound deny answers under the transport id"
+        );
+        assert_eq!(header.op, 0, "an unbound deny has no session to stamp");
+        assert_eq!(
+            header.commit, 0,
+            "an unbound transport must not learn the commit frontier"
+        );
+    }
+
+    #[compio::test]
+    async fn undeclared_operation_must_be_denied_invalid_command_with_its_own_byte_echoed() {
+        assert!(
+            !Operation::is_known_code(UNDECLARED_OPERATION),
+            "test needs an operation byte this build does not declare"
+        );
+        let (bus, shard) = shard_at_commit();
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let server_config = Arc::new(ServerConfig::default());
-        let request = request_message(Operation::NonReplicated, VSR_CLIENT, SESSION, REQUEST, &[])
-            .transmute_header(|header, ping: &mut RoutedRequestHeader| {
-                *ping = header;
-                ping.reserved[..4].copy_from_slice(&PING_CODE.to_le_bytes());
-                // The funnel promotes the client wire header with `group`
-                // unset, so the old side must build from the same bytes.
-                ping.group = 0;
+        let request = request_message(Operation::CreateStream, VSR_CLIENT, SESSION, REQUEST, &[])
+            .transmute_header(|header, stamped: &mut RoutedRequestHeader| {
+                *stamped = header;
+                stamped.request_checksum = REQUEST_CHECKSUM;
             });
-        let old = build_empty_reply(
-            request.header(),
-            request.header().client,
-            request.header().session,
-            current_metadata_commit(&shard),
-        )
-        .into_generic();
+        let request_header = *request.header();
+        let mut frame = request.into_generic();
+        frame.as_mut_slice()[offset_of!(RequestHeader, operation)] = UNDECLARED_OPERATION;
 
         handle_client_request(
             &shard,
             &sessions,
             &server_config,
-            1,
-            TRANSPORT,
-            request.into_generic(),
+            &ClientRequestQueues::default(),
+            &Rc::new(ClientDrain::new(&server_config)),
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            frame,
+            None,
         )
         .await;
 
-        let (target, frame) = sole_client_frame(&bus);
-        assert_eq!(target, TRANSPORT);
-        assert_eq!(frame, old.as_slice().to_vec());
+        {
+            let mut replies = bus.client_replies.borrow_mut();
+            let (_, reply) = replies
+                .first_mut()
+                .expect("the request must be answered, not dropped");
+            let operation_offset = offset_of!(ReplyHeader, operation);
+            assert_eq!(
+                reply[operation_offset], UNDECLARED_OPERATION,
+                "the deny must echo the request's own operation byte"
+            );
+            // A declared byte in its place lets the typed view check the rest.
+            reply[operation_offset] = request_header.operation as u8;
+        }
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_typed_deny(
+            &header,
+            &body,
+            &request_header,
+            IggyError::InvalidCommand.as_code(),
+        );
+        assert_eq!(
+            header.request_checksum, REQUEST_CHECKSUM,
+            "the deny must echo the request checksum"
+        );
+        assert_eq!(
+            header.client, TRANSPORT,
+            "a deny ahead of the session lookup answers under the transport id"
+        );
+        assert_eq!(header.op, 0, "the deny has no session to stamp");
+        assert_eq!(
+            header.commit, 0,
+            "a transport that may be unbound must not learn the commit frontier"
+        );
+    }
+
+    #[compio::test]
+    async fn non_replicated_deny_must_answer_under_the_request_session() {
+        let (bus, shard) = shard_at_commit();
+        let request = poll_request();
+        let status = IggyError::Unauthenticated.as_code();
+
+        send_non_replicated_deny(
+            &shard,
+            &request,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            status,
+        )
+        .await;
+
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_typed_deny(&header, &body, request.header(), status);
+        assert_eq!(
+            header.client, VSR_CLIENT,
+            "a read deny answers under the request's client id"
+        );
+        assert_eq!(
+            header.op, SESSION,
+            "a read deny stamps the request's session"
+        );
+        assert_eq!(
+            header.commit, COMMIT,
+            "a read deny stamps the live metadata commit"
+        );
+    }
+
+    #[compio::test]
+    async fn pre_consensus_deny_must_carry_the_error_code_as_status() {
+        let (bus, shard) = shard_at_commit();
+        let request = poll_request();
+        let error = IggyError::InvalidCredentials;
+
+        send_pre_consensus_deny(
+            &shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.header(),
+            &error,
+            RewriteStage::UserPassword,
+        )
+        .await;
+
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_typed_deny(&header, &body, request.header(), error.as_code());
+        assert_eq!(
+            header.client, TRANSPORT,
+            "a pre-consensus deny answers under the transport id"
+        );
+        assert_eq!(header.op, 0, "a pre-consensus deny has no session to stamp");
+        assert_eq!(
+            header.commit, COMMIT,
+            "a pre-consensus deny stamps the live metadata commit"
+        );
+    }
+
+    #[compio::test]
+    async fn result_rejection_must_ride_status_zero_with_the_code_in_the_result_section() {
+        let (bus, shard) = shard_at_commit();
+        let request = poll_request();
+        let error = IggyError::TransientNotAccepted;
+
+        send_result_rejection(
+            &shard,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.header(),
+            &error,
+            CONTEXT,
+        )
+        .await;
+
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_echoes_request(&header, request.header());
+        assert_eq!(header.status, 0, "a result-framed rejection keeps status 0");
+        assert_eq!(
+            body.len(),
+            REJECTION_SECTION_LEN,
+            "the body is exactly one rejection section"
+        );
+        assert_eq!(
+            result_code(&body),
+            Some(error.as_code()),
+            "the result section carries the code"
+        );
+        assert_eq!(
+            header.client, VSR_CLIENT,
+            "a rejection answers under the request's client id"
+        );
+        assert_eq!(
+            header.op, COMMIT,
+            "op is position-typed at the commit like every reply"
+        );
+        assert_eq!(
+            header.commit, COMMIT,
+            "a rejection stamps the live metadata commit"
+        );
+    }
+
+    #[compio::test]
+    async fn eviction_must_carry_the_typed_reason_and_the_live_consensus_context() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, EVICTION_REPLICA, 3, FIRST_BOOT));
+
+        let no_session = evict(&bus, &shard, TRANSPORT, EvictionReason::NoSession).await;
+        assert_eq!(
+            no_session.reason,
+            EvictionReason::NoSession,
+            "the reason rides typed"
+        );
+        assert_eq!(
+            no_session.client, TRANSPORT,
+            "a client without a session is addressed by its transport id"
+        );
+
+        let malformed_login = evict(&bus, &shard, VSR_CLIENT, EvictionReason::MalformedLogin).await;
+        assert_eq!(
+            malformed_login.reason,
+            EvictionReason::MalformedLogin,
+            "the reason rides typed"
+        );
+        assert_eq!(
+            malformed_login.client, VSR_CLIENT,
+            "a login eviction is addressed to the request's client id"
+        );
+
+        let incompatible = evict(
+            &bus,
+            &shard,
+            VSR_CLIENT,
+            EvictionReason::IncompatibleProtocol,
+        )
+        .await;
+        assert_eq!(
+            incompatible.reason,
+            EvictionReason::IncompatibleProtocol,
+            "the reason rides typed"
+        );
+        assert_eq!(
+            incompatible.client, VSR_CLIENT,
+            "a login eviction is addressed to the request's client id"
+        );
+        // On a `.0` release both bounds coincide, so a swapped max/min pair
+        // passes here; `validate` still holds `1 <= min <= max`.
+        assert_eq!(
+            (
+                incompatible.server_protocol_version,
+                incompatible.server_protocol_version_min
+            ),
+            (IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN),
+            "IncompatibleProtocol carries the accepted protocol window"
+        );
+    }
+
+    /// TCP is the only transport that still carries this sentinel. HTTP
+    /// rejects `consumer_kind=consumer_group` polls before a poll ever
+    /// reaches this path (`crate::http::wire::poll_wire_request`).
+    #[compio::test]
+    async fn resync_sentinel_must_ride_a_status_zero_poll_body_led_by_the_sentinel() {
+        let (bus, shard) = shard_at_commit();
+        let request = poll_request();
+        let (body, channel) = empty_poll_fallback(RESYNC_REQUIRED_PARTITION_SENTINEL);
+        assert!(
+            matches!(channel, FrameChannel::ResyncSentinel),
+            "the sentinel poll rides the re-sync channel"
+        );
+
+        send_non_replicated_bytes(
+            &shard,
+            &request,
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            body,
+            channel,
+            CONTEXT,
+        )
+        .await;
+
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_echoes_request(&header, request.header());
+        assert_eq!(
+            header.status, 0,
+            "the sentinel rides a success frame, not a deny"
+        );
+        assert_eq!(
+            body.len(),
+            POLL_RESPONSE_HEADER_SIZE,
+            "the body is the empty poll the SDK decoder requires"
+        );
+        assert_eq!(
+            body[..4],
+            RESYNC_REQUIRED_PARTITION_SENTINEL.to_le_bytes(),
+            "the body leads with the re-sync sentinel partition id"
+        );
+        assert_eq!(
+            header.client, VSR_CLIENT,
+            "a read reply answers under the request's client id"
+        );
+        assert_eq!(
+            header.op, SESSION,
+            "a read reply stamps the request's session"
+        );
+        assert_eq!(
+            header.commit, COMMIT,
+            "a read reply stamps the live metadata commit"
+        );
+    }
+
+    /// The PING reply is the one host-built success Reply the funnel serves
+    /// without a consensus round.
+    #[compio::test]
+    async fn ping_must_reply_status_zero_and_empty_under_the_request_session() {
+        let (bus, shard) = shard_at_commit();
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let server_config = Arc::new(ServerConfig::default());
+        let request = poll_request().transmute_header(|header, ping: &mut RoutedRequestHeader| {
+            *ping = header;
+            ping.reserved[..4].copy_from_slice(&PING_CODE.to_le_bytes());
+        });
+        let request_header = *request.header();
+
+        handle_client_request(
+            &shard,
+            &sessions,
+            &server_config,
+            &ClientRequestQueues::default(),
+            &Rc::new(ClientDrain::new(&server_config)),
+            ClientOrigin::capture(&shard.bus, TRANSPORT),
+            request.into_generic(),
+            None,
+        )
+        .await;
+
+        let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
+        assert_echoes_request(&header, &request_header);
+        assert_eq!(header.status, 0, "a served ping is a success reply");
+        assert!(body.is_empty(), "the ping reply carries no body");
+        assert_eq!(
+            header.client, VSR_CLIENT,
+            "the ping answers under the request's client id"
+        );
+        assert_eq!(header.op, SESSION, "the ping stamps the request's session");
+        assert_eq!(
+            header.commit, COMMIT,
+            "the ping stamps the live metadata commit"
+        );
     }
 }

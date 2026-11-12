@@ -25,15 +25,15 @@ under the License.
 </script>
 
 <script lang="ts">
-  import type { User } from '$lib/domain/User';
-  import SlimSortableList from '$lib/components/SlimSortableList.svelte';
-  import Checkbox from '$lib/components/Checkbox.svelte';
+  import type { User } from '#lib/domain/User.js';
+  import SlimSortableList from '#lib/components/SlimSortableList.svelte';
+  import Checkbox from '#lib/components/Checkbox.svelte';
   import { twMerge } from 'tailwind-merge';
-  import Button from '$lib/components/Button.svelte';
-  import Icon, { type iconType } from '$lib/components/Icon.svelte';
-  import DropdownMenu from '$lib/components/DropdownMenu/DropdownMenu.svelte';
-  import StopPropagation from '$lib/components/StopPropagation.svelte';
-  import { openModal } from '$lib/components/Modals/AppModals.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import Icon, { type iconType } from '#lib/components/Icon.svelte';
+  import DropdownMenu from '#lib/components/DropdownMenu/DropdownMenu.svelte';
+  import StopPropagation from '#lib/components/StopPropagation.svelte';
+  import { openModal } from '#lib/components/Modals/AppModals.svelte';
 
   interface Props {
     users: Array<User>;
@@ -50,8 +50,8 @@ under the License.
     {
       label: 'Edit',
       icon: 'editPen',
-      action: () => {
-        openModal('EditUserModal');
+      action: (user: User) => {
+        openModal('EditUserModal', { user });
       }
     },
     {
@@ -68,7 +68,7 @@ under the License.
         openModal('DeleteUserModal');
       }
     }
-  ] satisfies { label: string; icon: iconType; action: VoidFunction }[];
+  ] satisfies { label: string; icon: iconType; action: (_user: User) => void }[];
 
   const toggleAllChecked = (e: Event) => {
     const { checked } = e.target as HTMLInputElement;
@@ -179,7 +179,7 @@ under the License.
                 {#each userActions as { action, icon, label } (label)}
                   <button
                     onclick={() => {
-                      action();
+                      action(row);
                       close();
                     }}
                     class={twMerge(

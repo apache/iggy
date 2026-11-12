@@ -68,9 +68,10 @@ impl Decoder {
     /// set. A general 10-byte/64-bit reader here would decode a real gateway response
     /// identically (the crate's own encoder always terminates within 5 bytes for a real `u32`),
     /// but would silently disagree with the crate on any hand-built adversarial payload with a
-    /// 6th+ continuation byte - exactly the shape `protocol/bounds_guard.rs`'s own `read_varint`
-    /// needed this same fix for, and the reason to keep this decoder byte-exact with the crate
-    /// even where it happens not to matter for well-formed input.
+    /// 6th+ continuation byte - exactly the shape the `read_varint` in
+    /// `core/kafka_wire/src/bounds_guard.rs` needed this same fix for, and the reason to keep
+    /// this decoder byte-exact with the crate even where it happens not to matter for
+    /// well-formed input.
     pub fn read_varint(&mut self) -> Result<u64> {
         let mut value: u32 = 0;
         for i in 0..5 {
@@ -121,6 +122,17 @@ impl Decoder {
             return Ok(None);
         }
         let len = len as usize;
+        self.ensure(len)?;
+        Ok(Some(self.bytes.copy_to_bytes(len)))
+    }
+
+    /// Compact nullable bytes (flexible versions): varint(len+1) prefix, 0 = null.
+    pub fn read_compact_nullable_bytes(&mut self) -> Result<Option<Bytes>> {
+        let len_plus_one = self.read_varint()?;
+        if len_plus_one == 0 {
+            return Ok(None);
+        }
+        let len = usize::try_from(len_plus_one - 1).map_err(|e| e.to_string())?;
         self.ensure(len)?;
         Ok(Some(self.bytes.copy_to_bytes(len)))
     }

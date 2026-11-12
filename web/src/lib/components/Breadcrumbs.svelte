@@ -19,15 +19,15 @@ under the License.
 
 <script lang="ts">
   import { page } from '$app/state';
-  import { typedRoute } from '$lib/types/appRoutes';
+  import { typedRoute } from '#lib/types/appRoutes.js';
   import Icon from './Icon.svelte';
-  import { isNumber } from '$lib/utils/parsers';
+  import { isNumber } from '#lib/utils/parsers.js';
   import { twMerge } from 'tailwind-merge';
   import { resolve } from '$app/paths';
-  import type { Pathname } from '$app/types';
+  import type { Path } from '$app/types';
 
   type Crumb = {
-    path: Pathname;
+    path: Path;
     label: string;
   };
 
@@ -51,7 +51,7 @@ under the License.
   }
 
   function formatPathSegment(segment: string, index: number, parts: string[]): Crumb {
-    const path = `/dashboard/${parts.slice(0, index + 1).join('/')}` as Pathname;
+    const path = `dashboard/${parts.slice(0, index + 1).join('/')}` as Path;
 
     if (isNumber(segment)) {
       const prevSegment = parts[index - 1];
@@ -72,7 +72,7 @@ under the License.
 </script>
 
 <div class="flex items-center">
-  <a href={resolve(typedRoute('/dashboard/overview'))}>
+  <a href={resolve(typedRoute('dashboard/overview'))}>
     <Icon name="home" class="dark:fill-shade-d900 dark:stroke-white mr-2" />
   </a>
 

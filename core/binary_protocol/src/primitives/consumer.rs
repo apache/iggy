@@ -25,12 +25,16 @@ pub const KIND_CONSUMER: u8 = 1;
 /// Wire discriminant for a consumer-group consumer (vs a single `Consumer`).
 /// Public so the server dispatch can match on it by name instead of a raw `2`.
 pub const KIND_CONSUMER_GROUP: u8 = 2;
+/// Wire discriminant for the offsets of a group managed outside Iggy, such as a Kafka group.
+/// Offset calls only: no membership check, no range check, never polled.
+pub const KIND_EXTERNAL_GROUP: u8 = 3;
 
-/// Wire consumer type. Identifies either a single consumer or a consumer group.
+/// Wire consumer type. Identifies a single consumer, a consumer group, or an external group.
 ///
 /// Wire format: `[kind:1][identifier:variable]`
 /// - kind=1: consumer
 /// - kind=2: consumer group
+/// - kind=3: external group
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireConsumer {
     pub kind: u8,
@@ -53,6 +57,34 @@ impl WireConsumer {
             id,
         }
     }
+
+    #[must_use]
+    pub const fn external_group(id: WireIdentifier) -> Self {
+        Self {
+            kind: KIND_EXTERNAL_GROUP,
+            id,
+        }
+    }
+
+    pub(crate) fn skip(buf: &[u8]) -> Result<usize, WireError> {
+        Self::decode_kind(buf)?;
+        WireIdentifier::skip(&buf[1..]).map(|consumed| 1 + consumed)
+    }
+
+    fn decode_kind(buf: &[u8]) -> Result<u8, WireError> {
+        let kind = read_u8(buf, 0)?;
+        if !matches!(
+            kind,
+            KIND_CONSUMER | KIND_CONSUMER_GROUP | KIND_EXTERNAL_GROUP
+        ) {
+            return Err(WireError::UnknownDiscriminant {
+                type_name: "WireConsumer",
+                value: kind,
+                offset: 0,
+            });
+        }
+        Ok(kind)
+    }
 }
 
 impl WireEncode for WireConsumer {
@@ -68,14 +100,7 @@ impl WireEncode for WireConsumer {
 
 impl WireDecode for WireConsumer {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let kind = read_u8(buf, 0)?;
-        if kind != KIND_CONSUMER && kind != KIND_CONSUMER_GROUP {
-            return Err(WireError::UnknownDiscriminant {
-                type_name: "WireConsumer",
-                value: kind,
-                offset: 0,
-            });
-        }
+        let kind = Self::decode_kind(buf)?;
         let (id, id_consumed) = WireIdentifier::decode(&buf[1..])?;
         Ok((Self { kind, id }, 1 + id_consumed))
     }
@@ -103,6 +128,16 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, c);
         assert_eq!(decoded.kind, KIND_CONSUMER_GROUP);
+    }
+
+    #[test]
+    fn roundtrip_external_group() {
+        let c = WireConsumer::external_group(WireIdentifier::named("kafka.cg.orders").unwrap());
+        let bytes = c.to_bytes();
+        let (decoded, consumed) = WireConsumer::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, c);
+        assert_eq!(decoded.kind, KIND_EXTERNAL_GROUP);
     }
 
     #[test]

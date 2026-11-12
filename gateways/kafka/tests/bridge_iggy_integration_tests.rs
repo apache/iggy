@@ -20,412 +20,249 @@
 //! exercises directly: `ensure_stream_and_topic` idempotent on repeated calls, and the bridge
 //! module invoked from a real (non-unit) test rather than only compiled.
 
+use iggy::prelude::StreamCreateOptions;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::sync::OnceLock;
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::{
-    AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyMessage,
-    MessageClient, Partitioning, StreamClient, TopicClient,
+    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, Identifier, IggyError,
+    IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient, TransportEndpoints,
 };
 use secrecy::SecretString;
 use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 
+use iggy_gateway_kafka::auth::{IggyAuthenticator, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::{
-    BridgeError, IggyBridge, IggyBridgeConfig, TopicMapping, TopicOverride,
+    BridgeError, DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig,
+    IggyTls, KnownNodes, OffsetCalls, PartitionBatch, ProduceSessionLimits, Producer,
+    TopicCreationOutcome, TopicDefaults, TopicMapping, TopicOverride,
 };
+use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
+use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
 
-/// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
-/// real ephemeral range leaves little room, but this crate never needs more than a handful live
-/// at once (this binary's own tests already run one at a time - see `.config/nextest.toml`'s
-/// `kafka_bridge` test-group).
-const DESIRED_SLOTS: u16 = 200;
+#[path = "common/certs.rs"]
+mod certs;
+#[path = "common/iggy_server.rs"]
+mod iggy_server;
 
-/// Lowest port `port_band()` will ever place its band at - clear of the well-known/privileged
-/// range (0-1023).
-const MIN_CANDIDATE_PORT: u16 = 10000;
+use certs::TestPki;
+use iggy_server::{PortGuard, TestServer, raw_client};
 
-/// Ephemeral range assumed when the kernel's own can't be read (no `/proc` - e.g. macOS),
-/// matching the Linux default. Mirrors `core/integration`'s own `port_reserver.rs`.
-const DEFAULT_EPHEMERAL_RANGE: (u16, u16) = (32768, 60999);
+#[tokio::test]
+#[serial]
+async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lanes() {
+    const RELAY_BUFFER_SIZE: usize = 8192;
+    const RECOVERY_CANCEL_DELAY: Duration = Duration::from_millis(100);
+    const CALL_DEADLINE: Duration = Duration::from_secs(60);
 
-const IP_LOCAL_PORT_RANGE: &str = "/proc/sys/net/ipv4/ip_local_port_range";
-
-fn parse_ephemeral_range(range: &str) -> Option<(u16, u16)> {
-    let mut bounds = range.split_whitespace();
-    let floor: u16 = bounds.next()?.parse().ok()?;
-    let ceiling: u16 = bounds.next()?.parse().ok()?;
-    Some((floor, ceiling))
-}
-
-/// The range the kernel picks `bind(0)` ports from, read once.
-fn ephemeral_range() -> (u16, u16) {
-    static RANGE: OnceLock<(u16, u16)> = OnceLock::new();
-    *RANGE.get_or_init(|| {
-        std::fs::read_to_string(IP_LOCAL_PORT_RANGE)
-            .ok()
-            .as_deref()
-            .and_then(parse_ephemeral_range)
-            .unwrap_or(DEFAULT_EPHEMERAL_RANGE)
-    })
-}
-
-/// First port and slot count of a band clear of the kernel's ephemeral range: below the floor by
-/// preference (matches `core/integration`'s own `port_reserver.rs`), above the ceiling when the
-/// floor leaves no room there.
-///
-/// A *hardcoded* band, chosen once without reading the real range (this file's own prior version:
-/// `15000..15199`, on the unverified assumption that every real deployment's floor sits above
-/// it), is wrong on any box tuned wider - `net.ipv4.ip_local_port_range = "1024 65535"` swallows
-/// that whole band. `flock` alone doesn't save it either: it is advisory, so it only excludes
-/// another `PortGuard`-based process, never an unrelated `bind(0)` elsewhere on the box landing on
-/// the same number from the kernel's own ephemeral pool.
-///
-/// Known residual gap, not fixed by the "matches `port_reserver.rs`" preference above: this
-/// `PortGuard` locks its own directory (`iggy-kafka-gateway-test-port-locks`), disjoint from
-/// `port_reserver.rs`'s (`iggy-test-port-locks`), so the two share no lock state even when their
-/// *bands* land on the same numbers. That only happens when the ephemeral floor leaves neither
-/// allocator room below it - `port_reserver.rs` needs room below its own, higher `BAND_START`
-/// (20000) to use the below-floor branch at all, while this function only needs room below
-/// `MIN_CANDIDATE_PORT` (10000) - so a floor at or under 10000 pushes *both* to their
-/// above-the-ceiling fallback, anchored at the identical `ceiling + 1`: this band takes the first
-/// [`DESIRED_SLOTS`] of it, `port_reserver.rs` takes the entire rest up to `u16::MAX`. A port
-/// this crate's tests reserve there is invisible to `port_reserver.rs`'s own lock, and vice versa,
-/// so two suites in the same workspace could hand out the same port under two different locks.
-/// `core/integration/src/harness/mod.rs`'s `mod port_reserver;` is private, so sharing its lock
-/// directory (the complete fix) needs a visibility change there first; narrow enough (an
-/// ephemeral floor this low is uncommon - the Linux default is 32768) that this is disclosed
-/// rather than worked around here.
-fn port_band() -> (u16, u16) {
-    static BAND: OnceLock<(u16, u16)> = OnceLock::new();
-    *BAND.get_or_init(|| {
-        let (floor, ceiling) = ephemeral_range();
-        band_for(floor, ceiling)
-    })
-}
-
-/// Pure band-selection logic, split out from [`port_band`] so it's testable against synthetic
-/// ranges without needing to fake `/proc` contents.
-fn band_for(floor: u16, ceiling: u16) -> (u16, u16) {
-    if floor > MIN_CANDIDATE_PORT {
-        let room = floor - MIN_CANDIDATE_PORT;
-        return (MIN_CANDIDATE_PORT, room.min(DESIRED_SLOTS));
-    }
-    let Some(start) = ceiling.checked_add(1) else {
-        panic!(
-            "kernel ephemeral range [{floor}, {ceiling}] leaves no room for a test port band \
-             below {MIN_CANDIDATE_PORT} nor above {ceiling} - narrow the range, e.g. \
-             sysctl -w net.ipv4.ip_local_port_range='32768 60999'"
-        );
-    };
-    // start >= 1 (ceiling + 1), so this never overflows u16.
-    let room = u16::MAX - start + 1;
-    (start, room.min(DESIRED_SLOTS))
-}
-
-#[test]
-fn given_a_readable_range_when_parsed_should_take_both_bounds() {
-    assert_eq!(
-        parse_ephemeral_range("32768\t60999\n"),
-        Some((32768, 60999))
-    );
-    assert_eq!(parse_ephemeral_range("1024 65535"), Some((1024, 65535)));
-    assert_eq!(parse_ephemeral_range(""), None);
-    assert_eq!(parse_ephemeral_range("32768"), None);
-    assert_eq!(parse_ephemeral_range("garbage 60999"), None);
-}
-
-#[test]
-fn given_room_below_the_floor_when_choosing_a_band_should_take_it() {
-    let (start, slots) = band_for(32768, 60999);
-    assert_eq!(start, MIN_CANDIDATE_PORT);
-    assert!(
-        start + slots <= 32768,
-        "band [{start}, {}] runs into the ephemeral floor",
-        start + slots - 1
-    );
-}
-
-/// A box tuned `net.ipv4.ip_local_port_range = "1024 60999"` is exactly the case the prior
-/// hardcoded `15000..15199` band silently broke under: room below the floor down to
-/// `MIN_CANDIDATE_PORT` is gone, but the ceiling still leaves room above it.
-#[test]
-fn given_no_room_below_the_floor_when_choosing_a_band_should_fall_back_above_the_ceiling() {
-    let (start, slots) = band_for(1024, 60999);
-    assert!(slots > 0, "must find room above the ceiling, not just fail");
-    assert!(
-        start > 60999,
-        "band must start above the ephemeral ceiling, got {start}"
-    );
-}
-
-#[test]
-#[should_panic(expected = "leaves no room")]
-fn given_no_room_on_either_side_when_choosing_a_band_should_fail_loudly() {
-    band_for(1024, u16::MAX);
-}
-
-/// Exclusive claim on one port, released (and the port freed for reuse) when dropped - including
-/// on an unclean process exit, since the OS drops the `flock` with the file descriptor. Unlike
-/// bind-then-drop, this process itself never binds the port before `iggy-server` does; see
-/// `port_band`'s doc comment for the limits of that guarantee against *other* processes.
-struct PortGuard {
-    port: u16,
-    _lock: File,
-}
-
-impl PortGuard {
-    fn acquire() -> Self {
-        let (band_start, band_slots) = port_band();
-        let lock_dir = std::env::temp_dir().join("iggy-kafka-gateway-test-port-locks");
-        std::fs::create_dir_all(&lock_dir).expect("create port lock dir");
-        for offset in 0..band_slots {
-            let port = band_start + offset;
-            let path = lock_dir.join(format!("{port}.lock"));
-            let Ok(file) = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-            else {
-                continue;
-            };
-            if file.try_lock().is_ok() {
-                return Self { port, _lock: file };
-            }
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay");
+    let mut config = server.test_config();
+    let upstream = config.address.clone();
+    config.address = listener.local_addr().expect("relay address").to_string();
+    let (replies, allowed) = watch::channel(true);
+    let mut relays = JoinSet::new();
+    relays.spawn(async move {
+        let mut connections = JoinSet::new();
+        while let Ok((inbound, _)) = listener.accept().await {
+            let outbound = TcpStream::connect(&upstream).await.expect("upstream");
+            let mut allowed = allowed.clone();
+            connections.spawn(async move {
+                let (mut requests, mut replies) = inbound.into_split();
+                let (mut responses, mut writes) = outbound.into_split();
+                tokio::select! {
+                    _ = copy(&mut requests, &mut writes) => {}
+                    () = async {
+                        let mut buffer = [0; RELAY_BUFFER_SIZE];
+                        while let Ok(count) = responses.read(&mut buffer).await {
+                            if count == 0 || allowed.wait_for(|allowed| *allowed).await.is_err() {
+                                break;
+                            }
+                            if replies.write_all(&buffer[..count]).await.is_err() {
+                                break;
+                            }
+                        }
+                    } => {}
+                }
+            });
         }
-        panic!(
-            "no free port slot in [{band_start}, {}]",
-            band_start + band_slots - 1
-        );
-    }
-}
-
-/// Locates the already-built `iggy-server` binary. Does not build it - see this crate's
-/// `docs/TEST_SUITE.md` for the prerequisite, the same one `core/integration`'s own
-/// server-spawning tests already carry.
-///
-/// Walks up from this test binary's own path (`env::current_exe()`) rather than calling
-/// `assert_cmd::cargo::cargo_bin("iggy-server")` directly: `cargo_bin`'s `CARGO_BIN_EXE_*`
-/// env-var lookup only resolves for binaries owned by *this* package, so for `iggy-server`
-/// (a different package) it always falls through to `cargo_bin`'s own `legacy_cargo_bin`, which
-/// panics with its own internal message - not the "binary not found" text `TEST_SUITE.md`
-/// promises - when the binary is not yet built (`CARGO_BIN_EXE_iggy-server` is unset, so its
-/// panic path prints that plus every binary name it *did* find, not a helpful next step). Ancestor
-/// directories of `current_exe()` reach the same `target/<profile>/` directory
-/// `legacy_cargo_bin` derives - correct under `CARGO_TARGET_DIR`, `--release`, or a `--target`
-/// triple subdirectory for the identical reason: it reads back from where cargo actually placed
-/// *this* binary, not a guessed path - so checking existence there first, before ever calling
-/// into `assert_cmd`, gives this crate's own message instead of a Cargo internal one. An earlier
-/// version of this function drove `cargo build --package server --bin iggy-server` directly from
-/// every server-spawning test (nextest runs each as its own process, so the `OnceLock` memoized
-/// nothing across them), serialized by `.config/nextest.toml`'s `kafka_bridge` test-group but
-/// still real, avoidable per-test overhead this version has none of.
-///
-/// # Panics
-///
-/// Panics if `iggy-server` cannot be found alongside this test binary's own target directory.
-fn iggy_server_binary() -> PathBuf {
-    let current_exe = std::env::current_exe().expect("resolve this test binary's own path");
-    let binary_name = format!("iggy-server{}", std::env::consts::EXE_SUFFIX);
-    current_exe
-        .ancestors()
-        .map(|dir| dir.join(&binary_name))
-        .find(|candidate| candidate.is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "iggy-server binary not found near {} - build it first with \
-                 `cargo build --package server --bin iggy-server`",
-                current_exe.display()
-            )
-        })
-}
-
-struct TestServer {
-    child: Child,
-    address: String,
-    password: String,
-    _port_guard: PortGuard,
-}
-
-impl TestServer {
-    /// Spawns `iggy-server` with the default `iggy`/`iggy` root credentials. See
-    /// [`Self::spawn_with_password`] for the general form.
-    async fn spawn(data_dir: &std::path::Path) -> Self {
-        Self::spawn_with_password(data_dir, "iggy").await
-    }
-
-    /// Spawns `iggy-server` with an isolated temp data dir, a locked TCP port, and the given root
-    /// password, then blocks until its listener is ready or the startup budget is exhausted.
-    ///
-    /// A dedicated password parameter (not just the `spawn()` default everywhere) lets a
-    /// password-shaped regression test (special characters, say) reuse this harness's
-    /// `PortGuard`/graceful-`Drop`/`wait_ready` machinery instead of hand-rolling a second,
-    /// `Drop`-less spawn: a `Drop`-less copy has no guard to run `graceful_kill` on a panic before
-    /// its assertions, orphaning a process that still holds its `PortGuard` slot, which then
-    /// fails the next test that draws that slot to bind.
-    async fn spawn_with_password(data_dir: &std::path::Path, password: &str) -> Self {
-        let port_guard = PortGuard::acquire();
-        let address = format!("127.0.0.1:{}", port_guard.port);
-
-        let mut command = Command::new(iggy_server_binary());
-        command
-            .env("IGGY_PATH", data_dir.display().to_string())
-            .env("IGGY_TCP_ADDRESS", &address)
-            .env("IGGY_HTTP_ENABLED", "false")
-            .env("IGGY_QUIC_ENABLED", "false")
-            // WebSocket defaults to enabled on a fixed 127.0.0.1:8092 (config.toml), unlike TCP
-            // which reads a per-test port from PortGuard - every spawned server here would fight
-            // over that one port otherwise, and a bind failure aborts boot.
-            .env("IGGY_WEBSOCKET_ENABLED", "false")
-            // Matches core/integration's own spawned-server harness (harness/handle/server.rs):
-            // pinned shards (config.toml default: pin_cores = true) of concurrently running
-            // servers pile onto the same cores and starve each other. This crate's own tests are
-            // serialized against each other (.config/nextest.toml's kafka_bridge test-group -
-            // #[serial] alone does not survive nextest, which runs each test as its own process),
-            // but a spawned server here can still land alongside a pinned server from a different
-            // package's test in the same nextest run.
-            .env("IGGY_SHARDING_PIN_CORES", "false")
-            // Only half of core/integration's own pairing: unpinning cores stops a server from
-            // being pinned to a specific range, but config.toml's own default
-            // (cpu_allocation = "numa:auto") still sizes the shard pool to the whole machine with
-            // nothing set here - every server this crate's tests spawn would still compete for
-            // the entire box against unrelated packages' tests in the same nextest run. A small
-            // fixed range (matching the same harness's own fallback for an unreadable core count)
-            // caps that instead.
-            .env("IGGY_SHARDING_CPU_ALLOCATION", "0..4")
-            // `--with-default-root-credentials` is off by default (args.rs) - without these,
-            // a fresh server provisions no loginable root user at all, and every bridge connect
-            // attempt fails with "invalid credentials" no matter what this test passes.
-            .env("IGGY_ROOT_USERNAME", "iggy")
-            .env("IGGY_ROOT_PASSWORD", password);
-        let child = command.spawn().expect("spawn iggy-server");
-
-        let mut server = Self {
-            child,
-            address,
-            password: password.to_string(),
-            _port_guard: port_guard,
-        };
-        server.wait_ready().await;
-        server
-    }
-
-    /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries
-    /// `RECONNECTION_RETRIES` (3 dials at ~1s apart) on every failed attempt, so a poll loop built
-    /// on it pays several real seconds per iteration instead of running at its own 100ms cadence,
-    /// and a *successful* poll iteration would authenticate a client and then drop it without
-    /// `close()`, leaking a session server-side. A TCP accept slightly ahead of the app being
-    /// ready to authenticate is fine - every caller's own subsequent `IggyBridge::connect` already
-    /// retries a few times, which covers the last few hundred ms of that gap.
-    ///
-    /// Checks `try_wait()` every iteration: a server that fails at boot (bad config, a port
-    /// stolen between `PortGuard::acquire` and its own bind) exits almost immediately, and without
-    /// this check that reads as "still starting" for the full 30s budget - the eventual failure
-    /// names the wrong cause ("did not become ready") instead of the real one (exited early, with
-    /// whatever it printed before dying).
-    async fn wait_ready(&mut self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child status") {
-                panic!(
-                    "iggy-server at {} exited during startup with {status}",
-                    self.address
-                );
-            }
-            if tokio::net::TcpStream::connect(self.address.as_str())
+    });
+    let bridge = IggyBridge::connect(config).await.expect("bridge");
+    let raw = raw_client(&server).await;
+    let stream = Identifier::named("kafka").expect("stream name");
+    bridge
+        .ensure_stream_and_topic("rejected", 1)
+        .await
+        .expect("seed the topic the second write is refused for");
+    // The first topic write commits successfully; the second commits an already-exists rejection.
+    for (delayed, next) in [("delayed", "next"), ("rejected", "after_rejection")] {
+        replies.send(false).expect("hold replies");
+        let result = bridge.create_kafka_topic(delayed, 1).await;
+        assert!(matches!(result, Err(BridgeError::Timeout)), "{result:?}");
+        assert!(
+            raw.get_topic(&stream, &Identifier::named(delayed).expect("topic name"))
                 .await
-                .is_ok()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "iggy-server at {} did not become ready within the startup budget",
-                self.address
+                .expect("topic lookup")
+                .is_some(),
+            "the canceled write committed before its reply was released"
+        );
+        assert!(
+            tokio::time::timeout(
+                RECOVERY_CANCEL_DELAY,
+                bridge.create_kafka_topic("blocked", 1)
+            )
+            .await
+            .is_err(),
+            "recovery must wait for proof while replies are withheld"
+        );
+        if delayed == "delayed" {
+            let recovery = bridge
+                .create_kafka_topic("blocked_deadline", 1)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                recovery.to_kafka_error_code(),
+                ERROR_REQUEST_TIMED_OUT,
+                "{recovery:?}"
             );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        replies.send(true).expect("resume replies");
+        assert!(matches!(
+            bridge
+                .create_kafka_topic(next, 1)
+                .await
+                .expect("next create"),
+            TopicCreationOutcome::Created { .. }
+        ));
+        assert!(
+            bridge
+                .get_kafka_topic(next)
+                .await
+                .expect("next topic")
+                .is_some()
+        );
+        for unsent in ["blocked", "blocked_deadline"] {
+            assert!(
+                bridge
+                    .get_kafka_topic(unsent)
+                    .await
+                    .expect("unsent topic")
+                    .is_none()
+            );
         }
     }
 
-    fn test_config(&self) -> IggyBridgeConfig {
-        IggyBridgeConfig {
-            address: self.address.clone(),
-            username: "iggy".to_string(),
-            password: SecretString::from(self.password.clone()),
-            topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
-                .expect("valid mapping for this test's fixture data"),
+    let target = bridge.topic_target("next").expect("topic target");
+    for (payload, hold) in [("warm", false), ("uncertain", true), ("recovered", false)] {
+        let deadline = Instant::now() + CALL_DEADLINE;
+        let (result, returned) = {
+            let turn = bridge
+                .produce_turn(Producer::Connection(1), deadline)
+                .await
+                .expect("produce turn");
+            replies.send(!hold).expect("reply gate");
+            bridge
+                .send_records(
+                    turn,
+                    (),
+                    &target,
+                    PartitionBatch {
+                        partition: 0,
+                        producer: None,
+                        messages: vec![IggyMessage::from_str(payload).expect("message")],
+                    },
+                    deadline,
+                )
+                .await
+        };
+        assert!(
+            returned.is_some(),
+            "the retained operation must keep its client"
+        );
+        drop(returned);
+        if hold {
+            assert!(
+                matches!(
+                    result,
+                    Err(BridgeError::Iggy(IggyError::OperationUncertain(_)))
+                ),
+                "{result:?}"
+            );
+        } else {
+            result.expect("produce recovers the prior retained send");
         }
     }
-}
-
-/// SIGTERM, wait up to `SIGTERM_TIMEOUT`, then SIGKILL if it hasn't exited. Mirrors
-/// `core/integration`'s own `harness::handle::common::graceful_kill` (not reused directly - that
-/// crate is heavyweight, and pulling it in for one function isn't worth it; this crate already
-/// depends directly on `iggy`/`core/sdk`, so `core/integration` wouldn't add a *new*
-/// core/sdk-change-reruns-these-tests edge, just an unrelated dependency). A bare SIGKILL skips
-/// `iggy-server`'s shutdown path entirely, which is a materially different exit than what the
-/// binary is actually built to do on `SIGTERM` - `.kill()` alone bypassed that in every test run
-/// before this fix.
-const SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
-const SIGKILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-fn graceful_kill(child: &mut Child) {
-    // `wait_ready` calls `try_wait()` too (and panics on an early exit, unwinding into this via
-    // `Drop`) - if it already reaped the child, `child.id()` is a PID the OS is free to hand to an
-    // unrelated process by the time we get here, and a raw `libc::kill` (unlike `std::Child::kill`,
-    // which checks its own cached exit status first and no-ops instead) has no such guard against
-    // signaling that PID anyway. Checking here first closes the same gap `std` already closes for
-    // its own `kill`.
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-
-    let pid = child.id() as libc::pid_t;
-    // Safety: `pid` is this process's own live child, confirmed by the `try_wait` check above;
-    // sending it a signal is exactly what `Child::kill` itself does internally.
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-
-    let deadline = std::time::Instant::now() + SIGTERM_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(None) => std::thread::sleep(SIGKILL_POLL_INTERVAL),
-            Ok(Some(_)) | Err(_) => return,
+    for (offset, hold) in [(0, false), (1, true), (2, false)] {
+        replies.send(!hold).expect("reply gate");
+        let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
+        let result = bridge
+            .commit_group_offsets("recovery", &[(&target, 0, offset)], &calls)
+            .await
+            .remove(0);
+        if hold {
+            assert!(
+                matches!(
+                    result,
+                    Err(BridgeError::Iggy(IggyError::OperationUncertain(_)))
+                ),
+                "{result:?}"
+            );
+        } else {
+            result.expect("offset commit recovers the prior retained store");
         }
     }
-
-    let _ = child.kill();
+    let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
+    let stored = bridge
+        .fetch_group_offsets("recovery", &[(&target, 0)], &calls)
+        .await;
+    assert!(matches!(stored.as_slice(), [Ok(Some(2))]), "{stored:?}");
+    let topic = raw
+        .get_topic(&stream, &Identifier::named("next").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        topic.messages_count, 3,
+        "recovery must not duplicate the retained send"
+    );
+    bridge.close().await.expect("close bridge");
 }
 
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        graceful_kill(&mut self.child);
-        let _ = self.child.wait();
-    }
-}
+/// The bridge's own hop to Iggy encrypted: a server that speaks only TLS on its TCP port, and
+/// a bridge told to trust the CA that signed it. Produce and Fetch go through this client, so
+/// a bridge that silently stayed in the clear would fail to connect at all.
+#[tokio::test]
+#[serial]
+async fn given_a_tls_only_server_when_the_bridge_dials_over_tls_should_provision_topics() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let certs_dir = tempfile::tempdir().expect("certs dir");
+    let pki = TestPki::new();
+    let (cert_file, key_file) = pki.server_cert("iggy").write(certs_dir.path(), "server");
+    let ca_file = pki.write_ca(certs_dir.path());
+    let server = TestServer::spawn_with_tls(data_dir.path(), &cert_file, &key_file).await;
 
-/// Builds and connects a raw `IggyClient` against `server` - for producing test data directly,
-/// independent of the `IggyBridge` under test. Uses the fluent builder, not a hand-built
-/// `iggy://user:pass@host` string: `ConnectionString` splits on `@` then `:`, which breaks for
-/// any password containing either character.
-async fn raw_client(server: &TestServer) -> IggyClient {
-    let client = IggyClientBuilder::new()
-        .with_tcp()
-        .with_server_address(server.address.clone())
-        .with_auto_sign_in(AutoLogin::Enabled(Credentials::UsernamePassword(
-            "iggy".to_string(),
-            SecretString::from("iggy"),
-        )))
-        .build()
-        .expect("build raw test client");
-    client.connect().await.expect("connect raw test client");
-    client
+    let mut config = server.test_config();
+    config.tls = IggyTls {
+        enabled: true,
+        domain: String::new(),
+        ca_file: Some(ca_file.display().to_string()),
+    };
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("the bridge connects to a TLS-only server over TLS");
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("a call on the TLS session succeeds");
+    bridge.close().await.expect("clean close");
 }
 
 #[tokio::test]
@@ -728,7 +565,7 @@ async fn ensure_topic_targets_the_streams_live_incarnation_after_a_delete_and_re
         .await
         .expect("delete the stream (and its topic with it)");
     let recreated = raw
-        .create_stream("kafka")
+        .create_stream("kafka", &StreamCreateOptions::default())
         .await
         .expect("recreate a stream under the same name");
     if recreated.id == original.id {
@@ -782,21 +619,27 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
         password: SecretString::from("iggy"),
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
+        tls: IggyTls::default(),
+        produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
+        nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     };
 
     let result = IggyBridge::connect(config).await;
     assert!(matches!(result, Err(BridgeError::Iggy(_))));
 }
 
-/// Regression test for the missing dial timeout: `TcpClient::establish_bounded` only applies its
-/// own `FAILOVER_DIAL_TIMEOUT` when at least two failover candidates are configured, which a
-/// bridge (always exactly one address) never has, so the underlying `TcpStream::connect` had no
-/// deadline at all against an address that drops packets instead of refusing them. 192.0.2.1 is
-/// RFC 5737 TEST-NET-1 - reserved for documentation, routed nowhere, so the connect attempt hangs
-/// on the kernel's own SYN-retry timeout (confirmed against this exact address before writing this
-/// test: over the sandbox's real network stack, a bare `connect()` past 3s had not yet failed).
-/// Before `REQUEST_TIMEOUT`, this test would have hung for minutes; now it must fail within a
-/// bounded window.
+/// Regression test for the missing dial timeout: the SDK once bounded a dial only when at least
+/// two failover candidates were configured, which a bridge (always exactly one address) never
+/// has, so the underlying `TcpStream::connect` had no deadline at all against an address that
+/// drops packets instead of refusing them. 192.0.2.1 is RFC 5737 TEST-NET-1 - reserved for
+/// documentation, routed nowhere, so the connect attempt hangs on the kernel's own SYN-retry
+/// timeout (confirmed against this exact address before writing this test: over the sandbox's
+/// real network stack, a bare `connect()` past 3s had not yet failed). Before `REQUEST_TIMEOUT`,
+/// this test would have hung for minutes; now it must fail within a bounded window.
 #[tokio::test]
 async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
     let config = IggyBridgeConfig {
@@ -805,6 +648,13 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         password: SecretString::from("iggy"),
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
+        tls: IggyTls::default(),
+        produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: false,
+        nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     };
 
     let start = tokio::time::Instant::now();
@@ -819,10 +669,19 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         "connect took {:?}, longer than REQUEST_TIMEOUT (15s) should allow",
         start.elapsed()
     );
-    // BridgeError::Timeout, not BridgeError::Iggy: with_request_timeout's own elapsed branch
-    // maps here (see that function's doc for why an unknown outcome must not borrow
+    // Either bound can end the attempt first. The SDK cuts every dial at its own timeout and
+    // returns CannotEstablishConnection after its last reconnect pass, which is safe because no
+    // link ever came up. Otherwise with_request_timeout's own elapsed branch maps to
+    // BridgeError::Timeout (see that function's doc for why an unknown outcome must not borrow
     // CannotEstablishConnection's known-safe code).
-    assert!(matches!(result, Err(BridgeError::Timeout)));
+    assert!(
+        matches!(
+            result,
+            Err(BridgeError::Timeout | BridgeError::Iggy(IggyError::CannotEstablishConnection))
+        ),
+        "unexpected connect result: {:?}",
+        result.as_ref().err()
+    );
 }
 
 /// Regression test: `IggyClient::disconnect` (what `close` used to call) never touches
@@ -1026,4 +885,341 @@ async fn high_watermark_rejects_a_padded_kafka_topic_name() {
         .await
         .expect_err("a padded Kafka topic name must be rejected before any Iggy lookup");
     assert!(matches!(err, BridgeError::InvalidKafkaTopicName { .. }));
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_returns_none_when_neither_stream_nor_topic_exists() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup against a nonexistent stream must not error");
+    assert!(found.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_returns_none_when_the_stream_exists_but_the_topic_does_not() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    // Creates the mapped stream ("kafka", the default) without the "orders" topic in it, so the
+    // stream-exists / topic-missing branch is reachable independently of the neither-exists one.
+    bridge
+        .ensure_stream_and_topic("different-topic", 1)
+        .await
+        .expect("seed a different topic under the same default stream");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup against an existing stream with no matching topic must not error");
+    assert!(found.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_finds_a_topic_created_through_ensure_stream_and_topic() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 3)
+        .await
+        .expect("seed the topic this lookup should find");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup call")
+        .expect("topic was just created, must be found");
+    assert_eq!(found.name, "orders");
+    assert_eq!(found.partitions_count, 3);
+}
+
+#[tokio::test]
+#[serial]
+async fn get_kafka_topic_reports_the_kafka_side_name_through_a_real_topic_mapping_override() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let mut topics = HashMap::new();
+    topics.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: "commerce".to_string(),
+            topic: "orders-v2".to_string(),
+        },
+    );
+    config.topic_mapping = TopicMapping::new("kafka".to_string(), topics)
+        .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the mapped stream/topic");
+
+    let found = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("lookup call")
+        .expect("resolves through the override to the real Iggy topic");
+    // The Iggy-side name under the override ("orders-v2"), not the Kafka-side name asked about -
+    // TopicDetails carries only what the server itself knows the topic as.
+    assert_eq!(found.name, "orders-v2");
+}
+
+#[tokio::test]
+#[serial]
+async fn ensure_stream_and_topic_rejects_zero_partitions() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    let err = bridge
+        .ensure_stream_and_topic("orders", 0)
+        .await
+        .expect_err("zero partitions must not provision an unproducible topic");
+
+    assert_eq!(
+        err.to_kafka_error_code(),
+        iggy_gateway_kafka::protocol::api::ERROR_INVALID_PARTITIONS
+    );
+    match err {
+        BridgeError::InvalidPartitionCount { kafka_topic } => {
+            assert_eq!(kafka_topic, "orders");
+        }
+        other => panic!("expected InvalidPartitionCount, got {other:?}"),
+    }
+
+    // No stream must have been created either - rejected before ensure_stream runs.
+    let raw = raw_client(&server).await;
+    let streams = raw.get_streams().await.expect("get_streams call");
+    assert!(
+        streams.is_empty(),
+        "zero-partition request must not leave a dangling stream behind"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_is_empty_when_nothing_exists() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    let topics = bridge
+        .list_kafka_topics()
+        .await
+        .expect("listing against a nonexistent default stream must not error");
+    assert_eq!(topics, []);
+}
+
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_lists_every_default_stream_topic() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 3)
+        .await
+        .expect("seed orders");
+    bridge
+        .ensure_stream_and_topic("payments", 1)
+        .await
+        .expect("seed payments");
+
+    let mut topics = bridge.list_kafka_topics().await.expect("list call");
+    topics.sort_by(|a, b| a.kafka_topic.cmp(&b.kafka_topic));
+    assert_eq!(topics.len(), 2);
+    assert_eq!(topics[0].kafka_topic, "orders");
+    assert_eq!(topics[0].partitions_count, 3);
+    assert_eq!(topics[1].kafka_topic, "payments");
+    assert_eq!(topics[1].partitions_count, 1);
+}
+
+/// Regression test: an override's target Iggy topic, when it lives in the default stream, must
+/// be listed exactly once - under its Kafka-side (override) name - not a second time under its
+/// raw Iggy name when the default stream's topics are enumerated.
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_does_not_duplicate_an_override_target_living_in_the_default_stream() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let default_stream = config.topic_mapping.default_stream().to_string();
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: default_stream.clone(),
+            topic: "orders_internal".to_string(),
+        },
+    );
+    // Required by `TopicMapping::new`'s own anti-aliasing check: an override targeting the
+    // default stream must not leave its own target name `over.topic` free for an unmapped Kafka
+    // topic of that literal name to alias by accident. Never fires in this test - it exists only
+    // to satisfy that check, since no Kafka topic literally named "orders_internal" is ever used.
+    overrides.insert(
+        "orders_internal".to_string(),
+        TopicOverride {
+            stream: "elsewhere".to_string(),
+            topic: "orders_internal".to_string(),
+        },
+    );
+    config.topic_mapping = TopicMapping::new(default_stream, overrides)
+        .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the mapped topic");
+
+    let topics = bridge.list_kafka_topics().await.expect("list call");
+    assert_eq!(
+        topics.len(),
+        1,
+        "must list the override's target exactly once, not once per (override name, raw Iggy \
+         name): {topics:?}"
+    );
+    assert_eq!(topics[0].kafka_topic, "orders");
+    assert_eq!(topics[0].partitions_count, 2);
+}
+
+/// An override targeting a non-default stream is listed under its Kafka-side name, alongside
+/// whatever the default stream itself holds - the two enumeration sources don't interfere.
+#[tokio::test]
+#[serial]
+async fn list_kafka_topics_lists_an_override_target_in_a_non_default_stream_alongside_default_stream_topics()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let mut config = server.test_config();
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "orders".to_string(),
+        TopicOverride {
+            stream: "billing".to_string(),
+            topic: "orders_v2".to_string(),
+        },
+    );
+    config.topic_mapping =
+        TopicMapping::new(config.topic_mapping.default_stream().to_string(), overrides)
+            .expect("valid mapping for this test's fixture data");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the overridden topic in the billing stream");
+    bridge
+        .ensure_stream_and_topic("payments", 1)
+        .await
+        .expect("seed a plain default-stream topic");
+
+    let mut topics = bridge.list_kafka_topics().await.expect("list call");
+    topics.sort_by(|a, b| a.kafka_topic.cmp(&b.kafka_topic));
+    assert_eq!(topics.len(), 2);
+    assert_eq!(topics[0].kafka_topic, "orders");
+    assert_eq!(topics[0].partitions_count, 2);
+    assert_eq!(topics[1].kafka_topic, "payments");
+    assert_eq!(topics[1].partitions_count, 1);
+}
+
+/// A roster of one node: the server at `address`.
+fn roster_at(address: &str) -> ClusterMetadata {
+    let socket: SocketAddr = address
+        .parse()
+        .expect("the test server listens on an IP address");
+    ClusterMetadata {
+        name: "iggy-cluster".to_string(),
+        nodes: vec![ClusterNode {
+            replica_id: 0,
+            name: "iggy-node-0".to_string(),
+            ip: socket.ip().to_string(),
+            endpoints: TransportEndpoints::new(socket.port(), 0, 0, 0),
+            role: ClusterNodeRole::Leader,
+            status: ClusterNodeStatus::Healthy,
+        }],
+    }
+}
+
+/// Beside a stopped node, the configured address is down. A new client then dials the nodes of
+/// the last roster the bridge read, so the gateway still opens clients through the other nodes.
+#[tokio::test]
+#[serial]
+async fn given_a_stopped_configured_node_when_connecting_should_dial_the_next_known_node() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let live = server.test_config();
+    let stopped = PortGuard::acquire(); // locked but never bound, like a stopped node
+    let config = IggyBridgeConfig {
+        address: format!("127.0.0.1:{}", stopped.port),
+        ..live.clone()
+    };
+    config.nodes.learn(&roster_at(&live.address));
+
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("the bridge connects through the next known node");
+    bridge
+        .ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("the bridge serves through that node");
+}
+
+/// A SASL login dials the same known nodes, so it is checked beside a stopped node too.
+#[tokio::test]
+#[serial]
+async fn given_a_stopped_configured_node_when_checking_a_login_should_verify_it_on_the_next_node() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let root = server.test_config();
+    let stopped = PortGuard::acquire();
+    let nodes = KnownNodes::default();
+    nodes.learn(&roster_at(&root.address));
+    let authenticator =
+        IggyAuthenticator::new(format!("127.0.0.1:{}", stopped.port)).with_nodes(nodes);
+    let credentials = PlainCredentials {
+        username: root.username.clone(),
+        password: root.password.clone(),
+    };
+    let slots = Semaphore::new(1);
+
+    let principal = authenticator
+        .authenticate(
+            &credentials,
+            slots.acquire().await.expect("an open semaphore"),
+        )
+        .await
+        .expect("the login is verified on the next known node");
+    assert_eq!(principal.username, root.username);
 }

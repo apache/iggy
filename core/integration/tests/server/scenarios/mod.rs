@@ -31,8 +31,10 @@ pub mod consumer_timestamp_polling_scenario;
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,
 // so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
+pub mod delete_segments_scenario;
 pub mod delete_stats_rollback_scenario;
 pub mod encryption_scenario;
+pub mod external_group_offsets_scenario;
 pub mod invalid_consumer_offset_scenario;
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
@@ -40,7 +42,6 @@ pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod offset_scenario;
 pub mod permissions_scenario;
-pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
 pub mod reconnect_after_restart_scenario;
 pub mod restart_offset_skip_scenario;
@@ -65,11 +66,14 @@ const PARTITION_ID: u32 = 0;
 // One pair for every wait in these scenarios, because they all wait out the
 // same thing: the partition plane applies committed ops asynchronously on the
 // owning shard (a send folds into the shared stats and into the servable log at
-// commit-apply; purge and delete zero them when the reconciler drives the wipe),
+// commit-apply; a delete zeroes them when the reconciler drives the wipe),
 // so a read racing that window sees a pre-apply value. Retry until the
 // expectation holds, then make the terminal assertion for a real mismatch.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+// The server cap of one poll reply (`sharding.deferred_poll_max_read_bytes`).
+// A poll that must return more than the 1 MiB default in one reply asks for it.
+const POLL_REPLY_MAX_BYTES: u32 = 16 * 1024 * 1024;
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
@@ -199,8 +203,8 @@ async fn validate_system_stats(
     );
 }
 
-/// Poll until the partition serves `expected_count` messages or
-/// [`CONVERGENCE_TIMEOUT`] expires, returning the last poll result.
+/// Poll from `strategy` until the partition serves `expected_count` messages
+/// or [`CONVERGENCE_TIMEOUT`] expires, returning every message read.
 ///
 /// `send_messages` acks at consensus commit while the owning shard applies
 /// the batch asynchronously (see the materialisation race note at the top
@@ -208,32 +212,43 @@ async fn validate_system_stats(
 /// send burst can observe fewer messages than were acked. Retrying absorbs
 /// that convergence window without weakening the caller's assertion: real
 /// message loss still returns short and fails it once the deadline expires.
+/// One reply holds at most `max_bytes`, so a large read takes several polls.
 async fn poll_until_expected_count(
     client: &IggyClient,
     stream_name: &str,
     topic_name: &str,
     strategy: &PollingStrategy,
     expected_count: u32,
-) -> PolledMessages {
+) -> Vec<IggyMessage> {
+    let stream = Identifier::named(stream_name).unwrap();
+    let topic = Identifier::named(topic_name).unwrap();
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
+    let mut messages = Vec::with_capacity(expected_count as usize);
+    let mut next = *strategy;
+    while messages.len() < expected_count as usize && Instant::now() < deadline {
         let polled = client
             .poll_messages(
-                &Identifier::named(stream_name).unwrap(),
-                &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
+                &stream,
+                &topic,
+                PARTITION_ID,
                 &Consumer::default(),
-                strategy,
-                expected_count,
-                false,
+                &next,
+                PollOptions {
+                    count: expected_count - messages.len() as u32,
+                    max_bytes: POLL_REPLY_MAX_BYTES,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
-        if polled.messages.len() as u32 == expected_count || Instant::now() >= deadline {
-            return polled;
+        if polled.messages.is_empty() {
+            sleep(RETRY_INTERVAL).await;
+            continue;
         }
-        sleep(RETRY_INTERVAL).await;
+        next = polled.continuation();
+        messages.extend(polled.messages);
     }
+    messages
 }
 
 async fn create_client(harness: &TestHarness) -> IggyClient {
@@ -264,6 +279,17 @@ async fn join_consumer_group(client: &IggyClient) {
         )
         .await
         .unwrap();
+
+    let members_count = get_consumer_group(client).await.members_count;
+    integration::harness::wait_for_consumer_group_assignment(
+        client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        members_count,
+        CONVERGENCE_TIMEOUT,
+    )
+    .await;
 }
 
 async fn leave_consumer_group(client: &IggyClient) {

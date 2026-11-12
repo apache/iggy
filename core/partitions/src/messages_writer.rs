@@ -20,8 +20,10 @@ use compio::{
     io::AsyncWriteAtExt,
 };
 use iggy_common::{IggyByteSize, IggyError};
+use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::preallocate_file;
 use server_common::iobuf::{Frozen, IOV_MAX};
+use server_common::{DISK_USAGE, unreserved_bytes};
 use std::{
     path::Path,
     rc::Rc,
@@ -35,6 +37,10 @@ pub struct MessagesWriter {
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
+    /// End of the space `new` reserved, 0 without preallocation or when the
+    /// reservation took no effect. Writes below it fill blocks the reservation
+    /// already charged.
+    reserved_end: u64,
 }
 
 impl MessagesWriter {
@@ -59,11 +65,13 @@ impl MessagesWriter {
         let file = opts
             .open(file_path)
             .await
+            .note_descriptor_exhaustion(|| format!("opening {file_path}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        if let Some(preallocate_size) = preallocate_size {
-            preallocate_file(&file, Path::new(file_path), preallocate_size.as_bytes_u64());
-        }
+        let reserved_end = match preallocate_size {
+            Some(size) => preallocate_file(&file, Path::new(file_path), size.as_bytes_u64()).await,
+            None => 0,
+        };
 
         if file_exists {
             file.sync_all()
@@ -98,10 +106,11 @@ impl MessagesWriter {
             file,
             messages_size_bytes,
             fsync,
+            reserved_end,
         })
     }
 
-    /// Appends a batch of frozen message buffers at the current write cursor
+    /// Writes frozen message buffers at a captured file position
     /// and returns how many bytes landed. The cursor is left where it was: the
     /// caller advances it with `advance` once the companion index save has
     /// also succeeded.
@@ -109,20 +118,34 @@ impl MessagesWriter {
     /// # Errors
     ///
     /// Returns an error if any chunk cannot be written or synced to disk.
-    pub(crate) async fn save_frozen_batches<const ALIGN: usize>(
+    pub(crate) async fn save_frozen_batches_at<const ALIGN: usize>(
         &self,
         buffers: &[Frozen<ALIGN>],
+        position: u64,
+        completes_save: bool,
     ) -> Result<IggyByteSize, IggyError> {
-        let messages_size: u64 = buffers.iter().map(|buffer| buffer.len() as u64).sum();
+        let messages_size = buffers
+            .iter()
+            .try_fold(0_u64, |size, buffer| size.checked_add(buffer.len() as u64))
+            .ok_or(IggyError::CannotWriteToFile)?;
+        position
+            .checked_add(messages_size)
+            .ok_or(IggyError::CannotWriteToFile)?;
 
         if messages_size == 0 {
             return Ok(IggyByteSize::from(0));
         }
 
-        let position = self.messages_size_bytes.load(Ordering::Relaxed);
-        write_frozen_chunked(&self.file, &self.file_path, position, buffers).await?;
+        write_frozen_chunked(
+            &self.file,
+            &self.file_path,
+            position,
+            self.reserved_end,
+            buffers,
+        )
+        .await?;
 
-        if self.fsync {
+        if self.fsync && completes_save {
             self.fsync().await?;
         }
 
@@ -134,6 +157,10 @@ impl MessagesWriter {
     /// once both halves have succeeded.
     pub(crate) fn advance(&self, bytes: u64) {
         self.messages_size_bytes.fetch_add(bytes, Ordering::Release);
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.messages_size_bytes.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -151,10 +178,15 @@ impl MessagesWriter {
     ///
     /// Returns an error if the file cannot be synchronized.
     pub async fn fsync(&self) -> Result<(), IggyError> {
-        self.file
-            .sync_data()
-            .await
-            .map_err(|_| IggyError::CannotWriteToFile)?;
+        self.file.sync_data().await.map_err(|err| {
+            error!(
+                target: "iggy.partitions.storage",
+                file = self.file_path.as_str(),
+                %err,
+                "failed to sync segment file"
+            );
+            IggyError::CannotWriteToFile
+        })?;
         Ok(())
     }
 }
@@ -163,12 +195,14 @@ async fn write_frozen_chunked<const ALIGN: usize>(
     file: &File,
     file_path: &str,
     mut position: u64,
+    reserved_end: u64,
     buffers: &[Frozen<ALIGN>],
 ) -> Result<(), IggyError> {
     for chunk in buffers.chunks(IOV_MAX) {
         let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
         let chunk_vec: Vec<_> = chunk.to_vec();
-
+        let end = position + chunk_size as u64;
+        let _charge = DISK_USAGE.charge(unreserved_bytes(position, end, reserved_end));
         let (result, _) = (&*file)
             .write_vectored_all_at(chunk_vec, position)
             .await
@@ -184,7 +218,7 @@ async fn write_frozen_chunked<const ALIGN: usize>(
             IggyError::CannotWriteToFile
         })?;
 
-        position += chunk_size as u64;
+        position = end;
     }
 
     Ok(())

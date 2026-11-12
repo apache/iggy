@@ -21,7 +21,9 @@ mod certificates;
 mod consensus_message;
 pub mod crypto;
 pub mod diagnostics;
+mod disk_usage;
 pub mod executor;
+pub mod fatal;
 pub mod fs_utils;
 pub mod iobuf;
 pub mod log;
@@ -41,10 +43,9 @@ pub use consensus_message::{
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
     ResponseFragments,
 };
+pub use disk_usage::{DISK_USAGE, DiskCharge, DiskUsage, unreserved_bytes};
 pub use executor::create_shard_executor;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};
 pub use reactor_yield::yield_to_reactor;
-pub use segment_storage::{
-    IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
-};
+pub use segment_storage::{IndexReader, MessagesReader, SegmentStorage};
 pub use storage::Storage;

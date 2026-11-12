@@ -23,7 +23,7 @@ use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
     system::{EncryptionConfig, LoggingConfig},
 };
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 impl Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -106,7 +106,11 @@ impl Display for MessagesMaintenanceConfig {
 
 impl Display for ConsumerGroupConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ rebalancing_timeout: {} }}", self.rebalancing_timeout)
+        write!(
+            f,
+            "{{ rebalancing_timeout: {}, heartbeat_interval: {} }}",
+            self.rebalancing_timeout, self.heartbeat_interval
+        )
     }
 }
 
@@ -122,7 +126,24 @@ impl Display for HeartbeatConfig {
 
 impl Display for EncryptionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ enabled: {} }}", self.enabled)
+        write!(
+            f,
+            "{{ enabled: {}, previous_keys: {}, retired_kek_fingerprints: {:?} }}",
+            self.enabled,
+            self.previous_keys.len(),
+            self.retired_kek_fingerprints
+        )
+    }
+}
+
+impl Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("enabled", &self.enabled)
+            .field("key_set", &!self.key.is_empty())
+            .field("previous_keys", &self.previous_keys.len())
+            .field("retired_kek_fingerprints", &self.retired_kek_fingerprints)
+            .finish()
     }
 }
 
@@ -130,14 +151,15 @@ impl Display for LoggingConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, level: {}, file_enabled: {}, max_file_size: {}, max_total_size: {}, rotation_check_interval: {}, retention: {} }}",
+            "{{ path: {}, level: {}, file_enabled: {}, max_file_size: {}, max_total_size: {}, rotation_check_interval: {}, retention: {}, sysinfo_print_interval: {} }}",
             self.path,
             self.level,
             self.file_enabled,
             self.max_file_size.as_human_string_with_zero_as_unlimited(),
             self.max_total_size.as_human_string_with_zero_as_unlimited(),
             self.rotation_check_interval,
-            self.retention
+            self.retention,
+            self.sysinfo_print_interval
         )
     }
 }

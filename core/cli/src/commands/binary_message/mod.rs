@@ -15,6 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod flush_messages;
 pub mod poll_messages;
 pub mod send_messages;

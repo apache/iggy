@@ -28,7 +28,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 /// Hashable and comparable, so it can key the `Stats.cache_metrics` dict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass]
-#[pyclass(eq, frozen, hash, skip_from_py_object)]
+#[pyclass(eq, frozen, hash)]
 pub struct CacheMetricsKey {
     /// The unique identifier (numeric) of the stream.
     #[pyo3(get)]
@@ -327,6 +327,24 @@ impl Stats {
         self.inner.total_disk_space.as_bytes_u64()
     }
 
+    /// The number of file descriptors the server process holds open.
+    ///
+    /// 0 when unknown. Where the kernel cannot count them without a scan
+    /// (Linux before 6.2, macOS), the server scans at least every 10 seconds,
+    /// so the count can be 10 seconds old.
+    #[getter]
+    pub fn open_files_count(&self) -> u64 {
+        self.inner.open_files_count
+    }
+
+    /// The soft limit on open file descriptors of the server process.
+    ///
+    /// 0 when unknown.
+    #[getter]
+    pub fn open_files_limit(&self) -> u64 {
+        self.inner.open_files_limit
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Stats(hostname='{}', iggy_server_version='{}', streams_count={}, \
@@ -409,6 +427,8 @@ mod tests {
             threads_count: 0,
             free_disk_space: IggyByteSize::default(),
             total_disk_space: IggyByteSize::default(),
+            open_files_count: 0,
+            open_files_limit: 0,
         }
     }
 

@@ -55,11 +55,15 @@ const CONVERGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Boot line reporting the `(view, log_view)` a consensus group restored from
 /// its superblock: the recovered replica's own account of what it read back.
 /// One line per group since the unified restore constructor, so the parser
-/// filters the metadata group's line out by its `group` field.
+/// filters the metadata group's line out by its `group` field. Partition
+/// groups log it at `debug`, hence the `logging.level` override below.
 const RESTORED_VIEW_MARKER: &str = "restored group view from its superblock";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(sharding.cpu_allocation = "0..1", logging.level = "info,consensus=debug")
+)]
 async fn given_advanced_partition_view_when_survivor_restarts_should_recover_view_from_superblock(
     harness: &mut TestHarness,
 ) {
@@ -71,7 +75,7 @@ async fn given_advanced_partition_view_when_survivor_restarts_should_recover_vie
         .await
         .expect("connect a root client to the node");
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream on the view-0 primary");
     let stream_id = Identifier::named(STREAM_NAME).expect("stream identifier");
@@ -232,11 +236,13 @@ async fn poll_all(client: &IggyClient) -> Result<u32, IggyError> {
         .poll_messages(
             &Identifier::named(STREAM_NAME).expect("stream identifier"),
             &Identifier::named(TOPIC_NAME).expect("topic identifier"),
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
+            PollOptions {
+                count: MESSAGES_COUNT,
+                ..PollOptions::default()
+            },
         )
         .await?;
     Ok(polled.messages.len() as u32)

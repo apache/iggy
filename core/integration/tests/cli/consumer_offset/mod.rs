@@ -15,5 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod test_consumer_offset_external_group_command;
 mod test_consumer_offset_get_command;
 mod test_consumer_offset_set_command;

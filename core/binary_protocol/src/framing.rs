@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(consumed, 16);
         assert_eq!(frame.code, 1);
         assert_eq!(frame.request_id, 99);
-        assert!(frame.payload.is_empty());
+        assert_eq!(frame.payload, []);
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(consumed, 16);
         assert!(frame.is_ok());
         assert_eq!(frame.request_id, 42);
-        assert!(frame.payload.is_empty());
+        assert_eq!(frame.payload, []);
     }
 
     #[test]
@@ -347,7 +347,7 @@ mod tests {
         assert!(!frame.is_ok());
         assert_eq!(frame.status, 1001);
         assert_eq!(frame.request_id, 55);
-        assert!(frame.payload.is_empty());
+        assert_eq!(frame.payload, []);
     }
 
     #[test]

@@ -27,12 +27,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Minor versions deliberately not built as Windows wheels. Every other
-# version in the pyproject classifiers must appear in the wheel job
-# matrix, so adding a new supported version still fails this check
-# until the matrix is updated.
-WHEEL_MATRIX_SKIP=("3.10")
-
 # Default mode
 MODE=""
 
@@ -281,9 +275,15 @@ read_classifier_versions() {
 
 ensure_wheel_interpreters() {
     local file="$1"
+    local selector_script="scripts/ci/wheel-interpreters.sh"
+    # GitHub expressions are literal text here, not shell expansions.
+    # shellcheck disable=SC2016
+    local expected_interpreters='${{ steps.interpreters.outputs.versions }}'
     local classifier_versions=()
-    local expected_interpreters=""
     local current_interpreters
+    local line
+    local selector_steps
+    local selector_calls
     local version
     local mismatched=0
     local total=0
@@ -296,8 +296,7 @@ ensure_wheel_interpreters() {
         return
     fi
 
-    classifier_versions=()
-    while IFS= read -r _py_cls_tmp; do classifier_versions+=("$_py_cls_tmp"); done < <(read_classifier_versions)
+    while IFS= read -r version; do classifier_versions+=("$version"); done < <(read_classifier_versions)
 
     if [ "${#classifier_versions[@]}" -eq 0 ]; then
         echo -e "${RED}✗${NC} $SOURCE_FILE: could not find Python version classifiers"
@@ -305,10 +304,14 @@ ensure_wheel_interpreters() {
         return
     fi
 
-    for version in "${classifier_versions[@]}"; do
-        expected_interpreters+=" python${version}"
-    done
-    expected_interpreters=${expected_interpreters# }
+    selector_steps=$(grep -Ec '^[[:space:]]*id: interpreters$' "$file" || true)
+    selector_calls=$(grep -Fc -- "$selector_script >> \"\$GITHUB_OUTPUT\"" "$file" || true)
+    if [ "$selector_steps" -ne 2 ] || [ "$selector_calls" -ne 3 ] ||
+        [ ! -f "$selector_script" ] || ! grep -Fq -- "$SOURCE_FILE" "$selector_script"; then
+        echo -e "${RED}✗${NC} $file: wheel selectors must read $SOURCE_FILE"
+        FAILED=1
+        return
+    fi
 
     while IFS= read -r line; do
         total=$((total + 1))
@@ -316,7 +319,7 @@ ensure_wheel_interpreters() {
         if [ "$current_interpreters" != "$expected_interpreters" ]; then
             mismatched=1
         fi
-    done < <(grep -- "--interpreter" "$file" || true)
+    done < <(grep -- '--interpreter' "$file" || true)
 
     if [ "$total" -eq 0 ]; then
         echo -e "${RED}✗${NC} $file: could not find wheel interpreter list"
@@ -330,7 +333,7 @@ ensure_wheel_interpreters() {
     fi
 
     if [ "$MODE" = "fix" ]; then
-        sed -i.bak -E "s|(--interpreter ).*$|\\1${expected_interpreters}|" "$file"
+        sed -i.bak -E "s|(--interpreter[[:space:]]+).*$|\\1${expected_interpreters}|" "$file"
         rm -f "$file.bak"
         FIXED_CHECKS=$((FIXED_CHECKS + 1))
         echo -e "${GREEN}Fixed${NC} $file: wheel interpreter versions"
@@ -347,7 +350,6 @@ ensure_wheel_matrix() {
     local expected=""
     local current
     local version
-    local skipped
     local seen=0
 
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
@@ -360,9 +362,6 @@ ensure_wheel_matrix() {
 
     while IFS= read -r version; do
         seen=$((seen + 1))
-        for skipped in "${WHEEL_MATRIX_SKIP[@]}"; do
-            [ "$version" = "$skipped" ] && continue 2
-        done
         expected+=", \"${version}\""
     done < <(read_classifier_versions)
 
@@ -372,11 +371,6 @@ ensure_wheel_matrix() {
         return
     fi
 
-    if [ -z "$expected" ]; then
-        echo -e "${RED}✗${NC} $SOURCE_FILE: WHEEL_MATRIX_SKIP excludes every classifier version"
-        FAILED=1
-        return
-    fi
     expected="[${expected#, }]"
 
     current=$(sed -nE 's/^[[:space:]]*python-version: (\[.*\])$/\1/p' "$file")
@@ -510,6 +504,11 @@ if [ "$MODE" = "check" ]; then
 
     echo -e "${RED}✗ Python interpreter version checks failed${NC}"
     echo -e "${YELLOW}Run '$0 --fix' to fix supported drift points automatically${NC}"
+    exit 1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+    echo -e "${RED}✗ Some Python interpreter version checks need manual changes${NC}"
     exit 1
 fi
 

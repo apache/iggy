@@ -16,7 +16,8 @@
 # under the License.
 
 # Auto-publish: detects pre-release crate/SDK versions without tags
-# and publishes them to crates.io, Docker Hub, PyPI, npm, Maven, NuGet.
+# and publishes them to crates.io, Docker Hub, PyPI, npm, Maven, NuGet,
+# or as git tags for Go and Swift.
 # Runs on every push to master.
 
 name: Post-merge
@@ -38,13 +39,10 @@ env:
 
 jobs:
   check-auto-publish:
-    name: Check auto-publish
-    runs-on: ubuntu-latest
+    name: Auto-publish
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
     if: ${{ !github.event.repository.fork }}
-    outputs:
-      docker_components: ${{ steps.check.outputs.docker_components }}
-      crates_to_publish: ${{ steps.check.outputs.crates_to_publish }}
-      sdks_to_publish: ${{ steps.check.outputs.sdks_to_publish }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -55,32 +53,65 @@ jobs:
           if ! command -v yq >/dev/null 2>&1; then
             YQ_VERSION="v4.47.1"
             YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
             echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
             chmod +x /usr/local/bin/yq
           fi
 
-      # cargo-rail computes the affected crate set for the Docker :edge gate.
-      # Metadata-only `cargo rail plan` (no compile), so it runs on the runner's
-      # preinstalled cargo (version pinned by rust-toolchain.toml) and skips the
-      # heavyweight build-cache restore.
-      # Pinned for the same reason as .github/actions/rust/pre-merge/action.yml:
-      # 0.24 dropped the `-f json` edge-affected-images.sh relies on.
-      - name: Install cargo-rail
-        uses: taiki-e/install-action@v2.87.8
-        with:
-          tool: cargo-rail@0.23.0
+      # Planning is an optimization. A failure falls back to refreshing every
+      # Docker image in the component registry. The Action installs the one
+      # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
+      - name: Plan affected edge images
+        id: rail
+        continue-on-error: true
+        uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
 
       - name: Check all components
         id: check
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+          PLAN_STATUS: ${{ steps.rail.outcome }}
         run: |
-          chmod +x scripts/extract-version.sh
+          set -euo pipefail
 
-          # Refresh :edge only for Docker images whose crate closure or build
-          # context changed in this push (DAG gate). Fail-open to all images.
-          DOCKER_COMPONENTS=$(scripts/ci/edge-affected-images.sh "${{ github.event.before }}" "${{ github.sha }}")
+          COMPONENTS_JSON=$(yq -o=json -I=0 '.components' .github/config/publish.yml)
+          ALL_DOCKER_COMPONENTS=$(jq -r \
+            '[to_entries[] | select(.value.registry == "dockerhub") | .key] | join(",")' \
+            <<< "$COMPONENTS_JSON")
+
+          # The plan can only select images that have a catalog row, so a
+          # catalog that has drifted from publish.yml refreshes every image.
+          if [[ "$PLAN_STATUS" != "success" ]]; then
+            echo "::warning::Cargo-Rail plan unavailable; refreshing all edge images"
+            IMAGE_MATRIX=all
+          elif ! scripts/ci/edge-image-catalog.sh --check; then
+            echo "::warning::Edge image catalog does not match publish.yml; refreshing all edge images"
+            IMAGE_MATRIX=all
+          elif IMAGE_MATRIX=$(cargo-rail-action plan matrix "$PLAN_FILE" edge-images); then
+            echo "::notice::Using validated Cargo-Rail edge image plan: ${IMAGE_MATRIX}"
+          else
+            echo "::warning::Cargo-Rail edge image selector failed; refreshing all edge images"
+            IMAGE_MATRIX=all
+          fi
+
+          if [[ "$IMAGE_MATRIX" == "all" ]]; then
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          elif ! DOCKER_COMPONENTS=$(jq -er --argjson configured "$COMPONENTS_JSON" '
+            [.include[].component] as $selected
+            | [$selected[] | select($configured[.].registry != "dockerhub")] as $unknown
+            | if ($unknown | length) == 0
+              then $selected | join(",")
+              else error("Cargo-Rail selected unknown Docker components \($unknown | join(",")) in matrix \(tojson)")
+              end
+          ' <<< "$IMAGE_MATRIX"); then
+            echo "::warning::Cargo-Rail edge image matrix is invalid; refreshing all edge images"
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          fi
+
           echo "docker_components=$DOCKER_COMPONENTS" >> "$GITHUB_OUTPUT"
           echo "Docker components to refresh: ${DOCKER_COMPONENTS:-<none>}"
+
+          chmod +x scripts/extract-version.sh
 
           # Check Rust crates for pre-release versions without tags
           CRATES_TO_PUBLISH=""
@@ -108,7 +139,7 @@ jobs:
 
           # Check SDKs for pre-release versions without tags
           SDKS_TO_PUBLISH=""
-          for sdk in sdk-python sdk-node sdk-java sdk-csharp sdk-go; do
+          for sdk in sdk-python sdk-node sdk-java sdk-csharp sdk-go sdk-swift; do
             VERSION=$(scripts/extract-version.sh "$sdk")
             TAG=$(scripts/extract-version.sh "$sdk" --tag)
 
@@ -146,24 +177,19 @@ jobs:
           echo "sdks_to_publish=$SDKS_TO_PUBLISH" >> "$GITHUB_OUTPUT"
           echo "SDKs to publish: ${SDKS_TO_PUBLISH:-<none>}"
 
-  dispatch-publish:
-    name: Dispatch publisher
-    needs: check-auto-publish
-    if: >-
-      needs.check-auto-publish.outputs.crates_to_publish != '' ||
-      needs.check-auto-publish.outputs.docker_components != '' ||
-      needs.check-auto-publish.outputs.sdks_to_publish != ''
-    runs-on: ubuntu-latest
-    steps:
       # Trusted publishers validate the top-level workflow identity. Dispatching
       # publish.yml keeps automatic and manual releases on the same identity.
-      - name: Dispatch and wait for publish workflow
+      - name: Dispatch publisher
+        if: >-
+          steps.check.outputs.crates_to_publish != '' ||
+          steps.check.outputs.docker_components != '' ||
+          steps.check.outputs.sdks_to_publish != ''
         uses: actions/github-script@v9
         env:
           COMMIT: ${{ github.sha }}
-          PUBLISH_CRATES: ${{ needs.check-auto-publish.outputs.crates_to_publish }}
-          PUBLISH_DOCKERHUB: ${{ needs.check-auto-publish.outputs.docker_components }}
-          PUBLISH_OTHER: ${{ needs.check-auto-publish.outputs.sdks_to_publish }}
+          PUBLISH_CRATES: ${{ steps.check.outputs.crates_to_publish }}
+          PUBLISH_DOCKERHUB: ${{ steps.check.outputs.docker_components }}
+          PUBLISH_OTHER: ${{ steps.check.outputs.sdks_to_publish }}
         with:
           script: |
             const dispatch = await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
@@ -192,20 +218,6 @@ jobs:
             }
 
             core.info(`Publish run: ${dispatch.data.html_url}`);
-            while (true) {
-              const { data: run } = await github.rest.actions.getWorkflowRun({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: runId
-              });
-
-              if (run.status === 'completed') {
-                if (run.conclusion !== 'success') {
-                  throw new Error(`Publish workflow concluded with ${run.conclusion}: ${run.html_url}`);
-                }
-                core.info(`Publish workflow succeeded: ${run.html_url}`);
-                break;
-              }
-
-              await new Promise(resolve => setTimeout(resolve, 30000));
-            }
+            await core.summary
+              .addLink(`Publish run #${runId}`, dispatch.data.html_url)
+              .write();

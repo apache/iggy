@@ -16,14 +16,14 @@
 // under the License.
 
 use iggy_binary_protocol::Operation;
-use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
+use iggy_common::{IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
 /// A local commit that failed for an op the cluster had already committed.
 ///
-/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// The replica is divergent from here on: the commit walk popped
 /// the op, its `commit_min` never advanced, and the next
 /// `advance_commit_min` would assert on the gap. Continuing would either
 /// serve a prefix the cluster has moved past or panic somewhere less
@@ -36,7 +36,8 @@ use std::sync::Arc;
 pub struct FatalCommit {
     pub namespace_raw: u64,
     pub op: u64,
-    pub operation: Operation,
+    /// None for a checkpoint failure covering multiple operation kinds.
+    pub operation: Option<Operation>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,11 @@ pub struct Fragment<const ALIGN: usize = 4096> {
 }
 
 impl<const ALIGN: usize> Fragment<ALIGN> {
+    #[must_use]
+    pub fn allocation_bytes(&self) -> usize {
+        self.source.allocation_bytes()
+    }
+
     #[must_use]
     pub fn whole(source: Frozen<ALIGN>) -> Self {
         let end = source.len();
@@ -97,24 +103,33 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
     pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
         self.source.shares_allocation(source)
     }
+
+    /// Identity of the allocation this fragment keeps alive, so a byte charge
+    /// counts a shared allocation once instead of once per slice.
+    #[must_use]
+    pub fn allocation_id(&self) -> usize {
+        self.source.allocation_id()
+    }
 }
 
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
 pub struct PollingArgs {
-    pub strategy: PollingStrategy,
+    pub kind: PollingKind,
+    pub value: u64,
     pub count: u32,
     pub auto_commit: bool,
 }
 
 pub type PollFragments<const ALIGN: usize = 4096> = SmallVec<[Fragment<ALIGN>; 4]>;
-pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>);
+pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>, u32);
 
 impl PollingArgs {
     #[must_use]
     pub const fn new(strategy: PollingStrategy, count: u32, auto_commit: bool) -> Self {
         Self {
-            strategy,
+            kind: strategy.kind,
+            value: strategy.value,
             count,
             auto_commit,
         }
@@ -289,6 +304,9 @@ pub struct RepairSession {
     /// Consensus view in which this session was armed. A later view discards
     /// the session before any delayed repair body can enter its journal.
     pub view: u32,
+    /// Latest repair cursor: the proof hole for backward chunks, otherwise
+    /// the first requested op. A changed proof hole is progress despite fenced commits.
+    pub from_op: u64,
     /// Committed frontier this repair must make locally walkable. Floor
     /// completeness and session completion are bounded here.
     pub commit_to_op: u64,
@@ -302,16 +320,24 @@ pub struct RepairSession {
     pub floor: Option<u64>,
     /// The peer serving this stream (re-request target on stall).
     pub peer: u8,
-    /// Lowest `base_offset` among the repaired `SendMessages` batches:
-    /// where the served window begins in offset space. Compared against the
-    /// boot-recovered durable end when a commit floor arrives -- a window
-    /// starting above `recovered_durable_offset + 1` means ops below the
-    /// floor are neither locally durable nor repaired (state-transfer
-    /// territory), and the floor must be refused.
-    pub first_batch_offset: Option<u64>,
-    /// Ticks since the stream last made progress; at
-    /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
+    /// Ticks since the stream last made progress. At [`REPAIR_RETRY_TICKS`],
+    /// or at once while [`Self::requested_from`] is `None`, the remaining
+    /// window is re-requested and the count restarts.
     pub idle_ticks: u32,
+    /// Start of the last chunk a `RepairDone` pulled above a pending
+    /// [`Self::floor`], or 0 before the first such pull. Only that pull
+    /// writes it, the stall retry moves just [`Self::from_op`] and
+    /// [`Self::requested_from`]. A `RepairDone` pulls again only past it, so a
+    /// peer that serves nothing is left to the stall retry instead of
+    /// answering an unthrottled loop.
+    pub floor_pulled_from: u64,
+    /// First op of the latest request. The next chunk is pulled once the held
+    /// run reaches it, which works while a fenced commit point cannot move.
+    ///
+    /// `None` after any removal of resident entries, so the next sweep asks for
+    /// the cut window from the held run without waiting out
+    /// [`REPAIR_RETRY_TICKS`].
+    pub requested_from: Option<u64>,
 }
 
 /// How a repair-window commit walk concluded, decided by
@@ -330,9 +356,22 @@ pub enum RepairConclusion {
     /// The walk reached the requested frontier; the session was dropped.
     Done,
     /// The floor's continuity check failed: ops below it are neither locally
-    /// durable nor repaired. The session was dropped here -- state transfer
-    /// supersedes repair -- and the caller arms the transfer.
+    /// durable nor repaired. The repair walk of an unproven view log that
+    /// outgrew its byte budget also ends here, with `floor` at `commit_min`.
+    /// The session was dropped here -- state transfer supersedes repair -- and
+    /// the caller arms the transfer.
     FloorRefused { floor: u64, to_op: u64 },
+}
+
+/// How `IggyPartition::apply_repaired_prepare` disposed of a repaired prepare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairIngest {
+    /// Journaled, already held, or not the session's to take.
+    Handled,
+    /// Refused: the view's log names another prepare at or next to this op, or
+    /// nothing this replica holds vouches for it while its log is proven. The
+    /// view's primary serves the log that does.
+    Unvouched,
 }
 
 /// Where partition directories live on disk, mirroring the server's
@@ -377,16 +416,21 @@ pub struct PartitionsConfig {
     pub segment_size: IggyByteSize,
     /// Whether local message files reserve the configured segment size on open.
     pub preallocate_segments: bool,
-    /// Server-side at-rest encryption. Applied ONCE, on the primary at
-    /// ingestion, so the ciphertext replicates verbatim: every replica
-    /// journals, acks, and persists identical bytes (checksums and the
-    /// deterministic segment rolls both depend on that), and the poll path
-    /// decrypts uniformly whether a fragment came from the resident journal
-    /// or from disk.
-    pub encryptor: Option<Arc<EncryptorKind>>,
+    /// This node's key-encryption keys. Each stream's own key is opened from
+    /// its committed wrap set and pinned to its partitions. Encryption runs
+    /// once, on the primary at ingestion, so every replica journals, acks and
+    /// persists identical ciphertext.
+    pub key_context: Arc<ServerKeyContext>,
     /// On-disk location scheme for partition directories.
     pub path_layout: PartitionPathLayout,
 }
+
+/// Directory names under a partition's root; fixed, because existing data
+/// directories were written with them.
+pub const OFFSETS_DIR: &str = "offsets";
+const CONSUMER_OFFSETS_DIR: &str = "consumers";
+const CONSUMER_GROUP_OFFSETS_DIR: &str = "groups";
+const EXTERNAL_GROUP_OFFSETS_DIR: &str = "external_groups";
 
 impl PartitionsConfig {
     #[must_use]
@@ -429,6 +473,62 @@ impl PartitionsConfig {
         format!(
             "{}/{start_offset:0>20}.index",
             self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Root of the partition's consumer-offset directories.
+    #[must_use]
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{OFFSETS_DIR}",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Directory holding one offset file per consumer.
+    #[must_use]
+    pub fn get_consumer_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{CONSUMER_OFFSETS_DIR}",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Directory holding one offset file per consumer group.
+    #[must_use]
+    pub fn get_consumer_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{CONSUMER_GROUP_OFFSETS_DIR}",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    /// Directory holding one offset file per external group.
+    #[must_use]
+    pub fn get_external_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/{EXTERNAL_GROUP_OFFSETS_DIR}",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
         )
     }
 }

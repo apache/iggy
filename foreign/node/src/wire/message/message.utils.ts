@@ -16,7 +16,7 @@
 // under the License.
 
 import { randomFillSync } from 'node:crypto';
-import { uint32ToBuf, u128ToBuf, uint8ToBuf } from '../number.utils.js';
+import { uint32ToBuf, u128ToBuf } from '../number.utils.js';
 import { serializeHeaders, type Headers } from './header.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { serializePartitioning, type Partitioning } from './partitioning.utils.js';
@@ -289,33 +289,5 @@ export const serializeSendMessages = (
     bPartitioning,
     bMessagesCount,
     bBatch
-  ]);
-};
-
-/**
- * Serializes a flush unsaved buffers command payload.
- *
- * @param streamId - Stream identifier
- * @param topicId - Topic identifier
- * @param partitionId - Partition ID to flush
- * @param fsync - Whether to force sync to disk
- * @returns Serialized command payload
- */
-export const serializeFlushUnsavedBuffers = (
-  streamId: Id,
-  topicId: Id,
-  partitionId: number,
-  fsync = false
-) => {
-  const streamIdentifier = serializeIdentifier(streamId);
-  const topicIdentifier = serializeIdentifier(topicId);
-  const bPartitionId = uint32ToBuf(partitionId);
-  const bFSync = uint8ToBuf(fsync ? 1 : 0);
-
-  return Buffer.concat([
-    streamIdentifier,
-    topicIdentifier,
-    bPartitionId,
-    bFSync
   ]);
 };

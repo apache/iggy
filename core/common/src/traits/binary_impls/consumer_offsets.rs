@@ -18,7 +18,8 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{consumer_to_wire, identifier_to_wire};
 use crate::{
-    BinaryClient, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier, IggyError,
+    BinaryClient, Checkpoint, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier,
+    IggyError, PartitionContext,
 };
 use iggy_binary_protocol::AckLevel;
 use iggy_binary_protocol::codec::WireEncode;
@@ -32,6 +33,31 @@ use iggy_binary_protocol::responses::consumer_offsets::get_consumer_offset::Cons
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ConsumerOffsetClient for B {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), IggyError> {
+        fail_if_not_authenticated(self).await?;
+        self.send_offset_write_with_response(
+            STORE_CONSUMER_OFFSET_CODE,
+            StoreConsumerOffsetRequest {
+                consumer: consumer_to_wire(consumer)?,
+                stream_id: identifier_to_wire(stream_id)?,
+                topic_id: identifier_to_wire(topic_id)?,
+                partition_id: Some(checkpoint.partition_id()),
+                offset: checkpoint.offset(),
+                ack: AckLevel::Quorum,
+            }
+            .to_bytes(),
+            Some(checkpoint.context()),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -55,6 +81,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
                 ack: AckLevel::Quorum,
             }
             .to_bytes(),
+            None,
         )
         .await?;
         Ok(())
@@ -97,22 +124,50 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        fail_if_not_authenticated(self).await?;
-        let wire_consumer = consumer_to_wire(consumer)?;
-        let wire_stream_id = identifier_to_wire(stream_id)?;
-        let wire_topic_id = identifier_to_wire(topic_id)?;
-        self.send_offset_write_with_response(
+        delete_offset(self, consumer, stream_id, topic_id, partition_id, None).await
+    }
+
+    async fn delete_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), IggyError> {
+        delete_offset(
+            self,
+            consumer,
+            stream_id,
+            topic_id,
+            Some(checkpoint.partition_id()),
+            Some(checkpoint.context()),
+        )
+        .await
+    }
+}
+
+async fn delete_offset<B: BinaryClient>(
+    client: &B,
+    consumer: &Consumer,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition_id: Option<u32>,
+    context: Option<PartitionContext>,
+) -> Result<(), IggyError> {
+    fail_if_not_authenticated(client).await?;
+    client
+        .send_offset_write_with_response(
             DELETE_CONSUMER_OFFSET_CODE,
             DeleteConsumerOffsetRequest {
-                consumer: wire_consumer,
-                stream_id: wire_stream_id,
-                topic_id: wire_topic_id,
+                consumer: consumer_to_wire(consumer)?,
+                stream_id: identifier_to_wire(stream_id)?,
+                topic_id: identifier_to_wire(topic_id)?,
                 partition_id,
                 ack: AckLevel::Quorum,
             }
             .to_bytes(),
+            context,
         )
         .await?;
-        Ok(())
-    }
+    Ok(())
 }

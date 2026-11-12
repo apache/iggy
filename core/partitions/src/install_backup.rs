@@ -15,10 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use futures::TryStreamExt;
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
 use journal::partition_journal::FRONTIER_FILE_NAME;
-use std::io;
-use std::path::Path;
+use server_common::fatal::NoteDescriptorExhaustion;
+
+use crate::{CREATED_REVISION_FILE, FILE_SYNC_CONCURRENCY};
 
 const BACKUP: &str = ".install-backup";
 const BUILDING: &str = ".install-building";
@@ -29,7 +35,11 @@ const RETIRED: &str = ".install-retired";
 /// # Errors
 /// Returns an error if the previous materialization cannot be restored durably.
 pub async fn recover(directory: &Path) -> io::Result<()> {
-    recover_with_storage(directory, &DiskStorage).await
+    // Every step of an install is part of one durable write, reads and
+    // directory listings included, so each entry point notes its error once.
+    recover_with_storage(directory, &DiskStorage)
+        .await
+        .note_descriptor_exhaustion(|| format!("recovering an install in {}", directory.display()))
 }
 
 /// # Errors
@@ -45,29 +55,40 @@ pub async fn recover_with_storage<S: DurableStorage>(
         return Ok(());
     }
     for entry in storage.entries(directory).await? {
-        if entry.name == BACKUP {
+        // The marker stays: a delete cut short can leave a backup without a
+        // copy of it, and restoring that backup alone would unmark old files.
+        if entry.name == BACKUP || entry.name == CREATED_REVISION_FILE {
             continue;
         }
         storage.remove_tree(&directory.join(&entry.name)).await?;
     }
-    link_tree(&backup, directory, false, storage).await?;
+    link_tree(&backup, directory, false, &BTreeSet::new(), storage).await?;
     finish_with_storage(directory, storage).await
 }
 
 /// Freeze the old materialization and WAL together before a destructive install.
+///
 /// The caller drains persistence and holds the partition write lock until finish.
+/// Each path in `synced_files` must still name the inode synced by its original
+/// writer, with no further writes to that inode before `begin` returns. These
+/// paths skip a fresh sync of the backup hard link.
 ///
 /// # Errors
 /// Returns an error if the rollback state cannot be made durable.
 /// After any failure the caller must stop serving until recovery.
-pub async fn begin(directory: &Path) -> io::Result<()> {
-    begin_with_storage(directory, &DiskStorage).await
+pub async fn begin(directory: &Path, synced_files: &BTreeSet<PathBuf>) -> io::Result<()> {
+    begin_with_storage(directory, synced_files, &DiskStorage)
+        .await
+        .note_descriptor_exhaustion(|| format!("starting an install in {}", directory.display()))
 }
 
+/// Storage-generic install entry point with the same `synced_files` contract as [`begin`].
+///
 /// # Errors
 /// Returns an error when the install transaction cannot complete durably.
 pub async fn begin_with_storage<S: DurableStorage>(
     directory: &Path,
+    synced_files: &BTreeSet<PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     if storage.exists(&directory.join(BACKUP)).await? {
@@ -77,7 +98,7 @@ pub async fn begin_with_storage<S: DurableStorage>(
     storage.remove_tree(&building).await?;
     storage.remove_tree(&directory.join(RETIRED)).await?;
     storage.create_directories(&building).await?;
-    link_tree(directory, &building, true, storage).await?;
+    link_tree(directory, &building, true, synced_files, storage).await?;
     storage.rename(&building, &directory.join(BACKUP)).await?;
     storage.sync_directory(directory).await
 }
@@ -87,7 +108,9 @@ pub async fn begin_with_storage<S: DurableStorage>(
 /// # Errors
 /// Returns an error if the installation cannot be published durably.
 pub async fn finish(directory: &Path) -> io::Result<()> {
-    finish_with_storage(directory, &DiskStorage).await
+    finish_with_storage(directory, &DiskStorage)
+        .await
+        .note_descriptor_exhaustion(|| format!("finishing an install in {}", directory.display()))
 }
 
 /// # Errors
@@ -110,15 +133,21 @@ async fn link_tree<S: DurableStorage>(
     source: &Path,
     target: &Path,
     skip_scratch: bool,
+    synced_files: &BTreeSet<PathBuf>,
     storage: &S,
 ) -> io::Result<()> {
     let mut pending = vec![(source.to_path_buf(), target.to_path_buf())];
     let mut directories = Vec::new();
+    let mut files_to_sync = Vec::new();
     while let Some((source, target)) = pending.pop() {
         directories.push(target.clone());
         for entry in storage.entries(&source).await? {
             let name = entry.name;
-            if skip_scratch && is_scratch(&name.to_string_lossy()) {
+            // The incarnation marker belongs to the directory, not to one
+            // materialization, so no install freezes or restores it.
+            if name == CREATED_REVISION_FILE
+                || (skip_scratch && is_scratch(&name.to_string_lossy()))
+            {
                 continue;
             }
             let destination = target.join(&name);
@@ -134,19 +163,34 @@ async fn link_tree<S: DurableStorage>(
             } else {
                 // Transfer unlinks or atomically replaces these frozen files.
                 // Hard links retain the old bytes without copying segment data.
-                storage.hard_link(&source.join(&name), &destination).await?;
-                storage
-                    .open(&destination, OpenMode::Read)
-                    .await?
-                    .sync()
-                    .await?;
+                let source_file = source.join(&name);
+                storage.hard_link(&source_file, &destination).await?;
+                if !synced_files.contains(&source_file) {
+                    files_to_sync.push(destination);
+                    if files_to_sync.len() == FILE_SYNC_CONCURRENCY {
+                        sync_files(&mut files_to_sync, storage).await?;
+                    }
+                }
             }
         }
     }
+    sync_files(&mut files_to_sync, storage).await?;
     for directory in directories.into_iter().rev() {
         storage.sync_directory(&directory).await?;
     }
     Ok(())
+}
+
+async fn sync_files<S: DurableStorage>(files: &mut Vec<PathBuf>, storage: &S) -> io::Result<()> {
+    futures::stream::iter(std::mem::take(files).into_iter().map(Ok::<_, io::Error>))
+        .try_for_each_concurrent(FILE_SYNC_CONCURRENCY, |destination| async move {
+            storage
+                .open(&destination, OpenMode::Read)
+                .await?
+                .sync()
+                .await
+        })
+        .await
 }
 
 async fn copy_file<S: DurableStorage>(
@@ -191,12 +235,16 @@ mod tests {
         ] {
             std::fs::write(root.join(name), name.as_bytes()).unwrap();
         }
-        begin(root).await.unwrap();
+        // A segment that the transfer reuses reaches its name as a link.
+        std::fs::hard_link(root.join("0.index"), root.join("0.index.staging")).unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
         // Model the install's unlink and atomic replacement operations.
         for name in ["0.log", "offsets/1", "prepares-1/frontier"] {
             std::fs::remove_file(root.join(name)).unwrap();
             std::fs::write(root.join(name), b"replacement").unwrap();
         }
+        std::fs::remove_file(root.join("0.index")).unwrap();
+        std::fs::rename(root.join("0.index.staging"), root.join("0.index")).unwrap();
         std::fs::write(root.join("99.log"), b"new segment").unwrap();
         recover(root).await.unwrap();
         for name in [
@@ -210,7 +258,32 @@ mod tests {
             assert_eq!(std::fs::read(root.join(name)).unwrap(), name.as_bytes());
         }
         assert!(!root.join("99.log").exists());
+        assert!(!root.join("0.index.staging").exists());
         recover(root).await.unwrap();
+    }
+
+    #[compio::test]
+    async fn given_more_files_than_one_sync_batch_when_recovering_should_restore_them_all() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for index in 0..=FILE_SYNC_CONCURRENCY {
+            std::fs::write(root.join(format!("{index}.log")), b"old").unwrap();
+        }
+
+        begin(root, &BTreeSet::new()).await.unwrap();
+        for index in 0..=FILE_SYNC_CONCURRENCY {
+            let path = root.join(format!("{index}.log"));
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(path, b"new").unwrap();
+        }
+        recover(root).await.unwrap();
+
+        for index in 0..=FILE_SYNC_CONCURRENCY {
+            assert_eq!(
+                std::fs::read(root.join(format!("{index}.log"))).unwrap(),
+                b"old"
+            );
+        }
     }
 
     #[compio::test]
@@ -218,7 +291,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::write(root.join("0.log"), b"old").unwrap();
-        begin(root).await.unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
         std::fs::remove_file(root.join("0.log")).unwrap();
         std::fs::write(root.join("0.log"), b"new").unwrap();
         File::open(root.join("0.log"))
@@ -230,5 +303,36 @@ mod tests {
         finish(root).await.unwrap();
         recover(root).await.unwrap();
         assert_eq!(std::fs::read(root.join("0.log")).unwrap(), b"new");
+    }
+
+    #[compio::test]
+    async fn recovery_never_unmarks_a_directory_whose_delete_was_cut_short() {
+        const CREATED_REVISION: u64 = 7;
+        const SURVIVING_SEGMENT: &str = "0.log";
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let partition_dir = root.to_str().unwrap();
+        std::fs::write(root.join(SURVIVING_SEGMENT), b"old").unwrap();
+        crate::write_created_revision(partition_dir, CREATED_REVISION)
+            .await
+            .unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
+        // The delete walk removes the backup's files in no fixed order, the
+        // marker last only at the top level.
+        for entry in std::fs::read_dir(root.join(BACKUP)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name() != Some(SURVIVING_SEGMENT.as_ref()) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+
+        recover(root).await.unwrap();
+
+        assert_eq!(
+            crate::read_created_revision(partition_dir).await.unwrap(),
+            Some(CREATED_REVISION),
+            "the loader must still see the dead incarnation and delete it"
+        );
+        assert_eq!(std::fs::read(root.join(SURVIVING_SEGMENT)).unwrap(), b"old");
     }
 }

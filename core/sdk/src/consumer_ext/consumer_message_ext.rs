@@ -15,17 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::clients::consumer::{AutoCommit, AutoCommitAfter, IggyConsumer};
+use crate::clients::consumer::IggyConsumer;
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
-use crate::prelude::IggyError;
+use crate::prelude::{CommitAfter, ReadError};
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use std::future::poll_fn;
 use tokio::sync::oneshot;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 #[async_trait]
 impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// Consume messages from the stream and process them with the given message consumer.
+    ///
+    /// Under `CommitPolicy::Auto`, a message counts before the handler with
+    /// `CommitAfter::Delivery`, and once the handler succeeds with `CommitAfter::Processing`.
+    /// With `Processing`, a handler that fails ends the consumption with its error, and its
+    /// message stays uncounted, so the next run reads it again.
     ///
     /// # Arguments
     ///
@@ -36,45 +41,66 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     ///
     /// # Errors
     ///
-    /// * `IggyError::Disconnected`: The client has been disconnected.
-    /// * `IggyError::CannotEstablishConnection`: The client cannot establish a connection to iggy.
-    /// * `IggyError::StaleClient`: This client is stale and cannot be used to consume messages.
+    /// A [`ReadError`] with the partition of the error, if it has one, and one of these errors:
+    ///
     /// * `IggyError::InvalidServerAddress`: The server address is invalid.
     /// * `IggyError::InvalidClientAddress`: The client address is invalid.
-    /// * `IggyError::NotConnected`: The client is not connected.
+    /// * `IggyError::InvalidConfiguration`: The consumer was not initialized.
+    /// * The error of the handler, with the partition of its message, under
+    ///   `CommitAfter::Processing`.
     /// * `IggyError::ClientShutdown`: The client has been shut down.
+    /// * `IggyError::LaneBlocked`: A retained operation that the consumer does not resolve blocks
+    ///   its polls and requires caller recovery.
+    /// * `IggyError::PartitionLaneBlocked`: With `CommitPolicy::OnRead`, another call on the
+    ///   client left a committing read of the partition with an unknown outcome, and the
+    ///   partition stays stopped until the caller abandons the operation and seeks. A lost reply
+    ///   of the consumer itself ends nothing: the reader reads on and hands over what it stored.
+    /// * `IggyError::HistoryUnavailable`: The partition has a new history, and it stays stopped
+    ///   until the caller seeks.
+    /// * `IggyError::Unauthorized`, `IggyError::PartitionNotFound` and the other refusals that a
+    ///   retry does not change, with a partition: the reader retried the partition with a longer
+    ///   wait each time, and it stays stopped until the caller seeks.
+    /// * Any error with a [`ReadError::skip`]: A message of the partition does not decode, and
+    ///   the reader reads it again until the caller seeks to the skip.
+    /// * `IggyError::FetchProgressUncertain` with a [`ReadError::lost`] range: the reader cannot
+    ///   read again the messages that a read with a lost reply stored. A new call reads on after
+    ///   the range, unless the error also stopped the partition or the partition left.
+    /// * `IggyError::InvalidNumberEncoding`, `IggyError::InvalidMessagePayloadLength` or
+    ///   `IggyError::InvalidMessagesCount` without a skip: A reply of the partition does not
+    ///   decode, and the reader cannot name the message to skip. With
+    ///   `CommitPolicy::OnRead`, a read from `Next` stops the partition until the caller
+    ///   seeks.
+    /// * Any other poll error, once the client cannot come back without the caller: it has no
+    ///   link and no replica link that tries to reconnect, and the heartbeat does not restart it,
+    ///   because reconnection is disabled or the client holds no session to resume, as after
+    ///   `disconnect()`.
+    ///
+    /// Any other error is logged and the consumption goes on. A poll never dials. The client
+    /// reconnects while a replica link tries again, and the heartbeat of `IggyClient` restarts
+    /// the links that used up their retries. Once the client has signed in again, the consumer
+    /// rejoins its group and resolves an uncertain group create or join of its own.
     ///
     async fn consume_messages<P>(
         &mut self,
         message_consumer: &'a P,
         mut shutdown_rx: oneshot::Receiver<()>,
-    ) -> Result<(), IggyError>
+    ) -> Result<(), ReadError>
     where
         P: MessageConsumer + Sync,
     {
-        let auto_commit = self.auto_commit();
-        let store_offset_after_each_message = matches!(
-            auto_commit,
-            AutoCommit::After(AutoCommitAfter::ConsumingEachMessage)
-                | AutoCommit::IntervalOrAfter(_, AutoCommitAfter::ConsumingEachMessage)
-        );
-
-        let store_offset_after_all_messages = matches!(
-            auto_commit,
-            AutoCommit::After(AutoCommitAfter::ConsumingAllMessages)
-                | AutoCommit::IntervalOrAfter(_, AutoCommitAfter::ConsumingAllMessages)
-        );
-
-        let store_after_every_nth_message = match auto_commit {
-            AutoCommit::After(AutoCommitAfter::ConsumingEveryNthMessage(n))
-            | AutoCommit::IntervalOrAfter(_, AutoCommitAfter::ConsumingEveryNthMessage(n)) => {
-                n as u64
-            }
-            _ => 0,
-        };
+        // Unlike a caller of `next()`, a message consumer gets no handle to commit with.
+        if self.relies_on_manual_commits() {
+            warn!(
+                "Consumer: {name} on topic: {topic} and stream: {stream} never stores offsets, because it runs with CommitPolicy::Manual. With PollingStrategy::next(), each restart reads the same messages again. Set CommitPolicy::Auto in the poll options to store them.",
+                name = self.name(),
+                topic = self.topic(),
+                stream = self.stream()
+            );
+        }
 
         loop {
             tokio::select! {
+                biased;
                 // Check first if we have received a shutdown signal
                 _ = &mut shutdown_rx => {
                     info!("Received shutdown signal, stopping message consumption from consumer {name} on topic: {topic} and stream: {stream}",
@@ -82,53 +108,43 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                     break;
                 }
 
-                message = self.next() => {
+                message = poll_fn(|cx| self.poll_message(cx)) => {
                     match message {
-                        Some(Ok(received_message)) => {
+                        Some(Ok((received_message, ends_batch))) => {
+                            let checkpoint = received_message.checkpoint();
                             let partition_id = received_message.partition_id;
                             let current_offset = received_message.current_offset;
                             let message_offset = received_message.message.header.offset;
-                            if let Err(err) = message_consumer.consume(received_message).await {
-                                error!("Error while handling message at offset: {message_offset}/{current_offset}, partition: {partition_id} for consumer: {name} on topic: {topic} and stream: {stream} due to error: {err}",
-                                    name = self.name(), topic = self.topic(), stream = self.stream());
-                            } else {
-                                trace!("Message at offset: {message_offset}/{current_offset}, partition: {partition_id} has been handled by consumer: {name} on topic: {topic} and stream: {stream}",
-                                    name = self.name(), topic = self.topic(), stream = self.stream());
+                            let counts_after = self.counts_after();
+                            if counts_after == Some(CommitAfter::Delivery) {
+                                self.count(checkpoint, ends_batch);
                             }
-
-                            if store_offset_after_each_message {
-                                trace!("Storing offset: {message_offset}/{current_offset}, partition: {partition_id}, after each message for consumer: {name} on topic: {topic} and stream: {stream}",
-                                    name = self.name(), topic = self.topic(), stream = self.stream());
-                                self.send_store_offset(partition_id, message_offset);
-                            } else if store_after_every_nth_message > 0  && message_offset % store_after_every_nth_message == 0 {
-                                trace!("Storing offset: {message_offset}/{current_offset}, partition: {partition_id}, after every {store_after_every_nth_message} message for consumer: {name} on topic: {topic} and stream: {stream}",
-                                    store_after_every_nth_message = store_after_every_nth_message, name = self.name(), topic = self.topic(), stream = self.stream());
-                                self.send_store_offset(partition_id, message_offset);
-                            } else if store_offset_after_all_messages && message_offset == current_offset {
-                                trace!("Storing offset: {message_offset}/{current_offset}, partition: {partition_id}, after all messages for consumer: {name} on topic: {topic} and stream: {stream}",
-                                    name = self.name(), topic = self.topic(), stream = self.stream());
-                                self.send_store_offset(partition_id, message_offset);
+                            match message_consumer.consume(received_message).await {
+                                Ok(()) => {
+                                    trace!("Message at offset: {message_offset}/{current_offset}, partition: {partition_id} has been handled by consumer: {name} on topic: {topic} and stream: {stream}",
+                                        name = self.name(), topic = self.topic(), stream = self.stream());
+                                    if counts_after == Some(CommitAfter::Processing) {
+                                        self.count(checkpoint, ends_batch);
+                                    }
+                                }
+                                Err(err) => {
+                                    error!("Error while handling message at offset: {message_offset}/{current_offset}, partition: {partition_id} for consumer: {name} on topic: {topic} and stream: {stream} due to error: {err}",
+                                        name = self.name(), topic = self.topic(), stream = self.stream());
+                                    if counts_after == Some(CommitAfter::Processing) {
+                                        return Err(ReadError::new(Some(partition_id), err));
+                                    }
+                                }
                             }
                         }
                         Some(Err(err)) => {
-                            match err {
-                                IggyError::Disconnected |
-                                IggyError::CannotEstablishConnection |
-                                IggyError::StaleClient |
-                                IggyError::InvalidServerAddress |
-                                IggyError::InvalidClientAddress |
-                                IggyError::NotConnected |
-                                IggyError::ClientShutdown => {
-                                    error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
-                                        name = self.name(), topic = self.topic(), stream = self.stream());
-                                    return Err(err);
-                                }
-                                _ => {
-                                    error!("Error while handling message: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
-                                        name = self.name(), topic = self.topic(), stream = self.stream());
-                                    continue;
-                                }
+                            let ends = self.read_error_ends_consumption(&err).await;
+                            if ends {
+                                error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
+                                    name = self.name(), topic = self.topic(), stream = self.stream());
+                                return Err(err);
                             }
+                            error!("Error while handling message: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
+                                name = self.name(), topic = self.topic(), stream = self.stream());
                         }
                         None => break,
                     }

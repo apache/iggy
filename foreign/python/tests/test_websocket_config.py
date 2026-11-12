@@ -29,11 +29,13 @@ transport-agnostic and already covered by `test_client_config.py`.
 """
 
 import ast
+import json
 import socket
 import sys
 import threading
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -55,7 +57,10 @@ TUNGSTENITE_WRITE_BUFFER_SIZE = 128 * 1024
 # `usize::MAX`, tungstenite's "unbounded" write buffer.
 TUNGSTENITE_MAX_WRITE_BUFFER_SIZE = sys.maxsize * 2 + 1
 TUNGSTENITE_MAX_MESSAGE_SIZE = 64 << 20
-TUNGSTENITE_MAX_FRAME_SIZE = 16 << 20
+# The SDK raises the frame limit to one reply that holds the largest message.
+SDK_MAX_FRAME_SIZE = json.loads(
+    (Path(__file__).parent / "fixtures" / "deferred_polling.json").read_text()
+)["constants"]["max_record_reply_size"]
 
 # The accept thread only has to come back from a connection the client already
 # dialed, so anything beyond this is a hang, not slowness.
@@ -189,7 +194,7 @@ class TestWebSocketFramingConfig:
         assert framing.write_buffer_size == TUNGSTENITE_WRITE_BUFFER_SIZE
         assert framing.max_write_buffer_size == TUNGSTENITE_MAX_WRITE_BUFFER_SIZE
         assert framing.max_message_size == TUNGSTENITE_MAX_MESSAGE_SIZE
-        assert framing.max_frame_size == TUNGSTENITE_MAX_FRAME_SIZE
+        assert framing.max_frame_size == SDK_MAX_FRAME_SIZE
         assert framing.accept_unmasked_frames is False
 
     def test_every_field_round_trips(self):

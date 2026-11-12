@@ -21,4 +21,3 @@ pub mod defaults;
 pub mod delete_user;
 pub mod login_user;
 pub mod update_permissions;
-pub mod update_user;

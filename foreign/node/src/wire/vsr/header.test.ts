@@ -17,12 +17,15 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { COMMAND_CODE } from '../command.code.js';
 import {
   Command,
+  deferredCancellation,
   encodeRequestHeader,
   HEADER_SIZE,
   REQUEST_OFFSET
 } from './header.js';
+import { Operation } from './operation.js';
 
 describe('VSR request header', () => {
   it('encodes every field at its canonical offset', () => {
@@ -33,7 +36,8 @@ describe('VSR request header', () => {
       request: 0x0102030405060708n,
       operation: 2,
       session: 0x1020304050607080n,
-      nonReplicatedCode: 60_001
+      nonReplicatedCode: 60_001,
+      context: { incarnation: 17n, ownerGeneration: 9n, metadataOp: 52n }
     });
 
     assert.equal(header.length, HEADER_SIZE);
@@ -57,6 +61,9 @@ describe('VSR request header', () => {
       0x1020304050607080n
     );
     assert.equal(header.readUInt32LE(REQUEST_OFFSET.reserved), 60_001);
+    assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation), 17n);
+    assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.ownerGeneration), 9n);
+    assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp), 52n);
     assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.timestamp), 0n);
   });
 
@@ -87,5 +94,43 @@ describe('VSR request header', () => {
     });
     assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.request), maximum);
     assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.session), maximum);
+  });
+});
+
+describe('deferred request cancellation', () => {
+  const CLIENT = 0x1122334455667788_99AABBCCDDEEFF00n;
+  const BODY = Buffer.from('deferred body');
+  const request = (operation: number, code?: number): Buffer => Buffer.concat([
+    encodeRequestHeader({
+      size: HEADER_SIZE + BODY.length,
+      client: CLIENT,
+      request: 17n,
+      operation,
+      session: 42n,
+      nonReplicatedCode: code,
+      context: { incarnation: 7n, ownerGeneration: 8n, metadataOp: 9n }
+    }),
+    BODY
+  ]);
+
+  for (const code of [COMMAND_CODE.PollMessagesDeferred, COMMAND_CODE.FetchMessages])
+    it(`cancels command ${code} with a header-only frame of the same client, session and request`, () => {
+      const expected = encodeRequestHeader({
+        size: HEADER_SIZE,
+        client: CLIENT,
+        request: 17n,
+        operation: Operation.NonReplicated,
+        session: 42n,
+        nonReplicatedCode: COMMAND_CODE.CancelDeferredRequest
+      });
+      const cancellation = deferredCancellation(request(Operation.NonReplicated, code));
+      assert.deepEqual(cancellation, expected);
+      assert.equal(cancellation?.readUInt32LE(REQUEST_OFFSET.size), HEADER_SIZE);
+      assert.equal(cancellation?.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation), 0n);
+    });
+
+  it('has no cancellation for a request that the server never parks', () => {
+    assert.equal(deferredCancellation(request(Operation.NonReplicated, COMMAND_CODE.PollMessages)), undefined);
+    assert.equal(deferredCancellation(request(Operation.SendMessages)), undefined);
   });
 });

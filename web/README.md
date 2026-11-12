@@ -12,7 +12,7 @@ The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, an
 
 ## Tooling
 
-- Node.js: use a version supported by the current frontend toolchain, `^20.19.0 || ^22.13.0 || >=24`.
+- Node.js: use a version supported by the current frontend toolchain, `^22.17.0 || >=24`.
 - Package manager: `npm`
 - `pnpm` and `yarn` are not part of the supported workflow for this package. CI, Docker builds, and the committed lockfile use `npm`.
 

@@ -61,32 +61,17 @@
 
 use iggy::prelude::*;
 use integration::iggy_harness;
-use reqwest::{Response, StatusCode};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use crate::server::http_client::{
-    HttpClient, leader_and_follower, node_url, until_primary_resolved,
+    HttpClient, applied_op, leader_and_follower, node_url, until_primary_resolved,
 };
 
 /// Seed / read-back rounds. More than one because the lag is a race the test
 /// cannot force: each round re-runs it with the follower's commit walk in a
 /// different position relative to the epoch it just handed out.
 const ROUNDS: u32 = 4;
-
-/// The serving node's applied metadata op, as stamped on every authenticated
-/// success. A response without it is a contract violation, not an absence: the
-/// relay records this value as the caller's read-your-writes floor, so a
-/// missing header would silently reopen the stale read it exists to close.
-fn applied_op(response: &Response) -> u64 {
-    response
-        .headers()
-        .get("iggy-applied-op")
-        .expect("every authenticated success carries iggy-applied-op")
-        .to_str()
-        .expect("iggy-applied-op must be ASCII")
-        .parse()
-        .expect("iggy-applied-op must be an op number")
-}
 
 /// The `name` of every stream in a `GET /streams` list body.
 fn stream_names(body: &Value) -> Vec<String> {
@@ -121,7 +106,7 @@ async fn given_a_follower_when_its_register_binds_a_committed_epoch_should_not_r
     for round in 0..ROUNDS {
         let stream = format!("read-your-writes-{round}");
         seeder
-            .create_stream(&stream)
+            .create_stream(&stream, &StreamCreateOptions::default())
             .await
             .expect("the primary must commit the stream this round reads back");
 

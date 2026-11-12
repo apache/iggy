@@ -15,8 +15,9 @@
 | 🟠 Required Stub | Client state-machine API — must return a well-formed response or clients will stall/crash |
 | 🟡 Optional Stub | Admin/observability — can safely return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` |
 | ❌ Reject | Internal broker / KRaft only — return `INVALID_REQUEST` with a well-formed frame; **do not close the connection** |
+| ❌ Unadvertised | Deliberately absent from `ApiVersions`, so a conforming client never sends one; an arriving request closes the connection |
 
-> This table no longer carries a per-key header-framing status column. `src/protocol/header.rs`
+> This table no longer carries a per-key header-framing status column. `core/kafka_wire/src/header.rs`
 > has no per-key table of its own to be behind or caught up on: it delegates entirely to
 > `kafka_protocol::messages::ApiKey::request_header_version` / `response_header_version`. Any key
 > that crate recognizes is framed correctly; any key it doesn't (see `header_tests.rs` for the
@@ -54,7 +55,7 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 0 | **Produce** | 3 † | 12 | v9 | 🔴 Bridge |
 | 1 | **Fetch** | 4 | 17 | v12 | 🔴 Bridge |
-| 2 | **ListOffsets** | 1 | 9 | v6 | 🟠 Required Stub |
+| 2 | **ListOffsets** | 1 | 9 | v6 | 🔴 Bridge |
 | 3 | **Metadata** | 1 | 12 | v9 | 🔴 Bridge |
 
 † See KAFKA-18659 librdkafka workaround above — advertise min=0 in ApiVersions response.
@@ -80,16 +81,20 @@ Key new minimums:
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Gateway Action |
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
-| 8 | **OffsetCommit** | 2 | 9 | v8 | 🟠 Required Stub |
-| 9 | **OffsetFetch** | 1 | 9 | v6 | 🟠 Required Stub |
+| 8 | **OffsetCommit** | 2 | 9 | v8 | 🔴 Bridge |
+| 9 | **OffsetFetch** | 1 | 9 | v6 | 🔴 Bridge |
 | 10 | **FindCoordinator** | 1 | 6 | v3 | 🟠 Required Stub |
 | 11 | **JoinGroup** | 2 | 9 | v6 | 🟠 Required Stub |
 | 12 | **Heartbeat** | 1 | 4 | v4 | 🟠 Required Stub |
 | 13 | **LeaveGroup** | 1 | 5 | v4 | 🟠 Required Stub |
 | 14 | **SyncGroup** | 1 | 5 | v4 | 🟠 Required Stub |
-| 15 | **DescribeGroups** | 0 | 6 | v5 | 🟡 Optional Stub |
-| 16 | **ListGroups** | 1 | 5 | v3 | 🟡 Optional Stub |
-| 42 | **DeleteGroups** | 1 | 2 | v2 | 🟡 Optional Stub |
+| 15 | **DescribeGroups** | 0 | 6 | v5 | Implemented |
+| 16 | **ListGroups** | 1 | 5 | v3 | Implemented |
+| 42 | **DeleteGroups** | 1 | 2 | v2 | Implemented |
+
+> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups, and
+> report a group that only holds offsets in Iggy as `Empty`. DeleteGroups, and OffsetDelete (47)
+> below, delete those offsets. See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 ---
 
@@ -100,8 +105,9 @@ Key new minimums:
 | 68 | **ConsumerGroupHeartbeat** | 0 | 1 | v0 | 🟠 Required Stub |
 | 69 | **ConsumerGroupDescribe** | 0 | 1 | v0 | 🟡 Optional Stub |
 
-> ⚠️ Kafka 4.0 clients use the **new group protocol by default** and will send key 68.
-> A gateway that hard-rejects this breaks all modern Kafka consumers.
+> ⚠️ Kafka 4.0 consumers still default to `group.protocol=classic`. Only a consumer configured
+> with `group.protocol=consumer` sends key 68, and a gateway that hard-rejects it breaks that
+> consumer.
 
 ---
 
@@ -111,10 +117,13 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 19 | **CreateTopics** | 2 | 7 | v5 | 🟠 Required Stub |
 | 20 | **DeleteTopics** | 1 | 6 | v4 | 🟡 Optional Stub |
-| 21 | **DeleteRecords** | 0 | 2 | v2 | 🟡 Optional Stub |
+| 21 | **DeleteRecords** | 0 | 2 | v2 | ❌ Unadvertised |
 | 37 | **CreatePartitions** | 0 | 3 | v2 | 🟡 Optional Stub |
 
 > ⚠️ `SUPPORTED_RANGES` in `api.rs` currently advertises CreateTopics max=5; actual max is v7.
+>
+> DeleteRecords stays unadvertised until Iggy exposes a log-start offset; see
+> [`SCOPE.md`](SCOPE.md#deleterecords-is-not-advertised-3547).
 
 ---
 
@@ -122,13 +131,19 @@ Key new minimums:
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Gateway Action |
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
-| 22 | **InitProducerId** | 2 | 5 | v2 | 🟡 Optional Stub |
+| 22 | **InitProducerId** | 2 | 5 | v2 | 🟠 Required Stub |
 | 23 | **OffsetForLeaderEpoch** | 1 | 5 | v4 | 🟡 Optional Stub |
-| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | 🟡 Optional Stub |
-| 25 | **AddOffsetsToTxn** | 1 | 4 | v3 | 🟡 Optional Stub |
-| 26 | **EndTxn** | 1 | 4 | v3 | 🟡 Optional Stub |
+| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | ❌ Unadvertised |
+| 25 | **AddOffsetsToTxn** | 1 | 4 | v3 | ❌ Unadvertised |
+| 26 | **EndTxn** | 1 | 4 | v3 | ❌ Unadvertised |
 | 27 | **WriteTxnMarkers** | 0 | 1 | v1 | 🟡 Optional Stub |
-| 28 | **TxnOffsetCommit** | 2 | 5 | v3 | 🟡 Optional Stub |
+| 28 | **TxnOffsetCommit** | 2 | 5 | v3 | ❌ Unadvertised |
+
+> InitProducerId is implemented, not stubbed: it allocates a producer id so a stock idempotent
+> producer starts, and answers `UNSUPPORTED_VERSION` (35) only when the request carries a
+> `transactional_id`. The four keys marked Unadvertised are never listed in `ApiVersions`, which
+> is what stops a conforming client from opening a transaction at all. See
+> [`IDEMPOTENCE.md`](IDEMPOTENCE.md) and `SCOPE.md`'s Transactions section.
 
 ---
 
@@ -169,7 +184,7 @@ Key new minimums:
 | 43 | **ElectLeaders** | 0 | 2 | v2 | 🟡 Optional Stub |
 | 45 | **AlterPartitionReassignments** | 0 | 0 | v0 | 🟡 Optional Stub |
 | 46 | **ListPartitionReassignments** | 0 | 0 | v0 | 🟡 Optional Stub |
-| 47 | **OffsetDelete** | 0 | 0 | never | 🟡 Optional Stub |
+| 47 | **OffsetDelete** | 0 | 0 | never | Implemented |
 | 57 | **UpdateFeatures** | 0 | 1 | v1 | 🟡 Optional Stub |
 
 ---
@@ -180,7 +195,7 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 55 | **DescribeQuorum** | 0 | 2 | v0 | 🟡 Optional Stub |
 | 59 | **FetchSnapshot** | 0 | 1 | v0 | 🟡 Optional Stub |
-| 60 | **DescribeCluster** | 0 | 1 | v0 | 🟡 Optional Stub |
+| 60 | **DescribeCluster** | 0 | 2 | v0 | Implemented |
 | 61 | **DescribeProducers** | 0 | 0 | v0 | 🟡 Optional Stub |
 | 64 | **UnregisterBroker** | 0 | 0 | v0 | 🟡 Optional Stub |
 | 65 | **DescribeTransactions** | 0 | 0 | v0 | 🟡 Optional Stub |
@@ -256,9 +271,11 @@ Key new minimums:
 
 | Category | Count | Notes |
 | ---------- | :-----: | ------- |
-| 🔴 Bridge (data path) | 7 | Produce, Fetch, Metadata, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
-| 🟠 Required Stub (client state machine) | 12 | ListOffsets, consumer group (8-14), CreateTopics, ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
-| 🟡 Optional Stub (admin/observability) | 47 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
+| 🔴 Bridge (data path) | 10 | Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
+| 🟠 Required Stub (client state machine) | 10 | Consumer group (10-14), CreateTopics (19), InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
+| Implemented | 3 | DescribeGroups (15), ListGroups (16), DescribeCluster (60) |
+| 🟡 Optional Stub (admin/observability) | 39 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
+| ❌ Unadvertised | 5 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28), and DeleteRecords (21). Absent from ApiVersions, so a conforming client never sends one |
 | ❌ Reject (broker/KRaft internal) | 22 | Return `INVALID_REQUEST` with valid frame — never close the TCP connection |
 | **Total API Keys in this document** | **88** | Key IDs 0-88 with a gap at 73 |
 
@@ -272,31 +289,41 @@ Key new minimums:
 | ----- | :---: | :---: | :---: |
 | Produce | v3-v9 | v12 | 3 versions behind |
 | Fetch | v4-v12 | v17 | 5 versions behind |
-| ListOffsets | v1-v6 | v9 | 3 versions behind |
+| ListOffsets | v1-v7 | v9 | 2 versions behind |
 | Metadata | v0-v9 | v12 | 3 versions behind |
-| ApiVersions | v0-v3 | v4 | 1 version behind |
+| ApiVersions | v0-v5 | v4 | current, with v5 of Kafka 4.4 (KIP-1242) |
 | CreateTopics | v2-v5 | v7 | 2 versions behind |
+| FindCoordinator | v0-v4 | v6 | 2 versions behind |
+| JoinGroup | v0-v9 | v9 | current |
+| Heartbeat | v0-v4 | v4 | current |
+| LeaveGroup | v0-v5 | v5 | current |
+| SyncGroup | v0-v5 | v5 | current |
+| OffsetCommit | v2-v9 | v9 | current |
+| OffsetFetch | v1-v9 | v9 | current |
 
-### Missing from `SUPPORTED_RANGES` (82 of the 88 API keys in this document)
+### Missing from `SUPPORTED_RANGES` (74 of the 88 API keys in this document)
 
 Every key not in `SUPPORTED_RANGES` closes the connection - the same policy applied to every
-other unlisted key, not a special case for these. No api-specific response schema exists for an
-unlisted key, so any body the gateway could send would be misparsed by the client against the
-schema it expected. This includes:
+other unlisted key, not a special case for these. The gateway declines to define a response for a
+key it does not advertise, and a conforming client never sends one, so no response shape has to
+be agreed. This includes:
 
-- **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9), FindCoordinator (10)
-- **Classic consumer group protocol**: JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14)
-- **New consumer group protocol**: ConsumerGroupHeartbeat (68) — default in Kafka 4.0
+- **New consumer group protocol**: ConsumerGroupHeartbeat (68), opt-in via `group.protocol=consumer` (the 4.0 default is still `classic`)
 - **Share groups (KIP-932)**: ShareFetch, ShareGroupHeartbeat, ShareAcknowledge
 - **Auth flow**: SaslHandshake (17), SaslAuthenticate (36)
 - **All broker/KRaft-internal keys** (Group 14)
+
+The classic consumer group keys FindCoordinator (10), JoinGroup (11), Heartbeat (12),
+LeaveGroup (13), SyncGroup (14), DescribeGroups (15) and ListGroups (16) are supported - see
+[`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
+OffsetCommit (8) and OffsetFetch (9) are supported too - see [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
 
 Remaining scope (consumer groups, auth, admin/tuning) is tracked in `SCOPE.md`'s TODO section,
 not duplicated here.
 
 ### Header framing for keys `kafka_protocol` doesn't recognize
 
-`src/protocol/header.rs` delegates to `kafka_protocol::messages::ApiKey`; there is no per-key
+`core/kafka_wire/src/header.rs` delegates to `kafka_protocol::messages::ApiKey`; there is no per-key
 table in this codebase to have gaps in. `header_tests.rs` documents the one case where the crate
 itself has a gap: keys 4-7 (LeaderAndIsr, StopReplica, UpdateMetadata, ControlledShutdown, Group
 14 below) are inter-broker-only APIs `kafka_protocol` 0.17 does not implement at all, so

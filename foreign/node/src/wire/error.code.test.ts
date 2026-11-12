@@ -19,8 +19,39 @@ import assert from 'node:assert/strict';
 import { it } from 'node:test';
 import { translateErrorCode } from './error.code.js';
 
+it('translates the partitions capacity error', () => {
+  assert.equal(translateErrorCode(2022), 'Partitions limit reached, raise [metadata] partitions_max');
+});
+
+it('translates the fixed-topic resize error', () => {
+  assert.equal(translateErrorCode(2023), 'Partition resizing is disabled for this fixed topic');
+});
+
+it('reports an unknown outcome for an aged-out request', () => {
+  assert.equal(
+    translateErrorCode(85),
+    'Request is below the deduplication window; outcome unknown, resending may duplicate the write'
+  );
+});
+
+it('translates the partition history refusal', () => {
+  assert.equal(translateErrorCode(87), 'The partition history is no longer available; this request cannot execute again');
+});
+
+it('translates the lifecycle refusal', () => {
+  assert.equal(translateErrorCode(88), 'A committed lifecycle operation prevents this mutation. Retry as a new request.');
+});
+
+it('translates the deferred poll capacity refusal', () => {
+  assert.equal(translateErrorCode(90), 'Deferred poll capacity exceeded; retry after backoff on the same replica');
+});
+
 it('translates the consumer-offset capacity error', () => {
   assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition, raise [partition] consumer_offsets_max');
+});
+
+it('translates a partition history change', () => {
+  assert.equal(translateErrorCode(3014), 'Partition history changed after the request was resolved');
 });
 
 it('translates the consumer-group error range', () => {
@@ -55,5 +86,21 @@ it('translates the consumer-group error range', () => {
     translateErrorCode(5009),
     'Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress).'
   );
-  assert.equal(translateErrorCode(5010), 'error');
+  assert.equal(translateErrorCode(5010), 'Too many consumer groups');
+  assert.equal(translateErrorCode(5011), 'error');
+});
+
+it('translates the resource option refusals', () => {
+  assert.equal(translateErrorCode(4103), 'Option cannot be updated after creation: {0}');
+  assert.equal(translateErrorCode(4104), 'Option cannot be reset: {0}');
+  assert.equal(translateErrorCode(4105), 'Option is read-only: {0}');
+  assert.equal(translateErrorCode(4106), 'Stream encryption key requires a server encryption key');
+  assert.equal(translateErrorCode(4107), 'Unsupported critical option: {0}');
+  assert.equal(translateErrorCode(4108), 'Cannot modify root user');
+});
+
+it('translates the local lane and read recovery codes', () => {
+  assert.equal(translateErrorCode(14007), 'Lane blocked by operation {0} with an unknown outcome');
+  assert.equal(translateErrorCode(14009), 'Lane of partition {0} blocked by operation {1} with an unknown outcome');
+  assert.equal(translateErrorCode(14010), 'Read {0} has unknown progress and requires explicit abandonment');
 });

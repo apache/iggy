@@ -62,6 +62,7 @@ use tokio::task::JoinHandle;
 ///
 /// let producer = client
 ///     .producer("my-stream", "my-topic")?
+///     .topic_durability(iggy::prelude::Durability::Persisted)
 ///     .background(BackgroundConfig::builder().num_shards(4).build())
 ///     .build();
 /// producer.init().await?;
@@ -812,9 +813,10 @@ mod tests {
                 Err(IggyError::ProducerSendFailed {
                     cause: Box::new(IggyError::Error),
                     failed: Arc::new(vec![dummy_message(10)]),
+                    uncertain: 0,
                     committed: Arc::new(Vec::new()),
-                    stream_name: "1".to_string(),
-                    topic_name: "1".to_string(),
+                    stream_name: "1".into(),
+                    topic_name: "1".into(),
                 })
             })
         });
@@ -861,9 +863,10 @@ mod tests {
                 Err(IggyError::ProducerSendFailed {
                     cause: Box::new(IggyError::Error),
                     failed: Arc::new(vec![dummy_message(10)]),
+                    uncertain: 0,
                     committed: Arc::new(Vec::new()),
-                    stream_name: "1".to_string(),
-                    topic_name: "1".to_string(),
+                    stream_name: "1".into(),
+                    topic_name: "1".into(),
                 })
             })
         });
@@ -921,9 +924,10 @@ mod tests {
                 Err(IggyError::ProducerSendFailed {
                     cause: Box::new(IggyError::Error),
                     failed: Arc::new(vec![dummy_message(10)]),
+                    uncertain: 0,
                     committed: Arc::new(Vec::new()),
-                    stream_name: "1".to_string(),
-                    topic_name: "1".to_string(),
+                    stream_name: "1".into(),
+                    topic_name: "1".into(),
                 })
             })
         });

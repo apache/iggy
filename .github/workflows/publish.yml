@@ -44,12 +44,12 @@ on:
         required: false
         default: ""
       publish_dockerhub:
-        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, web-ui)"
+        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-kafka-gateway, web-ui)"
         type: string
         required: false
         default: ""
       publish_other:
-        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go)"
+        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go, swift)"
         type: string
         required: false
         default: ""
@@ -74,11 +74,12 @@ permissions:
 concurrency:
   group: publish-release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   validate:
     name: Validate inputs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       commit: ${{ steps.resolve.outputs.commit }}
       has_targets: ${{ steps.check.outputs.has_targets }}
@@ -158,7 +159,7 @@ jobs:
   validate-licenses:
     name: Validate third-party licenses (release gate)
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Re-runs the same per-artifact validation that pre-merge enforces,
     # against the resolved release commit. Tags can point at commits
     # older than the pre-merge gate, or be created via direct push that
@@ -175,23 +176,23 @@ jobs:
     name: Build publish plan
     needs: [validate, validate-licenses]
     if: needs.validate.outputs.has_targets == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       targets: ${{ steps.mk.outputs.targets }}
-      non_rust_targets: ${{ steps.mk.outputs.non_rust_targets }}
+      crates: ${{ steps.mk.outputs.crates }}
       non_docker_targets: ${{ steps.mk.outputs.non_docker_targets }}
       docker_matrix: ${{ steps.mk.outputs.docker_matrix }}
       docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
       has_python: ${{ steps.mk.outputs.has_python }}
-      has_rust_crates: ${{ steps.mk.outputs.has_rust_crates }}
+      has_swift: ${{ steps.mk.outputs.has_swift }}
       has_docker: ${{ steps.mk.outputs.has_docker }}
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
           # Download the copy script from master branch
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -223,13 +224,24 @@ jobs:
           fi
           echo "components_b64=$(yq -o=json -I=0 '.components' .github/config/publish.yml | base64 -w0)" >> "$GITHUB_OUTPUT"
 
+      - name: Cache Cargo metadata
+        if: inputs.create_edge_docker_tag && !inputs.skip_tag_creation && inputs.publish_crates != ''
+        env:
+          IGGY_CARGO_METADATA_FILE: ${{ runner.temp }}/iggy-cargo-metadata.json
+        run: |
+          cargo metadata --format-version 1 --no-deps > "$IGGY_CARGO_METADATA_FILE"
+          echo "IGGY_CARGO_METADATA_FILE=$IGGY_CARGO_METADATA_FILE" >> "$GITHUB_ENV"
+
       - name: Build matrix from inputs
         id: mk
         uses: actions/github-script@v9
         with:
           script: |
+            const { execFileSync } = require('node:child_process');
             const componentsB64 = '${{ steps.cfg.outputs.components_b64 }}';
             const cfg = JSON.parse(Buffer.from(componentsB64, 'base64').toString('utf-8') || "{}");
+            const skipReleased = '${{ inputs.create_edge_docker_tag }}' === 'true' &&
+              '${{ inputs.skip_tag_creation }}' !== 'true';
 
             const wants = [];
 
@@ -241,13 +253,18 @@ jobs:
 
             // Parse Docker images
             ('${{ inputs.publish_dockerhub }}').split(',').map(s => s.trim()).filter(Boolean).forEach(img => {
-              if (['rust-server','rust-mcp','rust-bench-dashboard','rust-connectors','web-ui'].includes(img)) wants.push(img);
+              // With use_latest_ci off, the config of a commit from before the move still lists
+              // this image. This workflow no longer selects the glibc build that the image needs.
+              if (img === 'rust-connectors') {
+                throw new Error('rust-connectors moved to apache/iggy-connectors. Publish the image from that repository.');
+              }
+              if (cfg[img]?.registry === 'dockerhub') wants.push(img);
               else core.warning(`Unknown Docker image: ${img}`);
             });
 
             // Parse other SDKs
             ('${{ inputs.publish_other }}').split(',').map(s => s.trim()).filter(Boolean).forEach(sdk => {
-              if (['python','node','java','csharp','go'].includes(sdk)) {
+              if (['python','node','java','csharp','go','swift'].includes(sdk)) {
                 wants.push(`sdk-${sdk}`);
               } else {
                 core.warning(`Unknown SDK: ${sdk}`);
@@ -261,13 +278,12 @@ jobs:
               npm: 'node',
               maven: 'java',
               nuget: 'csharp',
-              none: 'go'
+              none: 'go',
+              swiftpm: 'swift'
             }[entry.registry] || 'unknown');
 
             const targets = [];
-            const nonRustTargets = [];
             const seen = new Set();
-            let hasRustCrates = false;
 
             for (const key of wants) {
               if (seen.has(key)) continue;
@@ -275,6 +291,22 @@ jobs:
 
               const entry = cfg[key];
               if (!entry) { core.warning(`Component '${key}' not found in publish.yml`); continue; }
+
+              // A queued dispatch can contain releases completed by the previous publisher.
+              if (skipReleased && entry.registry !== 'dockerhub') {
+                const shouldTag = execFileSync('bash',
+                  ['scripts/extract-version.sh', key, '--should-tag'], { encoding: 'utf-8' }).trim();
+                if (shouldTag === 'true') {
+                  const tag = execFileSync('bash',
+                    ['scripts/extract-version.sh', key, '--tag'], { encoding: 'utf-8' }).trim();
+                  const remoteTag = execFileSync('git',
+                    ['ls-remote', '--tags', 'origin', `refs/tags/${tag}`], { encoding: 'utf-8' }).trim();
+                  if (remoteTag) {
+                    core.info(`Skipping ${key}: ${tag} is already released`);
+                    continue;
+                  }
+                }
+              }
 
               const target = {
                 key,
@@ -291,17 +323,10 @@ jobs:
               };
 
               targets.push(target);
-
-              // Separate Rust crates from other targets
-              if (target.type === 'rust') {
-                hasRustCrates = true;
-                // Rust crates are handled by the sequential job
-              } else {
-                nonRustTargets.push(target);
-              }
             }
 
             // Separate Docker targets from other non-Rust targets
+            const nonRustTargets = targets.filter(t => t.type !== 'rust');
             const dockerTargets = nonRustTargets.filter(t => t.type === 'docker');
             const nonDockerTargets = nonRustTargets.filter(t => t.type !== 'docker');
 
@@ -313,16 +338,15 @@ jobs:
             // Output all targets for reference and tag creation
             core.setOutput('targets', JSON.stringify(targets.length ? { include: targets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
-            // Output only non-Rust targets for the parallel publish job
-            core.setOutput('non_rust_targets', JSON.stringify(nonRustTargets.length ? { include: nonRustTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+            core.setOutput('crates', targets.filter(t => t.type === 'rust').map(t => t.key).join(','));
 
             // Output non-Docker, non-Rust targets (SDKs only)
             core.setOutput('non_docker_targets', JSON.stringify(nonDockerTargets.length ? { include: nonDockerTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
             // Build Docker matrix: components × platforms for native runner builds
             const platforms = [
-              { platform: 'linux/amd64', arch: 'amd64', runner: 'ubuntu-latest' },
-              { platform: 'linux/arm64', arch: 'arm64', runner: 'ubuntu-24.04-arm' }
+              { platform: 'linux/amd64', arch: 'amd64', runner: 'ubuntu-26.04' },
+              { platform: 'linux/arm64', arch: 'arm64', runner: 'ubuntu-26.04-arm' }
             ];
 
             const dockerMatrix = [];
@@ -337,7 +361,6 @@ jobs:
             core.setOutput('has_docker', String(dockerTargets.length > 0));
 
             core.setOutput('count', String(targets.length));
-            core.setOutput('has_rust_crates', String(hasRustCrates));
 
             // Check if Python SDK is in targets and extract version
             const pythonTarget = targets.find(t => t.key === 'sdk-python');
@@ -348,16 +371,18 @@ jobs:
               core.setOutput('has_python', 'false');
             }
 
+            core.setOutput('has_swift', String(targets.some(t => t.key === 'sdk-swift')));
+
   check-tags:
-    name: Check existing tags
+    name: Existing tags
     needs: [validate, plan]
     if: needs.validate.outputs.has_targets == 'true' && fromJson(needs.plan.outputs.targets).include[0].key != 'noop'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -375,12 +400,7 @@ jobs:
         run: |
           /tmp/copy-latest-from-master.sh save \
             .github \
-            scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
+            scripts
 
           /tmp/copy-latest-from-master.sh apply
 
@@ -396,15 +416,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "## 🏷️ Tag Existence Check" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🏷️ Tag Existence Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
-            echo "### ℹ️ Tag Creation Disabled" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Tag creation has been explicitly disabled for this run." >> $GITHUB_STEP_SUMMARY
-            echo "Components will be published without creating git tags." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ℹ️ Tag Creation Disabled" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Tag creation has been explicitly disabled for this run." >> "$GITHUB_STEP_SUMMARY"
+            echo "Components will be published without creating git tags." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           TARGETS_JSON='${{ needs.plan.outputs.targets }}'
@@ -413,8 +433,22 @@ jobs:
           NEW_TAGS=()
           WRONG_TARGET_TAGS=()  # populated when a tag exists at a commit != this run's target
 
-          echo "| Component | Version | Tag | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|---------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          # Every tag step is gated on dry_run == false at job or step level, and
+          # skip_tag_creation suppresses the tag push, so neither mode may
+          # render the "Will create" cell that promises a real tag write.
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            NEW_TAG_CELL="🔍 Would create (dry run)"
+            NEW_TAG_LOG="🔍 Tag would be created (dry run):"
+          elif [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+            NEW_TAG_CELL="ℹ️ Would create (tag creation disabled)"
+            NEW_TAG_LOG="ℹ️ Tag would be created (tag creation disabled):"
+          else
+            NEW_TAG_CELL="✅ Will create"
+            NEW_TAG_LOG="✅ Tag will be created:"
+          fi
+
+          echo "| Component | Version | Tag | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|---------|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
 
           # Process substitution (not pipe) so EXISTING_TAGS / NEW_TAGS
           # mutations survive the loop: `jq | while ...` puts the loop
@@ -449,7 +483,7 @@ jobs:
             SHOULD_TAG=$(scripts/extract-version.sh "$KEY" --should-tag 2>/dev/null || echo "false")
             if [ "$SHOULD_TAG" = "false" ]; then
               echo "ℹ️ $NAME: no tag will be created (SNAPSHOT or no tag_pattern)"
-              echo "| $NAME | $VERSION | _(none)_ | ℹ️ No tag (SNAPSHOT / no pattern) |" >> $GITHUB_STEP_SUMMARY
+              echo "| $NAME | $VERSION | _(none)_ | ℹ️ No tag (SNAPSHOT / no pattern) |" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
 
@@ -459,14 +493,14 @@ jobs:
             if [ "${{ inputs.create_edge_docker_tag }}" = "true" ] && [ "$REGISTRY" = "dockerhub" ]; then
               if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
                 echo "⏭️ $NAME: Stable Docker version in auto-publish mode, tag will be skipped"
-                echo "| $NAME | $VERSION | $TAG | ⏭️ Stable (manual publish only) |" >> $GITHUB_STEP_SUMMARY
+                echo "| $NAME | $VERSION | $TAG | ⏭️ Stable (manual publish only) |" >> "$GITHUB_STEP_SUMMARY"
                 continue
               fi
             fi
 
             if [ "$VERSION" = "ERROR" ] || [ "$TAG" = "ERROR" ]; then
               echo "❌ Failed to extract version/tag for $NAME"
-              echo "| $NAME | ERROR | ERROR | ❌ Failed to extract |" >> $GITHUB_STEP_SUMMARY
+              echo "| $NAME | ERROR | ERROR | ❌ Failed to extract |" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
 
@@ -497,7 +531,7 @@ jobs:
               # exit 1 below cannot trigger.
               if [ "${{ inputs.create_edge_docker_tag }}" = "true" ]; then
                 echo "ℹ️ $NAME: $TAG already exists at $SHORT_SHA - already released, run will refresh :edge only"
-                echo "| $NAME | $VERSION | $TAG | ℹ️ Already released ($SHORT_SHA) - :edge refresh only |" >> $GITHUB_STEP_SUMMARY
+                echo "| $NAME | $VERSION | $TAG | ℹ️ Already released ($SHORT_SHA) - :edge refresh only |" >> "$GITHUB_STEP_SUMMARY"
               # Fail-fast on wrong-target for MANUAL publish. A wrong-target tag
               # means create-git-tag would hard-fail 20-40 minutes later after
               # publishing artifacts to crates.io / PyPI / npm / Maven /
@@ -517,69 +551,74 @@ jobs:
                 WRONG_TARGET_TAGS+=("$TAG|$SHORT_SHA")
                 if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
                   echo "⚠️  Tag exists on remote at WRONG target: $TAG (points to $SHORT_SHA, not enforced: skip_tag_creation=true)"
-                  echo "| $NAME | $VERSION | $TAG | ⚠️ Wrong target at $SHORT_SHA (NOT enforced) |" >> $GITHUB_STEP_SUMMARY
+                  echo "| $NAME | $VERSION | $TAG | ⚠️ Wrong target at $SHORT_SHA (NOT enforced) |" >> "$GITHUB_STEP_SUMMARY"
                 else
                   echo "❌ Tag exists on remote at wrong target: $TAG (points to $SHORT_SHA)"
-                  echo "| $NAME | $VERSION | $TAG | ❌ Wrong target at $SHORT_SHA |" >> $GITHUB_STEP_SUMMARY
+                  echo "| $NAME | $VERSION | $TAG | ❌ Wrong target at $SHORT_SHA |" >> "$GITHUB_STEP_SUMMARY"
                 fi
               else
                 echo "⚠️  Tag exists on remote at same target: $TAG (points to $SHORT_SHA)"
-                echo "| $NAME | $VERSION | $TAG | ⚠️ Exists at $SHORT_SHA (benign) |" >> $GITHUB_STEP_SUMMARY
+                echo "| $NAME | $VERSION | $TAG | ⚠️ Exists at $SHORT_SHA (benign) |" >> "$GITHUB_STEP_SUMMARY"
               fi
             else
               NEW_TAGS+=("$TAG")
-              echo "✅ Tag will be created: $TAG"
-              echo "| $NAME | $VERSION | $TAG | ✅ Will create |" >> $GITHUB_STEP_SUMMARY
+              echo "$NEW_TAG_LOG $TAG"
+              echo "| $NAME | $VERSION | $TAG | $NEW_TAG_CELL |" >> "$GITHUB_STEP_SUMMARY"
             fi
           done < <(echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64')
 
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
           # Summary
           if [ ${#EXISTING_TAGS[@]} -gt 0 ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### ⚠️ Warning: Existing Tags Detected" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The following tags already exist on the remote:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ⚠️ Warning: Existing Tags Detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The following tags already exist on the remote:" >> "$GITHUB_STEP_SUMMARY"
             for tag in "${EXISTING_TAGS[@]}"; do
-              echo "- $tag" >> $GITHUB_STEP_SUMMARY
+              echo "- $tag" >> "$GITHUB_STEP_SUMMARY"
             done
-            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
 
             if [ "${{ inputs.dry_run }}" = "false" ]; then
               if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
-                echo "**Note:** Tag creation is disabled for this run." >> $GITHUB_STEP_SUMMARY
-                echo "Components will be (re)published, but no git tags will be pushed." >> $GITHUB_STEP_SUMMARY
+                echo "**Note:** Tag creation is disabled for this run." >> "$GITHUB_STEP_SUMMARY"
+                echo "Components will be (re)published, but no git tags will be pushed." >> "$GITHUB_STEP_SUMMARY"
               else
-                echo "**Tag behavior with \`create-git-tag\` (SHA-match invariant):**" >> $GITHUB_STEP_SUMMARY
-                echo "" >> $GITHUB_STEP_SUMMARY
-                echo "- If a pre-existing tag points at the SAME commit this run is publishing, the tag step is a no-op (benign skip). The artifact is (re)published; the tag stays." >> $GITHUB_STEP_SUMMARY
-                echo "- If a pre-existing tag points at a DIFFERENT commit, the tag step hard-fails with recovery instructions. The artifact publish still runs (registries are idempotent) but no tag is pushed." >> $GITHUB_STEP_SUMMARY
-                echo "" >> $GITHUB_STEP_SUMMARY
-                echo "To recover from a wrong-target tag:" >> $GITHUB_STEP_SUMMARY
-                echo "1. Verify the intended release commit." >> $GITHUB_STEP_SUMMARY
-                echo "2. Delete the existing tag on origin: \`git push --delete origin <tag>\`" >> $GITHUB_STEP_SUMMARY
-                echo "3. Rerun this workflow." >> $GITHUB_STEP_SUMMARY
-                echo "" >> $GITHUB_STEP_SUMMARY
-                echo "To republish without touching tags, set \`skip_tag_creation: true\` on the workflow dispatch." >> $GITHUB_STEP_SUMMARY
+                echo "**Tag behavior with \`create-git-tag\` (SHA-match invariant):**" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "- If a pre-existing tag points at the SAME commit this run is publishing, the tag step is a no-op (benign skip). The artifact is (re)published; the tag stays." >> "$GITHUB_STEP_SUMMARY"
+                echo "- If a pre-existing tag points at a DIFFERENT commit, the tag step hard-fails with recovery instructions. The artifact publish still runs (registries are idempotent) but no tag is pushed." >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "To recover from a wrong-target tag:" >> "$GITHUB_STEP_SUMMARY"
+                echo "1. Verify the intended release commit." >> "$GITHUB_STEP_SUMMARY"
+                echo "2. Delete the existing tag on origin: \`git push --delete origin <tag>\`" >> "$GITHUB_STEP_SUMMARY"
+                echo "3. Rerun this workflow." >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "To republish without touching tags, set \`skip_tag_creation: true\` on the workflow dispatch." >> "$GITHUB_STEP_SUMMARY"
               fi
             fi
           fi
 
           if [ ${#NEW_TAGS[@]} -eq 0 ] && [ ${#EXISTING_TAGS[@]} -gt 0 ]; then
-            echo "### ℹ️ No New Tags to Create" >> $GITHUB_STEP_SUMMARY
-            echo "All specified components are already tagged at some commit. If tags match this run's commit, the rerun converges cleanly. If not, see the wrong-target recovery above or bump versions." >> $GITHUB_STEP_SUMMARY
+            echo "### ℹ️ No New Tags to Create" >> "$GITHUB_STEP_SUMMARY"
+            echo "All specified components are already tagged at some commit. If tags match this run's commit, the rerun converges cleanly. If not, see the wrong-target recovery above or bump versions." >> "$GITHUB_STEP_SUMMARY"
           elif [ ${#NEW_TAGS[@]} -gt 0 ]; then
-            if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
-              echo "### ℹ️ Tags That Would Be Created (Skipped)" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "The following tags would be created if tag creation wasn't disabled:" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "### 🔍 Tags That Would Be Created (Dry Run)" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "The following tags would be created by a real run:" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            elif [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+              echo "### ℹ️ Tags That Would Be Created (Skipped)" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "The following tags would be created if tag creation wasn't disabled:" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "### ✅ Tags to be Created" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### ✅ Tags to be Created" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
             fi
             for tag in "${NEW_TAGS[@]}"; do
-              echo "- $tag" >> $GITHUB_STEP_SUMMARY
+              echo "- $tag" >> "$GITHUB_STEP_SUMMARY"
             done
           fi
 
@@ -610,7 +649,7 @@ jobs:
               echo "1. Delete the wrong tag(s) on origin: \`git push --delete origin <tag>\`"
               echo "2. Or bump the version(s) and rerun the workflow"
               echo "3. Or rerun with \`skip_tag_creation: true\` to republish artifacts only"
-            } >> $GITHUB_STEP_SUMMARY
+            } >> "$GITHUB_STEP_SUMMARY"
             echo "❌ Wrong-target tags detected: ${WRONG_TARGET_TAGS[*]}"
             echo "See the Wrong-target tags block in the step summary for recovery steps."
             if [ "${{ inputs.skip_tag_creation }}" != "true" ]; then
@@ -631,19 +670,63 @@ jobs:
       use_latest_ci: ${{ inputs.use_latest_ci }}
       commit: ${{ needs.validate.outputs.commit }}
 
+  # Without a lockfile SwiftPM runs the newest dependency manifests, unsandboxed
+  # on Linux, so the build a consumer would get runs without a write token.
+  build-swift-package:
+    name: Build Swift package
+    needs: [validate, plan, check-tags]
+    if: |
+      needs.validate.outputs.has_targets == 'true' &&
+      needs.plan.outputs.has_swift == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
+
+      # A cold resolve is what a consumer gets, so this build reads no cache.
+      - name: Setup Swift
+        uses: ./.github/actions/utils/setup-swift
+        with:
+          read-cache: "false"
+
+      - name: Build the published package
+        run: swift build -c release --product Iggy
+
   # Sequential Rust crate publishing to handle dependencies properly
   publish-rust-crates:
     name: Publish Rust crates
     needs: [validate, plan, check-tags]
     if: |
       needs.validate.outputs.has_targets == 'true' &&
-      contains(inputs.publish_crates, 'rust-')
+      needs.plan.outputs.crates != ''
     uses: ./.github/workflows/_publish_rust_crates.yml
     permissions:
       contents: write
       id-token: write
     with:
-      crates: ${{ inputs.publish_crates }}
+      crates: ${{ needs.plan.outputs.crates }}
       dry_run: ${{ inputs.dry_run }}
       commit: ${{ needs.validate.outputs.commit }}
       use_latest_ci: ${{ inputs.use_latest_ci }}
@@ -655,6 +738,7 @@ jobs:
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       !cancelled() &&
+      needs.check-tags.result == 'success' &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
@@ -672,7 +756,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -685,15 +769,14 @@ jobs:
 
       - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
         run: |
           /tmp/copy-latest-from-master.sh save \
             .github \
             scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
+            "$DOCKERFILE" \
+            "$DOCKERFILE.dockerignore"
 
           /tmp/copy-latest-from-master.sh apply
 
@@ -708,22 +791,11 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "✅ Resolved ${{ matrix.key }} -> version=$VERSION"
 
-      - name: Determine libc for component
-        id: libc
-        run: |
-          # Connectors runtime must use glibc because it dlopen()s glibc plugins
-          if [ "${{ matrix.key }}" = "rust-connectors" ]; then
-            echo "libc=glibc" >> "$GITHUB_OUTPUT"
-          else
-            echo "libc=musl" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish Docker image
         id: docker
         uses: ./.github/actions/utils/docker-buildx
         with:
           task: publish
-          libc: ${{ steps.libc.outputs.libc }}
           component: ${{ matrix.key }}
           version: ${{ steps.ver.outputs.version }}
           platform: ${{ matrix.platform }}
@@ -762,9 +834,9 @@ jobs:
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_components).include[0].key != 'noop' &&
-      needs.publish-docker.result == 'success' &&
+      (needs.publish-docker.result == 'success' || needs.publish-docker.result == 'failure') &&
       inputs.dry_run == false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.docker_components) }}
@@ -772,6 +844,14 @@ jobs:
       DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.validate.outputs.commit }}
@@ -781,6 +861,15 @@ jobs:
           # fetches via allowReachableSHA1InWant=true, so fetch-depth:1
           # here is enough - no need to pay for full history.
           fetch-depth: 1
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Ensure version extractor is executable
         run: |
@@ -834,21 +923,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "✅ Resolved $MATRIX_KEY -> version=$VERSION tag=${TAG:-<none>} should_tag=$SHOULD_TAG"
 
-      - name: Resolve image from config
-        id: config
-        shell: bash
-        run: |
-          if ! command -v yq >/dev/null 2>&1; then
-            YQ_VERSION="v4.47.1"
-            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
-            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
-            chmod +x /usr/local/bin/yq
-          fi
-          image=$(yq ".components.${{ matrix.key }}.image" .github/config/publish.yml)
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "📦 Image: $image"
-
       - name: Download amd64 digest
         uses: actions/download-artifact@v8
         with:
@@ -862,7 +936,7 @@ jobs:
           path: ${{ runner.temp }}/digests
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to Docker Hub
         uses: ./.github/actions/utils/docker-login
@@ -873,9 +947,9 @@ jobs:
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
         env:
+          IMAGE: ${{ matrix.image }}
           SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
         run: |
-          IMAGE="${{ steps.config.outputs.image }}"
           VERSION="${{ steps.ver.outputs.version }}"
 
           echo "Creating manifests for $IMAGE from digests:"
@@ -920,9 +994,9 @@ jobs:
 
       - name: Inspect manifest
         env:
+          IMAGE: ${{ matrix.image }}
           SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
         run: |
-          IMAGE="${{ steps.config.outputs.image }}"
           VERSION="${{ steps.ver.outputs.version }}"
 
           # Auto-publish pushed :version only when should_tag was true; in
@@ -955,18 +1029,20 @@ jobs:
             Commit: ${{ needs.validate.outputs.commit }}
             Released by: GitHub Actions (workflow ${{ github.run_id }})
 
-  # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go SDKs)
+  # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go, Swift SDKs)
   # Note: This job runs in parallel with Docker publishing - no dependency between them
   publish:
     name: ${{ matrix.name }}
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    needs: [validate, plan, check-tags, build-python-wheels, build-swift-package, publish-rust-crates]
     if: |
       !cancelled() &&
+      needs.check-tags.result == 'success' &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
+      (needs.build-swift-package.result == 'success' || needs.build-swift-package.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       id-token: write
@@ -983,7 +1059,7 @@ jobs:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -1001,12 +1077,7 @@ jobs:
         run: |
           /tmp/copy-latest-from-master.sh save \
             .github \
-            scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
+            scripts
 
           /tmp/copy-latest-from-master.sh apply
 
@@ -1014,14 +1085,10 @@ jobs:
         run: |
           test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
 
-      # matrix.type == 'rust' is dead: Rust crates are routed to the
-      # dedicated publish-rust-crates reusable workflow and never reach
-      # this SDK matrix (see plan job's hasRustCrates split at L349-354).
-      # Python uses maturin which depends on Rust, so python rows still
-      # need the toolchain.
+      # Python's maturin build needs the Rust toolchain.
       - name: Setup Rust toolchain (if needed)
         if: matrix.type == 'python'
-        uses: ./.github/actions/utils/setup-rust-with-cache
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Debug matrix
         run: echo '${{ toJson(matrix) }}'
@@ -1081,7 +1148,7 @@ jobs:
 
       - name: Upload Python SDK to PyPI
         if: matrix.type == 'python' && inputs.dry_run == false
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: dist
           skip-existing: true
@@ -1133,13 +1200,24 @@ jobs:
           dry_run: ${{ inputs.dry_run }}
 
       # ─────────────────────────────────────────
+      # Swift Package (Tag-only, root Package.swift)
+      # ─────────────────────────────────────────
+      - name: Prepare Swift tag
+        if: matrix.type == 'swift'
+        uses: ./.github/actions/swift/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          tag: ${{ steps.ver.outputs.tag }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # ─────────────────────────────────────────
       # Wait gates: do not push the git tag until the registry is actually
       # serving the new version. The Rust path already does this via
       # wait-for-crate; mirroring it here closes the "artifact published,
       # tag never created" rc1 failure class for foreign SDKs.
       #
-      # Go has no registry wait: the tag IS the release (the Go proxy
-      # fetches from git on demand).
+      # Go and Swift have no registry wait: the tag IS the release (the Go
+      # proxy and SwiftPM fetch from git on demand).
       # ─────────────────────────────────────────
       - name: Wait for PyPI availability
         if: |
@@ -1241,7 +1319,7 @@ jobs:
       # releases) and the "no tag_pattern" skip in one place — keeping the
       # rule symmetric with the docker-manifests job above. The wait gates
       # above ensure the tag is never pushed before the registry is serving
-      # the artifact (Go is exempt: the tag IS the release).
+      # the artifact (Go and Swift are exempt: the tag IS the release).
       - name: Tag SDK release (${{ matrix.key }})
         if: |
           success() &&
@@ -1274,18 +1352,19 @@ jobs:
         plan,
         check-tags,
         build-python-wheels,
+        build-swift-package,
         publish-rust-crates,
         publish-docker,
         docker-manifests,
         publish,
       ]
     if: ${{ !cancelled() && needs.validate.outputs.has_targets == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
@@ -1365,6 +1444,7 @@ jobs:
                 maven)      REGISTRY_DISPLAY="Maven" ;;
                 nuget)      REGISTRY_DISPLAY="NuGet" ;;
                 none)       REGISTRY_DISPLAY="Tag only" ;;
+                swiftpm)    REGISTRY_DISPLAY="Tag only (SwiftPM)" ;;
                 *)          REGISTRY_DISPLAY="$REGISTRY" ;;
               esac
 
@@ -1402,6 +1482,16 @@ jobs:
                 success)   echo "✅ **Python wheels built successfully for all platforms**" ;;
                 failure)   echo "❌ **Python wheel building failed**" ;;
                 skipped)   echo "⏭️ **Python wheel building was skipped**" ;;
+              esac
+              echo
+            fi
+
+            if [ "${{ needs.plan.outputs.has_swift }}" = "true" ]; then
+              echo "### Swift Package Build"
+              case "${{ needs.build-swift-package.result }}" in
+                success)   echo "✅ **Swift package built from the root manifest**" ;;
+                failure)   echo "❌ **Swift package build failed**" ;;
+                skipped)   echo "⏭️ **Swift package build was skipped**" ;;
               esac
               echo
             fi
@@ -1465,6 +1555,7 @@ jobs:
         validate,
         plan,
         build-python-wheels,
+        build-swift-package,
         publish-rust-crates,
         publish-docker,
         docker-manifests,
@@ -1472,7 +1563,7 @@ jobs:
         summary,
       ]
     if: failure() && inputs.dry_run == false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Notify failure
         run: |

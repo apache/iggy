@@ -15,78 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::{Buf, Bytes};
-use kafka_protocol::messages::api_versions_response::ApiVersion;
-use kafka_protocol::messages::metadata_response::{MetadataResponseBroker, MetadataResponseTopic};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
+
+use bytes::Bytes;
 use kafka_protocol::messages::{
-    ApiVersionsRequest, ApiVersionsResponse, BrokerId, CreateTopicsRequest, FetchRequest,
-    ListOffsetsRequest, MetadataRequest, MetadataResponse, ProduceRequest, TopicName,
+    DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
 };
-use kafka_protocol::protocol::{Decodable, StrBytes};
+use kafka_protocol::protocol::StrBytes;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use crate::error::{KafkaProtocolError, Result};
+use crate::auth::AuthenticatedPrincipal;
+use crate::bridge::IggyBridge;
+use crate::cluster_id::ClusterId;
+use crate::coordinator::{Coordination, Placement};
+use crate::error::Result;
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember, MAX_CLIENT_ID_BYTES};
+use crate::protocol::acl::{
+    self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
+    encode_describe_acls_response,
+};
+use crate::protocol::auto_topic_creation::{AutoTopicCreationConfig, AutoTopicCreator};
 use crate::protocol::bounds_guard::{
-    validate_api_versions_shape, validate_create_topics_shape, validate_fetch_shape,
-    validate_list_offsets_shape, validate_metadata_shape, validate_produce_shape,
+    validate_describe_acls_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
-use crate::protocol::responses::{
-    encode_create_topics_error_response, encode_create_topics_response,
-    encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
-    encode_list_offsets_response, encode_message, encode_produce_error_response,
-    encode_produce_response,
+use crate::protocol::handlers::api_versions::Advertisement;
+use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
+use crate::protocol::handlers::{
+    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_groups,
+    delete_topics, describe_cluster, describe_configs, describe_groups, dispatch, fetch,
+    find_coordinator, heartbeat, incremental_alter_configs, init_producer_id, join_group,
+    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_delete, offset_fetch,
+    produce, respond_or_close, sync_group,
+};
+use crate::protocol::probe_board::ProbeBoard;
+use crate::protocol::sasl::{
+    SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
 };
 
-pub const API_KEY_PRODUCE: i16 = 0;
-pub const API_KEY_FETCH: i16 = 1;
-pub const API_KEY_LIST_OFFSETS: i16 = 2;
-pub const API_KEY_METADATA: i16 = 3;
-pub const API_KEY_API_VERSIONS: i16 = 18;
-pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub use iggy_kafka_wire::api::*;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
-/// Generic catch-all. Not sent by any stub response today; the `bridge` module's error mapping
-/// uses it for an `IggyError` with no closer Kafka analogue.
-pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
-pub const ERROR_NONE: i16 = 0;
-pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-/// Retriable; Produce stub uses this until the Iggy bridge persists records.
-pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
-/// `bridge`'s mapping for `IggyError::TransientNotCommitted`: the request's outcome is genuinely
-/// unknown (neither confirmed applied nor confirmed rejected).
-///
-/// Retriable in real Kafka too (`TimeoutException extends RetriableException`; the Java producer's
-/// `Sender.canRetry` treats it the same as `NOT_LEADER_OR_FOLLOWER`) - this is not chosen to make
-/// clients stop retrying. It is chosen because it is the code a real broker sends for the same
-/// unknown-outcome shape (an ack that timed out with no confirmation either way), and Kafka has no
-/// dedicated "outcome unknown, retry could duplicate" code. The duplicate-write risk on retry is
-/// real regardless of which retriable code is sent; it closes only once `#3535` has an idempotent
-/// produce path, not by picking a different error code here.
-pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
-/// `bridge`'s mapping for a Kafka-side topic name that fails Kafka's own naming rules.
-///
-/// Empty, whitespace-padded, over 249 bytes, or outside `[A-Za-z0-9._-]`, checked before any Iggy
-/// call is made - a real Kafka client library validates topic names client-side and would never
-/// send one of these, but a raw/non-conformant client could.
-pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = 17;
-/// Closest fit for an Iggy permission/credential rejection in `bridge`'s error mapping.
-///
-/// There is no bridge-side SASL exchange yet (`#3549`), so `SASL_AUTHENTICATION_FAILED` would
-/// misstate the failure point. Not sent by any stub response today.
-pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
-pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
-/// `bridge`'s mapping for `BridgeError::PartitionCountMismatch`: the topic exists, just not with
-/// the requested partition count.
-///
-/// Not [`ERROR_INVALID_PARTITIONS`] - `kafka-protocol`'s own error table (`error.rs`) defines that
-/// code's text as "Number of partitions is below 1", which is a different condition (a client
-/// asking for zero/negative partitions) than "this topic already exists with a different count".
-pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
-pub const ERROR_INVALID_PARTITIONS: i16 = 37;
-pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
-/// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
-pub const ERROR_NOT_CONTROLLER: i16 = 41;
-pub const ERROR_INVALID_REQUEST: i16 = 42;
+/// Kafka's -1 for an offset or a timestamp that is not known.
+pub(crate) const UNKNOWN_OFFSET: i64 = -1;
+
+/// Ceiling on the bridge work of one request, wait included. A clock, not a partition cap, so a
+/// wide topic still works. Above one bridge call's 15 s timeout. Fits the 25 s shutdown drain.
+pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Result of handling one Kafka request body.
 #[derive(Debug)]
@@ -95,12 +75,20 @@ pub enum HandleOutcome {
     Respond(Bytes),
     /// Produce with `acks=0`: write nothing, keep the connection open.
     NoResponse,
+    /// Write this response body, then close the TCP connection.
+    ///
+    /// Kafka's authentication failures are shaped this way: the client parses a correctly-shaped
+    /// error body at its own version and only then sees the connection drop. [`Self::Close`]
+    /// alone would leave it guessing, and [`Self::Respond`] would leave an unauthenticated
+    /// connection open.
+    RespondThenClose(Bytes),
     /// No parseable response exists for this request; close the TCP connection.
     Close,
 }
 
 impl HandleOutcome {
-    /// Return the response body, or panic with `msg` if the outcome is not [`Self::Respond`].
+    /// Return the response body of a [`Self::Respond`] or [`Self::RespondThenClose`], or panic
+    /// with `msg`.
     ///
     /// # Panics
     ///
@@ -108,7 +96,7 @@ impl HandleOutcome {
     #[must_use]
     pub fn expect_response(self, msg: &str) -> Bytes {
         match self {
-            Self::Respond(body) => body,
+            Self::Respond(body) | Self::RespondThenClose(body) => body,
             Self::NoResponse => panic!("{msg}: got NoResponse"),
             Self::Close => panic!("{msg}: got Close"),
         }
@@ -140,44 +128,159 @@ impl Default for BrokerAdvertise {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ApiVersionRange {
-    pub api_key: i16,
-    pub min_version: i16,
-    pub max_version: i16,
+/// The node id of a gateway that `IGGY_KAFKA_NODE_ID` does not set.
+pub const DEFAULT_NODE_ID: u16 = 1;
+
+/// The first stand-in node id in a replica list: 65536, one past the largest node id a gateway can
+/// take, since `IGGY_KAFKA_NODE_ID` is a `u16`.
+pub const FIRST_STAND_IN_REPLICA: i32 = 1 << 16;
+
+/// The gateways that one listener lists in Metadata. A gateway alone lists itself, as node 1.
+#[derive(Debug, Clone)]
+pub struct Brokers {
+    /// This gateway's node id.
+    pub node_id: i32,
+    /// The other gateways, each with its endpoint for this listener, in node id order.
+    pub peers: Vec<(i32, BrokerAdvertise)>,
 }
 
+impl Default for Brokers {
+    fn default() -> Self {
+        Self {
+            node_id: i32::from(DEFAULT_NODE_ID),
+            peers: Vec::new(),
+        }
+    }
+}
+
+impl Brokers {
+    /// Every gateway in node id order, with `own` as the endpoint of this one.
+    #[must_use]
+    pub fn listed<'a>(&'a self, own: &'a BrokerAdvertise) -> Vec<(i32, &'a BrokerAdvertise)> {
+        let mut listed: Vec<(i32, &BrokerAdvertise)> = self
+            .peers
+            .iter()
+            .map(|(node, endpoint)| (*node, endpoint))
+            .collect();
+        listed.push((self.node_id, own));
+        listed.sort_by_key(|(node, _)| *node);
+        listed
+    }
+
+    /// `count` node ids for the replicas of a partition, and never fewer than one: this gateway
+    /// first, then the next gateways in node id order, wrapping round. A factor above the number
+    /// of gateways is filled with stand-in ids from [`FIRST_STAND_IN_REPLICA`], which no gateway
+    /// can take. A client reads a stand-in as a replica on a broker that is not up, and reads the
+    /// factor from the length of the list.
+    #[must_use]
+    pub fn replicas(&self, count: u32) -> Vec<i32> {
+        let wanted = usize::try_from(count).unwrap_or(usize::MAX).max(1);
+        let mut ids: Vec<i32> = self.peers.iter().map(|(node, _)| *node).collect();
+        ids.push(self.node_id);
+        ids.sort_unstable();
+        let own = ids
+            .iter()
+            .position(|node| *node == self.node_id)
+            .unwrap_or(0);
+        ids.rotate_left(own);
+        ids.truncate(wanted);
+        let stand_ins = (FIRST_STAND_IN_REPLICA..).take(wanted.saturating_sub(ids.len()));
+        ids.extend(stand_ins);
+        ids
+    }
+
+    /// The gateway that coordinates every consumer group: the lowest node id. Every gateway names
+    /// the same one, so the members of a group never split over two coordinators.
+    #[must_use]
+    pub fn coordinator<'a>(&'a self, own: &'a BrokerAdvertise) -> (i32, &'a BrokerAdvertise) {
+        match self.peers.first() {
+            Some((node, endpoint)) if *node < self.node_id => (*node, endpoint),
+            _ => (self.node_id, own),
+        }
+    }
+
+    /// Whether this gateway coordinates the consumer groups.
+    #[must_use]
+    pub fn coordinates_groups(&self) -> bool {
+        self.peers
+            .first()
+            .is_none_or(|(node, _)| *node > self.node_id)
+    }
+
+    /// The gateways that `placement` counts as live, in node id order, with `own` as the
+    /// endpoint of this one.
+    #[must_use]
+    pub fn live<'a>(
+        &'a self,
+        own: &'a BrokerAdvertise,
+        placement: &Placement,
+    ) -> Vec<(i32, &'a BrokerAdvertise)> {
+        self.listed(own)
+            .into_iter()
+            .filter(|(node, _)| u16::try_from(*node).is_ok_and(|node| placement.is_live(node)))
+            .collect()
+    }
+
+    /// `node_id` when this listener lists it, else this gateway, so an answer never names a
+    /// broker it does not list.
+    #[must_use]
+    pub fn listed_or_own(&self, node_id: u16) -> i32 {
+        let node_id = i32::from(node_id);
+        if self.peers.iter().any(|(node, _)| *node == node_id) {
+            node_id
+        } else {
+            self.node_id
+        }
+    }
+
+    /// The endpoint this listener lists for `node_id`, with `own` as this gateway's.
+    #[must_use]
+    pub fn endpoint<'a>(
+        &'a self,
+        own: &'a BrokerAdvertise,
+        node_id: u16,
+    ) -> Option<&'a BrokerAdvertise> {
+        let node_id = i32::from(node_id);
+        if node_id == self.node_id {
+            return Some(own);
+        }
+        self.peers
+            .iter()
+            .find(|(node, _)| *node == node_id)
+            .map(|(_, endpoint)| endpoint)
+    }
+}
+
+/// The version firewall, and the exact set `ApiVersions` advertises.
+///
+/// Absence is load-bearing for the transaction keys (24, 25, 26, 28): a conforming client that
+/// does not see a key here never sends it, which is the whole enforcement of "transactions are
+/// unsupported". See `docs/SCOPE.md`.
 static SUPPORTED_RANGES: &[ApiVersionRange] = &[
-    ApiVersionRange {
-        api_key: API_KEY_PRODUCE,
-        min_version: 3,
-        max_version: 9,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_FETCH,
-        min_version: 4,
-        max_version: 12,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_LIST_OFFSETS,
-        min_version: 1,
-        max_version: 6,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_METADATA,
-        min_version: 0,
-        max_version: 9,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_API_VERSIONS,
-        min_version: 0,
-        max_version: 3,
-    },
-    ApiVersionRange {
-        api_key: API_KEY_CREATE_TOPICS,
-        min_version: 2,
-        max_version: 5,
-    },
+    produce::RANGE,
+    fetch::RANGE,
+    list_offsets::RANGE,
+    metadata::RANGE,
+    offset_commit::RANGE,
+    offset_fetch::RANGE,
+    api_versions::RANGE,
+    create_topics::RANGE,
+    delete_topics::RANGE,
+    create_partitions::RANGE,
+    describe_configs::RANGE,
+    alter_configs::RANGE,
+    incremental_alter_configs::RANGE,
+    init_producer_id::RANGE,
+    find_coordinator::RANGE,
+    join_group::RANGE,
+    heartbeat::RANGE,
+    leave_group::RANGE,
+    sync_group::RANGE,
+    describe_groups::RANGE,
+    list_groups::RANGE,
+    delete_groups::RANGE,
+    offset_delete::RANGE,
+    describe_cluster::RANGE,
 ];
 
 #[must_use]
@@ -185,20 +288,353 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
     SUPPORTED_RANGES
 }
 
-/// Default `max_frame_size` used by [`handle_request`] - the ~150 direct call sites across this
+/// Everything a handler needs that outlives one request.
+///
+/// `bridge` is `None` until `IGGY_KAFKA_BRIDGE_ENABLED` turns it on. A handler that finds `None`
+/// answers with its stub, so APIs can be wired one at a time.
+///
+/// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
+/// `CreatePartitions`, `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` share one
+/// lockstep `IggyClient`, so those calls run one at a time across connections. See the README's
+/// "Concurrency ceiling".
+pub struct GatewayState {
+    pub bridge: Option<Arc<IggyBridge>>,
+    pub max_frame_size: usize,
+    /// Shared across every connection this gateway serves: a producer id has to be unique for
+    /// the process, not for the connection that asked for it.
+    pub producer_ids: ProducerIdAllocator,
+    /// `PRODUCE_CAPS` partition caps, in frame bytes, that Produce may hold decoded at once. Caps
+    /// its memory. A request takes what its largest partition may decode, and a send that
+    /// outlives the request keeps it while it owns the decoded partition.
+    pub(crate) produce_memory: Arc<Semaphore>,
+    /// `PRODUCE_LARGE` slots a large Produce request takes before its memory. Small ones skip it.
+    pub(crate) produce_large: Arc<Semaphore>,
+    /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
+    /// the connection that created it, and group coordination needs no Iggy call.
+    pub groups: GroupCoordinator,
+    /// Per Kafka topic and partition, how long probes read it as loading. Fetch and `ListOffsets`
+    /// share it, since every consumer sees the same probe.
+    pub(crate) loading: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
+    /// proof that no record matches. Only the first of a spell warns.
+    pub(crate) unproven_empty: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, what the Iggy polls of Fetch and `ListOffsets` showed: how
+    /// long the next poll may take, and whether the partition stalled. Shared, so the consumers
+    /// of a partition whose node stopped do not each spend a read slot waiting for it. In an
+    /// `Arc`, since a re-check reports after its request ended.
+    pub(crate) poll_records: Arc<Mutex<fetch::PollRecords>>,
+    /// Topic probes that every Fetch shares.
+    pub(crate) probe_board: ProbeBoard,
+    /// Held by `CreatePartitions` from reading a topic's partition count until its write is
+    /// settled, and by `CreateTopics` and `DeleteTopics` around their writes. Iggy adds a number
+    /// of partitions, Kafka asks for a count to reach, and two requests that read the same count
+    /// would otherwise both add and overshoot it. Per process: direct Iggy clients are not
+    /// behind it, and other gateways only while no controller is known, since with the
+    /// coordinator log only the controller serves these requests.
+    pub(crate) partition_growth: Arc<tokio::sync::Mutex<()>>,
+    /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
+    /// the one stored in Iggy.
+    pub cluster_id: ClusterId,
+    /// This gateway's node id: the one replica Metadata names for each partition, so the one
+    /// broker a manual replica assignment may name.
+    pub node_id: i32,
+    /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
+    pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
+    /// Present while the gateways share the groups through the coordinator log. It names the
+    /// coordinator of each group, the leader of each partition and the controller.
+    pub coordination: Option<Arc<Coordination>>,
+}
+
+/// Large Produce requests that decode and send at once. More at once only contend for the
+/// gateway's workers and for Iggy: at full load they cost CPU and gave no throughput.
+const PRODUCE_LARGE: usize = 4;
+
+/// Partition caps Produce may hold decoded at once, about 200 MB at the default 8 MiB frame.
+///
+/// Counted in bytes, not requests, so a small request takes a small share. One cap more than the
+/// large slots: large requests can hold a cap each, and the small ones still have one.
+const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
+
+impl GatewayState {
+    /// Whether this gateway gave out `producer_id` lately, so Produce may key an Iggy session on
+    /// it. With a bridge the ids come from Iggy. Without one, from the local allocator.
+    #[must_use]
+    pub(crate) fn issued_producer_id(&self, producer_id: i64) -> bool {
+        self.bridge.as_ref().map_or_else(
+            || self.producer_ids.issued(producer_id),
+            |bridge| bridge.issued_producer_id(producer_id),
+        )
+    }
+
+    #[must_use]
+    pub fn new(
+        bridge: Option<Arc<IggyBridge>>,
+        max_frame_size: usize,
+        instance_id: u16,
+        groups: GroupCoordinator,
+    ) -> Self {
+        Self {
+            bridge,
+            max_frame_size,
+            producer_ids: ProducerIdAllocator::new(instance_id),
+            produce_memory: Arc::new(Semaphore::new(
+                PRODUCE_CAPS
+                    .saturating_mul(max_frame_size)
+                    .min(Semaphore::MAX_PERMITS),
+            )),
+            produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
+            groups,
+            loading: Mutex::default(),
+            unproven_empty: Mutex::default(),
+            poll_records: Arc::default(),
+            probe_board: ProbeBoard::default(),
+            partition_growth: Arc::default(),
+            cluster_id: ClusterId::random(),
+            node_id: i32::from(DEFAULT_NODE_ID),
+            auto_topic_creation: None,
+            coordination: None,
+        }
+    }
+
+    /// Who leads each partition now. This gateway leads everything without the coordinator log.
+    #[must_use]
+    pub fn placement(&self) -> Placement {
+        self.coordination.as_ref().map_or_else(
+            || Placement::alone(u16::try_from(self.node_id).unwrap_or(DEFAULT_NODE_ID)),
+            |coordination| coordination.placement(),
+        )
+    }
+
+    /// Hands this gateway's groups to the other gateways, when it shares them, giving up on Iggy
+    /// at `until`. A shutdown calls it before its drain, so its group requests send their clients
+    /// to the new coordinators.
+    pub async fn hand_over_groups(&self, until: Instant) {
+        if let Some(coordination) = &self.coordination {
+            coordination.shutdown(until).await;
+        }
+    }
+
+    /// Signs the coordinator log's clients out of Iggy, after [`Self::hand_over_groups`].
+    pub async fn close_coordination(&self) {
+        if let Some(coordination) = &self.coordination {
+            coordination.close().await;
+        }
+    }
+
+    /// Shares the groups with the other gateways through `coordination`.
+    #[must_use]
+    pub fn with_coordination(mut self, coordination: Arc<Coordination>) -> Self {
+        self.coordination = Some(coordination);
+        self
+    }
+
+    /// Turns on Kafka's `auto.create.topics.enable` behaviour for `Metadata` when `config` says
+    /// so.
+    ///
+    /// # Errors
+    ///
+    /// [`KafkaProtocolError::InvalidConfig`](crate::error::KafkaProtocolError::InvalidConfig)
+    /// when creation is on and `config.partitions` is 0 or over Iggy's per-topic cap.
+    pub fn with_auto_topic_creation(mut self, config: AutoTopicCreationConfig) -> Result<Self> {
+        self.auto_topic_creation = if config.enabled {
+            Some(AutoTopicCreator::new(config.partitions)?)
+        } else {
+            None
+        };
+        Ok(self)
+    }
+
+    /// Cancels the auto topic creations still running and waits up to `deadline` for them to
+    /// end. An embedder that builds its own `GatewayState` calls it before closing the bridge.
+    pub async fn shutdown_auto_topic_creation(&self, deadline: Duration) {
+        let Some(creator) = &self.auto_topic_creation else {
+            return;
+        };
+        if creator.shutdown(deadline).await
+            && let Some(bridge) = &self.bridge
+        {
+            // A cancelled create can keep its client busy, and the bridge's sign-out would queue
+            // behind it.
+            bridge.discard_auto_create_client();
+        }
+    }
+
+    /// Holds back the writes of `CreateTopics`, `DeleteTopics` and `CreatePartitions` on this
+    /// gateway until the guard drops, the way a `CreatePartitions` settling an unknown outcome
+    /// does. For tests that check those handlers wait for it.
+    #[doc(hidden)]
+    pub async fn hold_topic_changes(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.partition_growth).lock_owned().await
+    }
+
+    #[must_use]
+    pub fn with_cluster_id(mut self, cluster_id: ClusterId) -> Self {
+        self.cluster_id = cluster_id;
+        self
+    }
+
+    /// Names `node_id` as this gateway, in place of [`DEFAULT_NODE_ID`].
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: u16) -> Self {
+        self.node_id = i32::from(node_id);
+        self
+    }
+
+    /// State with no bridge, so every handler takes its stub path.
+    ///
+    /// The coordinator is real but fresh, so two calls never share group state.
+    #[must_use]
+    pub fn stub(max_frame_size: usize) -> Self {
+        Self::new(
+            None,
+            max_frame_size,
+            0,
+            GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+        )
+    }
+}
+
+/// What a handler keeps for one Kafka connection, across its requests.
+///
+/// Fetch keeps its -1 holds and the offsets it cannot place here. One consumer's stuck offset then
+/// neither skips another consumer's read of it nor replaces the hold of a consumer stuck elsewhere
+/// in the partition, and one consumer's wait for an offset never spends another's grace.
+///
+/// The listener the connection arrived through lives here too, because a gateway with several
+/// listeners answers Metadata and `ApiVersions` differently on each: a client is pointed back at
+/// the port it used, and the SASL keys are advertised only where the exchange is run.
+#[derive(Default)]
+pub struct ConnectionState {
+    /// The broker address this connection's listener advertises.
+    pub broker: BrokerAdvertise,
+    /// The gateways this connection's listener lists in Metadata.
+    pub brokers: Arc<Brokers>,
+    /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed on this
+    /// connection's listener.
+    pub sasl_enabled: bool,
+    /// Whether `DescribeAcls` is advertised and answered: the listener names a principal, by
+    /// SASL or by a verified client certificate.
+    pub acls_enabled: bool,
+    /// Partitions that answered -1 to this connection's Fetches, per Kafka topic.
+    pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
+    /// Offsets this connection's Fetches cannot place, per Kafka topic.
+    pub(crate) unplaced: Mutex<fetch::Unplaced>,
+    /// The member that last sent a Heartbeat here. An offset call caps its hold by that member's
+    /// session, since its next heartbeat waits behind the call.
+    heartbeat_member: Mutex<Option<GroupMember>>,
+    /// The first `client_id` that a request header on this connection named, cut to
+    /// [`MAX_CLIENT_ID_BYTES`]. A Kafka client sends one id in every header of a connection.
+    client_id: OnceLock<StrBytes>,
+    /// The peer's IP address as Kafka reports a member's `client_host`: a `/`, then the address.
+    client_host: StrBytes,
+    /// Keys the Produce session of a producer without a producer id that this gateway gave out.
+    id: ConnectionId,
+}
+
+/// A Kafka connection's number, unique in the process.
+#[derive(Debug, Clone, Copy)]
+struct ConnectionId(u64);
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl ConnectionState {
+    /// State for a connection accepted on the listener that advertises `broker`.
+    ///
+    /// `acls_enabled` is at least `sasl_enabled`: a SASL listener always names a principal.
+    #[must_use]
+    pub fn for_listener(broker: BrokerAdvertise, sasl_enabled: bool, acls_enabled: bool) -> Self {
+        Self {
+            broker,
+            sasl_enabled,
+            acls_enabled: acls_enabled || sasl_enabled,
+            ..Self::default()
+        }
+    }
+
+    /// The same state, with `brokers` as the gateways that Metadata lists.
+    #[must_use]
+    pub fn with_brokers(mut self, brokers: Arc<Brokers>) -> Self {
+        self.brokers = brokers;
+        self
+    }
+
+    /// The same state, for a connection from `peer`. An IPv4 client of a dual-stack listener is
+    /// reported by its IPv4 address, as Kafka does.
+    #[must_use]
+    pub fn with_peer(mut self, peer: SocketAddr) -> Self {
+        self.client_host = StrBytes::from_string(format!("/{}", peer.ip().to_canonical()));
+        self
+    }
+
+    /// Keeps `client_id` if no earlier header named one. The copy is owned: the header is a view
+    /// into its frame, and a group member keeps the id for as long as it stays in the group.
+    pub fn note_client_id(&self, client_id: Option<&str>) {
+        if let Some(client_id) = client_id.filter(|client_id| !client_id.is_empty()) {
+            self.client_id.get_or_init(|| {
+                let end = client_id.floor_char_boundary(MAX_CLIENT_ID_BYTES);
+                StrBytes::from_string(client_id[..end].to_owned())
+            });
+        }
+    }
+
+    pub(crate) fn client_id(&self) -> StrBytes {
+        self.client_id.get().cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn client_host(&self) -> StrBytes {
+        self.client_host.clone()
+    }
+
+    /// What `ApiVersions` tells this connection about the listener-dependent keys.
+    #[must_use]
+    pub const fn advertisement(&self) -> Advertisement {
+        Advertisement {
+            sasl: self.sasl_enabled,
+            acls: self.acls_enabled,
+        }
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id.0
+    }
+
+    pub(crate) fn note_heartbeat(&self, member: GroupMember) {
+        *self
+            .heartbeat_member
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(member);
+    }
+
+    pub(crate) fn heartbeat_member(&self) -> Option<GroupMember> {
+        self.heartbeat_member
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Default `max_frame_size` used by [`handle_request`] - the direct call sites across this
 /// crate's test suite that don't care about the response-size guard specifically. Production
 /// traffic goes through [`handle_request_bounded`] instead (see `server.rs`'s call site), with
 /// the connection's actual configured `max_frame_size`.
 const DEFAULT_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
 /// Handles one decoded request frame and returns how the connection should proceed.
-pub fn handle_request(
+pub async fn handle_request(
     api_key: i16,
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
 ) -> HandleOutcome {
-    handle_request_bounded(api_key, api_version, body, broker, DEFAULT_MAX_FRAME_SIZE)
+    let state = GatewayState::stub(DEFAULT_MAX_FRAME_SIZE);
+    let connection = ConnectionState::for_listener(broker.clone(), false, false);
+    handle_connection_request(&state, &connection, None, api_key, api_version, body).await
 }
 
 /// Same as [`handle_request`], but rejects a request whose declared array/string lengths project
@@ -208,300 +644,33 @@ pub fn handle_request(
 /// docs for the CPU/memory amplification this closes (a request within the old element budget
 /// alone could still produce a multi-megabyte response from a single synchronous, non-yielding
 /// call).
-pub fn handle_request_bounded(
+///
+/// Each call is a new connection's first request, so nothing carries over to the next call.
+/// [`handle_connection_request`] keeps a connection's state.
+pub async fn handle_request_bounded(
+    state: &GatewayState,
     api_key: i16,
     api_version: i16,
     body: Bytes,
-    broker: &BrokerAdvertise,
-    max_frame_size: usize,
 ) -> HandleOutcome {
-    if api_key == API_KEY_PRODUCE {
-        return handle_produce_request(api_version, body, max_frame_size);
-    }
-    handle_other_request(api_key, api_version, body, broker, max_frame_size)
+    let connection = ConnectionState::default();
+    handle_connection_request(state, &connection, None, api_key, api_version, body).await
 }
 
-/// Decode `T` from the whole request body and reject unconsumed trailing bytes.
+/// [`handle_request_bounded`] for one request of `connection`.
 ///
-/// `kafka_protocol`'s `Decodable` stops once it has read the fields its schema defines; it does
-/// not know (or care) whether the caller handed it an exact-length body, so the trailing-bytes
-/// check has to live here.
-fn decode_exhaustive<T: Decodable>(version: i16, mut body: Bytes) -> Result<T> {
-    let value =
-        T::decode(&mut body, version).map_err(|e| KafkaProtocolError::Malformed(e.to_string()))?;
-    if body.has_remaining() {
-        return Err(KafkaProtocolError::Malformed(
-            "unexpected trailing bytes in request body".to_string(),
-        ));
-    }
-    Ok(value)
-}
-
-/// Runs `validate` (see [`crate::protocol::bounds_guard`]) before [`decode_exhaustive`].
-///
-/// `kafka_protocol` validates wire-declared array/string lengths as non-negative but never
-/// against the bytes actually remaining in the frame, so a tiny frame declaring a huge count
-/// drives an allocation attempt that aborts the whole process (`handle_alloc_error`, not a
-/// panic - uncatchable, and it kills every connection, not just the offending one). `validate`
-/// rejects that class of frame first, on a walk that never allocates a collection.
-fn decode_guarded<T: Decodable>(
-    version: i16,
-    body: Bytes,
-    validate: impl FnOnce(i16, &Bytes) -> Result<()>,
-) -> Result<T> {
-    validate(version, &body)?;
-    decode_exhaustive(version, body)
-}
-
-/// Turn an encode [`Result`] into a [`HandleOutcome`], closing the connection when encoding
-/// fails rather than propagating - there is no parseable response to send in that case.
-fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
-    match result {
-        Ok(body) => HandleOutcome::Respond(body),
-        Err(error) => {
-            tracing::warn!(%error, "failed to encode {api_name} response; closing connection");
-            HandleOutcome::Close
-        }
-    }
-}
-
-/// Produce is the only request the wire protocol allows to go unanswered
-/// (`acks=0`), so it gets its own path that may return [`HandleOutcome::NoResponse`].
-///
-/// The firewall check runs AFTER decoding the request, not before: `ApiVersions` advertises
-/// Produce min=0 (see [`advertised_min_version`]) while the firewall's real floor is 3, so a
-/// spec-compliant client can legitimately send Produce v0-2 with `acks=0`. Rejecting those
-/// versions before reading `acks` would send an error response the client never expects,
-/// desyncing the next correlation id it reads.
-fn handle_produce_request(api_version: i16, body: Bytes, max_frame_size: usize) -> HandleOutcome {
-    // Above the encoder max there is no response parseable at the client's version, so close
-    // rather than decode (same policy the other APIs apply). Fail-closed on a missing row
-    // (i16::MIN, not i16::MAX): `handle_request` dispatches Produce on a hard-coded `api_key ==`
-    // check, not from this table, so if a future edit ever drops the Produce row to disable the
-    // API, a fail-open default here would leave Produce v0-2 acks=0 silently accepted on an API
-    // the operator believes is off - unwrap_or(i16::MAX) is not the sound default the sibling
-    // lookup at `unsupported_version_response` uses (`map_or(0, ...)`, i.e. fail-closed).
-    if api_version > supported_max_version(API_KEY_PRODUCE).unwrap_or(i16::MIN) {
-        return HandleOutcome::Close;
-    }
-    // `kafka_protocol`'s ProduceRequest/ProduceResponse schemas only go back to v3, so v0-2
-    // (still advertised as the min in ApiVersions per KAFKA-18659) can be neither decoded nor
-    // encoded by the crate - there is no parseable response at these versions regardless of
-    // body content. `acks` is always the first i16 on the wire there (`transactional_id` was
-    // added in v3), so it's peeked by hand: acks=0 must keep the connection open per the wire
-    // protocol's fire-and-forget rule even though no response can ever be encoded for it.
-    if api_version < 3 {
-        let acks = match body.get(0..2) {
-            Some(&[hi, lo]) => Some(i16::from_be_bytes([hi, lo])),
-            _ => None,
-        };
-        return match acks {
-            Some(0) | None => HandleOutcome::NoResponse,
-            Some(_) => unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
-                encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
-            }),
-        };
-    }
-    match decode_guarded::<ProduceRequest>(api_version, body, |v, b| {
-        validate_produce_shape(v, b, max_frame_size)
-    }) {
-        // acks=0 is fire-and-forget: the client isn't reading a response, so
-        // sending one desyncs the next correlation id it expects.
-        Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
-        // `api_version` is always in `[3, supported_max]` here: the `< 3` case returned above,
-        // and the `> max` case returned at the top of this function - so it is always within
-        // `SUPPORTED_RANGES`' Produce row and an `is_supported_version` re-check can never fail.
-        Ok(req) => respond_or_close(encode_produce_response(api_version, &req), "Produce"),
-        Err(error) => {
-            // `kafka_protocol` decodes the whole request in one shot; a failure anywhere gives
-            // no partial-field access, so `acks` is unknowable here (unlike the pre-migration
-            // field-by-field decoder, which could still know `acks` on a later-field failure).
-            // Responding risks desyncing an acks=0 fire-and-forget client's correlation stream,
-            // so every Produce decode failure now stays silent - a behavior change from the
-            // hand-rolled decoder, which answered with INVALID_REQUEST when `acks` was known and
-            // nonzero.
-            // debug!, not warn!: the body is attacker-controlled, not operator-actionable, and
-            // a client looping malformed bodies on one connection (never disconnected - this
-            // arm returns NoResponse) has no rate limit here.
-            tracing::debug!(%error, "failed to decode Produce request (no response)");
-            HandleOutcome::NoResponse
-        }
-    }
-}
-
-fn handle_other_request(
+/// `principal` is `None` when no listener of the gateway names principals, or for a key the
+/// connection reached before authenticating. Only `crate::server::route_frame` ever has a
+/// principal to pass.
+pub async fn handle_connection_request(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
-    broker: &BrokerAdvertise,
-    max_frame_size: usize,
 ) -> HandleOutcome {
-    match api_key {
-        API_KEY_API_VERSIONS => handle_api_versions(api_version, body),
-        API_KEY_METADATA => handle_metadata(api_version, body, broker, max_frame_size),
-        API_KEY_FETCH => handle_versioned_request(
-            API_KEY_FETCH,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<FetchRequest>(v, b, |v, b| {
-                    validate_fetch_shape(v, b, max_frame_size)
-                })
-            },
-            encode_fetch_response,
-            encode_fetch_error_response,
-            "Fetch",
-        ),
-        API_KEY_LIST_OFFSETS => handle_versioned_request(
-            API_KEY_LIST_OFFSETS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<ListOffsetsRequest>(v, b, |v, b| {
-                    validate_list_offsets_shape(v, b, max_frame_size)
-                })
-            },
-            encode_list_offsets_response,
-            encode_list_offsets_error_response,
-            "ListOffsets",
-        ),
-        API_KEY_CREATE_TOPICS => handle_versioned_request(
-            API_KEY_CREATE_TOPICS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<CreateTopicsRequest>(v, b, |v, b| {
-                    validate_create_topics_shape(v, b, max_frame_size)
-                })
-            },
-            encode_create_topics_response,
-            encode_create_topics_error_response,
-            "CreateTopics",
-        ),
-        // Unknown API key: no api-specific response schema exists, so any body we send is
-        // misparsed by the client against the schema it expected. Close is unambiguous.
-        _ => HandleOutcome::Close,
-    }
-}
-
-fn handle_api_versions(api_version: i16, body: Bytes) -> HandleOutcome {
-    if !is_supported_version(API_KEY_API_VERSIONS, api_version) {
-        // KIP-511: reply with v0 when the requested version is not understood.
-        return respond_or_close(
-            encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION),
-            "ApiVersions",
-        );
-    }
-    match decode_guarded::<ApiVersionsRequest>(api_version, body, validate_api_versions_shape) {
-        Ok(_) => respond_or_close(
-            encode_api_versions_response(api_version, ERROR_NONE),
-            "ApiVersions",
-        ),
-        Err(error) => {
-            // debug!, not warn!: attacker-controlled, not operator-actionable (see the same
-            // note on the Produce decode-failure arm above).
-            tracing::debug!(%error, "failed to decode ApiVersions request");
-            respond_or_close(
-                encode_api_versions_response(api_version, ERROR_INVALID_REQUEST),
-                "ApiVersions",
-            )
-        }
-    }
-}
-
-fn handle_metadata(
-    api_version: i16,
-    body: Bytes,
-    broker: &BrokerAdvertise,
-    max_frame_size: usize,
-) -> HandleOutcome {
-    if !is_supported_version(API_KEY_METADATA, api_version) {
-        // Clamping the response to the supported max leaves a body the client parses at its own
-        // (unsupported) version, so UNSUPPORTED_VERSION never survives. Clients that skip
-        // ApiVersions get a naked close instead.
-        tracing::warn!(
-            api_version,
-            max_supported = supported_max_version(API_KEY_METADATA),
-            "Metadata version unsupported; closing connection"
-        );
-        return HandleOutcome::Close;
-    }
-    match decode_metadata_topics(api_version, body, max_frame_size) {
-        Ok(topics) => respond_or_close(
-            encode_metadata_response(api_version, &topics, broker, ERROR_NONE),
-            "Metadata",
-        ),
-        Err(error) => {
-            // Metadata has no top-level error field; a malformed body cannot carry
-            // INVALID_REQUEST in a version-correct way for every client. Close.
-            // debug!, not warn!: attacker-controlled, not operator-actionable.
-            tracing::debug!(
-                %error,
-                api_version,
-                "Failed to decode Metadata request; closing connection"
-            );
-            HandleOutcome::Close
-        }
-    }
-}
-
-fn handle_versioned_request<T>(
-    api_key: i16,
-    api_version: i16,
-    body: Bytes,
-    decode: impl FnOnce(i16, Bytes) -> Result<T>,
-    encode_ok: impl FnOnce(i16, &T) -> Result<Bytes>,
-    encode_err: impl Fn(i16, i16) -> Result<Bytes>,
-    api_name: &str,
-) -> HandleOutcome {
-    if is_supported_version(api_key, api_version) {
-        match decode(api_version, body) {
-            Ok(req) => respond_or_close(encode_ok(api_version, &req), api_name),
-            Err(error) => {
-                // debug!, not warn!: attacker-controlled, not operator-actionable.
-                tracing::debug!(%error, "Failed to decode {api_name} request");
-                respond_or_close(encode_err(api_version, ERROR_INVALID_REQUEST), api_name)
-            }
-        }
-    } else {
-        unsupported_version_response(api_key, api_version, |version| {
-            encode_err(version, ERROR_UNSUPPORTED_VERSION)
-        })
-    }
-}
-
-/// Unsupported-version policy for APIs whose encoders only implement up to
-/// [`ApiVersionRange::max_version`].
-///
-/// - `api_version > max`: Close. `SUPPORTED_RANGES` is the governance boundary, not just an
-///   encoding-capability limit - `kafka_protocol` can often encode versions above our firewall
-///   max just fine, but responding there would silently widen what this gateway accepts.
-/// - `api_version < min`: Respond with an error shaped for that version when `kafka_protocol`
-///   can encode it, otherwise `encode` fails and [`respond_or_close`] closes instead. In
-///   practice every `SUPPORTED_RANGES` min was chosen at or above the oldest version
-///   `kafka_protocol` implements for that message, so this always closes today (e.g.
-///   `ListOffsets` v0's legacy `old_style_offsets` shape predates the crate's schema) - kept
-///   generic rather than hard-coded so a future `kafka_protocol` upgrade that widens a schema's
-///   floor is picked up automatically instead of silently staying on `Close`.
-fn unsupported_version_response(
-    api_key: i16,
-    api_version: i16,
-    encode: impl FnOnce(i16) -> Result<Bytes>,
-) -> HandleOutcome {
-    let max_version = SUPPORTED_RANGES
-        .iter()
-        .find(|r| r.api_key == api_key)
-        .map_or(0, |r| r.max_version);
-    if api_version > max_version {
-        tracing::warn!(
-            api_key,
-            api_version,
-            max_version,
-            "request version above encoder max; closing connection"
-        );
-        return HandleOutcome::Close;
-    }
-    respond_or_close(encode(api_version), "unsupported-version")
+    dispatch(state, connection, principal, api_key, api_version, body).await
 }
 
 #[must_use]
@@ -521,149 +690,339 @@ pub fn supported_max_version(api_key: i16) -> Option<i16> {
         .map(|r| r.max_version)
 }
 
-/// Min version advertised in `ApiVersions` (may differ from the firewall min).
+/// Advertised only when SASL is switched on, and deliberately absent from [`SUPPORTED_RANGES`].
 ///
-/// Produce must advertise min=0 per KAFKA-18659 / `PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION`
-/// even though this gateway only accepts Produce v3+.
+/// These two keys never reach [`handle_request_bounded`]: the connection loop routes them through
+/// the SASL state machine before dispatch, whether SASL is on or off. With it off every connection
+/// starts authenticated, so both keys are answered `ILLEGAL_SASL_STATE` and the connection stays
+/// open, the answer a real broker gives on a PLAINTEXT listener. Keeping them out of the firewall
+/// table means dispatch never serves them on its own.
+///
+/// `SaslHandshake` v0 selects a bare token with no request header after it (KIP-152), and v1 a
+/// token in a `SaslAuthenticate` request. The connection loop serves both.
+static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
+    ApiVersionRange {
+        // librdkafka gates its whole SASL-handshake feature on `SaslHandshake` v0 appearing in the
+        // advertisement (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so
+        // advertising v1 alone makes it report "SASL Handshake not supported by broker" and give
+        // up before it ever sends one. It then picks v1, because `SaslAuthenticate` being
+        // advertised is what selects the KIP-152 framing.
+        api_key: API_KEY_SASL_HANDSHAKE,
+        min_version: 0,
+        max_version: 1,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_SASL_AUTHENTICATE,
+        min_version: 0,
+        max_version: 2,
+    },
+];
+
+/// Versions of `DescribeAcls` this gateway answers.
+///
+/// Public so the connection loop can enforce it. The key is deliberately absent from this module's
+/// `SUPPORTED_RANGES` firewall table, which is what makes this the only bound there is, and the
+/// advertised range below is derived from it so the two cannot drift apart.
+pub const SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS: std::ops::RangeInclusive<i16> = 1..=3;
+
+/// Advertised only on a listener that names a principal, and absent from [`SUPPORTED_RANGES`]
+/// for the same reason the SASL keys are: it answers about the authenticated principal, which
+/// only the connection knows. On a plaintext listener with SASL off there is none, so there is
+/// nothing it could truthfully describe, and advertising it would invite a question with no
+/// answer. An `SSL` listener that verifies client certificates names one too, so it is advertised
+/// there without the SASL keys.
+static ACL_ADVERTISED_RANGES: &[ApiVersionRange] = &[ApiVersionRange {
+    api_key: API_KEY_DESCRIBE_ACLS,
+    min_version: *SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.start(),
+    max_version: *SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS.end(),
+}];
+
+/// Sent with every `SASL_AUTHENTICATION_FAILED`, whatever the real cause.
+///
+/// Iggy's own login runs a dummy hash for an unknown user precisely so that "no such user" and
+/// "wrong password" are indistinguishable from the outside. Naming the cause here would undo that
+/// server-side care at the gateway. An unreachable Iggy reaches the client the same way, and the
+/// gateway's own log is where the difference is recorded.
+pub const SASL_AUTH_FAILED_MESSAGE: &str = "Authentication failed";
+
+/// Decodes a `DescribeAcls` filter.
+///
+/// # Errors
+///
+/// Returns an error when the body is not a well-formed `DescribeAcls` request at `api_version`.
+pub fn decode_acl_filter(api_version: i16, body: Bytes) -> Result<AclFilter> {
+    let req = decode_guarded::<DescribeAclsRequest>(api_version, body, |v, b| {
+        validate_describe_acls_shape(v, b)
+    })?;
+    Ok(AclFilter {
+        resource_type: req.resource_type_filter,
+        resource_name: req.resource_name_filter.map(|name| name.to_string()),
+        pattern_type: req.pattern_type_filter,
+        principal: req.principal_filter.map(|name| name.to_string()),
+        host: req.host_filter.map(|name| name.to_string()),
+        operation: req.operation,
+        permission_type: req.permission_type,
+    })
+}
+
+/// Answers `DescribeAcls` for `principal`, selecting from what Iggy already grants them.
 #[must_use]
-pub const fn advertised_min_version(api_key: i16, firewall_min: i16) -> i16 {
-    if api_key == API_KEY_PRODUCE {
-        0
-    } else {
-        firewall_min
+pub fn describe_acls_outcome(
+    api_version: i16,
+    principal: &str,
+    permissions: &PrincipalPermissions,
+    filter: &AclFilter,
+) -> HandleOutcome {
+    let selected: Vec<AclBinding> = acl::bindings_for(permissions)
+        .into_iter()
+        .filter(|binding| filter.matches(binding, principal))
+        .collect();
+    respond_or_close(
+        encode_describe_acls_response(api_version, principal, &selected),
+        "DescribeAcls",
+    )
+}
+
+/// `DescribeAcls` answer carrying only an error code.
+///
+/// `close` marks the refusals that must end the connection. A caller that keeps it open is saying
+/// the client may usefully send something else on it, which is true of a malformed filter and not
+/// of a state violation.
+#[must_use]
+pub fn respond_describe_acls_error(
+    api_version: i16,
+    error_code: i16,
+    close: bool,
+) -> HandleOutcome {
+    match encode_describe_acls_error_response(api_version, error_code) {
+        Ok(body) if close => HandleOutcome::RespondThenClose(body),
+        Ok(body) => HandleOutcome::Respond(body),
+        Err(error) => {
+            tracing::warn!(%error, "failed to encode DescribeAcls error; closing connection");
+            HandleOutcome::Close
+        }
     }
 }
 
-fn encode_api_versions_response(api_version: i16, error_code: i16) -> Result<Bytes> {
-    let api_keys = SUPPORTED_RANGES
-        .iter()
-        .map(|r| {
-            ApiVersion::default()
-                .with_api_key(r.api_key)
-                .with_min_version(advertised_min_version(r.api_key, r.min_version))
-                .with_max_version(r.max_version)
-        })
-        .collect();
-    let resp = ApiVersionsResponse::default()
-        .with_error_code(error_code)
-        .with_api_keys(api_keys);
-    encode_message(&resp, api_version, 128)
-}
-
-fn encode_metadata_response(
-    response_version: i16,
-    topics: &[StrBytes],
-    broker: &BrokerAdvertise,
-    topic_error_override: i16,
-) -> Result<Bytes> {
-    // Stub has no topic catalog: echo requested names with UNKNOWN_TOPIC_OR_PARTITION,
-    // or a forced override (unused today; kept for symmetry with other encoders).
-    let topic_error = if topic_error_override == ERROR_NONE {
-        ERROR_UNKNOWN_TOPIC_OR_PARTITION
-    } else {
-        topic_error_override
-    };
-
-    let response_topics = topics
-        .iter()
-        .map(|name| {
-            MetadataResponseTopic::default()
-                .with_error_code(topic_error)
-                .with_name(Some(TopicName(name.clone())))
-        })
-        .collect();
-
-    let broker_entry = MetadataResponseBroker::default()
-        .with_node_id(BrokerId(1))
-        .with_host(StrBytes::from_string(broker.host.clone()))
-        .with_port(broker.port);
-
-    let resp = MetadataResponse::default()
-        .with_brokers(vec![broker_entry])
-        .with_controller_id(BrokerId(1))
-        .with_topics(response_topics);
-
-    encode_message(&resp, response_version, 256)
-}
-
-/// Decodes a Metadata request body so the response can echo topic names.
+/// Reads the mechanism name out of a `SaslHandshake` body without consuming the caller's copy.
 ///
-/// A null topics array (`-1` legacy / `varint=0` compact) means "all topics" and decodes to an
-/// empty list for this stub. A null per-topic `name` (v10+ allows topic-id-only lookups) has no
-/// name to echo, so it errors rather than silently dropping the topic from the response.
-fn decode_metadata_topics(
-    api_version: i16,
-    body: Bytes,
-    max_frame_size: usize,
-) -> Result<Vec<StrBytes>> {
-    let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
-        validate_metadata_shape(v, b, max_frame_size)
+/// # Errors
+///
+/// Returns an error when the body is not a well-formed `SaslHandshake` request at `api_version`.
+pub fn decode_sasl_mechanism(api_version: i16, body: Bytes) -> Result<String> {
+    let req = decode_guarded::<SaslHandshakeRequest>(api_version, body, |v, b| {
+        validate_sasl_handshake_shape(v, b)
     })?;
-    req.topics
-        .unwrap_or_default()
-        .into_iter()
-        .map(|topic| {
-            topic
-                .name
-                .map(|name| name.0)
-                .ok_or(KafkaProtocolError::NullTopicName)
-        })
-        .collect()
+    Ok(req.mechanism.to_string())
+}
+
+/// Reads the opaque token out of a `SaslAuthenticate` body.
+///
+/// # Errors
+///
+/// Returns an error when the body is not a well-formed `SaslAuthenticate` request at
+/// `api_version`, including when its token exceeds the guard's size cap.
+pub fn decode_sasl_auth_bytes(api_version: i16, body: Bytes) -> Result<Bytes> {
+    let req = decode_guarded::<SaslAuthenticateRequest>(api_version, body, |v, b| {
+        validate_sasl_authenticate_shape(v, b)
+    })?;
+    Ok(req.auth_bytes)
+}
+
+/// `SaslHandshake` answer. `close` marks the refusal paths, where the response is written and the
+/// connection then dropped.
+#[must_use]
+pub fn sasl_handshake_outcome(api_version: i16, error_code: i16, close: bool) -> HandleOutcome {
+    // The mechanism list is what a client prints to tell its operator what to configure, so an
+    // unsupported-mechanism refusal carries it. `ILLEGAL_SASL_STATE` does not: the request was out
+    // of order, not mis-configured, and a real broker answers that one with an empty list. It also
+    // means a gateway with SASL switched off stops telling an unauthenticated scanner that it
+    // could speak PLAIN.
+    let mechanisms: &[&str] = if error_code == ERROR_ILLEGAL_SASL_STATE {
+        &[]
+    } else {
+        SaslMechanism::advertised()
+    };
+    let encoded = encode_sasl_handshake_response(api_version, error_code, mechanisms);
+    finish_sasl(encoded, close, "SaslHandshake")
+}
+
+/// `SaslAuthenticate` answer. `close` marks the refusal paths.
+#[must_use]
+pub fn sasl_authenticate_outcome(api_version: i16, error_code: i16, close: bool) -> HandleOutcome {
+    // Only a credential rejection carries the generic message. An `ILLEGAL_SASL_STATE` also
+    // travels on this response, and calling a protocol-ordering mistake an authentication failure
+    // would send the operator looking at credentials that were never presented.
+    let message =
+        (error_code == ERROR_SASL_AUTHENTICATION_FAILED).then_some(SASL_AUTH_FAILED_MESSAGE);
+    let encoded = encode_sasl_authenticate_response(api_version, error_code, message);
+    finish_sasl(encoded, close, "SaslAuthenticate")
+}
+
+fn finish_sasl(
+    encoded: iggy_kafka_wire::Result<Bytes>,
+    close: bool,
+    api_name: &str,
+) -> HandleOutcome {
+    match encoded {
+        Ok(body) if close => HandleOutcome::RespondThenClose(body),
+        Ok(body) => HandleOutcome::Respond(body),
+        Err(error) => {
+            tracing::warn!(%error, "failed to encode {api_name} response; closing connection");
+            HandleOutcome::Close
+        }
+    }
+}
+
+/// The SASL keys, advertised only on a listener that runs the exchange.
+#[must_use]
+pub fn sasl_advertised_ranges() -> &'static [ApiVersionRange] {
+    SASL_ADVERTISED_RANGES
+}
+
+/// The ACL keys, advertised only on a listener that names a principal.
+#[must_use]
+pub fn acl_advertised_ranges() -> &'static [ApiVersionRange] {
+    ACL_ADVERTISED_RANGES
+}
+
+/// Builds a well-formed error response for `api_key`, shaped for `api_version`.
+///
+/// Used when a request is refused for a reason that belongs to the connection rather than the
+/// request body, which today means `ILLEGAL_SASL_STATE` on an unauthenticated connection. A real
+/// broker answers from the offending request's own schema so the client can parse the body at the
+/// version it asked for, then drops the connection.
+///
+/// Two keys get [`HandleOutcome::Close`] with no body instead. Produce, because `acks=0` forbids a
+/// response and the acks value is not knowable without decoding a body this connection has not
+/// earned the right to have decoded. Metadata, because it carries no top-level error field at the
+/// versions this gateway supports, so there is no well-formed place to put the code.
+#[must_use]
+pub fn encode_error_for_key(
+    api_key: i16,
+    api_version: i16,
+    error_code: i16,
+    advertisement: Advertisement,
+) -> HandleOutcome {
+    // The firewall applies here too, and it has to be checked explicitly. `kafka_protocol`'s
+    // encoders accept a wider version range than `SUPPORTED_RANGES` does (Fetch to 18 against a
+    // firewall max of 12, for instance), so encoding at the version the client asked for would
+    // answer a pre-authentication Fetch v13 with a well-formed v13 body on the one path where the
+    // caller has proven nothing, while the dispatch path closes on the same request.
+    if !is_supported_version(api_key, api_version) {
+        return HandleOutcome::Close;
+    }
+    let encoded = match api_key {
+        API_KEY_FETCH => fetch::encode_error_response(api_version, error_code),
+        API_KEY_LIST_OFFSETS => list_offsets::encode_error_response(api_version, error_code),
+        API_KEY_CREATE_TOPICS => create_topics::encode_error_response(api_version, error_code),
+        API_KEY_DESCRIBE_CONFIGS => {
+            describe_configs::encode_error_response(api_version, error_code)
+        }
+        API_KEY_ALTER_CONFIGS => alter_configs::encode_error_response(api_version, error_code),
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => {
+            incremental_alter_configs::encode_error_response(api_version, error_code)
+        }
+        API_KEY_DESCRIBE_CLUSTER => {
+            describe_cluster::encode_error_response(api_version, error_code)
+        }
+        // Carries the listener's live advertisement, not a hardcoded `NONE`: answering an
+        // illegal-state ApiVersions with a SASL-less key set contradicts the advertisement sent
+        // one frame earlier on the same connection.
+        API_KEY_API_VERSIONS => {
+            api_versions::encode_response(api_version, error_code, advertisement)
+        }
+        _ => return HandleOutcome::Close,
+    };
+    match encoded {
+        Ok(body) => HandleOutcome::RespondThenClose(body),
+        Err(error) => {
+            tracing::debug!(%error, api_key, "no encodable error response; closing connection");
+            HandleOutcome::Close
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use iggy_kafka_wire::bounds_guard::guarded_range;
+
     use super::*;
 
-    const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
-
+    /// A version this gateway advertises but the guard does not walk would reach the decoder
+    /// unchecked, so the two tables must never drift apart.
     #[test]
-    fn decode_metadata_topics_legacy_null_topic_name_fails() {
-        let body = Bytes::from_static(&[
-            0x00, 0x00, 0x00, 0x01, // one topic
-            0xff, 0xff, // null topic name
-        ]);
-        let err = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap_err();
-        assert!(matches!(err, KafkaProtocolError::NullTopicName));
+    fn every_advertised_version_is_guarded() {
+        let advertised = supported_api_ranges()
+            .iter()
+            .chain(sasl_advertised_ranges())
+            .chain(acl_advertised_ranges());
+        for range in advertised {
+            let guarded = guarded_range(range.api_key)
+                .unwrap_or_else(|| panic!("api key {} has no guarded range", range.api_key));
+            assert!(
+                guarded.min_version <= range.min_version
+                    && range.max_version <= guarded.max_version,
+                "api key {}: advertised {}..={} exceeds guarded {}..={}",
+                range.api_key,
+                range.min_version,
+                range.max_version,
+                guarded.min_version,
+                guarded.max_version
+            );
+        }
     }
 
     #[test]
-    fn decode_metadata_topics_legacy_null_array_means_all_topics() {
-        // -1 is the spec-defined "all topics" sentinel for the legacy i32 array count, not a
-        // malformed request - must decode to an empty list.
-        let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
-        let topics = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert!(topics.is_empty());
+    fn given_request_headers_should_keep_the_first_client_id_that_one_names() {
+        let connection = ConnectionState::default();
+        connection.note_client_id(None);
+        connection.note_client_id(Some(""));
+        assert_eq!(connection.client_id().as_str(), "");
+
+        connection.note_client_id(Some("consumer-g-1"));
+        connection.note_client_id(Some("consumer-g-2"));
+        assert_eq!(connection.client_id().as_str(), "consumer-g-1");
     }
 
+    /// A 2-byte character that crosses the cap is left out whole, so the id stays UTF-8.
     #[test]
-    fn decode_metadata_topics_empty_body_is_malformed() {
-        assert!(decode_metadata_topics(0, Bytes::new(), TEST_MAX_FRAME_SIZE).is_err());
+    fn given_a_client_id_past_the_cap_should_keep_its_start() {
+        let connection = ConnectionState::default();
+        let client_id = format!("{}é", "c".repeat(MAX_CLIENT_ID_BYTES - 1));
+        connection.note_client_id(Some(&client_id));
+        assert_eq!(
+            connection.client_id().as_str(),
+            &client_id[..MAX_CLIENT_ID_BYTES - 1]
+        );
     }
 
+    /// Kafka shows a member's host as `/` and the address, without the port.
     #[test]
-    fn decode_metadata_topics_flexible_truncated_after_topics_fails() {
-        // topics = null (all topics) but missing allow_auto / auth flags / tagged fields.
-        let body = Bytes::from_static(&[0x00]);
-        assert!(decode_metadata_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
-    }
-
-    #[test]
-    fn decode_api_versions_v3_requires_software_fields() {
-        assert!(decode_exhaustive::<ApiVersionsRequest>(3, Bytes::new()).is_err());
-    }
-
-    #[test]
-    fn decode_api_versions_v3_accepts_valid_body() {
-        // Hand-encoded rather than round-tripped through `ApiVersionsRequest::encode`: encoding
-        // is gated behind the crate's "client" feature, which this broker-only binary doesn't
-        // enable.
-        let body = Bytes::from_static(&[
-            0x0a, b'i', b'g', b'g', b'y', b'-', b't', b'e', b's',
-            b't', // compact string (len 9)
-            0x06, b'0', b'.', b'1', b'.', b'0', // compact string (len 5)
-            0x00, // empty tagged fields
-        ]);
-        decode_exhaustive::<ApiVersionsRequest>(3, body).unwrap();
+    fn given_a_peer_should_report_its_address_as_kafka_does() {
+        let peer: SocketAddr = "192.0.2.10:51234".parse().unwrap();
+        assert_eq!(
+            ConnectionState::default()
+                .with_peer(peer)
+                .client_host()
+                .as_str(),
+            "/192.0.2.10"
+        );
+        let peer: SocketAddr = "[::ffff:192.0.2.10]:51234".parse().unwrap();
+        assert_eq!(
+            ConnectionState::default()
+                .with_peer(peer)
+                .client_host()
+                .as_str(),
+            "/192.0.2.10"
+        );
+        let peer: SocketAddr = "[2001:db8::1]:51234".parse().unwrap();
+        assert_eq!(
+            ConnectionState::default()
+                .with_peer(peer)
+                .client_host()
+                .as_str(),
+            "/2001:db8::1"
+        );
     }
 }

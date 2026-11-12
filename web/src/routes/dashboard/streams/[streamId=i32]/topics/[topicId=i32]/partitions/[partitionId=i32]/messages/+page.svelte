@@ -19,15 +19,15 @@ under the License.
 
 <script lang="ts">
   import { page } from '$app/state';
-  import Button from '$lib/components/Button.svelte';
-  import Icon from '$lib/components/Icon.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import Icon from '#lib/components/Icon.svelte';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
-  import { openModal } from '$lib/components/Modals/AppModals.svelte';
-  import SortableList from '$lib/components/SortableList.svelte';
-  import Paginator from '$lib/components/Paginator.svelte';
-  import type { MessagePartition } from '$lib/domain/Message';
-  import type { TopicDetails } from '$lib/domain/TopicDetails';
+  import { openModal } from '#lib/components/Modals/AppModals.svelte';
+  import SortableList from '#lib/components/SortableList.svelte';
+  import Paginator from '#lib/components/Paginator.svelte';
+  import type { MessagePartition } from '#lib/domain/Message.js';
+  import type { TopicDetails } from '#lib/domain/TopicDetails.js';
   import { SvelteURLSearchParams } from 'svelte/reactivity';
 
   interface Props {
@@ -65,16 +65,11 @@ under the License.
     searchParams.set('offset', offset.toString());
     searchParams.set('direction', direction);
 
-    // TODO: https://github.com/sveltejs/kit/issues/14750
     await goto(
-      // eslint-disable-next-line svelte/no-navigation-without-resolve
       resolve(
-        `/dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}/partitions/${page.params.partitionId}/messages`
+        `dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}/partitions/${page.params.partitionId}/messages`
       ) + `?${searchParams}`,
-      {
-        keepFocus: true,
-        noScroll: true
-      }
+      { reset: false }
     );
     currentPage = pageNum;
   }
@@ -95,7 +90,7 @@ under the License.
     variant="rounded"
     class="mr-5"
     onclick={() =>
-      goto(resolve(`/dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}`))}
+      goto(resolve(`dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}`))}
   >
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>

@@ -19,15 +19,15 @@ under the License.
 
 <script lang="ts">
   import { page } from '$app/state';
-  import Button from '$lib/components/Button.svelte';
-  import Icon from '$lib/components/Icon.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import Icon from '#lib/components/Icon.svelte';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
-  import { typedRoute } from '$lib/types/appRoutes';
-  import { openModal } from '$lib/components/Modals/AppModals.svelte';
-  import SortableList from '$lib/components/SortableList.svelte';
-  import type { Topic } from '$lib/domain/Topic';
-  import type { Partition } from '$lib/domain/Partition';
+  import { typedRoute } from '#lib/types/appRoutes.js';
+  import { openModal } from '#lib/components/Modals/AppModals.svelte';
+  import SortableList from '#lib/components/SortableList.svelte';
+  import type { Topic } from '#lib/domain/Topic.js';
+  import type { Partition } from '#lib/domain/Partition.js';
 
   interface Props {
     data: {
@@ -39,7 +39,7 @@ under the License.
 
   let { data }: Props = $props();
   let topic = $derived(data.topic);
-  let prevPage = $derived(typedRoute(`/dashboard/streams/${+(page.params.streamId || '')}`));
+  let prevPage = $derived(typedRoute(`dashboard/streams/${+(page.params.streamId || '')}`));
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
@@ -94,7 +94,7 @@ under the License.
   hrefBuilder={(partition) =>
     resolve(
       typedRoute(
-        `/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}/partitions/${partition.id}/messages`
+        `dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}/partitions/${partition.id}/messages`
       )
     )}
   colNames={{

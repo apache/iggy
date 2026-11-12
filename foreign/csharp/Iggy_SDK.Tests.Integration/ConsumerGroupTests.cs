@@ -21,6 +21,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
@@ -199,9 +200,8 @@ public class ConsumerGroupTests
                 Identifier.String(TopicName), Identifier.Numeric(cg!.Id));
         }
 
-        var response = await client.GetConsumerGroupByIdAsync(Identifier.String(streamName),
-            Identifier.String(TopicName),
-            Identifier.Numeric(cg!.Id));
+        var response = await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName),
+            Identifier.String(TopicName), Identifier.Numeric(cg!.Id), 2);
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(cg.Id);

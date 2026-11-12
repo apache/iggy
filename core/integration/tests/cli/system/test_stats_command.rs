@@ -25,6 +25,7 @@ use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::IggyMessage;
 use iggy::prelude::Partitioning;
+use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::TopicCreateOptions;
 use iggy_cli::commands::binary_system::stats::GetStatsOutput;
 use iggy_common::Stats;
@@ -67,7 +68,9 @@ impl TestStatsCmd {
 impl IggyCmdTestCase for TestStatsCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream_id = Identifier::from_str_value("logs").unwrap();
-        let stream = client.create_stream(&stream_id.as_string()).await;
+        let stream = client
+            .create_stream(&stream_id.as_string(), &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
 
         let topic = client
@@ -103,7 +106,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains("Consumer Groups Count    | 0"))
                     .stdout(contains("Threads Count"))
                     .stdout(contains("Free Disk Space"))
-                    .stdout(contains("Total Disk Space"));
+                    .stdout(contains("Total Disk Space"))
+                    .stdout(contains("Open Files Count"))
+                    .stdout(contains("Open Files Limit"));
             }
             TestStatsCmdOutput::Set(GetStatsOutput::List) => {
                 command_state
@@ -116,7 +121,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains("Consumer Groups Count|0"))
                     .stdout(contains("Threads Count|"))
                     .stdout(contains("Free Disk Space|"))
-                    .stdout(contains("Total Disk Space|"));
+                    .stdout(contains("Total Disk Space|"))
+                    .stdout(contains("Open Files Count|"))
+                    .stdout(contains("Open Files Limit|"));
             }
             TestStatsCmdOutput::Set(GetStatsOutput::Json) => {
                 command_state
@@ -129,7 +136,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains(r#""consumer_groups_count": 0"#))
                     .stdout(contains(r#""threads_count":"#))
                     .stdout(contains(r#""free_disk_space":"#))
-                    .stdout(contains(r#""total_disk_space":"#));
+                    .stdout(contains(r#""total_disk_space":"#))
+                    .stdout(contains(r#""open_files_count":"#))
+                    .stdout(contains(r#""open_files_limit":"#));
             }
             TestStatsCmdOutput::Set(GetStatsOutput::Toml) => {
                 command_state
@@ -142,7 +151,9 @@ impl IggyCmdTestCase for TestStatsCmd {
                     .stdout(contains("consumer_groups_count = 0"))
                     .stdout(contains("threads_count ="))
                     .stdout(contains("free_disk_space ="))
-                    .stdout(contains("total_disk_space ="));
+                    .stdout(contains("total_disk_space ="))
+                    .stdout(contains("open_files_count ="))
+                    .stdout(contains("open_files_limit ="));
             }
         }
     }
@@ -175,7 +186,9 @@ impl TestStatsCmdWithMessages {
 #[async_trait]
 impl IggyCmdTestCase for TestStatsCmdWithMessages {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream("size-test").await;
+        let stream = client
+            .create_stream("size-test", &StreamCreateOptions::default())
+            .await;
         assert!(stream.is_ok());
         let stream_details = stream.unwrap();
         self.stream_id = stream_details.id;
@@ -243,6 +256,12 @@ impl IggyCmdTestCase for TestStatsCmdWithMessages {
         assert!(
             stats.free_disk_space.as_bytes_u64() <= stats.total_disk_space.as_bytes_u64(),
             "free_disk_space should be <= total_disk_space"
+        );
+        assert!(stats.open_files_count > 0, "open_files_count should be > 0");
+        assert!(stats.open_files_limit > 0, "open_files_limit should be > 0");
+        assert!(
+            stats.open_files_count <= stats.open_files_limit,
+            "open_files_count should be <= open_files_limit"
         );
     }
 

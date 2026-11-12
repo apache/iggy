@@ -11,7 +11,7 @@
 
 <div align="center">
 
-[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/apache-iggy) | [Crates](https://crates.io/crates/iggy)
+[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/quickstart/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/apache-iggy) | [Crates](https://crates.io/crates/iggy) | [Mailing list](https://iggy.apache.org/community/mailing-lists/)
 
 </div>
 <p align="center">
@@ -38,6 +38,27 @@
 <p align="center">
   <a title="Discord" target="_blank" href="https://discord.gg/apache-iggy"><img alt="Chat with Apache Iggy community on Discord" src="https://img.shields.io/discord/1144142576266530928?label=Discord&logo=Discord&style=social"></a>
 </p>
+
+**Contents:** [What is Apache Iggy?](#what-is-apache-iggy) ·
+[Features](#features) ·
+[Architecture](#architecture) ·
+[Clustering](#clustering) ·
+[Version](#version) ·
+[Supported languages SDK](#supported-languages-sdk) ·
+[CLI](#cli) ·
+[Web UI](#web-ui) ·
+[Connectors](#connectors) ·
+[Kafka gateway](#kafka-gateway) ·
+[Model Context Protocol](#model-context-protocol) ·
+[Docker](#docker) ·
+[Kubernetes](#kubernetes) ·
+[Configuration](#configuration) ·
+[Run the server](#run-the-server) ·
+[Try the CLI](#try-the-cli) ·
+[Examples](#examples) ·
+[SDK](#sdk) ·
+[Benchmarks](#benchmarks) ·
+[Contributing](#contributing)
 
 ---
 
@@ -81,9 +102,9 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - Additional features such as **server side message deduplication**
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, WebSocket, QUIC, HTTPS)
-- **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
+- **[Connectors](https://github.com/apache/iggy-connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
-- Optional server-side as well as client-side **data encryption** using AES-256-GCM
+- Optional server-side as well as client-side **data encryption** using AES-256-GCM, server-side with a separate key per stream
 - Optional metadata support in the form of **message headers**
 - Server-side message compression is not supported yet. Topic compression values
   are reserved for future disk/network compression support; use message headers
@@ -109,11 +130,23 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ---
 
+## Clustering
+
+Clustering is built into the standard `iggy-server` binary, with no separate build or feature flag. The same server runs as a single node or as a cluster, and `cluster.enabled` in the configuration chooses which. Clustering is disabled by default.
+
+Replicas stay consistent using [Viewstamped Replication (VSR)](https://github.com/apache/iggy/blob/master/assets/vsr.pdf), which commits on a quorum and elects a new primary when the current one fails. See the [clustering documentation](https://iggy.apache.org/docs/clustering/vsr) for configuration and deployment.
+
+---
+
 ## Version
 
-The official releases follow the regular semver (`0.7.0`) or have `latest` tag applied (`apache/iggy:latest`).
+The official releases follow semver (for example `server-0.9.0`), and the Docker images also carry the `latest` tag (`apache/iggy:latest`).
 
-We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
+The server, SDKs and CLI are versioned independently. For example, server 0.9.0 ships with Rust SDK 0.11.0 and CLI 0.14.0. The [server compatibility table](https://iggy.apache.org/docs/sdk/introduction#server-compatibility) lists the SDK version for each server release.
+
+We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
+
+This checkout moves the binary protocol to 0.12.0 and the metadata snapshot format to 14. Both are breaking: older clients and servers do not interoperate with it, and data directories written by older releases are refused. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 
@@ -126,7 +159,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/igg
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) and [PHP](https://github.com/apache/iggy/tree/master/foreign/php) are work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp), [PHP](https://github.com/apache/iggy/tree/master/foreign/php), and [Swift](https://github.com/apache/iggy/tree/master/foreign/swift) are work in progress.
 
 ---
 
@@ -148,41 +181,15 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 
 ## Connectors
 
-The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
+Connectors move data between Iggy streams and external systems. A source reads data from an external system and produces messages to an Iggy stream. A sink consumes messages from an Iggy stream and writes them to an external system. Each connector is a Rust plugin, and the connectors runtime loads the plugins and runs them.
 
-```toml
-## Configure a sink or source connector, depending on your needs in its own config file.
-type = "sink"
-key = "quickwit"
-enabled = true
-version = 0
-name = "Quickwit sink"
-path = "target/release/libiggy_connector_quickwit_sink"
-plugin_config_format = "yaml"
+The runtime, the plugin SDK and all sinks and sources live in [apache/iggy-connectors](https://github.com/apache/iggy-connectors). Open connector issues and pull requests there.
 
-[[streams]]
-stream = "qw"
-topics = ["records"]
-schema = "json"
-batch_length = 1000
-poll_interval = "5ms"
-consumer_group = "qw_sink_connector"
+---
 
-[transforms.add_fields]
-enabled = true
+## Kafka gateway
 
-[[transforms.add_fields.fields]]
-key = "service_name"
-value.static = "qw_connector"
-
-[[transforms.add_fields.fields]]
-key = "timestamp"
-value.computed = "timestamp_millis"
-
-[transforms.delete_fields]
-enabled = true
-fields = ["email", "created_at"]
-```
+The [Kafka gateway](https://github.com/apache/iggy/tree/master/gateways/kafka) is a Kafka wire protocol listener in front of Iggy, intended to let existing Kafka clients use Iggy. It is in development and not yet part of a release. See its [README](gateways/kafka/README.md) for the current status and how to run it.
 
 ---
 
@@ -196,30 +203,44 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 ## Docker
 
-The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+The official images are on [Docker Hub](https://hub.docker.com/r/apache/iggy). Images tagged `latest` are built from stable releases, and `edge` images are built from the latest `master` branch. Images for the other tools, such as the connectors runtime and the MCP server, are also on [Docker Hub](https://hub.docker.com/u/apache?page=1&search=iggy).
 
-You can also find the images for all the different tooling such as Connectors, MCP Server etc. at [Docker Hub](https://hub.docker.com/u/apache?page=1&search=iggy).
+The published image listens on `127.0.0.1` inside the container, so the host can't reach it by default. This command makes it reachable and sets the root credentials:
 
-Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
-
-You can find the `Dockerfile` and `docker-compose` in the root of the repository. To build and start the server, run: `docker compose up`.
-
-Additionally, you can run the `CLI` which is available in the running container, by executing: `docker exec -it iggy-server /iggy`.
-
-Keep in mind that running the container on the OS other than Linux, where the Docker is running in the VM, might result in the performance degradation.
-
-Also, when running the container, **make sure to include the additional capabilities**, as you can find in [docker-compose](https://github.com/apache/iggy/blob/master/docker-compose.yml) file:
-
-```yml
-cap_add:
-  - SYS_NICE
-security_opt:
-  - seccomp:unconfined
-ulimits:
-  memlock:
-    soft: -1
-    hard: -1
+```bash
+docker run -d --name iggy \
+  --cap-add=SYS_NICE --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=iggy \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 -e IGGY_HTTP_ADDRESS=0.0.0.0:3000 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
+  -p 8090:8090 -p 3000:3000 \
+  -v iggy:/app/local_data \
+  apache/iggy
 ```
+
+The CLI is on the image's `PATH`:
+
+```bash
+docker exec -it iggy iggy -u iggy -p iggy stream list
+```
+
+The `SYS_NICE` capability, the seccomp setting and the unlimited locked memory are required. The [Docker & Helm](https://iggy.apache.org/docs/server/docker) page explains why, and has a `docker-compose.yml` example and the Helm chart.
+
+On operating systems other than Linux, Docker runs in a VM, so the container might run slower.
+
+To build the image from source instead, run `docker compose up` from the root of the repository. That image listens on all interfaces and keeps its data in `/local_data`. The container is named `iggy-server`, and the CLI is at `/iggy`. The compose file requires `IGGY_ROOT_PASSWORD` from your shell (`IGGY_ROOT_PASSWORD=... docker compose up`) and defaults `IGGY_ROOT_USERNAME` to `iggy`.
+
+---
+
+## Kubernetes
+
+A Helm chart for the server and the Web UI is in [helm/charts/iggy](helm/charts/iggy):
+
+```bash
+helm install iggy ./helm/charts/iggy --set server.image.tag=0.9.0
+```
+
+See the chart [README](helm/charts/iggy/README.md) and the [Docker & Helm](https://iggy.apache.org/docs/server/docker) page for its settings.
 
 ---
 
@@ -233,6 +254,17 @@ When config file is not found, the default values from embedded `config.toml` fi
 
 Topic creation accepts two independent policies: `durability` for message acknowledgments and `consumer_offset_durability` for explicit offset stores and deletes. Both default to `replicated`. This means VSR quorum commit without waiting for stable storage. `persisted` also requires recoverable stable-storage copies on the replication quorum. Both policies normally store data on disk. Poll auto-commit remains asynchronous and is not covered by the poll response's completion.
 
+What each policy survives in a cluster of `n` replicas. A partition gets the `persisted` guarantees only when both `durability` and `consumer_offset_durability` are `persisted`. If either is `replicated`, the `replicated` rules below apply to the whole partition.
+
+- `persisted` keeps every acknowledged write through any pattern of crashes and restarts. It is needed to survive `q` or more replicas crashing at once, power loss of the whole cluster, or any crash in a one-replica cluster.
+- `replicated` keeps every acknowledged write as long as fewer than `q` replicas lose unflushed writes at the same time, where `q`, the replicas that acknowledge each write, is half the replicas rounded up but at most 3 (2 in a two-replica cluster). A replica that returns with that partition awaiting a state transfer counts as one of them: its log is not used, even if its WAL still holds ops.
+- Graceful restarts flush the WAL first and lose nothing, one at a time or all together. After a crash (SIGKILL, OOM kill) or power loss, a replica recovers a `replicated` partition up to the last WAL frontier it published, at a checkpoint, a durable operation or a graceful shutdown, and discards later writes even if the OS held them. Under `replicated`, `q` or more such crashes at once can lose the most recently acknowledged writes. In a one-replica cluster, any crash can.
+- A restarted `replicated` replica accepts no writes and acknowledges no prepares until it joins a settled view: one a running primary sends it, or one that an election starts. Until then writes and polls sent to it, binary or HTTP, fail with `TransientNotAccepted` (HTTP 503), which clients retry.
+  When no primary answers, the restarted replicas hold an election and mark their logs as possibly incomplete. A new view starts only from `n - q + 1` replicas whose logs are not marked (2 in a two-replica cluster, a majority up to six replicas), or once every replica has reported, and the partition stays unavailable until then.
+  After a full-cluster restart that means every replica must be back. A replica whose partition awaits a state transfer still reports without a log while it is recovering; once it has joined a view it stays out of later elections until its transfer completes. A replica that never returns halts the partition indefinitely (no operator override yet).
+  Mixed versions can drop acknowledged writes, see [Upgrading](core/server/README.md#upgrading).
+- When a replica adopts a view whose headers contradict partition history it already applied, it sets that partition's local files aside in `.fenced.N` and fetches it again from a peer instead of stopping the node. A contradiction outside the headers the view carries, and a WAL append whose parent check fails, still stop the node.
+
 The data directory is configured with `path` or `IGGY_PATH`. The layout beneath it is `streams/<stream>/topics/<topic>/partitions/<partition>`, with fixed directory names.
 
 The HTTP `Iggy-Durability` header reports `replicated` or `persisted` for awaited writes, and `none` for early dispatch acceptance.
@@ -243,11 +275,15 @@ Rust HTTP callers can use `HttpClient::send_messages_with_durability` to read th
 
 The CLI exposes `--durability persisted` and `--consumer-offset-durability persisted` on `topic create`. Select either independently. The policy names describe completion guarantees and do not prescribe an I/O syscall.
 
+Streams, topics and users carry options from one catalog, listed by `iggy options <scope>` and changed by one sparse update. Each encrypted stream has its own data key, wrapped under the server's `[encryption] key`, and a stream created without encryption stays plaintext for life. Rotating the server key is a two-phase change through `previous_keys` and `retired_kek_fingerprints`. See [Resource options](core/server/README.md#resource-options) and [Stream encryption](core/server/README.md#stream-encryption).
+
+Each node keeps a bounded log of the committed metadata changes, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A client with `manage_servers` follows it with `metadata.changes` on every transport, `GET /metadata/changes` over HTTP or `iggy metadata changes`, and rebuilds from current state pages when its position falls out of the log. See [Metadata changes](core/server/README.md#metadata-changes).
+
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 
 ---
 
-## Quick start
+## Run the server
 
 Build the project (the longer compilation time is due to [LTO](https://doc.rust-lang.org/rustc/linker-plugin-lto.html) enabled in release [profile](https://github.com/apache/iggy/blob/master/Cargo.toml#L2):
 
@@ -257,10 +293,10 @@ Run the tests:
 
 `cargo test`
 
-Set root user credentials (OPTIONAL):
+Set root user credentials before the first start:
 
 Iggy requires credentials to authenticate requests to the server.
-You can set the root user **before** starting the server.
+Set the root user **before** starting the server.
 
 (macOS/Linux)
 
@@ -276,8 +312,7 @@ $env:IGGY_ROOT_USERNAME = "iggy"
 $env:IGGY_ROOT_PASSWORD = "iggy"
 ```
 
-By default, `iggy-server` will generate a randomized root user password and print it to `stdout`, when there's
-NO users created.
+When root does not exist, the leader needs both variables or `--with-default-root-credentials` below to create it. The server never generates a root password and never writes either credential to its output or log files.
 
 Start the server:
 
@@ -291,7 +326,7 @@ it should only be used for development and testing.
 
 `cargo run --bin iggy-server -- --with-default-root-credentials`
 
-Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables are ignored. They are still validated, though: a half-set pair or an out-of-range value aborts the boot instead of being silently dropped. To reset credentials, delete the data directory.
+The leader creates root once and records the username and password hash in the metadata journal. Followers apply that same operation. Restarts recover the stored account without the variables or the flag, even before the first metadata checkpoint. Supplying different credentials does not replace the stored account. A half-set pair or an out-of-range value still aborts startup. To change the root password, use the API or the CLI.
 
 For configuration options and detailed help:
 
@@ -315,7 +350,11 @@ To quickly generate the sample data:
 
 `cargo run --bin data-seeder-tool`
 
-*Please note that all commands below are using `iggy` binary, which is part of release (`cli` sub-crate).*
+---
+
+## Try the CLI
+
+The commands below use the `iggy` CLI from the `core/cli` crate, run against the server started above.
 
 Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `websocket`, `tcp`, `http`, default `tcp`):
 
@@ -357,7 +396,7 @@ Finally, restart the server to see it is able to load the persisted data.
 
 The HTTP API endpoints can be found in [server.http](https://github.com/apache/iggy/blob/master/core/server/server.http) file, which can be used with [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension for VS Code.
 
-To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` environment variable. See images below:
+To see the detailed logs from the CLI/server, run it with the `RUST_LOG=trace` environment variable.
 
 ---
 
@@ -366,6 +405,8 @@ To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` envir
 You can find comprehensive sample applications under the `examples/rust` directory. These examples showcase various usage patterns of the Iggy client SDK, from basic operations to advanced multi-tenant scenarios.
 
 For detailed information about available examples and how to run them, please see the [Examples README](examples/rust/README.md).
+
+There are also examples for [C#](examples/csharp/README.md), [Go](examples/go/README.md), [Java](examples/java/README.md), [Node.js](examples/node/README.md), [PHP](examples/php/README.md) and [Python](examples/python/README.md).
 
 ---
 
@@ -399,20 +440,24 @@ producer.init().await?;
 let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
-// Create a consumer for the given stream and one of its topics
+// Create a consumer group member for the given stream and one of its topics.
+// It stores the last processed message every second and after each batch.
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
-    .auto_commit(AutoCommit::IntervalOrWhen(
-        NonZeroIggyDuration::from_str("1s")?,
-        AutoCommitWhen::ConsumingAllMessages,
-    ))
     .create_consumer_group_if_not_exists()
-    .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
-    .poll_interval(IggyDuration::from_str("1ms")?)
-    .batch_length(1000)
+    .poll_options(PollOptions {
+        count: 1000,
+        commit: CommitPolicy::Auto(AutoCommit {
+            interval: Some(NonZeroIggyDuration::from_str("1s")?),
+            every: Some(CommitEvery::Batch),
+            after: CommitAfter::Processing,
+        }),
+        ..PollOptions::wait(IggyDuration::from_str("1s")?)
+    })
     .build();
 
+// Joins the group and starts reading
 consumer.init().await?;
 
 // Start consuming the messages
@@ -420,6 +465,8 @@ while let Some(message) = consumer.next().await {
     // Handle the message
 }
 ```
+
+For batches of many partitions, use `PartitionReader` from `client.reader(...)`. The [Rust SDK README](core/sdk/README.md#reading-messages) describes the three ways to read, the commit options and what to do after a lost reply.
 
 ---
 

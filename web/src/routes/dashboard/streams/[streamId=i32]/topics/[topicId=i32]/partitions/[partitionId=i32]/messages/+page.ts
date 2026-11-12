@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { clientApi } from '$lib/api/clientApi';
-import { partitionMessagesDetailsMapper } from '$lib/domain/MessageDetails';
-import { topicDetailsMapper } from '$lib/domain/TopicDetails';
+import { clientApi } from '#lib/api/clientApi.js';
+import { partitionMessagesDetailsMapper } from '#lib/domain/MessageDetails.js';
+import { topicDetailsMapper } from '#lib/domain/TopicDetails.js';
 import type { PageLoad } from './$types';
 
 const MESSAGES_PER_PAGE = 20;

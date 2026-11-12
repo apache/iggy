@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::prelude::{Identifier, IggyDuration, IggyError};
+use crate::prelude::{IggyDuration, IggyError, PollOptions};
 use crate::stream_builder::{IggyConsumerConfig, IggyProducerConfig};
 use bon::Builder;
 
@@ -44,7 +44,7 @@ impl IggyStreamConfig {
     }
 
     /// Creates a new `IggyStreamConfig` from the given stream and topic names, along with the max
-    /// batch size, the send interval and the polling interval.
+    /// batch size, send interval and poll limits.
     ///
     /// # Args
     ///
@@ -52,7 +52,8 @@ impl IggyStreamConfig {
     /// * `topic` - The topic name.
     /// * `batch_length` - The max number of messages to send in a batch.
     /// * `linger_time` - The interval between messages sent.
-    /// * `polling_interval` - The interval between polling for new messages.
+    /// * `poll_options` - The limits of each poll request, and whether the server stores the
+    ///   offset of a read.
     ///
     /// Returns:
     /// A new `IggyStreamConfig`.
@@ -62,10 +63,9 @@ impl IggyStreamConfig {
         topic: &str,
         batch_length: u32,
         linger_time: IggyDuration,
-        polling_interval: IggyDuration,
+        poll_options: PollOptions,
     ) -> Result<Self, IggyError> {
-        let consumer_config =
-            IggyConsumerConfig::from_stream_topic(stream, topic, batch_length, polling_interval)?;
+        let consumer_config = IggyConsumerConfig::from_stream_topic(stream, topic, poll_options)?;
 
         let producer_config =
             IggyProducerConfig::from_stream_topic(stream, topic, batch_length, linger_time)?;
@@ -75,9 +75,7 @@ impl IggyStreamConfig {
             producer_config,
         })
     }
-}
 
-impl IggyStreamConfig {
     pub fn consumer_config(&self) -> &IggyConsumerConfig {
         &self.consumer_config
     }
@@ -85,55 +83,41 @@ impl IggyStreamConfig {
     pub fn producer_config(&self) -> &IggyProducerConfig {
         &self.producer_config
     }
-
-    pub fn stream_id(&self) -> &Identifier {
-        self.producer_config.stream_id()
-    }
-
-    pub fn stream_name(&self) -> &str {
-        self.producer_config.stream_name()
-    }
-
-    pub fn topic_id(&self) -> &Identifier {
-        self.producer_config.topic_id()
-    }
-
-    pub fn topic_name(&self) -> &str {
-        self.producer_config.topic_name()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::time::Duration;
+
+    const BATCH_LENGTH: u32 = 100;
+
+    fn poll_options() -> PollOptions {
+        PollOptions {
+            count: BATCH_LENGTH,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        }
+    }
 
     #[test]
     fn should_be_equal() {
-        let consumer_config = IggyConsumerConfig::from_stream_topic(
-            "test_stream",
-            "test_topic",
-            100,
-            IggyDuration::from_str("5ms").unwrap(),
-        )
-        .unwrap();
+        let consumer_config =
+            IggyConsumerConfig::from_stream_topic("test_stream", "test_topic", poll_options())
+                .unwrap();
 
         let producer_config = IggyProducerConfig::from_stream_topic(
             "test_stream",
             "test_topic",
-            100,
+            BATCH_LENGTH,
             IggyDuration::from_str("5ms").unwrap(),
         )
         .unwrap();
         let config = IggyStreamConfig::new(consumer_config, producer_config);
-        assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.consumer_config().batch_length(), 100);
-        assert_eq!(config.producer_config().batch_length(), 100);
-        assert_eq!(
-            config.consumer_config().polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
+        assert_eq!(config.consumer_config().stream_name(), "test_stream");
+        assert_eq!(config.producer_config().topic_name(), "test_topic");
+        assert_eq!(config.consumer_config().poll_options(), poll_options());
+        assert_eq!(config.producer_config().batch_length(), BATCH_LENGTH);
         assert_eq!(
             config.producer_config().linger_time(),
             IggyDuration::from_str("5ms").unwrap()
@@ -143,14 +127,13 @@ mod tests {
     #[test]
     fn should_be_default() {
         let config = IggyStreamConfig::default();
-        assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.consumer_config().batch_length(), 100);
-        assert_eq!(config.producer_config().batch_length(), 100);
+        assert_eq!(config.consumer_config().stream_name(), "test_stream");
+        assert_eq!(config.producer_config().topic_name(), "test_topic");
         assert_eq!(
-            config.consumer_config().polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
+            config.consumer_config().poll_options(),
+            PollOptions::wait(IggyDuration::from(Duration::from_secs(5)))
         );
+        assert_eq!(config.producer_config().batch_length(), BATCH_LENGTH);
         assert_eq!(
             config.producer_config().linger_time(),
             IggyDuration::from_str("5ms").unwrap()
@@ -162,22 +145,18 @@ mod tests {
         let res = IggyStreamConfig::from_stream_topic(
             "test_stream",
             "test_topic",
-            100,
+            BATCH_LENGTH,
             IggyDuration::from_str("5ms").unwrap(),
-            IggyDuration::from_str("5ms").unwrap(),
+            poll_options(),
         );
 
         assert!(res.is_ok());
         let config = res.unwrap();
 
-        assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.consumer_config().batch_length(), 100);
-        assert_eq!(config.producer_config().batch_length(), 100);
-        assert_eq!(
-            config.consumer_config().polling_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
+        assert_eq!(config.consumer_config().stream_name(), "test_stream");
+        assert_eq!(config.producer_config().topic_name(), "test_topic");
+        assert_eq!(config.consumer_config().poll_options(), poll_options());
+        assert_eq!(config.producer_config().batch_length(), BATCH_LENGTH);
         assert_eq!(
             config.producer_config().linger_time(),
             IggyDuration::from_str("5ms").unwrap()

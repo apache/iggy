@@ -16,6 +16,8 @@
 // under the License.
 
 pub mod api;
-pub mod bounds_guard;
-pub mod header;
-pub mod responses;
+pub mod auto_topic_creation;
+pub mod handlers;
+pub(crate) mod probe_board;
+
+pub use iggy_kafka_wire::{acl, bounds_guard, dedup, header, sasl, wire_len};

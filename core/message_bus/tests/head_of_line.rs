@@ -18,8 +18,8 @@
 //! Verify that a slow peer cannot stall sends to other peers.
 //!
 //! Setup: a sender bus has two replica connections. Peer A reads normally;
-//! peer B's listener accepts but then drops the read half (so the sender's
-//! kernel TCP send buffer eventually fills, blocking peer B's writer task).
+//! peer B completes the replica handshake, then stops reading (so the sender's
+//! kernel TCP send buffer eventually fills, blocking that peer's writer task).
 //! With the per-peer queue model, sends to peer A must remain O(microseconds)
 //! regardless of how blocked peer B is.
 
@@ -27,10 +27,9 @@ mod common;
 
 use common::{
     header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
-    set_replica_ctx,
+    set_replica_ctx, spawn_stalled_replica,
 };
-use compio::net::TcpListener;
-use iggy_binary_protocol::{Command, HEADER_SIZE};
+use iggy_binary_protocol::Command;
 use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
@@ -39,6 +38,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const CLUSTER: u128 = 0xF00D;
+const PEER_B_ID: u8 = 2;
 
 #[compio::test]
 async fn slow_peer_does_not_block_other_peers() {
@@ -58,33 +58,9 @@ async fn slow_peer_does_not_block_other_peers() {
     });
     bus_a.track_background(la_handle);
 
-    // Peer B: raw TCP listener that accepts connections but never reads
-    // from them. This is how we force head-of-line blocking: bus0's dial
-    // completes (TCP connect + Ping write into the peer's kernel recv
-    // buffer), but subsequent Prepare frames pile up. Once the kernel send
-    // buffer on bus0's side and the per-peer queue are both full,
-    // send_to_replica(2) returns Backpressure.
-    let lb = TcpListener::bind(loopback()).await.unwrap();
-    let addr_b = lb.local_addr().unwrap();
-    let held_streams: Rc<std::cell::RefCell<Vec<compio::net::TcpStream>>> =
-        Rc::new(std::cell::RefCell::new(Vec::new()));
-    let held_streams_clone = held_streams.clone();
-    let accept_b_handle = compio::runtime::spawn(async move {
-        while let Ok((mut stream, _)) = lb.accept().await {
-            // Complete the two-way mesh handshake (consume the dialer's
-            // Ping, ack it) so the dial installs; only then go mute. The
-            // head-of-line scenario needs an installed peer that stops
-            // reading, not a peer that never joins.
-            if message_bus::framing::read_message(&mut stream, HEADER_SIZE)
-                .await
-                .is_ok()
-            {
-                let ack = header_only(Command::Ping, CLUSTER, 2);
-                let _ = message_bus::framing::write_message(&mut stream, ack).await;
-            }
-            held_streams_clone.borrow_mut().push(stream);
-        }
-    });
+    // Peer B joins through the normal handshake, then stops reading so
+    // subsequent Prepare frames backpressure its independent writer.
+    let (addr_b, peer_b) = spawn_stalled_replica(&bus_a, PEER_B_ID).await;
 
     // Sender bus 0 dials both A and B.
     let bus0 = Rc::new(IggyMessageBus::with_capacity(0, 16));
@@ -94,14 +70,14 @@ async fn slow_peer_does_not_block_other_peers() {
     start_connector(
         &bus0,
         0,
-        vec![(1, addr_a), (2, addr_b)],
+        vec![(1, addr_a), (PEER_B_ID, addr_b)],
         dial_delegate,
         bus0.config().reconnect_period,
     )
     .await;
 
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !(bus0.replicas().contains(1) && bus0.replicas().contains(2)) {
+    while !(bus0.replicas().contains(1) && bus0.replicas().contains(PEER_B_ID)) {
         assert!(Instant::now() < deadline, "both replicas must connect");
         compio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -119,7 +95,7 @@ async fn slow_peer_does_not_block_other_peers() {
     let mut b_saturated = false;
     for _ in 0..100_000 {
         match bus0
-            .send_to_replica(2, header_only(Command::Prepare, 0, 0).into_frozen())
+            .send_to_replica(PEER_B_ID, header_only(Command::Prepare, 0, 0).into_frozen())
             .await
         {
             Ok(()) => {}
@@ -147,7 +123,7 @@ async fn slow_peer_does_not_block_other_peers() {
 
     let send_b_start = Instant::now();
     let send_b_result = bus0
-        .send_to_replica(2, header_only(Command::Prepare, 0, 0).into_frozen())
+        .send_to_replica(PEER_B_ID, header_only(Command::Prepare, 0, 0).into_frozen())
         .await;
     let send_b_elapsed = send_b_start.elapsed();
     let b_backpressured = matches!(send_b_result, Err(SendError::Backpressure));
@@ -178,6 +154,5 @@ async fn slow_peer_does_not_block_other_peers() {
 
     bus0.shutdown(Duration::from_secs(2)).await;
     bus_a.shutdown(Duration::from_secs(2)).await;
-    drop(accept_b_handle);
-    drop(held_streams);
+    drop(peer_b);
 }

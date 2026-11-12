@@ -42,8 +42,9 @@ func encodedStream(streamId iggcon.Identifier) string {
 	return string(stream)
 }
 
-// topicCache holds what a send needs to pick a partition without a metadata
-// round trip per batch.
+// topicCache holds partition counts and the producer round-robin cursors.
+const maxCachedTopics = 4096
+
 type topicCache struct {
 	mtx              sync.Mutex
 	partitionsCounts map[topicKey]uint32
@@ -63,37 +64,52 @@ func (c *topicCache) setPartitionsCount(key topicKey, count uint32) {
 	if c.partitionsCounts == nil {
 		c.partitionsCounts = make(map[topicKey]uint32)
 	}
+	if _, found := c.partitionsCounts[key]; !found && len(c.partitionsCounts) >= maxCachedTopics {
+		for old := range c.partitionsCounts {
+			delete(c.partitionsCounts, old)
+			break
+		}
+	}
 	c.partitionsCounts[key] = count
 }
 
-func (c *topicCache) invalidatePartitionsCount(key topicKey) {
+// forgetCount forgets the partition count of a topic.
+func (c *topicCache) forgetCount(key topicKey) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	delete(c.partitionsCounts, key)
 }
 
+// invalidateAll forgets every partition count after the client
+// changed the topology itself. A name and a numeric id cache one topic under
+// two keys, so the change cannot tell which entries it made stale. The
+// balanced cursors survive.
+func (c *topicCache) invalidateAll() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	clear(c.partitionsCounts)
+}
+
+// drop restarts the balanced cursor of a deleted topic, then invalidates every
+// count.
 func (c *topicCache) drop(key topicKey) {
 	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	delete(c.partitionsCounts, key)
 	delete(c.balancedCursors, key)
+	c.mtx.Unlock()
+	c.invalidateAll()
 }
 
-// dropStream forgets every topic cached under the encoded stream identifier,
-// because deleting a stream invalidates each topic under it.
+// dropStream restarts the balanced cursor of every topic cached under the
+// encoded stream identifier of a deleted stream, then invalidates every count.
 func (c *topicCache) dropStream(stream string) {
 	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	for key := range c.partitionsCounts {
-		if key.stream == stream {
-			delete(c.partitionsCounts, key)
-		}
-	}
 	for key := range c.balancedCursors {
 		if key.stream == stream {
 			delete(c.balancedCursors, key)
 		}
 	}
+	c.mtx.Unlock()
+	c.invalidateAll()
 }
 
 // nextBalanced returns the partition a balanced send targets and advances the
@@ -106,6 +122,12 @@ func (c *topicCache) nextBalanced(key topicKey, partitionsCount uint32) uint32 {
 	defer c.mtx.Unlock()
 	if c.balancedCursors == nil {
 		c.balancedCursors = make(map[topicKey]uint32)
+	}
+	if _, found := c.balancedCursors[key]; !found && len(c.balancedCursors) >= maxCachedTopics {
+		for old := range c.balancedCursors {
+			delete(c.balancedCursors, old)
+			break
+		}
 	}
 	partition := c.balancedCursors[key] % partitionsCount
 	c.balancedCursors[key]++

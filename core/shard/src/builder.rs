@@ -18,8 +18,9 @@
 //! One-stop construction for an [`IggyShard`] plus, on shard 0 only, its
 //! associated [`ShardZeroCoordinator`].
 //!
-//! The coordinator owns shard-0's round-robin state for replica and
-//! client placement. Cluster-wide `replica_id -> owning_shard` routing
+//! The coordinator owns shard-0's round-robin state for client
+//! placement. Replica links go to the owner shard that the link
+//! placement names. Cluster-wide `replica_id -> owning_shard` routing
 //! flows through the cluster-shared [`message_bus::ReplicaOwnerTable`],
 //! stamped by the owning shard's installer and CAS-cleared on disconnect.
 //!
@@ -30,14 +31,12 @@
 use crate::coordinator::{ShardZeroCoordinator, classify_try_send_err};
 use crate::metrics::{ShardMetrics, frame_drop_variant};
 use crate::{
-    CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
-    PartitionConsensusConfig, Receiver, ShardCtorError, ShardFrame, ShardIdentity, TaggedSender,
+    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig, Receiver,
+    ShardCtorError, ShardFrame, ShardHost, ShardIdentity, TaggedSender,
 };
 use consensus::VsrConsensus;
 use journal::JournalHandle;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
-use message_bus::client_listener::RequestHandler;
-use message_bus::replica::listener::MessageHandler;
 use message_bus::{MessageBus, SendError};
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
@@ -63,16 +62,14 @@ where
 {
     identity: ShardIdentity,
     bus: B,
-    on_replica_message: MessageHandler,
-    on_client_request: RequestHandler,
-    on_metadata_submit: MetadataSubmitHandler,
-    on_list_clients: ListClientsHandler,
+    host: Rc<dyn ShardHost>,
     metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
     partitions: IggyPartitions<B, SB>,
     senders: Vec<TaggedSender>,
     inbox: Receiver<ShardFrame>,
     reply_inbox: Receiver<ShardFrame>,
     poll_completion_capacity: usize,
+    partition_io_limits: Option<crate::PartitionIoLimits>,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
@@ -94,10 +91,7 @@ where
     pub fn new(
         identity: ShardIdentity,
         bus: B,
-        on_replica_message: MessageHandler,
-        on_client_request: RequestHandler,
-        on_metadata_submit: MetadataSubmitHandler,
-        on_list_clients: ListClientsHandler,
+        host: Rc<dyn ShardHost>,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
@@ -112,21 +106,26 @@ where
         Self {
             identity,
             bus,
-            on_replica_message,
-            on_client_request,
-            on_metadata_submit,
-            on_list_clients,
+            host,
             metadata,
             partitions,
             senders,
             inbox,
             reply_inbox,
             poll_completion_capacity,
+            partition_io_limits: None,
             shards_table,
             partition_consensus,
             coord_config,
             metrics,
         }
+    }
+
+    /// Override the shard defaults with prevalidated partition I/O limits.
+    #[must_use]
+    pub const fn with_partition_io_limits(mut self, limits: crate::PartitionIoLimits) -> Self {
+        self.partition_io_limits = Some(limits);
+        self
     }
 
     /// Consume the builder and produce a fully wired [`BuiltShard`]. On
@@ -141,6 +140,8 @@ where
     /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
     /// fit in `u16`. Both are bootstrap programming errors and the
     /// `u16` overflow check fires on every shard, not only shard 0.
+    /// Returns [`ShardCtorError::PartitionIoLimits`] if the default I/O limits
+    /// cannot represent the compiled job sizes.
     ///
     /// # Panics
     ///
@@ -156,18 +157,15 @@ where
                 count: self.senders.len(),
             })?;
 
-        // Install the cross-shard forward closures. The bus' slow path
-        // (`send_to_replica` / `send_to_client`) calls these when the
-        // destination connection lives on a different shard; the closure
-        // wraps the message into a `LifecycleFrame::Forward{Replica,
-        // Client}Send` and `try_send`s it to the owning shard's inbox.
-        // The receiving shard's router unwraps the frame and re-enters
-        // the bus' fast path locally. The `senders` Vec is canonically
-        // ordered (`senders[i].shard_id() == i`).
+        // Install the cross-shard replica forward closure. The bus' slow path
+        // (`send_to_replica`) calls it when the replica connection lives on a
+        // different shard. The closure wraps the message into a
+        // `LifecycleFrame::ForwardReplicaSend` and `try_send`s it to the
+        // owning shard's inbox. The receiving shard's router unwraps the frame
+        // and re-enters the bus' fast path locally. The `senders` Vec is
+        // canonically ordered (`senders[i].shard_id() == i`).
         let senders_for_replica: Rc<Vec<TaggedSender>> = Rc::new(self.senders.clone());
-        let senders_for_client = Rc::clone(&senders_for_replica);
         let metrics_for_replica = self.metrics.clone();
-        let metrics_for_client = self.metrics.clone();
         self.bus
             .set_replica_forward_fn(Box::new(move |replica_id, owning_shard, msg| {
                 senders_for_replica.get(usize::from(owning_shard)).map_or(
@@ -187,28 +185,23 @@ where
                     },
                 )
             }));
-        self.bus
-            .set_client_forward_fn(Box::new(move |client_id, owning_shard, msg| {
-                senders_for_client.get(usize::from(owning_shard)).map_or(
-                    Err(SendError::ClientForwardFailed(client_id)),
-                    |sender| {
-                        let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
-                            client_id,
-                            msg,
-                        });
-                        // Reply lane: a forwarded client reply is terminal on
-                        // drop, so it must not compete with consensus frames
-                        // for main-lane capacity.
-                        sender.reply_sender().try_send(frame).map_err(|err| {
-                            metrics_for_client.record_frame_drop(
-                                frame_drop_variant::FORWARD_CLIENT_SEND,
-                                classify_try_send_err(&err),
-                            );
-                            SendError::ClientForwardFailed(client_id)
-                        })
-                    },
-                )
+
+        // Report every replica link close to shard 0, whose bundle of the
+        // peer tears down. Shard 0 reports to its own inbox as well, so its
+        // bus never holds a closure that owns the bus. A dropped report is
+        // covered by the next reconnect sweep, which finds the link missing.
+        if let Some(to_shard_zero) = self.senders.first().cloned() {
+            let metrics_for_close = self.metrics.clone();
+            self.bus.set_connection_lost_fn(Rc::new(move |link| {
+                let frame = ShardFrame::lifecycle(LifecycleFrame::ReplicaLinkClosed { link });
+                if let Err(err) = to_shard_zero.try_send(frame) {
+                    metrics_for_close.record_frame_drop(
+                        frame_drop_variant::REPLICA_LINK_CLOSED,
+                        classify_try_send_err(&err),
+                    );
+                }
             }));
+        }
 
         // On shard 0: build the coordinator BEFORE the shard, so the
         // coordinator can be passed to `IggyShard::new` as a ctor arg.
@@ -219,6 +212,7 @@ where
                 total_shards,
                 self.coord_config.clone(),
                 self.metrics.clone(),
+                crate::boot_nonce(self.metadata.consensus.as_ref()),
             )?))
         } else {
             None
@@ -227,16 +221,14 @@ where
         let shard = IggyShard::new(
             self.identity,
             self.bus,
-            self.on_replica_message,
-            self.on_client_request,
-            self.on_metadata_submit,
-            self.on_list_clients,
+            self.host,
             self.metadata,
             self.partitions,
             self.senders,
             self.inbox,
             self.reply_inbox,
             self.poll_completion_capacity,
+            self.partition_io_limits,
             self.shards_table,
             self.partition_consensus,
             coordinator,

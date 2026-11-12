@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers;
+using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.Contracts;
 
@@ -24,6 +25,9 @@ namespace Apache.Iggy.Contracts;
 /// </summary>
 public sealed class PolledMessagesRental : IDisposable
 {
+    /// <summary>Captured incarnation and ownership authority for these offsets.</summary>
+    public PartitionContext Context { get; init; }
+
     private readonly IMemoryOwner<byte> _owner;
     private readonly IMemoryOwner<byte>? _plaintextOwner;
     private int _disposed;
@@ -42,6 +46,9 @@ public sealed class PolledMessagesRental : IDisposable
     ///     Rented messages.
     /// </summary>
     public required IReadOnlyList<RentedMessageResponse> Messages { get; init; }
+
+    /// <summary>The start of the poll that returned these messages, which an empty batch keeps.</summary>
+    internal PollingStrategy? RequestStart { get; set; }
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="PolledMessagesRental" /> class with the specified memory owner.

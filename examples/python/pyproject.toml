@@ -20,13 +20,13 @@ name = "python_examples"
 version = "0.1.0"
 description = "Examples for the Iggy Python SDK"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "apache-iggy",
     "argparse==1.4.0",
     "loguru==0.7.3",
-    "pyrefly>=1.2.0",
-    "ruff>=0.16.5",
+    "pyrefly>=1.4.0",
+    "ruff>=0.17.3",
 ]
 
 [tool.ruff.lint]
@@ -58,4 +58,5 @@ search-path = [
     "message-headers",
     "message-headers/plain-headers",
     "message-headers/typed-headers",
+    "multi-tenant",
 ]

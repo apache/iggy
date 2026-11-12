@@ -32,10 +32,9 @@ pub async fn should_help_match() {
 {USAGE_PREFIX} message <COMMAND>
 
 Commands:
-  send   Send messages to given topic ID and given stream ID [alias: s]
-  poll   Poll messages from given topic ID and given stream ID [alias: p]
-  flush  Legacy message flush command (unsupported by the server) [alias: f]
-  help   Print this message or the help of the given subcommand(s)
+  send  Send messages to given topic ID and given stream ID [alias: s]
+  poll  Poll messages from given topic ID and given stream ID [alias: p]
+  help  Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help

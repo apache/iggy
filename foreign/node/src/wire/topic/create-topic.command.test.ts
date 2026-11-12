@@ -94,6 +94,20 @@ describe('CreateTopic', () => {
       );
     });
 
+    it('serialize replicationFactor as a uint32 option', () => {
+      const t = { ...t1, replicationFactor: 2 };
+      const b = CREATE_TOPIC.serialize(t);
+      const key = Buffer.from('replication_factor');
+      const keyAt = b.indexOf(key);
+      assert.ok(keyAt > fixedSize + t.name.length, 'replication_factor rides the options block');
+      const value = b.subarray(keyAt + key.length);
+      const uint32Kind = 11;
+      assert.equal(value.readUInt8(0), uint32Kind);
+      assert.equal(value.readUInt32LE(1), 4);
+      assert.equal(value.readUInt32LE(5), 2);
+      assert.equal(deserializeOptions(b, fixedSize + t.name.length).replication_factor, 2);
+    });
+
     it('serialize caller-supplied option keys, typed fields winning', () => {
       const t = {
         ...t1,

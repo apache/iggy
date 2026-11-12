@@ -32,6 +32,7 @@ import java.util.Set;
 public class IggyValidationException extends IggyServerException {
 
     private static final Set<IggyErrorCode> CODES = EnumSet.of(
+            IggyErrorCode.INVALID_CONFIGURATION,
             IggyErrorCode.INVALID_COMMAND,
             IggyErrorCode.INVALID_FORMAT,
             IggyErrorCode.FEATURE_UNAVAILABLE,
@@ -50,7 +51,14 @@ public class IggyValidationException extends IggyServerException {
             IggyErrorCode.TOO_MANY_MESSAGES,
             IggyErrorCode.EMPTY_MESSAGE_PAYLOAD,
             IggyErrorCode.TOO_BIG_MESSAGE_PAYLOAD,
-            IggyErrorCode.INVALID_MESSAGE_CHECKSUM);
+            IggyErrorCode.INVALID_MESSAGE_CHECKSUM,
+            IggyErrorCode.INVALID_ENCRYPTION_KEY,
+            IggyErrorCode.UNSUPPORTED_OPTION_KEY,
+            IggyErrorCode.INVALID_OPTION_VALUE,
+            IggyErrorCode.OPTIONS_BLOCK_TOO_LARGE,
+            IggyErrorCode.OPTION_NOT_UPDATABLE,
+            IggyErrorCode.OPTION_NOT_RESETTABLE,
+            IggyErrorCode.READ_ONLY_OPTION);
 
     /**
      * Constructs a new IggyValidationException.

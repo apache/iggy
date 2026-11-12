@@ -29,7 +29,13 @@ async fn main() -> Result<(), IggyError> {
 
     println!("Build iggy producer & consumer");
     // For customization, use the `new` or `from_stream_topic` constructor
-    let stream_config = IggyStreamConfig::default();
+    let consumer_config = IggyConsumerConfig::default();
+    let poll_options = PollOptions {
+        commit: CommitPolicy::OnRead,
+        ..consumer_config.poll_options()
+    };
+    let consumer_config = consumer_config.with_poll_options(poll_options);
+    let stream_config = IggyStreamConfig::new(consumer_config, IggyProducerConfig::default());
     let (producer, mut consumer) = IggyStream::build(&client, &stream_config).await?;
 
     println!("Start message stream");
@@ -61,7 +67,8 @@ async fn main() -> Result<(), IggyError> {
 
     println!("Stop the message stream and shutdown iggy client");
     sender.send(()).expect("Failed to send shutdown signal");
-    client.delete_stream(stream_config.stream_id()).await?;
+    let stream_id = Identifier::named(stream_config.producer_config().stream_name())?;
+    client.delete_stream(&stream_id).await?;
     client.shutdown().await?;
 
     Ok(())

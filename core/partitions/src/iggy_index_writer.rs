@@ -18,6 +18,8 @@
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncWriteAtExt;
 use iggy_common::IggyError;
+use server_common::DISK_USAGE;
+use server_common::fatal::NoteDescriptorExhaustion;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, trace};
@@ -51,6 +53,7 @@ impl IggyIndexWriter {
         let file = opts
             .open(file_path)
             .await
+            .note_descriptor_exhaustion(|| format!("opening {file_path}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
@@ -97,7 +100,7 @@ impl IggyIndexWriter {
         })
     }
 
-    /// Appends encoded sparse index bytes at the current write cursor and
+    /// Writes encoded sparse index bytes at a captured file position and
     /// returns how many bytes landed. The cursor is left where it was: the
     /// caller advances it with `advance` once the companion segment save has
     /// also succeeded.
@@ -105,22 +108,30 @@ impl IggyIndexWriter {
     /// # Errors
     ///
     /// Returns an error if the index bytes cannot be written or synced to disk.
-    pub(crate) async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
-        let saved = self.save_indexes_buffered(indexes).await?;
+    pub(crate) async fn save_indexes_at(
+        &self,
+        indexes: Vec<u8>,
+        position: u64,
+    ) -> Result<u64, IggyError> {
+        let saved = self.save_indexes_buffered_at(indexes, position).await?;
         if saved > 0 && self.fsync {
             self.fsync().await?;
         }
         Ok(saved)
     }
 
-    pub(crate) async fn save_indexes_buffered(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
+    pub(crate) async fn save_indexes_buffered_at(
+        &self,
+        indexes: Vec<u8>,
+        position: u64,
+    ) -> Result<u64, IggyError> {
         if indexes.is_empty() {
             return Ok(0);
         }
 
         let len = indexes.len();
-        let position = self.index_size_bytes.load(Ordering::Relaxed);
         let file = &self.file;
+        let _charge = DISK_USAGE.charge(len as u64);
         (&*file)
             .write_all_at(indexes, position)
             .await
@@ -144,6 +155,14 @@ impl IggyIndexWriter {
         self.index_size_bytes.fetch_add(bytes, Ordering::Release);
     }
 
+    pub(crate) fn path(&self) -> &str {
+        &self.file_path
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.index_size_bytes.load(Ordering::Relaxed)
+    }
+
     /// Flushes buffered index file contents to disk.
     ///
     /// Uses `fdatasync` (data only): index files are append-only and the
@@ -154,10 +173,15 @@ impl IggyIndexWriter {
     ///
     /// Returns an error if the file cannot be synchronized.
     pub async fn fsync(&self) -> Result<(), IggyError> {
-        self.file
-            .sync_data()
-            .await
-            .map_err(|_| IggyError::CannotWriteToFile)?;
+        self.file.sync_data().await.map_err(|err| {
+            error!(
+                target: "iggy.partitions.storage",
+                file = self.file_path.as_str(),
+                %err,
+                "failed to sync index file"
+            );
+            IggyError::CannotWriteToFile
+        })?;
         Ok(())
     }
 }
@@ -172,9 +196,15 @@ mod tests {
         let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
             .await
             .unwrap();
-        assert_eq!(writer.save_indexes_buffered(vec![1; 32]).await.unwrap(), 32);
+        assert_eq!(
+            writer
+                .save_indexes_buffered_at(vec![1; 32], 0)
+                .await
+                .unwrap(),
+            32
+        );
         assert!(writer.fsync().await.is_err());
-        assert!(writer.save_indexes(vec![1; 32]).await.is_err());
+        assert!(writer.save_indexes_at(vec![1; 32], 0).await.is_err());
     }
 
     #[compio::test]

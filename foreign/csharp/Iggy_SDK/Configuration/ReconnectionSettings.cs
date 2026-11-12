@@ -28,7 +28,9 @@ public sealed class ReconnectionSettings
     public bool Enabled { get; set; } = true;
 
     /// <summary>
-    ///     Maximum number of reconnection attempts (0 = infinite). Default is 0.
+    ///     Maximum number of reconnection attempts (0 = infinite). Default is 0. The limit covers one reconnect
+    ///     burst of a replica link: while the client is signed in, each heartbeat restarts a link that used it up,
+    ///     with a fresh budget.
     /// </summary>
     public int MaxRetries { get; set; }
 

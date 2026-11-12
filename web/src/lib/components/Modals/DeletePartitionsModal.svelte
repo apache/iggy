@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
 
   import Input from '../Input.svelte';
   import { z } from 'zod';
@@ -28,12 +28,12 @@ under the License.
   import Button from '../Button.svelte';
 
   import ModalConfirmation from '../ModalConfirmation.svelte';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { page } from '$app/state';
   import { showToast } from '../AppToasts.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
-  import type { TopicDetails } from '$lib/domain/TopicDetails';
-  import { arraySum } from '$lib/utils/arraySum';
+  import type { TopicDetails } from '#lib/domain/TopicDetails.js';
+  import { arraySum } from '#lib/utils/arraySum.js';
 
   interface Props {
     closeModal: CloseModalFn;

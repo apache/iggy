@@ -59,8 +59,14 @@ ENVIRONMENT VARIABLES:
         IGGY_NODE_ADVERTISED_ADDRESS=localhost         # Address clients dial, required
                                                        # when a listener binds a wildcard
         IGGY_LOGGING_LEVEL=debug                # Log level
-        IGGY_ROOT_USERNAME=iggy                        # Root user, set with the password
-        IGGY_ROOT_PASSWORD=secret                      # Root password, set with the username
+        IGGY_ROOT_USERNAME=iggy                        # Root user, required with the password
+        IGGY_ROOT_PASSWORD=secret                      # Root password, required with the username
+
+    Initial root creation requires both variables, or
+    --with-default-root-credentials, on every replica before the first cluster
+    start so any promoted node can initialize root. Root is journaled and
+    replicated. Restarts recover it without these inputs. The server never
+    generates a root password or writes credential values to output or logs.
 
 TRANSPORT PROTOCOLS:
     - TCP (binary protocol)                            (default: 127.0.0.1:8090)
@@ -87,6 +93,25 @@ For more information, visit: https://iggy.apache.org/docs/introduction/getting-s
 // variable names and paths must stay unquoted rather than wear rustdoc backticks.
 #[allow(clippy::doc_markdown)]
 pub struct Args {
+    #[arg(
+        long,
+        help = "Print supported configuration environment variables and exit",
+        long_help = r#"Print supported configuration environment variables and exit.
+
+Lists all supported IGGY_* environment variable names and templates,
+sorted and deduplicated. Template syntax:
+- <N> represents vector indices (0-255 for most fields, except
+  cluster.nodes[*].advertised_addresses, which caps at 0-15)
+
+Exits immediately before any startup (before dotenv, config loading,
+logging, runtimes, credentials, filesystem or network activity).
+Works even with missing or invalid configuration files.
+
+Example:
+  iggy-server --list-config-env-vars"#
+    )]
+    pub list_config_env_vars: bool,
+
     /// Remove the system path before starting (WARNING: THIS WILL DELETE ALL DATA!)
     ///
     /// Deletes the configured system data directory ('local_data' by default,
@@ -110,9 +135,9 @@ pub struct Args {
     /// already present in the environment, so the flag is equivalent to
     /// exporting both by hand and the environment always takes precedence.
     ///
-    /// These values initialize only a newly created root user. On restart,
-    /// supplied credentials are validated but do not replace the recovered
-    /// root user or its stored password.
+    /// The leader journals and replicates the initial root user. Restarts recover
+    /// that account without the flag or variables. Supplied values are validated
+    /// but never replace a stored root user or its password.
     ///
     /// Examples:
     ///   iggy-server --with-default-root-credentials     # Root logs in as iggy/iggy
@@ -125,4 +150,24 @@ pub struct Args {
     /// one `cluster.nodes[*].replica_id` entry in the loaded configuration.
     #[arg(long, verbatim_doc_comment)]
     pub replica_id: Option<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use configs::{ConfigEnvMappings, cluster::ClusterConfig};
+
+    #[test]
+    fn list_config_env_help_matches_cluster_template_limits() {
+        let template = ClusterConfig::env_templates()
+            .iter()
+            .find(|template| template.env_name == "NODES_<N>_ADVERTISED_ADDRESSES_<N>_CLIENT_CIDR")
+            .expect("cluster advertised-address template");
+        assert_eq!(template.max_elements, &[256, 16]);
+
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("0-255 for most fields"));
+        assert!(help.contains("caps at 0-15"));
+    }
 }

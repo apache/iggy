@@ -15,13 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Store consumer bookmarks.
+//!
+//! A bookmark records the last consumed offset. Recovery uses it to restore
+//! progress.
+//!
+//! Functions ending in `_with_storage` share the persistence sequence between
+//! real disk and simulated storage. File sync makes record contents durable;
+//! directory sync makes creation, replacement, or deletion durable. Offset callers
+//! own that directory sync.
+
+use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::{DISK_USAGE, DiskCharge};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use compio::{
-    fs::{OpenOptions, create_dir_all, remove_file, rename},
-    io::{AsyncReadAt, AsyncReadAtExt, AsyncWriteAtExt},
+    fs::{OpenOptions, remove_file, rename},
+    io::{AsyncReadAt, AsyncWriteAtExt},
 };
 use iggy_common::{IggyError, calculate_checksum};
-use std::{io, path::Path};
-use tracing::warn;
+use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
+
+#[cfg(unix)]
+use nix::sys::resource::{Resource, getrlimit};
 
 const OFFSET_SIZE: usize = core::mem::size_of::<u64>();
 const CHECKSUM_SIZE: usize = core::mem::size_of::<u64>();
@@ -32,18 +54,194 @@ const CHECKSUM_SIZE: usize = core::mem::size_of::<u64>();
 /// flipped bit silently rewinds the consumer into redelivery or skips it forward.
 pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
 
-/// Per-partition file recording the purge generation this replica last applied
-/// locally, in the partition dir beside the segments it fences.
-///
-/// Two LE u64s: the applied generation, then the `created_revision` of the
-/// partition incarnation it was applied for.
-pub const PURGE_GENERATION_FILE: &str = "purge.gen";
+/// Disk space an offset file's first record allocates: one block on ext4 and
+/// xfs defaults. The next disk usage sample corrects other block sizes.
+const OFFSET_FILE_BLOCK_BYTES: u64 = 4096;
 
 /// Sibling name an atomic offset replacement writes before its rename lands.
 const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
 
-/// `[generation][created_revision]`, both LE u64.
-const PURGE_GENERATION_RECORD_SIZE: usize = 2 * OFFSET_SIZE;
+#[cfg(unix)]
+const OFFSET_FILES_TOTAL_MAX: usize = 1024;
+const OFFSET_FILES_PER_PARTITION_MAX: usize = 64;
+#[cfg(unix)]
+const OFFSET_FILE_LIMIT_DIVISOR: u64 = 4;
+
+static RETAINED_OFFSET_FILES: AtomicUsize = AtomicUsize::new(0);
+static OFFSET_FILE_LIMIT: LazyLock<usize> = LazyLock::new(|| {
+    #[cfg(unix)]
+    let limit = getrlimit(Resource::RLIMIT_NOFILE).map_or(0, |(soft, _)| {
+        usize::try_from(soft / OFFSET_FILE_LIMIT_DIVISOR)
+            .unwrap_or(OFFSET_FILES_TOTAL_MAX)
+            .min(OFFSET_FILES_TOTAL_MAX)
+    });
+    #[cfg(not(unix))]
+    let limit = 0;
+    limit
+});
+
+/// The permit follows the descriptor through checkout and checkpoint sync.
+pub struct RetainedOffsetFile<F> {
+    pub(crate) file: F,
+    permit: Rc<OffsetFilePermit>,
+}
+
+pub(crate) struct OffsetFilePermit {
+    partition_count: Rc<Cell<usize>>,
+    valid: Cell<bool>,
+}
+
+enum OffsetFileEntry<F> {
+    Cached(RetainedOffsetFile<F>),
+    CheckedOut(Weak<OffsetFilePermit>),
+}
+
+/// One cache owner per partition. Invalidation also marks checked-out writers,
+/// so returning a completed write cannot cache an obsolete inode.
+pub(crate) struct RetainedOffsetFiles<F> {
+    files: RefCell<HashMap<String, OffsetFileEntry<F>>>,
+    retired: RefCell<Vec<RetainedOffsetFile<F>>>,
+    count: Rc<Cell<usize>>,
+}
+
+impl<F> Default for RetainedOffsetFiles<F> {
+    fn default() -> Self {
+        Self {
+            files: RefCell::new(HashMap::new()),
+            retired: RefCell::new(Vec::new()),
+            count: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl<F> RetainedOffsetFiles<F> {
+    pub(crate) fn take(&self, path: &str) -> Option<RetainedOffsetFile<F>> {
+        let mut files = self.files.borrow_mut();
+        let entry = files.get_mut(path)?;
+        let OffsetFileEntry::Cached(retained) = entry else {
+            return None;
+        };
+        let placeholder = OffsetFileEntry::CheckedOut(Rc::downgrade(&retained.permit));
+        match std::mem::replace(entry, placeholder) {
+            OffsetFileEntry::Cached(retained) => Some(retained),
+            OffsetFileEntry::CheckedOut(_) => unreachable!("checked cached entry"),
+        }
+    }
+
+    pub(crate) fn checkout(&self, path: &str) -> Option<(Option<F>, Rc<OffsetFilePermit>)> {
+        if let Some(retained) = self.take(path) {
+            return Some((Some(retained.file), retained.permit));
+        }
+        if self.files.borrow().get(path).is_some_and(|entry| {
+            matches!(entry, OffsetFileEntry::CheckedOut(permit) if permit.strong_count() != 0)
+        }) {
+            return None;
+        }
+        self.reserve(path).map(|permit| (None, permit))
+    }
+
+    pub(crate) fn reserve(&self, path: &str) -> Option<Rc<OffsetFilePermit>> {
+        if self.count.get() >= OFFSET_FILES_PER_PARTITION_MAX {
+            return None;
+        }
+        let permit = OffsetFilePermit::acquire(Rc::clone(&self.count))?;
+        self.retire(path);
+        let mut files = self.files.borrow_mut();
+        files.retain(|_, entry| {
+            !matches!(entry, OffsetFileEntry::CheckedOut(permit) if permit.strong_count() == 0)
+        });
+        files.insert(
+            path.to_owned(),
+            OffsetFileEntry::CheckedOut(Rc::downgrade(&permit)),
+        );
+        Some(permit)
+    }
+
+    pub(crate) fn put(&self, path: &str, file: F, permit: Rc<OffsetFilePermit>) {
+        let retained = RetainedOffsetFile { file, permit };
+        if retained.permit.valid.get() {
+            let mut files = self.files.borrow_mut();
+            if let Some(entry) = files.get_mut(path)
+                && matches!(entry, OffsetFileEntry::CheckedOut(permit) if permit.as_ptr() == Rc::as_ptr(&retained.permit))
+            {
+                *entry = OffsetFileEntry::Cached(retained);
+                return;
+            }
+        }
+        self.retired.borrow_mut().push(retained);
+    }
+
+    pub(crate) fn retire(&self, path: &str) {
+        let entry = self.files.borrow_mut().remove(path);
+        if let Some(entry) = entry {
+            self.retire_entry(entry);
+        }
+    }
+
+    pub(crate) fn retire_all(&self) {
+        for (_, entry) in self.files.borrow_mut().drain() {
+            self.retire_entry(entry);
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.retire_all();
+        self.discard_retired();
+    }
+
+    pub(crate) fn discard_retired(&self) {
+        self.retired.borrow_mut().clear();
+    }
+
+    pub(crate) fn take_checkpoint(&self) -> (Vec<RetainedOffsetFile<F>>, BTreeSet<PathBuf>) {
+        let paths = self
+            .files
+            .borrow()
+            .iter()
+            .filter(|(_, entry)| matches!(entry, OffsetFileEntry::Cached(_)))
+            .map(|(path, _)| PathBuf::from(path))
+            .collect();
+        self.retire_all();
+        (std::mem::take(&mut *self.retired.borrow_mut()), paths)
+    }
+
+    fn retire_entry(&self, entry: OffsetFileEntry<F>) {
+        match entry {
+            OffsetFileEntry::Cached(retained) => {
+                retained.permit.valid.set(false);
+                self.retired.borrow_mut().push(retained);
+            }
+            OffsetFileEntry::CheckedOut(permit) => {
+                if let Some(permit) = permit.upgrade() {
+                    permit.valid.set(false);
+                }
+            }
+        }
+    }
+}
+
+impl OffsetFilePermit {
+    fn acquire(partition_count: Rc<Cell<usize>>) -> Option<Rc<Self>> {
+        RETAINED_OFFSET_FILES
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < *OFFSET_FILE_LIMIT).then_some(count + 1)
+            })
+            .ok()?;
+        partition_count.set(partition_count.get() + 1);
+        Some(Rc::new(Self {
+            partition_count,
+            valid: Cell::new(true),
+        }))
+    }
+}
+
+impl Drop for OffsetFilePermit {
+    fn drop(&mut self) {
+        self.partition_count
+            .set(self.partition_count.get().wrapping_sub(1));
+        RETAINED_OFFSET_FILES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// What a consumer-offset file was found to hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,11 +320,28 @@ pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
 /// # Errors
 /// [`IggyError`] when the directory, file, or write cannot be created or completed.
 pub async fn persist_offset(path: &str, offset: u64, persisted: bool) -> Result<(), IggyError> {
+    persist_offset_with_storage(&DiskStorage, path, offset, persisted).await
+}
+
+/// Persist a consumer offset through the supplied storage backend.
+///
+/// Uses the same record and replacement policy as [`persist_offset`]. When
+/// `persisted` is true, the caller must still sync the parent directory before
+/// treating the replacement name as durable. Calls for one path must be serialized.
+///
+/// # Errors
+/// Returns the directory, open, or write error from [`persist_offset`].
+pub async fn persist_offset_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    offset: u64,
+    persisted: bool,
+) -> Result<(), IggyError> {
     let record = encode_offset_record(offset);
     if persisted {
-        replace_file(path, record, true, false).await
+        replace_file(storage, path, record, true).await
     } else {
-        write_in_place(path, record).await
+        write_in_place(storage, path, record).await
     }
 }
 
@@ -136,6 +351,8 @@ pub async fn persist_offset(path: &str, offset: u64, persisted: bool) -> Result<
 /// No barrier runs here. For either offset durability policy, the caller must
 /// retain the writer and sync it and its directory before reclaiming the WAL
 /// history that protects the update.
+/// Records have fixed [`OFFSET_RECORD_SIZE`] length, so overwrites need no
+/// truncation. A size change must use replacement to avoid leaving stale bytes.
 ///
 /// # Errors
 /// The outer error reports directory/open failures before writing begins.
@@ -144,44 +361,79 @@ pub async fn persist_offset_retained(
     offset: u64,
     existing: Option<compio::fs::File>,
 ) -> Result<(io::Result<()>, compio::fs::File), IggyError> {
-    let mut file = if let Some(file) = existing {
-        file
+    let (mut file, _charge) = if let Some(file) = existing {
+        (file, None)
     } else {
         create_parent_dir(path).await?;
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
+        open_offset_file(path)
             .await
+            .note_descriptor_exhaustion(|| format!("opening {path}"))
             .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?
     };
     let result = file.write_all_at(encode_offset_record(offset), 0).await.0;
     Ok((result, file))
 }
 
-async fn write_in_place<const N: usize>(path: &str, record: [u8; N]) -> Result<(), IggyError> {
-    create_parent_dir(path).await?;
-    let mut file = OpenOptions::new()
+/// Opens the offset file at `path` for writing, creating it when absent. Only a
+/// file this call creates is charged: its first record allocates a block, while
+/// an existing file already owns one. Hold the charge until that record is
+/// written. Commits reopen existing files far more often than they create
+/// new ones, so the plain open goes first.
+async fn open_offset_file(
+    path: &str,
+) -> io::Result<(compio::fs::File, Option<DiskCharge<'static>>)> {
+    match OpenOptions::new().write(true).open(path).await {
+        Ok(file) => return Ok((file, None)),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+    match OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)
         .await
-        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    file.write_all_at(record, 0)
+    {
+        Ok(file) => Ok((file, Some(DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES)))),
+        // Created by another writer between the two opens, so it owns its block.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .write(true)
+            .open(path)
+            .await
+            .map(|file| (file, None)),
+        Err(error) => Err(error),
+    }
+}
+
+async fn write_in_place<S: DurableStorage, const N: usize>(
+    storage: &S,
+    path: &str,
+    record: [u8; N],
+) -> Result<(), IggyError> {
+    create_parent_dir_with_storage(storage, path).await?;
+    let mut file = storage
+        .open(Path::new(path), OpenMode::CreateWriteOnly)
         .await
-        .0
+        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
+    // The open truncates, so the record allocates a block whether or not the
+    // file existed. The truncate freed the previous one, which the next sample sees.
+    let _charge = DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES);
+    file.write(0, record.to_vec())
+        .await
         .map_err(|_| IggyError::CannotWriteToFile)
 }
 
 async fn create_parent_dir(path: &str) -> Result<(), IggyError> {
-    // No `exists()` probe first: that is a BLOCKING `std::path` stat on the pump
-    // in front of every write, which serialises a batched fan-out on stats
-    // before it can submit any I/O. `create_dir_all` is already a no-op on an
-    // existing directory.
+    create_parent_dir_with_storage(&DiskStorage, path).await
+}
+
+async fn create_parent_dir_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+) -> Result<(), IggyError> {
+    // Probing with `Path::exists()` blocks the pump before it can submit writes.
+    // Creating an existing directory already succeeds without changing it.
     if let Some(parent) = Path::new(path).parent() {
-        create_dir_all(parent).await.map_err(|_| {
+        storage.create_directories(parent).await.map_err(|_| {
             IggyError::CannotCreateConsumerOffsetsDirectory(parent.display().to_string())
         })?;
     }
@@ -190,8 +442,8 @@ async fn create_parent_dir(path: &str) -> Result<(), IggyError> {
 
 pub(crate) async fn stage_offset_replacement(path: &str, offset: u64) -> Result<(), IggyError> {
     // Install can remove old files before publishing replacements. Staging
-    // must survive a crash regardless of the normal consumer-offset durability policy.
-    write_replacement(path, encode_offset_record(offset), true)
+    // must survive a crash regardless of the normal consumer offset durability policy.
+    write_replacement(&DiskStorage, path, encode_offset_record(offset), true)
         .await
         .map(|_| ())
 }
@@ -206,56 +458,57 @@ pub(crate) async fn discard_offset_replacement(path: &str) {
     let _ = remove_file(replacement_path(path)).await;
 }
 
-async fn replace_file<const N: usize>(
+async fn replace_file<S: DurableStorage, const N: usize>(
+    storage: &S,
     path: &str,
     record: [u8; N],
     persisted: bool,
-    sync_parent: bool,
 ) -> Result<(), IggyError> {
-    let temporary = write_replacement(path, record, persisted).await?;
-    if rename(&temporary, path).await.is_err() {
-        let _ = remove_file(&temporary).await;
+    let temporary = write_replacement(storage, path, record, persisted).await?;
+    if storage
+        .rename(Path::new(&temporary), Path::new(path))
+        .await
+        .is_err()
+    {
+        let _ = storage.remove_file(Path::new(&temporary)).await;
         return Err(IggyError::CannotWriteToFile);
-    }
-    if sync_parent && let Some(parent) = Path::new(path).parent() {
-        let parent = compio::fs::File::open(parent)
-            .await
-            .map_err(|_| IggyError::CannotSyncFile)?;
-        parent
-            .sync_all()
-            .await
-            .map_err(|_| IggyError::CannotSyncFile)?;
     }
 
     Ok(())
 }
 
-async fn write_replacement<const N: usize>(
+async fn write_replacement<S: DurableStorage, const N: usize>(
+    storage: &S,
     path: &str,
     record: [u8; N],
     persisted: bool,
 ) -> Result<String, IggyError> {
-    create_parent_dir(path).await?;
+    create_parent_dir_with_storage(storage, path).await?;
 
     // Keep the previous cursor intact until the complete replacement exists.
-    // A failed truncate-and-write otherwise turns a valid cursor into a torn
+    // A failed write after truncation otherwise turns a valid cursor into a torn
     // file that boot discards. The fixed sibling is safe because writes to one
     // consumer key are serialized by the partition pump.
     let temporary = replacement_path(path);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temporary)
+    // The replacement is a fresh inode, so its record allocates a block. Renamed
+    // over an existing file, it takes the place of the block the rename frees,
+    // so only a replacement that creates the file grows the volume. A failed
+    // probe charges, erring towards a fuller disk.
+    let creates = !storage.exists(Path::new(path)).await.unwrap_or(false);
+    let mut file = storage
+        .open(Path::new(&temporary), OpenMode::CreateWriteOnly)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    if file.write_all_at(record, 0).await.0.is_err() {
-        let _ = remove_file(&temporary).await;
+    let charge = creates.then(|| DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES));
+    let written = file.write(0, record.to_vec()).await;
+    drop(charge);
+    if written.is_err() {
+        let _ = storage.remove_file(Path::new(&temporary)).await;
         return Err(IggyError::CannotWriteToFile);
     }
 
-    if persisted && file.sync_data().await.is_err() {
-        let _ = remove_file(&temporary).await;
+    if persisted && file.sync().await.is_err() {
+        let _ = storage.remove_file(Path::new(&temporary)).await;
         return Err(IggyError::CannotWriteToFile);
     }
     drop(file);
@@ -343,90 +596,6 @@ pub async fn read_offset_max(path: &str, offset: u64) -> Result<PersistedOffset,
     })
 }
 
-/// Durably record the purge generation a partition has locally applied, keyed
-/// to the incarnation (`created_revision`) it was applied for.
-///
-/// Atomic replacement like [`persist_offset`] but ALWAYS data-synced, regardless of
-/// the consumer-offset durability policy: purges are rare, the record is 16 bytes, and
-/// a generation lost from the page cache in a crash makes the reconciler
-/// re-purge on restart, wiping messages appended after the purge. A failure
-/// leaves the previous record on disk so the caller keeps its in-memory
-/// applied generation old and retries.
-///
-/// # Errors
-/// Propagates the underlying open/write/sync failure.
-pub async fn persist_purge_generation(
-    path: &str,
-    generation: u64,
-    created_revision: u64,
-) -> Result<(), IggyError> {
-    let mut record = [0u8; PURGE_GENERATION_RECORD_SIZE];
-    record[..OFFSET_SIZE].copy_from_slice(&generation.to_le_bytes());
-    record[OFFSET_SIZE..].copy_from_slice(&created_revision.to_le_bytes());
-    replace_file(path, record, true, true).await
-}
-
-/// Read the purge generation this replica applied for the `created_revision`
-/// incarnation of the partition.
-///
-/// Absent and torn files map to `Ok(0)`: both imply a purge died mid-write, and
-/// `0` makes the reconciler re-apply the purge, the correct self-healing
-/// recovery for an idempotent wipe.
-///
-/// A record written for a DIFFERENT incarnation maps to `Ok(0)` too. A failed
-/// `delete_partitions_from_disk` leaves the directory (and this file) behind;
-/// the recreated topic's generations restart at 0, so hydrating the dead
-/// incarnation's generation would swallow every purge of the new topic until
-/// the committed counter climbed past it.
-///
-/// A real I/O error propagates instead: collapsing it to `0` would re-purge a
-/// partition whose durable generation is intact but momentarily unreadable,
-/// destroying every message appended after that purge.
-///
-/// # Errors
-/// Propagates a real open/read failure (anything but absent or short).
-pub async fn read_purge_generation(path: &str, created_revision: u64) -> Result<u64, IggyError> {
-    if !Path::new(path).exists() {
-        return Ok(0);
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .await
-        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    let buf = vec![0u8; PURGE_GENERATION_RECORD_SIZE];
-    let compio::BufResult(read, buf) = file.read_exact_at(buf, 0).await;
-    match read {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
-        Err(_) => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
-    }
-    let (generation_bytes, revision_bytes) = buf.split_at(OFFSET_SIZE);
-    let generation = u64::from_le_bytes(
-        generation_bytes
-            .try_into()
-            .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?,
-    );
-    let stored_revision = u64::from_le_bytes(
-        revision_bytes
-            .try_into()
-            .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?,
-    );
-    if stored_revision != created_revision {
-        warn!(
-            target: "iggy.partitions.diag",
-            plane = "partitions",
-            path,
-            generation,
-            stored_revision,
-            created_revision,
-            "ignoring a purge generation recorded for another partition incarnation"
-        );
-        return Ok(0);
-    }
-    Ok(generation)
-}
-
 /// Read whatever a consumer-offset file holds. `None` only when absent; a short file
 /// reports [`OffsetRecord::Torn`] and the caller folds it as the boot loader does.
 ///
@@ -435,7 +604,14 @@ pub async fn read_purge_generation(path: &str, created_revision: u64) -> Result<
 async fn read_offset_record(path: &str) -> Result<Option<OffsetRecord>, IggyError> {
     // Absence answered by the open, not a `Path::exists()` probe: that is a BLOCKING
     // stat on the pump before every cold-key commit (see `persist_offset`).
-    let file = match OpenOptions::new().read(true).open(path).await {
+    //
+    // Read-only, but one step of a commit write, so it counts like a write open.
+    let file = match OpenOptions::new()
+        .read(true)
+        .open(path)
+        .await
+        .note_descriptor_exhaustion(|| format!("opening {path}"))
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(IggyError::CannotOpenConsumerOffsetsFile(path.to_owned())),
@@ -458,14 +634,59 @@ async fn read_offset_record(path: &str) -> Result<Option<OffsetRecord>, IggyErro
 /// # Errors
 /// Returns [`IggyError::CannotDeleteConsumerOffsetFile`] if the unlink fails.
 pub async fn delete_persisted_offset(path: &str) -> Result<bool, IggyError> {
+    delete_persisted_offset_with_storage(&DiskStorage, path).await
+}
+
+/// Unlink a consumer offset through the supplied storage backend.
+///
+/// Returns `false` when already absent. No directory sync runs here, so the caller
+/// must sync the parent directory before treating a successful removal as durable.
+///
+/// # Errors
+/// Returns [`IggyError::CannotDeleteConsumerOffsetFile`] if unlinking fails.
+pub async fn delete_persisted_offset_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+) -> Result<bool, IggyError> {
     // NotFound is tolerated on the result instead of probed for: the probe was
     // a blocking stat on the pump before every unlink, and "already gone" is
     // exactly the outcome this wants anyway.
-    match remove_file(path).await {
+    match storage.remove_file(Path::new(path)).await {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(IggyError::CannotDeleteConsumerOffsetFile(path.to_owned())),
     }
+}
+
+/// File in a partition's offsets directory that names the committed delete
+/// which emptied every offset kind.
+pub(crate) const EMPTIED_MARKER_FILE: &str = "emptied";
+
+/// Leave `emptied_at` in the emptied-table marker at `path`, and remove the
+/// marker for `0`.
+///
+/// Unlike an offset record, the marker is durable on return in every offset
+/// durability mode: a state transfer trusts it to erase a receiver's offsets,
+/// so it cannot wait for a checkpoint. It is replaced, never rewritten in
+/// place, so a hard-linked install backup keeps the prior value.
+///
+/// # Errors
+/// [`IggyError`] when the write, the unlink, or the directory sync fails.
+pub(crate) async fn persist_emptied_marker_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    emptied_at: u64,
+) -> Result<(), IggyError> {
+    if emptied_at == 0 {
+        delete_persisted_offset_with_storage(storage, path).await?;
+    } else {
+        replace_file(storage, path, encode_offset_record(emptied_at), true).await?;
+    }
+    let parent = Path::new(path).parent().ok_or(IggyError::CannotSyncFile)?;
+    storage
+        .sync_directory(parent)
+        .await
+        .map_err(|_| IggyError::CannotSyncFile)
 }
 
 #[cfg(test)]
@@ -473,16 +694,9 @@ mod tests {
     use super::*;
 
     fn unique_temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "iggy-offset-storage-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        tempfile::tempdir()
+            .expect("create offset storage test directory")
+            .keep()
     }
 
     #[test]
@@ -496,6 +710,75 @@ mod tests {
                 checksummed: true
             }
         );
+    }
+
+    #[test]
+    fn retained_files_keep_permits_through_checkout_and_checkpoint() {
+        let cache = RetainedOffsetFiles::default();
+        for index in 0..OFFSET_FILES_PER_PARTITION_MAX {
+            let path = index.to_string();
+            let (file, permit) = cache.checkout(&path).unwrap();
+            assert!(file.is_none());
+            cache.put(&path, index, permit);
+        }
+        let checked_out = cache.take("0").unwrap();
+        assert_eq!(cache.count.get(), OFFSET_FILES_PER_PARTITION_MAX);
+        assert!(
+            cache.checkout("overflow").is_none(),
+            "checkout retains capacity"
+        );
+        cache.retire("1");
+        assert!(
+            cache.checkout("overflow").is_none(),
+            "retired files retain capacity"
+        );
+        let (checkpoint, paths) = cache.take_checkpoint();
+        assert_eq!(paths.len(), OFFSET_FILES_PER_PARTITION_MAX - 2);
+        assert!(
+            cache.checkout("overflow").is_none(),
+            "queued checkpoint owns its descriptors"
+        );
+        drop(checkpoint);
+        assert_eq!(cache.count.get(), 1, "checked-out descriptor is still open");
+        drop(checked_out);
+        assert_eq!(cache.count.get(), 0);
+        assert!(cache.checkout("overflow").is_some());
+    }
+
+    #[test]
+    fn invalidation_prevents_late_return_from_replacing_a_new_inode() {
+        let cache = RetainedOffsetFiles::default();
+        let (file, original) = cache.checkout("offset").unwrap();
+        assert!(file.is_none());
+        cache.put("offset", 7, original);
+        let (file, original) = cache.checkout("offset").unwrap();
+        assert_eq!(file, Some(7));
+        cache.retire("offset");
+        let (_, replacement) = cache.checkout("offset").unwrap();
+        cache.put("offset", 9, replacement);
+        cache.put("offset", 7, original);
+        assert_eq!(cache.retired.borrow().len(), 1);
+        let replacement = cache.take("offset").unwrap();
+        assert_eq!(replacement.file, 9);
+        cache.clear();
+        assert_eq!(
+            cache.count.get(),
+            1,
+            "clear cannot release a checked-out descriptor"
+        );
+        drop(replacement);
+        assert_eq!(cache.count.get(), 0);
+    }
+
+    #[test]
+    fn abandoned_cold_opens_do_not_accumulate_cache_entries_or_permits() {
+        let cache = RetainedOffsetFiles::<u64>::default();
+        for index in 0..OFFSET_FILES_PER_PARTITION_MAX * 2 {
+            let (_, permit) = cache.checkout(&index.to_string()).unwrap();
+            drop(permit);
+            assert_eq!(cache.count.get(), 0);
+            assert_eq!(cache.files.borrow().len(), 1);
+        }
     }
 
     #[test]
@@ -541,6 +824,39 @@ mod tests {
                 offset: 114,
                 checksummed: false
             }
+        );
+    }
+
+    #[compio::test]
+    async fn given_an_absent_offset_file_when_opening_should_create_and_charge_it() {
+        let path = unique_temp_dir().join("7");
+        let path = path.to_str().unwrap();
+
+        let (_file, charge) = open_offset_file(path).await.unwrap();
+
+        assert!(
+            charge.is_some(),
+            "a created file must be charged for its block"
+        );
+        assert!(Path::new(path).exists());
+    }
+
+    #[compio::test]
+    async fn given_an_existing_offset_file_when_opening_should_keep_its_record_and_not_charge() {
+        let path = unique_temp_dir().join("7");
+        std::fs::write(&path, encode_offset_record(114)).unwrap();
+        let path = path.to_str().unwrap();
+
+        let (_file, charge) = open_offset_file(path).await.unwrap();
+
+        assert!(charge.is_none(), "an existing file already owns its block");
+        assert_eq!(
+            read_offset_record(path).await.unwrap(),
+            Some(OffsetRecord::Value {
+                offset: 114,
+                checksummed: true,
+            }),
+            "opening must not truncate the record"
         );
     }
 
@@ -663,89 +979,6 @@ mod tests {
         assert!(
             matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
             "real I/O error must propagate, got {result:?}",
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[compio::test]
-    async fn purge_generation_absent_or_torn_is_zero_but_io_error_propagates() {
-        let dir = unique_temp_dir();
-        let path = dir
-            .join(PURGE_GENERATION_FILE)
-            .to_string_lossy()
-            .into_owned();
-
-        assert_eq!(
-            read_purge_generation(&path, 11).await.expect("absent file"),
-            0,
-            "absent file is 0"
-        );
-
-        persist_purge_generation(&path, 3, 11)
-            .await
-            .expect("persist generation");
-        assert_eq!(
-            read_purge_generation(&path, 11).await.expect("valid file"),
-            3,
-            "round-trip"
-        );
-
-        std::fs::write(&path, [0xAB, 0xCD]).expect("write torn file");
-        assert_eq!(
-            read_purge_generation(&path, 11).await.expect("torn file"),
-            0,
-            "torn file degrades to 0 so the reconciler re-applies the purge"
-        );
-
-        // A directory path is a real I/O error, not a short read: it must
-        // surface, not collapse to the re-purge sentinel (a silent re-purge
-        // would destroy post-purge messages).
-        let result = read_purge_generation(&dir.to_string_lossy(), 11).await;
-        assert!(
-            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
-            "real I/O error must propagate, got {result:?}",
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A failed `delete_partitions_from_disk` leaves the directory and this
-    /// file behind. The recreated partition's generations restart at 0, so a
-    /// record from the DEAD incarnation must not be hydrated: it would swallow
-    /// every purge of the new topic until the committed counter climbed past
-    /// it.
-    #[compio::test]
-    async fn purge_generation_from_another_incarnation_reads_as_zero() {
-        let dir = unique_temp_dir();
-        let path = dir
-            .join(PURGE_GENERATION_FILE)
-            .to_string_lossy()
-            .into_owned();
-
-        persist_purge_generation(&path, 9, 41)
-            .await
-            .expect("persist generation");
-
-        assert_eq!(
-            read_purge_generation(&path, 41).await.expect("same dir"),
-            9,
-            "the incarnation that wrote it still hydrates it"
-        );
-        assert_eq!(
-            read_purge_generation(&path, 42).await.expect("stale file"),
-            0,
-            "a record from a dead incarnation must not fence the new one"
-        );
-
-        // The new incarnation's own purge re-keys the file.
-        persist_purge_generation(&path, 1, 42)
-            .await
-            .expect("persist generation");
-        assert_eq!(read_purge_generation(&path, 42).await.expect("rekeyed"), 1);
-        assert_eq!(
-            read_purge_generation(&path, 41).await.expect("now stale"),
-            0
         );
 
         let _ = std::fs::remove_dir_all(&dir);

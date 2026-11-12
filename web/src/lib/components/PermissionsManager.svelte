@@ -50,19 +50,19 @@ under the License.
 
   import Icon from './Icon.svelte';
   import Combobox from './Combobox.svelte';
-  import type { Stream } from '$lib/domain/Stream';
-  import { topicMapper, type Topic } from '$lib/domain/Topic';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import type { Stream } from '#lib/domain/Stream.js';
+  import { topicMapper, type Topic } from '#lib/domain/Topic.js';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { showToast } from './AppToasts.svelte';
-  import type { KeysToSnakeCase } from '$lib/utils/utilTypes';
+  import type { KeysToSnakeCase } from '#lib/utils/utilTypes.js';
   import type {
     GlobalPermissions,
     StreamPermissions,
     TopicPermissions
-  } from '$lib/domain/Permissions';
+  } from '#lib/domain/Permissions.js';
   import Checkbox from './Checkbox.svelte';
   import { twMerge } from 'tailwind-merge';
-  import { noTypeCheck } from '$lib/utils/noTypeCheck';
+  import { noTypeCheck } from '#lib/utils/noTypeCheck.js';
   import { fade } from 'svelte/transition';
   import { SvelteSet } from 'svelte/reactivity';
 

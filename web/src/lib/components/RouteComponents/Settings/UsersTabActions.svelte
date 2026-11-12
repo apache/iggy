@@ -18,8 +18,8 @@ under the License.
 -->
 
 <script lang="ts">
-  import Icon from '$lib/components/Icon.svelte';
-  import Input from '$lib/components/Input.svelte';
+  import Icon from '#lib/components/Icon.svelte';
+  import Input from '#lib/components/Input.svelte';
   import { searchQuery, usersCount } from './UsersTab.svelte';
 </script>
 

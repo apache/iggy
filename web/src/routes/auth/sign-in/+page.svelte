@@ -20,15 +20,15 @@ under the License.
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
-  import { env } from '$env/dynamic/public';
-  import { authStore } from '$lib/auth/authStore.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import Checkbox from '$lib/components/Checkbox.svelte';
-  import Icon from '$lib/components/Icon.svelte';
-  import Input from '$lib/components/Input.svelte';
-  import PasswordInput from '$lib/components/PasswordInput.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
-  import { persistedStore } from '$lib/utils/persistedStore.js';
+  import { PUBLIC_IGGY_API_URL } from '$app/env/public';
+  import { authStore } from '#lib/auth/authStore.svelte.js';
+  import Button from '#lib/components/Button.svelte';
+  import Checkbox from '#lib/components/Checkbox.svelte';
+  import Icon from '#lib/components/Icon.svelte';
+  import Input from '#lib/components/Input.svelte';
+  import PasswordInput from '#lib/components/PasswordInput.svelte';
+  import { typedRoute } from '#lib/types/appRoutes.js';
+  import { persistedStore } from '#lib/utils/persistedStore.js';
   import { onMount } from 'svelte';
 
   let username = $state('');
@@ -72,7 +72,7 @@ under the License.
     isLoading = true;
 
     try {
-      const baseUrl = env.PUBLIC_IGGY_API_URL || '';
+      const baseUrl = PUBLIC_IGGY_API_URL || '';
       const response = await fetch(`${baseUrl}/users/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -89,7 +89,7 @@ under the License.
       const { access_token } = data;
 
       authStore.login(access_token.token, access_token.expiry);
-      goto(resolve(typedRoute('/dashboard/overview')));
+      goto(resolve(typedRoute('dashboard/overview')));
     } catch {
       errorMessage = 'Failed to connect to server';
       isLoading = false;

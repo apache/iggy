@@ -47,7 +47,12 @@ public static class StatsFactory
             MessagesSizeBytes = 1234567890,
             Hostname = "localhost",
             ClientsCount = 69,
-            IggyServerVersion = "1234"
+            IggyServerVersion = "1234",
+            ThreadsCount = 16,
+            FreeDiskSpace = 107374182400,
+            TotalDiskSpace = 512110190592,
+            OpenFilesCount = 1234,
+            OpenFilesLimit = 1048576
         };
     }
 }

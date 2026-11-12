@@ -28,6 +28,7 @@ use std::io;
 use std::path::{Component, Path};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Each `SimStorage` is an independent filesystem, so writer identities must not
 /// collide between instances the way bare paths would.
@@ -276,8 +277,17 @@ impl DurableStorage for SimStorage {
         ))
     }
 
+    // Unit-test storage driven by `block_on` with no virtual timer wired in, so
+    // a writer that never drains hangs the test instead of timing out.
+    fn sleep(&self, _duration: Duration) -> impl Future<Output = ()> {
+        futures::future::pending()
+    }
+
     async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<SimFile> {
-        let creates = matches!(mode, OpenMode::Create | OpenMode::CreateOrOpen);
+        let creates = matches!(
+            mode,
+            OpenMode::Create | OpenMode::CreateWriteOnly | OpenMode::CreateOrOpen
+        );
         let operation = if creates {
             StorageOperation::Create
         } else {
@@ -290,7 +300,7 @@ impl DurableStorage for SimStorage {
                 if let Some(&inode) = state.directory(parent)?.get(&name) {
                     match &mut state.inodes[inode] {
                         Inode::File { buffered, .. } => {
-                            if mode == OpenMode::Create {
+                            if matches!(mode, OpenMode::Create | OpenMode::CreateWriteOnly) {
                                 buffered.clear();
                             }
                         }
@@ -669,3 +679,6 @@ fn missing() -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bookmark_recovery;

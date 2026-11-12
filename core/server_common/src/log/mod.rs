@@ -21,7 +21,7 @@ pub mod settings;
 
 pub use logger::{LogError, Logging};
 pub use settings::{
-    LoggingSettings, TelemetryEndpointSettings, TelemetrySettings, TelemetryTransport,
+    LogFilter, LoggingSettings, TelemetryEndpointSettings, TelemetrySettings, TelemetryTransport,
 };
 
 /// Log the CI build fingerprint (or a developer-build notice).

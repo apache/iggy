@@ -110,7 +110,7 @@ static PARTITION_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("partition",
 /// Subtract `amount`, clamping at zero instead of wrapping. Returns what was
 /// actually taken, which is what the caller passes on to its parent.
 ///
-/// `fetch_update` rather than a load followed by a subtract: the counters are
+/// `try_update` rather than a load followed by a subtract: the counters are
 /// written from the metadata shard and from whichever shard owns the partition,
 /// so a separate load leaves a window where the clamp reads one value and
 /// subtracts from another.
@@ -118,7 +118,7 @@ macro_rules! clamped_sub {
     ($name:ident, $counter:ty, $amount:ty) => {
         fn $name(counter: &$counter, amount: $amount, site: &'static UnderflowSite) -> $amount {
             let previous = counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     // `None` on an already-zero counter: no store, and the
                     // `Err` it returns carries that same zero, so the clamp
                     // reports identically either way. That is the steady shape
@@ -413,6 +413,36 @@ impl PartitionStats {
 
     pub fn segments_count_inconsistent(&self) -> u32 {
         self.segments_count.load(Ordering::Relaxed)
+    }
+
+    /// Move every counter to the values another node reported, carrying the
+    /// difference into the parents.
+    pub fn store_reported(
+        &self,
+        size_bytes: u64,
+        messages_count: u64,
+        segments_count: u32,
+        current_offset: u64,
+    ) {
+        let size = self.size_bytes.load(Ordering::Relaxed);
+        if size_bytes >= size {
+            self.increment_size_bytes(size_bytes - size);
+        } else {
+            self.decrement_size_bytes(size - size_bytes);
+        }
+        let messages = self.messages_count.load(Ordering::Relaxed);
+        if messages_count >= messages {
+            self.increment_messages_count(messages_count - messages);
+        } else {
+            self.decrement_messages_count(messages - messages_count);
+        }
+        let segments = self.segments_count.load(Ordering::Relaxed);
+        if segments_count >= segments {
+            self.increment_segments_count(segments_count - segments);
+        } else {
+            self.decrement_segments_count(segments - segments_count);
+        }
+        self.set_current_offset(current_offset);
     }
 
     pub fn current_offset(&self) -> u64 {

@@ -20,14 +20,25 @@ use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use iggy_gateway_kafka::protocol::api::supported_api_ranges;
 use kafka_protocol::messages::add_partitions_to_txn_request::*;
+use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
+use kafka_protocol::messages::create_partitions_request::*;
 use kafka_protocol::messages::create_topics_request::*;
 use kafka_protocol::messages::delete_records_request::*;
 use kafka_protocol::messages::delete_topics_request::*;
 use kafka_protocol::messages::describe_configs_request::*;
 use kafka_protocol::messages::fetch_request::*;
+use kafka_protocol::messages::incremental_alter_configs_request::{
+    AlterConfigsResource as IncrementalAlterConfigsResource,
+    AlterableConfig as IncrementalAlterableConfig,
+};
 use kafka_protocol::messages::join_group_request::*;
+use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::*;
 use kafka_protocol::messages::offset_commit_request::*;
+use kafka_protocol::messages::offset_delete_request::{
+    OffsetDeleteRequestPartition, OffsetDeleteRequestTopic,
+};
+use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestGroup;
 use kafka_protocol::messages::produce_request::*;
 use kafka_protocol::messages::txn_offset_commit_request::*;
 use kafka_protocol::messages::*;
@@ -235,17 +246,23 @@ fn frame_request(
 }
 
 // ── Payload builders ──────────────────────────────────────────────────────────
+
+const CLIENT_SOFTWARE_NAME: &str = "kafka-message-gen";
+const CLIENT_SOFTWARE_VERSION: &str = "0.1.0";
+
 // Build the API-specific encoded body for a given api_key and version.
 // All required fields contain realistic non-zero values.
 // Returns raw bytes WITHOUT the framing header.
 fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
     let mut buf = BytesMut::new();
     match api_key {
+        // `kafka-protocol` 0.18 encodes `ApiVersions` only up to v4.
+        18 if version == 5 => put_api_versions_v5(&mut buf),
         18 => {
             let mut r = ApiVersionsRequest::default();
             if version >= 3 {
-                r.client_software_name = StrBytes::from_static_str("kafka-message-gen");
-                r.client_software_version = StrBytes::from_static_str("0.1.0");
+                r.client_software_name = StrBytes::from_static_str(CLIENT_SOFTWARE_NAME);
+                r.client_software_version = StrBytes::from_static_str(CLIENT_SOFTWARE_VERSION);
             }
             r.encode(&mut buf, version).context("ApiVersions")?;
         }
@@ -359,15 +376,28 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("OffsetCommit")?;
         }
         9 => {
-            OffsetFetchRequest::default()
-                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
-                .encode(&mut buf, version)
-                .context("OffsetFetch")?;
+            let group = GroupId::from(StrBytes::from_static_str("test-group"));
+            // v8 moved the group into `groups`, and the encoder refuses the top-level id there.
+            let request = if version >= 8 {
+                OffsetFetchRequest::default().with_groups(vec![
+                    OffsetFetchRequestGroup::default().with_group_id(group),
+                ])
+            } else {
+                OffsetFetchRequest::default().with_group_id(group)
+            };
+            request.encode(&mut buf, version).context("OffsetFetch")?;
         }
         10 => {
-            FindCoordinatorRequest::default()
-                .with_key(StrBytes::from_static_str("test-group"))
-                .with_key_type(0)
+            let key = StrBytes::from_static_str("test-group");
+            let request = FindCoordinatorRequest::default().with_key_type(0);
+            // v4 replaced the single key with `coordinator_keys`; the encoder refuses whichever
+            // field the version does not carry.
+            let request = if version >= 4 {
+                request.with_coordinator_keys(vec![key])
+            } else {
+                request.with_key(key)
+            };
+            request
                 .encode(&mut buf, version)
                 .context("FindCoordinator")?;
         }
@@ -394,11 +424,17 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("Heartbeat")?;
         }
         13 => {
-            LeaveGroupRequest::default()
-                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
-                .with_member_id(StrBytes::from_static_str("test-member-1"))
-                .encode(&mut buf, version)
-                .context("LeaveGroup")?;
+            let member_id = StrBytes::from_static_str("test-member-1");
+            let request = LeaveGroupRequest::default()
+                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")));
+            // v3 replaced the top-level member id with an identities array; the encoder refuses
+            // whichever field the version does not carry.
+            let request = if version >= 3 {
+                request.with_members(vec![MemberIdentity::default().with_member_id(member_id)])
+            } else {
+                request.with_member_id(member_id)
+            };
+            request.encode(&mut buf, version).context("LeaveGroup")?;
         }
         14 => {
             SyncGroupRequest::default()
@@ -536,17 +572,101 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .encode(&mut buf, version)
                 .context("DescribeConfigs")?;
         }
+        33 => {
+            let resource = AlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("test-topic"));
+            AlterConfigsRequest::default()
+                .with_resources(vec![resource])
+                .encode(&mut buf, version)
+                .context("AlterConfigs")?;
+        }
         36 => {
             SaslAuthenticateRequest::default()
                 .with_auth_bytes(Bytes::from_static(b"\x00iggy\x00secret"))
                 .encode(&mut buf, version)
                 .context("SaslAuthenticate")?;
         }
+        37 => {
+            let topic = CreatePartitionsTopic::default()
+                .with_name(TopicName::from(StrBytes::from_static_str(
+                    "iggy-test-topic",
+                )))
+                .with_count(2)
+                .with_assignments(None);
+            CreatePartitionsRequest::default()
+                .with_topics(vec![topic])
+                .with_timeout_ms(30_000)
+                .with_validate_only(false)
+                .encode(&mut buf, version)
+                .context("CreatePartitions")?;
+        }
+        42 => {
+            DeleteGroupsRequest::default()
+                .with_groups_names(vec![GroupId::from(StrBytes::from_static_str("test-group"))])
+                .encode(&mut buf, version)
+                .context("DeleteGroups")?;
+        }
+        44 => {
+            let config = IncrementalAlterableConfig::default()
+                .with_name(StrBytes::from_static_str("retention.ms"))
+                .with_config_operation(0)
+                .with_value(Some(StrBytes::from_static_str("60000")));
+            let resource = IncrementalAlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("test-topic"))
+                .with_configs(vec![config]);
+            IncrementalAlterConfigsRequest::default()
+                .with_resources(vec![resource])
+                .with_validate_only(false)
+                .encode(&mut buf, version)
+                .context("IncrementalAlterConfigs")?;
+        }
+        47 => {
+            let topic = OffsetDeleteRequestTopic::default()
+                .with_name(TopicName::from(StrBytes::from_static_str("test-topic")))
+                .with_partitions(vec![
+                    OffsetDeleteRequestPartition::default().with_partition_index(0),
+                ]);
+            OffsetDeleteRequest::default()
+                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
+                .with_topics(vec![topic])
+                .encode(&mut buf, version)
+                .context("OffsetDelete")?;
+        }
+        60 => {
+            DescribeClusterRequest::default()
+                .with_include_cluster_authorized_operations(false)
+                .encode(&mut buf, version)
+                .context("DescribeCluster")?;
+        }
         other => {
             warn!("api_key={other}: no explicit builder — empty payload (framing test)");
         }
     }
     Ok(buf.freeze())
+}
+
+/// `ApiVersions` v5 adds the `ClusterId` and `NodeId` of the broker that the client means to reach
+/// (KIP-1242). A client sends a null `ClusterId` and `NodeId` -1 to a bootstrap server, and so
+/// does this request.
+fn put_api_versions_v5(buf: &mut BytesMut) {
+    put_compact_string(buf, CLIENT_SOFTWARE_NAME);
+    put_compact_string(buf, CLIENT_SOFTWARE_VERSION);
+    buf.put_u8(0); // null ClusterId
+    buf.put_i32(-1); // NodeId
+    buf.put_u8(0); // no tagged fields
+}
+
+/// A compact string: the byte length plus one as an unsigned varint, then the bytes.
+fn put_compact_string(buf: &mut BytesMut, value: &str) {
+    let mut len = value.len() + 1;
+    while len >= 0x80 {
+        buf.put_u8((len & 0x7F) as u8 | 0x80);
+        len >>= 7;
+    }
+    buf.put_u8(len as u8);
+    buf.put_slice(value.as_bytes());
 }
 
 // Build a complete framed Kafka request message ready for TCP transmission.
@@ -862,4 +982,76 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use kafka_protocol::protocol::Decodable;
+
+    use super::*;
+
+    /// A version the gateway advertises but this tool cannot build leaves the fixture-backed
+    /// suites without a fixture, which `KAFKA_FIXTURES_REQUIRED=1` turns into a CI failure.
+    #[test]
+    fn given_every_gateway_scoped_version_should_build_a_request() {
+        for (api_key, name, min_version, max_version) in gateway_verify_registry() {
+            for version in min_version..=max_version {
+                assert!(
+                    build_framed(api_key, version, 1).is_ok(),
+                    "{name} v{version} must build"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_leave_group_from_v3_should_carry_the_member_in_the_identities_array() {
+        for version in 3..=5 {
+            let mut payload = build_payload(13, version).expect("LeaveGroup builds");
+            let request = LeaveGroupRequest::decode(&mut payload, version).expect("decodes");
+
+            assert!(request.member_id.is_empty(), "v{version}");
+            assert_eq!(request.members.len(), 1, "v{version}");
+            assert_eq!(
+                request.members[0].member_id.as_str(),
+                "test-member-1",
+                "v{version}"
+            );
+        }
+    }
+
+    /// `kafka-protocol` cannot encode v5, so its v4 body is the reference: v5 puts a null
+    /// `ClusterId` and `NodeId` -1 before the tagged fields.
+    #[test]
+    fn given_api_versions_v5_should_add_a_null_cluster_id_and_node_id_to_the_v4_body() {
+        let v4 = build_payload(18, 4).expect("ApiVersions v4 builds");
+        let v5 = build_payload(18, 5).expect("ApiVersions v5 builds");
+
+        let (fields, tagged_fields) = v4.split_at(v4.len() - 1);
+        let mut expected = fields.to_vec();
+        expected.push(0);
+        expected.extend_from_slice(&(-1_i32).to_be_bytes());
+        expected.extend_from_slice(tagged_fields);
+        assert_eq!(v5.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn given_an_api_versions_v5_response_should_decode_the_v4_fields() {
+        let mut payload = BytesMut::new();
+        payload.put_i32(7); // correlation id, in a v0 response header
+        payload.put_i16(0); // error code
+        payload.put_u8(2); // a compact array of one api key
+        payload.put_i16(18); // ApiVersions, versions 0 to 5
+        payload.put_i16(0);
+        payload.put_i16(5);
+        payload.put_u8(0); // no tagged fields
+        payload.put_i32(0); // throttle time
+        payload.put_u8(0); // no tagged fields
+
+        let summary = response::analyze_response(18, 5, 7, &payload);
+
+        assert!(summary.correlation_match);
+        assert_eq!(summary.decode_note, None);
+        assert_eq!(summary.primary_error_code, 0);
+    }
 }

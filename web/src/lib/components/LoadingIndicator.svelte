@@ -52,7 +52,9 @@ under the License.
     await opacity.set(0, { duration: 200, delay: 300 });
   }
 
-  onNavigate(() => {
+  onNavigate(({ shallow, type }) => {
+    if (shallow && type === 'goto') return;
+
     start();
     return () => {
       stop();

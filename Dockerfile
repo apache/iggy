@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.98
+ARG RUST_VERSION=1.99.1
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
 WORKDIR /build
@@ -46,5 +46,6 @@ ENV IGGY_HTTP_ADDRESS=0.0.0.0:3000
 ENV IGGY_QUIC_ADDRESS=0.0.0.0:8080
 ENV IGGY_TCP_ADDRESS=0.0.0.0:8090
 ENV IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
+ENV IGGY_NODE_ADVERTISED_ADDRESS=localhost
 
 CMD ["/iggy-server"]

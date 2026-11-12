@@ -16,14 +16,16 @@
 // under the License.
 
 import { afterNavigate } from '$app/navigation';
-import { base } from '$app/paths';
+import { resolve } from '$app/paths';
 import { writable } from 'svelte/store';
 
 export const useGoPrev = () => {
-  const { subscribe, set } = writable(base.toString());
+  const { subscribe, set } = writable<string>(resolve('dashboard/overview'));
 
-  afterNavigate(({ from }) => {
-    set(from?.url?.pathname || base);
+  afterNavigate(({ from, shallow, type }) => {
+    if (shallow && type === 'goto') return;
+
+    set(from?.url?.pathname || resolve('dashboard/overview'));
   });
 
   return { prevPage: { subscribe } };

@@ -21,6 +21,8 @@
 mod codec;
 #[path = "common/fixtures.rs"]
 mod fixtures;
+#[path = "common/scope.rs"]
+mod scope;
 #[path = "common/server.rs"]
 mod server;
 #[path = "common/tcp.rs"]
@@ -70,7 +72,7 @@ async fn e2e_apiversions_v3_flexible_preserves_correlation_id() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).expect("api count fits usize");
-    assert_eq!(count, 6);
+    assert_eq!(count, scope::SCOPED_API_KEYS.len());
 }
 
 #[tokio::test]
@@ -103,9 +105,9 @@ async fn e2e_unsupported_api_key_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // Unknown api key (8, OffsetCommit) has no response schema this gateway can encode, so the
+    // Unknown api key (21, DeleteRecords) has no response schema this gateway can encode, so the
     // server closes the connection without a (misparseable) response body.
-    let frame1 = build_request_frame(8, 2, 99, Some("e2e-test"), &[]);
+    let frame1 = build_request_frame(21, 2, 99, Some("e2e-test"), &[]);
     stream.write_all(&frame1).await.unwrap();
 
     assert_eq!(
@@ -172,11 +174,11 @@ async fn e2e_produce_v3_acks_zero_sends_no_response() {
 }
 
 #[tokio::test]
-async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
+async fn e2e_produce_v3_acks_zero_malformed_topics_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    // acks=0, claims one topic, no topic bytes - decode fails after acks is read.
+    // acks=0, claims one topic, no topic bytes.
     let body = build_produce_v3_body(0, 1);
     let frame = build_request_frame(API_KEY_PRODUCE, 3, 99, Some("review-test"), &body);
     stream
@@ -184,26 +186,10 @@ async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
         .await
         .expect("write produce acks=0 malformed");
 
-    let response =
-        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_millis(500))
-            .await;
-
-    assert!(
-        response.is_none(),
-        "Produce with acks=0 must stay silent even when the body is malformed; got {} bytes",
-        response.as_ref().map_or(0, Bytes::len)
-    );
-
-    // A silence assertion alone cannot distinguish "stayed open and correctly silent" from "the
-    // server dropped the connection" - both look like no bytes arrive. Probe with a request that
-    // must answer, so a regression that closes on decode failure fails here instead of passing.
-    let follow_up = build_request_frame(API_KEY_API_VERSIONS, 1, 100, Some("review-test"), &[]);
-    stream.write_all(&follow_up).await.expect("follow-up");
-    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert_eq!(
-        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
-        100,
-        "connection must stay usable after the silent malformed acks=0 Produce"
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "a Produce that fails to decode must close the connection"
     );
 }
 
@@ -234,7 +220,7 @@ async fn e2e_produce_v3_acks_one_still_returns_response() {
 #[tokio::test]
 async fn e2e_list_offsets_v0_closes_connection() {
     // `kafka_protocol` has no encoder for ListOffsets v0's legacy `old_style_offsets` shape
-    // (it predates the schema the crate generates from - see `responses::encode_list_offsets_error_response`),
+    // (it predates the schema the crate generates from - see `list_offsets::encode_error_response`),
     // so a v0 request - already below the firewall's min=1 - now closes instead of getting the
     // pre-migration downgraded response.
     let (addr, _shutdown) = spawn_test_server().await;
@@ -412,7 +398,7 @@ async fn metadata_all_topics_null_array_e2e_returns_broker() {
     assert_eq!(d.read_i32().unwrap(), 1, "one stub broker");
     d.read_i32().unwrap(); // node_id
     let host = d.read_nullable_string().unwrap().expect("broker host");
-    assert!(!host.is_empty());
+    assert_ne!(host, "");
     let port = d.read_i32().unwrap();
     assert!(port > 0);
 }
@@ -436,7 +422,7 @@ async fn metadata_empty_body_e2e_closes_connection() {
 async fn out_of_scope_api_keys_e2e_close() {
     let (addr, _shutdown) = spawn_test_server().await;
 
-    for &(api_key, name) in &OUT_OF_SCOPE_API_KEYS[..4] {
+    for &(api_key, name) in OUT_OF_SCOPE_API_KEYS {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let frame = build_request_frame(api_key, 0, i32::from(api_key), Some("scope-test"), &[]);
         stream.write_all(&frame).await.expect("write oos key");

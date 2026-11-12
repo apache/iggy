@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { ClientProvider } from '../client/client.type.js';
+import type { ClientProvider, SendCommandOptions } from '../client/client.type.js';
 
 import { COMMAND_CODE } from './command.code.js';
 import { responseError } from './error.utils.js';
@@ -38,7 +38,6 @@ import {
   ensureConsumerGroup, ensureConsumerGroupAndJoin
 } from './consumer-group/ensure-group.virtual.command.js';
 
-import { purgeTopic } from './topic/purge-topic.command.js';
 import { createTopic } from './topic/create-topic.command.js';
 import { updateTopic } from './topic/update-topic.command.js';
 import { getTopic } from './topic/get-topic.command.js';
@@ -49,17 +48,18 @@ import { ensureTopic } from './topic/ensure-topic.virtual.command.js';
 import { getOffset } from './offset/get-offset.command.js';
 import { storeOffset } from './offset/store-offset.command.js';
 import { deleteOffset } from './offset/delete-offset.command.js';
+import { storePosition, deletePosition } from './offset/position.command.js';
+import { openReader } from '../stream/partition-reader.js';
+import { openConsumer, openConsumerGroup } from '../stream/iggy-consumer.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
-import { flushUnsavedBuffers } from './message/flush-unsaved-buffers.command.js';
 
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
 import { getStream } from './stream/get-stream.command.js';
 import { getStreams } from './stream/get-streams.command.js';
 import { deleteStream } from './stream/delete-stream.command.js';
-import { purgeStream } from './stream/purge-stream.command.js';
 import { ensureStream } from './stream/ensure-stream.virtual.command.js';
 
 import { createPartition } from './partition/create-partition.command.js';
@@ -68,7 +68,9 @@ import { deletePartition } from './partition/delete-partition.command.js';
 import { deleteSegments } from './segment/delete-segments.command.js';
 
 import { describeOptions } from './system/describe-options.command.js';
+import { getMetadataChanges } from './system/get-metadata-changes.command.js';
 import { getStats } from './system/get-stats.command.js';
+import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
 
 import { getClusterMetadata } from './cluster/get-cluster-metadata.command.js';
@@ -128,7 +130,6 @@ const streamAPI = (c: ClientProvider) => ({
   create: createStream(c),
   update: updateStream(c),
   delete: deleteStream(c),
-  purge: purgeStream(c),
   ensure: ensureStream(c)
 });
 
@@ -140,7 +141,6 @@ const topicAPI = (c: ClientProvider) => ({
   create: createTopic(c),
   update: updateTopic(c),
   delete: deleteTopic(c),
-  purge: purgeTopic(c),
   ensure: ensureTopic(c)
 });
 
@@ -175,15 +175,17 @@ type GroupAPI = ReturnType<typeof groupAPI>;
 const offsetAPI = (c: ClientProvider) => ({
   get: getOffset(c),
   store: storeOffset(c),
-  delete: deleteOffset(c)
+  delete: deleteOffset(c),
+  storePosition: storePosition(c),
+  deletePosition: deletePosition(c)
 });
 
 type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
-  send: sendMessages(c),
-  flushUnsavedBuffers: flushUnsavedBuffers(c)
+  reader: openReader(c),
+  send: sendMessages(c)
 });
 
 type MessageAPI = ReturnType<typeof messageAPI>;
@@ -191,7 +193,9 @@ type MessageAPI = ReturnType<typeof messageAPI>;
 const systemAPI = (c: ClientProvider) => ({
   ping: ping(c),
   getStats: getStats(c),
-  describeOptions: describeOptions(c)
+  snapshot: snapshot(c),
+  describeOptions: describeOptions(c),
+  getMetadataChanges: getMetadataChanges(c)
 });
 
 type SystemAPI = ReturnType<typeof systemAPI>;
@@ -211,6 +215,7 @@ const SESSION_CONTROL_CODES = new Set([
 ]);
 
 const INVALID_COMMAND_ERROR_CODE = 3;
+const FEATURE_UNAVAILABLE_ERROR_CODE = 5;
 
 export abstract class AbstractAPI {
   clientProvider: ClientProvider;
@@ -232,6 +237,10 @@ export abstract class CommandAPI extends AbstractAPI {
   group: GroupAPI = groupAPI(this.clientProvider);
   offset: OffsetAPI = offsetAPI(this.clientProvider);
   message: MessageAPI = messageAPI(this.clientProvider);
+  /** A standalone consumer of some partitions, one message at a time, on this client. */
+  consumer = openConsumer(this.clientProvider);
+  /** A member of a consumer group, created when it is missing, one message at a time, on this client. */
+  consumerGroup = openConsumerGroup(this.clientProvider);
   system: SystemAPI = systemAPI(this.clientProvider);
   cluster: ClusterAPI = clusterAPI(this.clientProvider);
 
@@ -239,9 +248,25 @@ export abstract class CommandAPI extends AbstractAPI {
     super(c);
   }
 
+  async resolveOperation(operationId: bigint, options?: SendCommandOptions): Promise<void> {
+    const client = await this.clientProvider();
+    if (!client.resolveOperation)
+      throw responseError(0, FEATURE_UNAVAILABLE_ERROR_CODE, 'the supplied raw client does not support operation recovery');
+    return client.resolveOperation(operationId, options);
+  }
+
+  async abandonOperation(operationId: bigint): Promise<void> {
+    const client = await this.clientProvider();
+    if (!client.abandonOperation)
+      throw responseError(0, FEATURE_UNAVAILABLE_ERROR_CODE, 'the supplied raw client does not support operation recovery');
+    client.abandonOperation(operationId);
+  }
+
   /**
    * Sends a command code with a payload and returns the raw response payload.
-   * Session-control codes are rejected with an invalid-command error.
+   * Session-control codes and the cancellation of a deferred request (108),
+   * which only the client sends for its own requests, are rejected with an
+   * invalid-command error.
    *
    * @param code - Command code to send
    * @param payload - Raw command payload
@@ -251,13 +276,45 @@ export abstract class CommandAPI extends AbstractAPI {
     code: number,
     payload: Buffer
   ): Promise<Buffer> {
-    if (SESSION_CONTROL_CODES.has(code))
+    return this.sendRawCommand(code, payload);
+  }
+
+  /**
+   * Sends a command code with a payload to the replica with the given id, as
+   * the cluster metadata names it, and returns the raw response payload. Every
+   * node answers non-replicated commands such as GetStats from its own state.
+   * Replicated commands, polls, fetches, consumer-offset reads
+   * and session-control codes are rejected with an invalid-command error, and a replica id the cluster
+   * metadata does not name with an invalid-identifier error. A `NotPrimary`
+   * refusal is returned and not retried on another replica.
+   *
+   * @param code - Command code to send
+   * @param payload - Raw command payload
+   * @param replica - Replica id, as the cluster metadata names it
+   * @returns Raw response payload
+   */
+  async sendBinaryRequestToReplica(
+    code: number,
+    payload: Buffer,
+    replica: number
+  ): Promise<Buffer> {
+    return this.sendRawCommand(code, payload, { replica });
+  }
+
+  private async sendRawCommand(
+    code: number,
+    payload: Buffer,
+    options?: SendCommandOptions
+  ): Promise<Buffer> {
+    // Only a link cancels a deferred request, the one that it sent.
+    if (SESSION_CONTROL_CODES.has(code) || code === COMMAND_CODE.CancelDeferredRequest)
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
-    const requestPayload = Buffer.from(payload);
+    const snapshot = Buffer.from(payload);
     const response = await (await this.clientProvider()).sendCommand(
       code,
-      requestPayload
+      snapshot,
+      options
     );
     return response.length <= 1 ? Buffer.alloc(0) : response.data;
   }

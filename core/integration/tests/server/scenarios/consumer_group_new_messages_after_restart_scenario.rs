@@ -35,7 +35,10 @@ pub async fn run(harness: &TestHarness) {
 }
 
 async fn init_system(client: &IggyClient) {
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
 
     client
         .create_topic(
@@ -124,6 +127,7 @@ async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
     );
 
     // 6. Disconnect the consumer and client (simulating runtime restart)
+    consumer.shutdown().await.unwrap();
     drop(consumer);
     runtime_client.disconnect().await.unwrap();
     drop(runtime_client);
@@ -218,12 +222,13 @@ async fn create_consumer(client: &IggyClient) -> IggyConsumer {
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(10)
-        .poll_interval(IggyDuration::from_str("100ms").unwrap())
+        .poll_options(PollOptions {
+            count: 10,
+            commit: CommitPolicy::OnRead,
+            ..PollOptions::wait(IggyDuration::ONE_SECOND)
+        })
         .polling_strategy(PollingStrategy::next())
-        .auto_join_consumer_group()
         .create_consumer_group_if_not_exists()
-        .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
         .build();
 
     consumer.init().await.unwrap();

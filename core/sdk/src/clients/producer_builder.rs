@@ -20,8 +20,7 @@ use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, NonZeroIggyDuration, Partitioner,
-    Partitioning,
+    Durability, EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
 };
 use std::sync::Arc;
 
@@ -47,12 +46,12 @@ pub struct IggyProducerBuilder {
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
-    send_retries_count: Option<u32>,
-    send_retries_interval: Option<NonZeroIggyDuration>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
+    topic_durability: Durability,
     partitioning: Option<Partitioning>,
     mode: SendMode,
+    idempotent: bool,
 }
 
 impl IggyProducerBuilder {
@@ -80,9 +79,9 @@ impl IggyProducerBuilder {
             topic_partitions_count: 1,
             topic_message_expiry: IggyExpiry::ServerDefault,
             topic_max_size: MaxTopicSize::ServerDefault,
-            send_retries_count: Some(3),
-            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
+            topic_durability: Durability::default(),
             mode: SendMode::default(),
+            idempotent: false,
         }
     }
 
@@ -176,6 +175,16 @@ impl IggyProducerBuilder {
         }
     }
 
+    /// Sets message durability for an automatically created topic.
+    /// Defaults to Replicated. `Durability::Persisted` also provides stable
+    /// storage and crash-safe retry receipts.
+    pub fn topic_durability(self, durability: Durability) -> Self {
+        Self {
+            topic_durability: durability,
+            ..self
+        }
+    }
+
     /// Does not create the topic if it does not exist.
     pub fn do_not_create_topic_if_not_exists(self) -> Self {
         Self {
@@ -184,13 +193,29 @@ impl IggyProducerBuilder {
         }
     }
 
-    /// Sets the retry policy (maximum number of retries and interval between them) in case of messages sending failure.
-    /// The error can be related either to disconnecting from the server or to the server rejecting the messages.
-    /// Default is 3 retries with 1 second interval between them.
-    pub fn send_retries(self, retries: Option<u32>, interval: Option<NonZeroIggyDuration>) -> Self {
+    /// Turns on the idempotent mode. Each chunk carries this producer's id, an
+    /// epoch and the sequence of its first message, and a partition writes it
+    /// once, also when the producer sends it again from a new session.
+    ///
+    /// The producer gets its id from [`next_producer_id`] during
+    /// [`init()`](IggyProducer::init), so it needs a binary client. It picks the
+    /// partition of a chunk itself, and it sends the chunks of one partition one
+    /// at a time. Released builds of this SDK, of every client that embeds it
+    /// and of the Swift SDK cannot poll the batches that it writes, so upgrade
+    /// every consumer of the topic first. See [`IggyProducer`].
+    ///
+    /// [`next_producer_id`]: iggy_common::MessageClient::next_producer_id
+    pub fn idempotent(self) -> Self {
         Self {
-            send_retries_count: retries,
-            send_retries_interval: interval,
+            idempotent: true,
+            ..self
+        }
+    }
+
+    /// Turns off the idempotent mode, the default.
+    pub fn without_idempotence(self) -> Self {
+        Self {
+            idempotent: false,
             ..self
         }
     }
@@ -225,9 +250,9 @@ impl IggyProducerBuilder {
             self.topic_partitions_count,
             self.topic_message_expiry,
             self.topic_max_size,
-            self.send_retries_count,
-            self.send_retries_interval,
+            self.topic_durability,
             self.mode,
+            self.idempotent,
         )
     }
 }

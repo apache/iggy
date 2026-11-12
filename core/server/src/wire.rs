@@ -30,23 +30,6 @@ pub fn request_body(request: &Message<RoutedRequestHeader>) -> &[u8] {
     &request.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..request.header().size as usize]
 }
 
-/// Check a client's `request_checksum` against the body it stamps.
-///
-/// Must run BEFORE any body rewrite: PAT / password / consumer-group paths
-/// substitute server-chosen bytes. Zero is "unstamped" and skips the check, so an
-/// SDK predating the stamp still works.
-///
-/// # Errors
-/// [`IggyError::InvalidFormat`] when the stamp disagrees with the body.
-pub fn verify_request_checksum(request: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
-    let stamped = request.header().request_checksum;
-    if stamped == 0 || u128::from(iggy_common::calculate_checksum(request_body(request))) == stamped
-    {
-        return Ok(());
-    }
-    Err(IggyError::InvalidFormat)
-}
-
 /// Map the transport kind to the legacy wire discriminant
 /// (`1=TCP, 2=QUIC, 4=WebSocket`); TLS variants report their base
 /// transport. `ClientTransportKind` is `#[non_exhaustive]`, so any other
@@ -87,9 +70,8 @@ pub fn rewrite_request_body(
     // downstream. Clear rather than recompute; carrying them forward is a stale claim.
     header.checksum = 0;
     header.checksum_body = 0;
-    // `request_checksum` is deliberately NOT touched: it stamps what the CLIENT sent,
-    // already validated at admission. Re-stamping it over the substituted body would
-    // make the client-table reuse check compare a value no client ever produced.
+    // Preserve the original client request identifier in the prepare and receipt;
+    // the substituted body's integrity is sealed separately.
     rewritten.as_mut_slice()[std::mem::size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
     Ok(rewritten)
 }
@@ -124,8 +106,8 @@ mod tests {
     #[test]
     fn given_a_body_rewrite_should_keep_the_client_stamp_and_clear_the_stale_seals() {
         // The secret-bearing wire body is swapped for the hash-carrying replicated
-        // one. `request_checksum` describes what the client sent and admission has
-        // already checked it, so it must survive; the other two describe the body
+        // one. `request_checksum` identifies the logical client request, so it
+        // must survive; the other two describe the body
         // that just went away.
         let original = request(b"plaintext-secret", 0x1234);
         let rewritten = rewrite_request_body(&original, &Bytes::from_static(b"argon2-hash"))
@@ -148,8 +130,6 @@ mod tests {
 
     #[test]
     fn given_an_unstamped_request_when_rewriting_should_stay_unstamped() {
-        // Zero means "unstamped" all the way through the client table, so a rewrite
-        // must not manufacture a stamp for a client that sent none.
         let original = request(b"plaintext-secret", 0);
         let rewritten = rewrite_request_body(&original, &Bytes::from_static(b"argon2-hash"))
             .expect("the rewritten body fits a request message");

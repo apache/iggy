@@ -218,11 +218,10 @@ pub async fn fetch_benchmark_trend(
 pub fn download_test_artifacts(uuid: &Uuid) {
     let url = format!("{}/api/artifacts/{}", get_api_base_url(), uuid);
 
-    if let Some(window) = window() {
-        let _ = window
-            .location()
-            .set_href(&url)
-            .map_err(|_| log!("Failed to initiate download"));
+    if let Some(window) = window()
+        && window.location().set_href(&url).is_err()
+    {
+        log!("Failed to initiate download");
     }
 }
 

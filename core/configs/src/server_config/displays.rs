@@ -22,6 +22,7 @@
 //! [`ServerConfig`] formatter and the [`MessageBusConfig`] section
 //! formatter.
 
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
@@ -38,7 +39,7 @@ impl Display for ServerConfig {
              heartbeat: {}, path: {}, runtime: {{ path: {} }}, logging: {}, \
              encryption: {}, memory_pool: {:?}, sharding: {:?}, \
              quic: {}, tcp: {}, http: {}, telemetry: {}, \
-             metadata: {}, message_bus: {}, partition: {} }}",
+             metadata: {}, message_bus: {}, partition: {}, external_auth: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
@@ -55,6 +56,7 @@ impl Display for ServerConfig {
             self.metadata,
             self.message_bus,
             self.partition,
+            self.external_auth,
         )
     }
 }
@@ -86,8 +88,13 @@ impl Display for MetadataConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {} }}",
-            self.prepare_queue_depth, self.journal_slots, self.clients_table_max,
+            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {}, partitions_max: {}, change_log_resource_capacity: {}, change_log_activity_capacity: {} }}",
+            self.prepare_queue_depth,
+            self.journal_slots,
+            self.clients_table_max,
+            self.partitions_max,
+            self.change_log_resource_capacity,
+            self.change_log_activity_capacity,
         )
     }
 }
@@ -96,16 +103,25 @@ impl Display for MessageBusConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ max_batch: {}, max_message_size: {}, peer_queue_capacity: {}, \
-             reconnect_period: {}, close_peer_timeout: {}, close_grace: {}, \
-             handshake_grace: {} }}",
+            "{{ max_batch: {}, max_message_size: {}, replica_read_buffer_size: {}, \
+             peer_queue_capacity: {}, client_queue_capacity: {}, client_write_stall_timeout: {}, \
+             client_request_queue_bytes_max: {}, reconnect_period: {}, close_peer_timeout: {}, \
+             close_grace: {}, handshake_grace: {}, connections_max: {} }}",
             self.max_batch,
             self.max_message_size,
+            self.replica_read_buffer_size,
             self.peer_queue_capacity,
+            self.client_queue_capacity,
+            self.client_write_stall_timeout,
+            self.client_request_queue_bytes_max,
             self.reconnect_period,
             self.close_peer_timeout,
             self.close_grace,
             self.handshake_grace,
+            self.connections_max.map_or_else(
+                || "half of RLIMIT_NOFILE".to_owned(),
+                |connections_max| connections_max.to_string()
+            ),
         )
     }
 }
@@ -155,6 +171,16 @@ impl Display for QuicCertificateConfig {
             f,
             "{{ self_signed: {}, cert_file: {}, key_file: {} }}",
             self.self_signed, self.cert_file, self.key_file
+        )
+    }
+}
+
+impl Display for ExternalAuthConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, url: [redacted], timeout: {}, max_concurrent_callouts: {} }}",
+            self.enabled, self.timeout, self.max_concurrent_callouts,
         )
     }
 }

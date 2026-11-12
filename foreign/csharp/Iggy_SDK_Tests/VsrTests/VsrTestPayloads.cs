@@ -81,6 +81,11 @@ internal static class VsrTestPayloads
         return Concat(streamId, topicId, UInt32((int)partitionId), UInt32((int)segmentsCount));
     }
 
+    internal static byte[] Rejection(int code)
+    {
+        return Concat(UInt32(1), UInt32(0), UInt32(code));
+    }
+
     internal static byte[] UInt32(int value)
     {
         var bytes = new byte[4];

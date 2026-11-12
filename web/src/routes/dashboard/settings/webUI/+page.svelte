@@ -18,11 +18,11 @@ under the License.
 -->
 
 <script lang="ts">
-  import Button from '$lib/components/Button.svelte';
-  import Input from '$lib/components/Input.svelte';
-  import SettingsLayout from '$lib/components/Layouts/SettingsLayout.svelte';
-  import { invalidateIntervalDuration } from '$lib/components/PeriodicInvalidator.svelte';
-  import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
+  import Button from '#lib/components/Button.svelte';
+  import Input from '#lib/components/Input.svelte';
+  import SettingsLayout from '#lib/components/Layouts/SettingsLayout.svelte';
+  import { invalidateIntervalDuration } from '#lib/components/PeriodicInvalidator.svelte';
+  import { durationFormatter } from '#lib/utils/formatters/durationFormatter.js';
 
   let intervalValue = $state($invalidateIntervalDuration);
 

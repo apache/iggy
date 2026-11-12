@@ -57,12 +57,42 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected bool EnabledServerTraceLogs => true;
 
     /// <summary>
-    ///     Server-side heartbeat interval. Short so a client that stops pinging is evicted within a few seconds
-    ///     instead of the default five. Clients from <see cref="CreateClient" /> ping at half this interval;
-    ///     any client built by hand must set <see cref="IggyClientConfigurator.HeartbeatInterval" /> below it or
-    ///     be evicted once idle past 1.2 intervals.
+    ///     Server-side heartbeat interval. 1.2 intervals is the session timeout: a client that stops pinging is
+    ///     evicted once idle past it and loses its session about one timeout later. 13 s is the shortest
+    ///     whole-second interval whose timeout exceeds the cluster's 15 s heartbeat timeout, as the server
+    ///     requires. Clients from <see cref="CreateClient" /> ping at half this interval; any client built by
+    ///     hand must set <see cref="IggyClientConfigurator.HeartbeatInterval" /> below 1.2 intervals or be
+    ///     evicted once idle past them.
     /// </summary>
-    public static readonly TimeSpan ServerHeartbeatInterval = TimeSpan.FromSeconds(2);
+    public static readonly TimeSpan ServerHeartbeatInterval = TimeSpan.FromSeconds(13);
+
+    /// <summary>
+    ///     How often every node reports its sessions to the metadata primary. The server accepts the short
+    ///     heartbeat interval above only with reports this frequent.
+    /// </summary>
+    public static readonly TimeSpan SessionReportInterval = TimeSpan.FromMilliseconds(500);
+
+    private static readonly TimeSpan StatsConvergenceTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan StatsPollInterval = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>Node-local counters catch up after partition commit broadcasts.</summary>
+    public static async Task<T> ReadConvergedStatsAsync<T>(Func<Task<T>> read, Func<T, bool> converged)
+    {
+        var deadline = Environment.TickCount64 + (long)StatsConvergenceTimeout.TotalMilliseconds;
+        var result = await read();
+        while (!converged(result) && Environment.TickCount64 < deadline)
+        {
+            await Task.Delay(StatsPollInterval);
+            result = await read();
+        }
+        return result;
+    }
+
+    /// <summary>
+    ///     Server encryption key every node shares. With encryption enabled a stream created without its own key
+    ///     gets one the server generates, so the stream options tests read a server sourced key.
+    /// </summary>
+    public static readonly string ServerEncryptionKey = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
 
     /// <summary>
     ///     Extra environment variables for every node, layered over the cluster's base configuration.
@@ -72,13 +102,22 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     protected virtual Dictionary<string, string> EnvironmentVariables => new()
     {
         { "IGGY_HEARTBEAT_ENABLED", "true" },
-        { "IGGY_HEARTBEAT_INTERVAL", $"{ServerHeartbeatInterval.TotalSeconds}s" }
+        { "IGGY_HEARTBEAT_INTERVAL", $"{ServerHeartbeatInterval.TotalSeconds}s" },
+        { "IGGY_CONSUMER_GROUP_HEARTBEAT_INTERVAL", $"{SessionReportInterval.TotalMilliseconds}ms" },
+        { "IGGY_ENCRYPTION_ENABLED", "true" },
+        { "IGGY_ENCRYPTION_KEY", ServerEncryptionKey }
     };
 
     /// <summary>
     ///     Resource mappings (certificates, etc.) mounted into every node. Override in subclasses.
     /// </summary>
     protected virtual ResourceMapping[] ResourceMappings => [];
+
+    /// <summary>
+    ///     The cluster size, which is what a server on the default settings reports as the default replication
+    ///     factor.
+    /// </summary>
+    public int ClusterNodeCount => NodeCount;
 
     /// <summary>
     ///     Cluster size, mirroring the Rust integration harness knob of the same name: the

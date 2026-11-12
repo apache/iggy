@@ -10,6 +10,15 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
+Connector issues and PRs go to [apache/iggy-connectors](https://github.com/apache/iggy-connectors).
+
+### Good First Issues
+
+The `good first issue` label marks issues for new contributors.
+
+Take only one good first issue. After that, pick issues without the label, so that the
+next new contributor can find one.
+
 ## High-Risk Areas
 
 These require design discussion in the issue before coding:
@@ -18,7 +27,6 @@ These require design discussion in the issue before coding:
 - Protocol (binary format, wire encoding)
 - Concurrency (shards, inter-shard)
 - Public API (HTTP, SDKs, CLI)
-- Connectors
 
 ## PR Requirements
 
@@ -37,6 +45,15 @@ not. Before you open a PR you must be able to explain what every part of the cha
 and why, answer review questions about it yourself, and defend the design without going
 back to the tool for an answer. If you can't, the PR isn't ready.
 
+The license rules for AI output are in the
+[ASF guidance on generative tooling](https://www.apache.org/legal/generative-tooling.html).
+You must follow them.
+
+If an AI assistant helped you write the change, review it with the
+[`team-review`](.claude/skills/team-review/SKILL.md) skill before you open the PR.
+The skill can report false findings. Fix every finding that is correct and that applies to
+your change.
+
 While you're new to the project, please keep to **one open PR at a time**. Review takes
 longer than writing, so a queue of changes from one contributor holds up everyone else's.
 
@@ -44,6 +61,41 @@ Maintainers may close a PR at first review if it reads as a relay between the re
 a model, rather than a change the author understands and takes responsibility for. That is
 a judgment about the submission, not about you, and it does not bar you from contributing
 again if you come back with a change you can take responsibility for.
+
+### Agent-Driven PRs
+
+An AI agent is a tool that writes code by itself. In an agent-driven PR, an
+agent does the work from start to end, and a person only approves the result. Maintainers
+can close an agent-driven PR at their own discretion, without a code review.
+
+Maintainers can run the same agents. Your PR is useful to us because you understand the
+change and can maintain it later. Maintainer review time is limited, so we spend it on people
+and not on agent output.
+
+Maintainers look for signs like these:
+
+- The AI Usage section says that an agent did the work and that you approved it.
+- The description or a reply to a review describes changes that are not in the diff.
+- You cannot explain the change without the agent.
+
+If you follow [Bugs Found by an Agent](#bugs-found-by-an-agent), a bug that an agent found
+is the exception. After a maintainer agrees on the approach and assigns the issue to you, an
+agent can write the test and the fix.
+
+Your first contribution does not have to be code. A [review of another PR](#reviewing-prs),
+an answer on Discord, and an issue that shows that you read the source are all contributions.
+
+### Bugs Found by an Agent
+
+If the bug is a vulnerability, report it in private, as [SECURITY.md](SECURITY.md) tells you.
+Do not open a public issue or PR for it.
+
+1. Search open issues. If it is already there, comment on it.
+2. Otherwise open an issue that shows how to reproduce the bug.
+3. Wait until a maintainer agrees on the approach and assigns the issue to you.
+4. Open one PR with the test and the fix, and link the issue with "Closes #123".
+5. If the fix is hard, the PR can hold only the test, marked `#[ignore]`. Put any suggested
+   fix in a TODO in the test, and link the issue with "Relates to #123".
 
 ### Green CI
 
@@ -54,6 +106,23 @@ for review.
 ### Single Purpose
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
+
+### Review Comments
+
+Respond to every review comment, so that the reviewer knows you read it. Any one of these
+is enough:
+
+- Resolve the conversation
+- React with 👍
+- Reply to the comment
+
+### Updating Your Branch
+
+Do not rebase your branch or merge `master` into it only to keep it up to date. Each push
+runs CI again on GitHub Actions runners that all Apache projects share. A maintainer
+updates the branch before the merge.
+
+If GitHub reports a merge conflict, or if a maintainer asks you to, update your branch.
 
 ### Quality Checks
 
@@ -153,6 +222,22 @@ chore(integration): remove streaming tests superseded by API-level coverage
 
 Keep subject under 72 chars. Use body for details if needed.
 
+A pull request that adds or amends an RFC under `rfcs/` uses the type `rfc`,
+as described in `rfcs/README.md`. If no scope in
+`.github/workflows/pr-title.yml` fits, add the RFC's feature name to that list
+in the same pull request.
+
+## Reviewing PRs
+
+Anyone can review a PR. You don't need to be a committer, and reviews from contributors
+are welcome. Read the change, run it locally if you can, and leave comments or a review.
+Questions count too. If something isn't clear to you, it probably isn't clear to the next
+reader either.
+
+A committer still has to approve and merge. If you're a returning contributor, your
+"Request changes" review moves the PR to `S-waiting-on-author`, and you can use `/author`
+to do the same.
+
 ## PR Triage Commands
 
 Move a PR around the review queue by posting a slash command on its own
@@ -166,9 +251,19 @@ line in a regular PR comment (not an inline review reply):
 | `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
 | `/unpin`                            | author or maintainer                | remove `pinned`                                              |
 
-Some labels move on their own: opening or marking a non-draft PR ready sets
-`S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
-closing or converting to draft clears both.
+A returning contributor is anyone who has had a commit merged into apache/iggy.
+
+Some labels move on their own. Opening a non-draft PR, or marking a draft
+ready, sets `S-waiting-on-review`. A "Request changes" review sets
+`S-waiting-on-author`, and so does a `/skill` bot review with findings for the
+author. Closing a PR, or converting it to a draft, clears both.
+
+When a PR is opened, including a draft, `PR Triage Apply` checks its author once.
+It adds `Prolific Author` if a human author opened PRs in more than 20 visible
+repositories over the last 30 days, unless they have at least 10 merged PRs in Iggy.
+This follows [Arrow-rs's criteria](https://github.com/apache/arrow-rs/issues/11808).
+The label is informational and is not removed automatically. Maintainers can use it to
+decide where to spend review time.
 
 Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
 permission; if neither shows up, check the `PR Triage Apply` run in the
@@ -179,6 +274,7 @@ Actions tab.
 PRs may be closed if:
 
 - Maintainer feels like proxy between maintainer and LLM
+- Agent-driven PR, see [Agent-Driven PRs](#agent-driven-prs)
 - No approved issue or no approval from a maintainer
 - Code not ran and tested locally
 - Mixed purposes or purposes not clear
@@ -199,4 +295,6 @@ never labeled or closed by it. A closed PR can be reopened.
 
 ## Questions?
 
-[Discussions](https://github.com/apache/iggy/discussions) or [Discord](https://discord.gg/apache-iggy)
+[Discussions](https://github.com/apache/iggy/discussions), [Discord](https://discord.gg/apache-iggy) or the [dev@iggy.apache.org](https://iggy.apache.org/community/mailing-lists/) mailing list (subscribe by emailing <dev-subscribe@iggy.apache.org>)
+
+GitHub Discussions are mirrored to dev@. The mirror only runs one way: replies sent to the list do not appear in Discussions.

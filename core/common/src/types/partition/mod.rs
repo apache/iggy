@@ -19,6 +19,8 @@ use crate::utils::byte_size::IggyByteSize;
 use crate::utils::timestamp::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 
+pub use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+
 /// `Partition` represents the information about a partition.
 /// It consists of the following fields:
 /// - `id`: unique identifier of the partition.
@@ -27,6 +29,9 @@ use serde::{Deserialize, Serialize};
 /// - `current_offset`: the current offset of the partition.
 /// - `size_bytes`: the size of the partition in bytes.
 /// - `messages_count`: the number of messages in the partition.
+/// - `context`: the partition incarnation and the metadata operation the details were read at.
+/// - `members`: the nodes that store the partition.
+/// - `in_sync_members`: the members its primary last reported in sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Partition {
     /// Unique identifier of the partition.
@@ -41,4 +46,16 @@ pub struct Partition {
     pub size: IggyByteSize,
     /// The number of messages in the partition.
     pub messages_count: u64,
+    /// The partition incarnation and the metadata operation the details were read at. The
+    /// owner generation is zero because the details belong to no consumer group.
+    pub context: PartitionContext,
+    /// Node ids that store the partition, in member order. While one is down, a write
+    /// still commits if a quorum of the others is in sync.
+    #[serde(default)]
+    pub members: Vec<u8>,
+    /// Node ids among `members` that the partition's primary last reported in sync and
+    /// that are up. Empty until the primary first reports, and while no member that is
+    /// up can lead it.
+    #[serde(default)]
+    pub in_sync_members: Vec<u8>,
 }

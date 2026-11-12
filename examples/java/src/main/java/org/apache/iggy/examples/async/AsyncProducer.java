@@ -25,11 +25,9 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -135,13 +133,7 @@ public final class AsyncProducer {
                     }
                     log.info("Creating topic: {}", TOPIC_NAME);
                     return client.topics()
-                            .createTopic(
-                                    StreamId.of(STREAM_NAME),
-                                    1L,
-                                    CompressionAlgorithm.None,
-                                    BigInteger.ZERO,
-                                    BigInteger.ZERO,
-                                    TOPIC_NAME)
+                            .createTopic(StreamId.of(STREAM_NAME), TOPIC_NAME, 1L)
                             .thenAccept(created -> log.info("Topic created: {}", created.name()));
                 });
     }

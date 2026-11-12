@@ -55,7 +55,6 @@ func TestMetadataCommitDoesNotUsePartitionOrReadReplyIndexes(t *testing.T) {
 	}{
 		{OperationRegister, true},
 		{OperationLogout, true},
-		{OperationPurgeTopic, true},
 		{OperationJoinConsumerGroup, true},
 		{OperationNonReplicated, false},
 		{OperationSendMessages, false},

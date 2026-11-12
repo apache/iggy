@@ -19,9 +19,9 @@
 
 use super::conn_info::ClientConnMeta;
 use super::tcp::install_client_conn;
-use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::transports::ws::WsTransportConn;
+use crate::{ConnectionPermit, IggyMessageBus};
 use compio::net::TcpStream;
 use std::rc::Rc;
 
@@ -34,16 +34,18 @@ use std::rc::Rc;
 ///
 /// Like QUIC, this never crosses an inter-shard channel:
 /// `WebSocketStream<TcpStream>` is `!Send` (it holds compio `Rc<...>`
-/// driver state) so shard 0 terminates locally and uses the existing
-/// `ForwardClientSend` / `Consensus` variants. The post-upgrade socket
-/// IS still a raw TCP fd, but compio-ws has no "rebuild from fd" API
-/// and re-attaching the tungstenite state machine across shards would
-/// lose protocol invariants the dispatcher already enforced.
+/// driver state) so shard 0 terminates locally, and a request bound for
+/// another shard returns its reply over the request's own channel. The
+/// post-upgrade socket IS still a raw TCP fd, but compio-ws has no
+/// "rebuild from fd" API and re-attaching the tungstenite state machine
+/// across shards would lose protocol invariants the dispatcher already
+/// enforced.
 #[allow(clippy::future_not_send)]
 pub fn install_client_ws(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     stream: compio_ws::WebSocketStream<TcpStream>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let cfg = bus.config();
@@ -51,6 +53,7 @@ pub fn install_client_ws(
         bus,
         meta,
         WsTransportConn::new_server(stream).with_close_grace(cfg.close_grace),
+        Some(permit),
         on_request,
     );
 }

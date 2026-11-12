@@ -25,7 +25,8 @@ use futures::TryStreamExt;
 use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::{Command, ConsensusHeader, Operation, PrepareHeader};
 use server_common::{
-    Message,
+    DISK_USAGE, Message,
+    fatal::NoteDescriptorExhaustion,
     iobuf::{Frozen, Owned},
     send_messages::decode_prepare_slice,
 };
@@ -35,7 +36,7 @@ use crate::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode}
 
 mod segments;
 pub use segments::SegmentPosition;
-use segments::SegmentState;
+use segments::{SegmentFile, SegmentState};
 
 pub const PARTITION_WAL_BLOCK_SIZE: usize = 4096;
 pub const PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
@@ -61,15 +62,17 @@ const FRONTIER_BYTES: usize = FRONTIER_SLOTS * PARTITION_WAL_BLOCK_SIZE;
 const FRONTIER_SEQUENCE_OFFSET: usize = SEALED_STATE_MAGIC_OFFSET + size_of::<u64>();
 const _: () = assert!(FRONTIER_SEQUENCE_OFFSET + size_of::<u64>() <= PARTITION_WAL_BLOCK_SIZE);
 pub const PREPARE_BYTES_MAX: usize = 64 * 1024 * 1024;
-/// Two-slot frontier. `IGGYWAL1` and `IGGYWAL2` were the single-block layout,
-/// which this build neither writes nor reads.
+/// Two-slot frontier. `IGGYWAL1` and `IGGYWAL2` were the single-block layout.
+/// `IGGYWAL3` kept a purge marker in bytes 104..120, which are reserved now,
+/// and reading it as this layout would replay the prepares the marker fenced.
+/// This build neither writes nor reads any of the three.
 ///
-/// The value has to differ from those two. A build that predates the slots
-/// reads block 0 and truncates the data file to the length it finds there, and
-/// after an acknowledgment lands in slot 1 that block is one publication stale.
-/// Rejecting the magic makes such a build refuse the open instead of dropping
-/// acknowledged records.
-const STATE_MAGIC: &[u8; 8] = b"IGGYWAL3";
+/// The value has to differ from the single-block magics. A build that predates
+/// the slots reads block 0 and truncates the data file to the length it finds
+/// there, and after an acknowledgment lands in slot 1 that block is one
+/// publication stale. Rejecting the magic makes such a build refuse the open
+/// instead of dropping acknowledged records.
+const STATE_MAGIC: &[u8; 8] = b"IGGYWAL4";
 /// Segment references live in a flag inside the block, not in the magic, so a
 /// later format bump costs one constant rather than doubling the set.
 const SEGMENT_REFERENCES_FLAG: usize = 100;
@@ -81,6 +84,47 @@ const SEGMENT_RECORD: u32 = 1;
 const RECORD_KIND_OFFSET: usize = 4;
 const SEGMENT_REFERENCE_BYTES: usize = 4 * size_of::<u64>();
 const REFERENCED_PREPARE_BYTES: usize = size_of::<PrepareHeader>() + SEGMENT_REFERENCE_BYTES;
+
+/// How [`PartitionPrepareJournal::open_with_options`] opens a WAL.
+#[derive(Debug, Clone, Copy)]
+pub struct WalOpenOptions {
+    /// Admission budget. Recovery reads the existing history whatever it is.
+    pub capacity: u64,
+    pub preallocate_segments: bool,
+    /// The WAL is one of the two logs of a partition consensus group and
+    /// accepts gaps between its ops, see [`PartitionPrepareJournal::allow_gaps`].
+    pub sparse: bool,
+    /// The view a WAL this open creates starts certified at. An existing WAL
+    /// keeps the certificate it published.
+    pub new_log_view: u32,
+}
+
+impl WalOpenOptions {
+    fn validate(&self) -> io::Result<()> {
+        if (PARTITION_WAL_CAPACITY_MIN..=PARTITION_WAL_CAPACITY_MAX).contains(&self.capacity)
+            && self
+                .capacity
+                .is_multiple_of(PARTITION_WAL_BLOCK_SIZE as u64)
+        {
+            Ok(())
+        } else {
+            Err(invalid(
+                "partition WAL capacity is out of bounds or unaligned",
+            ))
+        }
+    }
+}
+
+impl Default for WalOpenOptions {
+    fn default() -> Self {
+        Self {
+            capacity: PARTITION_WAL_BYTES_MAX,
+            preallocate_segments: false,
+            sparse: false,
+            new_log_view: 0,
+        }
+    }
+}
 
 /// A prepare body in a segment inode retained by the WAL.
 ///
@@ -108,6 +152,7 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     file: S::File,
     frontier: S::File,
     frontier_sequence: u64,
+    recovered_frontier: bool,
     storage: S,
     capacity: u64,
     state: JournalState,
@@ -117,11 +162,16 @@ pub struct PartitionPrepareJournal<S: DurableStorage = DiskStorage> {
     obsolete: VecDeque<PathBuf>,
     cleanup_directory_dirty: bool,
     recovered_prepares: Vec<Message<PrepareHeader>>,
-    segment_files: BTreeMap<(u64, u64), S::File>,
+    segment_files: BTreeMap<(u64, u64), SegmentFile<S::File>>,
     segment_files_dirty: bool,
     segment_links_dirty: bool,
     preallocate_segments: bool,
     retained_bytes: u64,
+    /// Holds one of the two logs of a partition consensus group, so its ops
+    /// skip the ops the other log holds. Each record still verifies on its
+    /// own, and the parent link is checked wherever two ops are adjacent. The
+    /// caller verifies the links across a gap against the other log.
+    sparse: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -137,8 +187,6 @@ struct JournalState {
     anchor_known: bool,
     checkpoint_prepare: bool,
     certified_log_view: Option<u32>,
-    purge_generation: u64,
-    purge_floor: u64,
     segment_references: bool,
     segment_storage: Option<SegmentState>,
 }
@@ -154,6 +202,30 @@ struct StoredPrepare {
 }
 
 impl PartitionPrepareJournal {
+    /// Check prior publication without creating a frontier. Opening the WAL
+    /// still validates its complete identity and referenced history.
+    ///
+    /// # Errors
+    /// Returns an error if the frontier cannot be read.
+    pub async fn has_published_frontier(directory: &Path) -> io::Result<bool> {
+        let (frontier, slots) =
+            Self::open_frontier(&DiskStorage, &directory.join(FRONTIER_FILE_NAME)).await?;
+        let (state, _, _) = Self::read_frontier(frontier.as_ref(), slots).await?;
+        Ok(state.is_some())
+    }
+
+    /// The segment tail in whichever slot of `frontier`, the bytes of a
+    /// [`FRONTIER_FILE_NAME`] file, recovery would select. When every slot
+    /// verifies, recovery truncates the tail segment to it. `None` when no slot
+    /// verifies or the WAL does not own segment bodies.
+    #[must_use]
+    pub fn published_segment_tail(frontier: &[u8]) -> Option<SegmentPosition> {
+        let (state, _, _) = newest_frontier_slot(frontier);
+        state?
+            .segment_storage
+            .map(|segments| segments.tail.position)
+    }
+
     /// # Errors
     /// Returns an error on I/O failure or invalid durable history.
     pub async fn open(directory: &Path, group: u64, incarnation: u64) -> io::Result<Self> {
@@ -173,36 +245,29 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         incarnation: u64,
         storage: S,
     ) -> io::Result<Self> {
-        Self::open_with_storage_and_capacity(
+        Self::open_with_options(
             directory,
             group,
             incarnation,
             storage,
-            PARTITION_WAL_BYTES_MAX,
-            false,
+            WalOpenOptions::default(),
         )
         .await
     }
 
-    /// Open history independently of the current admission capacity.
+    /// Open and verify the durably published partition history, independently
+    /// of the current admission capacity.
     ///
     /// # Errors
     /// Returns an error for invalid capacity or unverifiable durable history.
-    pub async fn open_with_storage_and_capacity(
+    pub async fn open_with_options(
         directory: &Path,
         group: u64,
         incarnation: u64,
         storage: S,
-        capacity: u64,
-        preallocate_segments: bool,
+        options: WalOpenOptions,
     ) -> io::Result<Self> {
-        if !(PARTITION_WAL_CAPACITY_MIN..=PARTITION_WAL_CAPACITY_MAX).contains(&capacity)
-            || !capacity.is_multiple_of(PARTITION_WAL_BLOCK_SIZE as u64)
-        {
-            return Err(invalid(
-                "partition WAL capacity is out of bounds or unaligned",
-            ));
-        }
+        options.validate()?;
         let parent = directory
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -212,8 +277,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 "partition WAL parent must already be durably materialized",
             ));
         }
-        storage.create_directories(directory).await?;
-        storage.sync_directory(parent).await?;
         let state_path = directory.join(FRONTIER_FILE_NAME);
         let (published, slots) = Self::open_frontier(&storage, &state_path).await?;
         let (existing, sequence, verified) = Self::read_frontier(published.as_ref(), slots).await?;
@@ -225,13 +288,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         {
             return Err(invalid("partition WAL identity mismatch"));
         }
+        // A verified frontier was installed after an earlier open made this
+        // directory durable in its parent, so only a new WAL pays for that.
         if existing.is_none() {
+            storage.create_directories(directory).await?;
+            storage.sync_directory(parent).await?;
             Self::validate_unpublished_history(&storage, directory).await?;
         }
         let state = existing.unwrap_or_else(|| JournalState {
             group,
             incarnation,
-            certified_log_view: Some(0),
+            certified_log_view: Some(options.new_log_view),
             ..JournalState::default()
         });
         let mode = if existing.is_none() {
@@ -242,7 +309,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         let file = storage
             .open(&data_path(directory, state.generation), mode)
             .await?;
-        if file.length().await? < state.length {
+        let file_length = file.length().await?;
+        if file_length < state.length {
             return Err(invalid("partition WAL lost acknowledged bytes"));
         }
         // After the data file it names, never before: a frontier is visible the
@@ -265,8 +333,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             file,
             frontier,
             frontier_sequence,
+            recovered_frontier: existing.is_some(),
             storage,
-            capacity,
+            capacity: options.capacity,
             state,
             entries: BTreeMap::new(),
             poisoned: false,
@@ -277,8 +346,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             segment_files: BTreeMap::new(),
             segment_files_dirty: false,
             segment_links_dirty: false,
-            preallocate_segments,
+            preallocate_segments: options.preallocate_segments,
             retained_bytes: 0,
+            sparse: options.sparse,
         };
         // A slot that did not verify may have been the newest, so the frontier
         // this open read can name less than an acknowledgment already covered.
@@ -289,9 +359,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         // verify; what follows them is a tail no barrier ever covered.
         let recovered = journal.state;
         journal.durable_head = recovered.head;
-        journal.file.truncate(recovered.length).await?;
-        journal.file.sync().await?;
-        journal.storage.sync_directory(directory).await?;
+        let intact = existing.is_some() && slots == FRONTIER_SLOTS && verified == slots;
+        journal.truncate_to_recovered(intact, file_length).await?;
         // Also when nothing changed but a slot did not verify: leaving it
         // damaged keeps every later open on the tail-walking path, where an
         // ordinary unacknowledged tail reads as damage and refuses the open.
@@ -304,6 +373,46 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         journal.recover_segment_files().await?;
         journal.migrate_segment_prepares().await?;
         Ok(journal)
+    }
+
+    /// Cut the data file to the recovered history and make that durable.
+    ///
+    /// Every byte up to a published length was synced before its frontier,
+    /// so a file that ends exactly at the length an intact frontier published,
+    /// with nothing recovered past it, has no tail to drop and nothing left
+    /// to make durable.
+    async fn truncate_to_recovered(&self, intact: bool, file_length: u64) -> io::Result<()> {
+        if intact && file_length == self.state.length {
+            return Ok(());
+        }
+        self.file.truncate(self.state.length).await?;
+        self.file.sync().await?;
+        self.storage.sync_directory(&self.directory).await
+    }
+
+    /// An existing verified frontier proves this WAL survived a prior process.
+    #[must_use]
+    pub const fn recovered_frontier(&self) -> bool {
+        self.recovered_frontier
+    }
+
+    /// Accept gaps from now on, once the partition's other log holds an op.
+    pub const fn allow_gaps(&mut self) {
+        self.sparse = true;
+    }
+
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// The lowest op this WAL holds above `op`.
+    #[must_use]
+    pub fn first_op_above(&self, op: u64) -> Option<u64> {
+        self.entries
+            .range(op.checked_add(1)?..)
+            .next()
+            .map(|(op, _)| *op)
     }
 
     /// Open the frontier slot file without creating it, with the number of whole
@@ -381,23 +490,11 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         file: Option<&S::File>,
         slots: usize,
     ) -> io::Result<(Option<JournalState>, u64, usize)> {
-        let mut newest = None;
-        let mut sequence = 0;
-        let mut verified = 0;
         let Some(file) = file.filter(|_| slots > 0) else {
-            return Ok((newest, sequence, verified));
+            return Ok((None, 0, 0));
         };
         let bytes = file.read(0, slots * PARTITION_WAL_BLOCK_SIZE).await?;
-        for slot in bytes.as_chunks::<PARTITION_WAL_BLOCK_SIZE>().0 {
-            if let Ok((state, slot_sequence)) = JournalState::decode(slot) {
-                verified += 1;
-                if newest.is_none() || slot_sequence > sequence {
-                    newest = Some(state);
-                    sequence = slot_sequence;
-                }
-            }
-        }
-        Ok((newest, sequence, verified))
+        Ok(newest_frontier_slot(&bytes))
     }
 
     pub const fn certified_log_view(&self) -> Option<u32> {
@@ -412,12 +509,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.ensure_healthy()?;
         let matches = if op == self.state.checkpoint {
             (op == 0 && checksum == 0) || self.state.checkpoint_checksum == checksum
+        } else if let Some(entry) = self.entries.get(&op) {
+            entry.checksum == checksum
         } else {
-            self.entries
-                .get(&op)
-                .is_some_and(|entry| entry.checksum == checksum)
+            // The other log holds the op, and the caller checked it there.
+            self.sparse && op > self.state.checkpoint
         };
-        if op > self.state.head || !matches {
+        if (op > self.state.head && !self.sparse) || !matches {
             return Err(invalid("view certificate does not match WAL history"));
         }
         self.poisoned = true;
@@ -474,6 +572,30 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.retained_bytes
     }
 
+    /// Physical write lengths an append occupies in the current storage mode.
+    ///
+    /// The first return value is the padded number of bytes written to the WAL.
+    /// The second return value is the unpadded message-body bytes written to
+    /// segment storage, or zero when the prepare remains inline in the WAL.
+    ///
+    /// # Errors
+    /// Returns an error when `prepare_length` falls outside the supported bounds.
+    pub fn append_lengths(
+        &self,
+        operation: Operation,
+        prepare_length: usize,
+    ) -> io::Result<(usize, usize)> {
+        let inline_length = record_length(prepare_length)?;
+        if self.state.segment_storage.is_some() && operation == Operation::SendMessages {
+            Ok((
+                record_length(REFERENCED_PREPARE_BYTES)?,
+                prepare_length - size_of::<PrepareHeader>(),
+            ))
+        } else {
+            Ok((inline_length, 0))
+        }
+    }
+
     #[must_use]
     pub fn contains(&self, header: &PrepareHeader) -> bool {
         if header.op > self.durable_head {
@@ -518,6 +640,28 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Ok(());
         }
         self.state.certified_log_view = None;
+        self.drop_tail(from_op).await
+    }
+
+    /// [`Self::truncate_from`] at recovery, for a tail no acknowledgment
+    /// covered. What stays is a prefix of the history the certificate already
+    /// vouches for, so the certificate stays too, as it does when an open
+    /// drops an unpublished tail.
+    ///
+    /// # Errors
+    /// Returns an error on I/O failure, invalid history, or a poisoned journal.
+    pub async fn discard_unacknowledged_tail(&mut self, from_op: u64) -> io::Result<()> {
+        self.ensure_healthy()?;
+        if from_op <= self.state.checkpoint {
+            return Err(invalid("cannot truncate checkpointed partition operations"));
+        }
+        if from_op > self.state.head {
+            return Ok(());
+        }
+        self.drop_tail(from_op).await
+    }
+
+    async fn drop_tail(&mut self, from_op: u64) -> io::Result<()> {
         self.rewrite(
             self.state.checkpoint,
             self.state.checkpoint_checksum,
@@ -543,9 +687,25 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         directories: &[std::path::PathBuf],
         synced_files: &BTreeSet<PathBuf>,
     ) -> io::Result<()> {
+        self.sync_checkpoint_files(files, directories, synced_files)
+            .await?;
+        self.checkpoint(through_op).await
+    }
+
+    async fn sync_checkpoint_files(
+        &self,
+        files: &[std::path::PathBuf],
+        directories: &[std::path::PathBuf],
+        synced_files: &BTreeSet<PathBuf>,
+    ) -> io::Result<()> {
         futures::stream::iter(files.iter().map(Ok::<_, io::Error>))
             .try_for_each_concurrent(16, |path| async {
-                let file = self.storage.open(path, OpenMode::Read).await?;
+                // Read-only, but part of the sync barrier, so it counts like a write open.
+                let file = self
+                    .storage
+                    .open(path, OpenMode::Read)
+                    .await
+                    .note_descriptor_exhaustion(|| format!("opening {}", path.display()))?;
                 if synced_files.contains(path) {
                     Ok(())
                 } else {
@@ -556,7 +716,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         for path in directories {
             self.storage.sync_directory(path).await?;
         }
-        self.checkpoint(through_op).await
+        Ok(())
     }
 
     /// The caller has durably materialized every operation through this point.
@@ -576,6 +736,45 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .checksum;
         self.state.anchor_known = true;
         self.rewrite(through_op, checksum, None, None).await
+    }
+
+    /// [`Self::checkpoint`] at an op a sparse WAL may not hold, anchored to the
+    /// checksum the partition's other log recorded for it.
+    ///
+    /// # Errors
+    /// Returns an error when a held op disagrees with `checksum`, when a WAL
+    /// that is not sparse lacks the op, or on a storage failure.
+    pub async fn checkpoint_at(&mut self, through_op: u64, checksum: u128) -> io::Result<()> {
+        self.ensure_healthy()?;
+        if through_op <= self.state.checkpoint {
+            return Ok(());
+        }
+        match self.entries.get(&through_op) {
+            Some(entry) if entry.checksum != checksum => {
+                return Err(invalid("WAL checkpoint checksum mismatch"));
+            }
+            None if !self.sparse => return Err(invalid("unknown WAL checkpoint")),
+            _ => {}
+        }
+        self.state.anchor_known = true;
+        self.rewrite(through_op, checksum, None, None).await
+    }
+
+    /// [`Self::checkpoint_files`] through [`Self::checkpoint_at`].
+    ///
+    /// # Errors
+    /// Returns an error if any file or directory barrier or the checkpoint fails.
+    pub async fn checkpoint_files_at(
+        &mut self,
+        through_op: u64,
+        checksum: u128,
+        files: &[std::path::PathBuf],
+        directories: &[std::path::PathBuf],
+        synced_files: &BTreeSet<PathBuf>,
+    ) -> io::Result<()> {
+        self.sync_checkpoint_files(files, directories, synced_files)
+            .await?;
+        self.checkpoint_at(through_op, checksum).await
     }
 
     /// Install an already durable replacement state, such as a completed transfer.
@@ -636,48 +835,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(header)
     }
 
-    #[must_use]
-    pub const fn purge_marker(&self) -> (u64, u64) {
-        (self.state.purge_generation, self.state.purge_floor)
-    }
-
-    /// # Errors
-    /// Returns an error if the purge marker cannot be published durably.
-    pub async fn mark_purge(&mut self, generation: u64, floor: u64) -> io::Result<()> {
-        self.ensure_healthy()?;
-        if generation < self.state.purge_generation
-            || (generation == self.state.purge_generation && floor <= self.state.purge_floor)
-        {
-            return Ok(());
-        }
-        if floor > self.state.head
-            || (self.state.segment_storage.is_some() && floor < self.state.head)
-        {
-            return Err(invalid("purge must cover the owned segment history"));
-        }
-        self.poisoned = true;
-        self.sync_segment_files().await?;
-        self.file.sync().await?;
-        let mut state = JournalState {
-            purge_generation: generation,
-            purge_floor: floor,
-            ..self.state
-        };
-        if let Some(segments) = &mut state.segment_storage {
-            segments.reset_position(SegmentPosition::default())?;
-        }
-        self.publish(state).await?;
-        self.state = state;
-        self.durable_head = state.head;
-        // The barrier above covers every original writer before purge releases it.
-        self.segment_files.clear();
-        self.poisoned = false;
-        if self.state.segment_storage.is_some() {
-            self.migrate_segment_prepares().await?;
-        }
-        Ok(())
-    }
-
     /// Make every buffered predecessor recoverable with one frontier publication.
     ///
     /// The body barrier and the WAL barrier cover different inodes, so they run
@@ -728,7 +885,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// synchronize every referenced body through the handle that wrote it.
     ///
     /// Segment names in the parent directory remain offset-based. Hard links
-    /// owned by this WAL keep referenced inodes alive across retention and purge.
+    /// owned by this WAL keep referenced inodes alive across retention.
     ///
     /// # Errors
     /// Returns an error for invalid references, history, capacity, or storage.
@@ -772,14 +929,17 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             {
                 continue;
             }
-            if header.op
-                != state
+            let adjacent = header.op
+                == state
                     .head
                     .checked_add(1)
-                    .ok_or_else(|| invalid("WAL op exhausted"))?
-                || (state.anchor_known && header.parent != state.head_checksum)
-                || header.group != state.group
-            {
+                    .ok_or_else(|| invalid("WAL op exhausted"))?;
+            let extends = if adjacent {
+                !state.anchor_known || header.parent == state.head_checksum
+            } else {
+                self.sparse && header.op > state.head
+            };
+            if !extends || header.group != state.group {
                 return Err(invalid("partition WAL append does not extend its history"));
             }
             let (reference, next_offset) = if let Some(segments) = &mut state.segment_storage {
@@ -828,8 +988,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 state.certified_log_view = None;
             }
             if !state.anchor_known {
-                state.checkpoint_checksum = header.parent;
-                state.anchor_known = true;
+                state.learn_anchor(header, adjacent)?;
             }
         }
         if records.is_empty() {
@@ -852,6 +1011,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.poisoned = true;
         self.write_segment_bodies(prepares, &records).await?;
         self.retain_segment_inodes(&records).await?;
+        let _charge = DISK_USAGE.charge(extent.as_slice().len() as u64);
         self.file.write_aligned(self.state.length, extent).await?;
         for (op, record, _) in records {
             self.entries.insert(op, record);
@@ -894,7 +1054,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         }
         if linked {
             // A visible frontier must never name an inode whose last durable
-            // directory entry a concurrent retention or purge can remove.
+            // directory entry a concurrent retention can remove.
             self.storage.sync_directory(&self.directory).await?;
         }
         Ok(())
@@ -922,13 +1082,16 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 if header.op != state.checkpoint || header.checksum != state.checkpoint_checksum {
                     return Err(invalid("partition WAL checkpoint prepare mismatch"));
                 }
-            } else if header.op
-                != previous
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("WAL op overflow"))?
-                || header.parent != checksum
-            {
-                return Err(invalid("partition WAL prepare chain is broken"));
+            } else {
+                let adjacent = header.op
+                    == previous
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("WAL op overflow"))?;
+                if !(adjacent || self.sparse && header.op > previous)
+                    || (adjacent && header.parent != checksum)
+                {
+                    return Err(invalid("partition WAL prepare chain is broken"));
+                }
             }
             self.entries.insert(
                 header.op,
@@ -994,7 +1157,10 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             let next_op = previous
                 .checked_add(1)
                 .ok_or_else(|| invalid("WAL op overflow"))?;
-            if header.op != next_op || (self.state.anchor_known && header.parent != checksum) {
+            let adjacent = header.op == next_op;
+            if !(adjacent || self.sparse && header.op > previous)
+                || (adjacent && self.state.anchor_known && header.parent != checksum)
+            {
                 return Err(invalid("partition WAL prepare chain is broken"));
             }
             let body_bytes = record_length(header.size as usize)? as u64;
@@ -1019,8 +1185,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 state.certified_log_view = None;
             }
             if !state.anchor_known {
-                state.checkpoint_checksum = header.parent;
-                state.anchor_known = true;
+                state.learn_anchor(&header, adjacent)?;
             }
             self.recovered_prepares.push(prepare);
             self.entries.insert(
@@ -1380,6 +1545,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 encoded.as_mut_slice(),
             )?;
             let length = encoded.as_slice().len();
+            let _charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(0, encoded).await?;
             entries.insert(
                 checkpoint,
@@ -1408,27 +1574,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 .read_encoded_record(entry.position, self.state.length)
                 .await?;
             let mut next_offset = entry.next_offset;
-            // Purge removes polled data, but these operations still participate
-            // in repair. Inline their bodies before releasing whole segment inodes.
-            let purged_prepare = if state.segment_storage.is_some()
-                && reference.is_some()
-                && op <= state.purge_floor
-            {
-                let (_, _, prepare, _) =
-                    self.read_record(entry.position, self.state.length).await?;
-                reference = None;
-                next_offset = None;
-                Some(prepare)
-            } else {
-                None
-            };
-            let payload = purged_prepare.as_ref().map_or_else(
-                || &record.as_slice()[RECORD_PREFIX..RECORD_PREFIX + payload_length],
-                Message::as_slice,
-            );
+            let payload = &record.as_slice()[RECORD_PREFIX..RECORD_PREFIX + payload_length];
             let mut converted = false;
             if reference.is_none()
-                && op > state.purge_floor
                 && let Some(segments) = &mut state.segment_storage
             {
                 let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
@@ -1471,6 +1619,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 )?;
             }
             let length = encoded.as_slice().len();
+            let _charge = DISK_USAGE.charge(length as u64);
             file.write_aligned(state.length, encoded).await?;
             entries.insert(
                 op,
@@ -1528,6 +1677,21 @@ impl<S: DurableStorage> DurableAppend for PartitionPrepareJournal<S> {
 }
 
 impl JournalState {
+    /// The checkpoint's checksum is the parent of the op right above it. A
+    /// sparse WAL whose first op skips past that one learns nothing from it,
+    /// which is fine only at the genesis checkpoint, whose checksum is zero.
+    fn learn_anchor(&mut self, header: &PrepareHeader, adjacent: bool) -> io::Result<()> {
+        if adjacent {
+            self.checkpoint_checksum = header.parent;
+        } else if self.checkpoint != 0 {
+            return Err(invalid(
+                "partition WAL cannot skip ops before it knows its checkpoint checksum",
+            ));
+        }
+        self.anchor_known = true;
+        Ok(())
+    }
+
     /// Encode one frontier slot into an aligned single-block buffer.
     ///
     /// Aligned, block-sized and written at a block-aligned offset into a file
@@ -1556,8 +1720,7 @@ impl JournalState {
         bytes[97] = u8::from(self.checkpoint_prepare);
         bytes[98] = u8::from(self.certified_log_view.is_some());
         bytes[120..124].copy_from_slice(&self.certified_log_view.unwrap_or(0).to_le_bytes());
-        bytes[104..112].copy_from_slice(&self.purge_generation.to_le_bytes());
-        bytes[112..120].copy_from_slice(&self.purge_floor.to_le_bytes());
+        // Bytes 104..120 are reserved and stay zero.
         bytes[segments::SEGMENT_STATE_FLAG] = u8::from(self.segment_storage.is_some());
         if let Some(segments) = self.segment_storage {
             segments.encode(
@@ -1565,8 +1728,7 @@ impl JournalState {
                     ..segments::SEGMENT_STATE_OFFSET + segments::SEGMENT_STATE_BYTES],
             );
         }
-        // Repeat the format tag inside the existing checksum range. Older
-        // readers accept these reserved bytes, so rollback stays compatible.
+        // Repeat the format tag inside the existing checksum range.
         bytes.copy_within(..8, SEALED_STATE_MAGIC_OFFSET);
         let checksum = XxHash3_64::oneshot(&bytes[16..]);
         bytes[8..16].copy_from_slice(&checksum.to_le_bytes());
@@ -1632,8 +1794,6 @@ impl JournalState {
                 )),
                 _ => return Err(invalid("invalid certified view flag")),
             },
-            purge_generation: read_u64(104)?,
-            purge_floor: read_u64(112)?,
             checkpoint_checksum: u128::from_le_bytes(
                 bytes[56..72]
                     .try_into()
@@ -1662,6 +1822,24 @@ impl JournalState {
 /// what keeps a publication off the copy it would have to fall back on.
 const fn frontier_offset(sequence: u64) -> u64 {
     (sequence % FRONTIER_SLOTS as u64) * PARTITION_WAL_BLOCK_SIZE as u64
+}
+
+/// The newest verifying slot in `bytes`, its publication sequence, and how
+/// many whole slots verified. See [`PartitionPrepareJournal::read_frontier`].
+fn newest_frontier_slot(bytes: &[u8]) -> (Option<JournalState>, u64, usize) {
+    let mut newest = None;
+    let mut sequence = 0;
+    let mut verified = 0;
+    for slot in bytes.as_chunks::<PARTITION_WAL_BLOCK_SIZE>().0 {
+        if let Ok((state, slot_sequence)) = JournalState::decode(slot) {
+            verified += 1;
+            if newest.is_none() || slot_sequence > sequence {
+                newest = Some(state);
+                sequence = slot_sequence;
+            }
+        }
+    }
+    (newest, sequence, verified)
 }
 
 /// Padded size of a prepare record, including its envelope.
@@ -1812,26 +1990,13 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(target_os = "linux")]
+    use server_common::fs_utils::supports_preallocation;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
 
     const REFERENCE_TEST_BODY_BYTES: usize = 1024 * 1024;
     #[cfg(target_os = "linux")]
     const FILE_BLOCK_BYTES: u64 = 512;
-
-    #[cfg(target_os = "linux")]
-    fn supports_preallocation(directory: &Path, length: u64) -> bool {
-        let probe = tempfile::tempfile_in(directory).unwrap();
-        match nix::fcntl::fallocate(
-            &probe,
-            nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            0,
-            i64::try_from(length).unwrap(),
-        ) {
-            Ok(()) => true,
-            Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => false,
-            Err(error) => panic!("preallocation probe failed: {error}"),
-        }
-    }
 
     /// Reclamation used to run at the head of every append, so an unlink and a
     /// directory barrier for a generation the append does not touch landed
@@ -2102,7 +2267,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn references_coexist_with_legacy_records_and_survive_purge_name_reuse() {
+    async fn references_coexist_with_legacy_records_and_survive_segment_replacement() {
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
         let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
@@ -2137,7 +2302,6 @@ mod tests {
                 .iter()
                 .any(|slot| slot[SEGMENT_REFERENCES_FLAG] == 1)
         );
-        journal.mark_purge(1, 2).await.unwrap();
         DiskStorage
             .remove_file(&partition.path().join("00000000000000000000.log"))
             .await
@@ -2165,7 +2329,6 @@ mod tests {
         assert_eq!(recovered[0].as_slice(), legacy.as_slice());
         assert_eq!(recovered[1].as_slice(), first.as_slice());
         assert_eq!(recovered[2].as_slice(), second.as_slice());
-        assert_eq!(journal.purge_marker(), (1, 2));
         journal.truncate_from(3).await.unwrap();
         assert!(first_reference.path(&directory).exists());
         journal.cleanup_obsolete().await;
@@ -2547,26 +2710,6 @@ mod tests {
     }
 
     #[compio::test]
-    async fn same_generation_purge_retry_persists_the_larger_floor() {
-        let directory = tempdir().unwrap();
-        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        let first = prepare(1, 0);
-        let second = prepare(2, first.header().checksum);
-        journal.append(first.into_frozen()).await.unwrap();
-        journal.mark_purge(9, 1).await.unwrap();
-        journal.append(second.into_frozen()).await.unwrap();
-        journal.mark_purge(9, 2).await.unwrap();
-        journal.mark_purge(9, 1).await.unwrap();
-        drop(journal);
-        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        assert_eq!(journal.purge_marker(), (9, 2));
-    }
-
-    #[compio::test]
     async fn view_certificate_requires_complete_matching_history() {
         let directory = tempdir().unwrap();
         let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
@@ -2620,23 +2763,6 @@ mod tests {
     }
 
     #[compio::test]
-    async fn purge_marker_does_not_promote_the_uncommitted_tail_to_checkpoint() {
-        let directory = tempdir().unwrap();
-        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        journal.append(prepare(1, 0).into_frozen()).await.unwrap();
-        journal.mark_purge(9, 1).await.unwrap();
-        drop(journal);
-        let journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
-            .await
-            .unwrap();
-        assert_eq!(journal.purge_marker(), (9, 1));
-        assert_eq!(journal.checkpoint_op(), 0);
-        assert_eq!(journal.prepares().await.unwrap().len(), 1);
-    }
-
-    #[compio::test]
     async fn transferred_checkpoint_binds_the_next_accepted_parent() {
         let directory = tempdir().unwrap();
         let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
@@ -2652,6 +2778,150 @@ mod tests {
         assert_eq!(journal.checkpoint_op(), 7);
         assert_eq!(journal.head(), 8);
         assert!(journal.contains(next.header()));
+    }
+
+    #[compio::test]
+    async fn given_a_sparse_wal_when_its_ops_skip_the_other_log_should_recover_and_checkpoint_between_them()
+     {
+        const OTHER_LOG_CHECKSUM: u128 = 0xdead;
+        let directory = tempdir().unwrap();
+        let open = || {
+            PartitionPrepareJournal::open_with_options(
+                directory.path(),
+                42,
+                7,
+                DiskStorage,
+                WalOpenOptions {
+                    sparse: true,
+                    ..WalOpenOptions::default()
+                },
+            )
+        };
+        let first = prepare(1, 0);
+        // Ops 2 and 3 sit in the partition's other log.
+        let fourth = prepare(4, OTHER_LOG_CHECKSUM);
+        let mut journal = open().await.unwrap();
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        journal.append(fourth.clone().into_frozen()).await.unwrap();
+        assert_eq!(journal.first_op_above(1), Some(4));
+        journal
+            .certify_log_view(1, 3, OTHER_LOG_CHECKSUM)
+            .await
+            .unwrap();
+        drop(journal);
+
+        let mut journal = open().await.unwrap();
+        let recovered: Vec<u64> = journal
+            .take_recovered_prepares()
+            .iter()
+            .map(|prepare| prepare.header().op)
+            .collect();
+        assert_eq!(recovered, vec![1, 4]);
+        assert_eq!(journal.certified_log_view(), Some(1));
+        journal.checkpoint_at(3, OTHER_LOG_CHECKSUM).await.unwrap();
+        assert_eq!(journal.checkpoint_op(), 3);
+        assert_eq!(journal.head(), 4);
+        assert!(journal.checkpoint_at(4, OTHER_LOG_CHECKSUM).await.is_err());
+        drop(journal);
+
+        let mut journal = open().await.unwrap();
+        assert_eq!(journal.checkpoint_op(), 3);
+        assert_eq!(journal.checkpoint_checksum(), Some(OTHER_LOG_CHECKSUM));
+        let recovered: Vec<u64> = journal
+            .take_recovered_prepares()
+            .iter()
+            .map(|prepare| prepare.header().op)
+            .collect();
+        assert_eq!(recovered, vec![4]);
+    }
+
+    #[compio::test]
+    async fn given_a_certified_wal_when_discarding_an_unacknowledged_tail_should_keep_the_certificate()
+     {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        journal.append(second.into_frozen()).await.unwrap();
+        journal
+            .certify_log_view(3, 2, journal.entries[&2].checksum)
+            .await
+            .unwrap();
+
+        journal.discard_unacknowledged_tail(2).await.unwrap();
+        assert_eq!(journal.head(), 1);
+        assert_eq!(journal.certified_log_view(), Some(3));
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 1);
+        assert_eq!(journal.certified_log_view(), Some(3));
+        journal.truncate_from(1).await.unwrap();
+        assert_eq!(journal.certified_log_view(), None);
+    }
+
+    /// A WAL created mid-view publishes its first frontier at that view, so a
+    /// crash right after it is created leaves no lower certificate behind.
+    #[compio::test]
+    async fn given_a_new_log_view_when_creating_a_wal_should_publish_it_and_keep_an_existing_one() {
+        let directory = tempdir().unwrap();
+        let options = WalOpenOptions {
+            sparse: true,
+            new_log_view: 5,
+            ..WalOpenOptions::default()
+        };
+        let journal = PartitionPrepareJournal::open_with_options(
+            directory.path(),
+            42,
+            7,
+            DiskStorage,
+            options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(journal.certified_log_view(), Some(5));
+        drop(journal);
+        let reopened = PartitionPrepareJournal::open_with_options(
+            directory.path(),
+            42,
+            7,
+            DiskStorage,
+            WalOpenOptions {
+                new_log_view: 9,
+                ..options
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.certified_log_view(), Some(5));
+    }
+
+    #[compio::test]
+    async fn given_a_contiguous_wal_when_an_op_skips_ahead_should_refuse_it() {
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        assert!(
+            journal
+                .append(prepare(3, first.header().checksum).into_frozen())
+                .await
+                .is_err()
+        );
+        assert!(journal.checkpoint_at(2, 0).await.is_err());
+        journal.allow_gaps();
+        journal
+            .append(prepare(3, 0xbeef).into_frozen())
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 3);
     }
 
     #[compio::test]
@@ -2679,13 +2949,16 @@ mod tests {
         journal.append_buffered(second.into_frozen()).await.unwrap();
         journal.append(third.into_frozen()).await.unwrap();
         drop(journal);
-        let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+        let mut journal = PartitionPrepareJournal::open_with_options(
             directory.path(),
             42,
             7,
             DiskStorage,
-            PARTITION_WAL_CAPACITY_MIN,
-            false,
+            WalOpenOptions {
+                capacity: PARTITION_WAL_CAPACITY_MIN,
+                preallocate_segments: false,
+                ..WalOpenOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -2711,62 +2984,6 @@ mod tests {
         assert_eq!(JournalState::decode(bytes.as_slice()).unwrap().0, state);
         bytes.as_mut_slice()[24] ^= 1;
         assert!(JournalState::decode(bytes.as_slice()).is_err());
-    }
-
-    #[compio::test]
-    async fn purge_releases_segment_inodes_after_preserving_repair_bodies_inline() {
-        const BODY_BYTES: usize = 8192;
-        let partition = tempdir().unwrap();
-        let directory = partition.path().join("prepares-7");
-        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
-            .await
-            .unwrap();
-        journal
-            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
-            .await
-            .unwrap();
-        let mut parent = 0;
-        let mut prepares = Vec::new();
-        let mut references = Vec::new();
-        for op in 1..=3 {
-            let prepare = segment_prepare(op, parent, op - 1, BODY_BYTES);
-            parent = prepare.header().checksum;
-            journal.append(prepare.clone().into_frozen()).await.unwrap();
-            references.push(journal.segment_reference(prepare.header()).unwrap());
-            prepares.push(prepare);
-        }
-        let retained_bytes = journal.retained_bytes();
-        journal.mark_purge(1, 3).await.unwrap();
-        assert_eq!(
-            journal.checkpoint_op(),
-            0,
-            "purge must not fabricate a committed frontier"
-        );
-        assert_eq!(journal.retained_bytes(), retained_bytes);
-        journal.cleanup_obsolete().await;
-        for reference in references {
-            assert!(!reference.path(&directory).exists());
-            std::fs::remove_file(
-                partition
-                    .path()
-                    .join(format!("{:020}.log", reference.start_offset)),
-            )
-            .unwrap();
-        }
-        DiskStorage.sync_directory(partition.path()).await.unwrap();
-        drop(journal);
-        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
-            .await
-            .unwrap();
-        for (actual, expected) in journal.prepares().await.unwrap().iter().zip(&prepares) {
-            assert_eq!(actual.as_slice(), expected.as_slice());
-            assert!(journal.segment_reference(actual.header()).is_none());
-        }
-        journal.checkpoint(3).await.unwrap();
-        assert_eq!(
-            journal.size_bytes(),
-            record_length(prepares[2].as_slice().len()).unwrap() as u64
-        );
     }
 
     #[compio::test]
@@ -2889,7 +3106,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn owned_purge_refuses_a_partial_floor_and_preserves_recoverable_history() {
+    async fn owned_segments_refuse_invalid_boundaries_and_preserve_recoverable_history() {
         const BODY_BYTES: usize = 4096;
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
@@ -2908,9 +3125,6 @@ mod tests {
             .unwrap();
         journal.sync().await.unwrap();
         let frontier = std::fs::read(directory.join("frontier")).unwrap();
-        assert!(journal.mark_purge(1, 1).await.is_err());
-        assert!(!journal.poisoned);
-        assert_eq!(std::fs::read(directory.join("frontier")).unwrap(), frontier);
         let mut invalid_state = journal.state;
         invalid_state
             .segment_storage
@@ -2921,16 +3135,18 @@ mod tests {
             .next_offset = 3;
         assert!(journal.publish(invalid_state).await.is_err());
         assert_eq!(std::fs::read(directory.join("frontier")).unwrap(), frontier);
-        journal.mark_purge(1, 2).await.unwrap();
         journal.checkpoint(2).await.unwrap();
         drop(journal);
         let journal = PartitionPrepareJournal::open(&directory, 42, 7)
             .await
             .unwrap();
-        assert_eq!(journal.purge_marker(), (1, 2));
         assert_eq!(
             journal.segment_checkpoint(),
-            Some(SegmentPosition::default())
+            Some(SegmentPosition {
+                start_offset: 1,
+                length: BODY_BYTES as u64,
+                next_offset: 2,
+            })
         );
         assert_eq!(journal.prepares().await.unwrap().len(), 1);
     }
@@ -3041,13 +3257,16 @@ mod tests {
         std::fs::write(directory.join("frontier"), encoded.as_slice()).unwrap();
         drop(journal);
         assert!(
-            PartitionPrepareJournal::open_with_storage_and_capacity(
+            PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                true,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: true,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .is_err()
@@ -3077,7 +3296,8 @@ mod tests {
             );
             // Both single-block magics are refused, which is what keeps a build
             // that predates the slots from reading block 0 as the whole record.
-            for magic in [b"IGGYWAL1", b"IGGYWAL2"] {
+            // `IGGYWAL3` gave the reserved bytes a meaning this build ignores.
+            for magic in [b"IGGYWAL1", b"IGGYWAL2", b"IGGYWAL3"] {
                 let mut legacy = state.encode(1);
                 legacy.as_mut_slice()[..8].copy_from_slice(magic);
                 assert!(JournalState::decode(legacy.as_slice()).is_err());
@@ -3091,6 +3311,76 @@ mod tests {
             damaged.as_mut_slice()[8..16].copy_from_slice(&checksum.to_le_bytes());
             assert!(JournalState::decode(damaged.as_slice()).is_err());
         }
+    }
+
+    #[compio::test]
+    async fn given_checkpointed_history_when_reanchoring_a_reserved_gap_should_preserve_repair_bodies()
+     {
+        const BODY_BYTES: usize = 4096;
+        const RESERVED_OFFSET: u64 = 8;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        let frontier = std::fs::read(directory.join(FRONTIER_FILE_NAME)).unwrap();
+        assert!(
+            journal
+                .reanchor_segment_storage(RESERVED_OFFSET)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(directory.join(FRONTIER_FILE_NAME)).unwrap(),
+            frontier,
+            "uncheckpointed history must not be replaced by an empty append point"
+        );
+        journal.checkpoint(1).await.unwrap();
+        assert!(journal.reanchor_segment_storage(0).await.is_err());
+        journal
+            .reanchor_segment_storage(RESERVED_OFFSET)
+            .await
+            .unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.head(), 1);
+        assert_eq!(journal.checkpoint_op(), 1);
+        assert_eq!(
+            journal.segment_checkpoint(),
+            Some(SegmentPosition {
+                start_offset: RESERVED_OFFSET,
+                length: 0,
+                next_offset: RESERVED_OFFSET,
+            })
+        );
+        assert_eq!(
+            journal.prepares().await.unwrap()[0].as_slice(),
+            first.as_slice()
+        );
+        let second = segment_prepare(2, first.header().checksum, RESERVED_OFFSET, BODY_BYTES);
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), second.as_slice());
+        assert_eq!(
+            std::fs::read(partition.path().join(format!("{RESERVED_OFFSET:020}.log"))).unwrap(),
+            second.as_slice()[size_of::<PrepareHeader>()..]
+        );
     }
 
     #[compio::test]
@@ -3154,7 +3444,48 @@ mod tests {
     }
 
     #[compio::test]
-    async fn owned_segments_recover_unpublished_bytes_and_keep_purged_prepare_bodies() {
+    async fn given_a_truncated_roll_when_the_replacement_rolls_at_the_same_offset_should_replace_the_public_file()
+     {
+        const BODY_BYTES: usize = 8192;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), BODY_BYTES as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let dropped = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        journal.append(dropped.into_frozen()).await.unwrap();
+        journal.truncate_from(2).await.unwrap();
+        let rolled = partition.path().join("00000000000000000001.log");
+        assert_eq!(std::fs::metadata(&rolled).unwrap().len(), BODY_BYTES as u64);
+
+        let replacement = segment_prepare(2, first.header().checksum, 1, BODY_BYTES / 2);
+        journal
+            .append(replacement.clone().into_frozen())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&rolled).unwrap(),
+            replacement.as_slice()[size_of::<PrepareHeader>()..],
+            "the replacement segment must not keep the truncated suffix's bytes"
+        );
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), replacement.as_slice());
+    }
+
+    #[compio::test]
+    async fn owned_segments_recover_unpublished_bytes_and_append_in_their_place() {
         const BODY_BYTES: usize = 8192;
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
@@ -3179,8 +3510,7 @@ mod tests {
                 .len(),
             BODY_BYTES as u64
         );
-        journal.mark_purge(1, 1).await.unwrap();
-        let replacement = segment_prepare(2, first.header().checksum, 0, BODY_BYTES / 2);
+        let replacement = segment_prepare(2, first.header().checksum, 1, BODY_BYTES / 2);
         journal
             .append(replacement.clone().into_frozen())
             .await
@@ -3194,7 +3524,11 @@ mod tests {
         assert_eq!(recovered[1].as_slice(), replacement.as_slice());
         assert_eq!(
             std::fs::read(partition.path().join("00000000000000000000.log")).unwrap(),
-            replacement.as_slice()[size_of::<PrepareHeader>()..]
+            [
+                &first.as_slice()[size_of::<PrepareHeader>()..],
+                &replacement.as_slice()[size_of::<PrepareHeader>()..],
+            ]
+            .concat()
         );
     }
 
@@ -3206,15 +3540,19 @@ mod tests {
 
         for preallocate in [false, true] {
             let partition = tempdir().unwrap();
-            let preallocation_supported = supports_preallocation(partition.path(), SEGMENT_BYTES);
+            let preallocation_supported =
+                supports_preallocation(partition.path(), SEGMENT_BYTES).unwrap();
             let directory = partition.path().join("prepares-7");
-            let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                preallocate,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: preallocate,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -3236,13 +3574,16 @@ mod tests {
                 .unwrap()
                 .set_len(SEGMENT_BYTES + BODY_BYTES as u64)
                 .unwrap();
-            let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                preallocate,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: preallocate,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -3285,19 +3626,68 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_a_preallocated_segment_when_truncating_its_tail_should_reserve_it_again() {
+        const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+        const BODY_BYTES: usize = 256 * 1024;
+
+        let partition = tempdir().unwrap();
+        if !supports_preallocation(partition.path(), SEGMENT_BYTES).unwrap() {
+            eprintln!("skipped: the temporary directory does not support fallocate");
+            return;
+        }
+        let mut journal = PartitionPrepareJournal::open_with_options(
+            &partition.path().join("prepares-7"),
+            42,
+            7,
+            DiskStorage,
+            WalOpenOptions {
+                capacity: PARTITION_WAL_BYTES_MAX,
+                preallocate_segments: true,
+                ..WalOpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), SEGMENT_BYTES)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let second = segment_prepare(2, first.header().checksum, 1, BODY_BYTES);
+        journal.append(first.into_frozen()).await.unwrap();
+        journal.append(second.into_frozen()).await.unwrap();
+
+        journal.truncate_from(2).await.unwrap();
+
+        let metadata =
+            std::fs::metadata(partition.path().join("00000000000000000000.log")).unwrap();
+        assert_eq!(metadata.len(), BODY_BYTES as u64);
+        assert!(
+            metadata.blocks() * FILE_BLOCK_BYTES >= SEGMENT_BYTES,
+            "the truncated tail must be reserved up to the segment size again, since writes \
+             into it are charged only past that size; allocated {} bytes",
+            metadata.blocks() * FILE_BLOCK_BYTES
+        );
+    }
+
     #[compio::test]
     async fn owned_segments_install_checkpoint_bodies_with_and_without_public_data() {
         const BODY_BYTES: usize = 8192;
         for materialized in [true, false] {
             let partition = tempdir().unwrap();
             let directory = partition.path().join("prepares-7");
-            let mut journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+            let mut journal = PartitionPrepareJournal::open_with_options(
                 &directory,
                 42,
                 7,
                 DiskStorage,
-                PARTITION_WAL_BYTES_MAX,
-                true,
+                WalOpenOptions {
+                    capacity: PARTITION_WAL_BYTES_MAX,
+                    preallocate_segments: true,
+                    ..WalOpenOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -3344,7 +3734,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(installed.len(), initial.length);
-                if supports_preallocation(partition.path(), (4 * BODY_BYTES) as u64) {
+                if supports_preallocation(partition.path(), (4 * BODY_BYTES) as u64).unwrap() {
                     assert!(installed.blocks() * FILE_BLOCK_BYTES >= (4 * BODY_BYTES) as u64);
                 }
             }
@@ -3523,6 +3913,7 @@ mod tests {
             assert_eq!(&slot[..8], STATE_MAGIC);
             assert_ne!(&slot[..8], b"IGGYWAL1");
             assert_ne!(&slot[..8], b"IGGYWAL2");
+            assert_ne!(&slot[..8], b"IGGYWAL3");
         }
 
         // The other direction. A frontier a single-block build wrote is not a
@@ -3612,13 +4003,16 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[newest..newest + PARTITION_WAL_BLOCK_SIZE].fill(0);
         std::fs::write(&path, &bytes).unwrap();
-        let journal = PartitionPrepareJournal::open_with_storage_and_capacity(
+        let journal = PartitionPrepareJournal::open_with_options(
             directory.path(),
             42,
             7,
             DiskStorage,
-            PARTITION_WAL_CAPACITY_MIN,
-            false,
+            WalOpenOptions {
+                capacity: PARTITION_WAL_CAPACITY_MIN,
+                preallocate_segments: false,
+                ..WalOpenOptions::default()
+            },
         )
         .await
         .unwrap();

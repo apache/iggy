@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script lang="ts">
-  import { tooltip } from '$lib/actions/tooltip';
+  import { tooltip } from '#lib/actions/tooltip.js';
   import type { Placement } from '@floating-ui/dom';
 
   interface Props {

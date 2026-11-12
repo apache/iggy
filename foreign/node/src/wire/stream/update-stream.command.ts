@@ -15,44 +15,54 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
-import { COMMAND_CODE } from '../command.code.js';
-import { serializeIdentifier, type Id } from '../identifier.utils.js';
-import { uint8ToBuf } from '../number.utils.js';
+import type { Id } from '../identifier.utils.js';
+import type { OptionEntry, StreamOptionKey } from '../options.utils.js';
+import { OptionsScope } from '../system/describe-options.command.js';
+import { UPDATE_RESOURCE, columnOption } from '../system/update-resource.command.js';
 
 /**
- * Parameters for the update stream command.
+ * Parameters for the update stream command. Keys left out keep their values.
  */
 export type UpdateStream = {
   /** Stream identifier (ID or name) */
   streamId: Id,
   /** New stream name (1-255 bytes) */
-  name: string
+  name?: string,
+  /**
+   * Keys to reset to their defaults. No stream key is resettable yet, so any
+   * key is refused before the request is sent.
+   */
+  reset?: StreamOptionKey[],
+  /**
+   * Reset names with no typed member, for a resettable key the server catalog
+   * gained after this build shipped. The server decides on them.
+   */
+  rawReset?: readonly string[],
+  /**
+   * Option keys with no field of their own, for an updatable key the server
+   * catalog gained after this build shipped. A field above wins on collision.
+   * The server decides on them, so a create-only or unknown key comes back as
+   * a server error.
+   */
+  options?: OptionEntry[]
 }
 
 /**
  * Update stream command definition.
- * Updates a stream's name.
+ * Changes only the keys it names, through the generic update command.
  */
 export const UPDATE_STREAM = {
-  code: COMMAND_CODE.UpdateStream,
+  code: UPDATE_RESOURCE.code,
 
-  serialize: ({streamId, name}: UpdateStream) => {
-    const bId = serializeIdentifier(streamId);
-    const bName = Buffer.from(name);
-
-    if (bName.length < 1 || bName.length > 255)
-      throw new Error('Stream name should be between 1 and 255 bytes');
-
-    return Buffer.concat([
-      bId,
-      uint8ToBuf(bName.length),
-      bName
-    ]);
+  serialize: ({ streamId, name, reset, rawReset, options: rawOptions }: UpdateStream) => {
+    const options = name === undefined ? [] : [columnOption('name', name)];
+    return UPDATE_RESOURCE.serialize({
+      target: { scope: OptionsScope.Stream, streamId }, options, reset, rawOptions, rawReset
+    });
   },
 
-  deserialize: deserializeVoidResponse
+  deserialize: UPDATE_RESOURCE.deserialize
 };
 
 

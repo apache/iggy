@@ -58,6 +58,7 @@ public interface IIggyConsumerGroup
     /// <remarks>
     ///     Consumer groups allow multiple consumers to coordinate message consumption and share offset tracking.
     ///     Members of the same group consume from different partitions to load-balance message processing.
+    ///     The server refuses the creation with status 5010 once the topic holds 2^20 consumer groups.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>

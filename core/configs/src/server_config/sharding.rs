@@ -18,11 +18,12 @@
 //! Sharding config: the full thread-per-core + bus surface, with
 //! defaults read from the embedded `core/server/config.toml`.
 
-use iggy_common::IggyDuration;
-use iggy_common::Validatable;
+use std::time::Duration;
+
+use iggy_common::{IggyByteSize, IggyDuration, MAX_DEFERRED_POLL_WAIT_US, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use std::time::Duration;
+use server_common::sharding::PARTITION_IO_CAPACITY_MAX;
 
 use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
@@ -61,6 +62,10 @@ pub const SHUTDOWN_JOIN_TIMEOUT_MAX: Duration = Duration::from_secs(900);
 /// cap reins in pathological typos without disturbing reasonable
 /// production values.
 pub const RECONCILE_PERIODIC_INTERVAL_MAX: Duration = Duration::from_secs(30);
+
+/// Hard upper bound on `deferred_poll_max_inflight_bytes`, the read memory
+/// that each shard can reserve for deferred polls.
+pub const DEFERRED_POLL_INFLIGHT_BYTES_MAX: u64 = 1024 * 1024 * 1024;
 
 // Every omitted field falls back to the frozen `Default`, so a partial
 // `[sharding]` table resolves each key independently instead of
@@ -101,6 +106,36 @@ pub struct ShardingConfig {
     /// rejects new disk polls before I/O. Main and reply inbox traffic uses
     /// separate capacity. This counts operations, not retained message bytes.
     pub poll_completion_capacity: usize,
+    /// Active partition file jobs and results awaiting owner acceptance.
+    pub partition_io_capacity: usize,
+    /// Retained job allocations, resolved at boot against the largest legal record.
+    /// Omission selects the single-job minimum, slightly above 4 GiB per shard.
+    /// This is an admission ceiling; memory is allocated only for admitted jobs.
+    /// Config validation checks representability; boot checks the minimum against
+    /// the compiled file-job layout.
+    #[config_env(leaf)]
+    pub partition_io_bytes_max: Option<IggyByteSize>,
+    /// Longest wait of a deferred poll or readiness wait. A longer requested
+    /// wait is shortened to it. At most 10 minutes.
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub deferred_poll_max_wait: IggyDuration,
+    /// Deferred polls and readiness waits parked on one shard. A request
+    /// above the limit is refused with a retryable error.
+    pub deferred_poll_max_pending: usize,
+    /// The part of [`Self::deferred_poll_max_pending`] that one session may
+    /// hold. An HTTP request without a binary session counts against its user.
+    pub deferred_poll_max_pending_per_session: usize,
+    /// The most disk bytes that one deferred poll reserves for its read: three
+    /// times its `max_bytes`, and at least three times the largest disk chunk
+    /// (1 MiB), up to this value. Its reply carries no more than this value, unless the
+    /// first message alone is wider.
+    #[config_env(leaf)]
+    pub deferred_poll_max_read_bytes: IggyByteSize,
+    /// Disk bytes that the deferred reads of one shard reserve together. A
+    /// read that finds no room waits for one. At most 1 GiB.
+    #[config_env(leaf)]
+    pub deferred_poll_max_inflight_bytes: IggyByteSize,
     /// Wall-clock budget for a single shard's bus drain on shutdown.
     /// Drives `IggyMessageBus::shutdown(..)` from the per-shard watchdog
     /// and the parallel-join survivor path. Sized larger than typical
@@ -130,11 +165,12 @@ pub struct ShardingConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub shutdown_join_timeout: IggyDuration,
-    /// Safety-tick cadence for the partition reconciliation loop; the
-    /// reconciler also wakes immediately on every
-    /// `LifecycleFrame::MetadataCommitTick` from shard 0. This periodic
-    /// fallback covers dropped wake-ups (the wake channel is capacity-1)
-    /// and the initial post-bootstrap convergence window. Values above
+    /// Tick cadence for the partition reconciliation loop. The reconciler
+    /// also wakes immediately on every `LifecycleFrame::MetadataCommitTick`
+    /// from shard 0. The tick retries partitions that a pass left unfinished
+    /// (a backed-off build, an incomplete trim), checks local changes that no
+    /// commit announces, ages parked requests, and covers dropped wake-ups
+    /// (the wake channel is capacity-1). Values above
     /// [`RECONCILE_PERIODIC_INTERVAL_MAX`] are rejected by the validator.
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
@@ -149,6 +185,28 @@ impl Default for ShardingConfig {
             inbox_capacity: SERVER_CONFIG.sharding.inbox_capacity as usize,
             reply_inbox_capacity: SERVER_CONFIG.sharding.reply_inbox_capacity as usize,
             poll_completion_capacity: SERVER_CONFIG.sharding.poll_completion_capacity as usize,
+            partition_io_capacity: SERVER_CONFIG.sharding.partition_io_capacity as usize,
+            partition_io_bytes_max: None,
+            deferred_poll_max_wait: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_wait
+                .parse()
+                .unwrap(),
+            deferred_poll_max_pending: SERVER_CONFIG.sharding.deferred_poll_max_pending as usize,
+            deferred_poll_max_pending_per_session: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_pending_per_session
+                as usize,
+            deferred_poll_max_read_bytes: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_read_bytes
+                .parse()
+                .unwrap(),
+            deferred_poll_max_inflight_bytes: SERVER_CONFIG
+                .sharding
+                .deferred_poll_max_inflight_bytes
+                .parse()
+                .unwrap(),
             shutdown_drain_timeout: SERVER_CONFIG
                 .sharding
                 .shutdown_drain_timeout
@@ -175,6 +233,24 @@ impl Default for ShardingConfig {
 
 impl Validatable<ConfigurationError> for ShardingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        if self.partition_io_capacity == 0 || self.partition_io_capacity > PARTITION_IO_CAPACITY_MAX
+        {
+            eprintln!(
+                "Invalid sharding.partition_io_capacity: {} must be in 1..={PARTITION_IO_CAPACITY_MAX}",
+                self.partition_io_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(bytes) = self.partition_io_bytes_max
+            && (bytes.as_bytes_u64() == 0 || bytes.as_bytes_u64() > isize::MAX as u64)
+        {
+            eprintln!(
+                "Invalid sharding.partition_io_bytes_max: {} bytes must be in 1..={}",
+                bytes.as_bytes_u64(),
+                isize::MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.inbox_capacity == 0 {
             eprintln!(
                 "Invalid sharding configuration: inbox_capacity must be > 0 (crossfire silently \
@@ -219,6 +295,48 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                 "Invalid sharding configuration: poll_completion_capacity {} exceeds the {} \
                  cap (each shard preallocates a completion lane of this size)",
                 self.poll_completion_capacity, INBOX_CAPACITY_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let max_wait = IggyDuration::from(Duration::from_micros(MAX_DEFERRED_POLL_WAIT_US));
+        if self.deferred_poll_max_wait.is_zero()
+            || self.deferred_poll_max_wait.get_duration() > max_wait.get_duration()
+        {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_wait: {} must be above 0 and at most {max_wait}",
+                self.deferred_poll_max_wait
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let pending = self.deferred_poll_max_pending;
+        if pending == 0 || pending > INBOX_CAPACITY_MAX {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_pending: {pending} must be in 1..={INBOX_CAPACITY_MAX}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let per_session = self.deferred_poll_max_pending_per_session;
+        if per_session == 0 || per_session > pending {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_pending_per_session: {per_session} must be in \
+                 1..={pending} (deferred_poll_max_pending)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        let read_bytes = self.deferred_poll_max_read_bytes.as_bytes_u64();
+        let inflight_bytes = self.deferred_poll_max_inflight_bytes.as_bytes_u64();
+        if read_bytes == 0 || read_bytes > inflight_bytes {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_read_bytes: {read_bytes} bytes must be in \
+                 1..={inflight_bytes} (deferred_poll_max_inflight_bytes)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if inflight_bytes > DEFERRED_POLL_INFLIGHT_BYTES_MAX {
+            eprintln!(
+                "Invalid sharding.deferred_poll_max_inflight_bytes: {inflight_bytes} bytes must be \
+                 at most {DEFERRED_POLL_INFLIGHT_BYTES_MAX}"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -318,6 +436,49 @@ mod tests {
     #[test]
     fn defaults_validate() {
         assert!(ShardingConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn partition_io_limits_preserve_omission_and_accept_explicit_env_mappings() {
+        let omitted: ShardingConfig = Figment::new()
+            .merge(Toml::string("inbox_capacity = 7"))
+            .extract()
+            .unwrap();
+        assert_eq!(omitted.partition_io_capacity, 16);
+        assert_eq!(omitted.partition_io_bytes_max, None);
+
+        let configured: ShardingConfig = Figment::new()
+            .merge(Toml::string(
+                "partition_io_capacity = 3\npartition_io_bytes_max = \"8 GiB\"",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(configured.partition_io_capacity, 3);
+        assert_eq!(
+            configured.partition_io_bytes_max,
+            Some(IggyByteSize::from(8 * 1024 * 1024 * 1024))
+        );
+        assert!(configured.validate().is_ok());
+        let mappings = <ShardingConfig as configs::ConfigEnvMappings>::env_mappings();
+        for name in ["PARTITION_IO_CAPACITY", "PARTITION_IO_BYTES_MAX"] {
+            assert!(mappings.iter().any(|mapping| mapping.env_name == name));
+        }
+        for (capacity, bytes) in [
+            (0, None),
+            (PARTITION_IO_CAPACITY_MAX + 1, None),
+            (1, Some(IggyByteSize::from(0))),
+            (1, Some(IggyByteSize::from(u64::MAX))),
+        ] {
+            let invalid = ShardingConfig {
+                partition_io_capacity: capacity,
+                partition_io_bytes_max: bytes,
+                ..ShardingConfig::default()
+            };
+            assert!(
+                invalid.validate().is_err(),
+                "capacity={capacity}, bytes={bytes:?}"
+            );
+        }
     }
 
     #[test]

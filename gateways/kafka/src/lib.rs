@@ -17,9 +17,17 @@
 
 //! Kafka wire protocol gateway foundation for Apache Iggy.
 
+pub mod auth;
 pub mod bridge;
+pub mod cluster_id;
+pub mod coordinator;
+pub mod env;
 pub mod error;
+pub mod group;
+pub mod listener;
 pub mod protocol;
 pub mod server;
+pub mod tls;
 
-pub use server::{GatewayConfig, KafkaGateway};
+pub use iggy_kafka_wire::records;
+pub use server::{CoordinatorLog, GatewayConfig, KafkaGateway};

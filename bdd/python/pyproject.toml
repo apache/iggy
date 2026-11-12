@@ -20,7 +20,7 @@ name = "bdd-python"
 version = "0.1.0"
 description = "BDD tests for python"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "apache-iggy",
     "pyrefly>=1.2.0",

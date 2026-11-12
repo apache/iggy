@@ -25,36 +25,41 @@
 //! of that replica protocol on this page. Terminal failures surface as typed
 //! `Eviction` frames, transient ones as result-framed replay hints.
 //!
-//! Deliberate asymmetry (the two session stores): the per-shard
-//! `SessionManager` owns transport sessions (connection -> user binding,
-//! heartbeats, SDK info) and is never replicated; the consensus `ClientTable`
-//! owns replicated VSR sessions and their dedup watermarks. Login binds the
-//! two together, so logout and eviction must release BOTH -- every teardown
-//! path below pairs `remove_connection` with a replicated `Logout`.
+//! The per-shard `SessionManager` owns local connection bindings, heartbeats,
+//! and SDK info; the consensus `ClientTable` owns replicated logical sessions
+//! and retry protection. Disconnect and heartbeat eviction remove only the
+//! local binding. Explicit logout or committed lease expiry retires the shared
+//! session and its consumer-group membership.
 
+use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
-    FrameChannel, send_eviction, send_host_frame, send_result_rejection,
+    ClientOrigin, FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
 use crate::dispatch::login_error::LoginRegisterError;
-use crate::responses::{
+use crate::reply_frame::{
     build_deny_reply, build_empty_reply, build_login_register_reply, current_metadata_commit,
 };
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::request_body;
-use consensus::{Consensus, DISCONNECT_LOGOUT_REQUEST_ID, MetadataHandle};
+use consensus::client_table::bind_verifier;
+use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::requests::system::SessionIdentity;
+use iggy_binary_protocol::requests::users::login_register::{BindSecret, RegisterRequest};
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::{
     ClientVersionInfo, Command, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
     ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, HEADER_SIZE, ProtocolVersion, RoutedRequestHeader, WireDecode,
-    is_protocol_compatible,
+    WireEncode, is_protocol_compatible,
 };
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
+use iggy_common::{
+    IggyError, IggyTimestamp, PersonalAccessToken, UserStatus, check_critical_options,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::MetadataSubmitError;
@@ -89,7 +94,7 @@ pub fn verify_login_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
     password: &str,
-) -> Result<u32, LoginRegisterError>
+) -> Result<(u32, IggyTimestamp), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -107,35 +112,38 @@ where
         return Err(LoginRegisterError::InvalidCredentials);
     }
     shard.plane.metadata().mux_stm.users().read(|users| {
-        let user = users
-            .index
-            .get(username)
-            .copied()
-            .and_then(|user_id| users.items.get(user_id as usize));
-        let Some(user) = user else {
+        if users.items.is_empty() {
+            return Err(LoginRegisterError::Transient(
+                MetadataSubmitError::NotCaughtUp,
+            ));
+        }
+        let Some(user) = users.user_by_name(username) else {
             // Constant-cost path: verify against a dummy hash so a missing
             // username is indistinguishable by response timing from a wrong
-            // password (both return InvalidCredentials).
+            // password. UserNotFound lets the ext-auth guard distinguish the
+            // two cases; on the wire both surface as InvalidCredentials.
             let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
-            return Err(LoginRegisterError::InvalidCredentials);
+            return Err(LoginRegisterError::UserNotFound);
         };
         // Verify before the status check and collapse inactive to
         // InvalidCredentials: an inactive account must answer exactly like a
         // wrong password (same error, same Argon2 cost), or login could probe
-        // which accounts exist but are disabled.
+        // which accounts exist but are disabled. An account holding critical
+        // options this build cannot read answers the same way.
         if !crypto::verify_password(password, user.password_hash.as_ref())
             || user.status != UserStatus::Active
+            || check_critical_options(&user.options).is_err()
         {
             return Err(LoginRegisterError::InvalidCredentials);
         }
-        Ok(user.id)
+        Ok((user.id, user.created_at))
     })
 }
 
 pub fn verify_pat_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
-) -> Result<u32, LoginRegisterError>
+) -> Result<(u32, IggyTimestamp), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -143,17 +151,20 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
+    verify_pat_credentials_with_expiry(shard, token)
+        .map(|(user_id, created_at, _)| (user_id, created_at))
 }
 
-/// Like [`verify_pat_credentials`] but also surfaces the token's expiry (unix
-/// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
-/// per-token VSR session table on this expiry for lazy eviction; the wire and
-/// login paths only need the user id and go through [`verify_pat_credentials`].
+/// Like [`verify_pat_credentials`] but also surfaces the owner's `created_at`,
+/// from the same read so it names the token's owner, and the token's expiry
+/// (unix seconds, `u64::MAX` when the PAT never expires). The HTTP extractor
+/// keys a per-token VSR session table on this expiry for lazy eviction; the
+/// wire and login paths need the account identity and go through
+/// [`verify_pat_credentials`].
 pub fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
-) -> Result<(u32, u64), LoginRegisterError>
+) -> Result<(u32, IggyTimestamp, u64), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -171,6 +182,11 @@ where
     // not own the metadata consensus.
     let now = IggyTimestamp::from(shard.bus.realtime_micros());
     shard.plane.metadata().mux_stm.users().read(|users| {
+        if users.items.is_empty() {
+            return Err(LoginRegisterError::Transient(
+                MetadataSubmitError::NotCaughtUp,
+            ));
+        }
         let Some((user_id, token_name)) =
             users.personal_access_token_index.get(token_hash.as_str())
         else {
@@ -189,7 +205,7 @@ where
         let Some(user) = users.items.get(*user_id as usize) else {
             return Err(LoginRegisterError::InvalidToken);
         };
-        if user.status != UserStatus::Active {
+        if user.status != UserStatus::Active || check_critical_options(&user.options).is_err() {
             return Err(LoginRegisterError::UserInactive);
         }
         // `expiry_at == None` is a never-expiring PAT; map it to `u64::MAX` so
@@ -197,19 +213,20 @@ where
         let expiry = pat
             .expiry_at
             .map_or(u64::MAX, |expiry_at| expiry_at.to_secs());
-        Ok((user.id, expiry))
+        Ok((user.id, user.created_at, expiry))
     })
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn complete_login_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     vsr_client_id: u128,
     request_header: &RoutedRequestHeader,
-    user_id: u32,
+    (user_id, user_created_at): (u32, IggyTimestamp),
     client_version: &ClientVersionInfo,
+    secret: &BindSecret,
 ) -> Result<(), LoginRegisterError>
 where
     B: ShellBus,
@@ -218,45 +235,23 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let sdk_info = ClientSdkInfo {
         sdk_name: client_version.sdk_name.as_str().to_owned(),
         sdk_version: client_version.sdk_version.as_str().to_owned(),
         protocol_version: client_version.protocol_version,
     };
-    let existing_session = {
-        let sessions = sessions.borrow();
-        sessions
-            .get_session(transport_client_id)
-            .map(|(_, session)| session)
-    };
-    if let Some(session) = existing_session {
-        // Re-login on a bound connection: refresh the recorded SDK info
-        // (a reconnecting client may have been upgraded) and replay.
-        sessions
-            .borrow_mut()
-            .record_sdk_info(transport_client_id, sdk_info);
-        // A lagging backup's commit_max can sit below the epoch this session
-        // already bound; never advertise a commit behind the session itself.
-        let commit = current_metadata_commit(shard).max(session);
-        let reply =
-            build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
-        send_host_frame(
-            &shard.bus,
-            transport_client_id,
-            reply.into_generic().into_frozen(),
-            FrameChannel::Reply,
-            "login_replay_reply",
-        )
-        .await;
-        return Ok(());
-    }
-
     // Submit Register and await the commit. The SessionManager is left
     // untouched until the op commits cluster-wide (post-quorum): there is no
     // optimistic Authenticated transition, so a transient submit failure
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
-    let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
+    let registration = RegisterRequest {
+        user_created_at: user_created_at.as_micros(),
+        bind_verifier: bind_verifier(vsr_client_id, user_id, secret.expose_secret()),
+    };
+    let session = match submit_register_on_owner(shard, vsr_client_id, user_id, registration).await
+    {
         // The wire reply carries only the fence epoch; the SDK numbers its
         // own requests, so the bind watermark is not surfaced (see the
         // BoundSession doc for who does consume it).
@@ -266,25 +261,22 @@ where
         }
     };
 
-    // Post-commit: Connected -> Authenticated -> Bound in a single borrow with
-    // no await in between, so the intermediate Authenticated state is never
-    // observable to a concurrent request on this connection.
-    {
-        let mut sessions = sessions.borrow_mut();
-        sessions
-            .login(transport_client_id, user_id)
-            .map_err(LoginRegisterError::Session)?;
-        sessions.record_sdk_info(transport_client_id, sdk_info);
-        if let Err(error) = sessions.bind_session(transport_client_id, vsr_client_id, session) {
-            // No local rollback: `submit_register_in_process` above has
-            // already committed cluster-wide. A local-only
-            // `remove_client_session` here would diverge peers (they retain
-            // the slot until they evict the client themselves). The
-            // transport-disconnect callback owns local cleanup once the
-            // socket closes.
-            return Err(LoginRegisterError::Session(error));
-        }
-    }
+    complete_session_binding(
+        shard,
+        sessions,
+        transport_client_id,
+        SessionIdentity {
+            client_id: vsr_client_id,
+            session,
+            metadata_watermark: session,
+        },
+        secret.clone(),
+    )
+    .await
+    .map_err(LoginRegisterError::Binding)?;
+    sessions
+        .borrow_mut()
+        .record_sdk_info(transport_client_id, sdk_info);
 
     // `session` IS the register's commit op, and on a backup that forwarded
     // the proposal the local applied commit still lags it. Reporting the
@@ -292,8 +284,8 @@ where
     let commit = current_metadata_commit(shard).max(session);
     let reply = build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::Reply,
         "login_register_reply",
@@ -320,7 +312,7 @@ where
 #[allow(clippy::future_not_send)]
 async fn surface_login_failure<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request_header: &RoutedRequestHeader,
     error: &LoginRegisterError,
 ) where
@@ -333,7 +325,7 @@ async fn surface_login_failure<B, MJ, S, SB>(
     if error.is_terminal() {
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             request_header.client,
             eviction_reason_for(error),
             "login_rejection",
@@ -344,7 +336,7 @@ async fn surface_login_failure<B, MJ, S, SB>(
         // replay may move to another node: see `transient_login_code`.
         send_result_rejection(
             shard,
-            transport_client_id,
+            origin,
             request_header,
             &transient_login_code(error),
             "login_transient_replay_hint",
@@ -364,14 +356,18 @@ async fn surface_login_failure<B, MJ, S, SB>(
 /// UNKNOWN outcome, so none can ride that assertion. `TransientNotCommitted`
 /// pins the replay to this connection and its client id, where a register that
 /// did commit rebinds its own client-table entry. Re-issuing under a freshly
-/// minted id would instead orphan that entry until capacity eviction reclaims
-/// it.
+/// minted id would instead orphan that entry until ordered retirement reclaims
+/// it. Binding follows a committed Register, so a transient bind refusal also
+/// retains the registration identity.
 const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
     match error {
         LoginRegisterError::Transient(
             MetadataSubmitError::ForwardTimedOut
             | MetadataSubmitError::InProgress
             | MetadataSubmitError::Canceled,
+        )
+        | LoginRegisterError::Binding(
+            IggyError::TransientNotCommitted | IggyError::TransientNotAccepted,
         ) => IggyError::TransientNotCommitted,
         _ => IggyError::TransientNotAccepted,
     }
@@ -383,23 +379,28 @@ const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
 /// `SessionError`; the SDK maps it to `Unauthenticated`.
 const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     match error {
-        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
+        LoginRegisterError::InvalidCredentials | LoginRegisterError::UserNotFound => {
+            EvictionReason::InvalidCredentials
+        }
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
     }
 }
 
-/// Per-shard heartbeat verifier: evict connections that have not pinged within
-/// `1.2 x interval`. Mirrors the legacy `verify_heartbeats` periodic task.
-/// Eviction reuses the disconnect path (drops the client from its consumer
-/// groups + rebalances via the replicated `Logout`) and sends a session-
-/// terminal `Eviction(StaleClient)` so the client fails fast and can reconnect.
+/// Per-shard heartbeat verifier: every `interval`, evict group-member
+/// connections that sent nothing for `max_age`, the session timeout.
+///
+/// Mirrors the legacy `verify_heartbeats` periodic task. Eviction
+/// removes the connection binding and sends `Eviction(StaleClient)`. The
+/// shared logical session and its group membership remain until committed
+/// lease expiry or explicit logout.
 #[allow(clippy::future_not_send)]
 pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     interval: std::time::Duration,
+    max_age: std::time::Duration,
     stop_rx: shard::Receiver<()>,
 ) where
     B: ShellBus,
@@ -408,35 +409,19 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Legacy `MAX_THRESHOLD`: a client is stale once it misses 1.2 intervals.
-    // Integer 6/5 rather than `mul_f64`, which panics on an absurd interval.
-    let max_age = interval.saturating_mul(6) / 5;
     loop {
-        // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> pass.
-        // Waiting on the stop channel rather than sleeping past it keeps this
-        // task inside the shutdown drain budget, which is shorter than the
-        // heartbeat interval.
-        let stop_signal = compio::time::timeout(interval, stop_rx.recv()).await;
-        if stop_signal.is_ok() {
+        if shard::bus_timeout(&shard.bus, interval, stop_rx.recv())
+            .await
+            .is_some()
+        {
             break;
         }
-        // Production-only wall clock: the heartbeat verifier is spawned solely
-        // by `build_shard_for_thread`, never by the simulator's
-        // `wire_shell_handlers`, so neither the interval wait above nor this
-        // read is on a deterministic path. Driving this task under the
-        // deterministic executor means routing both through the injected clock.
         let stale = sessions
             .borrow()
-            .collect_stale(max_age, std::time::Instant::now());
+            .collect_stale(max_age, shard.bus.monotonic_now());
         for transport_client_id in stale {
-            // The heartbeat verifier exists to release a dead client's
-            // consumer-group membership (so the group rebalances off it). A
-            // connection that holds no membership has nothing for the eviction
-            // to clean up; reaping it would only drop a still-usable session
-            // (e.g. an idle admin connection that polls between long gaps),
-            // which the legacy server tolerates. The real transport-disconnect
-            // path still reaps it on socket close. So only evict a stale
-            // connection that is actually a group member.
+            // Preserve idle admin connections. Group-member connections get an
+            // eviction notice; membership ends through committed lease expiry.
             let is_group_member = sessions
                 .borrow()
                 .bound_client_id(transport_client_id)
@@ -456,9 +441,7 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     }
 }
 
-/// Evict one stale connection: drop its session (releasing consumer-group
-/// membership through a replicated `Logout`) and notify the client with a
-/// session-terminal `Eviction(StaleClient)`.
+/// Remove one stale connection binding and notify it with `Eviction(StaleClient)`.
 #[allow(clippy::future_not_send)]
 async fn evict_stale_client<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -471,20 +454,16 @@ async fn evict_stale_client<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let bound = sessions.borrow_mut().remove_connection(transport_client_id);
-    if let Some((vsr_client_id, session)) = bound {
-        submit_disconnect_logout(Rc::clone(shard), vsr_client_id, session);
-    }
-    // The eviction itself is done and observed at this point (session
-    // dropped, `Logout` submitted). The client notice below is best-effort
-    // and logs its own send failure, so this line must not claim it.
+    sessions.borrow_mut().remove_connection(transport_client_id);
     warn!(
         transport_client_id,
         "evicted stale client (missed heartbeat); sending the eviction notice"
     );
+    // The verifier found the binding stale just now, so the notice goes to
+    // the installation serving the transport id at this moment.
     send_eviction(
         shard,
-        transport_client_id,
+        ClientOrigin::capture(&shard.bus, transport_client_id),
         transport_client_id,
         EvictionReason::StaleClient,
         "stale_client_eviction",
@@ -503,6 +482,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    registration: RegisterRequest,
     nonce: u128,
     origin_replica: u8,
 ) where
@@ -525,7 +505,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     let bound = shard
         .plane
         .metadata()
-        .submit_register_in_process(vsr_client_id, user_id)
+        .submit_register_in_process(vsr_client_id, user_id, registration)
         .await;
     // `view` predates the await above, which parks with no deadline, so the
     // sealed value can be stale by send time. The origin routes the result by
@@ -596,6 +576,7 @@ pub(in crate::dispatch) async fn submit_register_local_or_forward<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    registration: RegisterRequest,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -620,15 +601,22 @@ where
         return shard
             .plane
             .metadata()
-            .submit_register_in_process(vsr_client_id, user_id)
+            .submit_register_in_process(vsr_client_id, user_id, registration)
             .await;
     }
 
     let nonce = shard.next_forward_nonce(self_replica);
     let (reply, outcome) = shard::channel::<ForwardRegisterResultHeader>(1);
     shard.park_register_forward(nonce, vsr_client_id, reply);
-    let forward =
-        build_forward_register_message(cluster, view, self_replica, vsr_client_id, nonce, user_id);
+    let forward = build_forward_register_message(
+        cluster,
+        view,
+        self_replica,
+        vsr_client_id,
+        nonce,
+        user_id,
+        registration,
+    );
     if let Err(error) = shard
         .bus
         .send_to_replica(target, forward.into_generic().into_frozen())
@@ -672,6 +660,7 @@ const fn forward_register_result(
         ForwardRegisterOutcome::ClientIdOwnedByAnotherUser => {
             Err(MetadataSubmitError::ClientIdOwnedByAnotherUser)
         }
+        ForwardRegisterOutcome::Unauthenticated => Err(MetadataSubmitError::Unauthenticated),
     }
 }
 
@@ -692,9 +681,11 @@ const fn forward_register_outcome(
         Err(MetadataSubmitError::ClientIdOwnedByAnotherUser) => {
             (zero, ForwardRegisterOutcome::ClientIdOwnedByAnotherUser)
         }
-        // `MetadataSubmitError` is `#[non_exhaustive]`. Every variant but the
-        // ownership refusal is transient by contract, and `Canceled` is the
-        // transient answer that claims nothing beyond "retry".
+        Err(MetadataSubmitError::Unauthenticated) => {
+            (zero, ForwardRegisterOutcome::Unauthenticated)
+        }
+        // `MetadataSubmitError` is `#[non_exhaustive]`. The remaining errors
+        // are transient; `Canceled` claims nothing beyond "retry".
         Err(_) => (zero, ForwardRegisterOutcome::Canceled),
     }
 }
@@ -707,20 +698,23 @@ fn build_forward_register_message(
     client: u128,
     nonce: u128,
     user_id: u32,
+    registration: RegisterRequest,
 ) -> Message<ForwardRegisterHeader> {
-    Message::<ForwardRegisterHeader>::new(HEADER_SIZE).transmute_header(
-        |_, header: &mut ForwardRegisterHeader| {
-            header.command = Command::ForwardRegister;
-            header.cluster = cluster;
-            header.view = view;
-            header.replica = replica;
-            header.client = client;
-            header.nonce = nonce;
-            header.user_id = user_id;
-            header.size = HEADER_SIZE as u32;
-            header.seal();
-        },
-    )
+    let body = registration.to_bytes();
+    let mut message = Message::<ForwardRegisterHeader>::new(HEADER_SIZE + body.len());
+    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+    message.transmute_header(|_, header: &mut ForwardRegisterHeader| {
+        header.command = Command::ForwardRegister;
+        header.cluster = cluster;
+        header.view = view;
+        header.replica = replica;
+        header.client = client;
+        header.nonce = nonce;
+        header.user_id = user_id;
+        header.size = (HEADER_SIZE + body.len()) as u32;
+        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+        header.seal();
+    })
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -872,6 +866,8 @@ const fn forward_logout_result(
         ForwardLogoutOutcome::PipelineFull => Err(MetadataSubmitError::PipelineFull),
         ForwardLogoutOutcome::InProgress => Err(MetadataSubmitError::InProgress),
         ForwardLogoutOutcome::Canceled => Err(MetadataSubmitError::Canceled),
+        ForwardLogoutOutcome::RequestTooOld => Err(MetadataSubmitError::RequestTooOld),
+        ForwardLogoutOutcome::OperationMismatch => Err(MetadataSubmitError::OperationMismatch),
     }
 }
 
@@ -883,6 +879,8 @@ const fn forward_logout_outcome(
         Err(MetadataSubmitError::NotPrimary) => (0, ForwardLogoutOutcome::NotPrimary),
         Err(MetadataSubmitError::PipelineFull) => (0, ForwardLogoutOutcome::PipelineFull),
         Err(MetadataSubmitError::InProgress) => (0, ForwardLogoutOutcome::InProgress),
+        Err(MetadataSubmitError::RequestTooOld) => (0, ForwardLogoutOutcome::RequestTooOld),
+        Err(MetadataSubmitError::OperationMismatch) => (0, ForwardLogoutOutcome::OperationMismatch),
         Err(_) => (0, ForwardLogoutOutcome::Canceled),
     }
 }
@@ -954,6 +952,7 @@ pub async fn submit_register_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
+    registration: RegisterRequest,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -963,12 +962,13 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return submit_register_local_or_forward(shard, vsr_client_id, user_id).await;
+        return submit_register_local_or_forward(shard, vsr_client_id, user_id, registration).await;
     }
     let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
+        registration,
         reply,
     });
     // The owner's outcome, verbatim in both directions. `Canceled` is only for a
@@ -1007,69 +1007,11 @@ where
         .await
         .unwrap_or(Err(MetadataSubmitError::Canceled))
 }
-
-/// Release the client-table slot for a disconnected transport, cluster-wide.
-///
-/// The local `SessionManager` connection is already dropped by the caller;
-/// this is what drops the replicated entry, so a peer replica does not keep an
-/// orphaned session until it evicts one under capacity pressure.
-///
-/// Unconditional, and deliberately so. Holding the slot open for a grace
-/// window would let a reconnecting client resume onto its entry with its
-/// watermark and reply ring intact, but nothing in tree re-presents a
-/// `client_id` after a disconnect (the Rust SDK mints a fresh one on
-/// re-login), so the window buys nothing today and the slot it holds is not
-/// free: the client table's eviction point moves from concurrent connections
-/// to CUMULATIVE connects, and every capacity eviction silently erases a
-/// dedup watermark.
-///
-/// A resume window becomes worth having once SDK-side identity stability
-/// lands, at which point it needs a timer of its own -- riding the heartbeat
-/// verifier would tie the grace period to heartbeat configuration, since
-/// `collect_stale` keys off `heartbeat.interval` and the verifier does not run
-/// at all when `heartbeat.enabled` is false.
-/// Deliberately does NOT drop the local `ClientTable` slot first:
-/// `submit_logout_*` short-circuits when the slot is already gone, so a
-/// pre-emptive local removal would suppress the `Logout` and leave peer
-/// replicas with an orphaned session until they evict it themselves -- the
-/// exact divergence this avoids. `submit_logout_on_owner` runs in-process on
-/// shard 0 and forwards for peer-homed connections; its session guard drops a
-/// stale logout for a reused client id.
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) fn submit_disconnect_logout<B, MJ, S, SB>(
-    shard: Rc<ShellShard<B, MJ, S, SB>>,
-    vsr_client_id: u128,
-    session: u64,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    // The sentinel request id is what the apply path reads to keep, rather
-    // than drop, the session's dedup fence: the client may be reconnecting
-    // under the same key, and its retry must still be answered.
-    let bus = shard.bus.clone();
-    bus.spawn(async move {
-        if let Err(error) =
-            submit_logout_on_owner(&shard, vsr_client_id, session, DISCONNECT_LOGOUT_REQUEST_ID)
-                .await
-        {
-            warn!(
-                vsr_client_id,
-                ?error,
-                "disconnect logout submit failed; peer slots may linger until eviction"
-            );
-        }
-    });
-}
-
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -1078,6 +1020,7 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
         // Logout on an unbound transport: the desired state already holds,
         // so answer ok. A silent drop would wedge the lockstep SDK on this
@@ -1090,8 +1033,8 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
         let commit = current_metadata_commit(shard);
         let reply = build_empty_reply(request.header(), transport_client_id, 0, commit);
         send_host_frame(
-            &shard.bus,
-            transport_client_id,
+            shard,
+            origin,
             reply.into_generic().into_frozen(),
             FrameChannel::Reply,
             "unbound_logout_reply",
@@ -1107,18 +1050,18 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
             // Deny as transient instead of dropping the frame: the submit
             // usually fails because this replica is not the metadata owner
             // right now, and the SDK replays a transient rejection.
-            warn!(transport_client_id, error = %error, "logout/unregister failed; denying transient");
+            warn!(transport_client_id, error = %error, "logout/unregister failed; denying logout");
             let commit = current_metadata_commit(shard);
             let reply = build_deny_reply(
                 request.header(),
                 vsr_client_id,
                 session,
                 commit,
-                transient_logout_code(&error).as_code(),
+                logout_deny_code(&error).as_code(),
             );
             send_host_frame(
-                &shard.bus,
-                transport_client_id,
+                shard,
+                origin,
                 reply.into_generic().into_frozen(),
                 FrameChannel::TypedDeny,
                 "logout_transient_deny",
@@ -1132,8 +1075,8 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
 
     let reply = build_empty_reply(request.header(), vsr_client_id, session, commit);
     send_host_frame(
-        &shard.bus,
-        transport_client_id,
+        shard,
+        origin,
         reply.into_generic().into_frozen(),
         FrameChannel::Reply,
         "logout_reply",
@@ -1144,8 +1087,10 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
 /// Preserve the client identity when a Logout may already have entered the
 /// primary's pipeline. Moving an unknown-outcome replay to another connection
 /// could race a later Register and obscure whether the old epoch was removed.
-const fn transient_logout_code(error: &MetadataSubmitError) -> IggyError {
+const fn logout_deny_code(error: &MetadataSubmitError) -> IggyError {
     match error {
+        MetadataSubmitError::RequestTooOld => IggyError::RequestTooOld,
+        MetadataSubmitError::OperationMismatch => IggyError::InvalidCommand,
         MetadataSubmitError::ForwardTimedOut
         | MetadataSubmitError::InProgress
         | MetadataSubmitError::Canceled => IggyError::TransientNotCommitted,
@@ -1157,7 +1102,8 @@ const fn transient_logout_code(error: &MetadataSubmitError) -> IggyError {
 pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    ext_auth: &configs::external_auth::ExternalAuthConfig,
+    origin: ClientOrigin,
     request: Message<RoutedRequestHeader>,
 ) where
     B: ShellBus,
@@ -1166,8 +1112,21 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let transport_client_id = origin.id;
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
+
+    if message_bus::is_server_internal_client(vsr_client_id) {
+        send_eviction(
+            shard,
+            origin,
+            vsr_client_id,
+            EvictionReason::MalformedLogin,
+            "login_rejection",
+        )
+        .await;
+        return;
+    }
 
     // Both login-register shapes share the ClientVersionInfo prefix, so the
     // protocol gate decodes it once and runs before any credential work; the
@@ -1183,7 +1142,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         );
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             vsr_client_id,
             EvictionReason::MalformedLogin,
             "login_rejection",
@@ -1201,7 +1160,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         );
         send_eviction(
             shard,
-            transport_client_id,
+            origin,
             vsr_client_id,
             EvictionReason::IncompatibleProtocol,
             "login_rejection",
@@ -1211,62 +1170,91 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     }
 
     let body_tail = &body[prefix_len..];
-    let mut credentials_rejected = false;
+
+    // A body that decodes as LoginRegisterRequest is always treated as a
+    // password login. A wrong password is final: the handler returns without
+    // trying PAT decode. The context length prevents cross-decode: a PAT
+    // body runs out of bytes before a LoginRegisterRequest can fully parse.
     if let Ok((wire_request, _)) =
         LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
     {
+        // verify_login_credentials handles not-caught-up (transient),
+        // unknown users (constant-cost dummy hash), and wrong passwords in
+        // one call. On InvalidCredentials with ext-auth enabled, the dummy
+        // hash has already equalized timing before the callout adds to it.
         match verify_login_credentials(
             shard,
             wire_request.username.as_str(),
             wire_request.password.expose_secret(),
         ) {
-            Ok(user_id) => {
+            Ok(account) => {
                 if let Err(error) = complete_login_register(
                     shard,
                     sessions,
-                    transport_client_id,
+                    origin,
                     vsr_client_id,
                     request.header(),
-                    user_id,
+                    account,
                     &wire_request.version_info,
+                    &wire_request.bind_secret,
                 )
                 .await
                 {
                     warn!(transport_client_id, error = %error, "login/register failed");
-                    surface_login_failure(shard, transport_client_id, request.header(), &error)
-                        .await;
+                    surface_login_failure(shard, origin, request.header(), &error).await;
                 }
-                return;
             }
-            Err(LoginRegisterError::InvalidCredentials) => {
-                // Fall through to PAT attempt so a credential payload that
-                // collides with a valid PAT payload shape still gets a
-                // chance. A password-shaped body rarely parses as a PAT
-                // body, so remember the rejection: the final fall-through
-                // must surface InvalidCredentials, not MalformedLogin.
-                credentials_rejected = true;
+            Err(LoginRegisterError::UserNotFound) if ext_auth.enabled => {
+                // Only the normal-status primary does callouts. Backups
+                // have a partially-replicated user store, and nodes in a
+                // view change cannot complete the Register proposal. Both
+                // cases block: peer shards forward the check to shard 0
+                // (the only shard that holds a consensus instance).
+                if is_metadata_primary(shard).await {
+                    // Boxed to keep the ext-auth state machine out of the
+                    // handle_client_request future, which every request pays.
+                    Box::pin(try_external_auth_login(
+                        shard,
+                        sessions,
+                        ext_auth,
+                        origin,
+                        vsr_client_id,
+                        request.header(),
+                        &wire_request,
+                    ))
+                    .await;
+                } else {
+                    surface_login_failure(
+                        shard,
+                        origin,
+                        request.header(),
+                        &LoginRegisterError::ExternalAuthUnavailable,
+                    )
+                    .await;
+                }
             }
             Err(error) => {
                 warn!(transport_client_id, error = %error, "login/register failed");
-                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
-                return;
+                surface_login_failure(shard, origin, request.header(), &error).await;
             }
         }
+        return;
     }
 
     if let Ok((wire_request, _)) =
         LoginRegisterWithPatRequest::decode_after_prefix(version_info, body_tail)
     {
         match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
-            Ok(user_id) => {
+            Ok(account) => {
                 if let Err(error) = complete_login_register(
                     shard,
                     sessions,
-                    transport_client_id,
+                    origin,
                     vsr_client_id,
                     request.header(),
-                    user_id,
+                    account,
                     &wire_request.version_info,
+                    &wire_request.bind_secret,
                 )
                 .await
                 {
@@ -1275,8 +1263,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                         error = %error,
                         "login/register with PAT failed"
                     );
-                    surface_login_failure(shard, transport_client_id, request.header(), &error)
-                        .await;
+                    surface_login_failure(shard, origin, request.header(), &error).await;
                 }
                 return;
             }
@@ -1286,26 +1273,10 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
                     error = %error,
                     "login/register with PAT failed"
                 );
-                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
+                surface_login_failure(shard, origin, request.header(), &error).await;
                 return;
             }
         }
-    }
-
-    if credentials_rejected {
-        warn!(
-            transport_client_id,
-            "rejecting register request: invalid credentials"
-        );
-        send_eviction(
-            shard,
-            transport_client_id,
-            request.header().client,
-            EvictionReason::InvalidCredentials,
-            "login_rejection",
-        )
-        .await;
-        return;
     }
 
     warn!(
@@ -1314,12 +1285,152 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     );
     send_eviction(
         shard,
-        transport_client_id,
+        origin,
         request.header().client,
         EvictionReason::MalformedLogin,
         "login_rejection",
     )
     .await;
+}
+
+/// `true` when the node's metadata consensus is in normal status and is the
+/// primary. On shard 0 the consensus instance is checked directly. On peer
+/// shards (`consensus: None`) the question is forwarded to shard 0 over the
+/// existing `MetadataSubmit` channel, because all shards on the same node
+/// share the same `LeftRight` user store and the only missing piece is the
+/// consensus role. A dropped channel (shard-0 inbox full / shutdown) answers
+/// `false` so the caller blocks the callout rather than leaking credentials.
+async fn is_metadata_primary<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if let Some(consensus) = shard.plane.metadata().consensus.as_ref() {
+        return consensus.is_normal() && consensus.is_primary();
+    }
+    // Non-metadata shard: ask shard 0 for the consensus role.
+    let (reply, rx) = shard::channel::<bool>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::IsMetadataPrimary { reply });
+    rx.recv().await.unwrap_or(false)
+}
+
+/// Attempt external auth callout and, on success, resolve the returned
+/// username to a pre-provisioned Iggy user and complete the login.
+///
+/// The SDK may replay a login after a transient failure, so the callout can
+/// fire more than once for a single logical login. The external service must
+/// be idempotent; one-time passwords will not work across replays.
+async fn try_external_auth_login<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    ext_auth: &configs::external_auth::ExternalAuthConfig,
+    origin: ClientOrigin,
+    vsr_client_id: u128,
+    header: &RoutedRequestHeader,
+    wire_request: &LoginRegisterRequest,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    use crate::external_auth::{
+        Credentials, ExternalAuthRequest, ValidatedDecision, callout_external_auth,
+    };
+
+    let transport_client_id = origin.id;
+
+    // If the client disconnected while queued, the session slot is gone.
+    // Firing the callout would waste a round-trip and widen the window where
+    // a committed Register holds a slot for a gone connection.
+    let (transport, client_address) = match sessions.borrow().client_record(transport_client_id) {
+        Some(r) => (r.transport.as_str(), r.address.to_string()),
+        None => return,
+    };
+    let connection_id = uuid::Uuid::from_u128(transport_client_id).to_string();
+
+    let ext_request = ExternalAuthRequest {
+        transport,
+        client_address: &client_address,
+        connection_id: &connection_id,
+        credentials: Credentials::UsernamePassword {
+            username: wire_request.username.as_str(),
+            password: &wire_request.password,
+        },
+    };
+
+    let decision = match callout_external_auth(ext_auth, ext_request).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!(transport_client_id, error = %error, "external auth callout failed");
+            let login_error = if error.is_transient() {
+                LoginRegisterError::ExternalAuthUnavailable
+            } else {
+                LoginRegisterError::InvalidCredentials
+            };
+            surface_login_failure(shard, origin, header, &login_error).await;
+            return;
+        }
+    };
+
+    let login_error = match decision {
+        ValidatedDecision::Allow { username } => {
+            let resolve = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| crate::external_auth::resolve_username(users, &username));
+            match resolve {
+                Ok(account) => {
+                    match complete_login_register(
+                        shard,
+                        sessions,
+                        origin,
+                        vsr_client_id,
+                        header,
+                        account,
+                        &wire_request.version_info,
+                        &wire_request.bind_secret,
+                    )
+                    .await
+                    {
+                        Ok(()) => return,
+                        Err(error) => {
+                            warn!(
+                                transport_client_id,
+                                error = %error,
+                                "ext-auth login/register failed"
+                            );
+                            error
+                        }
+                    }
+                }
+                Err(iggy_error) => {
+                    warn!(
+                        transport_client_id,
+                        ext_username = %username,
+                        error = %iggy_error,
+                        "ext-auth user resolution failed"
+                    );
+                    LoginRegisterError::InvalidCredentials
+                }
+            }
+        }
+        ValidatedDecision::Deny { reason } => {
+            warn!(
+                transport_client_id,
+                reason = %reason,
+                "external auth denied login"
+            );
+            LoginRegisterError::InvalidCredentials
+        }
+    };
+    surface_login_failure(shard, origin, header, &login_error).await;
 }
 
 #[cfg(test)]
@@ -1329,16 +1440,23 @@ mod tests {
         FIRST_BOOT, SECOND_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply,
         request_message, test_shard,
     };
-    use crate::session_manager::SessionError;
     use consensus::{LocalPipeline, Plane as _, PlaneKind, VsrConsensus};
     use iggy_binary_protocol::Operation;
+    use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, WireEncode, WireOptions};
     use iggy_common::eviction_reason_to_error;
+    use iggy_common::wire_conversions::resource_options_to_wire;
+    use iggy_common::{
+        HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
+    };
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::IggyMetadata;
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::stm::StateMachine as _;
+    use metadata::stm::user::CreatePersonalAccessTokenRequest;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
     use server_common::sharding::ShardId;
@@ -1346,13 +1464,100 @@ mod tests {
     use shard::{PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
     use std::future::Future;
     use std::mem::size_of;
+    use std::sync::Arc;
+
+    #[test]
+    fn given_uninitialized_root_when_verifying_credentials_should_return_a_retryable_failure() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 3, FIRST_BOOT));
+        for result in [
+            verify_login_credentials(&shard, "iggy", "iggy"),
+            verify_pat_credentials(&shard, "test-token"),
+        ] {
+            assert!(matches!(
+                result,
+                Err(LoginRegisterError::Transient(
+                    MetadataSubmitError::NotCaughtUp
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn given_user_with_unknown_critical_option_when_logging_in_should_refuse_it() {
+        const PASSWORD: &str = "user-password";
+        const TOKEN: &str = "user-personal-access-token";
+        let unreadable = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+            ),
+            (
+                HeaderKey::try_from("a_future_key").expect("key fits"),
+                OptionValue::explicit(HeaderValue::from(7u64)),
+            ),
+        ]);
+        for (options, refused) in [(ResourceOptions::new(), false), (unreadable, true)] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let mux_stm = &shard.plane.metadata().mux_stm;
+            mux_stm.users().ensure_root_user("root", "hash");
+            mux_stm
+                .update(prepare_message(
+                    Operation::CreateUser,
+                    0,
+                    1,
+                    &CreateUserRequest {
+                        username: WireName::new("user").expect("name fits"),
+                        password: server_common::crypto::hash_password(PASSWORD),
+                        status: UserStatus::Active.as_code(),
+                        permissions: None,
+                        options: resource_options_to_wire(&options, OptionsProvenance::All)
+                            .expect("options encode"),
+                    }
+                    .to_bytes(),
+                ))
+                .expect("user create applies");
+            mux_stm
+                .update(prepare_message(
+                    Operation::CreatePersonalAccessToken,
+                    0,
+                    2,
+                    &CreatePersonalAccessTokenRequest {
+                        user_id: 1,
+                        name: WireName::new("token").expect("name fits"),
+                        expiry: 0,
+                        token_hash: PersonalAccessToken::hash_token(TOKEN)
+                            .as_bytes()
+                            .try_into()
+                            .expect("hash fits"),
+                    }
+                    .to_bytes(),
+                ))
+                .expect("token create applies");
+
+            let password_login = verify_login_credentials(&shard, "user", PASSWORD);
+            let token_login = verify_pat_credentials(&shard, TOKEN);
+
+            if refused {
+                assert!(matches!(
+                    password_login,
+                    Err(LoginRegisterError::InvalidCredentials)
+                ));
+                assert!(matches!(token_login, Err(LoginRegisterError::UserInactive)));
+            } else {
+                assert!(password_login.is_ok(), "{password_login:?}");
+                assert!(token_login.is_ok(), "{token_login:?}");
+            }
+        }
+    }
 
     #[test]
     fn terminal_vs_transient() {
         assert!(LoginRegisterError::InvalidCredentials.is_terminal());
         assert!(LoginRegisterError::InvalidToken.is_terminal());
         assert!(LoginRegisterError::UserInactive.is_terminal());
-        assert!(LoginRegisterError::Session(SessionError::ConnectionNotFound(0)).is_terminal());
+        assert!(LoginRegisterError::Binding(IggyError::Unauthenticated).is_terminal());
         // Transient is the only recoverable variant: never terminal.
         assert!(!LoginRegisterError::Transient(MetadataSubmitError::PipelineFull).is_terminal());
     }
@@ -1388,6 +1593,16 @@ mod tests {
 
     #[test]
     fn unknown_register_outcomes_pin_the_client_identity() {
+        for error in [
+            IggyError::TransientNotAccepted,
+            IggyError::TransientNotCommitted,
+        ] {
+            assert_eq!(
+                transient_login_code(&LoginRegisterError::Binding(error)),
+                IggyError::TransientNotCommitted,
+                "a post-commit bind refusal must retain the registration identity",
+            );
+        }
         for error in [
             MetadataSubmitError::ForwardTimedOut,
             MetadataSubmitError::InProgress,
@@ -1471,11 +1686,10 @@ mod tests {
             PartitionsConfig {
                 messages_required_to_save: 1,
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
-
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context: Arc::default(),
                 path_layout: PartitionPathLayout::default(),
             },
         );
@@ -1492,11 +1706,15 @@ mod tests {
 
         // A and B hold committed sessions (as after their CLI logins).
         for client in [CLIENT_A, CLIENT_B] {
-            md.client_table.borrow_mut().commit_register(
-                client,
-                ACTING_USER,
-                register_reply(client, SESSION),
-            );
+            md.client_table
+                .borrow_mut()
+                .commit_register(
+                    client,
+                    ACTING_USER,
+                    [0x5a; 32],
+                    register_reply(client, SESSION),
+                )
+                .unwrap();
         }
         // A's transport connection, authenticated + bound — the state a
         // CLI connection is in right after its create-stream reply.
@@ -1505,14 +1723,24 @@ mod tests {
             TRANSPORT_A,
             "127.0.0.1:34567".parse().unwrap(),
             ClientTransportKind::Tcp,
+            std::time::Instant::now(),
         );
-        sessions
+        let attachment = md
+            .client_table
             .borrow_mut()
-            .login(TRANSPORT_A, ACTING_USER)
+            .attach_session(CLIENT_A, SESSION, ACTING_USER)
             .unwrap();
         sessions
             .borrow_mut()
-            .bind_session(TRANSPORT_A, CLIENT_A, SESSION)
+            .bind_authenticated_connection(
+                TRANSPORT_A,
+                CLIENT_A,
+                SESSION,
+                ACTING_USER,
+                attachment,
+                SESSION,
+                std::time::Instant::now(),
+            )
             .unwrap();
 
         // Sibling B's op: prepared, journaled, self-acked through the real
@@ -1526,7 +1754,12 @@ mod tests {
             options: WireOptions::empty(),
         }
         .to_bytes();
-        let prepare = prepare_message(Operation::CreateStream, CLIENT_B, 1, &create_body);
+        let prepare = prepare_message(Operation::CreateStream, CLIENT_B, 1, &create_body)
+            .transmute_header(|old, header| {
+                *header = old;
+                header.user_id = ACTING_USER;
+                header.checksum = header.identity_checksum();
+            });
         consensus.pipeline_message(PlaneKind::Metadata, &prepare);
         md.on_replicate(prepare).await;
         let mut loopback = Vec::new();
@@ -1552,7 +1785,13 @@ mod tests {
 
         // A's logout lands in the window, through the real dispatch path.
         let logout = request_message(Operation::Logout, CLIENT_A, SESSION, 2, &[]);
-        handle_logout_request(&shard, &sessions, TRANSPORT_A, logout).await;
+        handle_logout_request(
+            &shard,
+            &sessions,
+            ClientOrigin::capture(&shard.bus, TRANSPORT_A),
+            logout,
+        )
+        .await;
 
         // DESIRED CONTRACT (red on current code): the client must never be
         // left in silence — that silence is what a one-shot CLI reports as
@@ -1589,7 +1828,16 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, USER).await
+                submit_register_local_or_forward(
+                    &shard,
+                    CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
             })
         };
         await_forward(&bus).await;
@@ -1681,20 +1929,14 @@ mod tests {
             MetadataSubmitError::InProgress,
             MetadataSubmitError::Canceled,
         ] {
-            assert_eq!(
-                transient_logout_code(&error),
-                IggyError::TransientNotCommitted
-            );
+            assert_eq!(logout_deny_code(&error), IggyError::TransientNotCommitted);
         }
         for error in [
             MetadataSubmitError::NotPrimary,
             MetadataSubmitError::PipelineFull,
             MetadataSubmitError::PrimaryUnreachable,
         ] {
-            assert_eq!(
-                transient_logout_code(&error),
-                IggyError::TransientNotAccepted
-            );
+            assert_eq!(logout_deny_code(&error), IggyError::TransientNotAccepted);
         }
     }
 
@@ -1707,7 +1949,16 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, 0xCAFE, 7).await
+                submit_register_local_or_forward(
+                    &shard,
+                    0xCAFE,
+                    7,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
             })
         };
         await_forward(&bus).await;
@@ -1736,7 +1987,16 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
 
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(
+            &shard,
+            0xCAFE,
+            7,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        )
+        .await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         assert!(
             outcome.unwrap_err().is_transient(),
@@ -1781,7 +2041,13 @@ mod tests {
             ),
         ] {
             let error = LoginRegisterError::Transient(submit_error);
-            surface_login_failure(&shard, TRANSPORT, request.header(), &error).await;
+            surface_login_failure(
+                &shard,
+                ClientOrigin::capture(&shard.bus, TRANSPORT),
+                request.header(),
+                &error,
+            )
+            .await;
 
             let replies = bus.client_replies.borrow();
             assert_eq!(replies.len(), 1, "a transient login must answer a frame");
@@ -1835,7 +2101,16 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, 7).await
+                submit_register_local_or_forward(
+                    &shard,
+                    CLIENT,
+                    7,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
             })
         };
         await_forward(&bus).await;
@@ -1882,7 +2157,15 @@ mod tests {
         // matters is that nothing left over the interconnect.
         let _ = compio::time::timeout(
             Duration::from_millis(50),
-            submit_register_local_or_forward(&shard, 0xCAFE, 7),
+            submit_register_local_or_forward(
+                &shard,
+                0xCAFE,
+                7,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            ),
         )
         .await;
         assert!(
@@ -1898,7 +2181,16 @@ mod tests {
         let bus = SpyBus::default();
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, incarnation));
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7).await;
+        let outcome = submit_register_local_or_forward(
+            &shard,
+            0xCAFE,
+            7,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        )
+        .await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         bus.sole_replica_send::<ForwardRegisterHeader>().1.nonce
     }
@@ -1950,5 +2242,102 @@ mod tests {
             forward.nonce,
             outcome,
         ))
+    }
+
+    // ── is_metadata_primary ────────────────────────────────────────────
+
+    #[compio::test]
+    async fn given_backup_shard_0_when_checking_primary_should_return_false() {
+        let bus = SpyBus::default();
+        // Replica 1 of 3 at view 0: primary_index(0) == 0, so this is a backup.
+        let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
+        assert!(!is_metadata_primary(&shard).await);
+    }
+
+    #[compio::test]
+    async fn given_primary_shard_0_when_checking_primary_should_return_true() {
+        let bus = SpyBus::default();
+        // Replica 0 of 3 at view 0: primary_index(0) == 0, so this IS the primary.
+        let shard = Rc::new(test_shard(&bus, 0, 3, FIRST_BOOT));
+        assert!(is_metadata_primary(&shard).await);
+    }
+
+    #[compio::test]
+    async fn given_standalone_shard_0_when_checking_primary_should_return_true() {
+        let bus = SpyBus::default();
+        // Solo replica: always primary.
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        assert!(is_metadata_primary(&shard).await);
+    }
+
+    /// Build a peer shard (id=1, no consensus) with a shard-0 inbox for
+    /// forwarded `IsMetadataPrimary` queries, then run `is_metadata_primary`
+    /// and answer with `shard0_answer`.
+    async fn peer_shard_primary_check(shard0_answer: bool) -> bool {
+        let bus = SpyBus::default();
+
+        let (senders, mut inboxes, _reply_inboxes) = shard::shard_mesh_channels(2, 16, 16);
+        let shard0_inbox = inboxes[0].take().expect("shard 0 inbox");
+
+        let metadata: IggyMetadata<VsrConsensus<SpyBus>, PrepareJournal, IggySnapshot, TestMux> =
+            IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(1),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                key_context: Arc::default(),
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let mut peer = TestShard::without_inbox(
+            ShardIdentity::new(1, "peer-shard-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus.clone()),
+        );
+        peer.attach_senders(senders);
+        let peer = Rc::new(peer);
+
+        let peer_clone = Rc::clone(&peer);
+        let check = compio::runtime::spawn(async move { is_metadata_primary(&peer_clone).await });
+
+        let frame = shard0_inbox.recv().await.expect("frame from peer");
+        match frame {
+            shard::ShardFrame::Lifecycle(shard::LifecycleFrame::MetadataSubmit(
+                shard::MetadataSubmit::IsMetadataPrimary { reply },
+            )) => {
+                let _ = reply.try_send(shard0_answer);
+            }
+            _ => panic!("expected IsMetadataPrimary"),
+        }
+
+        check.await.expect("join")
+    }
+
+    /// A non-metadata shard (id > 0, consensus = None) forwards the check to
+    /// shard 0. When shard 0's consensus says "backup", the peer shard must
+    /// get `false` back (not the primary).
+    #[compio::test]
+    async fn given_peer_shard_on_backup_node_when_checking_primary_should_return_false() {
+        assert!(
+            !peer_shard_primary_check(false).await,
+            "peer shard on a backup node must not report primary"
+        );
+    }
+
+    /// Same as above but shard 0 is the primary: the peer shard must get
+    /// `true` back.
+    #[compio::test]
+    async fn given_peer_shard_on_primary_node_when_checking_primary_should_return_true() {
+        assert!(
+            peer_shard_primary_check(true).await,
+            "peer shard on the primary node must report primary"
+        );
     }
 }

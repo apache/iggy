@@ -66,6 +66,8 @@ func buildStatsPayload(t *testing.T, s Stats) []byte {
 	w.U32(s.ThreadsCount)
 	w.U64(s.FreeDiskSpace)
 	w.U64(s.TotalDiskSpace)
+	w.U64(s.OpenFilesCount)
+	w.U64(s.OpenFilesLimit)
 
 	if err := w.Err(); err != nil {
 		t.Fatalf("buildStatsPayload: %v", err)
@@ -102,6 +104,8 @@ func sampleStats() Stats {
 		ThreadsCount:        16,
 		FreeDiskSpace:       107_374_182_400,
 		TotalDiskSpace:      512_110_190_592,
+		OpenFilesCount:      1_234,
+		OpenFilesLimit:      1_048_576,
 	}
 }
 
@@ -134,8 +138,9 @@ func TestUnmarshalBinary_maliciousCacheCount(t *testing.T) {
 		IggyServerVersion: "v",
 	}
 	payload := buildStatsPayload(t, s)
-	// cache_metrics_count sits before the tail fields: threads(4) + free_disk(8) + total_disk(8) = 20
-	cacheCountOffset := len(payload) - 20 - 4
+	// cache_metrics_count sits before the tail fields:
+	// threads(4) + free_disk(8) + total_disk(8) + open_files_count(8) + open_files_limit(8) = 36
+	cacheCountOffset := len(payload) - 36 - 4
 	binary.LittleEndian.PutUint32(payload[cacheCountOffset:], math.MaxUint32)
 
 	var stats Stats
@@ -164,6 +169,32 @@ func TestUnmarshalBinary_withCacheMetrics(t *testing.T) {
 	assertStatsEqual(t, got, want)
 }
 
+func TestUnmarshalBinary_withoutOpenFilesFields(t *testing.T) {
+	want := sampleStats()
+	payload := buildStatsPayload(t, want)
+	olderReply := payload[:len(payload)-16]
+	want.OpenFilesCount = 0
+	want.OpenFilesLimit = 0
+
+	var got Stats
+	if err := got.UnmarshalBinary(olderReply); err != nil {
+		t.Fatalf("UnmarshalBinary error: %v", err)
+	}
+
+	assertStatsEqual(t, got, want)
+}
+
+func TestUnmarshalBinary_truncatedOpenFilesFields(t *testing.T) {
+	payload := buildStatsPayload(t, sampleStats())
+
+	for cut := 1; cut < 16; cut++ {
+		var stats Stats
+		if err := stats.UnmarshalBinary(payload[:len(payload)-cut]); err == nil {
+			t.Errorf("expected error with %d bytes cut from open-files fields, got nil", cut)
+		}
+	}
+}
+
 func TestUnmarshalBinary_truncatedFixedFields(t *testing.T) {
 	// Payload too short to contain all fixed fields.
 	payload := make([]byte, 10) // far too small
@@ -184,8 +215,8 @@ func TestUnmarshalBinary_truncatedAfterStrings(t *testing.T) {
 		IggyServerVersion: "s",
 	}
 	payload := buildStatsPayload(t, s)
-	// Remove tail fields + cache_metrics_count (4+4+8+8 = 24 bytes from the end).
-	payload = payload[:len(payload)-24]
+	// Remove tail fields + cache_metrics_count (4+4+8+8+8+8 = 40 bytes from the end).
+	payload = payload[:len(payload)-40]
 
 	var stats Stats
 	if err := stats.UnmarshalBinary(payload); err == nil {

@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::defaults::default_sysinfo_print_interval;
 use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
-use serde_with::serde_as;
+use serde_with::formats::PreferMany;
+use serde_with::{OneOrMany, serde_as};
 use server_common::log::LoggingSettings;
-
-pub const INDEX_EXTENSION: &str = "index";
-pub const LOG_EXTENSION: &str = "log";
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct RuntimeConfig {
@@ -47,6 +46,10 @@ pub struct LoggingConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_sysinfo_print_interval")]
+    pub sysinfo_print_interval: IggyDuration,
 }
 
 impl From<&LoggingConfig> for LoggingSettings {
@@ -63,7 +66,8 @@ impl From<&LoggingConfig> for LoggingSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde_as]
+#[derive(Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct EncryptionConfig {
     pub enabled: bool,
     // skip_serializing keeps the key out of the runtime current_config.toml (and
@@ -72,11 +76,23 @@ pub struct EncryptionConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub key: String,
+    /// Retired keys a node still unwraps stream keys with during a rotation.
+    // A bare string is one key, so a type error can never echo the key into the log.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default, skip_serializing)]
+    #[config_env(secret)]
+    pub previous_keys: Vec<String>,
+    /// Fingerprints of retired keys whose stream key wraps the primary drops.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
+    #[serde(default)]
+    pub retired_kek_fingerprints: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
 
     #[test]
     fn encryption_key_is_never_serialized() {
@@ -87,11 +103,57 @@ mod tests {
         let config = EncryptionConfig {
             enabled: true,
             key: "encryption-key-MUST-NOT-be-persisted".to_owned(),
+            previous_keys: vec!["previous-key-MUST-NOT-be-persisted".to_owned()],
+            retired_kek_fingerprints: Vec::new(),
         };
         let serialized = serde_json::to_string(&config).expect("serialize encryption config");
         assert!(
             !serialized.contains("MUST-NOT-be-persisted"),
             "encryption key leaked into serialized config: {serialized}"
         );
+        let debugged = format!("{config:?}");
+        assert!(
+            !debugged.contains("MUST-NOT-be-persisted"),
+            "encryption key leaked into debug output: {debugged}"
+        );
+    }
+
+    #[test]
+    fn given_bare_previous_key_string_when_extracting_should_read_one_key_without_echoing_it() {
+        let previous_key = "previous-key-MUST-NOT-be-logged";
+        let extracted = Figment::from(Toml::string(&format!(
+            "enabled = true\nprevious_keys = \"{previous_key}\""
+        )))
+        .extract::<EncryptionConfig>();
+
+        match extracted {
+            Ok(config) => assert_eq!(config.previous_keys, vec![previous_key.to_owned()]),
+            Err(error) => panic!(
+                "bare previous key string was refused, echoed: {}",
+                error.to_string().contains(previous_key)
+            ),
+        }
+    }
+
+    #[test]
+    fn given_retired_kek_fingerprints_when_extracting_should_read_one_or_many_and_serialize_them() {
+        let fingerprint = "39e4f0f95c3693c7";
+        for value in [format!("\"{fingerprint}\""), format!("[\"{fingerprint}\"]")] {
+            let config = Figment::from(Toml::string(&format!(
+                "enabled = true\nretired_kek_fingerprints = {value}"
+            )))
+            .extract::<EncryptionConfig>()
+            .expect("extracts");
+            assert_eq!(
+                config.retired_kek_fingerprints,
+                vec![fingerprint.to_owned()]
+            );
+            let serialized = serde_json::to_string(&config).expect("serialize encryption config");
+            assert!(serialized.contains(fingerprint), "{serialized}");
+        }
+        let defaulted = Figment::from(Toml::string("enabled = true"))
+            .extract::<EncryptionConfig>()
+            .expect("extracts");
+        assert!(defaulted.retired_kek_fingerprints.is_empty());
     }
 }

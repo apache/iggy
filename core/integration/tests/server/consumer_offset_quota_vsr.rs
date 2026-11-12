@@ -46,7 +46,7 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
     let stream = Identifier::named(STREAM_NAME).expect("stream identifier");
     let topic = Identifier::named(TOPIC_NAME).expect("topic identifier");
     let stream_details = client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let topic_details = client
@@ -56,6 +56,8 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -98,6 +100,7 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
                     },
                 )])),
             }),
+            &UserCreateOptions::default(),
         )
         .await
         .expect("create a topic-scoped consumer");
@@ -112,11 +115,14 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &first_consumer,
             &PollingStrategy::first(),
-            1,
-            true,
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("new auto-commit consumer fits");
@@ -138,11 +144,14 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
             .poll_messages(
                 &stream,
                 &topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &first_consumer,
                 &PollingStrategy::next(),
-                1,
-                true
+                PollOptions {
+                    count: 1,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                }
             )
             .await
             .expect("next poll")
@@ -188,26 +197,31 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &rejected_consumer,
             &PollingStrategy::first(),
-            1,
-            true,
+            PollOptions {
+                count: 1,
+                commit: CommitPolicy::OnRead,
+                ..PollOptions::default()
+            },
         )
         .await;
     assert!(
         matches!(poll_rejected, Err(IggyError::TooManyConsumerOffsets)),
-        "auto-commit must not return data when its new key cannot be admitted"
+        "auto-commit must not return data when its new key cannot be admitted: {poll_rejected:?}"
     );
     client
         .poll_messages(
             &stream,
             &topic,
-            Some(PARTITION_ID),
+            PARTITION_ID,
             &rejected_consumer,
             &PollingStrategy::first(),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("the same poll succeeds when auto-commit is disabled");
@@ -325,6 +339,7 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         )))
         .bearer_auth(&http.token)
         .json(&StoreConsumerOffset {
+            context: None,
             consumer: Consumer::new(Identifier::numeric(6).expect("consumer identifier")),
             partition_id: Some(PARTITION_ID),
             offset: 0,
@@ -396,7 +411,10 @@ async fn given_full_consumer_offset_table_when_server_restarts_should_preserve_a
     let stream = Identifier::named("consumer-offset-restart-stream").expect("stream identifier");
     let topic = Identifier::named("consumer-offset-restart-topic").expect("topic identifier");
     let stream_details = client
-        .create_stream("consumer-offset-restart-stream")
+        .create_stream(
+            "consumer-offset-restart-stream",
+            &StreamCreateOptions::default(),
+        )
         .await
         .expect("create stream");
     let topic_details = client
@@ -406,6 +424,8 @@ async fn given_full_consumer_offset_table_when_server_restarts_should_preserve_a
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

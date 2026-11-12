@@ -33,25 +33,6 @@ pub(super) enum Scenario {
     FailureDueToSessionTimeout,
 }
 
-// Helper trait to add command-specific methods to TransportProtocol
-trait TransportProtocolExt {
-    fn as_arg(&self) -> Vec<&str>;
-}
-
-impl TransportProtocolExt for TransportProtocol {
-    fn as_arg(&self) -> Vec<&str> {
-        match self {
-            TransportProtocol::Tcp => vec!["--transport", "tcp"],
-            TransportProtocol::Quic => vec!["--transport", "quic"],
-            TransportProtocol::WebSocket => vec!["--transport", "websocket"],
-            // Note: HTTP is not supported for the 'me' command
-            TransportProtocol::Http => {
-                panic!("HTTP transport is not supported for the 'me' command")
-            }
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(super) struct TestMeCmd {
     protocol: TransportProtocol,
@@ -61,8 +42,8 @@ pub(super) struct TestMeCmd {
 impl TestMeCmd {
     pub(super) fn new(protocol: TransportProtocol, scenario: Scenario) -> Self {
         assert!(
-            protocol == TransportProtocol::Tcp || protocol == TransportProtocol::Quic,
-            "Only TCP and QUIC protocols are supported for the 'me' command"
+            protocol != TransportProtocol::Http,
+            "HTTP transport is not supported for the 'me' command"
         );
         Self { protocol, scenario }
     }
@@ -73,7 +54,9 @@ impl IggyCmdTestCase for TestMeCmd {
     async fn prepare_server_state(&mut self, _client: &dyn Client) {}
 
     fn get_command(&self) -> IggyCmdCommand {
-        let command = IggyCmdCommand::new().opts(self.protocol.as_arg()).arg("me");
+        let command = IggyCmdCommand::new()
+            .opts(vec!["--transport", self.protocol.as_str()])
+            .arg("me");
 
         match &self.scenario {
             Scenario::SuccessWithCredentials => command.with_env_credentials(),
@@ -86,24 +69,25 @@ impl IggyCmdTestCase for TestMeCmd {
     fn verify_command(&self, command_state: Assert) {
         match &self.scenario {
             Scenario::SuccessWithCredentials | Scenario::SuccessWithoutCredentials => {
+                let transport = match self.protocol {
+                    TransportProtocol::WebSocket => "WebSocket".to_string(),
+                    _ => self.protocol.as_str().to_uppercase(),
+                };
                 command_state
                     .success()
                     .stdout(starts_with("Executing me command\n"))
-                    .stdout(contains(format!(
-                        "Transport | {}",
-                        self.protocol.as_str().to_uppercase()
-                    )));
+                    .stdout(contains(format!("Transport | {transport}")));
             }
             Scenario::FailureWithoutCredentials => {
                 command_state
                     .failure()
-                    .stderr(diff("Error: CommandError(Iggy command line tool error\n\nCaused by:\n    Missing iggy server credentials)\n"));
+                    .stderr(diff("Error: Iggy sdk or command error\nCaused by: Iggy command line tool error\nCaused by: Missing iggy server credentials\n"));
             }
             Scenario::FailureDueToSessionTimeout => {
                 // An expired or invalid stored session surfaces as a generic
                 // login-with-token failure.
                 command_state.failure().stderr(diff(
-                    "Error: CommandError(Problem with server login with token)\n",
+                    "Error: Iggy sdk or command error\nCaused by: Problem with server login with token\n",
                 ));
             }
         }

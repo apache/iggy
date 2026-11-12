@@ -45,11 +45,13 @@ public sealed class LoginRegisterTests
     }
 
     [Fact]
-    public void Serialize_WritesVersionInfoThenCredentialsThenContext()
+    public void Serialize_WritesVersionInfoThenBindSecretThenCredentialsThenContext()
     {
-        var body = LoginRegister.Serialize("admin", "secret");
+        var body = LoginRegister.Serialize("admin", "secret", new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         var position = AssertVersionInfo(body);
+        Assert.Equal(new byte[LoginRegister.BIND_SECRET_BYTES], body.AsSpan(position, LoginRegister.BIND_SECRET_BYTES).ToArray());
+        position += LoginRegister.BIND_SECRET_BYTES;
         position += AssertName(body, position, "admin");
         position += AssertName(body, position, "secret");
 
@@ -60,9 +62,11 @@ public sealed class LoginRegisterTests
     [Fact]
     public void Serialize_AppendsTheClientContextWithAUInt32Length()
     {
-        var body = LoginRegister.Serialize("admin", "secret", "ctx");
+        var body = LoginRegister.Serialize("admin", "secret", new byte[LoginRegister.BIND_SECRET_BYTES], "ctx");
 
         var position = AssertVersionInfo(body);
+        Assert.Equal(new byte[LoginRegister.BIND_SECRET_BYTES], body.AsSpan(position, LoginRegister.BIND_SECRET_BYTES).ToArray());
+        position += LoginRegister.BIND_SECRET_BYTES;
         position += AssertName(body, position, "admin");
         position += AssertName(body, position, "secret");
 
@@ -74,9 +78,11 @@ public sealed class LoginRegisterTests
     [Fact]
     public void SerializeWithPersonalAccessToken_PutsTheTokenInTheCredentialSlot()
     {
-        var body = LoginRegister.SerializeWithPersonalAccessToken("token");
+        var body = LoginRegister.SerializeWithPersonalAccessToken("token", new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         var position = AssertVersionInfo(body);
+        Assert.Equal(new byte[LoginRegister.BIND_SECRET_BYTES], body.AsSpan(position, LoginRegister.BIND_SECRET_BYTES).ToArray());
+        position += LoginRegister.BIND_SECRET_BYTES;
         position += AssertName(body, position, "token");
 
         Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(position)));
@@ -87,7 +93,7 @@ public sealed class LoginRegisterTests
     public void Serialize_RejectsAnEmptyCredential()
     {
         var error = Assert.Throws<IggyInvalidStatusCodeException>(() =>
-            LoginRegister.Serialize("admin", string.Empty));
+            LoginRegister.Serialize("admin", string.Empty, new byte[LoginRegister.BIND_SECRET_BYTES]));
 
         Assert.Equal(VsrError.INVALID_PASSWORD, error.StatusCode);
     }
@@ -96,7 +102,7 @@ public sealed class LoginRegisterTests
     public void Serialize_RejectsACredentialAboveTheLengthPrefix()
     {
         var error = Assert.Throws<IggyInvalidStatusCodeException>(() =>
-            LoginRegister.Serialize("admin", new string('x', 256)));
+            LoginRegister.Serialize("admin", new string('x', 256), new byte[LoginRegister.BIND_SECRET_BYTES]));
 
         Assert.Equal(VsrError.INVALID_PASSWORD, error.StatusCode);
     }
@@ -108,7 +114,7 @@ public sealed class LoginRegisterTests
     public void SerializeWithPersonalAccessToken_RejectsATokenAboveTheLengthPrefix()
     {
         var error = Assert.Throws<IggyInvalidStatusCodeException>(() =>
-            LoginRegister.SerializeWithPersonalAccessToken(new string('x', 256)));
+            LoginRegister.SerializeWithPersonalAccessToken(new string('x', 256), new byte[LoginRegister.BIND_SECRET_BYTES]));
 
         Assert.Equal(VsrError.INVALID_PERSONAL_ACCESS_TOKEN, error.StatusCode);
     }
@@ -117,9 +123,25 @@ public sealed class LoginRegisterTests
     public void SerializeWithPersonalAccessToken_RejectsAnEmptyToken()
     {
         var error = Assert.Throws<IggyInvalidStatusCodeException>(() =>
-            LoginRegister.SerializeWithPersonalAccessToken(string.Empty));
+            LoginRegister.SerializeWithPersonalAccessToken(string.Empty, new byte[LoginRegister.BIND_SECRET_BYTES]));
 
         Assert.Equal(VsrError.INVALID_PERSONAL_ACCESS_TOKEN, error.StatusCode);
+    }
+
+    [Fact]
+    public void SerializeBindSession_CarriesTheRegisteredSecretAfterIdentity()
+    {
+        var secret = Enumerable.Repeat((byte)0x5a, LoginRegister.BIND_SECRET_BYTES).ToArray();
+        var register = LoginRegister.Serialize("admin", "secret", secret);
+        Assert.Equal(secret, LoginRegister.ReadBindSecret(register));
+        var identity = new byte[LoginRegister.SESSION_IDENTITY_BYTES];
+        BinaryPrimitives.WriteUInt64LittleEndian(identity, 7);
+        BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(16), 11);
+        var body = LoginRegister.SerializeBindSession(identity, LoginRegister.ReadBindSecret(register));
+        var position = AssertVersionInfo(body);
+        Assert.Equal(identity, body.AsSpan(position, LoginRegister.SESSION_IDENTITY_BYTES).ToArray());
+        Assert.Equal(secret, body.AsSpan(position + LoginRegister.SESSION_IDENTITY_BYTES).ToArray());
+        Assert.Throws<ArgumentException>(() => LoginRegister.SerializeBindSession(identity, secret[..31]));
     }
 
     [Fact]

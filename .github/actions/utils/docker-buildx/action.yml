@@ -38,10 +38,6 @@ inputs:
     description: "Dry run mode"
     required: false
     default: "false"
-  libc:
-    description: "Libc to use (glibc/musl)"
-    required: false
-    default: "musl"
   platform:
     description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
     required: false
@@ -169,6 +165,9 @@ runs:
       id: meta
       uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
       with:
+        # The default context labels github.sha, the dispatch ref tip, but
+        # publish.yml builds its `commit` input. Label the checked-out commit.
+        context: git
         images: ${{ steps.config.outputs.image }}
         # Tags are only used for local builds (dry-run). Push mode always uses digest.
         tags: |
@@ -255,7 +254,6 @@ runs:
           else
             CACHE_TO=$(
               printf '%s\n' \
-                "type=registry,ref=${shared_deps}:buildcache-${arch},mode=max" \
                 "type=registry,ref=${img}:buildcache-${arch},mode=max" \
                 "type=inline" \
                 "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
@@ -315,9 +313,7 @@ runs:
         set -euo pipefail
         args="VERSION=${{ inputs.version }}
         BUILD_DATE=${{ github.event.repository.updated_at }}
-        VCS_REF=${{ github.sha }}
         RUST_VERSION=${{ env.RUST_VERSION }}
-        LIBC=${{ inputs.libc }}
         IGGY_CI_BUILD=true"
         {
           echo "all<<__EOF__"

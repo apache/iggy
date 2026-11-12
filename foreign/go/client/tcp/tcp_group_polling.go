@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -58,8 +59,7 @@ type groupAssignment struct {
 }
 
 // groupAssignmentCache holds the assignments this client polls with. It is
-// guarded by its own lock rather than the connection lock, because a poll
-// reads it around an exchange that already holds the connection.
+// guarded independently of network exchanges.
 type groupAssignmentCache struct {
 	mtx     sync.Mutex
 	entries map[groupKey]*groupAssignment
@@ -106,20 +106,23 @@ func (c *groupAssignmentCache) nextPartition(key groupKey) (uint32, bool) {
 
 // putSynced stores a fresh sync result, carrying the round-robin cursor
 // forward when the generation is unchanged, all under one lock so a
-// concurrent poll's advance is never overwritten with a stale value.
-func (c *groupAssignmentCache) putSynced(key groupKey, assignment groupAssignment) {
+// concurrent poll's advance is never overwritten with a stale value. It reports
+// whether the result differs from the cached assignment.
+func (c *groupAssignmentCache) putSynced(key groupKey, assignment groupAssignment) bool {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	if c.entries == nil {
 		c.entries = make(map[groupKey]*groupAssignment)
 	}
-	if current, ok := c.entries[key]; ok && current.generation == assignment.generation {
+	current, cached := c.entries[key]
+	if cached && current.generation == assignment.generation {
 		// A same-generation refresh is not a rebalance: the member still owns
 		// the same partitions, so the round-robin position carries over
 		// instead of resetting and starving the partitions behind it.
 		assignment.cursor = current.cursor
 	}
 	c.entries[key] = &assignment
+	return !cached || current.generation != assignment.generation || !slices.Equal(current.partitions, assignment.partitions)
 }
 
 func (c *groupAssignmentCache) drop(key groupKey) {
@@ -157,8 +160,7 @@ func (c *groupAssignmentCache) hasLeft(key groupKey) bool {
 	return ok
 }
 
-// clear forgets every assignment. A new connection registers a new client
-// identity, so nothing the server assigned to the old one still holds.
+// clear forgets assignments when the logical session changes.
 func (c *groupAssignmentCache) clear() {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -206,12 +208,17 @@ func (c *IggyTcpClient) pollGroup(
 		}
 
 		polled, err := c.pollPartition(
-			ctx, streamId, topicId, consumer, strategy, count, autoCommit, &partitionId)
+			ctx, streamId, topicId, consumer, strategy, count, autoCommit, &partitionId, nil)
 		if err != nil {
 			if !isAssignmentStale(err) {
 				return nil, err
 			}
 			c.groups.drop(key)
+			if strategy.Context != nil {
+				// The caller's context names the owner its offset was polled
+				// under, so a retry with it would only be refused again.
+				return nil, err
+			}
 			continue
 		}
 
@@ -248,33 +255,53 @@ func (c *IggyTcpClient) ensureAssignment(
 	key groupKey,
 	streamId, topicId, groupId iggcon.Identifier,
 ) (groupAssignment, error) {
-	if cached, ok := c.groups.get(key); ok &&
-		time.Since(cached.fetchedAt) < assignmentRefreshInterval {
-		return cached, nil
-	}
-
-	synced, err := c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
-	if errors.Is(err, ierror.ErrConsumerGroupMemberNotFound) && !c.groups.hasLeft(key) {
-		// The first poll may run before the caller joined, so the membership
-		// is established on its behalf. A group the caller explicitly left
-		// stays left, and the poll reports the membership error instead.
-		if err = c.JoinConsumerGroup(ctx, streamId, topicId, groupId); err != nil {
+	for {
+		// The fence refuses a sync that a session change overtook, so it is
+		// taken only after a running recovery, and a recovery that overtakes
+		// the sync starts it again under the new session.
+		if err := c.waitForRecovery(ctx); err != nil {
 			return groupAssignment{}, err
 		}
-		synced, err = c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
-	}
-	if err != nil {
-		return groupAssignment{}, err
-	}
+		c.mtx.Lock()
+		fence := c.sessionFence
+		c.mtx.Unlock()
+		// As in Rust, an empty assignment is synced again on every poll: a
+		// member gets its partitions only as each one installs it as the owner.
+		if cached, ok := c.groups.get(key); ok && len(cached.partitions) > 0 &&
+			time.Since(cached.fetchedAt) < assignmentRefreshInterval {
+			return cached, nil
+		}
 
-	assignment := groupAssignment{
-		generation: synced.Generation,
-		partitions: synced.Partitions,
-		fetchedAt:  time.Now(),
+		synced, err := c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
+		if errors.Is(err, ierror.ErrConsumerGroupMemberNotFound) && !c.groups.hasLeft(key) {
+			// The first poll may run before the caller joined, so the
+			// membership is established on its behalf. A group the caller
+			// explicitly left stays left, and the poll reports the membership
+			// error instead.
+			if err = c.JoinConsumerGroup(ctx, streamId, topicId, groupId); err != nil {
+				return groupAssignment{}, err
+			}
+			synced, err = c.SyncConsumerGroup(ctx, streamId, topicId, groupId)
+		}
+		if err != nil {
+			return groupAssignment{}, err
+		}
+
+		assignment := groupAssignment{
+			generation: synced.Generation,
+			partitions: synced.Partitions,
+		}
+		c.logger.Debug("Synced the consumer group assignment",
+			slog.Uint64("generation", assignment.generation),
+			slog.Int("partitions", len(assignment.partitions)))
+		c.mtx.Lock()
+		if c.sessionFence == fence {
+			c.mtx.Unlock()
+			return assignment, nil
+		}
+		c.mtx.Unlock()
+		if !c.sessionRecovers(ctx, ierror.ErrUnauthenticated) {
+			return groupAssignment{}, ierror.ErrUnauthenticated
+		}
 	}
-	c.logger.Debug("Synced the consumer group assignment",
-		slog.Uint64("generation", assignment.generation),
-		slog.Int("partitions", len(assignment.partitions)))
-	c.groups.putSynced(key, assignment)
-	return assignment, nil
 }

@@ -24,11 +24,13 @@
 //! quorum COMMIT, which for a topic below its flush thresholds means the
 //! batch lives only in the in-memory partition journal
 //! (`PartitionJournalMemStorage`) on each node. Process death never loses a
-//! completed `write()` (the page cache survives the process), so what SIGKILL
-//! probes is precisely that written-before-acked gap, not fsync ordering.
+//! completed `write()` (the page cache survives the process), but recovery
+//! only trusts what the published WAL frontier covers, and discards the bytes
+//! of a `replicated` partition past it even when they reached the segments.
 //!
-//! Single-node-crash tests must hold every ack via the surviving quorum;
-//! the whole-cluster-crash test must hold exactly what reached the segments.
+//! Single-node-crash tests must hold every ack via the surviving quorum. The
+//! whole-cluster-crash tests must hold what was made durable, and pin that a
+//! `replicated` partition loses the acks past its published frontier.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,30 +62,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// primary dies, so the surviving quorum has a meaningful prefix to preserve.
 const PRE_KILL_ACKS: usize = 50;
 
-async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool) {
+async fn create_stream_and_topic(client: &IggyClient, eager_flush: bool, durability: Durability) {
     client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
-    // `eager_flush` persists and fsyncs every committed batch on every
-    // replica before anything else happens on the partition; it is a topic
-    // creation option, so it travels with the topic to all nodes. The default
-    // shape leaves the 1024-message / 1 MiB thresholds in place, so small
-    // runs are acked from RAM only.
-    let options = if eager_flush {
-        TopicCreateOptions {
-            partitions_count: Some(1),
-            message_expiry: Some(IggyExpiry::NeverExpire),
-            messages_required_to_save: Some(1),
-            durability: iggy_common::Durability::Persisted,
-            ..TopicCreateOptions::default()
-        }
-    } else {
-        TopicCreateOptions {
-            partitions_count: Some(1),
-            message_expiry: Some(IggyExpiry::NeverExpire),
-            ..TopicCreateOptions::default()
-        }
+    // `eager_flush` saves every committed batch to the segments on every
+    // replica before anything else happens on the partition. `persisted`
+    // durability also backs each ack with a stable-storage copy, where
+    // `replicated` acks on quorum commit alone. Both are topic creation
+    // options, so they travel with the topic to all nodes. The default shape
+    // leaves the 1024-message / 1 MiB thresholds in place, so small runs are
+    // acked from RAM only.
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        messages_required_to_save: eager_flush.then_some(1),
+        durability,
+        ..TopicCreateOptions::default()
     };
     client
         .create_topic(
@@ -132,6 +128,73 @@ async fn produce_acked(
     acked
 }
 
+/// Send one message once the partition accepts writes again after a restart,
+/// returning its confirmed `(offset, payload)`.
+async fn produce_acked_when_serving(client: &IggyClient, budget: Duration) -> (u64, String) {
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let payload = "after-restart".to_owned();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload(payload.clone().into())
+                .build()
+                .expect("build message"),
+        ];
+        match client
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(PARTITION_ID),
+                &mut messages,
+            )
+            .await
+        {
+            Ok(response) => {
+                let confirmation = response
+                    .confirmations
+                    .first()
+                    .expect("the VSR server confirms every send");
+                return (confirmation.base_offset, payload);
+            }
+            Err(error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the partition did not accept a write after the restart: {error}"
+            ),
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The `(offset, payload)` of up to `count` messages from offset 0.
+async fn poll_from_start(client: &IggyClient, count: u32) -> Vec<(u64, String)> {
+    let polled = client
+        .poll_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            PARTITION_ID,
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
+        )
+        .await
+        .expect("poll from offset 0");
+    polled
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.header.offset,
+                String::from_utf8_lossy(&message.payload).into_owned(),
+            )
+        })
+        .collect()
+}
+
 /// Poll from offset 0 until every acked `(offset, payload)` reads back at its
 /// confirmed offset with offsets strictly increasing, or `budget` runs out.
 /// `Err` carries the last observed shortfall so the caller's verdict can show
@@ -151,11 +214,13 @@ async fn wait_for_acked_readable(
             .poll_messages(
                 &stream,
                 &topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                want,
-                false,
+                PollOptions {
+                    count: want,
+                    ..PollOptions::default()
+                },
             )
             .await
         {
@@ -251,6 +316,34 @@ async fn wait_until_cluster_serves(
     }
 }
 
+/// Poll until `node`'s partition superblock records the highest view any other
+/// node persisted as its log view, so `node` adopted it instead of still probing.
+async fn wait_until_partition_rejoined(harness: &TestHarness, node: usize, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let view = (0..harness.cluster_size())
+            .filter(|other| *other != node)
+            .filter_map(|other| {
+                disk::read_partition_superblock_state(&harness.node(other).data_path())
+            })
+            .map(|state| state.view)
+            .max();
+        let own = disk::read_partition_superblock_state(&harness.node(node).data_path())
+            .map(|state| (state.view, state.log_view));
+        if let (Some(view), Some((_, log_view))) = (view, own)
+            && log_view >= view
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node {node} did not rejoin the partition's view within {budget:?}: \
+             others at view {view:?}, node {node} at (view, log_view) {own:?}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Poll until every node's segment files hold all of `payloads`, so a
 /// follow-up SIGKILL provably erases nothing that was flushed. Replaces a
 /// settle sleep: the ack proves quorum COMMIT, but each replica flushes on
@@ -314,7 +407,7 @@ async fn given_committed_sends_when_a_backup_is_killed_and_restarts_should_prese
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, true).await;
+    create_stream_and_topic(&client, true, Durability::Persisted).await;
     let mut acked = produce_acked(&client, "pre-kill", 200).await;
 
     let leader = disk::leader_node_index(harness).await;
@@ -358,7 +451,7 @@ async fn given_mid_flight_produce_when_the_primary_is_killed_should_elect_and_pr
     harness: &mut TestHarness,
 ) {
     let setup_client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&setup_client, false).await;
+    create_stream_and_topic(&setup_client, false, Durability::Replicated).await;
 
     let producer_client = harness.tcp_root_client().await.unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -454,7 +547,7 @@ async fn given_a_committed_consumer_offset_when_a_backup_is_killed_should_surviv
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, false).await;
+    create_stream_and_topic(&client, false, Durability::Replicated).await;
     let acked = produce_acked(&client, "offset-fodder", 10).await;
     let stored_offset = acked.last().expect("ten acked sends").0;
 
@@ -497,7 +590,7 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    create_stream_and_topic(&client, true).await;
+    create_stream_and_topic(&client, true, Durability::Persisted).await;
     let acked = produce_acked(&client, "flushed", 30).await;
     let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
     wait_until_payloads_installed(harness, &payloads, FLUSH_INSTALL_TIMEOUT).await;
@@ -521,6 +614,67 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
         .unwrap_or_else(|state| {
             panic!("eagerly flushed acked data must survive a whole-cluster SIGKILL: {state}")
         });
+}
+
+/// The `replicated` twin of the eager-flush test above. A crash rolls a
+/// `replicated` partition back to the last WAL frontier it published, at a
+/// checkpoint, a durable operation or a graceful shutdown, so acks past it are
+/// lost even with every payload already in every node's segment files. Topics
+/// that must survive a whole-cluster crash use `persisted`.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_should_discard_acks_past_the_published_frontier(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    create_stream_and_topic(&client, true, Durability::Replicated).await;
+    let acked = produce_acked(&client, "flushed", 30).await;
+    let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
+    wait_until_payloads_installed(harness, &payloads, FLUSH_INSTALL_TIMEOUT).await;
+
+    // Same reason as above for keeping the producer's connection open.
+    harness.kill_cluster().expect("SIGKILL every node");
+    // Read with every node down, so no publication can land after the read.
+    let frontiers: Vec<Option<u64>> = (0..harness.cluster_size())
+        .map(|node| disk::read_partition_wal_frontier(&harness.node(node).data_path()))
+        .collect();
+    // Whichever log the election picks, recovery then keeps the same prefix.
+    let frontier = frontiers[0].expect("node 0 published a partition WAL frontier");
+    assert!(
+        frontiers.iter().all(|other| *other == Some(frontier)),
+        "every node must publish the same WAL frontier: {frontiers:?}"
+    );
+    let (mut expected, discarded): (Vec<_>, Vec<_>) = acked
+        .iter()
+        .cloned()
+        .partition(|(offset, _)| *offset < frontier);
+    assert!(
+        !discarded.is_empty(),
+        "the published WAL frontier {frontier} covers all {} acks, so the crash pins no loss",
+        acked.len()
+    );
+
+    harness
+        .restart_cluster()
+        .await
+        .expect("restart the whole cluster");
+
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    // A write that reads back proves the partition serves again, so the
+    // missing acks below are discarded, not still recovering.
+    let after_restart = produce_acked_when_serving(&client, CONVERGE_TIMEOUT).await;
+    expected.push(after_restart);
+    wait_for_acked_readable(&client, &expected, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| panic!("the partition should serve after the restart: {state}"));
+    let readable = poll_from_start(&client, acked.len() as u32 + 16).await;
+    assert_eq!(
+        readable,
+        expected,
+        "a whole-cluster SIGKILL must keep exactly the acks below the published WAL frontier \
+         {frontier} and discard the {} past it",
+        discarded.len()
+    );
 }
 
 /// The kill follows the confirmation without waiting for segment installation.
@@ -548,7 +702,10 @@ async fn given_mixed_durability_when_killed_below_flush_threshold_should_recover
 
 async fn verify_persisted_restart(harness: &mut TestHarness, durability: Durability) {
     let client = harness.tcp_root_client().await.unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::named(STREAM_NAME).unwrap();
     client
         .create_topic(
@@ -609,7 +766,10 @@ async fn given_persisted_topic_when_backup_misses_writes_should_repair_before_du
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    client.create_stream(STREAM_NAME).await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -638,12 +798,83 @@ async fn given_persisted_topic_when_backup_misses_writes_should_repair_before_du
         .unwrap();
 }
 
+/// Every replica is SIGKILLed and restarted in turn while writes continue, each
+/// missing more ops than one repair chunk. A restarted replica holds back entries
+/// above its recovered commit point until the view's log proves them, so repair has to walk that
+/// window chunk by chunk before the replica can ack again, and the next kill
+/// leaves it as half of the quorum. The next kill waits for it to rejoin the
+/// partition's view: until then it votes as a log that may lack acked ops, and
+/// with one survivor left no trusted quorum can elect.
+#[iggy_harness(cluster_nodes = 3, server(cluster.repair_chunk_max = 4))]
+async fn given_persisted_topic_when_every_replica_is_killed_in_turn_should_preserve_acked_messages(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                durability: Durability::Persisted,
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut acked = produce_acked(&client, "warmup", 16).await;
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    for node in nodes.clone() {
+        harness.kill_node(node).unwrap();
+        let survivors: Vec<usize> = nodes.iter().copied().filter(|n| *n != node).collect();
+        let client = wait_until_cluster_serves(harness, &survivors, CONVERGE_TIMEOUT).await;
+        acked.extend(
+            tokio::time::timeout(
+                CONVERGE_TIMEOUT,
+                produce_acked(&client, &format!("node-{node}-down"), 24),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("writes stalled while node {node} was down")),
+        );
+        harness.restart_node(node).unwrap();
+        let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+        acked.extend(
+            tokio::time::timeout(
+                CONVERGE_TIMEOUT,
+                produce_acked(&client, &format!("node-{node}-back"), 8),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("writes stalled after node {node} restarted")),
+        );
+        wait_until_partition_rejoined(harness, node, CONVERGE_TIMEOUT).await;
+    }
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| {
+            panic!("every acked offset must poll back after the rolling restart: {state}")
+        });
+    let data_paths: Vec<PathBuf> = harness
+        .all_servers()
+        .iter()
+        .map(|server| server.data_path())
+        .collect();
+    disk::wait_for_log_convergence(&data_paths).await;
+}
+
 #[iggy_harness(cluster_nodes = 3, server(partition.wal_bytes_max = "134225920 B"))]
 async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_the_log(
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
-    let stream_details = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream_details = client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let stream = Identifier::numeric(stream_details.id).unwrap();
     let topic_details = client
         .create_topic(
@@ -652,6 +883,9 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 durability: Durability::Persisted,
+                // The donor never returns after the full restart, which only
+                // a partition persisting every acknowledged prepare survives.
+                consumer_offset_durability: Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -756,11 +990,13 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
             .poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(offset),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -773,6 +1009,62 @@ async fn given_all_replicas_checkpointed_when_restarted_should_elect_and_extend_
     verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id, 2).await;
     verify_checkpoint_quarantine(harness, stream_details.id, topic_details.id, 1).await;
     verify_transferred_quorum(harness, &stream, &topic).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_uninitialized_partitions_when_all_replicas_restart_should_elect_and_accept_writes(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    create_stream_and_topic(&client, true, Durability::Persisted).await;
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
+    let stream_id = client.get_stream(&stream).await.unwrap().unwrap().id;
+    let deadline = tokio::time::Instant::now() + CONVERGE_TIMEOUT;
+    for node in 0..3 {
+        let follower = harness
+            .node(node)
+            .tcp_client()
+            .unwrap()
+            .with_root_login()
+            .connect()
+            .await
+            .unwrap();
+        loop {
+            if matches!(follower.get_topic(&stream, &topic).await, Ok(Some(_))) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "all replicas must commit the topic metadata"
+            );
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+    harness.kill_cluster().unwrap();
+    // No partition writes were submitted. Recreate the crash cut after the
+    // metadata commit and before any local initialization was published.
+    for node in 0..3 {
+        let data = harness.node(node).data_path();
+        for path in [
+            data.join(format!(
+                "streams/{stream_id}/topics/{}/partitions/0",
+                details.id
+            )),
+            data.join("partition-initialization"),
+        ] {
+            if path.exists() {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+    }
+    harness.restart_cluster().await.unwrap();
+    let client = wait_until_cluster_serves(harness, &[0, 1, 2], CONVERGE_TIMEOUT).await;
+    let acked = produce_acked(&client, "initialized-after-restart", 1).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap();
 }
 
 async fn verify_checkpoint_quarantine(
@@ -799,11 +1091,13 @@ async fn verify_checkpoint_quarantine(
             .poll_messages(
                 &stream,
                 &topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await
             .is_ok_and(|polled| {

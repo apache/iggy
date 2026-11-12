@@ -35,8 +35,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
@@ -46,6 +48,9 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerGroupsTcpClient.class);
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    // The assignment of the last sync reply of each group. A reply that names no membership removes it, and so does a
+    // join.
+    private final Map<ClientRoutingState.GroupKey, ConsumerGroupAssignment> synced = new ConcurrentHashMap<>();
 
     public ConsumerGroupsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
         this.connectionSupplier = connectionSupplier;
@@ -64,9 +69,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Getting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.GET.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.GET.getValue(), payload), response -> {
                     try {
                         if (response.isReadable()) {
                             return Optional.of(BytesDeserializer.readConsumerGroupDetails(response));
@@ -86,9 +90,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Getting consumer groups - Stream: {}, Topic: {}", streamId, topicId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.GET_ALL.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.GET_ALL.getValue(), payload), response -> {
                     try {
                         List<ConsumerGroup> groups = new ArrayList<>();
                         while (response.isReadable()) {
@@ -110,9 +113,8 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Creating consumer group - Stream: {}, Topic: {}, Name: {}", streamId, topicId, name);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.CREATE.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.CREATE.getValue(), payload), response -> {
                     try {
                         return BytesDeserializer.readConsumerGroupDetails(response);
                     } finally {
@@ -129,11 +131,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Deleting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.DELETE.getValue(), payload)
-                .thenAccept(response -> {
-                    response.release();
-                });
+        return connection().sendAndRelease(CommandCode.ConsumerGroup.DELETE, payload);
     }
 
     @Override
@@ -151,12 +149,11 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.JOIN.getValue(), payload)
-                .thenAccept(response -> {
-                    log.debug("Successfully joined consumer group");
-                    response.release();
-                });
+        // A group that was deleted and created again counts its sync generation from 0, so its sync reply can equal
+        // the one of the old group. A client becomes a member only by its own join, so the first sync after a join
+        // counts as a changed assignment.
+        synced.remove(ClientRoutingState.groupKey(streamId, topicId, groupId));
+        return connection().sendAndRelease(CommandCode.ConsumerGroup.JOIN, payload);
     }
 
     @Override
@@ -174,17 +171,26 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Leaving consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection()
-                .send(CommandCode.ConsumerGroup.LEAVE.getValue(), payload)
-                .thenAccept(response -> {
-                    log.debug("Successfully left consumer group");
-                    response.release();
-                });
+        return connection().sendAndRelease(CommandCode.ConsumerGroup.LEAVE, payload);
     }
 
     @Override
     public CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
             StreamId streamId, TopicId topicId, ConsumerId groupId) {
+        return syncConsumerGroup(streamId, topicId, groupId, 0);
+    }
+
+    CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
+            StreamId streamId, TopicId topicId, ConsumerId groupId, long deadline) {
+        return syncConsumerGroup(streamId, topicId, groupId, deadline, new AsyncTcpConnection.TransientFailoverState());
+    }
+
+    CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
+            StreamId streamId,
+            TopicId topicId,
+            ConsumerId groupId,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
         var payload = Unpooled.buffer();
         payload.writeBytes(BytesSerializer.toBytes(streamId));
         payload.writeBytes(BytesSerializer.toBytes(topicId));
@@ -192,11 +198,29 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Syncing consumer group assignment - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
+        var group = ClientRoutingState.groupKey(streamId, topicId, groupId);
         // An empty body means "not a member", which exchangeForOptional maps
         // to an empty Optional; a member owning zero partitions still gets a
         // non-empty body with a zero partition count.
-        return connection()
-                .exchangeForOptional(
-                        CommandCode.ConsumerGroup.SYNC, payload, BytesDeserializer::readConsumerGroupAssignment);
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.ConsumerGroup.SYNC.getValue(), payload, deadline, state), response -> {
+                    try {
+                        if (!response.isReadable()) {
+                            synced.remove(group);
+                            return Optional.empty();
+                        }
+                        var assignment = BytesDeserializer.readConsumerGroupAssignment(response);
+                        // A handover installs each owner in a later metadata op than the join, and a primary that has
+                        // not applied it refuses a read as not owned. So the reads of a changed assignment wait for
+                        // the commit that the reply was read at.
+                        if (!assignment.equals(synced.get(group))) {
+                            connection().sessionOwner().observeMetadata(state.replyCommit());
+                            synced.put(group, assignment);
+                        }
+                        return Optional.of(assignment);
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 }

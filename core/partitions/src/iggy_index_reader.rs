@@ -46,10 +46,17 @@ impl IggyIndexReader {
             .open(file_path)
             .await
             .map_err(|_| IggyError::CannotReadFile)?;
-        Ok(Self {
+        Ok(Self::from_file(file_path, file))
+    }
+
+    /// Wraps a file that the caller opened for reading, so the caller sees the
+    /// `io::Error` of a failed open.
+    #[must_use]
+    pub fn from_file(file_path: &str, file: File) -> Self {
+        Self {
             file_path: file_path.to_owned(),
             file,
-        })
+        }
     }
 
     /// Number of whole 24-byte entries in the file. A trailing partial entry

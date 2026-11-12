@@ -52,12 +52,6 @@ public sealed class VsrReplyDecoderTests
         return VsrTestPayloads.Concat(VsrTestPayloads.UInt32(0), payload);
     }
 
-    private static byte[] RejectionBody(uint code)
-    {
-        return VsrTestPayloads.Concat(VsrTestPayloads.UInt32(1), VsrTestPayloads.UInt32(0),
-            VsrTestPayloads.UInt32((int)code));
-    }
-
     [Fact]
     public void Decode_StripsTheResultSectionFromACommittedMetadataReply()
     {
@@ -72,13 +66,71 @@ public sealed class VsrReplyDecoderTests
     [Fact]
     public void Decode_CommittedRejectionThrowsTheTypedError()
     {
-        var body = RejectionBody(1009);
+        var body = VsrTestPayloads.Rejection(1009);
 
         var exception = Assert.Throws<IggyInvalidStatusCodeException>(() =>
             VsrReplyDecoder.Decode(ReplyHeader(VsrOperation.CreateStream, body.Length), body));
 
         Assert.Equal(1009, exception.StatusCode);
         Assert.True(exception.FromServer);
+    }
+
+    [Theory]
+    [InlineData((byte)0, false)]
+    [InlineData((byte)1, true)]
+    [InlineData((byte)2, false)]
+    public void given_a_business_rejection_when_decoding_should_require_the_exact_commit_marker(byte marker, bool committed)
+    {
+        var body = VsrTestPayloads.Rejection(VsrError.UNAUTHENTICATED);
+        var header = ReplyHeader(VsrOperation.StoreConsumerOffset, body.Length);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = marker;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, body));
+
+        Assert.Equal(committed, error.Committed);
+        Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+    }
+
+    [Fact]
+    public void given_a_truncated_rejection_when_marked_committed_should_not_prove_a_business_result()
+    {
+        var body = VsrTestPayloads.Rejection(VsrError.UNAUTHENTICATED);
+        BinaryPrimitives.WriteUInt32LittleEndian(body, 2);
+        var header = ReplyHeader(VsrOperation.StoreConsumerOffset, body.Length);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = VsrHeader.COMMITTED_RESULT_MARKER;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, body));
+
+        Assert.False(error.Committed);
+        Assert.False(error.FromServer);
+    }
+
+    [Theory]
+    [InlineData(VsrError.TRANSIENT_NOT_COMMITTED)]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
+    [InlineData(VsrError.NOT_PRIMARY)]
+    public void given_a_transient_result_when_marked_committed_should_not_resolve_uncertainty(int status)
+    {
+        var body = VsrTestPayloads.Rejection(status);
+        var header = ReplyHeader(VsrOperation.StoreConsumerOffset, body.Length);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = VsrHeader.COMMITTED_RESULT_MARKER;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, body));
+
+        Assert.False(error.Committed);
+        Assert.Equal(status, error.StatusCode);
+    }
+
+    [Fact]
+    public void given_a_header_denial_when_marked_committed_should_not_prove_commit()
+    {
+        var header = ReplyHeader(VsrOperation.SendMessages, 0, VsrError.UNAUTHENTICATED);
+        header[VsrHeader.REPLY_COMMITTED_OFFSET] = VsrHeader.COMMITTED_RESULT_MARKER;
+
+        var error = Assert.Throws<IggyInvalidStatusCodeException>(() => VsrReplyDecoder.Decode(header, ReadOnlyMemory<byte>.Empty));
+
+        Assert.False(error.Committed);
+        Assert.False(VsrHeader.ReadCommitted(header));
     }
 
     /// <summary>
@@ -284,7 +336,7 @@ public sealed class VsrReplyDecoderTests
     public void ReadResultSectionLength_CoversTheCountAndItsEntries()
     {
         Assert.Equal(4, VsrReplyDecoder.ReadResultSectionLength(SuccessBody(1, 2)));
-        Assert.Equal(12, VsrReplyDecoder.ReadResultSectionLength(RejectionBody(1009)));
+        Assert.Equal(12, VsrReplyDecoder.ReadResultSectionLength(VsrTestPayloads.Rejection(1009)));
         Assert.Null(VsrReplyDecoder.ReadResultSectionLength(VsrTestPayloads.UInt32(1)));
 
         // Shorter than the count itself, so there is no section to measure.

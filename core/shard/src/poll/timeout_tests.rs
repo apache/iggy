@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
@@ -24,8 +24,7 @@ use consensus::PartitionsHandle;
 use futures::channel::oneshot;
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::{
-    BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn,
-    SendError,
+    BusMessage, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn, SendError,
 };
 use metadata::IggyMetadata;
 use partitions::{IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
@@ -74,12 +73,9 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     let first_poll = owner.partition_read(
         namespace,
         PartitionRead::Poll {
+            metadata: None,
             consumer,
-            args: PollingArgs {
-                strategy: PollingStrategy::next(),
-                count: 3,
-                auto_commit: true,
-            },
+            args: PollingArgs::new(PollingStrategy::next(), 3, true),
         },
     );
     futures::pin_mut!(first_poll);
@@ -88,6 +84,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
         namespace: requested_namespace,
         read:
             PartitionRead::Poll {
+                metadata: None,
                 consumer: requested_consumer,
                 args,
             },
@@ -121,7 +118,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     );
     assert!(
         matches!(
-            late_reply.try_send(PartitionReadReply::Ack),
+            late_reply.try_send(PartitionReadReply::NotFound),
             Err(crossfire::TrySendError::Disconnected(_))
         ),
         "timeout closed the reply channel before completion"
@@ -169,12 +166,9 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     let next_poll = owner.partition_read(
         namespace,
         PartitionRead::Poll {
+            metadata: None,
             consumer,
-            args: PollingArgs {
-                strategy: PollingStrategy::next(),
-                count: 4,
-                auto_commit: false,
-            },
+            args: PollingArgs::new(PollingStrategy::next(), 4, false),
         },
     );
     futures::pin_mut!(next_poll);
@@ -226,7 +220,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
         .expect("fixture has messages before eviction");
     assert!(!resident_plan.needs_off_pump_io());
     let delayed_result = resident_plan.execute_resident();
-    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    evict_messages_for_disk_dispatch(&owner, namespace);
     assert!(
         partitions
             .build_poll_snapshot(&namespace, consumer, &args)
@@ -247,6 +241,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
         .on_partition_read(
             namespace,
             PartitionRead::Poll {
+                metadata: None,
                 consumer,
                 args: args.clone(),
             },
@@ -273,6 +268,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
         .on_partition_read(
             namespace,
             PartitionRead::Poll {
+                metadata: None,
                 consumer,
                 args: args.clone(),
             },
@@ -314,7 +310,15 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
     );
     let (reply, replies) = channel(1);
     owner
-        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args,
+                metadata: None,
+            },
+            reply,
+        )
         .await;
     assert_eq!(
         bus.spawned_tasks.borrow().len(),
@@ -338,7 +342,7 @@ async fn given_missing_owner_route_when_disk_poll_arrives_should_reject_before_d
     let namespace = IggyNamespace::new(1, 1, 0);
     let bus = PollTestBus::default();
     let owner = owner_with_messages(&bus, namespace).await;
-    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    evict_messages_for_disk_dispatch(&owner, namespace);
     let consumer = PollingConsumer::ConsumerGroup(7, 0);
     let args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
     assert!(
@@ -352,7 +356,15 @@ async fn given_missing_owner_route_when_disk_poll_arrives_should_reject_before_d
     let (reply, replies) = channel(1);
 
     owner
-        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args,
+                metadata: None,
+            },
+            reply,
+        )
         .await;
 
     assert!(matches!(
@@ -382,7 +394,7 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
     owner.attach_senders(vec![owner_sender]);
     drop(owner_inbox);
     drop(owner_replies);
-    evict_messages_for_disk_dispatch(&owner, namespace).await;
+    evict_messages_for_disk_dispatch(&owner, namespace);
     let consumer = PollingConsumer::ConsumerGroup(7, 0);
     let args = PollingArgs::new(PollingStrategy::offset(0), 3, true);
     assert!(
@@ -396,7 +408,15 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
     let (reply, replies) = channel(1);
 
     owner
-        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args,
+                metadata: None,
+            },
+            reply,
+        )
         .await;
 
     assert!(matches!(
@@ -417,17 +437,15 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
     assert_eq!(committed, None);
 }
 
-/// Remove the fixture's only resident batch to select disk dispatch without
+/// Remove the fixture's resident batches to select disk dispatch without
 /// creating files. Captured tasks must stay unpolled: these tests establish
 /// admission behavior, while real disk reads are covered in partition tests.
-#[allow(clippy::future_not_send)]
-async fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
+pub(super) fn evict_messages_for_disk_dispatch(owner: &PollTestShard, namespace: IggyNamespace) {
     let partitions = owner.plane.partitions();
     let partition = partitions
         .remove(&namespace)
         .expect("fixture partition exists");
-    let retained = partition.log.journal().inner.evict_prefix(1).await;
-    assert!(retained.is_empty(), "fixture has exactly one batch");
+    partition.log.journal().inner.evict_prefix(usize::MAX);
     assert!(
         partition
             .log
@@ -477,19 +495,24 @@ async fn owner_with_messages(bus: &PollTestBus, namespace: IggyNamespace) -> Pol
     )
 }
 
-type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
+pub type CapturedTask = Pin<Box<dyn Future<Output = ()>>>;
 
 /// The first configured timer expires on demand; other timers stay pending.
 /// Detached tasks are captured so dispatch tests can observe admission without
 /// executing their synthetic disk plans.
 #[derive(Clone, Default)]
-struct PollTestBus {
+pub struct PollTestBus {
+    pub(super) now: Rc<Cell<u64>>,
     next_timeout: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
-    spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
+    pub(crate) spawned_tasks: Rc<RefCell<Vec<CapturedTask>>>,
 }
 
 #[allow(clippy::future_not_send)]
 impl MessageBus for PollTestBus {
+    fn monotonic_micros(&self) -> u64 {
+        self.now.get()
+    }
+
     fn spawn(&self, future: impl Future<Output = ()> + 'static) {
         self.spawned_tasks.borrow_mut().push(Box::pin(future));
     }
@@ -527,6 +550,5 @@ impl MessageBus for PollTestBus {
 
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
-    fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
     fn track_background(&self, _handle: JoinHandle<()>) {}
 }

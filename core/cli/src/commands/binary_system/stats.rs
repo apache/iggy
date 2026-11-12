@@ -164,6 +164,14 @@ impl CliCommand for GetStatsCmd {
                     "Total Disk Space",
                     stats.total_disk_space.as_bytes_u64().to_string().as_str(),
                 ]);
+                table.add_row(vec![
+                    "Open Files Count",
+                    format!("{}", stats.open_files_count).as_str(),
+                ]);
+                table.add_row(vec![
+                    "Open Files Limit",
+                    format!("{}", stats.open_files_limit).as_str(),
+                ]);
 
                 table.add_row(vec!["OS Name", stats.os_name.as_str()]);
                 table.add_row(vec!["OS Version", stats.os_version.as_str()]);
@@ -223,6 +231,8 @@ impl CliCommand for GetStatsCmd {
                     "Total Disk Space|{}",
                     stats.total_disk_space.as_bytes_u64()
                 ));
+                list.push(format!("Open Files Count|{}", stats.open_files_count));
+                list.push(format!("Open Files Limit|{}", stats.open_files_limit));
 
                 list.push(format!("OS Name|{}", stats.os_name));
                 list.push(format!("OS Version|{}", stats.os_version));

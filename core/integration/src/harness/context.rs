@@ -25,6 +25,12 @@ use std::thread;
 use uuid::Uuid;
 
 const TEST_CLEANUP_DISABLED_ENV_VAR: &str = "IGGY_TEST_CLEANUP_DISABLED";
+/// Replaces the default root of the test directories. A crate that uses the
+/// harness as a git dependency sets it, because the default root lies inside
+/// the cargo git checkout.
+const TEST_LOGS_DIR_ENV_VAR: &str = "IGGY_TEST_LOGS_DIR";
+const TEST_DIRECTORY_NAME_MAX_BYTES: usize = 255;
+pub(crate) const TEST_STDOUT_LOG_FILE: &str = "test_stdout.log";
 
 /// Global registry mapping test names to their log directories.
 static TEST_DIRECTORIES: LazyLock<RwLock<HashMap<String, PathBuf>>> =
@@ -51,11 +57,15 @@ fn is_cleanup_disabled_by_env() -> bool {
 }
 
 static TEST_LOGS_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("Failed to find workspace root")
-        .join("test_logs")
+    std::env::var_os(TEST_LOGS_DIR_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("Failed to find workspace root")
+                .join("test_logs")
+        })
 });
 
 /// Owns the test directory and provides paths for all binaries within a test.
@@ -70,7 +80,9 @@ impl TestContext {
     pub fn new(test_name: Option<String>, cleanup: bool) -> Result<Self, TestBinaryError> {
         let test_name = test_name.unwrap_or_else(Self::derive_test_name);
         let uuid_suffix = Uuid::new_v4().to_string()[..8].to_string();
-        let dir_name = format!("{}_{}", sanitize_path(&test_name), uuid_suffix);
+        let mut prefix = sanitize_path(&test_name);
+        prefix.truncate(TEST_DIRECTORY_NAME_MAX_BYTES - uuid_suffix.len() - 1);
+        let dir_name = format!("{prefix}_{uuid_suffix}");
 
         let base_dir = (*TEST_LOGS_DIR).join(dir_name);
 
@@ -137,7 +149,7 @@ impl TestContext {
     }
 
     pub fn test_stdout_path(&self) -> PathBuf {
-        self.base_dir.join("test_stdout.log")
+        self.base_dir.join(TEST_STDOUT_LOG_FILE)
     }
 
     pub fn cleanup(&self) {
@@ -192,5 +204,16 @@ mod tests {
                 .ends_with("connectors_runtime_0_state")
         );
         assert!(ctx.mcp_stdout_path(1).ends_with("mcp_1_stdout.log"));
+    }
+
+    #[test]
+    fn given_long_parameterized_name_when_creating_context_should_preserve_its_identity() {
+        let name = "consumer_λ::".repeat(TEST_DIRECTORY_NAME_MAX_BYTES);
+        let mut first = TestContext::new(Some(name.clone()), true).unwrap();
+        let second = TestContext::new(Some(name.clone()), true).unwrap();
+        first.ensure_created().unwrap();
+        assert_eq!(first.test_name(), name);
+        assert_ne!(first.base_dir(), second.base_dir());
+        assert_eq!(get_test_directory(&name).unwrap(), first.base_dir());
     }
 }

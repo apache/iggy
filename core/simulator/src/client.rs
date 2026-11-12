@@ -16,16 +16,23 @@
 // under the License.
 
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::codes::{GET_STREAM_CODE, POLL_MESSAGES_CODE};
+use iggy_binary_protocol::batch::BatchProducer;
+use iggy_binary_protocol::codes::{
+    CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, GET_STREAM_CODE, POLL_MESSAGES_CODE,
+    POLL_MESSAGES_DEFERRED_CODE,
+};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
-    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest, JoinConsumerGroupRequest,
+    LeaveConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
-    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    DeferredPollMessagesRequest, FetchMessagesRequest, FetchMessagesTarget, PollMessagesRequest,
+    RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -36,25 +43,60 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, PurgeStreamRequest,
-    UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, WRAPPED_STREAM_KEY_LENGTH,
 };
-use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+use iggy_binary_protocol::requests::system::{
+    BindSessionRequest, ResourceTarget, SessionIdentity, UpdateResourceRequest,
 };
+use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, LoginRegisterRequest,
-    UpdatePermissionsRequest, UpdateUserRequest,
+    UpdatePermissionsRequest,
 };
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
-    WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
+    WireIdentifier, WireName, WireOptions, WirePartitioning, WirePermissions, WirePollingStrategy,
 };
-use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
+use iggy_common::DEFAULT_POLL_MAX_BYTES;
+use iggy_common::wire_conversions::resource_options_to_wire;
+use iggy_common::{
+    HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsPatch, OptionsProvenance,
+    ResourceOptions, StreamUpdateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
+    critical_keys_marker,
+};
+use metadata::stm::user::{
+    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, ROOT_USER_CREATED_AT_MICROS,
+};
 use secrecy::SecretString;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+
+/// Key-encryption key [`SIM_STREAM_WRAP_SET`] is sealed under.
+pub const SIM_STREAM_KEK: &str = "c2ltdWxhdG9yLXN0cmVhbS1rZXktZW5jcnlwdGlvbi0=";
+/// Key-encryption key [`SIM_ROTATED_WRAP_SET`] is sealed under.
+pub const SIM_ROTATED_KEK: &str = "c2ltdWxhdG9yLXJvdGF0ZWQta2V5LWVuY3J5cHRpb24=";
+/// Client stream key both fixed wrap sets hold.
+pub const SIM_STREAM_KEY: [u8; 32] = [0x51; 32];
+/// [`SIM_STREAM_KEY`] wrapped under [`SIM_STREAM_KEK`]. Precomputed, since a
+/// fresh wrap draws its nonce from the OS generator and breaks seeded replay.
+pub const SIM_STREAM_WRAP_SET: [u8; WRAPPED_STREAM_KEY_LENGTH] = [
+    0x01, 0x01, 0xd5, 0x40, 0xc9, 0x77, 0x57, 0xd4, 0x39, 0x46, 0xec, 0x07, 0x1d, 0xb1, 0x3d, 0xfb,
+    0x78, 0x80, 0x18, 0xfc, 0xae, 0x2b, 0xb8, 0x25, 0x96, 0x8a, 0xd7, 0x9d, 0x65, 0xbc, 0x41, 0x08,
+    0xd6, 0x1d, 0xed, 0x5e, 0x85, 0x01, 0x54, 0xcd, 0x8d, 0x17, 0x34, 0x16, 0x9f, 0x19, 0x6e, 0xc6,
+    0xf7, 0xdc, 0x23, 0xcb, 0x1d, 0x9e, 0x04, 0x7a, 0xc7, 0xa6, 0xbf, 0x8b, 0xf2, 0x81, 0x42, 0x32,
+    0xa9, 0x58, 0xd0, 0x29, 0x44, 0x35, 0x31, 0x19, 0x21, 0x47, 0x46, 0xe2, 0x94, 0xc5,
+];
+/// [`SIM_STREAM_KEY`] wrapped under [`SIM_ROTATED_KEK`], the set a rewrap stores.
+pub const SIM_ROTATED_WRAP_SET: [u8; WRAPPED_STREAM_KEY_LENGTH] = [
+    0x01, 0x01, 0x28, 0x05, 0x68, 0xfc, 0x9e, 0xaa, 0x81, 0x5f, 0x96, 0x5f, 0x30, 0x69, 0xfd, 0x3f,
+    0x3c, 0x50, 0xd8, 0xf5, 0x48, 0xdb, 0x49, 0xb4, 0x0e, 0x11, 0xbb, 0xd0, 0x66, 0x1e, 0xb3, 0xff,
+    0x95, 0xe5, 0x24, 0x1e, 0x4a, 0xb0, 0x69, 0x04, 0xee, 0x40, 0x43, 0xe5, 0x36, 0x81, 0x09, 0xf1,
+    0x16, 0x43, 0xa3, 0x11, 0xf3, 0x53, 0xcd, 0x76, 0x8d, 0x4a, 0xff, 0x95, 0xc4, 0xbd, 0xc8, 0x84,
+    0x41, 0x84, 0xf2, 0x31, 0x01, 0x37, 0x31, 0x19, 0x21, 0x47, 0x46, 0xe2, 0x94, 0xc5,
+];
 
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
@@ -73,6 +115,7 @@ pub struct SimClient {
     /// a pure function of the seed. See [`SimClient::next_message_id`].
     message_counter: Cell<u64>,
     session: Cell<u64>,
+    partition_contexts: RefCell<BTreeMap<IggyNamespace, PartitionContext>>,
     /// Whether this client talks to the server's real dispatch layer, which
     /// changes what a PAT request must contain.
     ///
@@ -94,6 +137,7 @@ impl SimClient {
             request_counter: Cell::new(0),
             message_counter: Cell::new(0),
             session: Cell::new(0),
+            partition_contexts: RefCell::new(BTreeMap::new()),
             shell_wire: Cell::new(false),
         }
     }
@@ -126,6 +170,25 @@ impl SimClient {
         self.client_id
     }
 
+    /// Discovery updates affect new requests; retained messages keep their captured context.
+    pub fn set_partition_context(&self, namespace: IggyNamespace, context: PartitionContext) {
+        self.partition_contexts
+            .borrow_mut()
+            .insert(namespace, context);
+    }
+
+    fn stamp_partition_context(&self, header: &mut RoutedRequestHeader) {
+        if let Some(context) = self
+            .partition_contexts
+            .borrow()
+            .get(&IggyNamespace::from_raw(header.group))
+        {
+            header.partition_incarnation = context.incarnation;
+            header.owner_generation = context.owner_generation;
+            header.minimum_metadata_op = context.metadata_op;
+        }
+    }
+
     /// Next deterministic, non-zero, cross-client-unique message id, standing
     /// in for the SDK's `id: 0` / server-side random UUID mint so a produce's
     /// replicated bytes are a pure function of the seed. The `client_id` fills
@@ -156,22 +219,54 @@ impl SimClient {
     /// nothing, because `ClientTable` admits anything above the watermark
     /// (`client_table.rs`: "There is no `RequestGap`").
     ///
-    /// `NonReplicated` reads never reach here — the poll path builds its own
-    /// header and reads the counter without advancing it, matching the SDK,
-    /// since the server ignores the id for ops the table never sees.
+    /// The server ignores the id of a `NonReplicated` read. The SDK still spends
+    /// one per bound read, so a link can match each reply to its request, and
+    /// [`Self::poll_messages_at`] does the same.
     fn next_request_id(&self) -> u64 {
         let next = self.request_counter.get() + 1;
         self.request_counter.set(next);
         next
     }
 
-    fn session_id(&self) -> u64 {
+    pub(crate) fn session_id(&self) -> u64 {
         let s = self.session.get();
         assert!(
             s > 0,
             "session not bound — call register() + bind_session() first"
         );
         s
+    }
+
+    fn bind_secret(&self) -> [u8; consensus::client_table::BIND_SECRET_BYTES] {
+        let mut secret = [0; consensus::client_table::BIND_SECRET_BYTES];
+        secret[..16].copy_from_slice(&self.client_id.to_le_bytes());
+        secret[16..].copy_from_slice(&self.client_id.to_le_bytes());
+        secret
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the fixed simulator SDK name or version is invalid.
+    pub fn bind_session_request(&self, metadata_watermark: u64) -> Message<RoutedRequestHeader> {
+        let request = BindSessionRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("simulator").expect("valid SDK name"),
+                sdk_version: WireName::new("1.0.0").expect("valid SDK version"),
+            },
+            identity: SessionIdentity {
+                client_id: self.client_id,
+                session: self.session_id(),
+                metadata_watermark,
+            },
+            bind_secret: BindSecret::new(Box::new(self.bind_secret())),
+        };
+        self.non_replicated_request(
+            iggy_binary_protocol::codes::BIND_SESSION_CODE,
+            METADATA_GROUP,
+            &request.to_bytes(),
+            self.request_counter.get(),
+        )
     }
 
     /// Build a `Register` request for this client.
@@ -184,10 +279,19 @@ impl SimClient {
     #[allow(clippy::cast_possible_truncation)]
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let registration = iggy_binary_protocol::requests::users::login_register::RegisterRequest {
+            user_created_at: ROOT_USER_CREATED_AT_MICROS,
+            bind_verifier: consensus::client_table::bind_verifier(
+                self.client_id,
+                0,
+                &self.bind_secret(),
+            ),
+        }
+        .to_bytes();
         let header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
-            size: header_size as u32,
+            size: (header_size + registration.len()) as u32,
             client: self.client_id,
             session: 0,
             request: 0,
@@ -199,7 +303,8 @@ impl SimClient {
         };
 
         let header_bytes = bytemuck::bytes_of(&header);
-        let buffer = header_bytes.to_vec();
+        let mut buffer = header_bytes.to_vec();
+        buffer.extend_from_slice(&registration);
 
         Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("register request must be valid")
@@ -226,6 +331,7 @@ impl SimClient {
                 sdk_version: WireName::new("1.0.0").expect("sim sdk version is valid"),
             },
             username: WireName::new(username).expect("login username is a valid wire name"),
+            bind_secret: BindSecret::new(Box::new(self.bind_secret())),
             password: SecretString::from(password.to_owned()),
             client_context: None,
         }
@@ -275,6 +381,38 @@ impl SimClient {
         self.build_request(Operation::CreateStream, &payload)
     }
 
+    /// A `CreateStream` already in the replicated form an edge produces: the
+    /// fixed [`SIM_STREAM_WRAP_SET`] and the critical marker naming it. The
+    /// dispatch shell refuses a client-sent wrap set, so only the raw path
+    /// commits one.
+    ///
+    /// # Panics
+    /// Panics if the stream name is not a valid wire name.
+    pub fn create_keyed_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
+        let options = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(
+                    HeaderValue::try_from(SIM_STREAM_WRAP_SET.as_slice())
+                        .expect("a wrap set fits a header value"),
+                ),
+            ),
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(
+                    critical_keys_marker(&[OptionKey::EncryptionKeyWrapped])
+                        .expect("the wrapped key is a critical option"),
+                ),
+            ),
+        ]);
+        let wire = CreateStreamRequest {
+            name: WireName::new(name).expect("stream name must be valid"),
+            options: resource_options_to_wire(&options, OptionsProvenance::All)
+                .expect("the keyed options fit a block"),
+        };
+        self.build_request(Operation::CreateStream, &wire.to_bytes())
+    }
+
     /// # Panics
     /// Panics if the stream name cannot be converted to a `WireIdentifier`.
     pub fn delete_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
@@ -290,21 +428,18 @@ impl SimClient {
     /// Panics if the new name or the existing stream name is not a valid
     /// `WireName`.
     pub fn update_stream(&self, stream: &str, new_name: &str) -> Message<RoutedRequestHeader> {
-        let wire = UpdateStreamRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            name: WireName::new(new_name).expect("stream name must be valid"),
-            options: WireOptions::empty(),
-        };
-        self.build_request(Operation::UpdateStream, &wire.to_bytes())
-    }
-
-    /// # Panics
-    /// Panics if `stream` is not a valid `WireName`.
-    pub fn purge_stream(&self, stream: &str) -> Message<RoutedRequestHeader> {
-        let wire = PurgeStreamRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-        };
-        self.build_request(Operation::PurgeStream, &wire.to_bytes())
+        let patch = StreamUpdateOptions {
+            name: Some(new_name.to_owned()),
+            ..StreamUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("stream name must be valid");
+        self.update_resource(
+            ResourceTarget::Stream {
+                stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            },
+            patch,
+        )
     }
 
     /// # Panics
@@ -315,30 +450,54 @@ impl SimClient {
         name: &str,
         partitions_count: u32,
     ) -> Message<RoutedRequestHeader> {
+        self.create_topic_with_factor(stream, name, partitions_count, None)
+    }
+
+    /// [`Self::create_topic`] with an explicit replication factor; `None`
+    /// leaves it to the server default.
+    ///
+    /// # Panics
+    /// As [`Self::create_topic`].
+    pub fn create_topic_with_factor(
+        &self,
+        stream: &str,
+        name: &str,
+        partitions_count: u32,
+        replication_factor: Option<u32>,
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
             name: WireName::new(name).expect("topic name must be valid"),
-            options: WireOptions::empty(),
+            options: iggy_common::TopicCreateOptions {
+                durability: iggy_common::Durability::Persisted,
+                consumer_offset_durability: iggy_common::Durability::Persisted,
+                replication_factor,
+                ..Default::default()
+            }
+            .to_wire()
+            .expect("valid simulator durability options"),
         };
         self.build_request(Operation::CreateTopic, &wire.to_bytes())
     }
 
     /// # Panics
-    /// Panics if `stream`, `topic`, or `new_name` is not a valid `WireName`.
+    /// Panics if `stream` or `topic` is not a valid `WireName`, or `options`
+    /// fail the client-side patch checks.
     pub fn update_topic(
         &self,
         stream: &str,
         topic: &str,
-        new_name: &str,
+        options: &TopicUpdateOptions,
     ) -> Message<RoutedRequestHeader> {
-        let wire = UpdateTopicRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-            name: WireName::new(new_name).expect("topic name must be valid"),
-            options: WireOptions::empty(),
-        };
-        self.build_request(Operation::UpdateTopic, &wire.to_bytes())
+        let patch = options.to_patch().expect("topic patch must be valid");
+        self.update_resource(
+            ResourceTarget::Topic {
+                stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+                topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            },
+            patch,
+        )
     }
 
     /// # Panics
@@ -349,16 +508,6 @@ impl SimClient {
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
         };
         self.build_request(Operation::DeleteTopic, &wire.to_bytes())
-    }
-
-    /// # Panics
-    /// Panics if `stream` or `topic` is not a valid `WireName`.
-    pub fn purge_topic(&self, stream: &str, topic: &str) -> Message<RoutedRequestHeader> {
-        let wire = PurgeTopicRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-        };
-        self.build_request(Operation::PurgeTopic, &wire.to_bytes())
     }
 
     /// # Panics
@@ -428,6 +577,38 @@ impl SimClient {
     }
 
     /// # Panics
+    /// Panics if any identifier is not a valid name.
+    pub fn join_consumer_group(
+        &self,
+        stream: &str,
+        topic: &str,
+        group: &str,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = JoinConsumerGroupRequest {
+            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            group_id: WireIdentifier::named(group).expect("group name must be valid"),
+        };
+        self.build_request(Operation::JoinConsumerGroup, &wire.to_bytes())
+    }
+
+    /// # Panics
+    /// Panics if any identifier is not a valid name.
+    pub fn leave_consumer_group(
+        &self,
+        stream: &str,
+        topic: &str,
+        group: &str,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = LeaveConsumerGroupRequest {
+            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            group_id: WireIdentifier::named(group).expect("group name must be valid"),
+        };
+        self.build_request(Operation::LeaveConsumerGroup, &wire.to_bytes())
+    }
+
+    /// # Panics
     /// Panics if `stream`, `topic`, or `group` is not a valid `WireName`.
     pub fn delete_consumer_group(
         &self,
@@ -451,11 +632,23 @@ impl SimClient {
         password: &str,
         status: u8,
     ) -> Message<RoutedRequestHeader> {
+        self.create_user_with_permissions(username, password, status, None)
+    }
+
+    /// # Panics
+    /// Panics if `username` is not a valid `WireName`.
+    pub fn create_user_with_permissions(
+        &self,
+        username: &str,
+        password: &str,
+        status: u8,
+        permissions: Option<WirePermissions>,
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateUserRequest {
             username: WireName::new(username).expect("username must be valid"),
             password: password.to_string(),
             status,
-            permissions: None,
+            permissions,
             options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateUser, &wire.to_bytes())
@@ -468,15 +661,34 @@ impl SimClient {
         &self,
         user: &str,
         new_username: Option<&str>,
-        status: Option<u8>,
+        status: Option<UserStatus>,
     ) -> Message<RoutedRequestHeader> {
-        let wire = UpdateUserRequest {
-            user_id: WireIdentifier::named(user).expect("username must be valid"),
-            username: new_username.map(|n| WireName::new(n).expect("username must be valid")),
+        let patch = UserUpdateOptions {
+            username: new_username.map(ToOwned::to_owned),
             status,
-            options: WireOptions::empty(),
+            ..UserUpdateOptions::default()
+        }
+        .to_patch()
+        .expect("username must be valid");
+        self.update_resource(
+            ResourceTarget::User {
+                user_id: WireIdentifier::named(user).expect("username must be valid"),
+            },
+            patch,
+        )
+    }
+
+    fn update_resource(
+        &self,
+        target: ResourceTarget,
+        patch: OptionsPatch,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = UpdateResourceRequest {
+            target,
+            reset: patch.reset,
+            options: patch.set,
         };
-        self.build_request(Operation::UpdateUser, &wire.to_bytes())
+        self.build_request(Operation::UpdateResource, &wire.to_bytes())
     }
 
     /// # Panics
@@ -573,6 +785,28 @@ impl SimClient {
         group: IggyNamespace,
         messages: &[Bytes],
     ) -> Message<RoutedRequestHeader> {
+        self.send_batch(group, None, messages)
+    }
+
+    /// [`Self::send_messages`] as one batch of an idempotent producer.
+    ///
+    /// # Panics
+    /// Panics if a group id exceeds `u32` or the request buffer is invalid.
+    pub fn send_producer_messages(
+        &self,
+        group: IggyNamespace,
+        producer: BatchProducer,
+        messages: &[Bytes],
+    ) -> Message<RoutedRequestHeader> {
+        self.send_batch(group, Some(producer), messages)
+    }
+
+    fn send_batch(
+        &self,
+        group: IggyNamespace,
+        producer: Option<BatchProducer>,
+        messages: &[Bytes],
+    ) -> Message<RoutedRequestHeader> {
         let to_u32 = |v: usize| u32::try_from(v).expect("group id fits u32");
         let stream_id = WireIdentifier::Numeric(to_u32(group.stream_id()));
         let topic_id = WireIdentifier::Numeric(to_u32(group.topic_id()));
@@ -595,8 +829,15 @@ impl SimClient {
 
         let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &raw);
         let mut buf = BytesMut::with_capacity(size);
-        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw)
-            .expect("simulator send batch encodes");
+        SendMessagesEncoder::encode_with_producer(
+            &mut buf,
+            &stream_id,
+            &topic_id,
+            &partitioning,
+            producer,
+            &raw,
+        )
+        .expect("simulator send batch encodes");
 
         self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }
@@ -604,10 +845,9 @@ impl SimClient {
     /// Build a `NonReplicated` request: `code` in the header's `reserved`
     /// prefix, `group` as the routing namespace, `body` already encoded.
     ///
-    /// The request id ECHOES the current counter WITHOUT advancing it (matching
-    /// the SDK, and unlike [`Self::header`]): the server ignores the id for ops
-    /// its `ClientTable` never sees, so burning one would buy nothing - and
-    /// burning one here would desync every replicated request that follows.
+    /// The server ignores `request` for ops its `ClientTable` never sees. The
+    /// setup and fixture reads echo the current counter without advancing it, so
+    /// the request ids their hand-written scenarios pin stay put.
     ///
     /// # Panics
     /// Panics if the request buffer is invalid.
@@ -617,22 +857,23 @@ impl SimClient {
         code: u32,
         group: u64,
         body: &[u8],
+        request: u64,
     ) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
-        let mut reserved = [0u8; 52];
-        reserved[..4].copy_from_slice(&code.to_le_bytes());
-        let header = RoutedRequestHeader {
+        let reserved = code.to_le_bytes();
+        let mut header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command::Request,
             operation: Operation::NonReplicated,
             size: total_size as u32,
             client: self.client_id,
             session: self.session_id(),
-            request: self.request_counter.get(),
+            request,
             reserved,
             group,
             ..Default::default()
         };
+        self.stamp_partition_context(&mut header);
 
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(bytemuck::bytes_of(&header));
@@ -661,7 +902,175 @@ impl SimClient {
             auto_commit: false,
         }
         .to_bytes();
-        self.non_replicated_request(POLL_MESSAGES_CODE, group.inner(), &body)
+        self.non_replicated_request(
+            POLL_MESSAGES_CODE,
+            group.inner(),
+            &body,
+            self.request_counter.get(),
+        )
+    }
+
+    /// Build a `POLL_MESSAGES_DEFERRED` request for an individual consumer of
+    /// `group`'s partition. Spends a request id, as every bound read does, so
+    /// the reply and a cancellation can name it.
+    ///
+    /// # Panics
+    /// Panics if the session is unbound or the request buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn deferred_poll_messages(
+        &self,
+        group: IggyNamespace,
+        strategy: WirePollingStrategy,
+        (count, min_count): (u32, u32),
+        auto_commit: bool,
+        (wait_us, request_timeout_us): (u64, u64),
+    ) -> Message<RoutedRequestHeader> {
+        self.deferred_poll_messages_for_consumer(
+            group,
+            strategy,
+            (count, min_count),
+            auto_commit,
+            (wait_us, request_timeout_us),
+            self.client_id as u32,
+        )
+    }
+
+    /// Build a deferred read of another session's standalone consumer.
+    pub fn deferred_poll_messages_for_consumer(
+        &self,
+        group: IggyNamespace,
+        strategy: WirePollingStrategy,
+        (count, min_count): (u32, u32),
+        auto_commit: bool,
+        (wait_us, request_timeout_us): (u64, u64),
+        consumer_id: u32,
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
+        let body = DeferredPollMessagesRequest {
+            poll: PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
+                stream_id,
+                topic_id,
+                partition_id,
+                strategy,
+                count,
+                auto_commit,
+            },
+            wait_us,
+            min_count,
+            max_bytes: DEFAULT_POLL_MAX_BYTES,
+            request_timeout_us,
+        }
+        .to_bytes();
+        self.non_replicated_request(
+            POLL_MESSAGES_DEFERRED_CODE,
+            group.inner(),
+            &body,
+            self.next_request_id(),
+        )
+    }
+
+    /// Build a `FETCH_MESSAGES` request of the client's own consumer for
+    /// `partitions` of one stream and topic, each read from `strategy` with
+    /// the partition context the client discovered. Spends a request id, so
+    /// the reply and a cancellation can name it.
+    ///
+    /// # Panics
+    /// Panics if `partitions` is empty, the session is unbound or the request
+    /// buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn fetch_messages(
+        &self,
+        partitions: &[IggyNamespace],
+        strategy: &WirePollingStrategy,
+        (count, min_count): (u32, u32),
+        auto_commit: bool,
+        (wait_us, request_timeout_us): (u64, u64),
+    ) -> Message<RoutedRequestHeader> {
+        let first = *partitions.first().expect("a fetch names a partition");
+        let (stream_id, topic_id, _) = namespace_ids(first);
+        let contexts = self.partition_contexts.borrow();
+        let targets = partitions
+            .iter()
+            .map(|namespace| {
+                let context = contexts.get(namespace).copied().unwrap_or_default();
+                FetchMessagesTarget {
+                    partition_id: namespace.partition_id() as u32,
+                    strategy: strategy.clone(),
+                    max_bytes: DEFAULT_POLL_MAX_BYTES,
+                    incarnation: context.incarnation,
+                    owner_generation: context.owner_generation,
+                }
+            })
+            .collect();
+        drop(contexts);
+        let body = FetchMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(self.client_id as u32)),
+            stream_id,
+            topic_id,
+            wait_us,
+            request_timeout_us,
+            min_count,
+            count,
+            max_bytes: DEFAULT_POLL_MAX_BYTES,
+            auto_commit,
+            targets,
+        }
+        .to_bytes();
+        self.non_replicated_request(
+            FETCH_MESSAGES_CODE,
+            first.inner(),
+            &body,
+            self.next_request_id(),
+        )
+    }
+
+    /// Build a `CANCEL_DEFERRED_REQUEST` for the deferred request this client
+    /// sent with `request`, as the SDK sends it: same connection, empty body.
+    ///
+    /// # Panics
+    /// Panics if the session is unbound or the request buffer is invalid.
+    pub fn cancel_deferred_request(
+        &self,
+        group: IggyNamespace,
+        request: u64,
+    ) -> Message<RoutedRequestHeader> {
+        self.non_replicated_request(CANCEL_DEFERRED_REQUEST_CODE, group.inner(), &[], request)
+    }
+
+    /// Build a `POLL_MESSAGES` request reading `count` messages from `offset` of
+    /// `group`'s partition as `consumer_kind`/`consumer_id`, without auto-commit.
+    ///
+    /// Spends a request id, as the SDK does for every bound read, so a late copy
+    /// of the previous request's reply cannot answer this one.
+    ///
+    /// # Panics
+    /// Panics if the session is unbound or the request buffer is invalid.
+    pub fn poll_messages_at(
+        &self,
+        group: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        offset: u64,
+        count: u32,
+    ) -> Message<RoutedRequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(group);
+        let body = PollMessagesRequest {
+            consumer: namespace_consumer(consumer_kind, consumer_id),
+            stream_id,
+            topic_id,
+            partition_id,
+            strategy: WirePollingStrategy::offset(offset),
+            count,
+            auto_commit: false,
+        }
+        .to_bytes();
+        self.non_replicated_request(
+            POLL_MESSAGES_CODE,
+            group.inner(),
+            &body,
+            self.next_request_id(),
+        )
     }
 
     /// Build a `GET_STREAM` read for `name`.
@@ -679,7 +1088,12 @@ impl SimClient {
             stream_id: WireIdentifier::named(name).expect("stream name must be valid"),
         }
         .to_bytes();
-        self.non_replicated_request(GET_STREAM_CODE, METADATA_GROUP, &body)
+        self.non_replicated_request(
+            GET_STREAM_CODE,
+            METADATA_GROUP,
+            &body,
+            self.request_counter.get(),
+        )
     }
 
     /// Store offset with explicit `AckLevel`. A multi-replica partition routes
@@ -748,7 +1162,9 @@ impl SimClient {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + payload.len();
 
-        let header = self.header(operation, group.inner(), total_size);
+        let mut header = self.header(operation, group.inner(), total_size);
+        self.stamp_partition_context(&mut header);
+        header.request_checksum = 0;
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -766,7 +1182,10 @@ impl SimClient {
         // Every `build_request` caller is a metadata-plane op (partition
         // ops go through `build_request_with_namespace`), and metadata
         // requests carry the metadata consensus group on the wire.
-        let header = self.header(operation, METADATA_GROUP, total_size);
+        let mut header = self.header(operation, METADATA_GROUP, total_size);
+        // The simulator keeps request bytes deterministic for seeded replay.
+        // Sequence identity must never expose a hash of a secret-bearing body.
+        header.request_checksum = u128::from(header.request) + 1;
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -827,6 +1246,21 @@ fn namespace_ids(ns: IggyNamespace) -> (WireIdentifier, WireIdentifier, Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_common::{ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrapSet};
+
+    #[test]
+    fn given_fixed_wrap_sets_when_opened_under_their_keks_should_hold_the_same_client_key() {
+        let key = StreamEncryptionKey::try_from(SIM_STREAM_KEY.as_slice()).expect("32 bytes");
+        for (kek, bytes) in [
+            (SIM_STREAM_KEK, SIM_STREAM_WRAP_SET),
+            (SIM_ROTATED_KEK, SIM_ROTATED_WRAP_SET),
+        ] {
+            let context = ServerKeyContext::from_config(kek, &[], false).expect("valid kek");
+            let set = WrapSet::try_from(bytes.as_slice()).expect("a valid wrap set");
+            assert_eq!(set.origin(), StreamKeyOrigin::Client);
+            assert_eq!(context.open(&set).expect("opens under its kek"), key);
+        }
+    }
 
     // A partition send consumes a request id like any other replicated op, so
     // an interleaved run numbers both planes from one sequence and the metadata

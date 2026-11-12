@@ -18,6 +18,7 @@
 package command
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 
@@ -47,5 +48,37 @@ func TestSerialize_LoginUser_ContainsVersion(t *testing.T) {
 
 	if version != iggcon.Version {
 		t.Errorf("Version mismatch. Expected: %q, Got: %q", iggcon.Version, version)
+	}
+}
+
+// The live TCP client uses VSR login; this covers only the legacy command's wire format.
+func TestLegacyLoginWithPersonalAccessTokenMarshalBinary(t *testing.T) {
+	request := &LoginWithPersonalAccessToken{Token: "abc123"}
+	if got := request.Code(); got != 44 {
+		t.Fatalf("LoginWithPersonalAccessToken code = %d, want 44", got)
+	}
+
+	got, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{6, 'a', 'b', 'c', '1', '2', '3'}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("LoginWithPersonalAccessToken body = %v, want %v", got, want)
+	}
+}
+
+func TestLogoutUserMarshalBinary(t *testing.T) {
+	request := &LogoutUser{}
+	if got := request.Code(); got != 39 {
+		t.Fatalf("LogoutUser code = %d, want 39", got)
+	}
+
+	got, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("LogoutUser body = %v, want empty", got)
 	}
 }

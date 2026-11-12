@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX};
+use crate::cli::common::{
+    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, OverWebSocket, TestHelpCmd, USAGE_PREFIX,
+};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
@@ -83,6 +85,17 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestPatDeleteCmd::new(String::from("client")))
+        .await;
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_be_successful_using_transport_ws() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(OverWebSocket(TestPatDeleteCmd::new(String::from("name"))))
         .await;
 }
 

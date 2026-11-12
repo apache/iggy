@@ -57,6 +57,7 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
+        Outcome::PartitionResizeDisabled => None,
         Outcome::Ok => {
             let (stream, topic) = shadow.pick_topic_pair(prng)?;
             let live = *shadow

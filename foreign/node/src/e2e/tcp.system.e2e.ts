@@ -43,9 +43,19 @@ describe('e2e -> system', async () => {
         'availableMemory', 'runTime', 'startTime', 'readBytes', 'writtenBytes',
         'messagesSizeBytes', 'streamsCount', 'topicsCount', 'partitionsCount',
         'segmentsCount', 'messagesCount', 'clientsCount', 'consumersGroupsCount',
-        'hostname', 'osName', 'osVersion', 'kernelVersion'
+        'hostname', 'osName', 'osVersion', 'kernelVersion',
+        'iggyServerVersion', 'iggyServerSemver', 'cacheMetrics',
+        'threadsCount', 'freeDiskSpace', 'totalDiskSpace',
+        'openFilesCount', 'openFilesLimit'
       ]
     );
+  });
+
+  it('e2e -> system::snapshot', async () => {
+    const data = await c.system.snapshot();
+    assert.ok(data.length > 0);
+    assert.equal(data[0], 0x50);
+    assert.equal(data[1], 0x4B);
   });
 
   it('e2e -> system::logout', async () => {

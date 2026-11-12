@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Factory;
@@ -67,11 +68,12 @@ public class IggyTlsConnectionTests
             ReconnectionSettings = new ReconnectionSettings { Enabled = false }
         });
 
-        // Nothing travels at connect time (the roster read is auth-gated away), so the plaintext client
-        // only dies against the TLS listener on its first request: the server drops the connection
-        // without answering a single byte.
+        // Registration is the first request. The TLS listener closes the plaintext connection
+        // after transmission starts without returning a verdict.
         await client.ConnectAsync();
-        await Should.ThrowAsync<IggyZeroBytesException>(client.LoginUserAsync("iggy", "iggy"));
+        var error = await Should.ThrowAsync<VsrRequestOutcomeUnknownException>(client.LoginUserAsync("iggy", "iggy"));
+        error.InnerException.ShouldBeAssignableTo<IOException>();
+        error.OperationId.ShouldBeNull();
     }
 
     [Test]
@@ -100,5 +102,59 @@ public class IggyTlsConnectionTests
         var loginResult = await client.LoginUserAsync("iggy", "iggy");
 
         loginResult.ShouldNotBeNull();
+    }
+
+    [Test]
+    public async Task given_tls_connection_when_reading_metadata_changes_should_follow_a_created_stream()
+    {
+        using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+        {
+            BaseAddress = await Fixture.GetIggyAddressAsync(Protocol.Tcp),
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings { Enabled = false },
+            TlsSettings = new TlsSettings
+            {
+                Enabled = true,
+                Hostname = "localhost",
+                CertificatePath = "Certs/iggy_ca_cert.pem"
+            }
+        });
+        await client.ConnectAsync();
+        await client.LoginUserAsync("iggy", "iggy");
+        MetadataChangeGroup[] groups = [MetadataChangeGroup.Streams];
+        var latest = await client.GetMetadataChangesAsync(new MetadataChangesQuery
+        {
+            Start = MetadataChangeStart.Latest,
+            Groups = groups
+        });
+        var name = $"changes-tls-{Guid.NewGuid():N}";
+        var stream = await client.CreateStreamAsync(name);
+
+        var page = await client.GetMetadataChangesAsync(new MetadataChangesQuery
+        {
+            Start = MetadataChangeStart.After(latest.Next.ShouldNotBeNull()),
+            Groups = groups
+        });
+
+        page.Status.ShouldBe(MetadataChangeStatus.Ok);
+        page.Records.Select(record => record.Body).OfType<MetadataStreamChange>()
+            .ShouldContain(created => created.StreamId == stream!.Id && created.Name == name);
+        await client.DeleteStreamAsync(Identifier.Numeric(stream!.Id));
+    }
+
+    [Test]
+    public async Task Connect_WithTlsConnectionString_Should_SignIn()
+    {
+        var address = await Fixture.GetIggyAddressAsync(Protocol.Tcp);
+
+        // The heartbeat stays below the fixture's server heartbeat, or an idle client is evicted mid-test.
+        using var client = IggyClientFactory.CreateClient(
+            $"iggy://iggy:iggy@{address}?tls=true&tls_domain=localhost&tls_ca_file=Certs/iggy_ca_cert.pem"
+            + "&reconnection_retries=0&heartbeat_interval=1s");
+        await client.ConnectAsync();
+
+        var me = await client.GetMeAsync();
+        me.ShouldNotBeNull();
+        me.UserId.ShouldBe(0u);
     }
 }

@@ -78,7 +78,9 @@ pub fn sidebar(_props: &SidebarProps) -> Html {
                         }
                         benchmarks_handle.set(data);
                     }
-                    Err(error) => log!(format!("Sidebar: fetch_recent_benchmarks failed: {error}")),
+                    Err(error) => {
+                        log!(format!("Sidebar: fetch_recent_benchmarks failed: {error}"));
+                    }
                 }
                 if !cancelled_async.get() {
                     is_loading_handle.set(false);

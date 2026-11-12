@@ -62,7 +62,7 @@ You can also customize the server using environment variables:
 
 ```bash
 ## Example: Enable HTTP transport and set custom address
-IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server
+IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server -- --with-default-root-credentials
 ```
 
 You can run multiple producers and consumers simultaneously to observe how messages are distributed across clients. Most examples support configurable options via the [Args](https://github.com/apache/iggy/blob/master/examples/rust/src/shared/args.rs) struct, including transport protocol, stream/topic/partition settings, consumer ID, message size, and more.
@@ -162,7 +162,7 @@ cargo run --example new-sdk-producer
 cargo run --example new-sdk-consumer
 ```
 
-Showcases the newer SDK APIs with simplified setup, automatic topic creation, consumer groups, and AutoCommit configuration.
+Showcases the newer SDK APIs with simplified setup, automatic topic creation, consumer groups, and offsets that the server stores on each poll.
 
 ### High-Volume Data Generation
 
@@ -195,7 +195,7 @@ cargo run --example stream-producer-config
 cargo run --example stream-consumer-config
 ```
 
-These examples document all available configuration options including partitioning strategies, retry policies, batching, AutoCommit strategies, polling strategies, and retry mechanisms.
+These examples document all available configuration options including partitioning strategies, retry policies, batching, offset commit policies, polling strategies, and retry mechanisms.
 
 ## Security Examples
 

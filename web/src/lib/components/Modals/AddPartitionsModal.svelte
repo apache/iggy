@@ -18,14 +18,14 @@ under the License.
 -->
 
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import { z } from 'zod';
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
-  import { numberSizes } from '$lib/utils/constants/numberSizes';
+  import { numberSizes } from '#lib/utils/constants/numberSizes.js';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { page } from '$app/state';
   import { showToast } from '../AppToasts.svelte';
   import Button from '../Button.svelte';

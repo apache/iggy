@@ -42,16 +42,17 @@
 //! per-peer queue depth, close-grace, reconnect period,
 //! handshake-grace).
 //!
-//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
-//! clients manage their own keepalive policy; replica<->replica
-//! liveness is observed by VSR heartbeats. No keepalive knobs live in
-//! this section.
+//! Client sockets get no TCP keepalive: SDK clients manage their own
+//! keepalive policy. Replica sockets get keepalive probes, and on Linux
+//! `cluster.heartbeat_timeout` bounds how long they may go unanswered.
+//! No keepalive knobs live in this section.
 //!
 //! Construction of the runtime type from this struct happens in the
 //! follow-up PR that wires `core/server` to call
 //! [`super::server::ServerConfig::load`].
 
 use super::COMPONENT;
+use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
 use configs::ConfigEnv;
 use iggy_common::{IggyByteSize, IggyDuration, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
@@ -70,7 +71,15 @@ use serde_with::{DisplayFromStr, serde_as};
 /// failure until both are reconciled.
 pub const IOV_MAX_LIMIT: usize = 512;
 
-const DEFAULT_CLIENT_QUEUE_CAPACITY: usize = 256;
+/// Floor for a nonzero [`MessageBusConfig::replica_read_buffer_size`].
+/// A buffer below one page costs more reads and copies than no buffer.
+const MIN_REPLICA_READ_BUFFER_BYTES: u64 = 4 * 1024;
+
+/// Ceiling for a nonzero [`MessageBusConfig::replica_read_buffer_size`].
+/// The buffer is allocated per replica link on every shard, and a fill
+/// cannot take more than the socket receive queue holds, so a value above
+/// this is a typo rather than a tuning choice.
+const MAX_REPLICA_READ_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Tunables for the message bus that ships consensus traffic between
 /// replicas and SDK-client traffic between shards.
@@ -88,6 +97,19 @@ pub struct MessageBusConfig {
     #[config_env(leaf)]
     pub max_message_size: IggyByteSize,
 
+    /// Read-ahead buffer per plaintext replica link. Costs one buffer of
+    /// this size per installed connection. The framing layer decodes
+    /// every complete frame a fill delivered, so a burst costs one read
+    /// instead of one or two per frame. A read at least this size goes
+    /// straight to the socket, so a body larger than the buffer crosses
+    /// it only for the part the header's fill already pulled in. Zero
+    /// keeps the unbuffered path. No effect under `cluster.tls`, whose
+    /// reader buffers inside compio's `SyncStream` adapter, nor on the
+    /// client plane, which never wraps its read half.
+    #[serde(default = "default_replica_read_buffer_size")]
+    #[config_env(leaf)]
+    pub replica_read_buffer_size: IggyByteSize,
+
     /// Bound on each replica peer's mpsc queue. Writer task drains; the
     /// `send_to_*` path enqueues. Too small drops under burst; too
     /// large delays backpressure signalling.
@@ -97,6 +119,19 @@ pub struct MessageBusConfig {
     /// from replica queues so repair bursts do not enlarge every client allocation.
     #[serde(default = "default_client_queue_capacity")]
     pub client_queue_capacity: usize,
+
+    /// How long a reply waits for room in a full client queue before the
+    /// connection is closed.
+    #[serde(default = "default_client_write_stall_timeout")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub client_write_stall_timeout: IggyDuration,
+
+    /// Bytes of requests one SDK connection may have queued behind the
+    /// requests the server runs for it. An empty queue takes any frame.
+    #[serde(default = "default_client_request_queue_bytes_max")]
+    #[config_env(leaf)]
+    pub client_request_queue_bytes_max: IggyByteSize,
 
     /// Interval between outbound reconnect attempts to peers with
     /// `peer_id > self_id`. Also bounds each dial, so a peer that drops
@@ -127,9 +162,26 @@ pub struct MessageBusConfig {
     /// Threaded into `compio::time::timeout(handshake_grace, ...)` at
     /// each handshake site so a slowloris peer cannot pin per-conn
     /// channels + registry slot + spawned task indefinitely.
+    ///
+    /// A replica link gets one such window for the placement preamble,
+    /// TLS and the replica handshake together. The window also bounds how
+    /// long the links to a peer may stay incomplete before they close and
+    /// redial, so a value below [`Self::reconnect_period`] lets them form
+    /// only when all of them connect in one sweep.
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub handshake_grace: IggyDuration,
+
+    /// Node-wide cap on open client sockets: TCP, TCP-TLS, WS, WSS, HTTP and
+    /// HTTPS together. Shard 0 closes a connection past it at accept, so
+    /// clients cannot take the descriptors that storage writes need. QUIC
+    /// does not count, because its connections share one UDP socket.
+    ///
+    /// `None` resolves at boot to half the soft `RLIMIT_NOFILE`. Zero is no
+    /// cap.
+    #[config_env(leaf)]
+    #[serde(default)]
+    pub connections_max: Option<u32>,
 }
 
 impl Validatable<ConfigurationError> for MessageBusConfig {
@@ -145,12 +197,35 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        // The one key in this section where zero is legal: it selects the
+        // unbuffered read path, so the A/B baseline is a config change
+        // rather than a separate build.
+        let replica_read_buffer = self.replica_read_buffer_size.as_bytes_u64();
+        if replica_read_buffer != 0
+            && !(MIN_REPLICA_READ_BUFFER_BYTES..=MAX_REPLICA_READ_BUFFER_BYTES)
+                .contains(&replica_read_buffer)
+        {
+            eprintln!(
+                "{COMPONENT} message_bus.replica_read_buffer_size ({replica_read_buffer}) must be \
+                 0 (unbuffered) or between {MIN_REPLICA_READ_BUFFER_BYTES} and \
+                 {MAX_REPLICA_READ_BUFFER_BYTES} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.peer_queue_capacity == 0 {
             eprintln!("{COMPONENT} message_bus.peer_queue_capacity must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         if self.client_queue_capacity == 0 {
             eprintln!("{COMPONENT} message_bus.client_queue_capacity must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.client_write_stall_timeout.as_micros() == 0 {
+            eprintln!("{COMPONENT} message_bus.client_write_stall_timeout must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.client_request_queue_bytes_max.as_bytes_u64() == 0 {
+            eprintln!("{COMPONENT} message_bus.client_request_queue_bytes_max must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         if self.max_message_size.as_bytes_u64() == 0 {
@@ -187,8 +262,35 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
     }
 }
 
-const fn default_client_queue_capacity() -> usize {
-    DEFAULT_CLIENT_QUEUE_CAPACITY
+/// Zero fails validation, so the value comes from the embedded `config.toml`.
+fn default_client_queue_capacity() -> usize {
+    SERVER_CONFIG.message_bus.client_queue_capacity as usize
+}
+
+fn default_client_write_stall_timeout() -> IggyDuration {
+    SERVER_CONFIG
+        .message_bus
+        .client_write_stall_timeout
+        .parse()
+        .expect("message_bus.client_write_stall_timeout is a duration")
+}
+
+fn default_client_request_queue_bytes_max() -> IggyByteSize {
+    SERVER_CONFIG
+        .message_bus
+        .client_request_queue_bytes_max
+        .parse()
+        .expect("message_bus.client_request_queue_bytes_max is a byte size")
+}
+
+/// [`IggyByteSize`]'s own `Default` is 0 bytes, which turns the read-ahead
+/// buffer off, so the value comes from the embedded `config.toml`.
+fn default_replica_read_buffer_size() -> IggyByteSize {
+    SERVER_CONFIG
+        .message_bus
+        .replica_read_buffer_size
+        .parse()
+        .expect("message_bus.replica_read_buffer_size is a byte size")
 }
 
 #[cfg(test)]
@@ -241,7 +343,10 @@ mod tests {
             .remove("client_queue_capacity");
         config["peer_queue_capacity"] = serde_json::json!(8192);
         let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
-        assert_eq!(decoded.client_queue_capacity, DEFAULT_CLIENT_QUEUE_CAPACITY);
+        assert_eq!(
+            decoded.client_queue_capacity,
+            baseline().client_queue_capacity
+        );
         assert_eq!(decoded.peer_queue_capacity, 8192);
         decoded.validate().unwrap();
     }
@@ -251,6 +356,110 @@ mod tests {
         let mut config = baseline();
         config.client_queue_capacity = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_client_write_stall_timeout() {
+        let mut config = baseline();
+        config.client_write_stall_timeout = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_client_request_queue_bytes_max() {
+        let mut config = baseline();
+        config.client_request_queue_bytes_max = IggyByteSize::from(0_u64);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn missing_client_stall_and_queue_bytes_keep_config_defaults() {
+        let mut config = serde_json::to_value(baseline()).unwrap();
+        let fields = config.as_object_mut().unwrap();
+        fields.remove("client_write_stall_timeout");
+        fields.remove("client_request_queue_bytes_max");
+        let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            decoded.client_write_stall_timeout,
+            baseline().client_write_stall_timeout
+        );
+        assert_eq!(
+            decoded.client_request_queue_bytes_max,
+            baseline().client_request_queue_bytes_max
+        );
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn default_replica_read_buffer_is_32_kib() {
+        assert_eq!(
+            baseline().replica_read_buffer_size.as_bytes_u64(),
+            32 * 1024
+        );
+    }
+
+    /// Zero is the unbuffered path, not a misconfiguration: it is the
+    /// A/B baseline arm and must survive validation.
+    #[test]
+    fn accepts_zero_replica_read_buffer() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(0_u64);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_replica_read_buffer_at_floor() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(MIN_REPLICA_READ_BUFFER_BYTES);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_replica_read_buffer_below_floor() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(MIN_REPLICA_READ_BUFFER_BYTES - 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_replica_read_buffer_at_ceiling() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(MAX_REPLICA_READ_BUFFER_BYTES);
+        assert!(c.validate().is_ok());
+    }
+
+    /// A mistyped size allocates per link at connect time, long after
+    /// boot, so validation is the only place that can still refuse it.
+    #[test]
+    fn rejects_replica_read_buffer_above_ceiling() {
+        let mut c = baseline();
+        c.replica_read_buffer_size = IggyByteSize::from(MAX_REPLICA_READ_BUFFER_BYTES + 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn replica_read_buffer_parses_byte_size_strings() {
+        for (text, expected) in [("0", 0_u64), ("64 KiB", 64 * 1024)] {
+            let mut config = serde_json::to_value(baseline()).unwrap();
+            config["replica_read_buffer_size"] = serde_json::json!(text);
+            let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
+            assert_eq!(decoded.replica_read_buffer_size.as_bytes_u64(), expected);
+            decoded.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_replica_read_buffer_keeps_config_default() {
+        let mut config = serde_json::to_value(baseline()).unwrap();
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("replica_read_buffer_size");
+        let decoded: MessageBusConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            decoded.replica_read_buffer_size,
+            baseline().replica_read_buffer_size
+        );
     }
 
     #[test]

@@ -29,6 +29,10 @@ type STRING = typeof STRING;
  */
 export type Id = number | string;
 
+/** Map key of an identifier that keeps numeric and named ids apart. */
+export const idKey = (id: Id): string =>
+  typeof id === 'number' ? `number:${id}` : `string:${id}`;
+
 /**
  * Serializes an identifier (numeric or string) to a Buffer for wire protocol.
  *

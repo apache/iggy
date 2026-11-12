@@ -27,6 +27,7 @@ import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
@@ -574,6 +575,31 @@ class BytesSerializerTest {
 
             // then - verify buffer contains data for both headers
             assertThat(result.readableBytes()).isEqualTo(28);
+        }
+
+        @Test
+        void shouldNameTheKeyWhenAKeyIsTooLong() {
+            // given
+            String name = "k".repeat(256);
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
+            headers.put(new HeaderKey(HeaderKind.String, name.getBytes()), HeaderValue.fromRaw("v".getBytes()));
+
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(headers))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessage("Invalid header key '" + name + "' length: 256 bytes, must be between 1 and 255");
+        }
+
+        @Test
+        void shouldNameTheKeyWhenAValueIsEmpty() {
+            // given
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
+            headers.put(HeaderKey.fromString("k1"), new HeaderValue(HeaderKind.Raw, new byte[0]));
+
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(headers))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessage("Invalid header value for key 'k1' length: 0 bytes, must be between 1 and 255");
         }
     }
 

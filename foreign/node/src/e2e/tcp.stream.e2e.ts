@@ -49,10 +49,6 @@ describe('e2e -> stream', async () => {
     assert.ok(stream);
   });
 
-  it('e2e -> stream::purge', async () => {
-    assert.ok(await c.stream.purge({ streamId: name2 }));
-  });
-
   it('e2e -> stream::delete', async () => {
     assert.ok(await c.stream.delete({ streamId: name2 }));
   });

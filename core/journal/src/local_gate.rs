@@ -19,19 +19,25 @@
 //!
 //! Many futures can drive the same shard-local resource concurrently (a pump
 //! loop, detached per-client tasks, repair drivers). This gate serializes them
-//! without atomics: the shard is never `Sync`, so a `Cell` flag provides the
+//! without atomics: the shard is never `Sync`, so a `Cell` state provides the
 //! exclusion a `tokio::sync::Mutex` would buy with an atomic RMW per acquire.
 //!
-//! Not a general lock: single-threaded (`Cell`/`RefCell`, never `Sync`),
-//! release wakes every waiter and poll order re-races (arrival-order FIFO
-//! under `futures::join!`-style drivers), cancel-safe (dropping the guard
-//! releases; dropping a waiter leaves only a stale waker). Non-reentrant: a
-//! holder that re-acquires deadlocks itself.
+//! Not a general lock: single-threaded (`Cell`/`RefCell`, never `Sync`).
+//! Waiters take the gate in arrival order: a release hands it to the oldest
+//! waiter without freeing it, so a later acquirer never takes it first, in
+//! whatever order the executor polls them. Dropping a borrowed guard releases.
+//! Dropping a waiter gives up its place, or passes the gate on when it was
+//! already handed the gate. An owned lease requires explicit release after
+//! physical completion: dropping it keeps the resource fenced.
+//! Non-reentrant: a holder that re-acquires deadlocks itself.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::task::Waker;
 
-/// See the module docs. Callers hold the returned guard across the awaited
-/// critical section; dropping it releases the gate and wakes every waiter.
+/// See the module docs. Borrowed guards release on drop; owned leases release
+/// explicitly after physical completion and otherwise keep the gate closed.
 ///
 /// Its exclusion is load-bearing in RELEASE, not only under
 /// `debug_assertions`: this gate is the only enforcement of the superblock
@@ -39,25 +45,101 @@ use std::cell::{Cell, RefCell};
 /// `PingPongSuperblock::write` takes `&self`, and two overlapping writers
 /// collide on one fixed `.tmp` path and tear a slot while both return `Ok`.
 pub struct LocalGate {
-    busy: Cell<bool>,
-    waiters: RefCell<Vec<std::task::Waker>>,
+    state: Cell<GateState>,
+    waiters: RefCell<VecDeque<Waiter>>,
+    next_ticket: Cell<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    Free,
+    Held,
+    /// A release handed the gate to the waiter with this ticket, which has not
+    /// taken it yet.
+    Handed(u64),
+}
+
+struct Waiter {
+    ticket: u64,
+    waker: Waker,
 }
 
 impl LocalGate {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            busy: Cell::new(false),
-            waiters: RefCell::new(Vec::new()),
+            state: Cell::new(GateState::Free),
+            waiters: RefCell::new(VecDeque::new()),
+            next_ticket: Cell::new(0),
         }
     }
 
+    /// Waits for the gate. The returned future joins the waiter queue at its
+    /// first poll, not here, so arrival order is first-poll order.
     // A manual `Future` impl does not inherit the async-fn unused lint, so
     // without these `gate.acquire();` and `gate.acquire().await;` both
     // compile clean as no-op exclusion (the guard drops at the semicolon).
     #[must_use = "acquire does nothing until awaited"]
     pub const fn acquire(&self) -> LocalGateAcquire<'_> {
-        LocalGateAcquire { gate: self }
+        LocalGateAcquire {
+            gate: self,
+            ticket: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn try_acquire(&self) -> Option<LocalGateGuard<'_>> {
+        if self.take_free() {
+            Some(LocalGateGuard { gate: self })
+        } else {
+            None
+        }
+    }
+
+    /// A dropped owned lease leaves the resource fenced. Only an owner that
+    /// observed physical completion may release it.
+    #[must_use]
+    pub fn try_acquire_owned(self: &Rc<Self>) -> Option<OwnedLocalGateGuard> {
+        if !self.take_free() {
+            return None;
+        }
+        Some(OwnedLocalGateGuard {
+            gate: Rc::clone(self),
+        })
+    }
+
+    /// A gate handed to a waiter is not free, so no acquirer overtakes it.
+    const fn take_free(&self) -> bool {
+        let free = matches!(self.state.get(), GateState::Free);
+        if free {
+            // `Cell::set` is not const, and `try_acquire` is.
+            self.state.replace(GateState::Held);
+        }
+        free
+    }
+
+    fn release(&self) {
+        // Pop before waking: a waker that polls inline can re-enter acquire and
+        // borrow the waiter queue again.
+        let next = self.waiters.borrow_mut().pop_front();
+        match next {
+            Some(waiter) => {
+                self.state.set(GateState::Handed(waiter.ticket));
+                waiter.waker.wake();
+            }
+            None => self.state.set(GateState::Free),
+        }
+    }
+}
+
+#[must_use = "release only after physical work has settled"]
+pub struct OwnedLocalGateGuard {
+    gate: Rc<LocalGate>,
+}
+
+impl OwnedLocalGateGuard {
+    pub fn release(self) {
+        self.gate.release();
     }
 }
 
@@ -70,6 +152,9 @@ impl Default for LocalGate {
 #[must_use = "the acquire future must be awaited to take the gate"]
 pub struct LocalGateAcquire<'a> {
     gate: &'a LocalGate,
+    /// Its place in the waiter queue, from the first poll that found the gate
+    /// busy.
+    ticket: Option<u64>,
 }
 
 impl<'a> std::future::Future for LocalGateAcquire<'a> {
@@ -79,19 +164,54 @@ impl<'a> std::future::Future for LocalGateAcquire<'a> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        if self.gate.busy.get() {
-            // Deduped, not appended: a waiter driven by a multi-source driver
-            // (`select!`, `join!`) is re-polled on every unrelated wake, and
-            // release wakes the whole list, so a bare push makes draining n
-            // contenders O(n^2) waker clones.
-            let mut waiters = self.gate.waiters.borrow_mut();
-            if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
-                waiters.push(cx.waker().clone());
+        let this = self.get_mut();
+        let gate = this.gate;
+        let Some(ticket) = this.ticket else {
+            // A release hands a contended gate over without freeing it, so a
+            // free gate has no waiter to overtake.
+            if gate.take_free() {
+                return std::task::Poll::Ready(LocalGateGuard { gate });
             }
-            std::task::Poll::Pending
+            let ticket = gate.next_ticket.get();
+            gate.next_ticket.set(ticket.wrapping_add(1));
+            gate.waiters.borrow_mut().push_back(Waiter {
+                ticket,
+                waker: cx.waker().clone(),
+            });
+            this.ticket = Some(ticket);
+            return std::task::Poll::Pending;
+        };
+        if gate.state.get() == GateState::Handed(ticket) {
+            gate.state.set(GateState::Held);
+            this.ticket = None;
+            return std::task::Poll::Ready(LocalGateGuard { gate });
+        }
+        // A waiter driven by `select!` or `join!` is polled on every wake of
+        // its task, and the task can poll it with a new waker.
+        if let Some(waiter) = gate
+            .waiters
+            .borrow_mut()
+            .iter_mut()
+            .find(|waiter| waiter.ticket == ticket)
+        {
+            waiter.waker.clone_from(cx.waker());
+        }
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for LocalGateAcquire<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket else {
+            return;
+        };
+        if self.gate.state.get() == GateState::Handed(ticket) {
+            self.gate.release();
         } else {
-            self.gate.busy.set(true);
-            std::task::Poll::Ready(LocalGateGuard { gate: self.gate })
+            self.gate
+                .waiters
+                .borrow_mut()
+                .retain(|waiter| waiter.ticket != ticket);
         }
     }
 }
@@ -103,14 +223,7 @@ pub struct LocalGateGuard<'a> {
 
 impl Drop for LocalGateGuard<'_> {
     fn drop(&mut self) {
-        self.gate.busy.set(false);
-        // Move the waiters out before waking: `wake()` only schedules under
-        // compio today, but a waker that ever polled a waiter inline would
-        // re-enter `acquire`'s `waiters.borrow_mut()` and panic the RefCell.
-        let waiters = std::mem::take(&mut *self.gate.waiters.borrow_mut());
-        for waker in waiters {
-            waker.wake();
-        }
+        self.gate.release();
     }
 }
 
@@ -119,7 +232,17 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use futures::future::join;
-    use std::rc::Rc;
+
+    #[test]
+    fn owned_lease_requires_explicit_settlement_before_reuse() {
+        let gate = Rc::new(LocalGate::new());
+        let held = gate.try_acquire_owned().unwrap();
+        assert!(gate.try_acquire_owned().is_none());
+        held.release();
+        let interrupted = gate.try_acquire_owned().unwrap();
+        drop(interrupted);
+        assert!(gate.try_acquire_owned().is_none());
+    }
 
     /// Two writers queued on the same gate run one after the other, never
     /// interleaved -- the property a torn superblock slot depends on.
@@ -186,9 +309,9 @@ mod tests {
         );
     }
 
-    /// A waiter that goes away leaves only a stale waker behind: the next
-    /// acquirer still gets the gate. Cancel safety is load-bearing here, since
-    /// every acquire site sits in a future a shard can drop.
+    /// A waiter that goes away leaves the queue: the next acquirer still gets
+    /// the gate. Cancel safety is load-bearing here, since every acquire site
+    /// sits in a future a shard can drop.
     #[compio::test]
     async fn given_dropped_waiter_when_guard_releases_should_not_wedge() {
         let gate = LocalGate::new();
@@ -203,5 +326,52 @@ mod tests {
             gate.acquire().now_or_never().is_some(),
             "a dropped waiter must not keep the gate busy"
         );
+    }
+
+    /// A release hands the gate to the oldest waiter. An acquirer that polls
+    /// before that waiter runs again queues behind it, and so does a
+    /// `try_acquire`.
+    #[test]
+    fn given_a_waiter_when_another_acquirer_polls_after_release_should_hand_the_gate_to_the_waiter()
+    {
+        let gate = LocalGate::new();
+        let held = gate.try_acquire().unwrap();
+        let mut waiter = Box::pin(gate.acquire());
+        assert!(waiter.as_mut().now_or_never().is_none());
+
+        drop(held);
+        let mut later = Box::pin(gate.acquire());
+        assert!(
+            later.as_mut().now_or_never().is_none(),
+            "a later acquirer must not take the gate handed to a waiter"
+        );
+        assert!(gate.try_acquire().is_none());
+
+        let guard = waiter
+            .now_or_never()
+            .expect("the release handed the gate to the waiter");
+        drop(guard);
+        assert!(later.now_or_never().is_some());
+        assert!(gate.try_acquire().is_some(), "the gate is free again");
+    }
+
+    /// A waiter dropped after a release handed it the gate passes the gate to
+    /// the next waiter, so the gate does not wedge.
+    #[test]
+    fn given_a_waiter_handed_the_gate_when_dropped_should_pass_it_to_the_next_waiter() {
+        let gate = LocalGate::new();
+        let held = gate.try_acquire().unwrap();
+        let mut handed = Box::pin(gate.acquire());
+        let mut next = Box::pin(gate.acquire());
+        assert!(handed.as_mut().now_or_never().is_none());
+        assert!(next.as_mut().now_or_never().is_none());
+
+        drop(held);
+        drop(handed);
+        let guard = next
+            .now_or_never()
+            .expect("the dropped waiter passed the gate on");
+        drop(guard);
+        assert!(gate.try_acquire().is_some(), "the gate is free again");
     }
 }

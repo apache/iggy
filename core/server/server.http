@@ -18,6 +18,8 @@
 @url = http://localhost:3000
 @stream_id = 0
 @topic_id = 0
+@metadata_cursor = mc1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+@current_page_token = REPLACE_WITH_THE_PREVIOUS_CURRENT_PAGE_TOKEN
 @partition_id = 0
 @consumer_group_id = 1
 @consumer_id = 1
@@ -27,8 +29,8 @@
 @message_2_payload_base64 = d29ybGQ=
 @header_key_1_base64 = a2V5XzE=
 @header_value_1_base64 = dmFsdWUgMQ==
-@header_key_2_base64 = Kg==
-@header_value_2_base64 = AAAA
+@header_key_2_base64 = KgAAAA==
+@header_value_2_base64 = AAAAAA==
 @root_username = iggy
 @root_password = iggy
 @user1_username = user1
@@ -72,6 +74,26 @@ Content-Type: application/json
   "compression": "Deflated",
   "snapshot_types": ["All"]
 }
+
+### Metadata changes from the oldest retained operation
+GET {{url}}/metadata/changes?from=earliest&limit=100
+Authorization: Bearer {{access_token}}
+
+### Metadata changes: a cursor at the newest record, no records
+GET {{url}}/metadata/changes?from=latest&groups=streams,topics
+Authorization: Bearer {{access_token}}
+
+### Metadata changes after a cursor, within a time range in microseconds
+GET {{url}}/metadata/changes?after={{metadata_cursor}}&since=1760352000000000&limit=100
+Authorization: Bearer {{access_token}}
+
+### Current state, first page, then continue with current_after
+GET {{url}}/metadata/changes?from=current&groups=streams,topics&limit=100
+Authorization: Bearer {{access_token}}
+
+### Current state, next page
+GET {{url}}/metadata/changes?from=current&groups=streams,topics&current_after={{current_page_token}}
+Authorization: Bearer {{access_token}}
 
 ###
 GET {{url}}/cluster/metadata
@@ -224,10 +246,6 @@ DELETE {{url}}/streams/{{stream_id}}
 Authorization: Bearer {{access_token}}
 
 ###
-DELETE {{url}}/streams/{{stream_id}}/purge
-Authorization: Bearer {{access_token}}
-
-###
 GET {{url}}/streams/{{stream_id}}/topics
 Authorization: Bearer {{access_token}}
 
@@ -243,9 +261,11 @@ Content-Type: application/json
 {
   "name": "topic1",
   "partitions_count": 1,
-  "compression_algorithm": "none",
-  "max_topic_size": 0,
-  "message_expiry": 0
+  "options": {
+    "compression_algorithm": "none",
+    "message_expiry": "7 days",
+    "max_topic_size": "1 GiB"
+  }
 }
 
 ###
@@ -255,17 +275,12 @@ Content-Type: application/json
 
 {
   "name": "topic1",
-  "compression_algorithm": "none",
-  "max_topic_size": 0,
-  "message_expiry": 0
+  "message_expiry": "1 day",
+  "max_topic_size": "2 GiB"
 }
 
 ###
 DELETE {{url}}/streams/{{stream_id}}/topics/{{topic_id}}
-Authorization: Bearer {{access_token}}
-
-###
-DELETE {{url}}/streams/{{stream_id}}/topics/{{topic_id}}/purge
 Authorization: Bearer {{access_token}}
 
 ###

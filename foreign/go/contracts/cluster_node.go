@@ -26,6 +26,7 @@ import (
 )
 
 type ClusterNode struct {
+	ReplicaID uint8
 	Name      string
 	IP        string
 	Endpoints TransportEndpoints
@@ -34,12 +35,13 @@ type ClusterNode struct {
 }
 
 func (n *ClusterNode) BufferSize() int {
-	return 4 + len(n.Name) + 4 + len(n.IP) + n.Endpoints.GetBufferSize() + 1 + 1
+	return 1 + 4 + len(n.Name) + 4 + len(n.IP) + n.Endpoints.GetBufferSize() + 1 + 1
 }
 
 func (n *ClusterNode) MarshalBinary() ([]byte, error) {
 	size := n.BufferSize()
 	buf := bytes.NewBuffer(make([]byte, 0, size))
+	buf.WriteByte(n.ReplicaID)
 
 	// name
 	if err := binary.Write(buf, binary.LittleEndian, uint32(len(n.Name))); err != nil {
@@ -88,11 +90,11 @@ func (n *ClusterNode) MarshalBinary() ([]byte, error) {
 }
 
 func (n *ClusterNode) UnmarshalBinary(b []byte) error {
-	// Minimal size check: 4 (name_len) + 4 (ip_len) + 1 (role) + 1 (status)
-	if len(b) < 10 {
+	if len(b) < 19 {
 		return ierror.ErrInvalidCommand
 	}
-	pos := 0
+	n.ReplicaID = b[0]
+	pos := 1
 
 	// name length
 	if len(b) < pos+4 {

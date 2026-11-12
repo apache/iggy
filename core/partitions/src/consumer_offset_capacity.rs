@@ -34,7 +34,11 @@ pub struct DurableOffsetState {
 pub struct DurableConsumerOffsets {
     consumers: RefCell<HashMap<u32, DurableOffsetState>>,
     groups: RefCell<HashMap<u32, DurableOffsetState>>,
+    external_groups: RefCell<HashMap<u32, DurableOffsetState>>,
     membership_epoch: Cell<u64>,
+    /// The op of the committed delete that left every kind empty, `0` when
+    /// none is known. Any entry the table gains resets it.
+    emptied_at: Cell<u64>,
 }
 
 impl DurableConsumerOffsets {
@@ -63,6 +67,7 @@ impl DurableConsumerOffsets {
         committed_offset: u64,
         persisted_high_water: u64,
     ) -> bool {
+        self.emptied_at.set(0);
         let created = self
             .entries(kind)
             .borrow_mut()
@@ -87,6 +92,7 @@ impl DurableConsumerOffsets {
         committed_offset: u64,
         persisted_high_water: u64,
     ) {
+        self.emptied_at.set(0);
         let mut entries = self.entries(kind).borrow_mut();
         match entries.entry(id) {
             Entry::Occupied(mut entry) => {
@@ -116,7 +122,17 @@ impl DurableConsumerOffsets {
     pub(crate) fn clear(&self) {
         self.consumers.borrow_mut().clear();
         self.groups.borrow_mut().clear();
+        self.external_groups.borrow_mut().clear();
+        self.emptied_at.set(0);
         self.bump_membership_epoch();
+    }
+
+    pub(crate) const fn emptied_at(&self) -> u64 {
+        self.emptied_at.get()
+    }
+
+    pub(crate) fn set_emptied_at(&self, op: u64) {
+        self.emptied_at.set(op);
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -140,12 +156,51 @@ impl DurableConsumerOffsets {
         match kind {
             ConsumerKind::Consumer => &self.consumers,
             ConsumerKind::ConsumerGroup => &self.groups,
+            ConsumerKind::ExternalGroup => &self.external_groups,
         }
     }
 
     fn bump_membership_epoch(&self) {
         self.membership_epoch
             .set(self.membership_epoch.get().wrapping_add(1));
+    }
+}
+
+/// When a client last stored or deleted each consumer offset, on the bus
+/// clock. A parked read compares stamps, because a store can leave the value
+/// as it was.
+#[derive(Debug, Default)]
+pub struct ExplicitOffsetStores {
+    stored_at: RefCell<HashMap<(ConsumerKind, u32), u64>>,
+    /// The last delete of any offset, which an offset without a stamp reads.
+    deleted_at: Cell<Option<u64>>,
+}
+
+impl ExplicitOffsetStores {
+    pub(crate) fn record_store(&self, kind: ConsumerKind, id: u32, now: u64) {
+        self.stored_at.borrow_mut().insert((kind, id), now);
+    }
+
+    pub(crate) fn record_delete(&self, kind: ConsumerKind, id: u32, now: u64) {
+        self.stored_at.borrow_mut().remove(&(kind, id));
+        self.deleted_at.set(Some(now));
+    }
+
+    /// Forgets every stamp, as a delete of every offset at `now`.
+    pub(crate) fn clear(&self, now: u64) {
+        self.stored_at.borrow_mut().clear();
+        self.deleted_at.set(Some(now));
+    }
+
+    /// Whether a client stored or deleted the offset at or after `since`. An
+    /// offset without a stamp counts the last delete of any offset.
+    pub(crate) fn since(&self, kind: ConsumerKind, id: u32, since: u64) -> bool {
+        self.stored_at
+            .borrow()
+            .get(&(kind, id))
+            .copied()
+            .or_else(|| self.deleted_at.get())
+            .is_some_and(|at| at >= since)
     }
 }
 
@@ -306,10 +361,8 @@ impl ConsumerOffsetCapacity {
                 .is_some_and(|token| token.active_count() > 0)
     }
 
-    /// Assigns the pending count outright while [`Self::release_reservation`]
-    /// decrements it. Both take `&self` and neither locks: they are serialized
-    /// by their call sites, which all run under the partition's `&mut self` on
-    /// its own shard thread.
+    /// Assign the pending count under the partition's exclusive shard-local
+    /// ownership. Callers derive it from the remaining admitted operations.
     pub(crate) fn set_pending_count(&self, id: u32, count: usize) {
         if count == 0 {
             if self.pending.borrow_mut().remove(&id).is_some() {
@@ -320,18 +373,8 @@ impl ConsumerOffsetCapacity {
         }
     }
 
-    /// See [`Self::set_pending_count`] for the serialization contract.
-    pub(crate) fn release_reservation(&self, id: u32) {
-        let mut pending = self.pending.borrow_mut();
-        let Some(count) = pending.get_mut(&id) else {
-            return;
-        };
-        if *count == 1 {
-            pending.remove(&id);
-            self.note_local_key_change();
-        } else {
-            *count -= 1;
-        }
+    pub(crate) fn has_pending(&self, id: u32) -> bool {
+        self.pending.borrow().contains_key(&id)
     }
 
     pub(crate) const fn is_uncertain(&self) -> bool {
@@ -378,6 +421,10 @@ impl ConsumerOffsetCapacity {
     /// zero. Exported as a gauge so that refusal has a signal.
     pub(crate) fn stranded_count(&self) -> usize {
         self.stranded.borrow().len()
+    }
+
+    pub(crate) fn extend_stranded_ids(&self, ids: &mut HashSet<u32>) {
+        ids.extend(self.stranded.borrow().iter().copied());
     }
 
     pub(crate) fn rearm_if_below_limit(&self, durable: &DurableConsumerOffsets) {
@@ -459,6 +506,36 @@ impl ConsumerOffsetCapacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_store_of_the_same_value_when_checking_since_admission_should_report_it() {
+        let stores = ExplicitOffsetStores::default();
+        stores.record_store(ConsumerKind::Consumer, 1, 5);
+        assert!(!stores.since(ConsumerKind::Consumer, 1, 6));
+        stores.record_store(ConsumerKind::Consumer, 1, 6);
+        assert!(stores.since(ConsumerKind::Consumer, 1, 6));
+        assert!(
+            !stores.since(ConsumerKind::ConsumerGroup, 1, 6),
+            "a store of another kind leaves the offset alone"
+        );
+        assert!(!stores.since(ConsumerKind::Consumer, 2, 6));
+    }
+
+    #[test]
+    fn given_a_deleted_offset_when_checking_since_admission_should_count_the_last_delete() {
+        let stores = ExplicitOffsetStores::default();
+        stores.record_store(ConsumerKind::Consumer, 1, 2);
+        stores.record_store(ConsumerKind::Consumer, 2, 2);
+        stores.record_delete(ConsumerKind::Consumer, 1, 7);
+        assert!(stores.since(ConsumerKind::Consumer, 1, 7));
+        assert!(
+            !stores.since(ConsumerKind::Consumer, 2, 7),
+            "an offset with its own stamp ignores deletes of others"
+        );
+        assert!(stores.since(ConsumerKind::Consumer, 3, 7));
+        stores.clear(9);
+        assert!(stores.since(ConsumerKind::Consumer, 2, 9));
+    }
 
     #[test]
     fn given_cached_inactive_tokens_when_admitting_should_count_only_active_keys() {
@@ -608,12 +685,12 @@ mod tests {
         assert_eq!(capacity.try_reserve(7, &durable), Ok(()));
         assert_eq!(capacity.try_reserve(7, &durable), Ok(()));
         assert!(capacity.try_reserve(8, &durable).is_err());
-        capacity.release_reservation(7);
+        capacity.set_pending_count(7, 1);
         assert!(
             capacity.try_reserve(8, &durable).is_err(),
             "one of two reservations still owns the slot"
         );
-        capacity.release_reservation(7);
+        capacity.set_pending_count(7, 0);
         assert!(
             capacity.try_reserve(8, &durable).is_ok(),
             "the slot is released after the last reservation"

@@ -33,9 +33,11 @@
 //! cross-transport invariant in `message_bus::client_listener`). Handshaken
 //! streams flow to the serve loop over a bounded channel.
 
+use message_bus::accept::pause_after_accept_error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,8 +53,8 @@ use futures::{FutureExt, pin_mut};
 use hyper::rt::Executor;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
-use message_bus::ShutdownToken;
 use message_bus::transports::tls::{TlsServerCredentials, load_pem};
+use message_bus::{ConnectionCap, ConnectionPermit, ShutdownToken};
 use tower_http::add_extension::AddExtension;
 use tracing::{debug, error};
 
@@ -72,9 +74,9 @@ const ALPN_HTTP11: &[u8] = b"http/1.1";
 /// a handshake burst from queuing without limit.
 const ACCEPT_CHANNEL_DEPTH: usize = 256;
 
-/// A handshaken TLS stream plus the peer it came from, carried from the
-/// accept pump to the serve loop.
-type Handshaken = (TlsStream<TcpStream>, SocketAddr);
+/// A handshaken TLS stream, the peer it came from, and its slot in the
+/// node's connection cap, carried from the accept pump to the serve loop.
+type Handshaken = (TlsStream<TcpStream>, SocketAddr, ConnectionPermit);
 
 /// Load the HTTPS `ServerConfig` from the operator's PEM cert + key.
 ///
@@ -100,10 +102,12 @@ pub fn load_http_tls_server_config(
 /// join handle for the caller to track. `handshake_grace` bounds each
 /// connection's TLS handshake; the caller sources it from
 /// `MessageBusConfig::handshake_grace` so the HTTPS listener shares the same
-/// slowloris budget as the binary transports.
+/// slowloris budget as the binary transports. `connections` is the node's
+/// cap on client sockets: the pump closes a socket past it at accept.
 pub fn spawn_accept_pump(
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
+    connections: Rc<ConnectionCap>,
     handshake_grace: Duration,
     shutdown: ShutdownToken,
 ) -> (Receiver<Handshaken>, JoinHandle<()>) {
@@ -114,6 +118,7 @@ pub fn spawn_accept_pump(
         listener,
         acceptor,
         connections_tx,
+        connections,
         handshake_grace,
         shutdown,
     ));
@@ -125,10 +130,10 @@ pub fn spawn_accept_pump(
 /// shutdown the pump drops its sender, this loop ends, and the in-flight
 /// connection tasks drain via their own shutdown clone.
 pub async fn serve(connections: Receiver<Handshaken>, router: Router, shutdown: ShutdownToken) {
-    while let Ok((tls, peer)) = connections.recv().await {
+    while let Ok((tls, peer, permit)) = connections.recv().await {
         let router = router.clone();
         let shutdown = shutdown.clone();
-        compio::runtime::spawn(serve_connection(tls, peer, router, shutdown)).detach();
+        compio::runtime::spawn(serve_connection(tls, peer, permit, router, shutdown)).detach();
     }
 }
 
@@ -138,6 +143,7 @@ pub async fn serve(connections: Receiver<Handshaken>, router: Router, shutdown: 
 async fn serve_connection(
     tls: TlsStream<TcpStream>,
     peer: SocketAddr,
+    permit: ConnectionPermit,
     router: Router,
     shutdown: ShutdownToken,
 ) {
@@ -152,8 +158,11 @@ async fn serve_connection(
     // here - the extractors cannot tell the two paths apart. `AddExtension`
     // wraps the shared router as one thin per-request insert; `Router::layer`
     // would rebuild every route's boxed service on each connection.
-    let service =
-        TowerToHyperService::new(AddExtension::new(router, ConnectInfo(ClientAddr(peer))));
+    let client_addr = ClientAddr {
+        addr: peer,
+        _permit: Some(Arc::new(permit)),
+    };
+    let service = TowerToHyperService::new(AddExtension::new(router, ConnectInfo(client_addr)));
     let builder = Builder::new(LocalExecutor);
     // `serve_connection_with_upgrades` borrows `builder`, so it must outlive
     // `conn`; keep it bound rather than inlined.
@@ -217,7 +226,8 @@ fn build_server_config(
 async fn accept_pump(
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    connections: Sender<Handshaken>,
+    handshaken: Sender<Handshaken>,
+    connections: Rc<ConnectionCap>,
     handshake_grace: Duration,
     shutdown: ShutdownToken,
 ) {
@@ -229,9 +239,16 @@ async fn accept_pump(
             }
             result = listener.accept().fuse() => match result {
                 Ok((stream, peer)) => {
-                    spawn_handshake(&acceptor, &connections, handshake_grace, stream, peer);
+                    // At the cap the stream drops here, which closes it.
+                    if let Some(permit) = connections.try_acquire() {
+                        let accepted = (stream, peer, permit);
+                        spawn_handshake(&acceptor, &handshaken, handshake_grace, accepted);
+                    }
                 }
-                Err(error) => error!(%error, "server HTTPS accept failed"),
+                Err(error) => {
+                    error!(%error, "server HTTPS accept failed");
+                    pause_after_accept_error(&error, &shutdown).await;
+                }
             },
         }
     }
@@ -243,19 +260,18 @@ async fn accept_pump(
 /// loop.
 fn spawn_handshake(
     acceptor: &TlsAcceptor,
-    connections: &Sender<Handshaken>,
+    handshaken: &Sender<Handshaken>,
     handshake_grace: Duration,
-    stream: TcpStream,
-    peer: SocketAddr,
+    (stream, peer, permit): (TcpStream, SocketAddr, ConnectionPermit),
 ) {
     let acceptor = acceptor.clone();
-    let connections = connections.clone();
+    let handshaken = handshaken.clone();
     compio::runtime::spawn(async move {
         match compio::time::timeout(handshake_grace, acceptor.accept(stream)).await {
             Ok(Ok(tls)) => {
                 // Drop on send error: the channel is closed only at
                 // shutdown, when the serve loop is already tearing down.
-                let _ = connections.send((tls, peer)).await;
+                let _ = handshaken.send((tls, peer, permit)).await;
             }
             Ok(Err(error)) => debug!(%peer, %error, "server HTTPS handshake failed"),
             Err(_elapsed) => {

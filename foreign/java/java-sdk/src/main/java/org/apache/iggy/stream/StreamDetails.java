@@ -19,11 +19,18 @@
 
 package org.apache.iggy.stream;
 
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.topic.Topic;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
+/**
+ * A stream with its topics, as the server reports it. See {@link StreamBase} for what {@code options} and
+ * {@code derivedOptions} carry.
+ */
 public record StreamDetails(
         Long id,
         BigInteger createdAt,
@@ -31,8 +38,39 @@ public record StreamDetails(
         String size,
         BigInteger messagesCount,
         Long topicsCount,
-        List<Topic> topics) {
+        List<Topic> topics,
+        Map<String, HeaderValue> options,
+        Map<String, HeaderValue> derivedOptions) {
+    public StreamDetails {
+        options = options == null ? Map.of() : options;
+        derivedOptions = derivedOptions == null ? Map.of() : derivedOptions;
+    }
+
     public StreamDetails(StreamBase base, List<Topic> topics) {
-        this(base.id(), base.createdAt(), base.name(), base.size(), base.messagesCount(), base.topicsCount(), topics);
+        this(
+                base.id(),
+                base.createdAt(),
+                base.name(),
+                base.size(),
+                base.messagesCount(),
+                base.topicsCount(),
+                topics,
+                base.options(),
+                base.derivedOptions());
+    }
+
+    /** Who chose the stream's data key, empty when the server reported no source. */
+    public Optional<EncryptionKeySource> encryptionKeySource() {
+        return EncryptionProjection.source(options, derivedOptions);
+    }
+
+    /** Fingerprint of the stream's data key, empty for a plaintext stream. */
+    public Optional<String> encryptionKeyFingerprint() {
+        return EncryptionProjection.keyFingerprint(options, derivedOptions);
+    }
+
+    /** Fingerprints of the server keys that wrap the stream's key, empty for a plaintext stream. */
+    public List<String> encryptionKekFingerprints() {
+        return EncryptionProjection.kekFingerprints(options, derivedOptions);
     }
 }

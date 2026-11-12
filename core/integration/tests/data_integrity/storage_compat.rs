@@ -18,24 +18,30 @@
 //! On-disk format backwards compatibility.
 //!
 //! A server built from the master tip the change merges onto (the BASELINE)
-//! writes a rich data directory. The same directory is then restarted under
+//! writes a rich data directory. The same directory is then booted under
 //! the build under test, and everything must read back unchanged:
 //!
 //! - A checkpointed metadata snapshot holding topics with every option key,
-//!   partitions with a deletion watermark and a purge generation, consumer
-//!   groups, users with permissions and personal access tokens, all created
-//!   BEFORE the checkpoint fires, plus an uncheckpointed WAL tail holding one
-//!   more of each, created after it. The snapshot and the WAL encode the same
-//!   types differently, and either can break on its own.
+//!   partitions with a deletion watermark, consumer groups, users with
+//!   permissions and personal access tokens, all created BEFORE the
+//!   checkpoint fires, plus an uncheckpointed WAL tail holding one more of
+//!   each, created after it. The snapshot and the WAL encode the same types
+//!   differently, and either can break on its own.
 //! - Sealed and active segments in a non-zero partition, holding messages
 //!   with explicit ids, typed user headers and payload lengths that vary
 //!   inside every batch, and a partial segment deletion.
-//! - Individual and group consumer offsets, and a purge generation with
-//!   messages appended past it.
+//! - Individual and group consumer offsets.
 //!
-//! The swap works because `ServerHandle::start` re-reads
-//! `config.executable_path` on every call while the data directory, the
-//! ports and the harness paths all survive a `stop`.
+//! # Two halves, two source trees
+//!
+//! The seed half runs from the baseline's own source, so it talks to the
+//! baseline through the baseline's SDK and a client protocol change in the
+//! build under test cannot fail it. It copies the data directory to
+//! `COMPAT_BASELINE_DATA` and writes everything it read from the baseline
+//! into a JSON record beside it. The verify half runs from the build under
+//! test, boots on a copy of that directory and compares against the record.
+//! The harness owns the server's data path, so the directory travels by copy
+//! in both directions.
 //!
 //! # Why every assertion here is about DATA
 //!
@@ -61,9 +67,9 @@
 //!
 //! The baseline uses its extracted config and a test-only launcher that maps
 //! current harness environment names to the baseline's system-prefixed names.
-//! On replacement, the fixture copies supported values into the current schema
-//! and switches IGGY_CONFIG_PATH before restarting. Removed settings stay out
-//! of the replacement config. This isolates storage compatibility from the
+//! The verify half copies supported values into the current schema and points
+//! IGGY_CONFIG_PATH at the result. Removed settings stay out of the
+//! replacement config. This isolates storage compatibility from the
 //! deliberately breaking public configuration rename.
 //!
 //! Topic creation likewise uses the baseline options block. The new durability
@@ -87,7 +93,9 @@ use iggy_common::wire_conversions::{
 };
 use integration::harness::{
     TestHarness, TestServerConfig, USER_PASSWORD, disk, resolve_config_paths,
+    wait_for_consumer_group_assignment,
 };
+use serde::{Deserialize, Serialize};
 use serial_test::parallel;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -109,9 +117,16 @@ const BASELINE_SERVER_ENV: &str = "COMPAT_BASELINE_SERVER";
 /// Same naming rule as [`BASELINE_SERVER_ENV`].
 const BASELINE_CONFIG_ENV: &str = "COMPAT_BASELINE_CONFIG";
 
+/// Absolute path of the data directory the seed half writes and the verify
+/// half boots from. The seed's record sits beside it, see [`record_path`].
+/// Same naming rule as [`BASELINE_SERVER_ENV`].
+const BASELINE_DATA_ENV: &str = "COMPAT_BASELINE_DATA";
+
 /// Selects the server's config file, ahead of the relative default path the
 /// module documentation warns about.
 const CONFIG_PATH_ENV: &str = "IGGY_CONFIG_PATH";
+
+const JOURNAL_SLOTS_KEY: &str = "metadata.journal_slots";
 
 /// `metadata.journal_slots` floor for `prepare_queue_depth = 32`
 /// (`4 * max(64, 32)`). With the 64-op checkpoint margin a checkpoint fires
@@ -133,8 +148,8 @@ const DATA_STREAM: &str = "compat-data";
 const DATA_TOPIC: &str = "data";
 /// Created after the checkpoint, so its options only exist as a WAL record.
 const WAL_TAIL_TOPIC: &str = "tail";
-const PURGE_STREAM: &str = "compat-purge";
-const PURGE_TOPIC: &str = "purged";
+const COMPRESSION_STREAM: &str = "compat-compression";
+const COMPRESSION_TOPIC: &str = "compression";
 const OFFSET_CONSUMER: &str = "compat-offset-consumer";
 const READBACK_CONSUMER: &str = "compat-readback";
 const OFFSET_GROUP: &str = "compat-offset-group";
@@ -149,7 +164,7 @@ const WAL_TAIL_PAT: &str = "compat-tail-pat";
 /// can be non-zero.
 const PARTITIONS_COUNT: u32 = 2;
 
-/// The partition every message, offset and purge check targets. Non-zero on
+/// The partition every message and offset check targets. Non-zero on
 /// purpose: the segment batch header carries the partition id, and a field
 /// that decoded as 0 is indistinguishable from a correct one when the only
 /// seeded partition is 0. Partition 0 stays empty.
@@ -210,18 +225,6 @@ const SEND_BATCH: u64 = 16;
 /// before deleting one, so a sealed segment is still left behind.
 const MIN_SEGMENTS_BEFORE_DELETE: usize = 4;
 
-/// Messages produced into the topic that is purged afterwards.
-const PURGED_MESSAGES: u64 = 8;
-
-/// Messages appended to the purged topic AFTER the purge, at generation 1.
-///
-/// Without them the purge check is vacuous. An unreadable `purge.gen` reads
-/// as 0 on purpose (the absent-or-torn sentinel), the reconciler then
-/// re-purges the partition, and an empty topic passes a `messages_count == 0`
-/// assertion whether or not the generation decoded. Only messages that must
-/// SURVIVE the swap can tell the two apart.
-const POST_PURGE_MESSAGES: u64 = 8;
-
 /// Seeded personal access token expiry. Non-default (the default is
 /// `NeverExpire`, which reads back as `None`) so a dropped or misread field
 /// cannot pass as the default.
@@ -231,12 +234,12 @@ const WAL_TAIL_PAT_EXPIRY_SECS: u64 = 3 * 24 * 60 * 60;
 /// Contiguous messages re-polled after the swap.
 const READBACK_COUNT: u32 = 16;
 
-/// Bound on every [`wait_until`] probe loop.
+/// Bound on every [`wait_until`] probe loop and on the group assignment wait.
 ///
-/// Kept small because the whole test has to finish inside nextest's 300s hard
+/// Kept small because the seed half has to finish inside nextest's 300s hard
 /// kill (`slow-timeout` x `terminate-after` in `.config/nextest.toml`, and the
-/// driving script deliberately runs without `--profile ci`). Two boots at 60s
-/// plus two stops at 5s plus seven of these waits is 200s. A SIGKILL past
+/// driving script deliberately runs without `--profile ci`). One boot at 60s
+/// plus one stop at 5s plus six of these waits is 125s. A SIGKILL past
 /// that budget would take the named `wait_until` message with it, losing the
 /// diagnostic in exactly the run that needed it. At a 200ms
 /// [`POLL_INTERVAL`] this is still ~50 probes per wait.
@@ -276,37 +279,93 @@ const TOMBSTONE_FIELD: &str = "tombstoned=";
 /// same time.
 const GRACEFUL_SHUTDOWN_MARKER: &str = "server shutdown complete";
 
+/// Everything the seed half read from the baseline that the verify half
+/// compares against. Names, topic options and message generators are not
+/// here: both halves share them through this file.
+#[derive(Serialize, Deserialize)]
+struct BaselineRecord {
+    data_stream_id: u32,
+    data_topic_id: u32,
+    compression_stream_id: u32,
+    streams: BTreeMap<u32, String>,
+    retained_segments: Vec<String>,
+    /// Blake3 of every comparable file, so the verify half can tell that its
+    /// directory is the one this record describes.
+    segment_digests: BTreeMap<String, String>,
+    first_retained_offset: u64,
+    retained_window: Vec<RecordedMessage>,
+    last_message: Vec<RecordedMessage>,
+    user_permissions: Permissions,
+    wal_tail_user_permissions: Permissions,
+    token: SeededToken,
+    wal_tail_token: SeededToken,
+}
+
+/// A polled message with its stored bytes kept exact. `IggyMessage`'s own
+/// serde form rebuilds user headers from a decoded map.
+#[derive(Serialize, Deserialize)]
+struct RecordedMessage {
+    header: IggyMessageHeader,
+    payload: String,
+    user_headers: Option<String>,
+}
+
+impl From<IggyMessage> for RecordedMessage {
+    fn from(message: IggyMessage) -> Self {
+        Self {
+            header: message.header,
+            payload: hex::encode(message.payload),
+            user_headers: message.user_headers.map(hex::encode),
+        }
+    }
+}
+
+impl TryFrom<RecordedMessage> for IggyMessage {
+    type Error = hex::FromHexError;
+
+    fn try_from(recorded: RecordedMessage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            header: recorded.header,
+            payload: Bytes::from(hex::decode(recorded.payload)?),
+            user_headers: recorded
+                .user_headers
+                .map(hex::decode)
+                .transpose()?
+                .map(Bytes::from),
+        })
+    }
+}
+
+/// A personal access token as the baseline handed it out: the raw token a
+/// later login presents, and the stored expiry a listing must reproduce.
+#[derive(Serialize, Deserialize)]
+struct SeededToken {
+    raw: String,
+    expiry_at: IggyTimestamp,
+}
+
 #[tokio::test]
 #[parallel]
-#[ignore = "needs a baseline iggy-server built from master; run via scripts/ci/storage-compat.sh"]
-async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
+#[ignore = "needs a baseline iggy-server built from master, run via scripts/ci/storage-compat.sh"]
+async fn given_baseline_server_when_seeding_data_directory_should_record_what_it_serves() {
     let baseline = baseline_server_binary();
     let baseline_config = baseline_server_config();
+    let seed_directory = baseline_data_directory();
+    assert!(
+        !seed_directory.exists(),
+        "{BASELINE_DATA_ENV}={} already exists. The seed refuses to write into it, so a stale \
+         directory can never be verified against a fresh record.",
+        seed_directory.display()
+    );
     let fixture = tempfile::tempdir().unwrap();
     let baseline_document: toml::Value =
         toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
     let launcher = baseline_launcher(fixture.path(), &baseline, &baseline_document);
-    let replacement_config = fixture.path().join("replacement.toml");
-    let current_document: toml::Value =
-        toml::from_str(include_str!("../../../server/config.toml")).unwrap();
-    fs::write(
-        &replacement_config,
-        toml::to_string(&replacement_configuration(
-            &baseline_document,
-            current_document,
-        ))
-        .unwrap(),
-    )
-    .unwrap();
 
-    let overrides = HashMap::from([(
-        "metadata.journal_slots".to_string(),
-        JOURNAL_SLOTS.to_string(),
-    )]);
+    let overrides = HashMap::from([(JOURNAL_SLOTS_KEY.to_string(), JOURNAL_SLOTS.to_string())]);
     assert_overrides_known_to_the_baseline(&overrides, &baseline_config);
     let mut envs = resolve_config_paths(&overrides)
         .expect("metadata.journal_slots resolves against the live config catalog");
-    // The baseline reads its own schema until the explicit replacement below.
     envs.insert(CONFIG_PATH_ENV.to_string(), baseline_config.clone());
 
     let mut harness = TestHarness::builder()
@@ -333,7 +392,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     // 1. The topic carrying the segment chain. The flush thresholds are load
     //    bearing: without them committed messages stay in the journal and the
     //    partition directory looks empty until shutdown.
-    let data_stream_details = client.create_stream(DATA_STREAM).await.unwrap();
+    let data_stream_details = client
+        .create_stream(DATA_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
     let data_stream = Identifier::numeric(data_stream_details.id).unwrap();
     let data_topic_details =
         create_baseline_topic(&client, &data_stream, DATA_TOPIC, &data_topic_options())
@@ -353,9 +415,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     let mut produced = 0u64;
     while produced < PRODUCED_MESSAGES {
         let batch_end = (produced + SEND_BATCH).min(PRODUCED_MESSAGES);
-        let mut batch: Vec<IggyMessage> = (produced..batch_end)
-            .map(|offset| seeded_message(offset, payload_for(offset)))
-            .collect();
+        let mut batch: Vec<IggyMessage> = (produced..batch_end).map(seeded_message).collect();
         client
             .send_messages(
                 &data_stream,
@@ -438,10 +498,11 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .create_consumer_group(&data_stream, &data_topic, OFFSET_GROUP)
         .await
         .unwrap();
-    // Storing a GROUP offset is a partition op gated on membership: a caller
-    // that only created the group does not own the partition at the current
-    // generation, so the namespace resolve fails and the server replies
-    // ResourceNotFound with an empty body.
+    // Storing a GROUP offset is a partition op gated on ownership: a caller
+    // that only created the group owns no partition, so the server refuses
+    // the store. The join alone is not enough either: the group lists a
+    // partition under the member only once the partition durably installs
+    // that owner.
     client
         .join_consumer_group(
             &data_stream,
@@ -451,6 +512,15 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .await
         .unwrap();
     let offset_group = Consumer::group(Identifier::named(OFFSET_GROUP).unwrap());
+    wait_for_consumer_group_assignment(
+        &client,
+        &data_stream,
+        &data_topic,
+        &offset_group.id,
+        1,
+        SETTLE_TIMEOUT,
+    )
+    .await;
     client
         .store_consumer_offset(
             &offset_group,
@@ -477,62 +547,21 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .await;
     }
 
-    // 5. A purge on a SEPARATE topic: it resets the partition and empties its
-    //    segment chain, so it must not touch the one above.
-    let purge_stream_details = client.create_stream(PURGE_STREAM).await.unwrap();
-    let purge_stream = Identifier::numeric(purge_stream_details.id).unwrap();
-    let purge_topic_details =
-        create_baseline_topic(&client, &purge_stream, PURGE_TOPIC, &purge_topic_options())
-            .await
-            .unwrap();
-    let purge_topic = Identifier::numeric(purge_topic_details.id).unwrap();
-    let mut purged_batch: Vec<IggyMessage> = (0..PURGED_MESSAGES)
-        .map(|index| seeded_message(index, Bytes::from(format!("compat-purged-{index}"))))
-        .collect();
-    client
-        .send_messages(
-            &purge_stream,
-            &purge_topic,
-            &Partitioning::partition_id(SEEDED_PARTITION),
-            &mut purged_batch,
-        )
+    // 5. A second topic, in its own stream: the only snapshot topic that sends
+    //    `compression_algorithm`.
+    let compression_stream_details = client
+        .create_stream(COMPRESSION_STREAM, &StreamCreateOptions::default())
         .await
         .unwrap();
-    client
-        .purge_topic(&purge_stream, &purge_topic)
-        .await
-        .unwrap();
-
-    let purge_generation = partition_dir(
-        &data_path,
-        purge_stream_details.id,
-        purge_topic_details.id,
-        SEEDED_PARTITION,
+    let compression_stream = Identifier::numeric(compression_stream_details.id).unwrap();
+    create_baseline_topic(
+        &client,
+        &compression_stream,
+        COMPRESSION_TOPIC,
+        &compression_topic_options(),
     )
-    .join("purge.gen");
-    wait_until("the purge generation to reach disk", async || {
-        if purge_generation.is_file() {
-            Ok(())
-        } else {
-            Err(format!("{} does not exist", purge_generation.display()))
-        }
-    })
-    .await;
-
-    // Appended once the generation is durable, so they sit at offset 0 of the
-    // reset chain and only survive a boot that decodes `purge.gen`.
-    let mut post_purge_batch: Vec<IggyMessage> = (0..POST_PURGE_MESSAGES)
-        .map(|index| seeded_message(index, post_purge_payload(index)))
-        .collect();
-    client
-        .send_messages(
-            &purge_stream,
-            &purge_topic,
-            &Partitioning::partition_id(SEEDED_PARTITION),
-            &mut post_purge_batch,
-        )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     // 6. A user with permissions at every level, and a personal access token.
     let permissions = seeded_permissions(data_stream_details.id, data_topic_details.id);
@@ -542,6 +571,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
             USER_PASSWORD,
             UserStatus::Active,
             Some(permissions.clone()),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -564,7 +594,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     //    records replayed on top of it.
     for index in 0..SEED_STREAMS {
         client
-            .create_stream(&format!("compat-seed-{index}"))
+            .create_stream(
+                &format!("compat-seed-{index}"),
+                &StreamCreateOptions::default(),
+            )
             .await
             .unwrap_or_else(|error| panic!("create seed stream {index}: {error}"));
     }
@@ -601,6 +634,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
             USER_PASSWORD,
             UserStatus::Active,
             Some(tail_permissions.clone()),
+            &UserCreateOptions::default(),
         )
         .await
         .unwrap();
@@ -621,7 +655,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
 
     for index in 0..WAL_TAIL_STREAMS {
         client
-            .create_stream(&format!("compat-tail-{index}"))
+            .create_stream(
+                &format!("compat-tail-{index}"),
+                &StreamCreateOptions::default(),
+            )
             .await
             .unwrap_or_else(|error| panic!("create tail stream {index}: {error}"));
     }
@@ -651,7 +688,6 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         &retained_before,
         first_retained_offset,
         READBACK_COUNT as usize,
-        payload_for,
     );
     let tail_before = poll_window(
         &client,
@@ -662,29 +698,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         1,
     )
     .await;
-    assert_seeded_messages(
-        "the last produced message",
-        &tail_before,
-        last_offset,
-        1,
-        payload_for,
-    );
-    let post_purge_before = poll_window(
-        &client,
-        &purge_stream,
-        &purge_topic,
-        &readback,
-        0,
-        READBACK_COUNT,
-    )
-    .await;
-    assert_seeded_messages(
-        "the post-purge messages",
-        &post_purge_before,
-        0,
-        POST_PURGE_MESSAGES as usize,
-        post_purge_payload,
-    );
+    assert_seeded_messages("the last produced message", &tail_before, last_offset, 1);
 
     drop(client);
     harness.stop().await.unwrap();
@@ -725,30 +739,140 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
          still hold. Segments: {retained:?}"
     );
 
-    // The swap: `None` selects the cargo-built binary of the crate under test.
-    harness.server_mut().set_executable_path(None);
-    harness.server_mut().add_env(
-        CONFIG_PATH_ENV,
+    copy_directory(&data_path, &seed_directory);
+    let record = BaselineRecord {
+        data_stream_id: data_stream_details.id,
+        data_topic_id: data_topic_details.id,
+        compression_stream_id: compression_stream_details.id,
+        streams: expected_streams,
+        retained_segments: retained,
+        segment_digests: segment_digests(&baseline_files),
+        first_retained_offset,
+        retained_window: retained_before
+            .into_iter()
+            .map(RecordedMessage::from)
+            .collect(),
+        last_message: tail_before.into_iter().map(RecordedMessage::from).collect(),
+        user_permissions: permissions,
+        wal_tail_user_permissions: tail_permissions,
+        token: pat,
+        wal_tail_token: tail_pat,
+    };
+    fs::write(
+        record_path(&seed_directory),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+#[parallel]
+#[ignore = "needs a data directory seeded by the baseline, run via scripts/ci/storage-compat.sh"]
+async fn given_baseline_data_directory_when_booted_by_build_under_test_should_read_back_the_record()
+{
+    let baseline_config = baseline_server_config();
+    let seed_directory = baseline_data_directory();
+    let record_file = record_path(&seed_directory);
+    let record: BaselineRecord =
+        serde_json::from_slice(&fs::read(&record_file).unwrap_or_else(|error| {
+            panic!(
+                "reading the seed record {}: {error}. The baseline's seed test writes it.",
+                record_file.display()
+            )
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "the seed record {} does not parse: {error}. The baseline's seed test and this \
+                 verify test disagree on the record shape.",
+                record_file.display()
+            )
+        });
+
+    let baseline_files = disk::collect_comparable_files(&seed_directory, false);
+    assert_eq!(
+        segment_digests(&baseline_files),
+        record.segment_digests,
+        "the segment files under {} are not the ones the seed recorded (directory left, record \
+         right), so the directory and its record come from different seed runs or the \
+         directory changed after the seed",
+        seed_directory.display()
+    );
+
+    let fixture = tempfile::tempdir().unwrap();
+    let baseline_document: toml::Value =
+        toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
+    let replacement_config = fixture.path().join("replacement.toml");
+    let current_document: toml::Value =
+        toml::from_str(include_str!("../../../server/config.toml")).unwrap();
+    fs::write(
+        &replacement_config,
+        toml::to_string(&replacement_configuration(
+            &baseline_document,
+            current_document,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let overrides = HashMap::from([(JOURNAL_SLOTS_KEY.to_string(), JOURNAL_SLOTS.to_string())]);
+    let mut envs = resolve_config_paths(&overrides)
+        .expect("metadata.journal_slots resolves against the live config catalog");
+    envs.insert(
+        CONFIG_PATH_ENV.to_string(),
         replacement_config.to_string_lossy().into_owned(),
     );
-    harness.restart_server().await.unwrap_or_else(|error| {
+
+    // No executable path: the harness boots the cargo-built binary of the
+    // crate under test.
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(TestServerConfig::builder().extra_envs(envs).build())
+        .build()
+        .unwrap();
+    let data_path = harness.server().data_path();
+    copy_directory(&seed_directory, &data_path);
+    harness.start().await.unwrap_or_else(|error| {
         panic!(
-            "the server under test did not restart on the data directory the baseline wrote. \
+            "the server under test did not start on the data directory the baseline wrote. \
              A Config(...) error below is a configuration break rather than a storage one: \
              this branch dropped or renamed a key the merge base's config file still sets, or \
              added a field without a `#[serde(default)]`: {error}"
         )
     });
 
-    // `tcp_root_client` hands out a client the harness does not own, so the
-    // reconnect loop inside `restart_server` never touched it. Take a fresh one.
     let client = harness.tcp_root_client().await.unwrap();
+    let data_stream = Identifier::numeric(record.data_stream_id).unwrap();
+    let data_topic = Identifier::numeric(record.data_topic_id).unwrap();
+    let compression_stream = Identifier::numeric(record.compression_stream_id).unwrap();
+    let partition = partition_dir(
+        &data_path,
+        record.data_stream_id,
+        record.data_topic_id,
+        SEEDED_PARTITION,
+    );
+    let readback = Consumer::new(Identifier::named(READBACK_CONSUMER).unwrap());
+    let offset_consumer = Consumer::new(Identifier::named(OFFSET_CONSUMER).unwrap());
+    let offset_group = Consumer::group(Identifier::named(OFFSET_GROUP).unwrap());
+    let first_retained_offset = record.first_retained_offset;
+    let last_offset = PRODUCED_MESSAGES - 1;
+    let retained_before = record
+        .retained_window
+        .into_iter()
+        .map(IggyMessage::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the recorded retained window is hex");
+    let tail_before = record
+        .last_message
+        .into_iter()
+        .map(IggyMessage::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the recorded last message is hex");
 
     // Ids AND names: later reads resolve by numeric id, so a corrupted name
     // would pass a bare count.
     assert_eq!(
         stream_catalog(&client).await,
-        expected_streams,
+        record.streams,
         "streams written by the baseline must all recover with their ids and names, both the \
          checkpointed prefix and the WAL tail"
     );
@@ -761,11 +885,17 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         &wal_tail_topic_options(),
     )
     .await;
-    assert_topic_recovered(&client, &purge_stream, PURGE_TOPIC, &purge_topic_options()).await;
+    assert_topic_recovered(
+        &client,
+        &compression_stream,
+        COMPRESSION_TOPIC,
+        &compression_topic_options(),
+    )
+    .await;
 
     assert_eq!(
         segment_logs(&partition),
-        retained,
+        record.retained_segments,
         "the segment chain must recover exactly as the baseline left it"
     );
 
@@ -830,76 +960,16 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         "the on-disk offset record must decode to the offset the baseline stored"
     );
 
-    let purged = client
-        .get_topic(&purge_stream, &purge_topic)
-        .await
-        .unwrap()
-        .expect("the purged topic survives the swap");
-    assert_eq!(
-        purged.messages_count, POST_PURGE_MESSAGES,
-        "the purged topic must hold exactly the messages appended after the purge: fewer means \
-         `purge.gen` read back as 0 and the partition was purged again, more means the purge \
-         itself was lost"
-    );
-    assert_messages_identical(
-        "the post-purge messages",
-        &post_purge_before,
-        &poll_window(
-            &client,
-            &purge_stream,
-            &purge_topic,
-            &readback,
-            0,
-            READBACK_COUNT,
-        )
-        .await,
-    );
-
-    // A generation that decoded ABOVE the committed one passes both checks
-    // above, nothing was re-purged, while parking the partition past every
-    // purge the topic will ever commit: the reconciler stages a reset only
-    // for `committed > applied`. So a purge issued under the build under test
-    // must still take effect.
-    client
-        .purge_topic(&purge_stream, &purge_topic)
-        .await
-        .unwrap();
-    wait_until("the post-swap purge to empty the topic", async || {
-        let topic = client
-            .get_topic(&purge_stream, &purge_topic)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "the purged topic is gone".to_string())?;
-        if topic.messages_count == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "messages_count is still {}: the reconciler staged no reset, so the recovered \
-                 generation must sit at or above the newly committed one",
-                topic.messages_count
-            ))
-        }
-    })
-    .await;
-    let after_purge = poll_window(
+    assert_user_recovered(&harness, &client, COMPAT_USER, &record.user_permissions).await;
+    assert_user_recovered(
+        &harness,
         &client,
-        &purge_stream,
-        &purge_topic,
-        &readback,
-        0,
-        READBACK_COUNT,
+        WAL_TAIL_USER,
+        &record.wal_tail_user_permissions,
     )
     .await;
-    assert!(
-        after_purge.is_empty(),
-        "offset 0 of the purged topic must be empty after the post-swap purge, got {} message(s)",
-        after_purge.len()
-    );
-
-    assert_user_recovered(&harness, &client, COMPAT_USER, &permissions).await;
-    assert_user_recovered(&harness, &client, WAL_TAIL_USER, &tail_permissions).await;
-    assert_token_recovered(&harness, &client, COMPAT_PAT, &pat).await;
-    assert_token_recovered(&harness, &client, WAL_TAIL_PAT, &tail_pat).await;
+    assert_token_recovered(&harness, &client, COMPAT_PAT, &record.token).await;
+    assert_token_recovered(&harness, &client, WAL_TAIL_PAT, &record.wal_tail_token).await;
 
     let groups = client
         .get_consumer_groups(&data_stream, &data_topic)
@@ -929,12 +999,9 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
          durable state; boot still exits 0, so only the log says so. Server stdout:\n{stdout}"
     );
 
-    // The purged topic was rewritten by the post-swap purge on purpose, so
-    // only the rest of the tree is held to byte identity.
     assert_segments_identical(
         &baseline_files,
         &disk::collect_comparable_files(&data_path, false),
-        &topic_prefix(purge_stream_details.id, purge_topic_details.id),
     );
 }
 
@@ -953,7 +1020,7 @@ fn baseline_path_from_env(variable: &str, artefact: &str) -> String {
             "{variable} is unset. It must be an ABSOLUTE path to the baseline {artefact}. \
              Without it this test would run entirely on the build under test and prove nothing, \
              so it refuses to run. Use scripts/ci/storage-compat.sh, which builds the baseline \
-             and exports both variables."
+             and exports every variable this test reads."
         )
     });
 
@@ -984,6 +1051,61 @@ fn baseline_server_binary() -> String {
 
 fn baseline_server_config() -> String {
     baseline_path_from_env(BASELINE_CONFIG_ENV, "core/server/config.toml")
+}
+
+/// Absolute because the two halves run from different source trees, each with
+/// its own crate directory as the working directory, so a relative value
+/// would name two different places.
+fn baseline_data_directory() -> PathBuf {
+    let raw = std::env::var(BASELINE_DATA_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{BASELINE_DATA_ENV} is unset. It must be an ABSOLUTE path to the data directory the \
+             seed half writes and the verify half boots from. Use scripts/ci/storage-compat.sh, \
+             which runs both halves on one directory."
+        )
+    });
+    let path = PathBuf::from(&raw);
+    assert!(
+        path.is_absolute(),
+        "{BASELINE_DATA_ENV}={raw:?} is relative. The seed and verify halves run from different \
+         crate directories, so it must be ABSOLUTE."
+    );
+    path
+}
+
+fn record_path(data_directory: &Path) -> PathBuf {
+    let mut path = data_directory.as_os_str().to_owned();
+    path.push(".json");
+    PathBuf::from(path)
+}
+
+fn segment_digests(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .map(|(relative, bytes)| (relative.clone(), blake3::hash(bytes).to_hex().to_string()))
+        .collect()
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination)
+        .unwrap_or_else(|error| panic!("creating {}: {error}", destination.display()));
+    let entries = fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("listing {}: {error}", source.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| panic!("listing {}: {error}", source.display()));
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_directory(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap_or_else(|error| {
+                panic!(
+                    "copying {} to {}: {error}",
+                    entry.path().display(),
+                    target.display()
+                )
+            });
+        }
+    }
 }
 
 /// Refuse an override the baseline binary cannot read.
@@ -1140,10 +1262,11 @@ fn wal_tail_topic_options() -> TopicCreateOptions {
     }
 }
 
-/// Options of the topic that is purged. `compression_algorithm` is stored
-/// topic metadata only (the server compresses nothing), so Gzip is just a
-/// non-default value that must round-trip.
-fn purge_topic_options() -> TopicCreateOptions {
+/// Options of the second topic in the snapshot, the only one there that sends
+/// `compression_algorithm`. It is stored topic metadata only (the server
+/// compresses nothing), so Gzip is just a non-default value that must
+/// round-trip.
+fn compression_topic_options() -> TopicCreateOptions {
     TopicCreateOptions {
         partitions_count: Some(PARTITIONS_COUNT),
         compression_algorithm: Some(CompressionAlgorithm::Gzip),
@@ -1153,11 +1276,12 @@ fn purge_topic_options() -> TopicCreateOptions {
 }
 
 /// Deterministic message for `offset`: an explicit id, typed user headers and
-/// the given payload, so a readback can name exactly which message diverged.
-fn seeded_message(offset: u64, payload: Bytes) -> IggyMessage {
+/// the [`payload_for`] payload, so a readback can name exactly which message
+/// diverged.
+fn seeded_message(offset: u64) -> IggyMessage {
     IggyMessage::builder()
         .id(message_id_for(offset))
-        .payload(payload)
+        .payload(payload_for(offset))
         .user_headers(user_headers_for(offset))
         .build()
         .unwrap()
@@ -1205,10 +1329,6 @@ fn payload_for(offset: u64) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn post_purge_payload(index: u64) -> Bytes {
-    Bytes::from(format!("compat-post-purge-{index}"))
-}
-
 /// Alternating bits at every level. All-true (the harness default) reads back
 /// identical under any field permutation, and a level left `None` cannot tell
 /// a dropped map from one never seeded.
@@ -1247,13 +1367,6 @@ fn seeded_permissions(stream_id: u32, topic_id: u32) -> Permissions {
             },
         )])),
     }
-}
-
-/// A personal access token as the baseline handed it out: the raw token a
-/// later login presents, and the stored expiry a listing must reproduce.
-struct SeededToken {
-    raw: String,
-    expiry_at: IggyTimestamp,
 }
 
 async fn create_token(client: &IggyClient, name: &str, expiry_secs: u64) -> SeededToken {
@@ -1302,11 +1415,13 @@ async fn poll_window(
         .poll_messages(
             stream,
             topic,
-            Some(SEEDED_PARTITION),
+            SEEDED_PARTITION,
             consumer,
             &PollingStrategy::offset(offset),
-            count,
-            false,
+            PollOptions {
+                count,
+                ..PollOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("poll {count} message(s) from offset {offset}: {error}"));
@@ -1320,13 +1435,7 @@ async fn poll_window(
 /// The baseline's own readback of what it was asked to store. Verified before
 /// the swap, so the captured messages are a trustworthy oracle for the
 /// field-by-field comparison after it.
-fn assert_seeded_messages(
-    what: &str,
-    messages: &[IggyMessage],
-    first_offset: u64,
-    count: usize,
-    payload: fn(u64) -> Bytes,
-) {
+fn assert_seeded_messages(what: &str, messages: &[IggyMessage], first_offset: u64, count: usize) {
     assert_eq!(
         messages.len(),
         count,
@@ -1346,7 +1455,7 @@ fn assert_seeded_messages(
             "{what}: user headers of the message at offset {offset}"
         );
         assert!(
-            message.payload == payload(offset),
+            message.payload == payload_for(offset),
             "{what}: the payload of the message at offset {offset} ({} bytes) is not the seeded one",
             message.payload.len()
         );
@@ -1409,12 +1518,19 @@ async fn assert_topic_recovered(
         partitions_count: seed.partitions_count.map(|_| topic.partitions_count),
         compression_algorithm: seed
             .compression_algorithm
-            .map(|_| topic.compression_algorithm),
-        message_expiry: seed.message_expiry.map(|_| topic.message_expiry),
-        max_topic_size: seed.max_topic_size.map(|_| topic.max_topic_size),
+            .map(|_| topic.resolved_options().compression_algorithm),
+        message_expiry: seed
+            .message_expiry
+            .map(|_| topic.resolved_options().message_expiry),
+        max_topic_size: seed
+            .max_topic_size
+            .map(|_| topic.resolved_options().max_topic_size),
         segment_size: seed.segment_size.and(recovered.segment_size),
         durability: recovered.durability,
         consumer_offset_durability: recovered.consumer_offset_durability,
+        partition_resize_policy: seed
+            .partition_resize_policy
+            .and(recovered.partition_resize_policy),
         messages_required_to_save: seed
             .messages_required_to_save
             .and(recovered.messages_required_to_save),
@@ -1424,6 +1540,7 @@ async fn assert_topic_recovered(
         preallocate_segments: seed
             .preallocate_segments
             .and(recovered.preallocate_segments),
+        replication_factor: seed.replication_factor.and(recovered.replication_factor),
         raw: BTreeMap::new(),
     };
     assert_eq!(
@@ -1539,17 +1656,10 @@ async fn assert_token_recovered(
         });
 }
 
-/// A topic directory relative to the data directory, in the key form of
-/// [`disk::collect_comparable_files`].
-fn topic_prefix(stream_id: u32, topic_id: u32) -> String {
-    format!("streams/{stream_id}/topics/{topic_id}/")
-}
-
 fn partition_dir(data_path: &Path, stream_id: u32, topic_id: u32, partition_id: u32) -> PathBuf {
-    data_path
-        .join(topic_prefix(stream_id, topic_id))
-        .join("partitions")
-        .join(partition_id.to_string())
+    data_path.join(format!(
+        "streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}"
+    ))
 }
 
 /// Segment log file names in a partition directory, in offset order (they are
@@ -1588,8 +1698,7 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
     );
 }
 
-/// Byte-compare the segment files across the binary swap, except under
-/// `rewritten`, the one directory the build under test was told to change.
+/// Byte-compare the segment files across the binary swap.
 ///
 /// Segment batch headers carry no magic and no version, and recovery is
 /// allowed to truncate a torn tail, so a misparse can shorten a `.log` while
@@ -1597,18 +1706,9 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
 fn assert_segments_identical(
     baseline: &BTreeMap<String, Vec<u8>>,
     current: &BTreeMap<String, Vec<u8>>,
-    rewritten: &str,
 ) {
-    assert!(
-        baseline.keys().any(|rel| rel.starts_with(rewritten)),
-        "`{rewritten}` matches nothing the baseline wrote, so the exclusion would hide a typo \
-         rather than the post-swap purge"
-    );
     let mut problems = Vec::new();
-    for (rel, baseline_bytes) in baseline
-        .iter()
-        .filter(|(rel, _)| !rel.starts_with(rewritten))
-    {
+    for (rel, baseline_bytes) in baseline {
         match current.get(rel) {
             None => problems.push(format!(
                 "`{rel}` was written by the baseline but is GONE after the swap"
@@ -1619,7 +1719,7 @@ fn assert_segments_identical(
             Some(_) => {}
         }
     }
-    for rel in current.keys().filter(|rel| !rel.starts_with(rewritten)) {
+    for rel in current.keys() {
         if !baseline.contains_key(rel) {
             problems.push(format!("`{rel}` appeared only after the swap"));
         }

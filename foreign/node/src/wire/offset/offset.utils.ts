@@ -103,9 +103,6 @@ export const serializeGetOffset = (
   partitionId: number | null
 ) => {
 
-  if (consumer.kind === ConsumerKind.Single && partitionId === null)
-    throw new Error('getOffset error: partitionId must be provided for single consumer kind');
-
   const streamIdentifier = serializeIdentifier(streamId);
   const topicIdentifier = serializeIdentifier(topicId);
   const consumerIdentifier = serializeIdentifier(consumer.id);
@@ -147,6 +144,8 @@ export const serializeStoreOffset = (
   partitionId: number | null,
   offset: bigint
 ) => {
+  if (partitionId === null)
+    throw new Error('storeOffset error: partitionId must be provided');
   const b = Buffer.allocUnsafe(9);
   b.writeBigUInt64LE(offset, 0);
   b.writeUInt8(ACK_QUORUM, 8);
@@ -171,8 +170,11 @@ export const serializeDeleteOffset = (
   topicId: Id,
   consumer: Consumer,
   partitionId: number | null
-) =>
-  Buffer.concat([
+) => {
+  if (partitionId === null)
+    throw new Error('deleteOffset error: partitionId must be provided');
+  return Buffer.concat([
     serializeGetOffset(streamId, topicId, consumer, partitionId),
     uint8ToBuf(ACK_QUORUM)
   ]);
+};

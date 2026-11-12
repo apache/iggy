@@ -21,12 +21,13 @@ package org.apache.iggy.client.async;
 
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.SendMessagesResponse;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -34,7 +35,6 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -42,6 +42,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.iggy.TestConstants.PERSISTED_TOPIC_OPTIONS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -128,10 +129,8 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
         client.users().logout().get(5, TimeUnit.SECONDS);
         log.info("Logout successful");
 
-        // then - commands should fail after logout
-        assertThatThrownBy(() -> client.streams().getStreams().get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .hasCauseInstanceOf(IggyNotConnectedException.class);
+        // then - commands should fail with 40 after logout
+        assertUnauthenticated(client.streams().getStreams());
         log.info("Commands correctly rejected after logout");
 
         // when - re-login
@@ -155,13 +154,7 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
 
         client.streams().createStream(streamName).get(5, TimeUnit.SECONDS);
         client.topics()
-                .createTopic(
-                        StreamId.of(streamName),
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        "test-topic")
+                .createTopic(StreamId.of(streamName), "test-topic", 1L, PERSISTED_TOPIC_OPTIONS)
                 .get(5, TimeUnit.SECONDS);
 
         // when - fire a burst of concurrent requests to exercise lazy
@@ -195,13 +188,7 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
 
         client.streams().createStream(streamName).get(5, TimeUnit.SECONDS);
         client.topics()
-                .createTopic(
-                        StreamId.of(streamName),
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        "test-topic")
+                .createTopic(StreamId.of(streamName), "test-topic", 1L, PERSISTED_TOPIC_OPTIONS)
                 .get(5, TimeUnit.SECONDS);
 
         List<CompletableFuture<SendMessagesResponse>> warmupFutures = new ArrayList<>();
@@ -258,10 +245,18 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
             client.users().logout().get(5, TimeUnit.SECONDS);
 
             // then - verify commands are rejected
-            assertThatThrownBy(() -> client.streams().getStreams().get(5, TimeUnit.SECONDS))
-                    .isInstanceOf(ExecutionException.class)
-                    .hasCauseInstanceOf(IggyNotConnectedException.class);
+            assertUnauthenticated(client.streams().getStreams());
             log.info("Cycle {}: logout and rejection verified", i + 1);
         }
+    }
+
+    private static void assertUnauthenticated(CompletableFuture<?> call) {
+        assertThatThrownBy(() -> call.get(5, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOfSatisfying(
+                        IggyServerException.class,
+                        error ->
+                                assertThat(error.getRawErrorCode()).isEqualTo(IggyErrorCode.UNAUTHENTICATED.getCode()));
     }
 }

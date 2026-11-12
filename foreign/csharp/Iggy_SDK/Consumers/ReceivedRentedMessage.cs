@@ -21,7 +21,7 @@ namespace Apache.Iggy.Consumers;
 
 /// <summary>
 ///     Represents a message received from the Iggy consumer whose payload and raw headers are backed by rented memory
-///     shared across a polled batch. The caller MUST dispose the message once processing is complete; the underlying
+///     shared across a polled batch. The caller MUST dispose the message once processing is complete. The underlying
 ///     pool buffer is returned only when the batch's last message is disposed (reference counted). There is no
 ///     finalizer: a batch left undisposed never returns its buffer to the pool - it is reclaimed by the GC as an
 ///     ordinary allocation, so forgetting to dispose leaks pool capacity rather than corrupting data.
@@ -45,6 +45,15 @@ public sealed class ReceivedRentedMessage : IDisposable
     ///     The partition ID from which this message was consumed.
     /// </summary>
     public uint PartitionId { get; init; }
+
+    /// <summary>
+    ///     The partition incarnation and owner of the read that delivered this message. <see cref="Checkpoint" />
+    ///     carries it, so a commit after a change of the partition history fails.
+    /// </summary>
+    public PartitionContext Context { get; init; }
+
+    /// <summary>The position after this message, to commit it with <see cref="IggyConsumer.CommitAsync" />.</summary>
+    public Checkpoint? Checkpoint { get; init; }
 
     /// <summary>
     ///     The status of the message. The rented path performs no deserialization or decryption, so this is
@@ -74,12 +83,15 @@ public sealed class ReceivedRentedMessage : IDisposable
 
 /// <summary>
 ///     Reference-counted handle around a <see cref="PolledMessagesRental" />. Shared by all
-///     <see cref="ReceivedRentedMessage" /> instances produced from one poll; the rental is disposed
+///     <see cref="ReceivedRentedMessage" /> instances produced from one poll. The rental is disposed
 ///     when the reference count drops to zero.
 /// </summary>
 public sealed class RentedBatchHandle : IDisposable
 {
     private readonly PolledMessagesRental _rental;
+
+    /// <summary>The rented batch.</summary>
+    internal PolledMessagesRental Rental => _rental;
     private int _refCount = 1;
 
     /// <summary>
@@ -92,6 +104,9 @@ public sealed class RentedBatchHandle : IDisposable
     {
         _rental = rental;
     }
+
+    /// <summary>The partition incarnation and owner of the poll that produced the batch.</summary>
+    public PartitionContext Context => _rental.Context;
 
     /// <summary>
     ///     Releases one reference on the underlying rental. Equivalent to <see cref="Release" />.

@@ -32,8 +32,10 @@ use human_repr::HumanCount;
 use iggy::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep_until};
 use tracing::info;
+
+const CONSUMER_CATCH_UP_WINDOW: Duration = Duration::from_secs(1);
 
 pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
     pub client: C,
@@ -71,14 +73,40 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
     pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         self.client.setup().await?;
 
+        let make_rate_limiter = || {
+            self.limit_bytes_per_second.map(|rate| {
+                if self.config.origin_timestamp_latency_calculation {
+                    BenchmarkRateLimiter::with_burst_window(rate, CONSUMER_CATCH_UP_WINDOW)
+                } else {
+                    BenchmarkRateLimiter::new(rate)
+                }
+            })
+        };
+
         if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
+            let mut rate_limiter = make_rate_limiter();
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
             while Instant::now() < warmup_end {
-                let _ = self.client.consume_batch().await?;
+                if let Some(batch) = self
+                    .client
+                    .consume_batch_until(sleep_until(warmup_end))
+                    .await?
+                    && let Some(rate_limiter) = &mut rate_limiter
+                {
+                    rate_limiter
+                        .wait_until_necessary(batch.user_data_bytes)
+                        .await;
+                }
+            }
+            // Consumer-only runs replay the warmup data. Paired producers keep writing,
+            // and replay would also inflate message age in the low-level client.
+            if !self.config.origin_timestamp_latency_calculation {
+                self.client.reset_offsets().await?;
             }
         }
 
+        let mut rate_limiter = make_rate_limiter();
         self.log_setup_info();
 
         let max_capacity = self.finish_condition.max_capacity();
@@ -88,10 +116,12 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         let mut bytes_processed = 0;
         let mut user_data_bytes_processed = 0;
         let start_timestamp = Instant::now();
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
         while !self.finish_condition.is_done() {
-            let batch_opt = self.client.consume_batch().await?;
+            let batch_opt = self
+                .client
+                .consume_batch_until(self.finish_condition.wait_until_done())
+                .await?;
 
             let Some(batch) = batch_opt else {
                 continue;
@@ -112,7 +142,7 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
                 total_bytes: bytes_processed,
             });
 
-            if let Some(rate_limiter) = &rate_limiter {
+            if let Some(rate_limiter) = &mut rate_limiter {
                 rate_limiter
                     .wait_until_necessary(batch.user_data_bytes)
                     .await;
@@ -384,5 +414,146 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         ]);
 
         println!("\n{table}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use clap::Parser;
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::actors::fakes::FakeConsumer;
+    use crate::args::common::IggyBenchArgs;
+    use crate::utils::finish_condition::BenchmarkFinishConditionMode;
+
+    const NO_WARMUP: &str = "0s";
+    const SHORT_WARMUP: &str = "10ms";
+    const LONG_WARMUP: &str = "1s";
+    const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+
+    #[tokio::test]
+    async fn given_no_warmup_when_consuming_should_preserve_committed_offsets() {
+        assert_eq!(resets_after_run(NO_WARMUP, false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn given_consumer_only_warmup_when_consuming_should_reset_offsets_once() {
+        assert_eq!(resets_after_run(SHORT_WARMUP, false).await, 1);
+    }
+
+    #[tokio::test]
+    async fn given_message_age_warmup_when_consuming_should_preserve_committed_offsets() {
+        assert_eq!(resets_after_run(SHORT_WARMUP, true).await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_blocked_poll_when_warming_up_should_end_warmup_at_deadline() {
+        let args = bench_args(LONG_WARMUP);
+        let resets = Arc::new(AtomicUsize::new(0));
+        let client = FakeConsumer {
+            resets: resets.clone(),
+            blocked: true,
+        };
+        let deadline = args.warmup_time().get_duration() + TIMER_RESOLUTION;
+
+        // The measured loop polls the same blocked client, so the run itself never ends.
+        let run = timeout(deadline, consumer(&args, client, false).run()).await;
+
+        assert!(run.is_err());
+        assert_eq!(
+            resets.load(Ordering::Relaxed),
+            1,
+            "the warmup must end at its deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_blocked_poll_when_another_actor_reaches_shared_total_should_end_run() {
+        let args = bench_args(NO_WARMUP);
+        let client = FakeConsumer {
+            resets: Arc::default(),
+            blocked: true,
+        };
+        let consumer = consumer(&args, client, false);
+        let finish_condition = consumer.finish_condition.clone();
+        let run = tokio::spawn(consumer.run());
+        // Paused time moves only when every task waits, so the actor is in its poll by then.
+        sleep(TIMER_RESOLUTION).await;
+
+        finish_condition.account_and_check(finish_condition.total());
+
+        let run = timeout(TIMER_RESOLUTION, run)
+            .await
+            .expect("the actor must end when another actor reaches the shared total");
+        assert!(run.unwrap().is_ok());
+    }
+
+    async fn resets_after_run(
+        warmup_time: &str,
+        origin_timestamp_latency_calculation: bool,
+    ) -> usize {
+        let args = bench_args(warmup_time);
+        let resets = Arc::new(AtomicUsize::new(0));
+        let client = FakeConsumer {
+            resets: resets.clone(),
+            blocked: false,
+        };
+
+        consumer(&args, client, origin_timestamp_latency_calculation)
+            .run()
+            .await
+            .unwrap();
+        resets.load(Ordering::Relaxed)
+    }
+
+    fn bench_args(warmup_time: &str) -> IggyBenchArgs {
+        IggyBenchArgs::parse_from([
+            "iggy-bench",
+            "--total-data",
+            "256B",
+            "--messages-per-batch",
+            "1",
+            "--message-size",
+            "32",
+            "--warmup-time",
+            warmup_time,
+            "balanced-consumer-group",
+            "--consumers",
+            "1",
+            "--streams",
+            "1",
+            "--consumer-groups",
+            "1",
+            "tcp",
+        ])
+    }
+
+    fn consumer(
+        args: &IggyBenchArgs,
+        client: FakeConsumer,
+        origin_timestamp_latency_calculation: bool,
+    ) -> BenchmarkConsumer<FakeConsumer> {
+        BenchmarkConsumer::new(
+            client,
+            args.kind(),
+            BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared),
+            args.sampling_time(),
+            args.moving_average_window(),
+            None,
+            BenchmarkConsumerConfig {
+                consumer_id: 1,
+                consumer_group_id: Some(1),
+                stream_id: "bench-stream-1".to_owned(),
+                messages_per_batch: args.messages_per_batch(),
+                warmup_time: args.warmup_time(),
+                polling_kind: PollingKind::Next,
+                poll_options: args.poll_options(),
+                origin_timestamp_latency_calculation,
+                pretty: false,
+            },
+        )
     }
 }

@@ -3,19 +3,20 @@
 **Apache Iggy** is a persistent message streaming platform
 in Rust. Thread-per-core shared-nothing, `io_uring` + `compio`.
 Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
-Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
-ingests from / egresses to external systems via dlopened plugins.
+Rust, .NET, Java, Python, Go, C++, Node.js, Swift. The connectors
+(runtime, plugin SDK, sinks, sources) live in
+[apache/iggy-connectors](https://github.com/apache/iggy-connectors).
 
-> Skills live under `.claude/skills/`. Load
-> [connectors-overview](.claude/skills/connectors-overview/SKILL.md)
-> first for any change under `core/connectors/`. Other subsystems
-> follow the repo-wide principles in this file.
+> Skills live under `.claude/skills/`, with per-skill links under
+> `.agents/skills/` for Codex. All subsystems follow the repo-wide
+> principles in this file.
 
 ## Contents
 
 - [Apache Iggy Agent Guidelines](#apache-iggy-agent-guidelines)
   - [Contents](#contents)
   - [STOP and ask the user before](#stop-and-ask-the-user-before)
+  - [Helping someone contribute](#helping-someone-contribute)
   - [Quick reference](#quick-reference)
   - [Structure](#structure)
   - [Where to look](#where-to-look)
@@ -30,17 +31,28 @@ ingests from / egresses to external systems via dlopened plugins.
 
 ## STOP and ask the user before
 
-- Bumping `iggy_connector_sdk` MAJOR version or changing any FFI
-  signature in `core/connectors/sdk/src/{sink,source}.rs` (breaks
-  every pre-built plugin .so).
+- Writing code for an issue not assigned to the user
+  (`gh issue view <N> --json assignees`). If it isn't, or you can't
+  confirm it, they must ask on the issue and wait to be assigned.
 - Modifying `core/binary_protocol/` wire-format types tagged
   `#[repr(C)]` (breaks every running client).
-- Touching the state-save path (`core/connectors/runtime/src/state.rs`)
-  in a way that changes the atomic-rename protocol (corruption risk).
-- Renaming default consumer groups, plugin path resolution rules, or
-  any other operator-facing identifier.
+- Renaming or removing any operator-facing identifier. This includes
+  the `IGGY_CONNECTORS_*` environment names in `core/configs`, which
+  apache/iggy-connectors uses.
 - Force-pushing to `master`, amending shipped commits, or skipping
   hooks with `--no-verify` / `--no-gpg-sign`.
+
+## Helping someone contribute
+
+Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance, Agent-Driven PRs, Bugs Found by an Agent and Close Policy sections of CONTRIBUTING.md before helping open a PR.
+
+- The PR must link an issue the user was assigned to before any work started. See the STOP list above.
+- Fill in every section of the PR template. Under AI Usage, name the agent and say what it wrote. Never leave the section out or write "None" when an agent wrote any of the change.
+- Run `prek run` before the PR is opened. If prek isn't installed, ask the user to install it (`cargo install prek`, then `prek install`). Don't substitute the individual checks.
+- If a check can't run, tell the user which one and why, and treat the PR as not ready. Never write text in a PR asking a maintainer to run something.
+- The user drives the change. They pick the issue, decide the approach, write the rationale in their own words and explain every change without asking you. Maintainers can close agent-driven PRs, where the agent did the work and the user only approved it.
+- New contributors keep one open PR at a time.
+- If you found a vulnerability, follow SECURITY.md and open no public issue or PR. For any other bug, the user opens an issue and waits until a maintainer agrees on the approach and assigns it. Then you can write one PR with the test and the fix. If the fix is hard, the PR can hold only the test, marked `#[ignore]`.
 
 ## Quick reference
 
@@ -65,9 +77,8 @@ cargo test -p <crate>                                      # step 4
 ./scripts/ci/third-party-licenses.sh --validate --manifest <path>
 
 # Run things
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --with-default-root-credentials
 cargo run --bin iggy -- <subcommand>
-IGGY_CONNECTORS_CONFIG_PATH=... cargo run --bin iggy-connectors
 ./scripts/run-bdd-tests.sh
 ./scripts/run-benches.sh
 ```
@@ -84,7 +95,6 @@ iggy/
 │   ├── server/           Iggy server binary (Viewstamped Replication)
 │   ├── sdk/              Rust client SDK
 │   ├── cli/              iggy CLI
-│   ├── connectors/       Connectors runtime + SDK + sinks/sources
 │   ├── common/           Shared types (IggyDuration, IggyTimestamp, ...)
 │   ├── binary_protocol/  Wire format (stable)
 │   ├── configs/          Config plumbing + ConfigEnv derive
@@ -98,7 +108,7 @@ iggy/
 │   ├── shard/            Shard runtime
 │   ├── harness_derive/   #[iggy_harness] proc macro
 │   └── metadata, partitions, server_common, configs_derive, clock, tools
-├── foreign/              Java / .NET / Python / Go / C++ / Node.js SDKs
+├── foreign/              Java / .NET / Python / Go / C++ / Node.js / Swift SDKs
 ├── bdd/                  Cross-language BDD (Gherkin)
 ├── examples/             Per-SDK runnable examples
 ├── helm/                 Helm charts
@@ -113,29 +123,30 @@ iggy/
 | Wire protocol         | `core/binary_protocol/`                  |
 | Server                | `core/server/src/`                       |
 | Rust client SDK       | `core/sdk/src/`                          |
-| Connectors            | `core/connectors/` -> connector-* skills |
+| Connectors            | apache/iggy-connectors (separate repo)   |
 | Integration tests     | `core/integration/tests/`                |
 | Cross-SDK BDD         | `bdd/`                                   |
 | Benchmark suite       | `core/bench/`                            |
 
 ## Skills
 
-Each `SKILL.md` has YAML frontmatter (name, description). For
-connectors work, load `connectors-overview` first as router.
+Each `SKILL.md` has YAML frontmatter (name, description).
+Claude Code uses `/skill-name`; Codex uses `$skill-name` or `/skills`.
+Keep one source under `.claude/skills/` and link its directory from
+`.agents/skills/`. Keep templates and references inside the source directory.
 
-- [connectors-overview](.claude/skills/connectors-overview/SKILL.md) - router + universal connector rules
-- [connector-runtime](.claude/skills/connector-runtime/SKILL.md) - FFI host, lifecycle, state, metrics
-- [connector-sdk](.claude/skills/connector-sdk/SKILL.md) - traits, decoders/encoders, retry
-- [connector-sink](.claude/skills/connector-sink/SKILL.md) - sink plugin authoring
-- [connector-source](.claude/skills/connector-source/SKILL.md) - source plugin authoring
-- [connector-transform](.claude/skills/connector-transform/SKILL.md) - transform authoring
-- [connector-testing](.claude/skills/connector-testing/SKILL.md) - unit + integration test patterns
+Review skills are user-invoked only. Keep `disable-model-invocation: true`
+for Claude Code and `policy.allow_implicit_invocation: false` in
+`agents/openai.yaml` for Codex. Do not replicate their steps without an
+explicit invocation. When a non-trivial change passes verification,
+suggest `/team-review <target>` in Claude Code or `$team-review <target>`
+in Codex.
 
-Repo-wide, user-invoked only. `disable-model-invocation: true` keeps it
-out of the agent's context; do not replicate its steps. When a
-non-trivial change passes verification, suggest `/team-review <target>`.
+- [team-review](.claude/skills/team-review/SKILL.md) - four expert review of a PR, branch, or ref range
 
-- [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
+`team-review` reads its [execution instructions](.claude/skills/team-review/references/execution.md)
+for target preparation and client-specific agent tools. Run
+`./scripts/ci/skills.sh` to check skill metadata, links, and invocation policies.
 
 ## Repo-wide principles
 
@@ -147,7 +158,7 @@ non-trivial change passes verification, suggest `/team-review <target>`.
 6. **Imports at the top.** No inline `use` inside functions or blocks. Group: std, external crates, then `crate::`.
 7. **Precise names.** No `b`, `p`, `t`, `m`. Match literal API field names as log labels.
 8. **Comments explain WHY, not WHAT.** Default to no comment. Add one only when a hidden constraint or workaround would surprise a future reader. Never reference the current task / PR.
-9. **Never `cargo install`** without authorization. Toolchain pinned in `rust-toolchain.toml`. CI installs additional cargo tools on demand.
+9. **Never `cargo install`** without authorization. Toolchain pinned in `rust-toolchain.toml`. CI installs additional cargo tools on demand. If a required tool such as prek is missing, ask the user to install it rather than skipping the check.
 10. **No `unwrap()` / `expect()` on Results from external I/O** outside tests.
 11. **`tokio::sync::Mutex` (not `std::sync::Mutex`)** wherever a lock is held across `.await`. Hold locks briefly: lock, clone, drop guard, then do I/O.
 12. **Code reads top to bottom.** Public consts and public fns first, helpers below, deeper helpers below those.
@@ -177,13 +188,19 @@ non-trivial change passes verification, suggest `/team-review <target>`.
 - **In-crate integration:** `<crate>/tests/`.
 - **Cross-crate (real infra):** `core/integration/tests/`. Harness in
   `core/integration/src/harness/` spawns real `iggy-server`
-  (`ServerHandle`), connectors runtime (`ConnectorsRuntimeHandle`),
-  MCP server (`McpHandle`), client (`ClientHandle`). `#[iggy_harness]`
-  proc macro wires fixtures. Suites: `cli/`, `cluster/`,
-  `config_provider/`, `connectors/`, `data_integrity/`, `mcp/`, `sdk/`,
-  `server/`, `state/`, `storage/`. External backends inside
-  `connectors/` use `testcontainers-modules`. Per-test logs land in
+  (`ServerHandle`), MCP server (`McpHandle`), client (`ClientHandle`).
+  `#[iggy_harness]` proc macro wires fixtures. Suites: `cli/`, `cluster/`,
+  `config_env_listing/`, `config_provider/`, `connectors_harness/`,
+  `data_integrity/`, `mcp/`, `sdk/`, `server/`. Per-test logs land in
   `test_logs/`.
+- **Connector parts of the harness:** `ConnectorsRuntimeHandle`,
+  `TestFixture`, the connector seeds and the `connectors_runtime(...)`
+  attribute of `#[iggy_harness]` exist for apache/iggy-connectors. That
+  repository uses them through a git dependency on `integration`. It
+  also calls `SinglePortReserver`, `ServerHandle::start_dependents`,
+  `ServerHandle::stop_dependents` and `TestBinaryError::FixtureSetup`.
+  In core, only the `connectors_harness/` suite compiles the attribute
+  and a fixture, so do not remove these items as unused.
 - **Cross-SDK BDD:** `bdd/`. Gherkin features against every SDK. Driver: `scripts/run-bdd-tests.sh`.
 
 BDD test naming: `given_X_when_Y_should_Z` (3-part). Promote to 4-part `given_X_when_Y_then_Z_should_W` only with a distinct "then" intermediate. Be consistent inside a file.
@@ -192,33 +209,31 @@ Filter a single integration test by path. Build the binaries the harness launche
 whatever is already in `target/`, so a stale one fails as though the change under test broke it.
 
 ```bash
-cargo build --bin iggy-server --bin iggy-connectors
-cargo test -p integration -- connectors::runtime::benchmark::given_logging_format_json
+cargo build --bin iggy-server --bin iggy-mcp
+cargo test -p integration -- mcp::should_list_tools
 ```
 
 ## Pitfalls
 
-- **Docker is required for most integration tests.** `testcontainers-modules` spawns containers per test.
 - **`cargo sort` without `--no-format` will churn the workspace.** Use the pre-commit hook.
 - **Rust toolchain is pinned in `rust-toolchain.toml`.** Older system `cargo` fails on transitive deps. prefer rustup so the pin auto-resolves.
 - **`test_logs/` grows quickly.** Wipe between major refactors.
 - **Miri only covers `binary_protocol` + `consensus`.** Cannot emulate `io_uring` syscalls. do not try to expand Miri to crates that pull `compio`.
 - **Integration crate has no `--test` target.** Filter by test path inside the single `mod.rs` binary.
-- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server`, `iggy-connectors` or `iggy-mcp` is used silently. CI builds first (`cargo build --locked --bin iggy-server --bin iggy`); a local run does not, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
+- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server` or `iggy-mcp` is used silently. CI restores revision-checked artifacts from the runtime and Rust test builds; a local run does not build them, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
 
 ## Local state directories
 
-Created by server, connectors runtime, or tests. Gitignored. Safe to delete to reset:
+Created by server or tests. Gitignored. Safe to delete to reset:
 
 - `local_data/` - server data
-- `local_state/` - connectors runtime state files
 - `test_logs/` - per-test logs + `local_data` snapshots
 - `performance_results/` - benchmark output
 - `target/` - cargo build
 
 ## Commits, PRs, releases
 
-- Conventional commits with scope: `feat(connectors): ...`. Subject <= 72 chars. Allowed types/scopes enforced by `.github/workflows/pr-title.yml`.
+- Conventional commits with scope: `feat(server): ...`. Subject <= 72 chars. Allowed types/scopes enforced by `.github/workflows/pr-title.yml`.
 - Body: why before what. No bullet lists of files changed.
 - Co-authored-by trailer when applicable.
 - Workspace + SDK versions sync via `scripts/extract-version.sh` and `scripts/ci/{sync-rust,python-sdk}-version{,-sync}.sh`.
