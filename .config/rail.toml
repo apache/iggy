@@ -16,8 +16,8 @@
 # under the License.
 
 # Tests launch these artifacts at run time, an edge Cargo cannot record:
-# `integration` spawns binaries through `Command::cargo_bin` and dlopens every
-# connector plugin, and the Kafka gateway suites spawn `iggy-server`.
+# `integration` spawns binaries through `Command::cargo_bin`, and the Kafka
+# gateway suites spawn `iggy-server`.
 [plan.work.runtime-artifacts]
 scope = "cargo"
 cargo_prerequisites = [
@@ -27,10 +27,7 @@ cargo_prerequisites = [
         { package = "server", target = { name = "iggy-server", kind = "bin" } },
         { package = "iggy-cli", target = { name = "iggy", kind = "bin" } },
         { package = "iggy-bench", target = { name = "iggy-bench", kind = "bin" } },
-        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
         { package = "iggy-mcp", target = { name = "iggy-mcp", kind = "bin" } },
-    ], require_target_kinds = [
-        "cdylib",
     ] },
     { source_work = "cargo.test", when = [
         { package = "iggy-gateway-kafka" },

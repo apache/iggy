@@ -27,6 +27,7 @@ pub mod error;
 pub mod iggy_bridge;
 pub mod nodes;
 pub mod topic_map;
+pub mod topic_settings;
 
 pub use config::{
     DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, MAX_FETCH_SLOTS,
@@ -37,9 +38,14 @@ pub use iggy_bridge::{
     CLUSTER_ID_TOPIC, COORDINATOR_LEASE_GROUP, COORDINATOR_LOG_TOPIC, COORDINATOR_OWNER_TOPIC,
     ClusterIdCall, CoordinatorLink, DEFAULT_TOPIC_PARTITIONS, DeletedTopic, IggyBridge,
     KafkaTopicMetadata, LoggedRecord, MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls,
-    OffsetGroupSource, OffsetGroups, PartitionBatch, PermissionBoard, ProduceTurn, Producer,
-    ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicShape, TopicShapes,
-    TopicTarget, UserAccess, cluster_id_stream, iggy_producer_id, kafka_producer_id,
+    OffsetGroupListing, OffsetGroupSource, OffsetGroups, PartitionBatch, PermissionBoard,
+    ProduceTurn, Producer, Reach, ScannedGroups, StreamTopicCache, TopicCreationOutcome, TopicLoad,
+    TopicShape, TopicShapes, TopicTarget, UserAccess, cluster_id_stream, iggy_producer_id,
+    kafka_producer_id,
 };
 pub use nodes::KnownNodes;
 pub use topic_map::{TopicMapping, TopicOverride};
+pub use topic_settings::{
+    CleanupPolicy, KafkaTopicSettings, RetentionBytes, SettingChange, TopicConfigSnapshot,
+    TopicConfigUpdate, TopicDefaults,
+};

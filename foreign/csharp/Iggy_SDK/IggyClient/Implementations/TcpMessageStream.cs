@@ -332,9 +332,7 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
     {
         using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, strategy, options,
             token);
-        var polled = BinaryMapper.MaterializeMessages(rental);
-        polled.RequestStart = strategy;
-        return polled;
+        return BinaryMapper.MaterializeMessages(rental);
     }
 
     /// <inheritdoc />
@@ -1114,10 +1112,8 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
 
         try
         {
-            long? deadline = null;
             if (deferred is not null)
             {
-                deadline = Environment.TickCount64 + (long)deferred.RequestTimeout.TotalMilliseconds;
                 deferred = deferred with
                 {
                     MaxBytes = Math.Min(deferred.MaxBytes,
@@ -1129,17 +1125,25 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
                 topicId, pollingStrategy, count, autoCommit, partitionId ?? 0, deferred);
 
             var body = payload.AsMemory(0, messageBufferSize);
-            responseBuffer = await SendWithResponseAsync(
-                deferred is null ? CommandCodes.POLL_MESSAGES_CODE : CommandCodes.POLL_MESSAGES_DEFERRED_CODE, body,
-                token: token, capturedContext: pollingStrategy.Context, deadline: deadline, startedUnder: generation);
+            var code = deferred is null ? CommandCodes.POLL_MESSAGES_CODE : CommandCodes.POLL_MESSAGES_DEFERRED_CODE;
+            responseBuffer = await SendRoutedAsync(code, PartitionTarget(code, body.Span), body,
+                pollingStrategy.Context, token, deferred?.RequestTimeout, generation);
             if (responseBuffer.Memory.Length == 0)
             {
                 responseBuffer.Dispose();
-                return EmptyPolledMessages;
+                return new PolledMessagesRental(EmptyMemoryOwner.Instance)
+                {
+                    PartitionId = 0,
+                    CurrentOffset = 0,
+                    Messages = [],
+                    RequestStart = pollingStrategy
+                };
             }
 
-            return BinaryMapper.MapRentedMessages(responseBuffer.Memory, responseBuffer,
+            var rental = BinaryMapper.MapRentedMessages(responseBuffer.Memory, responseBuffer,
                 _configuration.MessageEncryptor);
+            rental.RequestStart = pollingStrategy;
+            return rental;
         }
         catch
         {

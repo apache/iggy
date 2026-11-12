@@ -361,6 +361,7 @@ pub struct ShardMetrics {
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
     partitions_duplicate_builds_discarded_total: Counter,
+    partitions_reconcile_repairs_total: Counter,
     partition_transfer_refusals_total: Counter,
     partition_applied_divergences_total: Counter,
     partitions_untrusted_log: Gauge,
@@ -457,6 +458,7 @@ impl ShardMetrics {
             partitions_removed_total: Counter::default(),
             partitions_reconcile_failures_total: Counter::default(),
             partitions_duplicate_builds_discarded_total: Counter::default(),
+            partitions_reconcile_repairs_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
             partition_applied_divergences_total: Counter::default(),
             partitions_untrusted_log: Gauge::default(),
@@ -798,6 +800,22 @@ impl ShardMetrics {
     /// full, permission denied, ENOENT on a path it cannot recreate, etc.).
     pub fn record_partition_reconcile_failure(&self) {
         self.partitions_reconcile_failures_total.inc();
+    }
+
+    /// Bumped when the periodic full reconcile changes a partition that no
+    /// committed change and no local record announced. The reconciler's
+    /// change sources should make this unreachable, so a non-zero value is a
+    /// caught correctness anomaly that only the repair fixed.
+    pub fn record_partition_reconcile_repair(&self) {
+        self.partitions_reconcile_repairs_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings; the production scrape goes
+    /// through the prometheus registry.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partitions_reconcile_repairs_value(&self) -> u64 {
+        self.partitions_reconcile_repairs_total.get()
     }
 
     /// Bumped every time a serving peer refuses a partition state transfer.
@@ -1224,6 +1242,11 @@ impl ShardMetrics {
             "partitions_duplicate_builds_discarded",
             "duplicate partition builds discarded by the pump; non-zero is a caught anomaly",
             self.partitions_duplicate_builds_discarded_total.clone(),
+        );
+        registry.register(
+            "partitions_reconcile_repairs",
+            "partitions the periodic full reconcile changed although no change announced them; non-zero is a caught anomaly",
+            self.partitions_reconcile_repairs_total.clone(),
         );
         registry.register(
             "partition_transfer_refusals",

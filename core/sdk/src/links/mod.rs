@@ -65,9 +65,10 @@ pub(crate) const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
 pub(crate) type LateReply = Box<dyn FnOnce(Result<Reply, IggyError>) + Send>;
 
 tokio::task_local! {
-    /// Turns true when the reader of the committing reads of this task closes. A committing
-    /// deferred request then sends its cancel and still takes its one reply, which tells whether
-    /// the server stored.
+    /// Turns true when the reader cancels the committing read of this task: at its close, or
+    /// for the seek or the offset store of one of its partitions. A committing deferred request
+    /// then sends its cancel and still takes its one reply, which tells whether the server
+    /// stored.
     pub(crate) static CANCEL_COMMITTING: watch::Receiver<bool>;
 }
 
