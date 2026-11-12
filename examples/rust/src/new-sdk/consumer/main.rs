@@ -111,7 +111,8 @@ pub async fn consume_messages(
 
 /// The consumer stops a partition after a read with an unknown outcome, a message that does not
 /// decode, or a new partition history, and retries any other error by itself. Without a seek, a
-/// run on one partition would stall.
+/// run on one partition would stall. It also stops a partition after refusals in a row that a
+/// retry does not change. A seek would meet the same refusal, so this example ends with it.
 async fn resume_partition(
     client: &IggyClient,
     consumer: &mut IggyConsumer,
@@ -120,6 +121,13 @@ async fn resume_partition(
     let Some(partition_id) = error.partition_id else {
         return Ok(());
     };
+    // A report of lost messages stops nothing, and a seek would drop the batch that follows it.
+    if error.lost.is_some() {
+        return Ok(());
+    }
+    if error.is_lasting_refusal() {
+        return Err(error.error);
+    }
     let start = match (error.error, error.skip) {
         (
             IggyError::FetchProgressUncertain(operation)

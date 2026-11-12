@@ -24,8 +24,8 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 # From iggy workspace root (or iggy-gateway-kafka subdir)
 cargo build -p iggy-gateway-kafka
 
-# Terminal 1 — start listener (default 127.0.0.1:9093)
-RUST_LOG=info cargo run -p iggy-gateway-kafka
+# Terminal 1 — start listener (default 127.0.0.1:9093) in stub mode, without Iggy
+IGGY_KAFKA_BRIDGE_ENABLED=false RUST_LOG=info cargo run -p iggy-gateway-kafka
 ```
 
 Expected log:
@@ -79,7 +79,7 @@ No host installs needed, both clients run from containers with `--network host`:
 IGGY_PATH=/tmp/iggy-sasl-data ./target/debug/iggy-server --fresh --with-default-root-credentials
 
 # Terminal 2 - gateway with SASL on
-IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_BRIDGE_ENABLED=false IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
   IGGY_KAFKA_BIND_ADDR=127.0.0.1:9095 RUST_LOG=debug cargo run -p iggy-gateway-kafka
 ```
 
@@ -118,9 +118,8 @@ docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:
 
 S7 and S8 send `SaslHandshake` v0 and then the token in a bare frame with no request header
 (KIP-152). kafka-python 2.0.2 always does this, and Sarama does it by default up to 1.40.1. Both
-cases produce, so add `IGGY_KAFKA_BRIDGE_ENABLED=true IGGY_KAFKA_IGGY_USERNAME=iggy
-IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway in
-terminal 2. kafka-python 2.0.2 needs Python 3.11 or older:
+cases produce, so in terminal 2 drop `IGGY_KAFKA_BRIDGE_ENABLED=false` and add
+`IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway. kafka-python 2.0.2 needs Python 3.11 or older:
 
 ```bash
 uv venv --python 3.11 /tmp/kafka-python-2.0.2
@@ -385,8 +384,8 @@ The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:909
 broker's usual port). Every command below passes `--host 127.0.0.1:9093` explicitly - omitting it
 connection-refuses before any assertion runs.
 
-Every case below describes a gateway started **without** a bridge (`IGGY_KAFKA_BRIDGE_ENABLED`
-unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
+Every case below describes a gateway started **without** a bridge
+(`IGGY_KAFKA_BRIDGE_ENABLED=false`). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
 `tests/produce_real_bridge_tests.rs` covers the bridge path.
 
 | ID | Test | Steps | Expected result | Pass criteria |
