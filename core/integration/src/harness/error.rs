@@ -66,6 +66,7 @@ pub enum TestBinaryError {
     NotStarted,
     AlreadyStarted,
     SeedFailed(String),
+    /// Only the fixtures in apache/iggy-connectors return this.
     FixtureSetup {
         fixture_type: String,
         message: String,

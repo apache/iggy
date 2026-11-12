@@ -458,6 +458,28 @@ TEST(IggyExceptionTest, CopyKeepsKindAfterOriginalIsDestroyed) {
     EXPECT_EQ(copy.Kind(), "operation_not_retained");
 }
 
+namespace iggy {
+
+// ReadException names this class as a friend, because only a failed read against a server builds one.
+class ReadExceptionTestPeer {
+  public:
+    static ReadException FromBridge(ffi::ReadErrorInfo &error) { return ReadException("read failed", error); }
+};
+
+}  // namespace iggy
+
+TEST(ReadExceptionTest, IsLastingRefusalFollowsTheBridgeFlag) {
+    for (const bool lasting_refusal : {true, false}) {
+        SCOPED_TRACE(lasting_refusal);
+        iggy::ffi::ReadErrorInfo read_error{};
+        read_error.lasting_refusal = lasting_refusal;
+
+        const auto error = iggy::ReadExceptionTestPeer::FromBridge(read_error);
+
+        EXPECT_EQ(error.IsLastingRefusal(), lasting_refusal);
+    }
+}
+
 TEST(IggyBlockingClientTest, RecoveryErrorsPreserveFullWidthOperationIds) {
     auto client                      = iggy::IggyBlockingClient::Builder().Build();
     const std::uint64_t operations[] = {(std::uint64_t{1} << 53) + 7, std::numeric_limits<std::uint64_t>::max()};

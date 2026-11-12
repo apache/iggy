@@ -371,7 +371,14 @@ final class PollRouter: Sendable {
         }
     }
 
-    func progressContext(
+    /// The context that a request on the route of `key` names. The server
+    /// refuses a poll, a store, a delete and a lookup with incarnation 0 as
+    /// `historyUnavailable`. So a context without an incarnation takes the
+    /// one of the route and keeps its owner and op, which the server still
+    /// checks. A fully zero context carries nothing and takes the route
+    /// context, as nil does. A route without an incarnation is not ready,
+    /// which is a transient refusal.
+    func historyContext(
         _ key: RouteKey, context: PartitionContext?, lineage: UInt64, coordinator: ClientCore, deadline: ContinuousClock.Instant
     ) async throws -> PartitionContext {
         if let context, context.incarnation != 0 {
@@ -382,7 +389,7 @@ final class PollRouter: Sendable {
             guard route.context.incarnation != 0 else {
                 throw IggyError(.transientNotAccepted, context: "the route has no partition incarnation")
             }
-            guard let context else {
+            guard let context, context != .empty else {
                 return route.context
             }
             return PartitionContext(
@@ -390,9 +397,8 @@ final class PollRouter: Sendable {
         }
     }
 
-    /// Sends a poll or an offset request on its route. `context` is the
-    /// partition context the caller captured, else the route's is taken and
-    /// kept for every retry.
+    /// Sends a poll or an offset request on its route. Every attempt names
+    /// `context`.
     ///
     /// `deadline` is checked between attempts and caps each exchange instead
     /// of cancelling one in flight, which would take the coordinator
@@ -411,7 +417,7 @@ final class PollRouter: Sendable {
     /// committing request answers the cancellation once, so its caller waits
     /// for that reply.
     func send(
-        _ code: CommandCode, body: Body, key: RouteKey, context: PartitionContext?, lineage: UInt64, coordinator: ClientCore,
+        _ code: CommandCode, body: Body, key: RouteKey, context: PartitionContext, lineage: UInt64, coordinator: ClientCore,
         deadline: ContinuousClock.Instant
     ) async throws -> [UInt8] {
         if body.isDeferred {
@@ -433,7 +439,6 @@ final class PollRouter: Sendable {
             _ = try await control(.ping, [], lineage: lineage, coordinator: coordinator, deadline: deadline)
         }
         let request = Request(code: code, body: body, key: key, lineage: lineage, deadline: deadline)
-        var captured = context
         var backoff = Backoff()
         var replay = Replay()
         var refusal = IggyError(.transientNotAccepted, context: "the budget ran out before command \(code.rawValue) was sent")
@@ -443,9 +448,9 @@ final class PollRouter: Sendable {
             }
             do {
                 if clustered {
-                    return try await sendOnPrimary(request, context: &captured, replay: &replay, coordinator: coordinator)
+                    return try await sendOnPrimary(request, context: context, replay: &replay, coordinator: coordinator)
                 }
-                return try await sendOnCoordinator(request, context: &captured, replay: &replay, coordinator: coordinator)
+                return try await sendOnCoordinator(request, context: context, replay: &replay, coordinator: coordinator)
             } catch let error as IggyError {
                 if body.fetchAttempt?.mayHaveCommitted == true {
                     // A committing read that may have stored is never sent again.
@@ -672,29 +677,26 @@ final class PollRouter: Sendable {
         }.value
     }
 
-    /// The single-node path: the request goes over the coordinator connection
-    /// with the context of its route, a deferred one over a data connection to
-    /// the same node.
+    /// The single-node path: the request goes over the coordinator
+    /// connection, a deferred one over a data connection to the same node.
     private func sendOnCoordinator(
-        _ request: Request, context: inout PartitionContext?, replay: inout Replay, coordinator: ClientCore
+        _ request: Request, context: PartitionContext, replay: inout Replay, coordinator: ClientCore
     ) async throws -> [UInt8] {
         let route = try await route(request.key, clustered: false, lineage: request.lineage, coordinator: coordinator, deadline: request.deadline)
-        let captured = context ?? route.context
-        context = captured
         do {
             if request.body.isDeferred {
                 return try await exchange(
-                    at: await coordinator.serverAddress, code: request.code.rawValue, body: request.body, context: captured,
+                    at: await coordinator.serverAddress, code: request.code.rawValue, body: request.body, context: context,
                     identity: route.consumerSession, lineage: request.lineage, fence: route.fence, coordinator: coordinator, deadline: request.deadline,
                     dialDeadline: request.deadline, replay: &replay)
             }
             let payload = try request.body.payload()
             if request.code == .pollMessages {
                 return try await coordinator.exchangeOnce(
-                    code: request.code.rawValue, payload: payload, context: captured, deadline: request.deadline, lineage: request.lineage)
+                    code: request.code.rawValue, payload: payload, context: context, deadline: request.deadline, lineage: request.lineage)
             }
             return try await coordinator.exchange(
-                code: request.code.rawValue, payload: payload, context: captured, deadline: request.deadline, lineage: request.lineage)
+                code: request.code.rawValue, payload: payload, context: context, deadline: request.deadline, lineage: request.lineage)
         } catch let unsent as UnsentRequest {
             removeRoute(request.key)
             throw unsent.refusal
@@ -707,14 +709,12 @@ final class PollRouter: Sendable {
     /// The cluster path: the request goes over a data connection to the
     /// partition primary.
     private func sendOnPrimary(
-        _ request: Request, context: inout PartitionContext?, replay: inout Replay, coordinator: ClientCore
+        _ request: Request, context: PartitionContext, replay: inout Replay, coordinator: ClientCore
     ) async throws -> [UInt8] {
         let route = try await route(request.key, clustered: true, lineage: request.lineage, coordinator: coordinator, deadline: request.deadline)
-        let captured = context ?? route.context
-        context = captured
         do {
             return try await exchange(
-                onReplica: route.primaryReplica, code: request.code.rawValue, body: request.body, context: captured,
+                onReplica: route.primaryReplica, code: request.code.rawValue, body: request.body, context: context,
                 identity: route.consumerSession, lineage: request.lineage, fence: route.fence, coordinator: coordinator, deadline: request.deadline,
                 dialDeadline: request.deadline, replay: &replay)
         } catch let unsent as UnsentRequest {

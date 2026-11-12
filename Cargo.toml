@@ -39,6 +39,7 @@ members = [
     "core/kafka_wire",
     "core/message_bus",
     "core/metadata",
+    "core/object_store",
     "core/partitions",
     "core/sdk",
     "core/server",
@@ -176,6 +177,7 @@ iggy-gateway-kafka = { path = "gateways/kafka" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.12.0" }
 iggy_common = { path = "core/common", version = "0.12.0" }
 iggy_kafka_wire = { path = "core/kafka_wire" }
+iggy_object_store = { path = "core/object_store" }
 indexmap = "2.14.2"
 integration = { path = "core/integration" }
 ipnet = "2.12.2"
@@ -286,6 +288,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "fmt",
     "env-filter",
     "ansi",
+    "tracing-log",
 ] }
 trait-variant = "0.1.3"
 tungstenite = "0.30.0"
