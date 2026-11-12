@@ -27,6 +27,9 @@ enum VSRFrame {
     /// Upper bound on a frame the client is willing to read; a corrupt size
     /// field must not turn into a multi-gigabyte allocation.
     static let maxFrameSize = 1 << 30
+    /// The largest request frame the server reads, its default
+    /// `max_message_size`; it drops the connection on a larger one.
+    static let maxRequestSize = 64 * 1024 * 1024
 
     /// Request header field offsets the client writes.
     enum RequestOffset {
@@ -53,6 +56,10 @@ enum VSRFrame {
         static let status = 216
         static let committedResult = 220
     }
+
+    /// The byte at ``ReplyOffset/committedResult`` that proves a final
+    /// committed result, `ReplyHeader::COMMITTED_RESULT` in Rust.
+    static let committedResultMarker: UInt8 = 1
 
     /// Eviction header field offsets the client reads.
     enum EvictionOffset {
@@ -97,15 +104,35 @@ enum VSRFrame {
         /// can be replayed as it is after a reconnect.
         let clientID: UInt128Value
         let session: UInt64
+
+        /// A cancellation for a deferred poll or fetch, as
+        /// `RequestHeader::deferred_cancellation` in Rust: the header of this
+        /// request with command 108, no body and no partition context. It
+        /// must follow the request on the same connection, so the server sees
+        /// the request queued or admitted when the cancellation arrives. Nil
+        /// for any other request.
+        var deferredCancellation: [UInt8]? {
+            let code = UInt32(littleEndianBytes: bytes[RequestOffset.reserved..<RequestOffset.reserved + 4])
+            guard operation == .nonReplicated, CommandCode.isDeferred(code) else {
+                return nil
+            }
+            var frame = Array(bytes[..<VSRFrame.headerSize])
+            frame.withUnsafeMutableBytes { buffer in
+                buffer.storeBytes(of: UInt32(VSRFrame.headerSize).littleEndian, toByteOffset: RequestOffset.size, as: UInt32.self)
+                buffer.storeBytes(of: CommandCode.cancelDeferredRequest.rawValue.littleEndian, toByteOffset: RequestOffset.reserved, as: UInt32.self)
+            }
+            let context = RequestOffset.partitionIncarnation..<RequestOffset.minimumMetadataOp + 8
+            frame.replaceSubrange(context, with: repeatElement(0, count: context.count))
+            return frame
+        }
     }
 
     /// Builds the complete request frame for a command code and its encoded
     /// payload, deriving sequencing from the command code and the session.
     ///
-    /// The request checksum is stamped for the operations the server's client
-    /// table deduplicates, like the Rust SDK does; partition and
-    /// non-replicated operations leave it zero, which the server reads as
-    /// unstamped.
+    /// Metadata and session requests carry a random identifier retained in
+    /// the encoded frame across retries. Partition and non-replicated
+    /// operations leave it zero.
     ///
     /// `partitionContext` is the context captured with the partition the
     /// request targets. The server fences a send or an offset change on it, so
@@ -134,8 +161,14 @@ enum VSRFrame {
             sessionID = bound
             requestID = try session.nextRequestID()
         }
-        let requestChecksum: UInt64 =
-            (operation.isPartition || operation == .nonReplicated) ? 0 : XXH3.hash64(payload)
+        let requestIdentifier: UInt128Value =
+            if operation.isPartition || operation == .nonReplicated {
+                .zero
+            } else if operation == .register {
+                session.registerRequestIdentifier
+            } else {
+                .random()
+            }
 
         var frame = [UInt8]()
         frame.reserveCapacity(totalSize)
@@ -145,7 +178,8 @@ enum VSRFrame {
             buffer[RequestOffset.command] = Command.request.rawValue
             buffer.storeBytes(of: session.clientID.low.littleEndian, toByteOffset: RequestOffset.client, as: UInt64.self)
             buffer.storeBytes(of: session.clientID.high.littleEndian, toByteOffset: RequestOffset.client + 8, as: UInt64.self)
-            buffer.storeBytes(of: requestChecksum.littleEndian, toByteOffset: RequestOffset.requestChecksum, as: UInt64.self)
+            buffer.storeBytes(of: requestIdentifier.low.littleEndian, toByteOffset: RequestOffset.requestChecksum, as: UInt64.self)
+            buffer.storeBytes(of: requestIdentifier.high.littleEndian, toByteOffset: RequestOffset.requestChecksum + 8, as: UInt64.self)
             buffer.storeBytes(of: requestID.littleEndian, toByteOffset: RequestOffset.request, as: UInt64.self)
             buffer[RequestOffset.operation] = operation.rawValue
             buffer.storeBytes(of: sessionID.littleEndian, toByteOffset: RequestOffset.session, as: UInt64.self)
@@ -177,6 +211,14 @@ enum VSRFrame {
             return nil
         }
         return Command(rawValue: header[header.startIndex + ReplyOffset.command])
+    }
+
+    static func readRequestID(_ header: ArraySlice<UInt8>) -> UInt64? {
+        guard header.count >= RequestOffset.request + 8 else {
+            return nil
+        }
+        let start = header.startIndex + RequestOffset.request
+        return UInt64(littleEndianBytes: header[start..<start + 8])
     }
 
     static func readReplyRequestID(_ header: ArraySlice<UInt8>) -> UInt64? {
@@ -216,7 +258,7 @@ enum VSRFrame {
     static func hasCommittedResult(_ header: ArraySlice<UInt8>) -> Bool {
         header.count == headerSize && peekCommand(header) == .reply
             && readReplyStatus(header) == 0
-            && header[header.startIndex + ReplyOffset.committedResult] == 1
+            && header[header.startIndex + ReplyOffset.committedResult] == committedResultMarker
     }
 
     /// The decoded fields of an eviction frame.

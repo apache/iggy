@@ -17,12 +17,44 @@
 
 //! Partition reconciliation loop.
 //!
-//! One task per shard. On wake (commit tick or periodic safety tick),
-//! diff committed `Streams` STM against local `IggyPartitions`:
+//! One task per shard. On wake (commit tick or periodic safety tick), it
+//! checks each namespace of its work set against committed `Streams` STM and
+//! local `IggyPartitions`:
 //! - non-owned namespaces: seed `shards_table` row pointing at owner.
 //! - owned namespaces: `build_partition_fresh` then enqueue
 //!   `ReconcileOp::InsertOwned` for pump-side apply.
 //! - ghosts: two-phase tombstone, disk delete, `ConfirmRemove`.
+//!
+//! # Work set
+//!
+//! A commit costs work for its own partitions, not for every partition on the
+//! node. Three sources fill [`ReconcilerCtx::pending`]:
+//!
+//! - the partition changes each commit records
+//!   (`StreamsInner::partition_changes_since`), except consumer group
+//!   deletes, which leave the partition as it was and feed only the group
+//!   offset sweep;
+//! - the namespaces the pump records for local changes that no commit
+//!   announces: every applied `ReconcileOp`, and every finished partition
+//!   install (`IggyShard::take_reconcile_needed`);
+//! - a full fill from committed metadata and every local structure: at boot,
+//!   when the change feed lost entries the last pass did not read (overflow
+//!   or a snapshot restore), and every `FULL_RECONCILE_INTERVAL` as a repair.
+//!   A repair that acts on a namespace that no change announced logs a
+//!   warning and counts `partitions_reconcile_repairs`, because one of the
+//!   sources above missed it.
+//!
+//! A namespace leaves the work set only when its check finds it converged.
+//! Work the check cannot finish now (a staged build, a deferred rebuild, a
+//! backoff, an incomplete trim) keeps it in the set for the next pass.
+//!
+//! A pass checks the work set in key order and stops after
+//! `DISK_VISITS_PER_PASS` builds or teardowns. The next pass resumes after
+//! the last namespace checked. A round over the work set ends after the last
+//! namespace the set held when the round started, and the next round starts
+//! again from the first namespace. New topics and streams take higher keys,
+//! so without that bound a create burst would hold a round open and leave
+//! the namespaces behind the cursor unchecked.
 //!
 //! # Materialisation race: the reply ships before the partition exists
 //!
@@ -71,12 +103,10 @@
 //! documents why the owner-readiness probe that used to live there was both
 //! unnecessary and ineffective.
 //!
-//! Keeping the table a hint is what makes it repairable: a pass that runs
-//! re-derives the full row set from committed metadata, so a lost row is
-//! rewritten. Note the qualifier -- the revision fast-skip below returns before
-//! reading `shards_table` at all, so repair is driven by the signals that defeat
-//! that skip (a partition-shaping commit, a pending retry, unfinished work, a
-//! non-empty park buffer), not by every tick. An earlier design made the owner the sole writer and pushed
+//! Keeping the table a hint is what makes it repairable: a check re-derives
+//! the namespace's row from committed metadata, so a lost row is rewritten
+//! once something puts the namespace in the work set, at the latest by the
+//! periodic full reconcile. An earlier design made the owner the sole writer and pushed
 //! rows to peers to promote presence into a materialisation proof; it bought
 //! nothing the owner-side fences above do not already guarantee, and it traded
 //! that level-triggered repair for cross-core delta propagation that has to be
@@ -85,7 +115,7 @@
 //! Park residency is bounded on three axes, since the frame count alone bounds
 //! nothing useful (`Message::into_generic` is a retag, so each entry keeps its
 //! whole buffer, up to 64 MiB): a per-namespace frame cap, byte budgets per
-//! namespace and per shard, and an age in reconciler passes.
+//! namespace and per shard, and an age in rounds over the work set.
 //!
 //! They apply asymmetrically, because the two frame classes fail differently. A
 //! shed request costs a retry: answered with a retriable status, re-issued by
@@ -110,7 +140,7 @@
 //! nobody to answer, so the counter is the only record it existed.
 //!
 //! A shed or discarded *prepare* is not recovered by retransmit once its op has
-//! reached quorum (`consensus::retransmit_targets` skips entries with
+//! reached quorum (`consensus::prepare_timeout_targets` skips entries with
 //! `ok_quorum_received`), so the backup gap-stops. `tick_partitions` opens a
 //! repair session for it: its level-triggered detector arms once a partition has
 //! been gap-stopped for `[cluster] repair_gap_debounce_interval`, independently of the
@@ -158,15 +188,17 @@ use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::Consensus;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::{MetadataHandle, PartitionsHandle, ReplicaSet, quorum_view_change};
 use futures::FutureExt;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
 use iggy_binary_protocol::{
-    AckLevel, Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireConsumer,
-    WireEncode, WireIdentifier,
+    AckLevel, Command, Operation, PrepareHeader, RoutedRequestHeader, WireConsumer, WireEncode,
+    WireIdentifier,
 };
-use iggy_common::{ConsumerKind, IggyTimestamp};
+use iggy_common::{
+    ConsumerKind, IggyError, IggyTimestamp, StreamEncryption, check_critical_options,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
@@ -174,25 +206,42 @@ use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::lifecycle::{
     CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion, LifecycleFence,
-    RETIRED_PARTITION_OP,
+    RETIRED_PARTITION_OP, retired_member_op,
 };
-use metadata::stm::stream::{Partition, StatsRegistry};
-use partitions::{delete_partitions_from_disk, read_created_revision};
+use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
+use partitions::{
+    IggyPartition, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
+};
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
 use shard::ReconcileOp;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{Receiver, Sender};
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
+use std::future::poll_fn;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
 const GROUP_OFFSET_DELETES_PER_PASS: usize = 32;
+
+/// Checks between two yields to the shard's other tasks.
+const VISITS_PER_YIELD: usize = 1_024;
+
+/// Checks with disk work (a build or a teardown) in one pass. The task runs
+/// the next pass at once, so parked frames and lifecycle reports wait for at
+/// most this many builds.
+const DISK_VISITS_PER_PASS: usize = 64;
+
+/// Time from the end of one full reconcile to the start of the next repair.
+const FULL_RECONCILE_INTERVAL: Duration = Duration::from_mins(10);
 
 /// Consecutive same-cause failures before [`ReconcilerCtx::record_failure`]
 /// escalates to an operator-visible error (the backoff is capped, so
@@ -235,6 +284,28 @@ pub struct LifecycleReports {
     fence_sends: RefCell<AHashMap<(u64, IggyNamespace), u64>>,
 }
 
+/// The group offset cleanup of one shard.
+///
+/// `inflight` holds the namespaces whose deletes and retirement still wait for
+/// replies. `synced_revision` is the `Streams::revision` through which consumer
+/// group deletes are folded into the partitions' dirty set. At `None` the next
+/// fold marks every local partition dirty.
+#[derive(Default)]
+pub struct GroupOffsetCleanup {
+    inflight: Rc<RefCell<AHashSet<IggyNamespace>>>,
+    synced_revision: Cell<Option<u64>>,
+}
+
+/// What one check left for later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum Convergence {
+    Converged,
+    /// Work the check started or could not finish, so the namespace stays in
+    /// the work set.
+    Pending,
+}
+
 pub struct ReconcilerCtx {
     pub shard: Rc<ServerShard>,
     pub total_shards: u16,
@@ -249,16 +320,28 @@ pub struct ReconcilerCtx {
     /// change.
     stats_registry: Arc<StatsRegistry>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
-    /// `Streams::revision` observed at the end of the last pass that fully
-    /// converged. Paired with `last_pass_noop` for the fast-skip in
-    /// [`reconcile_once`] (no O(N) scan when nothing changed).
-    last_revision: Cell<Option<u64>>,
-    /// `true` when the previous pass made no changes. Only then is a
-    /// same-`revision` pass safe to skip.
-    last_pass_noop: Cell<bool>,
-    group_offset_cleanup_inflight: Rc<RefCell<AHashSet<IggyNamespace>>>,
-    group_offset_cleanup_completed: Rc<Cell<usize>>,
-    last_group_offset_reconcile_epoch: Cell<u64>,
+    /// Owned namespaces boot left unbuilt, whose files a delete committed
+    /// before any build must still remove.
+    unbuilt_owned: RefCell<AHashSet<IggyNamespace>>,
+    /// The namespaces a pass must check. Ordered, so a capped pass resumes
+    /// after the last namespace it checked.
+    pending: RefCell<BTreeSet<IggyNamespace>>,
+    /// The last namespace a capped pass checked. `None` makes the next pass
+    /// start a round from the first namespace.
+    resume_after: Cell<Option<IggyNamespace>>,
+    /// The last namespace of `pending` when the round under way started. A
+    /// namespace added above it waits for the next round.
+    round_last: Cell<Option<IggyNamespace>>,
+    /// `Streams::revision` through which committed partition changes are in
+    /// `pending`. `None` makes the next pass fill it from the whole tree.
+    synced_revision: Cell<Option<u64>>,
+    /// When the next repair round starts. `None` while a full fill is in
+    /// `pending` and its round has not ended.
+    next_full_reconcile_at: Cell<Option<Instant>>,
+    /// While a repair round runs: the namespaces that something other than
+    /// the repair put in `pending`.
+    repair_scrub: RefCell<Option<BTreeSet<IggyNamespace>>>,
+    group_offset_cleanup: GroupOffsetCleanup,
     lifecycle_reports: LifecycleReports,
 }
 
@@ -287,13 +370,75 @@ impl ReconcilerCtx {
             replica_count,
             stats_registry,
             failure_state: RefCell::new(AHashMap::new()),
-            last_revision: Cell::new(None),
-            last_pass_noop: Cell::new(false),
-            group_offset_cleanup_inflight: Rc::new(RefCell::new(AHashSet::new())),
-            group_offset_cleanup_completed: Rc::new(Cell::new(0)),
-            last_group_offset_reconcile_epoch: Cell::new(0),
+            unbuilt_owned: RefCell::new(AHashSet::new()),
+            pending: RefCell::new(BTreeSet::new()),
+            resume_after: Cell::new(None),
+            round_last: Cell::new(None),
+            synced_revision: Cell::new(None),
+            next_full_reconcile_at: Cell::new(Some(Instant::now() + FULL_RECONCILE_INTERVAL)),
+            repair_scrub: RefCell::new(None),
+            group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
         }
+    }
+
+    /// Record the owned namespaces boot did not build.
+    pub fn mark_unbuilt(&self, namespaces: impl IntoIterator<Item = IggyNamespace>) {
+        self.unbuilt_owned.borrow_mut().extend(namespaces);
+    }
+
+    /// Adds namespaces that a change announced to the work set.
+    fn add_announced(&self, namespaces: impl IntoIterator<Item = IggyNamespace>) {
+        let mut pending = self.pending.borrow_mut();
+        let mut scrub = self.repair_scrub.borrow_mut();
+        for ns in namespaces {
+            pending.insert(ns);
+            if let Some(announced) = scrub.as_mut() {
+                announced.insert(ns);
+            }
+        }
+    }
+
+    /// Ends a round over the work set. The end of a full round restarts the
+    /// repair clock and ends the repair scrub.
+    fn finish_round(&self) {
+        if self.next_full_reconcile_at.get().is_none() {
+            self.next_full_reconcile_at
+                .set(Some(Instant::now() + FULL_RECONCILE_INTERVAL));
+            self.repair_scrub.take();
+        }
+    }
+
+    /// Warns when the repair acted on `ns` although no change announced it,
+    /// which means a source of the work set missed it.
+    fn report_unannounced_repair(&self, ns: IggyNamespace) {
+        let announced = self
+            .repair_scrub
+            .borrow()
+            .as_ref()
+            .is_none_or(|announced| announced.contains(&ns));
+        if announced || self.shard.reconcile_needed_contains(ns) {
+            return;
+        }
+        // A commit that lands during this pass is folded by the next one.
+        let synced = self.synced_revision.get();
+        let changed = self.shard.plane.metadata().mux_stm.streams().read(|inner| {
+            synced
+                .and_then(|synced| inner.partition_changes_since(synced))
+                .is_none_or(|mut changes| {
+                    changes
+                        .any(|change| change.namespace == ns && needs_partition_check(change.kind))
+                })
+        });
+        if changed {
+            return;
+        }
+        warn!(
+            shard = self.shard.id,
+            ns_raw = ns.inner(),
+            "full reconcile repaired a partition that no change announced"
+        );
+        self.shard.metrics().record_partition_reconcile_repair();
     }
 
     fn is_backed_off(&self, ns: IggyNamespace, cause: FailureCause, now: Instant) -> bool {
@@ -306,20 +451,19 @@ impl ReconcilerCtx {
             .is_some_and(|record| record.next_retry_at > now)
     }
 
-    /// `true` when a prior teardown of `ns` recorded a disk-delete failure
-    /// not since cleared. Teardown clears the `FailureCause::Delete` record
-    /// (via [`Self::record_success`]) exactly when it enqueues
-    /// `ConfirmRemove`, and sets it only on a delete that failed without
-    /// enqueuing one, so it doubles as "no `ConfirmRemove` in flight for
-    /// `ns`": the signal [`reconcile_additions`] uses to tell a
-    /// permanently-wedged tombstone (retry the delete) from one whose drop
-    /// is genuinely pending (defer).
-    fn has_pending_delete_failure(&self, ns: IggyNamespace) -> bool {
+    /// `true` when an attempt of `cause` on `ns` failed and no success cleared
+    /// it since.
+    ///
+    /// A failed `FailureCause::Add` can leave files that no partition owns.
+    /// Teardown clears the `FailureCause::Delete` record (via
+    /// [`Self::record_success`]) exactly when it enqueues `ConfirmRemove`, and
+    /// sets it only on a delete that failed without enqueuing one, so it
+    /// doubles as "no `ConfirmRemove` in flight for `ns`": the signal
+    /// [`reconcile_target`] uses to tell a permanently-wedged tombstone (retry
+    /// the delete) from one whose drop is genuinely pending (defer).
+    fn has_failure(&self, ns: IggyNamespace, cause: FailureCause) -> bool {
         let state = self.failure_state.borrow();
-        if state.is_empty() {
-            return false;
-        }
-        state.contains_key(&(ns, FailureCause::Delete))
+        !state.is_empty() && state.contains_key(&(ns, cause))
     }
 
     fn record_success(&self, ns: IggyNamespace, cause: FailureCause) {
@@ -358,19 +502,11 @@ impl ReconcilerCtx {
         }
     }
 
-    /// Drop records whose namespace left both target and local sets;
-    /// otherwise a failed-then-deleted namespace's stale backoff
-    /// would throttle a future same-namespace re-create.
-    fn prune_failure_state_stale(
-        &self,
-        target_set: &AHashSet<IggyNamespace>,
-        local_set: &AHashSet<IggyNamespace>,
-    ) {
-        let mut state = self.failure_state.borrow_mut();
-        if state.is_empty() {
-            return;
-        }
-        state.retain(|(ns, _cause), _record| target_set.contains(ns) || local_set.contains(ns));
+    /// Drops the records of a namespace that left the target and every local
+    /// structure, so its stale backoff cannot throttle a future re-create.
+    fn forget_failures(&self, ns: IggyNamespace) {
+        self.record_success(ns, FailureCause::Add);
+        self.record_success(ns, FailureCause::Delete);
     }
 }
 
@@ -378,7 +514,8 @@ pub type WakeTx = Sender<()>;
 pub type WakeRx = Receiver<()>;
 
 /// One initial reconcile before the wait loop so a shard that comes up
-/// before shard 0's first `MetadataCommitTick` still converges.
+/// before shard 0's first `MetadataCommitTick` still converges. A pass that
+/// stopped at `DISK_VISITS_PER_PASS` is followed by the next one at once.
 pub async fn run_reconciler(
     ctx: Rc<ReconcilerCtx>,
     wake_rx: WakeRx,
@@ -391,9 +528,16 @@ pub async fn run_reconciler(
         periodic_ms = periodic.as_millis(),
         "partition reconciler starting"
     );
-    reconcile_once(&ctx).await;
+    let mut capped = reconcile_once(&ctx).await;
 
     loop {
+        if capped {
+            if stop_rx.recv().now_or_never().is_some() {
+                break;
+            }
+            capped = reconcile_once(&ctx).await;
+            continue;
+        }
         let sleep = ctx.shard.bus.sleep(periodic);
         // Biased for the same reason as the shard pump: unbiased `select!`
         // polls arms in process-random order, which a deterministic
@@ -405,10 +549,10 @@ pub async fn run_reconciler(
                     break;
                 }
                 while wake_rx.try_recv().is_ok() {}
-                reconcile_once(&ctx).await;
+                capped = reconcile_once(&ctx).await;
             }
             () = sleep.fuse() => {
-                reconcile_once(&ctx).await;
+                capped = reconcile_once(&ctx).await;
             }
         }
     }
@@ -422,19 +566,22 @@ struct PassCounters {
     routed: usize,
     removed_local: usize,
     removed_routed: usize,
+    /// Logged only. A backed-off namespace stays in the work set, and a pass
+    /// after its retry comes due builds it.
     backoff_skipped: usize,
     /// Stale incarnations (slab-key reuse) torn down for rebuild.
     stale: usize,
+    /// Routing rows of live owned partitions found missing or stale and
+    /// rewritten.
+    rows_rewritten: usize,
     /// Group-offset deletes successfully handed to the pump this pass.
     cg_offsets_submitted: usize,
-    /// Successful replicated deletes reported by detached completion tasks.
-    cg_offsets_completed: usize,
     /// Group-offset deletes and retirement catalogs that need another pass.
     cg_offsets_pending: usize,
     /// Committed delete watermarks not yet fully enforced on local segments.
-    /// Counted so the pass does not arm the fast-skip: the pump can be
-    /// blocked by a consumer barrier or by a rejoin whose offsets land via
-    /// journal repair, and neither unblocking bumps `Streams::revision`.
+    /// The pump can be blocked by a consumer barrier or by a rejoin whose
+    /// offsets land via journal repair, and neither unblocking commits
+    /// anything, so the namespace stays in the work set until it is trimmed.
     trims_pending: usize,
     /// Namespaces the sweep acted on (see [`reconcile_parked_frames`]):
     /// discarded because this shard cannot serve them, or aged past
@@ -442,129 +589,73 @@ struct PassCounters {
     /// acted on is not answered: aging answers requests, discarding also
     /// destroys prepares.
     parked_reclaimed: usize,
-    /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. Counted
-    /// so the pass does not arm the fast-skip: the pump's drop clears the
-    /// tombstone and re-wakes us without bumping `Streams::revision`, so an
-    /// armed skip would swallow that wake and strand the rebuild forever.
+    /// Rebuilds deferred until an in-flight `ConfirmRemove` drains. The
+    /// pump's drop records the namespace for the next pass and wakes it.
     deferred: usize,
     /// Namespaces an earlier pass already built, whose `InsertOwned` the pump
-    /// has not applied yet. Counted so the pass does not arm the fast-skip
-    /// while work is in flight; applying it bumps no revision.
+    /// has not applied yet.
     already_staged: usize,
+    /// Checks that built or tore down a partition.
+    disk_visits: usize,
 }
 
 impl PassCounters {
-    const fn total(&self) -> usize {
+    /// Changes the checks made, as opposed to work they found in flight.
+    const fn actions(&self) -> usize {
         self.materialised
             + self.routed
             + self.removed_local
             + self.removed_routed
-            + self.backoff_skipped
             + self.stale
-            + self.cg_offsets_submitted
-            + self.cg_offsets_completed
-            + self.cg_offsets_pending
+            + self.rows_rewritten
             + self.trims_pending
+    }
+
+    const fn total(&self) -> usize {
+        self.actions()
+            + self.cg_offsets_submitted
+            + self.cg_offsets_pending
             + self.deferred
             + self.parked_reclaimed
             + self.already_staged
     }
 }
 
-/// Diff target vs local; materialise missing, tear down ghosts. Idempotent.
-/// Returns `false` when the pass fast-skipped (nothing changed), `true`
-/// when it ran the full diff. Callers in production discard the result;
-/// tests assert the skip.
+/// One pass: fold what changed into the work set, check the work set, then
+/// run the duties that read their own state. Returns `true` when the checks
+/// stopped at `DISK_VISITS_PER_PASS` with namespaces left to check.
 async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
-    let shard_id = ctx.shard.id;
-    let revision = current_revision(ctx);
-    // Snapshotted with `revision` before the pass, so a partition that arms
-    // itself during one of the awaits below bumps past this value and forces
-    // the next pass instead of being absorbed by an end-of-pass read.
-    let group_offset_epoch = ctx
-        .shard
-        .plane
-        .partitions()
-        .consumer_group_offsets_reconcile_epoch();
-
-    // Cooperative-revocation completion runs every tick, before the fast-skip:
-    // a timeout fires on wall-clock and a drain on partition-offset state, and
-    // neither bumps `Streams::revision`, so the skip would otherwise starve an
-    // idle group's pending revocations forever. Cheap no-op when none pending.
+    // Cooperative-revocation completion runs every tick: a timeout fires on
+    // wall-clock and a drain on partition-offset state, and neither commits a
+    // partition change. Cheap no-op when none pending.
     reconcile_pending_revocations(
         &ctx.shard,
         IggyTimestamp::now().as_micros(),
         ctx.config.consumer_group.rebalancing_timeout.as_micros(),
     );
 
-    // Fast-skip: committed partition set unchanged since the last
-    // fully-converged pass and no backoff retry due, so the O(N) diff is
-    // pure waste. Safe because reconcile is level-triggered: the next
-    // partition-shaping commit bumps `revision`, a pending retry keeps
-    // `failure_state` non-empty, and a pass that found work it could not
-    // finish (a deferred rebuild, an incomplete trim) leaves
-    // `last_pass_noop` false; any of the three forces the next pass.
-    //
-    // A non-empty park buffer is the fourth signal. Parking does not bump
-    // `revision` and does not wake the reconciler, so without this a frame that
-    // parks in a converged steady state is held for the process lifetime while
-    // its client burns the full response read-timeout -- exactly what
-    // `reconcile_parked_frames` exists to prevent. Held frames also occupy the
-    // shard-wide byte budget, so one stranded namespace would shed every other
-    // namespace's legitimate convergence window.
-    if ctx.last_revision.get() == Some(revision)
-        && ctx.last_pass_noop.get()
-        && ctx.failure_state.borrow().is_empty()
-        && ctx.group_offset_cleanup_completed.get() == 0
-        && !ctx.shard.has_parked_partition_frames()
-        && ctx.last_group_offset_reconcile_epoch.get() == group_offset_epoch
-    {
-        trace!(
-            shard = shard_id,
-            revision, "reconciler fast-skip (no change)"
-        );
-        report_lifecycles(ctx).await;
-        return false;
+    let partition_may_be_gone = fold_changes(ctx).await;
+    let mut counters = PassCounters::default();
+    let capped = visit_pending(ctx, &mut counters).await;
+    reconcile_parked_frames(ctx, !capped, &mut counters);
+    reconcile_group_offsets(&ctx.shard, &ctx.group_offset_cleanup, &mut counters);
+    if partition_may_be_gone {
+        reconcile_stream_keys(ctx);
     }
-
-    let target = snapshot_target_namespaces(ctx);
-    let target_set: AHashSet<IggyNamespace> = target.iter().map(|partition| partition.ns).collect();
-    let mut counters = PassCounters {
-        cg_offsets_completed: ctx.group_offset_cleanup_completed.replace(0),
-        ..PassCounters::default()
-    };
-
-    reconcile_additions(ctx, target, &mut counters).await;
-    reconcile_removals(ctx, &target_set, &mut counters).await;
-    reconcile_parked_frames(ctx, &mut counters);
-    reconcile_consumer_group_offsets(ctx, &mut counters);
-    reconcile_segment_truncations(ctx, &mut counters);
     report_lifecycles(ctx).await;
 
-    let local_set: AHashSet<IggyNamespace> =
-        ctx.shard.plane.partitions().namespaces().copied().collect();
-    ctx.prune_failure_state_stale(&target_set, &local_set);
-
-    // Arm the fast-skip only when this pass converged (did nothing). A
-    // working pass (including a staleness teardown that rebuilds on the
-    // next pass) leaves `last_pass_noop = false` so the follow-up pass
-    // still runs even though `revision` did not change.
-    let did_work = counters.total() > 0;
-    ctx.last_revision.set(Some(revision));
-    ctx.last_group_offset_reconcile_epoch
-        .set(group_offset_epoch);
-    ctx.last_pass_noop.set(!did_work);
-
-    if did_work {
+    if counters.total() > 0 {
         debug!(
-            shard = shard_id,
-            revision,
+            shard = ctx.shard.id,
+            pending = ctx.pending.borrow().len(),
+            capped,
             materialised = counters.materialised,
             routed = counters.routed,
             removed_local = counters.removed_local,
             removed_routed = counters.removed_routed,
             backoff_skipped = counters.backoff_skipped,
             stale = counters.stale,
+            rows_rewritten = counters.rows_rewritten,
             deferred = counters.deferred,
             already_staged = counters.already_staged,
             parked_reclaimed = counters.parked_reclaimed,
@@ -574,18 +665,238 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         );
     } else {
         trace!(
-            shard = shard_id,
+            shard = ctx.shard.id,
             "partition reconciler pass complete (no-op)"
         );
     }
-
-    true
+    capped
 }
 
-/// Runs on every wake, apart from the full pass. A fence applies, or its
-/// primary changes, without a `Streams::revision` bump. Each report commit
-/// also wakes every shard, so a full pass per report grows a delete
-/// quadratically with its partitions.
+/// Folds into the work set what changed since the last pass. Returns whether
+/// a partition may have gone: a change removed one, or a full fill ran.
+async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
+    ctx.add_announced(ctx.shard.take_reconcile_needed());
+    let (revision, changes) = ctx
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .revision_and_partition_changes(ctx.synced_revision.get());
+    let mut partition_may_be_gone = true;
+    if let Some(changes) = changes {
+        partition_may_be_gone = changes
+            .iter()
+            .any(|change| change.kind == PartitionChangeKind::Removed);
+        ctx.add_announced(
+            changes
+                .iter()
+                .filter(|change| needs_partition_check(change.kind))
+                .map(|change| change.namespace),
+        );
+    } else {
+        // The lost changes can name any namespace, so a repair round under way
+        // can no longer tell what they announced.
+        ctx.repair_scrub.take();
+        fill_pending(ctx).await;
+    }
+    ctx.synced_revision.set(Some(revision));
+    if ctx
+        .next_full_reconcile_at
+        .get()
+        .is_some_and(|at| Instant::now() >= at)
+    {
+        let announced = ctx.pending.borrow().clone();
+        *ctx.repair_scrub.borrow_mut() = Some(announced);
+        ctx.group_offset_cleanup.synced_revision.set(None);
+        fill_pending(ctx).await;
+        partition_may_be_gone = true;
+    }
+    partition_may_be_gone
+}
+
+/// Whether a change can leave a partition's local state behind committed
+/// metadata. A consumer group delete leaves the partition as it was, and
+/// only the group offset sweep acts on it.
+fn needs_partition_check(kind: PartitionChangeKind) -> bool {
+    kind != PartitionChangeKind::ConsumerGroupDeleted
+}
+
+/// Puts every namespace that committed metadata or a local structure names
+/// into the work set, and starts a round over it from the first namespace.
+/// Inserts in chunks with a yield between them, because at a million
+/// partitions the work set takes a million namespaces.
+async fn fill_pending(ctx: &ReconcilerCtx) {
+    add_committed_targets(ctx).await;
+    let partitions = ctx.shard.plane.partitions();
+    let local: Vec<IggyNamespace> = partitions
+        .namespaces()
+        .copied()
+        .chain(partitions.tombstoned_namespaces())
+        .chain(ctx.shard.shards_table().namespaces())
+        .chain(ctx.unbuilt_owned.borrow().iter().copied())
+        .chain(ctx.failure_state.borrow().keys().map(|(ns, _)| *ns))
+        .collect();
+    for chunk in local.chunks(VISITS_PER_YIELD) {
+        ctx.pending.borrow_mut().extend(chunk);
+        yield_now().await;
+    }
+    ctx.resume_after.set(None);
+    ctx.next_full_reconcile_at.set(None);
+}
+
+/// Puts every committed partition this node stores into the work set. Reads
+/// the tree in chunks with a yield between them, so no read holds the
+/// metadata writer back for a whole walk. A change between two chunks is in
+/// the feed after the revision the caller read first.
+async fn add_committed_targets(ctx: &ReconcilerCtx) {
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    let mut chunk = Vec::new();
+    let mut next = Some((0, 0));
+    while let Some((first_stream, first_topic)) = next {
+        next = streams.read(|inner| {
+            let mut visited = 0;
+            for (stream_key, stream) in inner.items.iter_from(first_stream) {
+                if visited >= VISITS_PER_YIELD {
+                    return Some((stream_key, 0));
+                }
+                let topic_from = if stream_key == first_stream {
+                    first_topic
+                } else {
+                    0
+                };
+                for (topic_id, topic) in stream.topics.iter_from(topic_from) {
+                    if visited >= VISITS_PER_YIELD {
+                        return Some((stream_key, topic_id));
+                    }
+                    visited += topic.partitions.len().max(1);
+                    chunk.extend(
+                        topic
+                            .partitions
+                            .iter()
+                            .filter(|partition| {
+                                partition
+                                    .replica_set(ctx.replica_count)
+                                    .member(ctx.self_replica_id)
+                                    .is_some()
+                            })
+                            .map(|partition| IggyNamespace::new(stream.id, topic_id, partition.id)),
+                    );
+                }
+                visited += 1;
+            }
+            None
+        });
+        ctx.pending.borrow_mut().extend(&chunk);
+        chunk.clear();
+        if next.is_some() {
+            yield_now().await;
+        }
+    }
+}
+
+/// Checks the work set in key order, from the namespace after the last one
+/// checked through the last namespace of the round. Returns `true` when the
+/// pass stopped at `DISK_VISITS_PER_PASS` with namespaces of the round left
+/// to check.
+async fn visit_pending(ctx: &ReconcilerCtx, counters: &mut PassCounters) -> bool {
+    let mut last = ctx.resume_after.take();
+    if last.is_none() {
+        ctx.round_last.set(ctx.pending.borrow().last().copied());
+    }
+    let round_last = ctx.round_last.get();
+    let mut visits = 0_usize;
+    loop {
+        let next = {
+            let pending = ctx.pending.borrow();
+            last.map_or_else(
+                || pending.first().copied(),
+                |last| pending.range((Excluded(last), Unbounded)).next().copied(),
+            )
+            .filter(|ns| round_last.is_some_and(|round_last| *ns <= round_last))
+        };
+        let Some(ns) = next else {
+            ctx.finish_round();
+            return false;
+        };
+        last = Some(ns);
+        let actions = counters.actions();
+        if reconcile_namespace(ctx, ns, counters).await == Convergence::Converged {
+            ctx.pending.borrow_mut().remove(&ns);
+        }
+        if counters.actions() > actions {
+            ctx.report_unannounced_repair(ns);
+        }
+        if counters.disk_visits >= DISK_VISITS_PER_PASS {
+            ctx.resume_after.set(Some(ns));
+            return true;
+        }
+        visits += 1;
+        if visits.is_multiple_of(VISITS_PER_YIELD) {
+            yield_now().await;
+        }
+    }
+}
+
+/// Brings one namespace in line with committed metadata. Decides from
+/// committed and local state alone, so it does not matter which source put
+/// the namespace in the work set.
+async fn reconcile_namespace(
+    ctx: &ReconcilerCtx,
+    ns: IggyNamespace,
+    counters: &mut PassCounters,
+) -> Convergence {
+    if ctx.shard.plane.partitions().contains(&ns) {
+        ctx.unbuilt_owned.borrow_mut().remove(&ns);
+    }
+    match committed_target(ctx, ns) {
+        Some(target) => reconcile_target(ctx, ns, target, counters).await,
+        None => reconcile_ghost(ctx, ns, counters).await,
+    }
+}
+
+/// Lets the shard's other tasks run before the reconciler goes on.
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|context| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// Forget the key of a stream incarnation that is deleted or holds no
+/// partition, so a reused stream id can never meet a previous stream's key.
+/// Only a partition build opens a key, and every commit that removes a
+/// partition records it, so this runs only after a pass that saw a partition
+/// removed or filled the work set. A stream deleted after its last topic lost
+/// its key when that topic went. A key lookup includes `created_op`, so a key
+/// the sweep has not reached yet is kept but never served.
+fn reconcile_stream_keys(ctx: &ReconcilerCtx) {
+    let partitions = ctx.shard.plane.partitions();
+    if !partitions.has_stream_keys() {
+        return;
+    }
+    let () = ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        partitions.retain_stream_keys(|identity| {
+            inner.items.get(identity.stream_id).is_some_and(|stream| {
+                stream.created_op == identity.created_op
+                    && stream
+                        .topics
+                        .iter()
+                        .any(|(_, topic)| !topic.partitions.is_empty())
+            })
+        });
+    });
+}
+
+/// Runs on every wake. A fence applies, or its primary changes, without a
+/// partition change, so no check of the work set covers it.
 async fn report_lifecycles(ctx: &ReconcilerCtx) {
     reconcile_partition_lifecycles(
         &ctx.shard,
@@ -595,267 +906,341 @@ async fn report_lifecycles(ctx: &ReconcilerCtx) {
     reconcile_retired_lifecycles(ctx).await;
 }
 
+/// Checks a namespace this node stores against its committed incarnation:
+/// route it, build it, trim it, or replace a stale local incarnation.
 #[allow(clippy::too_many_lines)]
-async fn reconcile_additions(
+async fn reconcile_target(
     ctx: &ReconcilerCtx,
-    target: Vec<TargetPartition>,
+    ns: IggyNamespace,
+    target: CommittedTarget,
     counters: &mut PassCounters,
-) {
+) -> Convergence {
+    let epoch = target.created_revision;
     let shard_id = ctx.shard.id;
     let partitions = ctx.shard.plane.partitions();
-    let total_shards = u32::from(ctx.total_shards);
 
-    for TargetPartition { ns, epoch } in target {
-        if partitions.contains(&ns) {
-            // Tombstoned but still in the map. Two cases, told apart by
-            // whether teardown's disk delete succeeded:
-            //
-            //   * Succeeded -> a `ConfirmRemove` is in flight. The pump
-            //     drops the partition and clears the tombstone, then
-            //     `signal_reconcile_wake` re-wakes us to rebuild within one
-            //     pump-iter. Building over a path mid-unlink would race, so
-            //     defer.
-            //   * Failed -> no `ConfirmRemove` enqueued, so the tombstone
-            //     never lifts. Paired with a same-key recreate landing `ns`
-            //     back in the target, this pass would defer forever while
-            //     `reconcile_removals` no longer sees a ghost: the partition
-            //     is fenced permanently and every data-plane frame dropped.
-            //     Re-drive teardown to retry the delete.
-            //
-            // A recorded `FailureCause::Delete` is the authoritative "no
-            // ConfirmRemove in flight" signal (see
-            // [`ReconcilerCtx::has_pending_delete_failure`]).
-            if partitions.is_tombstoned(&ns) {
-                if !ctx.has_pending_delete_failure(ns) {
-                    counters.deferred += 1;
-                    trace!(
-                        shard = shard_id,
-                        ns_raw = ns.inner(),
-                        "additions: ns tombstoned + in-map; rebuild deferred to post-ConfirmRemove wake"
-                    );
-                    continue;
-                }
+    if partitions.contains(&ns) {
+        // Tombstoned but still in the map. Two cases, told apart by
+        // whether teardown's disk delete succeeded:
+        //
+        //   * Succeeded -> a `ConfirmRemove` is in flight. The pump
+        //     drops the partition and clears the tombstone, records the
+        //     namespace for the next pass and wakes it. Building over a path
+        //     mid-unlink would race, so defer.
+        //   * Failed -> no `ConfirmRemove` enqueued, so the tombstone
+        //     never lifts. Paired with a same-key recreate landing `ns`
+        //     back in the target, this check would defer forever: the
+        //     partition is fenced permanently and every data-plane frame
+        //     dropped. Re-drive teardown to retry the delete.
+        //
+        // A recorded `FailureCause::Delete` is the authoritative "no
+        // ConfirmRemove in flight" signal (see
+        // [`ReconcilerCtx::has_failure`]).
+        if partitions.is_tombstoned(&ns) {
+            if !ctx.has_failure(ns, FailureCause::Delete) {
+                counters.deferred += 1;
                 trace!(
                     shard = shard_id,
                     ns_raw = ns.inner(),
-                    "additions: ns tombstoned + in-map with failed disk delete; re-driving teardown to retry delete"
+                    "additions: ns tombstoned + in-map; rebuild deferred to post-ConfirmRemove wake"
                 );
-                tear_down_owned_partition(ctx, ns, counters).await;
-                continue;
-            }
-
-            // Staleness: the namespace tuple is built from reused slab
-            // keys, so a delete+recreate of the same (stream, topic,
-            // partition) yields an identical `ns` whose committed
-            // `created_revision` differs from the epoch recorded when the
-            // local partition materialised. A mismatch (or a missing
-            // routing row on a live partition, an invariant violation)
-            // means the local partition is a prior incarnation carrying
-            // stale segments/offsets/log. Tear it down; the
-            // post-ConfirmRemove wake rebuilds it fresh next pass.
-            if shards_table_has_epoch(ctx, ns, epoch) {
-                continue;
+                return Convergence::Pending;
             }
             trace!(
                 shard = shard_id,
                 ns_raw = ns.inner(),
+                "additions: ns tombstoned + in-map with failed disk delete; re-driving teardown to retry delete"
+            );
+            tear_down_owned_partition(ctx, ns, counters).await;
+            return Convergence::Pending;
+        }
+
+        // Staleness: the namespace tuple is built from reused slab
+        // keys, so a delete+recreate of the same (stream, topic,
+        // partition) yields an identical `ns` whose committed
+        // `created_revision` differs from the incarnation the local
+        // partition was built with. Such a partition carries stale
+        // segments/offsets/log. Tear it down; the post-ConfirmRemove
+        // wake rebuilds it fresh. The partition's own incarnation
+        // decides, as it does for every consensus frame: the routing row
+        // is a hint, and a lost row must not delete a live partition's
+        // data.
+        let local_epoch = partitions.with_partition(&ns, IggyPartition::created_revision);
+        if local_epoch != Some(epoch) {
+            trace!(
+                shard = shard_id,
+                ns_raw = ns.inner(),
                 target_epoch = epoch,
+                ?local_epoch,
                 "additions: stale incarnation (slab-key reuse); tearing down for rebuild"
             );
             counters.stale += 1;
             tear_down_owned_partition(ctx, ns, counters).await;
-            continue;
+            return Convergence::Pending;
         }
+        if !shards_table_has_epoch(ctx, ns, epoch) {
+            warn!(
+                shard = shard_id,
+                ns_raw = ns.inner(),
+                epoch,
+                "routing row of a live partition is missing or stale; rewriting it"
+            );
+            ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertRouted {
+                namespace: ns,
+                owner: ShardId::new(shard_id),
+                epoch,
+            });
+            counters.rows_rewritten += 1;
+            return Convergence::Pending;
+        }
+        return trim_to_watermark(ctx, ns, target.delete_watermark, counters);
+    }
 
-        // Tombstoned without ever being materialised: a boot-time damage
-        // verdict (a refused segment chain, an untrusted superblock) fenced
-        // the namespace before any partition existed, so no teardown ran and
-        // no `ConfirmRemove` is coming to lift the tombstone. Building fresh
-        // would plant segment 0 over the refused files, truncating the
-        // oldest one, and the partition would then serve empty, hiding
-        // exactly the loss the tombstone surfaces. Deliberately uncounted:
-        // while the namespace stays committed nothing lifts this state (the
-        // exit is `reconcile_removals`' fenced-ghost sweep, which fires only
-        // once an operator delete removes it from the target), and a commit
-        // bumps `Streams::revision`, which forces the next pass past the
-        // fast-skip.
-        if partitions.is_tombstoned(&ns) {
-            // Unless a teardown put it there. The mid-pass-recreate arm below
-            // tears down a prior life this shard never mounted, and a disk
-            // delete that failed leaves the tombstone standing with no
-            // `ConfirmRemove` behind it -- the same permanent fence the in-map
-            // branch above escapes, told apart by the same signal.
-            if ctx.has_pending_delete_failure(ns)
-                || partitions
-                    .failed_revision(&ns)
-                    .is_some_and(|failed| failed < epoch)
-            {
-                trace!(
-                    shard = shard_id,
-                    ns_raw = ns.inner(),
-                    "additions: removing fenced files of a superseded or incompletely deleted incarnation"
-                );
-                tear_down_owned_partition(ctx, ns, counters).await;
-                continue;
-            }
+    // Tombstoned without ever being materialised: a boot-time damage
+    // verdict (a refused segment chain, an untrusted superblock) fenced
+    // the namespace before any partition existed, so no teardown ran and
+    // no `ConfirmRemove` is coming to lift the tombstone. Building fresh
+    // would plant segment 0 over the refused files, truncating the
+    // oldest one, and the partition would then serve empty, hiding
+    // exactly the loss the tombstone surfaces. Converged while the
+    // namespace stays committed: the exit is the ghost check, which
+    // fires once an operator delete removes it from the target, and a
+    // recreate is a committed change that brings the namespace back.
+    if partitions.is_tombstoned(&ns) {
+        // Unless a teardown put it there. The mid-pass-recreate arm below
+        // tears down a prior life this shard never mounted, and a disk
+        // delete that failed leaves the tombstone standing with no
+        // `ConfirmRemove` behind it -- the same permanent fence the in-map
+        // branch above escapes, told apart by the same signal.
+        if ctx.has_failure(ns, FailureCause::Delete)
+            || partitions
+                .failed_revision(&ns)
+                .is_some_and(|failed| failed < epoch)
+        {
             trace!(
                 shard = shard_id,
                 ns_raw = ns.inner(),
-                "additions: ns tombstoned before materialisation; refusing to rebuild over fenced files"
+                "additions: removing fenced files of a superseded or incompletely deleted incarnation"
             );
-            continue;
+            tear_down_owned_partition(ctx, ns, counters).await;
+            return Convergence::Pending;
         }
+        trace!(
+            shard = shard_id,
+            ns_raw = ns.inner(),
+            "additions: ns tombstoned before materialisation; refusing to rebuild over fenced files"
+        );
+        return Convergence::Converged;
+    }
 
-        let owning_shard = calculate_shard_assignment(&ns, total_shards);
-        if owning_shard != shard_id {
-            // Compare the epoch, not just presence: a delete + recreate
-            // recycles the slab keys, so the row survives with the DEAD
-            // incarnation's `created_revision`. A presence-only gate never
-            // refreshes it, and nothing else writes a non-owner's row.
-            //
-            // No mirror of the staged-`InsertOwned` guard below, deliberately:
-            // a lagging pump costs one duplicate `InsertRouted` per pass, and
-            // the apply is an idempotent row overwrite, while scanning the op
-            // queue per routed namespace would go quadratic.
-            if !shards_table_has_epoch(ctx, ns, epoch) {
-                ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertRouted {
-                    namespace: ns,
-                    owner: ShardId::new(owning_shard),
-                    epoch,
-                });
-                counters.routed += 1;
-            }
-            continue;
+    let owning_shard = calculate_shard_assignment(&ns, u32::from(ctx.total_shards));
+    if owning_shard != shard_id {
+        // Compare the epoch, not just presence: a delete + recreate
+        // recycles the slab keys, so the row survives with the DEAD
+        // incarnation's `created_revision`. A presence-only gate never
+        // refreshes it, and nothing else writes a non-owner's row.
+        //
+        // No mirror of the staged-`InsertOwned` guard below, deliberately:
+        // a lagging pump costs one duplicate `InsertRouted` per pass, and
+        // the apply is an idempotent row overwrite, while scanning the op
+        // queue per routed namespace would go quadratic.
+        if shards_table_has_epoch(ctx, ns, epoch) {
+            return Convergence::Converged;
         }
+        ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertRouted {
+            namespace: ns,
+            owner: ShardId::new(owning_shard),
+            epoch,
+        });
+        counters.routed += 1;
+        return Convergence::Pending;
+    }
 
-        // An earlier pass already built this one and the pump has not applied it
-        // yet, so the `contains` test above reads false for finished work.
-        // Rebuilding is not a wasted-effort question: the second build shares
-        // the namespace's `PartitionStats` with the queued sibling and re-opens
-        // segment 0 with `file_exists = false`, truncating the file that
-        // sibling is about to serve.
-        if ctx.shard.has_staged_insert_owned(ns) {
-            counters.already_staged += 1;
-            continue;
+    // An earlier pass already built this one and the pump has not applied it
+    // yet, so the `contains` test above reads false for finished work.
+    // Rebuilding is not a wasted-effort question: the second build shares
+    // the namespace's `PartitionStats` with the queued sibling and re-opens
+    // segment 0 with `file_exists = false`, truncating the file that
+    // sibling is about to serve.
+    if ctx.shard.has_staged_insert_owned(ns) {
+        counters.already_staged += 1;
+        return Convergence::Pending;
+    }
+
+    let now = Instant::now();
+    if ctx.is_backed_off(ns, FailureCause::Add, now) {
+        counters.backoff_skipped += 1;
+        return Convergence::Pending;
+    }
+
+    // A stream, topic or partition that vanished since the target read is a
+    // committed removal, which the next check of this namespace handles.
+    let Some(PartitionBuildInputs {
+        stats: partition_stats,
+        runtime: topic_runtime,
+        metadata: partition_metadata,
+        stream_key,
+        encryption,
+    }) = fetch_partition_build_inputs(ctx, ns)
+    else {
+        return Convergence::Pending;
+    };
+    let topic_runtime = match topic_runtime {
+        Ok(topic_runtime) => topic_runtime,
+        Err(error) => {
+            ctx.record_failure(ns, FailureCause::Add, now);
+            ctx.shard.metrics().record_partition_reconcile_failure();
+            error!(
+                shard = shard_id,
+                stream_id = ns.stream_id(),
+                topic_id = ns.topic_id(),
+                partition_id = ns.partition_id(),
+                %error,
+                "Partition of topic {} cannot be built, its options hold critical state this node cannot read",
+                ns.topic_id()
+            );
+            return Convergence::Pending;
         }
-
-        let now = Instant::now();
-        if ctx.is_backed_off(ns, FailureCause::Add, now) {
-            counters.backoff_skipped += 1;
-            continue;
+    };
+    // An encrypted partition is built only with its own stream's key. A
+    // key that does not open here leaves the partition unbuilt, never
+    // served as plaintext or under another key.
+    let encryptor = match partitions.resolve_stream_encryptor(stream_key, &encryption) {
+        Ok(encryptor) => encryptor,
+        Err(error) => {
+            ctx.record_failure(ns, FailureCause::Add, now);
+            ctx.shard.metrics().record_partition_reconcile_failure();
+            error!(
+                shard = shard_id,
+                stream_id = ns.stream_id(),
+                topic_id = ns.topic_id(),
+                partition_id = ns.partition_id(),
+                kek_fingerprints = %partitions.key_context().kek_fingerprints().join(","),
+                %error,
+                "Partition of stream {} cannot be built, its key does not open on this node",
+                ns.stream_id()
+            );
+            return Convergence::Pending;
         }
+    };
 
-        // Resolved only for namespaces actually built, not once per committed
-        // partition every pass. A stream, topic or partition that vanished
-        // between the target snapshot and this read defers to the next pass.
-        let Some((partition_stats, topic_runtime, partition_metadata)) =
-            fetch_partition_build_inputs(ctx, ns)
-        else {
-            continue;
-        };
+    // A directory already on disk is a prior life of this namespace. The
+    // usual shape: this replica applied the create before a crash, but its
+    // WAL watermark trails the commit by one op, so boot saw no such
+    // partition and the post-election re-commit lands here. Recover it the
+    // way boot does, segments included. Building fresh opens segment 0
+    // with truncation and throws away flushed data that no peer may still
+    // hold once the whole cluster restarted.
+    counters.disk_visits += 1;
+    let partition_dir =
+        ctx.config
+            .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
+    let prior_life_on_disk = compio::fs::metadata(&partition_dir).await.is_ok();
 
-        // A directory already on disk is a prior life of this namespace. The
-        // usual shape: this replica applied the create before a crash, but its
-        // WAL watermark trails the commit by one op, so boot saw no such
-        // partition and the post-election re-commit lands here. Recover it the
-        // way boot does, segments included. Building fresh opens segment 0
-        // with truncation and throws away flushed data that no peer may still
-        // hold once the whole cluster restarted.
-        let partition_dir =
-            ctx.config
-                .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
-        let prior_life_on_disk = compio::fs::metadata(&partition_dir).await.is_ok();
+    // The target was read before this one, so a delete plus a recreate of
+    // the same slab keys can commit in between. Everything below has to
+    // describe the incarnation the row will carry, so the committed record
+    // wins over the earlier read on both counts.
+    let created_revision = partition_metadata.created_revision;
+    let created_view = partition_metadata.created_view;
+    if created_revision != epoch {
+        trace!(
+            shard = shard_id,
+            ns_raw = ns.inner(),
+            target_epoch = epoch,
+            created_revision,
+            prior_life_on_disk,
+            "additions: recreate committed mid-pass; deferring the build to the next pass"
+        );
+        counters.deferred += 1;
+        // Skipping alone settles it unless the directory is unmarked. The
+        // loader deletes a directory marked by an older incarnation and
+        // keeps one marked by the committed or a newer one, which can hold
+        // data this replica served. An unmarked directory, from an older
+        // server, it would adopt as the NEW incarnation, so that prior life
+        // has to go first. Teardown tombstones until its `ConfirmRemove`
+        // lands, which is what holds the next pass off. A marker that
+        // cannot be read is left to that pass's loader.
+        if prior_life_on_disk && matches!(read_created_revision(&partition_dir).await, Ok(None)) {
+            tear_down_owned_partition(ctx, ns, counters).await;
+        }
+        return Convergence::Pending;
+    }
 
-        // The target was snapshotted before this read, so a delete plus a
-        // recreate of the same slab keys can commit in between. Everything
-        // below has to describe the incarnation the row will carry, so the
-        // committed record wins over the snapshot on both counts.
-        let created_revision = partition_metadata.created_revision;
-        let created_view = partition_metadata.created_view;
-        if created_revision != epoch {
-            trace!(
+    let built = if prior_life_on_disk {
+        load_partition_or_fence(
+            ctx.config.as_ref(),
+            ns,
+            partition_stats,
+            &partition_metadata,
+            topic_runtime,
+            ctx.cluster_id,
+            ctx.self_replica_id,
+            partition_metadata.replica_set(ctx.replica_count),
+            Rc::clone(&ctx.shard.bus),
+            partitions,
+        )
+        .await
+    } else {
+        build_partition_fresh(
+            ctx.config.as_ref(),
+            partitions.config(),
+            ns,
+            partition_stats,
+            created_revision,
+            partition_metadata.created_at.as_micros(),
+            topic_runtime,
+            ctx.cluster_id,
+            ctx.self_replica_id,
+            partition_metadata.replica_set(ctx.replica_count),
+            created_view,
+            Rc::clone(&ctx.shard.bus),
+        )
+        .await
+        .map(Some)
+    };
+    match built {
+        Ok(Some(mut partition)) => {
+            partition.set_encryptor(encryptor);
+            ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
+                namespace: ns,
+                partition: Box::new(partition),
+                epoch: created_revision,
+            });
+            ctx.record_success(ns, FailureCause::Add);
+            counters.materialised += 1;
+            Convergence::Pending
+        }
+        // Tombstoned by the loader over damaged files; the tombstone keeps
+        // every later check from rebuilding over them. Or deferred, because
+        // the directory belongs to a newer incarnation than local metadata
+        // knows, and the commit that moves metadata on brings the namespace
+        // back.
+        Ok(None) => Convergence::Converged,
+        // Retrying cannot bring the history back; the tombstone keeps every
+        // later check from rebuilding it empty.
+        Err(err @ crate::server_error::ServerError::PartitionLostWithStorage { .. }) => {
+            error!(
                 shard = shard_id,
                 ns_raw = ns.inner(),
-                target_epoch = epoch,
-                created_revision,
-                prior_life_on_disk,
-                "additions: recreate committed mid-pass; deferring the build to the next pass"
+                error = %err,
+                "refusing to rebuild a partition lost with this node's storage"
             );
-            counters.deferred += 1;
-            // Skipping alone settles it unless the directory is unmarked. The
-            // loader deletes a directory marked by an older incarnation and
-            // keeps one marked by the committed or a newer one, which can hold
-            // data this replica served. An unmarked directory, from an older
-            // server, it would adopt as the NEW incarnation, so that prior life
-            // has to go first. Teardown tombstones until its `ConfirmRemove`
-            // lands, which is what holds the next pass off. A marker that
-            // cannot be read is left to that pass's loader.
-            if prior_life_on_disk && matches!(read_created_revision(&partition_dir).await, Ok(None))
-            {
-                tear_down_owned_partition(ctx, ns, counters).await;
-            }
-            continue;
+            partitions.fence(ns, created_revision);
+            Convergence::Converged
         }
-
-        let built = if prior_life_on_disk {
-            load_partition_or_fence(
-                ctx.config.as_ref(),
-                ns,
-                partition_stats,
-                &partition_metadata,
-                topic_runtime,
-                ctx.cluster_id,
-                ctx.self_replica_id,
-                ctx.replica_count,
-                Rc::clone(&ctx.shard.bus),
-                partitions,
-            )
-            .await
-        } else {
-            build_partition_fresh(
-                ctx.config.as_ref(),
-                partitions.config(),
-                ns,
-                partition_stats,
-                created_revision,
-                topic_runtime,
-                ctx.cluster_id,
-                ctx.self_replica_id,
-                ctx.replica_count,
-                created_view,
-                Rc::clone(&ctx.shard.bus),
-            )
-            .await
-            .map(Some)
-        };
-        match built {
-            Ok(Some(partition)) => {
-                ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
-                    namespace: ns,
-                    partition: Box::new(partition),
-                    epoch: created_revision,
-                });
-                ctx.record_success(ns, FailureCause::Add);
-                counters.materialised += 1;
-            }
-            // Tombstoned by the loader over damaged files; the gate above keeps
-            // every later pass from rebuilding over them. Or deferred, because
-            // the directory belongs to a newer incarnation than local metadata
-            // knows: nothing is counted, so the pass may fast-skip, and the
-            // commit that moves metadata on bumps the revision and retries it.
-            Ok(None) => {}
-            Err(err) => {
-                ctx.record_failure(ns, FailureCause::Add, now);
-                ctx.shard.metrics().record_partition_reconcile_failure();
-                error!(
-                    shard = shard_id,
-                    stream_id = ns.stream_id(),
-                    topic_id = ns.topic_id(),
-                    partition_id = ns.partition_id(),
-                    error = %err,
-                    "reconciler failed to materialize partition"
-                );
-            }
+        Err(err) => {
+            ctx.record_failure(ns, FailureCause::Add, now);
+            ctx.shard.metrics().record_partition_reconcile_failure();
+            error!(
+                shard = shard_id,
+                stream_id = ns.stream_id(),
+                topic_id = ns.topic_id(),
+                partition_id = ns.partition_id(),
+                error = %err,
+                "reconciler failed to materialize partition"
+            );
+            Convergence::Pending
         }
     }
 }
@@ -865,10 +1250,11 @@ async fn reconcile_additions(
 /// `park_if_unmaterialised` holds a frame until `ReconcileOp::InsertOwned` lands;
 /// the only other drains are `ConfirmRemove` and `RemoveRouted`. Neither can name
 /// a namespace that was never built, since it is in neither `IggyPartitions` (no
-/// owned ghost for `reconcile_removals`) nor `shards_table` (the owner seeds a
-/// row only via `InsertOwned`, and emits `InsertRouted` only for namespaces it
-/// does NOT own). Without this sweep the frames are held for the process lifetime
-/// and every waiting client burns its full read-timeout.
+/// owned ghost for `reconcile_ghost`) nor `shards_table` (the owner seeds a
+/// row via `InsertOwned`, emits `InsertRouted` for its own namespace only to
+/// rewrite the row of a partition it built, and otherwise only for namespaces
+/// it does NOT own). Without this sweep the frames are held for the process
+/// lifetime and every waiting client burns its full read-timeout.
 ///
 /// Immediate discard needs positive evidence this shard can never serve the
 /// namespace, because it destroys prepares outright. Two signals carry it: the
@@ -882,13 +1268,11 @@ async fn reconcile_additions(
 /// second later; the 60s clamp the old reasoning leaned on takes seven
 /// consecutive failures.
 ///
-/// Absence from the target set is not evidence either. It covers both a namespace
-/// that left committed metadata and one this replica has not applied yet, and
-/// local state cannot tell them apart: `snapshot_target_namespaces` reads this
-/// node's committed metadata, so a lagging backup reports a namespace it is
-/// milliseconds from committing exactly as it reports a deleted one. It is also
-/// snapshotted before `reconcile_additions` awaits `build_partition_fresh`, so a
-/// topic committing during those awaits is judged against a stale set.
+/// Absence from committed metadata is not evidence either. It covers both a
+/// namespace that left committed metadata and one this replica has not applied
+/// yet, and local state cannot tell them apart: a lagging backup reports a
+/// namespace it is milliseconds from committing exactly as it reports a deleted
+/// one.
 ///
 /// Everything else is aged: building, backed off, still committing, or
 /// genuinely deleted. [`shard::IggyShard::age_parked_partition_frames`] answers
@@ -896,15 +1280,19 @@ async fn reconcile_additions(
 /// client waits out its read timeout and no committed op dies on a
 /// local-convergence signal. Residency only; see `ParkedFrame::passes`.
 ///
+/// Aged only when `round_ended`. A pass that stopped at
+/// `DISK_VISITS_PER_PASS` leaves builds to the next one, so aging there would
+/// answer a request whose build is still queued behind the cap.
+///
 /// A namespace with a staged, unapplied `InsertOwned` is exempt: its partition
 /// is on the way but reads as un-materialised here. The queue is asked per
 /// parked namespace ([`shard::IggyShard::has_staged_insert_owned`]) rather than
-/// carrying a set over from the additions pass, so the answer cannot go stale
-/// across `reconcile_removals`' awaits; `parked` is empty on the steady path,
+/// carrying a set over from the checks, so the answer cannot go stale across
+/// their awaits; `parked` is empty on the steady path,
 /// so the scan costs nothing there. The exemption spans passes, not just the
 /// one that built the namespace, covering arbitrary pump lag; dropping it ages
 /// frames on every commit-driven pass the pump falls behind.
-fn reconcile_parked_frames(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+fn reconcile_parked_frames(ctx: &ReconcilerCtx, round_ended: bool, counters: &mut PassCounters) {
     let parked = ctx.shard.parked_namespaces();
     if parked.is_empty() {
         return;
@@ -935,69 +1323,64 @@ fn reconcile_parked_frames(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
         // so age the requests rather than hold them for the process lifetime.
         // Materialisation hands its frames straight to the pump, so a namespace
         // in `IggyPartitions` no longer reaches here with any parked.
-        if ctx.shard.age_parked_partition_frames(ns) > 0 {
+        if round_ended && ctx.shard.age_parked_partition_frames(ns) > 0 {
             counters.parked_reclaimed += 1;
         }
     }
 }
 
-async fn reconcile_removals(
+/// Checks a namespace committed metadata does not place on this node, and
+/// removes what this shard still holds of it.
+async fn reconcile_ghost(
     ctx: &ReconcilerCtx,
-    target_set: &AHashSet<IggyNamespace>,
+    ns: IggyNamespace,
     counters: &mut PassCounters,
-) {
+) -> Convergence {
     let partitions = ctx.shard.plane.partitions();
-    let shards_table = ctx.shard.shards_table();
 
-    let owned_ghosts: Vec<IggyNamespace> = partitions
-        .namespaces()
-        .copied()
-        .filter(|ns| !target_set.contains(ns))
-        .collect();
-    for ns in owned_ghosts {
+    // Three kinds of local trace, each removed through the same teardown, so
+    // the disk delete removes the files FIRST and only its success enqueues
+    // the `ConfirmRemove` that drops the partition and lifts a fence:
+    //
+    //   * A mounted partition, including one already tombstoned.
+    //   * A tombstone without a partition. Boot-time damage verdicts
+    //     tombstone a namespace BEFORE it is ever materialised, and
+    //     `ConfirmRemove` (the only untombstone) is never enqueued for it.
+    //     A bare untombstone would leave the refused files in place for the
+    //     next boot to re-derive, with a window where a fresh build
+    //     truncates them. While the namespace is still committed the fence
+    //     stands: only an operator delete authorises destroying the bytes it
+    //     guards.
+    //   * Files without a partition or a tombstone: a namespace boot left
+    //     unbuilt, or one a failed build left.
+    let unbuilt = ctx.unbuilt_owned.borrow().contains(&ns);
+    if partitions.contains(&ns)
+        || partitions.is_tombstoned(&ns)
+        || unbuilt
+        || ctx.has_failure(ns, FailureCause::Add)
+    {
         tear_down_owned_partition(ctx, ns, counters).await;
+        // From its tombstone on, the teardown carries itself to the end. A
+        // teardown refused before it keeps the marks for the next check.
+        if partitions.is_tombstoned(&ns) {
+            ctx.unbuilt_owned.borrow_mut().remove(&ns);
+            ctx.record_success(ns, FailureCause::Add);
+        }
+        return Convergence::Pending;
     }
 
-    // Boot-time damage verdicts tombstone a namespace BEFORE it is ever
-    // materialised, so it sits in neither `partitions.namespaces()` nor the
-    // shards table: the loop above can never reach it, and `ConfirmRemove`
-    // (the only untombstone) is never enqueued for it -- without this, a
-    // boot fence has no exit and a recreate of the recycled ids inherits it
-    // forever. Once committed metadata no longer names the namespace (the
-    // operator deleted it), route it through the same teardown: the disk
-    // delete removes the refused files the verdict left at their real paths
-    // FIRST, and only its success enqueues the `ConfirmRemove` that lifts
-    // the fence -- a bare untombstone would leave the cause in place for
-    // the next boot to re-derive, with a window where a fresh build
-    // truncates the refused files. While the namespace is still in the
-    // committed target the fence stands: only an operator delete authorises
-    // destroying the bytes it guards.
-    let fenced_ghosts: Vec<IggyNamespace> = partitions
-        .tombstoned_namespaces()
-        .into_iter()
-        .filter(|ns| !target_set.contains(ns) && !partitions.contains(ns))
-        .collect();
-    for ns in fenced_ghosts {
-        tear_down_owned_partition(ctx, ns, counters).await;
-    }
-
-    // Skip namespaces still locally owned (disk-delete-failed ghosts):
-    // pruning their shards_table row would strand peer routing.
-    let still_owned: AHashSet<IggyNamespace> = partitions.namespaces().copied().collect();
-    let routed_ghosts: Vec<IggyNamespace> = shards_table
-        .namespaces()
-        .into_iter()
-        .filter(|ns| !target_set.contains(ns) && !still_owned.contains(ns))
-        .collect();
-    for ns in routed_ghosts {
+    if ctx.shard.shards_table().epoch_for(ns).is_some() {
         ctx.shard
             .enqueue_reconcile_op(ReconcileOp::RemoveRouted { namespace: ns });
         counters.removed_routed += 1;
+        return Convergence::Pending;
     }
+    ctx.forget_failures(ns);
+    Convergence::Converged
 }
 
-/// Two-phase owned-partition teardown shared by the removals pass (a ghost
-/// no longer in the committed target) and the additions pass (a stale
+/// Two-phase owned-partition teardown shared by the ghost check (a namespace
+/// no longer in the committed target) and the target check (a stale
 /// incarnation after slab-key reuse). Fences writes synchronously
 /// (tombstone + `shards_table` row removal), unlinks the on-disk
 /// hierarchy, then enqueues `ConfirmRemove` so the pump drops the
@@ -1039,6 +1422,7 @@ async fn tear_down_owned_partition(
         counters.backoff_skipped += 1;
         return;
     }
+    counters.disk_visits += 1;
 
     // Fence through detached handles before awaiting disk delete. The pump
     // may hold a mutable partition borrow, so this must not access its vec.
@@ -1100,21 +1484,64 @@ async fn tear_down_owned_partition(
     counters.removed_local += 1;
 }
 
-/// Reclaim deleted groups through ordered offset deletes. Replicas must see
-/// each delete before a replacement store can reuse its durable slot.
-fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
-    let catalogs = snapshot_topic_live_groups(ctx);
-    let partitions = ctx.shard.plane.partitions();
-    let namespaces: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
-    for namespace in namespaces {
-        if ctx
-            .group_offset_cleanup_inflight
-            .borrow()
-            .contains(&namespace)
-        {
+/// Reclaim deleted groups through ordered offset deletes, then retire their
+/// owners. Replicas must see each delete before a replacement store can reuse
+/// its durable slot.
+///
+/// Visits only the partitions that marked themselves dirty and the local
+/// partitions of topics whose group was deleted since the last call. The first
+/// call with a fresh `cleanup` visits every local partition.
+pub fn reconcile_consumer_group_offsets<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    cleanup: &GroupOffsetCleanup,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    reconcile_group_offsets(shard, cleanup, &mut PassCounters::default());
+}
+
+fn reconcile_group_offsets<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    cleanup: &GroupOffsetCleanup,
+    counters: &mut PassCounters,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    mark_deleted_group_offsets(shard, cleanup);
+    let partitions = shard.plane.partitions();
+    let mut catalog: Option<((usize, usize), Option<GroupCatalog>)> = None;
+    for namespace in partitions.take_consumer_group_offsets_dirty() {
+        // Its completion task marks the namespace again.
+        if cleanup.inflight.borrow().contains(&namespace) {
             continue;
         }
-        let Some(catalog) = catalogs.get(&(namespace.stream_id(), namespace.topic_id())) else {
+        let status = partitions.with_partition(&namespace, |partition| {
+            let consensus = partition.consensus();
+            (consensus.is_primary(), consensus.is_normal())
+        });
+        // Marked once per view, at the first operation that sees it, which can
+        // come before the view is normal. Keep the mark until it is.
+        if let Some((_, false)) = status {
+            partitions.mark_consumer_group_offsets_dirty(namespace);
+        }
+        // Only a primary in a normal view deletes or retires. A backup is
+        // marked again by the view that makes it primary.
+        if status != Some((true, true)) {
+            continue;
+        }
+        let topic = (namespace.stream_id(), namespace.topic_id());
+        if catalog.as_ref().is_none_or(|(cached, _)| *cached != topic) {
+            catalog = Some((topic, topic_group_catalog(shard, topic.0, topic.1)));
+        }
+        let Some((_, Some(catalog))) = &catalog else {
             continue;
         };
         let dead = partitions
@@ -1125,7 +1552,9 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
             })
             .unwrap_or_default();
         // Bound work per pass so a historical directory cannot monopolize the
-        // reconciler. Unprocessed keys keep the partition's dirty flag armed.
+        // reconciler. The completion task marks the namespace again for the
+        // keys left, and anything refused here marks it below.
+        let mut refused = false;
         let mut tickets = Vec::with_capacity(dead.len().min(GROUP_OFFSET_DELETES_PER_PASS));
         for (kind, consumer_id) in dead.into_iter().take(GROUP_OFFSET_DELETES_PER_PASS) {
             let context = partitions
@@ -1144,41 +1573,44 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
                     Some(PartitionContext {
                         incarnation: partition.created_revision(),
                         owner_generation,
-                        metadata_op: ctx.shard.plane.metadata().applied_frontier().get(),
+                        metadata_op: shard.plane.metadata().applied_frontier().get(),
                     })
                 })
                 .flatten();
             let Some(context) = context else {
                 counters.cg_offsets_pending += 1;
+                refused = true;
                 continue;
             };
             let request = group_offset_delete_request(namespace, kind, consumer_id, context);
-            if let Ok(ticket) = ctx.shard.partition_submit(namespace, request) {
+            if let Ok(ticket) = shard.partition_submit(namespace, request) {
                 counters.cg_offsets_submitted += 1;
                 tickets.push(ticket);
             } else {
                 counters.cg_offsets_pending += 1;
+                refused = true;
             }
         }
-        let retirement_ticket = consumer_group_retirement_request(ctx, namespace, catalog)
+        let retirement_ticket = consumer_group_retirement_request(shard, namespace, catalog)
             .and_then(|request| {
-                let ticket = ctx.shard.partition_submit(namespace, request).ok();
+                let ticket = shard.partition_submit(namespace, request).ok();
                 if ticket.is_none() {
                     counters.cg_offsets_pending += 1;
+                    refused = true;
                 }
                 ticket
             });
+        if refused {
+            partitions.mark_consumer_group_offsets_dirty(namespace);
+        }
         if tickets.is_empty() && retirement_ticket.is_none() {
             continue;
         }
-        ctx.group_offset_cleanup_inflight
-            .borrow_mut()
-            .insert(namespace);
-        let inflight = Rc::clone(&ctx.group_offset_cleanup_inflight);
-        let completed = Rc::clone(&ctx.group_offset_cleanup_completed);
-        let shard = Rc::clone(&ctx.shard);
+        cleanup.inflight.borrow_mut().insert(namespace);
+        let inflight = Rc::clone(&cleanup.inflight);
+        let shard = Rc::clone(shard);
         shard.bus.clone().spawn(async move {
-            let replies = futures::future::join_all(
+            futures::future::join_all(
                 tickets
                     .into_iter()
                     .map(|ticket| shard.await_partition_submit(ticket)),
@@ -1187,44 +1619,73 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
             if let Some(ticket) = retirement_ticket {
                 shard.await_partition_submit(ticket).await;
             }
-            let count = replies
-                .into_iter()
-                .flatten()
-                .filter(|reply| {
-                    reply
-                        .as_slice()
-                        .get(..size_of::<ReplyHeader>())
-                        .and_then(|bytes| {
-                            bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok()
-                        })
-                        .is_some_and(|header| header.status == 0)
-                })
-                .count();
-            completed.set(completed.get() + count);
             inflight.borrow_mut().remove(&namespace);
             shard
                 .plane
                 .partitions()
-                .note_consumer_group_offsets_reconcile_needed();
+                .mark_consumer_group_offsets_dirty(namespace);
         });
     }
 }
 
-fn consumer_group_retirement_request(
-    ctx: &ReconcilerCtx,
+/// Marks the local partitions of each topic whose consumer group was deleted
+/// since the last call, or every local partition when the change feed cannot
+/// tell.
+fn mark_deleted_group_offsets<B, MJ, S, SB>(
+    shard: &ShellShard<B, MJ, S, SB>,
+    cleanup: &GroupOffsetCleanup,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let partitions = shard.plane.partitions();
+    let (revision, changes) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .revision_and_partition_changes(cleanup.synced_revision.get());
+    cleanup.synced_revision.set(Some(revision));
+    let marked: Vec<IggyNamespace> = changes.map_or_else(
+        || partitions.namespaces().copied().collect(),
+        |changes| {
+            changes
+                .iter()
+                .filter(|change| change.kind == PartitionChangeKind::ConsumerGroupDeleted)
+                .map(|change| change.namespace)
+                .collect()
+        },
+    );
+    for namespace in marked {
+        if partitions.contains(&namespace) {
+            partitions.mark_consumer_group_offsets_dirty(namespace);
+        }
+    }
+}
+
+/// The owner retirement request of `namespace`, whose replica the caller found
+/// to be the primary of a normal view.
+fn consumer_group_retirement_request<B, MJ, S, SB>(
+    shard: &ShellShard<B, MJ, S, SB>,
     namespace: IggyNamespace,
     groups: &GroupCatalog,
-) -> Option<Message<RoutedRequestHeader>> {
-    let catalog = ctx
-        .shard
+) -> Option<Message<RoutedRequestHeader>>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let catalog = shard
         .plane
         .partitions()
         .with_partition(&namespace, |partition| {
-            if !partition.consensus().is_primary() || !partition.consensus().is_normal() {
-                return None;
-            }
             let kept = partition.retirement_kept_groups(|id| groups.is_live(id))?;
-            let mut live_group_ids = groups.sorted_live().to_vec();
+            let mut live_group_ids = groups.live.clone();
             if !kept.is_empty() {
                 live_group_ids.extend(kept);
                 live_group_ids.sort_unstable();
@@ -1373,97 +1834,76 @@ pub fn reconcile_pending_revocations<B, MJ, S, SB>(
 struct GroupCatalog {
     metadata_op: u64,
     next_group_id: u64,
-    live: AHashSet<u64>,
-    sorted_live: OnceCell<Vec<u64>>,
+    /// Sorted.
+    live: Vec<u64>,
 }
 
 impl GroupCatalog {
     /// Ids at or above the allocation boundary may exist on a newer replica.
     fn is_live(&self, group_id: u64) -> bool {
-        group_id >= self.next_group_id || self.live.contains(&group_id)
+        group_id >= self.next_group_id || self.live.binary_search(&group_id).is_ok()
     }
+}
 
-    /// Sorted on first use, so a pass sorts a topic at most once, and only
-    /// when one of its partitions sends a catalog.
-    fn sorted_live(&self) -> &[u64] {
-        self.sorted_live.get_or_init(|| {
-            let mut live: Vec<_> = self.live.iter().copied().collect();
-            live.sort_unstable();
-            live
+/// One topic's consumer group catalog from committed metadata, `None` once the
+/// topic is gone. The partition plane keys a group's offset by the monotonic
+/// group id (the store path is rewritten to it; the read path resolves it), so
+/// the live set carries those ids too -- otherwise the reconciler would treat
+/// every live offset as orphaned and purge it.
+fn topic_group_catalog<B, MJ, S, SB>(
+    shard: &ShellShard<B, MJ, S, SB>,
+    stream_id: usize,
+    topic_id: usize,
+) -> Option<GroupCatalog>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+        let mut live: Vec<u64> = topic
+            .consumer_groups
+            .values()
+            .map(|group| group.id)
+            .collect();
+        live.sort_unstable();
+        Some(GroupCatalog {
+            metadata_op: topic.consumer_group_catalog_op,
+            next_group_id: topic.next_consumer_group_id,
+            live,
         })
-    }
-}
-
-/// `(stream_id, topic_id) -> consumer-group catalog` from committed metadata.
-/// The partition plane keys a group's offset by the monotonic group id (the
-/// store path is rewritten to it; the read path resolves it), so the live-set
-/// carries those ids too -- otherwise the reconciler would treat every live
-/// offset as orphaned and purge it.
-fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), GroupCatalog> {
-    ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let mut map = AHashMap::new();
-        for (_, stream) in &inner.items {
-            for (topic_id, topic) in &stream.topics {
-                map.insert(
-                    (stream.id, topic_id),
-                    GroupCatalog {
-                        metadata_op: topic.consumer_group_catalog_op,
-                        next_group_id: topic.next_consumer_group_id,
-                        live: topic
-                            .consumer_groups
-                            .values()
-                            .map(|group| group.id)
-                            .collect(),
-                        sorted_live: OnceCell::new(),
-                    },
-                );
-            }
-        }
-        map
     })
 }
 
-/// One committed partition the additions pass has to account for.
-struct TargetPartition {
-    ns: IggyNamespace,
-    /// The committed `created_revision`. Lets the pass detect a stale local
-    /// incarnation after slab-key reuse without an `Arc<TopicStats>` clone per
-    /// partition: [`fetch_partition_build_inputs`] re-reads committed metadata
-    /// for the namespaces actually built, and takes the stats there.
-    epoch: u64,
+/// What a check of a stored partition reads from committed metadata.
+#[derive(Clone, Copy)]
+struct CommittedTarget {
+    created_revision: u64,
+    /// The committed `TruncatePartition` watermark, `0` when never trimmed.
+    delete_watermark: u64,
 }
 
-/// Every committed partition, as the additions pass needs it.
-fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<TargetPartition> {
-    ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
-        // TODO(krishna): O(committed partitions) per non-skipped pass (here +
-        // reconcile_removals). The revision fast-skip hides this in steady
-        // state but not under sustained churn; switch to an incremental diff
-        // keyed on the changed namespaces if it bottlenecks large clusters.
-        let mut entries = Vec::new();
-        for (_, stream) in &inner.items {
-            for (topic_id, topic) in &stream.topics {
-                for partition in &topic.partitions {
-                    entries.push(TargetPartition {
-                        ns: IggyNamespace::new(stream.id, topic_id, partition.id),
-                        epoch: partition.created_revision,
-                    });
-                }
-            }
-        }
-        entries
-    })
-}
-
-/// Monotonic `Streams::revision`. Stable between passes iff no
-/// partition-shaping op committed since, which is the fast-skip signal.
-fn current_revision(ctx: &ReconcilerCtx) -> u64 {
+/// The committed partition `ns` names when this node stores it. A partition
+/// this node does not store gets neither a build nor a routing row here.
+fn committed_target(ctx: &ReconcilerCtx, ns: IggyNamespace) -> Option<CommittedTarget> {
     ctx.shard
         .plane
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| inner.revision)
+        .with_committed_partition(ns, |partition| {
+            partition
+                .replica_set(ctx.replica_count)
+                .member(ctx.self_replica_id)
+                .map(|_| CommittedTarget {
+                    created_revision: partition.created_revision,
+                    delete_watermark: partition.deleted_up_to_offset,
+                })
+        })
+        .flatten()
 }
 
 /// Roll a torn-down partition out of its parent topic and stream by dropping
@@ -1491,6 +1931,17 @@ fn settle_partition_stats(ctx: &ReconcilerCtx, ns: IggyNamespace) {
         .remove_partitions(ns.stream_id(), ns.topic_id(), &[ns.partition_id()]);
 }
 
+/// What building one partition reads from committed metadata.
+struct PartitionBuildInputs {
+    stats: Arc<iggy_common::PartitionStats>,
+    /// `UnsupportedCriticalOption` when the topic holds critical state this
+    /// build cannot read.
+    runtime: Result<iggy_common::TopicRuntimeOptions, IggyError>,
+    metadata: Partition,
+    stream_key: StreamKeyIdentity,
+    encryption: StreamEncryption,
+}
+
 /// Everything one namespace's build needs out of committed metadata: the shared
 /// `Arc<PartitionStats>`, the topic's runtime options, and the committed
 /// [`Partition`] record the disk loader reads `created_at` / `created_revision`
@@ -1509,11 +1960,7 @@ fn settle_partition_stats(ctx: &ReconcilerCtx, ns: IggyNamespace) {
 fn fetch_partition_build_inputs(
     ctx: &ReconcilerCtx,
     ns: IggyNamespace,
-) -> Option<(
-    Arc<iggy_common::PartitionStats>,
-    iggy_common::TopicRuntimeOptions,
-    Partition,
-)> {
+) -> Option<PartitionBuildInputs> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream = inner.items.get(ns.stream_id())?;
         let topic = stream.topics.get(ns.topic_id())?;
@@ -1524,16 +1971,22 @@ fn fetch_partition_build_inputs(
             .clone();
         // Get-or-create in the shared registry so the owning shard's counters
         // are the same `Arc` every shard's `get_topic` reply reads.
-        Some((
-            inner.stats_registry.partition(
+        Some(PartitionBuildInputs {
+            stats: inner.stats_registry.partition(
                 ns.stream_id(),
                 ns.topic_id(),
                 &partition,
                 topic.stats.clone(),
             ),
-            iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options),
-            partition,
-        ))
+            runtime: check_critical_options(&topic.options)
+                .map(|()| iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)),
+            metadata: partition,
+            stream_key: StreamKeyIdentity {
+                stream_id: stream.id,
+                created_op: stream.created_op,
+            },
+            encryption: StreamEncryption::from(&stream.options),
+        })
     })
 }
 
@@ -1544,38 +1997,35 @@ fn shards_table_has_epoch(ctx: &ReconcilerCtx, ns: IggyNamespace, epoch: u64) ->
     ctx.shard.shards_table().epoch_for(ns) == Some(epoch)
 }
 
-/// Enforce committed `TruncatePartition` watermarks: for each owned partition
-/// carrying a non-zero delete watermark, stage a pump-side trim to that offset.
-/// Idempotent — the pump no-ops once a partition is trimmed past the watermark,
-/// so a redundant pass triggered by an unrelated revision bump is harmless.
-/// A watermark whose enforcement is still incomplete (first local segment
-/// starts below it) counts as pending work: the pump may be blocked by a
-/// consumer barrier, by a rejoin whose offsets arrive via journal repair, or
-/// by the per-pass removal budget that keeps one trim from monopolising the
-/// pump, and no such unblocking bumps `Streams::revision`, so the pass must
-/// keep the reconciler ticking until the layout converges.
-fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
-    let partitions = ctx.shard.plane.partitions();
-    let namespaces: Vec<_> = partitions.namespaces().copied().collect();
-    let streams = ctx.shard.plane.metadata().mux_stm.streams();
-    for namespace in namespaces {
-        let watermark = streams.partition_delete_watermark(
-            namespace.stream_id(),
-            namespace.topic_id(),
-            namespace.partition_id(),
-        );
-        if watermark == 0 {
-            continue;
-        }
-        ctx.shard.request_truncate_partition(namespace, watermark);
-        let trimmed = partitions
-            .get_by_ns(&namespace)
-            .and_then(|partition| partition.log.segments().first())
-            .is_none_or(|first| first.start_offset >= watermark);
-        if !trimmed {
-            counters.trims_pending += 1;
-        }
+/// Enforce the committed `TruncatePartition` watermark of a live owned
+/// partition. A watermark whose enforcement is still incomplete (first local
+/// segment starts below it) is pending work: the pump may be blocked by a
+/// consumer barrier, by a rejoin whose offsets arrive via journal repair, or by
+/// the per-pass removal budget that keeps one trim from monopolising the pump,
+/// and no such unblocking commits anything, so the namespace stays in the work
+/// set until the layout converges.
+fn trim_to_watermark(
+    ctx: &ReconcilerCtx,
+    ns: IggyNamespace,
+    watermark: u64,
+    counters: &mut PassCounters,
+) -> Convergence {
+    if watermark == 0 {
+        return Convergence::Converged;
     }
+    let trimmed = ctx
+        .shard
+        .plane
+        .partitions()
+        .get_by_ns(&ns)
+        .and_then(|partition| partition.log.segments().first())
+        .is_none_or(|first| first.start_offset >= watermark);
+    if trimmed {
+        return Convergence::Converged;
+    }
+    ctx.shard.request_truncate_partition(ns, watermark);
+    counters.trims_pending += 1;
+    Convergence::Pending
 }
 
 /// A report relays committed local evidence. Only the partition primary orders a fence.
@@ -1666,67 +2116,99 @@ pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(
     }
 }
 
-/// On a single-replica node, recovery fences a partition it cannot load, and
-/// then no log can install a lifecycle fence. Without this, a delete of the
-/// topic, the operator's exit from that fence, would wait forever. The durable
-/// retirement fence keeps the incarnation offline, which is what the lifecycle
-/// fence would have proven.
+/// On a partition this node alone stores, recovery fences an incarnation it
+/// cannot load, and then no log can install a lifecycle fence. Without this, a
+/// delete of the topic, the operator's exit from that fence, would wait
+/// forever. The durable retirement fence keeps the incarnation offline, which
+/// is what the lifecycle fence would have proven.
+///
+/// A wider partition being deleted gets the same exit once enough of its
+/// members lost their copies: each such member retires its copy durably and
+/// reports it, and when the members still holding one are too few to elect a
+/// primary, a member completes the target. No log could install the fence
+/// after that.
 async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
-    if ctx.replica_count != 1 || ctx.lifecycle_reports.batch_in_flight.get() {
+    if ctx.lifecycle_reports.batch_in_flight.get() {
         return;
     }
     let partitions = ctx.shard.plane.partitions();
     let system_path = ctx.config.get_system_path();
-    // The fence writes below await, so only the targets that failed recovery
-    // leave the borrow.
+    // The fence writes below await, so the targets leave the borrow first.
     let streams = ctx.shard.plane.metadata().mux_stm.streams();
-    let failed = streams.read(|state| {
-        let mut failed = Vec::new();
+    let pending = streams.read(|state| {
+        let mut pending = Vec::new();
         for intent in state.lifecycle_intents.values() {
-            let mut targets = Vec::new();
-            for target in intent
+            let targets: Vec<_> = intent
                 .partitions
                 .iter()
                 .filter(|target| target.partition_op.is_none())
-            {
-                let namespace = IggyNamespace::new(
-                    intent.stream_id as usize,
-                    target.topic_id as usize,
-                    target.partition_id as usize,
-                );
-                let incarnation = match target.fence {
-                    LifecycleFence::History(transition) => transition.incarnation,
-                    LifecycleFence::Owner(installation) => installation.incarnation,
-                };
-                if partitions.failed_revision(&namespace) == Some(incarnation) {
-                    targets.push((target.topic_id, target.partition_id, namespace, incarnation));
-                }
-            }
+                .map(|target| {
+                    let (incarnation, deletes) = match target.fence {
+                        LifecycleFence::History(transition) => (transition.incarnation, true),
+                        LifecycleFence::Owner(installation) => (installation.incarnation, false),
+                    };
+                    RetirementTarget {
+                        topic_id: target.topic_id,
+                        partition_id: target.partition_id,
+                        namespace: IggyNamespace::new(
+                            intent.stream_id as usize,
+                            target.topic_id as usize,
+                            target.partition_id as usize,
+                        ),
+                        incarnation,
+                        deletes,
+                        retired_members: target.retired_members,
+                    }
+                })
+                .collect();
             if !targets.is_empty() {
-                failed.push((intent.context.metadata_op, intent.stream_id, targets));
+                pending.push((intent.context.metadata_op, intent.stream_id, targets));
             }
         }
-        failed
+        pending
     });
-    for (metadata_op, stream_id, targets) in failed {
+    for (metadata_op, stream_id, targets) in pending {
         let mut completions = Vec::new();
-        for (topic_id, partition_id, namespace, incarnation) in targets {
-            // Other tasks run during the awaits, so each target is checked
-            // again right before its durable write.
-            if partitions.failed_revision(&namespace) != Some(incarnation) {
+        for target in targets {
+            let Some(members) = committed_members(ctx, target.namespace) else {
+                continue;
+            };
+            if members.member(ctx.self_replica_id).is_none() {
                 continue;
             }
-            if let Err(error) =
-                record_partition_retirement_fence(&system_path, namespace, incarnation).await
-            {
-                warn!(%error, namespace_raw = namespace.inner(),
-                    "lifecycle waits for a durable partition fence");
-                continue;
-            }
+            let partition_op = match retirement_step(ctx, &members, &target) {
+                Some(RetirementStep::Complete) => RETIRED_PARTITION_OP,
+                Some(RetirementStep::RetireCopy) => {
+                    // Other tasks run during the awaits, so the copy is checked
+                    // again right before its durable write.
+                    if !copy_lost_here(ctx, &target) {
+                        continue;
+                    }
+                    if let Err(error) = record_partition_retirement_fence(
+                        &system_path,
+                        target.namespace,
+                        target.incarnation,
+                    )
+                    .await
+                    {
+                        warn!(%error, namespace_raw = target.namespace.inner(),
+                            "lifecycle waits for a durable partition fence");
+                        continue;
+                    }
+                    if members.len() == 1 {
+                        RETIRED_PARTITION_OP
+                    } else {
+                        // A retired copy must not vote either.
+                        partitions.fence(target.namespace, target.incarnation);
+                        retired_member_op(ctx.self_replica_id)
+                    }
+                }
+                None => continue,
+            };
             completions.push(LifecycleCompletion {
-                topic_id,
-                partition_id,
-                partition_op: RETIRED_PARTITION_OP,
+                topic_id: target.topic_id,
+                partition_id: target.partition_id,
+                partition_op,
             });
             // Metadata records only the reported batch, so a fence written
             // past it is written again on the next pass.
@@ -1739,6 +2221,85 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
             return;
         }
     }
+}
+
+/// A pending lifecycle target as [`reconcile_retired_lifecycles`] reads it.
+struct RetirementTarget {
+    topic_id: u32,
+    partition_id: u32,
+    namespace: IggyNamespace,
+    incarnation: u64,
+    /// The lifecycle removes the partition, so retiring a copy loses nothing.
+    deletes: bool,
+    retired_members: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetirementStep {
+    /// Too few members still hold a copy to elect a primary, so no log can
+    /// fence it.
+    Complete,
+    /// This member's copy is lost: retire it durably and report it.
+    RetireCopy,
+}
+
+/// What this member does for `target`, or `None` to wait for its log.
+fn retirement_step(
+    ctx: &ReconcilerCtx,
+    members: &ReplicaSet,
+    target: &RetirementTarget,
+) -> Option<RetirementStep> {
+    if members.len() == 1 {
+        return copy_lost_here(ctx, target).then_some(RetirementStep::RetireCopy);
+    }
+    if !target.deletes {
+        return None;
+    }
+    let retired = members
+        .nodes()
+        .iter()
+        .filter(|&&node| retired_bit(node).is_some_and(|bit| target.retired_members & bit != 0))
+        .count();
+    // Electing the primary that installs the fence takes a view-change quorum
+    // of the members that kept a copy. A primary that kept its copy may still
+    // commit with fewer, but it installs the fence itself, and what it commits
+    // afterwards belongs to a partition being deleted.
+    let holding = usize::from(members.len()) - retired;
+    if holding < quorum_view_change(members.len()) {
+        return Some(RetirementStep::Complete);
+    }
+    let retired_here =
+        retired_bit(ctx.self_replica_id).is_none_or(|bit| target.retired_members & bit != 0);
+    (!retired_here && copy_lost_here(ctx, target)).then_some(RetirementStep::RetireCopy)
+}
+
+const fn retired_bit(node: u8) -> Option<u32> {
+    1_u32.checked_shl(node as u32)
+}
+
+/// Whether this node's copy of the target incarnation is gone: recovery
+/// fenced it, or it waits for a state transfer that would rebuild it.
+fn copy_lost_here(ctx: &ReconcilerCtx, target: &RetirementTarget) -> bool {
+    let partitions = ctx.shard.plane.partitions();
+    partitions.failed_revision(&target.namespace) == Some(target.incarnation)
+        || partitions
+            .get_by_ns(&target.namespace)
+            .is_some_and(|partition| {
+                partition.created_revision() == target.incarnation
+                    && partition.requires_state_transfer()
+            })
+}
+
+/// The committed members of `namespace`, every node for a partition created
+/// before replication factors.
+fn committed_members(ctx: &ReconcilerCtx, namespace: IggyNamespace) -> Option<ReplicaSet> {
+    ctx.shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .members_for_namespace(namespace)
+        .map(|members| members.unwrap_or_else(|| ReplicaSet::all(ctx.replica_count)))
 }
 
 /// The ready completions of the intent at `metadata_op` in batch order, at
@@ -1848,14 +2409,18 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureCause, FailureRecord, LIFECYCLE_FENCE_RETRY_MICROS, PassCounters, ReconcilerCtx,
-        TargetPartition, build_partition_fresh, current_revision, delete_partitions_from_disk,
-        fetch_partition_build_inputs, group_offset_delete_request, reconcile_additions,
-        reconcile_consumer_group_offsets, reconcile_once, reconcile_partition_lifecycles,
-        reconcile_pending_revocations, reconcile_retired_lifecycles,
+        CommittedTarget, Convergence, DISK_VISITS_PER_PASS, FailureCause, FailureRecord,
+        GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS, PassCounters, ReconcilerCtx,
+        build_partition_fresh, delete_partitions_from_disk, fetch_partition_build_inputs,
+        fill_pending, fold_changes, group_offset_delete_request, reconcile_group_offsets,
+        reconcile_once, reconcile_partition_lifecycles, reconcile_pending_revocations,
+        reconcile_retired_lifecycles, reconcile_target, visit_pending,
     };
+    use bytes::Bytes;
     use configs::server::ServerConfig;
-    use consensus::{MetadataHandle, PartitionsHandle, Sequencer, StateTransferStage};
+    use consensus::{
+        MetadataHandle, PartitionsHandle, PlaneKind, Sequencer, StateTransferStage, Status,
+    };
     use iggy_binary_protocol::codec::{WireDecode, WireEncode};
     use iggy_binary_protocol::primitives::identifier::WireName;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -1865,13 +2430,21 @@ mod tests {
         CreatePartitionsRequest, CreatePartitionsWithAssignmentsRequest,
         RetireConsumerGroupOwnersRequest,
     };
-    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
+    use iggy_binary_protocol::requests::streams::{
+        CreateStreamRequest, DeleteStreamRequest, RewrapStreamKeyEntry, RewrapStreamKeysRequest,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
     use iggy_binary_protocol::{
-        AckLevel, Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
-        RoutedRequestHeader, WireConsumer, WireIdentifier, WireOptions,
+        AckLevel, Command, ConsensusHeader, Operation, PrepareHeader, RepairRangeReplyHeader,
+        RoutedRequestHeader, StartViewChangeHeader, WireConsumer, WireIdentifier, WireOptions,
+    };
+    use iggy_common::wire_conversions::resource_options_to_wire;
+    use iggy_common::{
+        Durability, HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance,
+        ResourceOptions, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrapSet,
+        critical_keys_marker,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -1881,20 +2454,28 @@ mod tests {
     use metadata::stm::StateMachine;
     use metadata::stm::lifecycle::{
         CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion,
+        RETIRED_PARTITION_OP, retired_member_op,
     };
-    use metadata::stm::stream::Streams;
+    use metadata::stm::stream::{
+        PartitionChangeKind, RECENT_PARTITION_CHANGES_RETAINED, Streams, TruncatePartitionRequest,
+    };
     use metadata::stm::user::Users;
-    use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairSession};
+    use partitions::{
+        IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairSession,
+    };
+    use rand::prelude::{RngExt, SeedableRng, StdRng};
     use server_common::sharding::{IggyNamespace, ShardId};
     use server_common::{Message, MessageBag};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
-    use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, ShardIdentity};
+    use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
+    use std::collections::BTreeSet;
     use std::mem::size_of;
+    use std::path::Path;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     type TestMux = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
@@ -1907,6 +2488,8 @@ mod tests {
     >;
 
     const CLUSTER_ID: u128 = 1;
+    const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
+    const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
     /// Sanity test that ensures the `()` channel can coalesce wakes
     /// without blocking the producer when the consumer hasn't drained
@@ -2040,8 +2623,10 @@ mod tests {
 
     fn assignment(partition_id: u32, consensus_group_id: u64) -> CreatedPartitionAssignment {
         CreatedPartitionAssignment {
+            initial_view: 0,
             partition_id,
             consensus_group_id,
+            members: Vec::new(),
         }
     }
 
@@ -2056,6 +2641,46 @@ mod tests {
             .expect("CreateStream apply succeeds");
     }
 
+    /// [`seed_stream`] for an encrypted stream, in the committed form the edge
+    /// writes once it has wrapped the stream's key.
+    fn seed_encrypted_stream(mux: &TestMux, op: u64, name: &str, set: &WrapSet) {
+        let options = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("set fits")),
+            ),
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(
+                    critical_keys_marker(&[OptionKey::EncryptionKeyWrapped]).expect("marker"),
+                ),
+            ),
+        ]);
+        let req = CreateStreamRequest {
+            name: WireName::new(name).expect("test stream name fits WireName"),
+            options: resource_options_to_wire(&options, OptionsProvenance::All)
+                .expect("options encode"),
+        };
+        mux.update(build_prepare(op, Operation::CreateStream, &req))
+            .expect("CreateStream apply succeeds");
+    }
+
+    fn key_context(config_key: &str) -> Arc<ServerKeyContext> {
+        Arc::new(ServerKeyContext::from_config(config_key, &[], true).expect("valid config key"))
+    }
+
+    fn wrap_stream_key(context: &ServerKeyContext, seed: u8) -> WrapSet {
+        let key = StreamEncryptionKey::try_from([seed; 32].as_slice()).expect("32 bytes");
+        WrapSet::from(context.wrap(&key, StreamKeyOrigin::Server).expect("wraps"))
+    }
+
+    fn served_encrypted(shard: &TestShard, ns: IggyNamespace) -> Option<bool> {
+        shard
+            .plane
+            .partitions()
+            .with_partition(&ns, |partition| partition.encryptor().is_some())
+    }
+
     /// Drive a `CreateTopicWithAssignments` commit.
     fn seed_topic(
         mux: &TestMux,
@@ -2067,13 +2692,12 @@ mod tests {
         let req = CreateTopicWithAssignmentsRequest {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
-                partitions_count: 1,
+                partitions_count: u32::try_from(assignments.len()).unwrap(),
                 name: WireName::new(name).expect("test topic name fits WireName"),
                 options: WireOptions::empty(),
             },
             derived_options: WireOptions::empty(),
             partitions: assignments,
-            created_view: 0,
         };
         mux.update(build_prepare(
             op,
@@ -2281,6 +2905,7 @@ mod tests {
         partition.on_request(request, None).await;
         let op = partition.consensus().sequencer().current_sequence();
         assert_eq!(op, previous + 1, "the partition must admit the request");
+        partition.consensus().drain_loopback_into(&mut Vec::new());
         partition.consensus().advance_commit_max(op);
         compio::time::timeout(std::time::Duration::from_secs(5), async {
             while partition.fatal().is_none() && partition.consensus().commit_min() < op {
@@ -2300,7 +2925,11 @@ mod tests {
         lanes: &TestLanes,
         namespace: IggyNamespace,
     ) -> RetireConsumerGroupOwnersRequest {
-        reconcile_consumer_group_offsets(ctx, &mut PassCounters::default());
+        reconcile_group_offsets(
+            &ctx.shard,
+            &ctx.group_offset_cleanup,
+            &mut PassCounters::default(),
+        );
         let mut submitted = drain_partition_submits(lanes);
         assert_eq!(submitted.len(), 1, "the pass submits one owner retirement");
         let request = submitted.remove(0);
@@ -2317,7 +2946,8 @@ mod tests {
     async fn await_group_offset_cleanup(ctx: &ReconcilerCtx, namespace: IggyNamespace) {
         compio::time::timeout(std::time::Duration::from_secs(5), async {
             while ctx
-                .group_offset_cleanup_inflight
+                .group_offset_cleanup
+                .inflight
                 .borrow()
                 .contains(&namespace)
             {
@@ -2339,6 +2969,16 @@ mod tests {
     /// Uses `IggyShard::without_inbox` so no inter-shard pump runs; the
     /// reconciler can be driven directly by `reconcile_once`.
     fn build_test_shard(shard_id: u16, config: &ServerConfig, mux: TestMux) -> Rc<TestShard> {
+        build_test_shard_with_keys(shard_id, config, mux, Arc::default())
+    }
+
+    /// [`build_test_shard`] on a node holding `key_context`.
+    fn build_test_shard_with_keys(
+        shard_id: u16,
+        config: &ServerConfig,
+        mux: TestMux,
+        key_context: Arc<ServerKeyContext>,
+    ) -> Rc<TestShard> {
         let bus = Rc::new(IggyMessageBus::with_config(shard_id, config));
         let metadata: IggyMetadata<
             consensus::VsrConsensus<Rc<IggyMessageBus>>,
@@ -2354,7 +2994,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
-                encryptor: None,
+                key_context,
                 // The reconciler reads segment and offset paths off this layout,
                 // so it must root where `test_config` rooted the server's own.
                 path_layout: PartitionPathLayout {
@@ -2590,6 +3230,245 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_topic_with_unknown_critical_option_when_reconciling_should_not_build_its_partition()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        let unreadable = ResourceOptions::from([
+            (
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(HeaderValue::try_from("a_future_key").expect("marker fits")),
+            ),
+            (
+                HeaderKey::try_from("a_future_key").expect("key fits"),
+                OptionValue::explicit(HeaderValue::from(7u64)),
+            ),
+        ]);
+        let request = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic-a").expect("test topic name fits WireName"),
+                options: WireOptions::empty(),
+            },
+            derived_options: resource_options_to_wire(&unreadable, OptionsProvenance::All)
+                .expect("options encode"),
+            partitions: vec![assignment(0, 1)],
+        };
+        mux.update(build_prepare(
+            2,
+            Operation::CreateTopicWithAssignments,
+            &request,
+        ))
+        .expect("CreateTopicWithAssignments apply succeeds");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            !shard
+                .plane
+                .partitions()
+                .contains(&IggyNamespace::new(0, 0, 0)),
+            "a topic this build cannot read must not be served"
+        );
+    }
+
+    #[compio::test]
+    async fn given_stream_key_that_does_not_open_when_reconciling_should_not_build_its_partition() {
+        let stream_context = key_context(CONFIG_KEY);
+        let ns = IggyNamespace::new(0, 0, 0);
+        for (node_context, opens) in [
+            (Arc::clone(&stream_context), true),
+            (key_context(OTHER_CONFIG_KEY), false),
+        ] {
+            let tmp = TempDir::new().expect("tempdir for system path");
+            let config = test_config(&tmp);
+            let partition_dir = config.get_partition_path(0, 0, 0);
+            let mux = TestMux::default();
+            seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
+            seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+            let shard = build_test_shard_with_keys(0, &config, mux, node_context);
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+            reconcile_pass(&ctx).await;
+
+            assert_eq!(
+                served_encrypted(&shard, ns),
+                opens.then_some(true),
+                "a partition is served only under its own stream's key"
+            );
+            assert_eq!(
+                ctx.failure_state
+                    .borrow()
+                    .contains_key(&(ns, FailureCause::Add)),
+                !opens
+            );
+            assert_eq!(Path::new(&partition_dir).exists(), opens);
+        }
+    }
+
+    #[compio::test]
+    async fn given_only_backed_off_add_when_reconciling_should_skip_until_retry_is_due() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let stream_context = key_context(CONFIG_KEY);
+        let node_context = key_context(OTHER_CONFIG_KEY);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, node_context);
+        let ctx = make_ctx(shard, 1, Rc::new(config));
+        let attempts = || {
+            ctx.failure_state
+                .borrow()
+                .values()
+                .map(|record| record.attempts)
+                .sum::<u32>()
+        };
+
+        reconcile_once(&ctx).await;
+        assert_eq!(attempts(), 1, "the stream key does not open here");
+        reconcile_once(&ctx).await;
+        assert_eq!(attempts(), 1, "a backed-off build must wait for its retry");
+
+        for record in ctx.failure_state.borrow_mut().values_mut() {
+            record.next_retry_at = Instant::now();
+        }
+        reconcile_once(&ctx).await;
+        assert_eq!(attempts(), 2, "a due retry must build again");
+    }
+
+    #[compio::test]
+    async fn given_unbuilt_encrypted_partition_when_its_stream_is_deleted_should_remove_its_files()
+    {
+        for boot_deferred in [false, true] {
+            let tmp = TempDir::new().expect("tempdir for system path");
+            let config = test_config(&tmp);
+            let partition_dir = config.get_partition_path(0, 0, 0);
+            let stream_context = key_context(CONFIG_KEY);
+            let mux = TestMux::default();
+            seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
+            seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+            let shard = build_test_shard_with_keys(0, &config, mux, key_context(OTHER_CONFIG_KEY));
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ns = IggyNamespace::new(0, 0, 0);
+            std::fs::create_dir_all(&partition_dir).expect("prior partition files");
+            if boot_deferred {
+                ctx.mark_unbuilt([ns]);
+            } else {
+                reconcile_pass(&ctx).await;
+                assert!(
+                    ctx.failure_state
+                        .borrow()
+                        .contains_key(&(ns, FailureCause::Add))
+                );
+            }
+
+            seed_delete_stream(&shard.plane.metadata().mux_stm, 3, 0);
+            reconcile_pass(&ctx).await;
+
+            assert!(
+                !Path::new(&partition_dir).exists(),
+                "boot deferred {boot_deferred}: a deleted partition that never built keeps no files"
+            );
+            assert!(!shard.plane.partitions().is_tombstoned(&ns));
+        }
+    }
+
+    #[compio::test]
+    async fn given_rewrap_committed_after_a_failed_build_when_reconciling_should_build_under_the_new_wrap()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let old_context = key_context(CONFIG_KEY);
+        let new_context = key_context(OTHER_CONFIG_KEY);
+        let stored = wrap_stream_key(&old_context, 1);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &stored);
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, Arc::clone(&new_context));
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_pass(&ctx).await;
+        assert_eq!(served_encrypted(&shard, ns), None);
+
+        let mux = &shard.plane.metadata().mux_stm;
+        let created_op = mux
+            .streams()
+            .read(|inner| inner.items.get(0).map(|stream| stream.created_op))
+            .expect("stream exists");
+        let rewrap = RewrapStreamKeysRequest {
+            entries: vec![RewrapStreamKeyEntry {
+                stream_id: 0,
+                created_op,
+                key_fingerprint: stored
+                    .key_fingerprint_bytes()
+                    .try_into()
+                    .expect("8-byte fingerprint"),
+                wrap_set: Bytes::copy_from_slice(wrap_stream_key(&new_context, 1).as_ref()),
+            }],
+        };
+        mux.update(build_prepare(3, Operation::RewrapStreamKeys, &rewrap))
+            .expect("RewrapStreamKeys apply succeeds");
+        for record in ctx.failure_state.borrow_mut().values_mut() {
+            record.next_retry_at = Instant::now();
+        }
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(served_encrypted(&shard, ns), Some(true));
+    }
+
+    #[compio::test]
+    async fn given_deleted_encrypted_stream_when_reconciling_should_forget_its_key() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let context = key_context(CONFIG_KEY);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, context);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+        assert!(shard.plane.partitions().has_stream_keys());
+
+        seed_delete_stream(&shard.plane.metadata().mux_stm, 3, 0);
+        reconcile_pass(&ctx).await;
+
+        assert!(!shard.plane.partitions().has_stream_keys());
+    }
+
+    /// A stream with no topic records no partition change when it is deleted,
+    /// so the delete of its last topic must already drop its key.
+    #[compio::test]
+    async fn given_stream_deleted_after_its_last_topic_when_reconciling_should_forget_its_key() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let context = key_context(CONFIG_KEY);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, context);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        assert!(shard.plane.partitions().has_stream_keys());
+
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_topic(mux, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        seed_delete_stream(mux, 4, 0);
+        reconcile_pass(&ctx).await;
+
+        assert!(!shard.plane.partitions().has_stream_keys());
+    }
+
     /// A delete and a recreate of the same ids can commit while a pass runs,
     /// so the pass holds an older epoch than the committed partition. The
     /// directory of the committed incarnation must survive that deferral,
@@ -2605,8 +3484,9 @@ mod tests {
             let shard = build_test_shard(0, &config, mux);
             let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
             let ns = IggyNamespace::new(0, 0, 0);
-            let (_, _, partition) =
-                fetch_partition_build_inputs(&ctx, ns).expect("committed namespace resolves");
+            let partition = fetch_partition_build_inputs(&ctx, ns)
+                .expect("committed namespace resolves")
+                .metadata;
             let snapshot_epoch = partition
                 .created_revision
                 .checked_sub(1)
@@ -2621,16 +3501,14 @@ mod tests {
                     .unwrap();
             }
 
-            reconcile_additions(
-                &ctx,
-                vec![TargetPartition {
-                    ns,
-                    epoch: snapshot_epoch,
-                }],
-                &mut PassCounters::default(),
-            )
-            .await;
+            let target = CommittedTarget {
+                created_revision: snapshot_epoch,
+                delete_watermark: 0,
+            };
+            let convergence =
+                reconcile_target(&ctx, ns, target, &mut PassCounters::default()).await;
 
+            assert_eq!(convergence, Convergence::Pending, "marked: {marked}");
             assert_eq!(
                 std::path::Path::new(&directory).exists(),
                 marked,
@@ -2702,8 +3580,9 @@ mod tests {
 
         reconcile_once(&ctx).await;
         ctx.shard.apply_reconcile_ops();
-        let (stats, ..) =
-            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let stats = fetch_partition_build_inputs(&ctx, ns)
+            .expect("materialised namespace has stats")
+            .stats;
         stats.increment_size_bytes(512);
 
         seed_delete_topic(&ctx.shard.plane.metadata().mux_stm, 3, 0, 0);
@@ -2743,8 +3622,9 @@ mod tests {
 
         reconcile_once(&ctx).await;
         ctx.shard.apply_reconcile_ops();
-        let (stats, _, partition) =
+        let inputs =
             fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let (stats, partition) = (inputs.stats, inputs.metadata);
         let topic_stats = stats.parent();
 
         seed_delete_topic(&ctx.shard.plane.metadata().mux_stm, 3, 0, 0);
@@ -2832,8 +3712,9 @@ mod tests {
         // `ensure_initial_segment` plants exactly one segment per build and
         // folds it into the namespace's shared stats, so this counter is the
         // observable that separates them.
-        let (stats, ..) =
-            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let stats = fetch_partition_build_inputs(&ctx, ns)
+            .expect("materialised namespace has stats")
+            .stats;
         assert_eq!(
             stats.segments_count_inconsistent(),
             1,
@@ -2870,18 +3751,20 @@ mod tests {
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config.clone()));
         let ns = IggyNamespace::new(0, 0, 0);
 
-        let (stats, ..) =
-            fetch_partition_build_inputs(&ctx, ns).expect("committed namespace has stats");
+        let stats = fetch_partition_build_inputs(&ctx, ns)
+            .expect("committed namespace has stats")
+            .stats;
         let live = build_partition_fresh(
             &config,
             ctx.shard.plane.partitions().config(),
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
-            1,
+            consensus::ReplicaSet::all(1),
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -2909,10 +3792,11 @@ mod tests {
             ns,
             Arc::clone(&stats),
             LIVE_EPOCH + 1,
+            0,
             iggy_common::TopicRuntimeOptions::default(),
             CLUSTER_ID,
             0,
-            1,
+            consensus::ReplicaSet::all(1),
             created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
@@ -3072,7 +3956,6 @@ mod tests {
                         partitions_count: 2,
                     },
                     partitions: vec![assignment(0, 3), assignment(1, 4)],
-                    created_view: 0,
                 },
             ))
             .expect("CreatePartitions apply succeeds");
@@ -3354,64 +4237,560 @@ mod tests {
         );
     }
 
-    /// Once converged, a pass with an unchanged
-    /// `Streams::revision` fast-skips the O(N) diff instead of re-scanning
-    /// every committed namespace every periodic tick. A fresh
-    /// partition-shaping commit bumps the revision and defeats the skip.
+    /// A converged shard keeps no work, so a tick checks nothing. A commit
+    /// puts only its own partitions in the work set.
     #[compio::test]
-    async fn reconcile_fast_skips_when_revision_unchanged() {
+    async fn given_converged_shard_when_a_commit_lands_should_check_only_its_partitions() {
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let mux = TestMux::default();
-        seed_stream(&mux, 1, "stream-skip");
-        seed_topic(&mux, 2, 0, "topic-skip", vec![assignment(0, 1)]);
-
+        seed_stream(&mux, 1, "stream-delta");
+        seed_topic(&mux, 2, 0, "topic-delta", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
 
-        // First pass materialises (work); the verify pass that follows a
-        // working pass does nothing and arms the fast-skip.
-        assert!(reconcile_once(&ctx).await, "first pass must run");
-        ctx.shard.apply_reconcile_ops();
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
         assert!(
-            reconcile_once(&ctx).await,
-            "the verify pass after a working pass must still run"
-        );
-        ctx.shard.apply_reconcile_ops();
-
-        // No commit since: revision unchanged + last pass a no-op → skip.
-        assert!(
-            !reconcile_once(&ctx).await,
-            "unchanged revision after convergence must fast-skip the diff"
+            ctx.pending.borrow().is_empty(),
+            "a converged shard must keep no work"
         );
 
-        let revision = current_revision(&ctx);
-        shard
-            .plane
-            .partitions()
-            .note_consumer_group_offsets_reconcile_needed();
-        assert_eq!(
-            current_revision(&ctx),
-            revision,
-            "partition-local offset work does not change metadata revision"
-        );
-        assert!(
-            reconcile_once(&ctx).await,
-            "the shard offset epoch must defeat the O(1) fast-skip"
-        );
-
-        // A new partition-shaping commit bumps the revision → next pass runs.
         seed_topic(
             &shard.plane.metadata().mux_stm,
             3,
             0,
-            "topic-skip-2",
+            "topic-delta-2",
             vec![assignment(0, 2)],
         );
+        fold_changes(&ctx).await;
+        let created = IggyNamespace::new(0, 1, 0);
+        assert_eq!(
+            *ctx.pending.borrow(),
+            BTreeSet::from([created]),
+            "only the new partition needs a check"
+        );
+
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(shard.plane.partitions().contains(&created));
+        assert!(ctx.pending.borrow().is_empty());
+    }
+
+    /// A consumer group delete leaves its topic's partitions as they were, so
+    /// it puts none of them in the work set. Only the group sweep reads it.
+    #[compio::test]
+    async fn given_converged_shard_when_a_consumer_group_is_deleted_should_check_no_partition() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-group");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-group",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_create_consumer_group(&mux, 3, 0, 0, "group");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(ctx.pending.borrow().is_empty());
+
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_consumer_group(mux, 4, 0, 0, 0);
+        let (_, changes) = mux
+            .streams()
+            .revision_and_partition_changes(ctx.synced_revision.get());
+        let kinds: Vec<PartitionChangeKind> = changes
+            .expect("the feed holds the delete")
+            .iter()
+            .map(|change| change.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![PartitionChangeKind::ConsumerGroupDeleted; 2],
+            "the delete must record one change per partition"
+        );
+        fold_changes(&ctx).await;
+
+        assert!(
+            ctx.pending.borrow().is_empty(),
+            "a group delete must not check its topic's partitions"
+        );
+    }
+
+    /// A pass stops after `DISK_VISITS_PER_PASS` builds and says so, and the
+    /// next pass builds the rest.
+    #[compio::test]
+    async fn given_more_builds_than_one_pass_allows_when_reconciling_should_finish_in_the_next_pass()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let partitions_count = DISK_VISITS_PER_PASS + 1;
+        seed_stream(&mux, 1, "stream-wide");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-wide",
+            (0..u32::try_from(partitions_count).unwrap())
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let partitions = shard.plane.partitions();
+
+        assert!(reconcile_once(&ctx).await, "the pass must stop at the cap");
+        shard.apply_reconcile_ops();
+        assert_eq!(partitions.namespaces().count(), DISK_VISITS_PER_PASS);
+
+        assert!(
+            !reconcile_once(&ctx).await,
+            "the next pass must build the rest"
+        );
+        shard.apply_reconcile_ops();
+        assert_eq!(partitions.namespaces().count(), partitions_count);
+    }
+
+    /// A capped pass resumes after the last namespace it checked. The next
+    /// pass runs at once, before the pump may apply what the capped pass
+    /// staged, so it must go on to the rest instead of tearing the same
+    /// partitions down again.
+    #[compio::test]
+    async fn given_capped_teardowns_not_yet_applied_when_the_next_pass_runs_should_tear_down_the_rest()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let partitions_count = DISK_VISITS_PER_PASS + 1;
+        seed_stream(&mux, 1, "stream-teardown");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-teardown",
+            (0..u32::try_from(partitions_count).unwrap())
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let partitions = shard.plane.partitions();
+        while reconcile_once(&ctx).await {
+            shard.apply_reconcile_ops();
+        }
+        reconcile_pass(&ctx).await;
+        assert_eq!(partitions.namespaces().count(), partitions_count);
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
         assert!(
             reconcile_once(&ctx).await,
-            "a fresh commit must defeat the fast-skip"
+            "the teardowns must cap the pass"
         );
+        assert!(
+            !reconcile_once(&ctx).await,
+            "the next pass must reach the partition the cap left"
+        );
+        shard.apply_reconcile_ops();
+        assert_eq!(partitions.namespaces().count(), 0);
+    }
+
+    /// A round ends after the last namespace the work set held when it
+    /// started. A create burst that adds more builds above the cursor than a
+    /// pass allows must not hold the round open, so a delete behind the
+    /// cursor is checked in the next round.
+    #[compio::test]
+    async fn given_create_burst_above_the_cursor_when_a_partition_behind_it_is_deleted_should_remove_it()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-early");
+        seed_topic(&mux, 2, 0, "topic-early", vec![assignment(0, 1)]);
+        seed_stream(&mux, 3, "stream-burst");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let partitions = shard.plane.partitions();
+        let mux = &shard.plane.metadata().mux_stm;
+        let early = IggyNamespace::new(0, 0, 0);
+        reconcile_pass(&ctx).await;
+        assert!(partitions.contains(&early));
+
+        let burst_partitions = u32::try_from(DISK_VISITS_PER_PASS + 1).unwrap();
+        let seed_burst_topic = |op: u64, topic_id: u32| {
+            seed_topic(
+                mux,
+                op,
+                1,
+                &format!("topic-burst-{topic_id}"),
+                (0..burst_partitions)
+                    .map(|partition_id| {
+                        let group = topic_id * burst_partitions + partition_id;
+                        assignment(partition_id, u64::from(group) + 2)
+                    })
+                    .collect(),
+            );
+        };
+        seed_burst_topic(4, 0);
+        assert!(reconcile_once(&ctx).await, "the burst must cap the pass");
+        shard.apply_reconcile_ops();
+
+        seed_delete_topic(mux, 5, 0, 0);
+        for topic_id in 1..=3 {
+            seed_burst_topic(5 + u64::from(topic_id), topic_id);
+            reconcile_once(&ctx).await;
+            shard.apply_reconcile_ops();
+        }
+
+        assert!(
+            !partitions.contains(&early),
+            "the next round must remove the partition behind the cursor"
+        );
+    }
+
+    /// The change feed and the pump's records must leave nothing for a full
+    /// reconcile. Random creates, deletes and recreates on two shards, with
+    /// passes and pump applies at random points, drain the work set, and a
+    /// full fill then finds no action.
+    #[compio::test]
+    async fn given_random_partition_changes_when_the_work_set_drains_should_leave_a_full_reconcile_nothing()
+     {
+        const SEEDS: u64 = 32;
+        const STEPS: u64 = 96;
+        const TOTAL_SHARDS: u16 = 2;
+        const MAX_TOPICS: usize = 4;
+        const MAX_PARTITIONS: u32 = 3;
+        const DRAIN_PASSES: usize = 16;
+        for seed in 0..SEEDS {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let mux = TestMux::default();
+            seed_stream(&mux, 1, "oracle-stream");
+            let shard = build_test_shard(0, &config, mux);
+            let ctx = make_ctx(Rc::clone(&shard), TOTAL_SHARDS, Rc::new(config));
+            let stm = &shard.plane.metadata().mux_stm;
+            let topic_ids = || {
+                stm.streams().read(|inner| {
+                    inner.items.get(0).map_or_else(Vec::new, |stream| {
+                        stream
+                            .topics
+                            .iter_from(0)
+                            .map(|(id, _)| id)
+                            .collect::<Vec<_>>()
+                    })
+                })
+            };
+            let mut rng = StdRng::seed_from_u64(seed);
+            for op in 2..2 + STEPS {
+                match rng.random_range(0..4) {
+                    0 if topic_ids().len() < MAX_TOPICS => {
+                        let partitions = rng.random_range(1..=MAX_PARTITIONS);
+                        let assignments = (0..partitions)
+                            .map(|partition_id| {
+                                assignment(partition_id, op * 16 + u64::from(partition_id))
+                            })
+                            .collect();
+                        seed_topic(stm, op, 0, &format!("topic-{op}"), assignments);
+                    }
+                    1 => {
+                        let topics = topic_ids();
+                        if !topics.is_empty() {
+                            let topic_id = topics[rng.random_range(0..topics.len())];
+                            seed_delete_topic(stm, op, 0, u32::try_from(topic_id).unwrap());
+                        }
+                    }
+                    2 => {
+                        reconcile_once(&ctx).await;
+                    }
+                    _ => shard.apply_reconcile_ops(),
+                }
+            }
+            for _ in 0..DRAIN_PASSES {
+                reconcile_pass(&ctx).await;
+            }
+            assert!(
+                ctx.pending.borrow().is_empty(),
+                "seed {seed}: the work set must drain: {:?}",
+                ctx.pending.borrow()
+            );
+
+            fill_pending(&ctx).await;
+            let mut counters = PassCounters::default();
+            assert!(!visit_pending(&ctx, &mut counters).await);
+            assert_eq!(
+                (counters.total(), counters.disk_visits),
+                (0, 0),
+                "seed {seed}: a full reconcile found work the change sources missed"
+            );
+            assert!(ctx.pending.borrow().is_empty());
+        }
+    }
+
+    /// A build or a routing row staged before its topic's delete lands after
+    /// the delete was checked. Only the pump's record of the applied op brings
+    /// the ghost back to the reconciler.
+    #[compio::test]
+    async fn given_ops_staged_before_a_delete_when_the_pump_applies_them_should_remove_the_ghosts()
+    {
+        const TOTAL_SHARDS: u16 = 2;
+        const PARTITIONS: u32 = 8;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "ghost-stream");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "ghost-topic",
+            (0..PARTITIONS)
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), TOTAL_SHARDS, Rc::new(config));
+        let namespaces: Vec<_> = (0..PARTITIONS as usize)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        let owners: BTreeSet<_> = namespaces
+            .iter()
+            .map(|ns| calculate_shard_assignment(ns, u32::from(TOTAL_SHARDS)))
+            .collect();
+        assert_eq!(owners.len(), 2, "the topic must straddle both shards");
+
+        reconcile_once(&ctx).await;
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        reconcile_once(&ctx).await;
+        shard.apply_reconcile_ops();
+        assert!(
+            namespaces
+                .iter()
+                .any(|ns| shard.plane.partitions().contains(ns))
+                && namespaces
+                    .iter()
+                    .any(|ns| shard.shards_table().shard_for(*ns) == Some(1)),
+            "both kinds of ghost must have landed for this test to mean anything"
+        );
+
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        for ns in &namespaces {
+            assert!(!shard.plane.partitions().contains(ns), "{ns:?}");
+            assert_eq!(shard.shards_table().shard_for(*ns), None, "{ns:?}");
+            let path =
+                ctx.config
+                    .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
+            assert!(!Path::new(&path).exists(), "{ns:?}");
+        }
+        assert!(ctx.pending.borrow().is_empty());
+    }
+
+    /// A commit that outgrows the change feed between two passes must not lose
+    /// the partitions it pushed out: the next pass fills the work set from the
+    /// whole tree.
+    #[compio::test]
+    async fn given_changes_the_feed_cannot_keep_when_reconciling_should_fill_from_the_whole_tree() {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "overflow-stream");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        reconcile_pass(&ctx).await;
+        let synced = ctx.synced_revision.get().expect("a pass syncs the feed");
+
+        let streams = shard.plane.metadata().mux_stm.streams();
+        let stored_here = IggyNamespace::new(0, 0, 0);
+        streams.seed_namespace_on(stored_here, 1, 0, Durability::Persisted, &[0]);
+        streams.seed_namespace_on(
+            IggyNamespace::new(0, 1, RECENT_PARTITION_CHANGES_RETAINED),
+            2,
+            0,
+            Durability::Persisted,
+            &[1, 2],
+        );
+        assert!(
+            streams.read(|inner| inner.partition_changes_since(synced).is_none()),
+            "the second create must push the first out of the feed"
+        );
+
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert!(shard.plane.partitions().contains(&stored_here));
+        assert_eq!(shard.plane.partitions().len(), 1);
+    }
+
+    /// The periodic full reconcile repairs what no change announced and counts
+    /// it. A change announced in the same round is not counted.
+    #[compio::test]
+    async fn given_unannounced_damage_when_the_repair_runs_should_fix_it_and_count_only_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "repair-stream");
+        seed_topic(&mux, 2, 0, "repair-topic", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let damaged = IggyNamespace::new(0, 0, 0);
+        let announced = IggyNamespace::new(0, 1, 0);
+        shard.shards_table().remove(&damaged);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            3,
+            0,
+            "announced-topic",
+            vec![assignment(0, 2)],
+        );
+        ctx.next_full_reconcile_at.set(Some(Instant::now()));
+
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(
+            shard.shards_table().shard_for(damaged),
+            Some(0),
+            "the repair must rewrite the lost row"
+        );
+        assert!(shard.plane.partitions().contains(&announced));
+        assert_eq!(
+            shard.metrics().partitions_reconcile_repairs_value(),
+            1,
+            "only the lost row went unannounced"
+        );
+        assert!(ctx.pending.borrow().is_empty());
+    }
+
+    /// Changes an overflow pushed out of the feed can name any namespace, so
+    /// acting on them in a repair round under way is no repair.
+    #[compio::test]
+    async fn given_repair_round_when_the_feed_overflows_should_count_no_repair() {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "overflow-repair-stream");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        reconcile_pass(&ctx).await;
+        let streams = shard.plane.metadata().mux_stm.streams();
+        streams.seed_namespace_on(
+            IggyNamespace::new(0, 0, DISK_VISITS_PER_PASS),
+            1,
+            0,
+            Durability::Persisted,
+            &[0],
+        );
+        ctx.next_full_reconcile_at.set(Some(Instant::now()));
+        assert!(
+            reconcile_once(&ctx).await,
+            "the builds must hold the repair round open"
+        );
+
+        let lost = IggyNamespace::new(0, 1, 0);
+        streams.seed_namespace_on(lost, 2, 0, Durability::Persisted, &[0]);
+        streams.seed_namespace_on(
+            IggyNamespace::new(0, 2, RECENT_PARTITION_CHANGES_RETAINED),
+            3,
+            0,
+            Durability::Persisted,
+            &[1, 2],
+        );
+        let synced = ctx.synced_revision.get().expect("a pass syncs the feed");
+        assert!(
+            streams.read(|inner| inner.partition_changes_since(synced).is_none()),
+            "the overflow must push the create of `lost` out of the feed"
+        );
+
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert!(shard.plane.partitions().contains(&lost));
+        assert_eq!(
+            shard.metrics().partitions_reconcile_repairs_value(),
+            0,
+            "a change the feed lost is not one that no source announced"
+        );
+    }
+
+    /// A committed truncate reaches its partition through the change feed. The
+    /// partition stays in the work set, with its trim requested on every pass,
+    /// while its log starts below the watermark.
+    #[compio::test]
+    async fn given_committed_truncate_when_reconciling_should_request_the_trim_until_the_log_is_trimmed()
+     {
+        const WATERMARK: u64 = 10;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "trim-stream");
+        seed_topic(&mux, 2, 0, "trim-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let trims = || {
+            let mut trims = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::TruncatePartition {
+                    namespace,
+                    up_to_offset,
+                }) = frame
+                {
+                    trims.push((namespace, up_to_offset));
+                }
+            }
+            trims
+        };
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(trims().is_empty(), "an untruncated partition needs no trim");
+
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let stm = &shard.plane.metadata().mux_stm;
+        let created_revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        stm.update(build_prepare(
+            3,
+            Operation::TruncatePartition,
+            &TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: WATERMARK,
+                expected_history: Some(created_revision),
+            },
+        ))
+        .expect("TruncatePartition apply succeeds");
+
+        for _ in 0..2 {
+            reconcile_pass(&ctx).await;
+            assert_eq!(trims(), [(namespace, WATERMARK)]);
+            assert!(ctx.pending.borrow().contains(&namespace));
+        }
     }
 
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this
@@ -3553,7 +4932,15 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-repair-ceiling", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        // The repair peer must be a member of the group it repairs from.
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            2,
+        ));
         reconcile_pass(&ctx).await;
 
         let ns = IggyNamespace::new(0, 0, 0);
@@ -3579,6 +4966,8 @@ mod tests {
                 floor: None,
                 peer: PEER,
                 idle_ticks: 0,
+                floor_pulled_from: 0,
+                requested_from: Some(1),
             });
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();
@@ -3955,6 +5344,239 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_fenced_partition_only_this_node_stores_in_a_larger_cluster_when_deleted_should_complete_the_delete()
+     {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let solo = IggyNamespace::new(0, 0, 0);
+        let shared = IggyNamespace::new(1, 0, 0);
+        mux.streams()
+            .seed_namespace_on(solo, 1, 0, iggy_common::Durability::Persisted, &[0]);
+        mux.streams()
+            .seed_namespace_on(shared, 2, 0, iggy_common::Durability::Persisted, &[0, 1]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        for namespace in [solo, shared] {
+            let revision = stm
+                .streams()
+                .created_revision_for_namespace(namespace)
+                .unwrap();
+            shard.plane.partitions().fence(namespace, revision);
+        }
+        for (op, stream_id) in [(10, 0), (11, 1)] {
+            stm.update(build_prepare(
+                op,
+                Operation::DeleteTopic,
+                &DeleteTopicRequest {
+                    stream_id: WireIdentifier::numeric(stream_id),
+                    topic_id: WireIdentifier::numeric(0),
+                },
+            ))
+            .expect("DeleteTopic apply succeeds");
+        }
+
+        reconcile_retired_lifecycles(&ctx).await;
+
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        let completed: Vec<_> = batches
+            .iter()
+            .map(|(request, _)| request.completions().to_vec())
+            .collect();
+        assert_eq!(
+            completed,
+            [vec![LifecycleCompletion {
+                topic_id: 0,
+                partition_id: 0,
+                partition_op: metadata::stm::lifecycle::RETIRED_PARTITION_OP,
+            }]],
+            "only the partition no other node stores may complete through its fence"
+        );
+    }
+
+    /// A delete of a partition whose members lost their copies: each such
+    /// member retires its copy and reports it, and once too few members still
+    /// hold one to elect a primary, a member completes the target, since no
+    /// log can install its fence any more.
+    #[compio::test]
+    async fn given_a_deleted_partition_whose_members_lost_their_copies_when_reconciling_should_complete_once_too_few_can_elect()
+     {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        mux.streams().seed_namespace_on(
+            namespace,
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2],
+        );
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        let revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        shard.plane.partitions().fence(namespace, revision);
+        stm.update(build_prepare(
+            10,
+            Operation::DeleteTopic,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+        ))
+        .expect("DeleteTopic apply succeeds");
+        let completion = |partition_op| LifecycleCompletion {
+            topic_id: 0,
+            partition_id: 0,
+            partition_op,
+        };
+        let in_flight = Rc::clone(&ctx.lifecycle_reports.batch_in_flight);
+        let release = |reply: Sender<bool>| async move {
+            reply.try_send(true).unwrap();
+            compio::time::timeout(Duration::from_secs(5), async {
+                while in_flight.get() {
+                    compio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        };
+
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, mut batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0.completions(),
+            [completion(retired_member_op(0))],
+            "a member that lost its copy retires it, and one of three cannot finish"
+        );
+        assert_eq!(
+            crate::partition_helpers::partition_retirement_fence(
+                &ctx.config.get_system_path(),
+                namespace
+            )
+            .await
+            .unwrap(),
+            Some(revision),
+            "the copy is retired durably before it is reported"
+        );
+        let (request, reply) = batches.pop().unwrap();
+        stm.update(build_prepare(11, Operation::CompleteLifecycle, &request))
+            .expect("CompleteLifecycle apply succeeds");
+        release(reply).await;
+
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        assert!(
+            batches.is_empty(),
+            "two members still hold a copy and can elect the primary that fences it"
+        );
+
+        let other =
+            CompleteLifecycleRequest::new(10, 0, vec![completion(retired_member_op(1))]).unwrap();
+        stm.update(build_prepare(12, Operation::CompleteLifecycle, &other))
+            .expect("another member's retirement applies");
+        assert!(stm.streams().lifecycle_pending(10));
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, mut batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0.completions(),
+            [completion(RETIRED_PARTITION_OP)],
+            "one member left cannot elect, so the target completes"
+        );
+        let (request, _) = batches.pop().unwrap();
+        stm.update(build_prepare(13, Operation::CompleteLifecycle, &request))
+            .expect("the final completion applies");
+        assert!(
+            !stm.streams().lifecycle_pending(10),
+            "the delete finishes and frees the topic"
+        );
+    }
+
+    /// Four members elect with three votes and commit with two, so two lost
+    /// copies leave survivors that could commit under a primary but cannot
+    /// elect one. The target completes then, or the delete would wait forever.
+    #[compio::test]
+    async fn given_four_members_when_two_lost_their_copies_should_complete_the_delete() {
+        const NODES: u8 = 4;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        mux.streams().seed_namespace_on(
+            namespace,
+            1,
+            0,
+            iggy_common::Durability::Persisted,
+            &[0, 1, 2, 3],
+        );
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let stm = &shard.plane.metadata().mux_stm;
+        stm.update(build_prepare(
+            10,
+            Operation::DeleteTopic,
+            &DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+            },
+        ))
+        .expect("DeleteTopic apply succeeds");
+        let completion = |partition_op| LifecycleCompletion {
+            topic_id: 0,
+            partition_id: 0,
+            partition_op,
+        };
+        // This node kept its copy; nodes 1 and 2 came back without theirs.
+        assert!(!shard.plane.partitions().is_tombstoned(&namespace));
+        for (op, node) in [(11, 1), (12, 2)] {
+            let retired =
+                CompleteLifecycleRequest::new(10, 0, vec![completion(retired_member_op(node))])
+                    .unwrap();
+            stm.update(build_prepare(op, Operation::CompleteLifecycle, &retired))
+                .expect("a member's retirement applies");
+        }
+
+        reconcile_retired_lifecycles(&ctx).await;
+        let (_, batches) = drain_lifecycle_reports(&lanes);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0.completions(),
+            [completion(RETIRED_PARTITION_OP)],
+            "two copies left cannot elect a primary of four"
+        );
+    }
+
+    #[compio::test]
     async fn given_retirement_fence_when_topic_recreated_between_passes_should_rebuild() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -4167,13 +5789,12 @@ mod tests {
         );
     }
 
-    /// Deferral-arms-the-fast-skip regression: a deferred rebuild is pending
-    /// work, but a pass that found nothing else used to report `did_work =
-    /// false` and arm the fast-skip. The wake the pump fires after draining
-    /// `ConfirmRemove` carries no revision bump (dropping a partition is not a
-    /// metadata commit), so it landed on the armed guard and was swallowed:
-    /// the rebuild never ran, the namespace stayed unroutable, and every
-    /// parked data-plane frame hung until the client timed out.
+    /// A deferred rebuild is pending work. The wake the pump fires after
+    /// draining `ConfirmRemove` carries no partition change (dropping a
+    /// partition is not a metadata commit), so if the deferring check let the
+    /// namespace leave the work set, the rebuild would never run, the
+    /// namespace would stay unroutable, and every parked data-plane frame
+    /// would hang until the client timed out.
     #[compio::test]
     async fn reconcile_rebuilds_after_deferred_confirm_remove_drains() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -4221,17 +5842,15 @@ mod tests {
         );
 
         // Pump drains: partition dropped, tombstone cleared, reconciler woken.
-        // No commit happened, so `revision` is unchanged and `last_pass_noop`
-        // is the only thing that can keep the woken pass alive.
+        // No commit happened, so only the work set brings the namespace back.
         shard.apply_reconcile_ops();
         assert!(!partitions.contains(&ns));
-
         assert!(
-            reconcile_once(&ctx).await,
-            "the post-ConfirmRemove wake must run a full pass: a deferring \
-             pass has not converged and must not arm the fast-skip"
+            ctx.pending.borrow().contains(&ns),
+            "a deferring check must keep its namespace in the work set"
         );
-        shard.apply_reconcile_ops();
+
+        reconcile_pass(&ctx).await;
         assert!(
             partitions.contains(&ns),
             "the deferred rebuild must materialise once the drop drains"
@@ -4240,6 +5859,89 @@ mod tests {
             shard.shards_table().shard_for(ns),
             Some(0),
             "rebuilt partition must be addressable again"
+        );
+    }
+
+    /// `fence_partition_for_rebuild` tombstones the partition and drops its
+    /// routing row, and the end of its quarantine queues `ConfirmRemove`. No
+    /// metadata commit is involved, so an idle partition on a converged shard
+    /// has nothing but the drain to bring it back.
+    #[compio::test]
+    async fn given_converged_shard_when_quarantine_of_idle_partition_drains_should_rebuild_it() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-quarantine");
+        seed_topic(&mux, 2, 0, "topic-quarantine", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(partitions.contains(&ns));
+
+        partitions.tombstone(ns);
+        shard.shards_table().remove(&ns);
+        reconcile_pass(&ctx).await;
+        shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace: ns });
+        shard.apply_reconcile_ops();
+        assert!(!partitions.contains(&ns));
+
+        reconcile_pass(&ctx).await;
+        assert!(
+            partitions.contains(&ns),
+            "the drain of the quarantine must rebuild the partition"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            Some(0),
+            "the rebuilt partition must be routable again"
+        );
+    }
+
+    /// Only the partition's own incarnation can call it stale. A live
+    /// partition that lost its routing row matches the committed one, so the
+    /// pass rewrites the row and its files stay.
+    #[compio::test]
+    async fn given_live_partition_when_its_routing_row_is_lost_should_rewrite_the_row_and_keep_its_files()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-lost-row");
+        seed_topic(&mux, 2, 0, "topic-lost-row", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        let partition_dir = ctx.config.get_partition_path(0, 0, 0);
+
+        reconcile_pass(&ctx).await;
+        assert!(partitions.contains(&ns));
+        shard.shards_table().remove(&ns);
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            partitions.contains(&ns) && !partitions.is_tombstoned(&ns),
+            "the live partition must not be torn down"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            Some(0),
+            "its routing row must come back"
+        );
+        assert_eq!(
+            shard.shards_table().epoch_for(ns),
+            partitions.with_partition(&ns, IggyPartition::created_revision),
+            "the row must carry the live incarnation"
+        );
+        assert!(
+            Path::new(&partition_dir).exists(),
+            "its files must stay on disk"
         );
     }
 
@@ -4280,9 +5982,14 @@ mod tests {
                     ),
                 );
             });
-        reconcile_consumer_group_offsets(&ctx, &mut PassCounters::default());
+        reconcile_group_offsets(
+            &ctx.shard,
+            &ctx.group_offset_cleanup,
+            &mut PassCounters::default(),
+        );
         assert!(
-            ctx.group_offset_cleanup_inflight
+            ctx.group_offset_cleanup
+                .inflight
                 .borrow()
                 .contains(&namespace)
         );
@@ -4302,7 +6009,8 @@ mod tests {
             "an unanswered cleanup must not block partition creation"
         );
         assert!(
-            ctx.group_offset_cleanup_inflight
+            ctx.group_offset_cleanup
+                .inflight
                 .borrow()
                 .contains(&namespace)
         );
@@ -4411,8 +6119,13 @@ mod tests {
         let stm = &shard.plane.metadata().mux_stm;
         seed_consumer_group_deletion_intent(stm, 5, 0, 0, 0);
         let now = iggy_common::IggyTimestamp::now();
-        stm.streams()
-            .refresh_consumer_group_session(CLIENT_ID, NEW_SESSION, REGISTER_OP, now);
+        stm.streams().refresh_consumer_group_session(
+            CLIENT_ID,
+            NEW_SESSION,
+            REGISTER_OP,
+            now,
+            None,
+        );
         assert_eq!(
             stm.streams().consumer_group_pending_revocations().len(),
             1,
@@ -4533,14 +6246,14 @@ mod tests {
                 );
             });
         let mut counters = PassCounters::default();
-        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        reconcile_group_offsets(&ctx.shard, &ctx.group_offset_cleanup, &mut counters);
         assert_eq!(counters.cg_offsets_submitted, 0);
         let stm = &shard.plane.metadata().mux_stm;
         seed_create_consumer_group(stm, 3, 0, 0, "not-replayed-yet");
-        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        reconcile_group_offsets(&ctx.shard, &ctx.group_offset_cleanup, &mut counters);
         assert_eq!(counters.cg_offsets_submitted, 0);
         seed_delete_consumer_group(stm, 4, 0, 0, 0);
-        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        reconcile_group_offsets(&ctx.shard, &ctx.group_offset_cleanup, &mut counters);
         assert_eq!(counters.cg_offsets_submitted, 1);
     }
 
@@ -4751,7 +6464,11 @@ mod tests {
                 );
             });
 
-        reconcile_consumer_group_offsets(&ctx, &mut PassCounters::default());
+        reconcile_group_offsets(
+            &ctx.shard,
+            &ctx.group_offset_cleanup,
+            &mut PassCounters::default(),
+        );
         let mut submitted = drain_partition_submits(&inbox);
         assert_eq!(
             submitted
@@ -4772,6 +6489,76 @@ mod tests {
             assert!(catalog.retires(group_id), "{catalog:?}");
             assert_eq!(partition.consumer_group_owner(group_id), None);
         }
+    }
+
+    /// A partition marks itself for the group sweep once per view, at the
+    /// first operation that sees it, which can come before the view is
+    /// normal. A sweep in that window must keep the mark.
+    #[compio::test]
+    async fn given_view_change_when_the_group_sweep_runs_should_keep_the_mark() {
+        const NODES: u8 = 3;
+        // Replica 0 leads every view that is a multiple of the replica count.
+        const NEXT_VIEW: u32 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "view-change-stream");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard.plane.metadata().mux_stm.streams().seed_namespace_on(
+            namespace,
+            1,
+            0,
+            Durability::Persisted,
+            &[0, 1, 2],
+        );
+        reconcile_pass(&ctx).await;
+        let partitions = shard.plane.partitions();
+        partitions
+            .with_partition(&namespace, |partition| {
+                for voter in [1, 2] {
+                    let change =
+                        Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+                            .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                                header.command = Command::StartViewChange;
+                                header.size =
+                                    u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+                                header.cluster = CLUSTER_ID;
+                                header.group = namespace.inner();
+                                header.replica = voter;
+                                header.view = NEXT_VIEW;
+                                header.seal();
+                            });
+                    partition
+                        .consensus()
+                        .handle_start_view_change(PlaneKind::Partitions, change.header());
+                }
+                assert_eq!(partition.consensus().status(), Status::ViewChange);
+            })
+            .expect("the pass must build the partition");
+        let _ = partitions.take_consumer_group_offsets_dirty();
+        partitions.mark_consumer_group_offsets_dirty(namespace);
+
+        reconcile_group_offsets(
+            &ctx.shard,
+            &ctx.group_offset_cleanup,
+            &mut PassCounters::default(),
+        );
+
+        assert!(
+            partitions
+                .take_consumer_group_offsets_dirty()
+                .contains(&namespace),
+            "the next sweep must still visit the partition once the view is normal"
+        );
     }
 
     /// A failed `NoAck` write leaves a durable group offset with a stranded
@@ -4848,14 +6635,19 @@ mod tests {
         install_deleted_group_owner(&shard, namespace, RETIRED_GROUP, REMOVAL_OP).await;
         let catalog = commit_owner_retirement(&ctx, &inbox, namespace).await;
         assert!(catalog.retires(u64::from(RETIRED_GROUP)), "{catalog:?}");
-        shard
-            .plane
-            .partitions()
-            .with_partition(&namespace, |partition| {
-                partition.seed_recovered_consumer_offset(kind, RETIRED_GROUP, 0, 0);
-            });
+        reconcile_once(&ctx).await;
+        reconcile_once(&ctx).await;
+        assert!(
+            drain_partition_submits(&inbox).is_empty(),
+            "the retired group must leave nothing to submit"
+        );
+        let partitions = shard.plane.partitions();
+        let recovered = partitions.remove(&namespace).unwrap();
+        recovered.seed_recovered_consumer_offset(kind, RETIRED_GROUP, 0, 0);
+        partitions.insert(namespace, recovered);
 
-        reconcile_consumer_group_offsets(&ctx, &mut PassCounters::default());
+        // Nothing committed, so only the partition's own mark brings it back.
+        reconcile_once(&ctx).await;
         let mut submitted = drain_partition_submits(&inbox);
         assert_eq!(
             submitted
@@ -4876,6 +6668,74 @@ mod tests {
 
     /// Metadata keeps the groups of a topic in a hash map, and a partition
     /// refuses a catalog whose live ids are out of order.
+    #[compio::test]
+    async fn given_burst_group_deletes_when_reconciling_should_bound_actual_submissions() {
+        let groups = u32::try_from(GROUP_OFFSET_DELETES_PER_PASS + 1).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "retire-stream");
+        seed_topic(&mux, 2, 0, "retire-topic", vec![assignment(0, 1)]);
+        for group in 0..groups {
+            seed_create_consumer_group(&mux, u64::from(group) + 3, 0, 0, &format!("group-{group}"));
+        }
+        for group in 0..groups {
+            seed_delete_consumer_group(&mux, u64::from(groups + group) + 3, 0, 0, group);
+        }
+        let (shard, inbox) =
+            build_test_shard_with_inbox(0, &config, mux, GROUP_OFFSET_DELETES_PER_PASS + 8);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        for group in 0..groups {
+            install_deleted_group_owner(&shard, namespace, group, u64::from(groups + group) + 3)
+                .await;
+            shard
+                .plane
+                .partitions()
+                .with_partition(&namespace, |partition| {
+                    partition.seed_recovered_consumer_offset(
+                        iggy_common::ConsumerKind::ConsumerGroup,
+                        group,
+                        0,
+                        0,
+                    );
+                });
+        }
+        let mut deletes = 0;
+        let mut retirements = 0;
+        for _ in 0..4 {
+            reconcile_once(&ctx).await;
+            let submitted = drain_partition_submits(&inbox);
+            let pass_deletes = submitted
+                .iter()
+                .filter(|request| request.header().operation == Operation::DeleteConsumerOffset)
+                .count();
+            assert!(pass_deletes <= GROUP_OFFSET_DELETES_PER_PASS);
+            for request in submitted {
+                match request.header().operation {
+                    Operation::DeleteConsumerOffset => deletes += 1,
+                    Operation::RetireConsumerGroupOwners => {
+                        retirements += 1;
+                        let catalog = iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest::decode_from(request.body()).unwrap();
+                        assert!(catalog.live_group_ids.len() <= iggy_binary_protocol::requests::partitions::retire_consumer_group_owners::CONSUMER_GROUP_OWNERS_MAX as usize);
+                    }
+                    operation => panic!("unexpected cleanup operation {operation:?}"),
+                }
+                commit_partition_submit(&shard, namespace, request).await;
+            }
+            await_group_offset_cleanup(&ctx, namespace).await;
+            if retirements > 0 {
+                break;
+            }
+        }
+        assert_eq!(deletes, groups as usize);
+        assert_eq!(
+            retirements, 1,
+            "all confirmed deletions share one retirement catalog"
+        );
+    }
+
     #[compio::test]
     async fn given_two_retirable_partitions_when_reconciling_should_submit_one_sorted_catalog_each()
     {
@@ -4911,7 +6771,11 @@ mod tests {
             install_deleted_group_owner(&shard, namespace, DELETED_GROUP, delete_op).await;
         }
 
-        reconcile_consumer_group_offsets(&ctx, &mut PassCounters::default());
+        reconcile_group_offsets(
+            &ctx.shard,
+            &ctx.group_offset_cleanup,
+            &mut PassCounters::default(),
+        );
         let submitted = drain_partition_submits(&inbox);
         let mut targets: Vec<_> = submitted
             .iter()
@@ -4930,8 +6794,8 @@ mod tests {
         }
     }
 
-    /// A refused catalog leaves no completion task, and an idle shard changes no
-    /// revision or epoch. Only the pending count keeps the fast skip off.
+    /// A refused catalog leaves no completion task, and an idle shard commits
+    /// nothing. Only the mark the refusal leaves brings the namespace back.
     #[compio::test]
     async fn given_refused_catalog_submit_when_the_next_pass_runs_should_retry_it() {
         const DELETED_GROUP: u32 = 0;
@@ -4964,10 +6828,7 @@ mod tests {
             .is_ok()
         {}
 
-        assert!(
-            reconcile_once(&ctx).await,
-            "the owner install forces a pass"
-        );
+        reconcile_once(&ctx).await;
         assert!(
             drain_partition_submits(&inbox)
                 .iter()
@@ -4975,10 +6836,7 @@ mod tests {
             "a full inbox refuses the catalog"
         );
 
-        assert!(
-            reconcile_once(&ctx).await,
-            "a refused catalog is pending work"
-        );
+        reconcile_once(&ctx).await;
         assert_eq!(
             drain_partition_submits(&inbox)
                 .iter()
@@ -5015,9 +6873,9 @@ mod tests {
             });
         seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
         let mut counters = PassCounters::default();
-        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        reconcile_group_offsets(&ctx.shard, &ctx.group_offset_cleanup, &mut counters);
         assert_eq!(counters.cg_offsets_submitted, 0);
-        assert!(ctx.group_offset_cleanup_inflight.borrow().is_empty());
+        assert!(ctx.group_offset_cleanup.inflight.borrow().is_empty());
     }
 
     #[compio::test]
@@ -5080,7 +6938,11 @@ mod tests {
             partition.dead_group_offset_keys(|id| id == u64::from(live_key)),
             vec![(ConsumerKind::ConsumerGroup, dead_key)]
         );
-        assert!(!ctx.last_pass_noop.get(), "failed cleanup must be retried");
+        assert_eq!(
+            partitions.take_consumer_group_offsets_dirty(),
+            BTreeSet::from([ns]),
+            "failed cleanup must be retried"
+        );
     }
 
     /// A partition-count change must re-run consumer-group assignment: a new
@@ -5131,7 +6993,6 @@ mod tests {
                     partitions_count: 1,
                 },
                 partitions: vec![assignment(0, 3)],
-                created_view: 0,
             },
         ))
         .expect("CreatePartitions apply succeeds");
@@ -5201,8 +7062,12 @@ mod tests {
         assert_eq!(assigned(200).map(|p| p.len()), Some(1));
 
         // Client 100 disconnects.
-        mux.streams()
-            .remove_consumer_group_member(100, iggy_common::IggyTimestamp::default(), 6);
+        mux.streams().remove_consumer_group_member(
+            100,
+            iggy_common::IggyTimestamp::default(),
+            6,
+            None,
+        );
         assert_eq!(assigned(200), Some(vec![1]));
         seed_installed_owners(&mux);
 
@@ -5261,8 +7126,7 @@ mod tests {
              is also what a not-yet-applied commit looks like"
         );
 
-        // Every subsequent pass ages it, and the park buffer keeps defeating the
-        // revision fast-skip until it drains.
+        // Every subsequent pass ages it until it drains.
         for _ in 0..=PARK_MAX_PASSES {
             reconcile_pass(&ctx).await;
         }
@@ -5362,7 +7226,7 @@ mod tests {
         // Drain path 1: materialisation re-dispatches.
         let late = IggyNamespace::new(0, 1, 0);
         park_one_request(&shard, late).await;
-        assert!(shard.has_parked_partition_frames());
+        assert_ne!(shard.parked_namespaces(), []);
         seed_topic(
             &shard.plane.metadata().mux_stm,
             3,
@@ -5372,28 +7236,28 @@ mod tests {
         );
         reconcile_pass(&ctx).await;
         assert!(
-            !shard.has_parked_partition_frames(),
+            shard.parked_namespaces().is_empty(),
             "re-dispatch must debit the parked-byte total"
         );
 
         // Drain path 2: the age bound answers the frame.
         let never = IggyNamespace::new(0, 9, 0);
         park_one_request(&shard, never).await;
-        assert!(shard.has_parked_partition_frames());
+        assert_ne!(shard.parked_namespaces(), []);
         for _ in 0..=PARK_MAX_PASSES {
             shard.age_parked_partition_frames(never);
         }
         assert!(
-            !shard.has_parked_partition_frames(),
+            shard.parked_namespaces().is_empty(),
             "aging out must debit the parked-byte total"
         );
 
         // Drain path 3: an explicit reclaim.
         park_one_request(&shard, never).await;
-        assert!(shard.has_parked_partition_frames());
+        assert_ne!(shard.parked_namespaces(), []);
         shard.discard_parked_partition_frames(never);
         assert!(
-            !shard.has_parked_partition_frames(),
+            shard.parked_namespaces().is_empty(),
             "reclaim must debit the parked-byte total"
         );
 
@@ -5654,46 +7518,88 @@ mod tests {
         );
     }
 
-    /// Parking does not bump `Streams::revision` and does not wake the reconciler,
-    /// so a frame that parks in a converged steady state would be held for the
-    /// process lifetime if the revision fast-skip could still fire. A non-empty
-    /// park buffer must therefore defeat the skip.
+    /// Parking commits nothing and puts nothing in the work set, so a frame
+    /// that parks on a converged shard is held for the process lifetime unless
+    /// every pass ages it.
     #[compio::test]
-    async fn park_buffer_defeats_the_revision_fast_skip() {
+    async fn given_converged_shard_when_a_frame_parks_should_age_it_without_a_commit() {
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let mux = TestMux::default();
-        seed_stream(&mux, 1, "stream-skip");
-        seed_topic(&mux, 2, 0, "topic-skip", vec![assignment(0, 1)]);
+        seed_stream(&mux, 1, "stream-park");
+        seed_topic(&mux, 2, 0, "topic-park", vec![assignment(0, 1)]);
 
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
-
-        // Converge: the first pass materialises, the verify pass after it arms
-        // the skip (same sequence as `reconcile_fast_skips_when_revision_unchanged`).
-        assert!(reconcile_once(&ctx).await, "first pass runs the full diff");
-        ctx.shard.apply_reconcile_ops();
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
         assert!(
-            reconcile_once(&ctx).await,
-            "the verify pass after a working pass must still run"
-        );
-        ctx.shard.apply_reconcile_ops();
-        assert!(
-            !reconcile_once(&ctx).await,
-            "a converged pass with an unchanged revision must fast-skip"
+            ctx.pending.borrow().is_empty(),
+            "the shard must be converged"
         );
 
-        // Park a frame for a namespace that is NOT materialised, without touching
-        // the revision, and the skip must stop firing.
         let unbuilt = IggyNamespace::new(0, 0, 7);
         park_one_request(&shard, unbuilt).await;
         assert!(
-            shard.has_parked_partition_frames(),
+            !shard.parked_namespaces().is_empty(),
             "the frame must be parked for this test to mean anything"
         );
+        for _ in 0..=PARK_MAX_PASSES {
+            reconcile_once(&ctx).await;
+        }
         assert!(
-            reconcile_once(&ctx).await,
-            "a non-empty park buffer must defeat the fast-skip so the sweep can run"
+            shard.parked_namespaces().is_empty(),
+            "every pass must age the parked frame until it is answered"
+        );
+    }
+
+    /// A pass that stops at `DISK_VISITS_PER_PASS` leaves builds to the next
+    /// one, so it must not age a request parked for a build still queued
+    /// behind the cap.
+    #[compio::test]
+    async fn given_more_builds_than_the_admission_window_when_reconciling_should_serve_the_parked_request()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let last_partition = (PARK_MAX_PASSES as usize + 1) * DISK_VISITS_PER_PASS;
+        seed_stream(&mux, 1, "stream-backlog");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-backlog",
+            (0..=u32::try_from(last_partition).unwrap())
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let parked = IggyNamespace::new(0, 0, last_partition);
+        park_one_request(&shard, parked).await;
+        assert_eq!(shard.parked_frame_count(parked), 1);
+
+        let mut capped_passes = 0;
+        while reconcile_once(&ctx).await {
+            shard.apply_reconcile_ops();
+            capped_passes += 1;
+        }
+        shard.apply_reconcile_ops();
+
+        assert!(
+            capped_passes > PARK_MAX_PASSES as usize,
+            "the backlog must outlast the admission window"
+        );
+        assert_eq!(shard.parked_frame_count(parked), 0);
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            1,
+            "the build must hand the request to the pump"
+        );
+        assert_eq!(
+            shard.metrics().partition_requests_denied_transient_value(),
+            0,
+            "no capped pass may answer the request before its build"
         );
     }
 
@@ -5820,17 +7726,8 @@ mod tests {
         );
     }
 
-    /// Past the per-namespace cap the frame is gone either way, but a client
-    /// request must still be answered: the transports decode replies in
-    /// lockstep, so a silent shed leaves the connection waiting out its full
-    /// response read-timeout.
-    ///
-    /// Registers an in-process client, so the assertion is that a reply reached
-    /// a waiter, not that a counter moved. With no client every send fails
-    /// `ClientNotFound`, and a counter bumped before the send reports an answer
-    /// nobody received.
     #[compio::test]
-    async fn park_overflow_answers_the_client_instead_of_shedding_silently() {
+    async fn park_overflow_without_reply_owner_keeps_http_slot_untouched() {
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let mux = TestMux::default();
@@ -5839,7 +7736,7 @@ mod tests {
 
         let shard = build_test_shard(0, &config, mux);
         let ns = IggyNamespace::new(0, 0, 0);
-        let (_slot, reply_rx) = register_waiting_client(&shard);
+        let (_slot, mut reply_rx) = register_waiting_client(&shard);
 
         // Fill the buffer to its cap, then one more.
         for _ in 0..PARK_CAP {
@@ -5868,27 +7765,24 @@ mod tests {
             PARK_CAP,
             "the shed frame must not have grown the buffer past its cap"
         );
-        // The point of the fix: shedding is unavoidable at the cap, silence is
-        // not. Without the deny the connection waits out its whole response
-        // read-timeout on a frame that is already gone.
-        let reply = reply_rx
-            .await
-            .expect("the shed request must reach the waiting client");
-        assert_eq!(
-            reply_status(&reply),
-            iggy_common::IggyError::TransientNotAccepted.as_code(),
-            "the shed request must be answered with a retriable status"
+        assert!(
+            matches!(reply_rx.try_recv(), Ok(None)),
+            "a parked request without its reply owner must not fill an HTTP slot"
         );
         assert_eq!(
             shard.metrics().partition_requests_denied_transient_value(),
-            1,
-            "and the counter must credit that delivered answer"
+            0
+        );
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::PARTITION,
+                shard::metrics::frame_drop_reason::DELIVERY_FAILED
+            ),
+            1
         );
     }
 
-    /// Credit only denies the bus delivered. Incrementing before
-    /// `send_to_client` reported an answer with no client registered, blinding
-    /// `park_overflow_answers_the_client_instead_of_shedding_silently`.
+    /// A staged denial without a reply owner is counted as undelivered.
     #[compio::test]
     async fn overflow_deny_is_not_counted_when_the_client_is_gone() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -6388,13 +8282,5 @@ mod tests {
             .clients()
             .install_reply_slot(TEST_CLIENT_ID, TEST_REQUEST_ID)
             .expect("reply slot installs")
-    }
-
-    fn reply_status(reply: &message_bus::BusMessage) -> u32 {
-        bytemuck::checked::try_from_bytes::<ReplyHeader>(
-            &reply.first().as_slice()[..size_of::<ReplyHeader>()],
-        )
-        .expect("deny reply carries a valid ReplyHeader")
-        .status
     }
 }

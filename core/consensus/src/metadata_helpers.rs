@@ -427,16 +427,39 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    consensus.is_primary()
-        && !consensus.has_ceded_primaryship()
-        && consensus.is_normal()
-        && !consensus.is_transferring()
+    is_unceded_normal_primary(consensus)
         // Recovery re-pipelines the WAL's prepared-but-uncommitted suffix;
         // those ops were acked to clients before the restart, so admitting
         // new requests (a login is a Register write) before the suffix
         // re-commits would serve state that rolls back committed history.
         // Held transient until the retransmit path re-earns quorum.
         && consensus.commit_max() >= consensus.recovery_barrier()
+}
+
+/// [`is_caught_up_primary`] without the recovery barrier.
+///
+/// The barrier holds back only the recovered suffix above `commit_max`. State at
+/// or below `commit_min` is committed whatever becomes of that suffix, so a caller
+/// that only hands out such state, as a state transfer does, needs no barrier.
+/// Waiting for it can deadlock: when the only other live replica sits below this
+/// primary's WAL floor, a transfer is its one route to acking the suffix.
+pub fn is_caught_up_primary_except_barrier<B, P>(consensus: &VsrConsensus<B, P>) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    is_unceded_normal_primary(consensus) && consensus.commit_min() == consensus.commit_max()
+}
+
+fn is_unceded_normal_primary<B, P>(consensus: &VsrConsensus<B, P>) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    consensus.is_primary()
+        && !consensus.has_ceded_primaryship()
+        && consensus.is_normal()
+        && !consensus.is_transferring()
 }
 
 /// Build + best-effort send `Eviction`. `SendError` dropped: eviction is
@@ -519,7 +542,6 @@ mod tests {
 
         fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
         fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
-        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     // A registered client's fresh Register dispatches instead of being
@@ -1113,6 +1135,23 @@ mod tests {
         assert!(!backup.is_primary());
         assert!(!is_caught_up_primary(&backup));
         assert!(!is_settled_primary(&backup));
+        assert!(!is_caught_up_primary_except_barrier(&backup));
+
+        // Recovered suffix above commit_max -> neither caught up nor settled, yet
+        // its committed state is servable.
+        let recovering = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
+        recovering.init();
+        recovering.set_recovery_barrier(recovering.commit_max() + 1);
+        assert!(!is_caught_up_primary(&recovering));
+        assert!(!is_settled_primary(&recovering));
+        assert!(is_caught_up_primary_except_barrier(&recovering));
+
+        // The barrier is the only clause it drops.
+        recovering.begin_state_transfer_await();
+        assert!(!is_caught_up_primary_except_barrier(&recovering));
+        recovering.set_state_transfer_stage(crate::StateTransferStage::Idle);
+        recovering.advance_commit_max(5);
+        assert!(!is_caught_up_primary_except_barrier(&recovering));
     }
 
     #[test]

@@ -74,13 +74,12 @@
       ]
     },
     {
-      "id": "rust-connectors",
-      "dimensions": { "component": "rust-connectors" },
+      "id": "rust-kafka-gateway",
+      "dimensions": { "component": "rust-kafka-gateway" },
       "cargo_roots": [
-        { "package": "iggy-connectors", "target": { "name": "iggy-connectors", "kind": "bin" } }
+        { "package": "iggy-gateway-kafka", "target": { "name": "iggy-gateway-kafka", "kind": "bin" } }
       ],
       "external_paths": [
-        ".dockerignore",
         ".github/actions/utils/docker-buildx/**",
         ".github/actions/utils/docker-login/**",
         ".github/config/publish.yml",
@@ -90,7 +89,8 @@
         "NOTICE",
         "about.toml",
         "about.hbs",
-        "core/connectors/runtime/Dockerfile",
+        "gateways/kafka/Dockerfile",
+        "gateways/kafka/Dockerfile.dockerignore",
         "scripts/extract-version.sh",
         "scripts/ci/third-party-licenses.sh"
       ]

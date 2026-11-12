@@ -22,7 +22,7 @@ use futures::channel::oneshot;
 use futures::lock::{Mutex, OwnedMutexGuard};
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command, PrepareHeader};
 use server_common::fatal::NoteDescriptorExhaustion;
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
+use server_common::{DISK_USAGE, MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
 use std::io::{self, Read};
@@ -960,6 +960,7 @@ impl PrepareJournal {
                 let size = header.size as usize;
                 let buf = vec![0u8; size];
                 let buf = self.storage.read_at(*old_offset, buf).await?;
+                let _charge = DISK_USAGE.charge(size as u64);
                 let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
                 result?;
                 write_pos += size as u64;
@@ -1649,6 +1650,63 @@ mod tests {
                 journal.entry(&header).await.unwrap().as_slice(),
                 entry.as_slice()
             );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_divergent_run_when_its_removal_stops_around_the_rename_should_keep_the_canonical_tail()
+     {
+        const FIRST: u64 = 3;
+        const LAST: u64 = 34;
+        const HEAD: u64 = LAST + 6;
+        const BODY: usize = 64;
+        let mut parent = 0;
+        let entries: Vec<_> = (1..=HEAD)
+            .map(|op| {
+                let entry = make_identity_sealed_prepare(op, BODY, parent);
+                parent = entry.header().checksum;
+                entry
+            })
+            .collect();
+
+        for renamed in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("journal.wal");
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            for entry in &entries {
+                journal.append(entry.deep_copy()).await.unwrap();
+            }
+            if renamed {
+                let Some(unreadable) = UnreadableDir::new(dir.path()) else {
+                    return;
+                };
+                journal
+                    .remove_range(FIRST..=LAST)
+                    .await
+                    .expect_err("the directory sync after the rename must fail");
+                drop(unreadable);
+            } else {
+                let mut removal = Box::pin(journal.remove_range(FIRST..=LAST));
+                assert!(futures::poll!(&mut removal).is_pending());
+                drop(removal);
+            }
+            drop(journal);
+
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            assert_eq!(journal.last_op(), Some(HEAD));
+            for entry in &entries {
+                let op = entry.header().op;
+                let held = journal.header(op as usize).map(|header| *header);
+                if renamed && (FIRST..=LAST).contains(&op) {
+                    assert_eq!(held, None, "op {op} went with the renamed WAL");
+                    continue;
+                }
+                let header = held.unwrap_or_else(|| panic!("op {op} must survive"));
+                assert_eq!(
+                    journal.entry(&header).await.unwrap().as_slice(),
+                    entry.as_slice()
+                );
+            }
         }
     }
 

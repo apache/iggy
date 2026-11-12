@@ -41,6 +41,10 @@ pub fn follower_address() -> String {
     required_env("IGGY_TCP_ADDRESS_FOLLOWER")
 }
 
+pub fn no_quorum_address() -> String {
+    required_env("IGGY_TCP_ADDRESS_NO_QUORUM")
+}
+
 pub fn root_username() -> String {
     required_env("IGGY_ROOT_USERNAME")
 }

@@ -33,10 +33,21 @@ namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 public class LeaderRedirectionSteps
 {
     private readonly TestContext _context;
+    private IIggyClient? _streamClient;
 
     public LeaderRedirectionSteps(TestContext context)
     {
         _context = context;
+    }
+
+    // The single-server scenario shares its server with the other features, and this runs before the clients close.
+    [AfterScenario(Order = 0)]
+    public async Task DeleteCreatedStream()
+    {
+        if (_streamClient is not null && _context.LastStreamId is { } streamId)
+        {
+            await _streamClient.DeleteStreamAsync(Identifier.Numeric(streamId));
+        }
     }
 
     // ---------- Background ----------
@@ -162,6 +173,7 @@ public class LeaderRedirectionSteps
         var client = GetClient("main");
         var stream = await client.CreateStreamAsync(streamName);
         stream.ShouldNotBeNull("Should be able to create stream");
+        _streamClient = client;
         _context.LastStreamId = stream.Id;
     }
 

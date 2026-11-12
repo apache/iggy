@@ -20,6 +20,7 @@ package tcp
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -43,19 +44,18 @@ type linkReply struct {
 type linkPending struct{ reply chan linkReply }
 
 type tcpLink struct {
-	boundFence     uint64
-	boundWatermark uint64
-	bindGate       chan struct{}
-	conn           net.Conn
-	endpoint       string
-	mu             sync.Mutex
-	pending        map[uint64]*linkPending
-	capacity       chan struct{}
-	writes         chan *operationFrame
-	closed         chan struct{}
-	senders        sync.WaitGroup
-	closeOnce      sync.Once
-	done           sync.WaitGroup
+	boundFence uint64
+	bindGate   chan struct{}
+	conn       net.Conn
+	endpoint   string
+	mu         sync.Mutex
+	pending    map[uint64]*linkPending
+	capacity   chan struct{}
+	writes     chan *operationFrame
+	closed     chan struct{}
+	senders    sync.WaitGroup
+	closeOnce  sync.Once
+	done       sync.WaitGroup
 }
 
 func newTCPLink(conn net.Conn, endpoint string) *tcpLink {
@@ -84,7 +84,8 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
 	default:
 	}
-	if l.pending[id] != nil {
+	// A select picks a ready case at random, so a cancelled caller must be refused before its frame is queued.
+	if l.pending[id] != nil || ctx.Err() != nil {
 		l.mu.Unlock()
 		<-l.capacity
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
@@ -92,13 +93,16 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 	l.pending[id] = pending
 	l.senders.Add(1)
 	l.mu.Unlock()
+	cancelled := false
 	defer func() {
 		l.mu.Lock()
 		if l.pending[id] == pending {
 			delete(l.pending, id)
 		}
 		l.mu.Unlock()
-		<-l.capacity
+		if !cancelled {
+			<-l.capacity
+		}
 	}()
 	queued := frame.acquire()
 	sent := false
@@ -114,10 +118,29 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 	if !sent {
 		return linkReply{err: ierror.ErrTransientNotAccepted}, false
 	}
+	caller := ctx
+	ctx, stopWaiting := replyContext(ctx, frame)
+	defer stopWaiting()
+	if frame.uncancellable {
+		select {
+		case reply := <-pending.reply:
+			return reply, true
+		case <-caller.Done():
+			// The server answers the cancelled request once, refused or with what it stored.
+			if errors.Is(caller.Err(), context.Canceled) {
+				l.queueCancellation(frame.data)
+			}
+		case <-ctx.Done():
+		case <-l.closed:
+		}
+	}
 	select {
 	case reply := <-pending.reply:
 		return reply, true
 	case <-ctx.Done():
+		if !frame.uncancellable {
+			cancelled = l.cancelDeferred(id, pending, frame.data)
+		}
 		return linkReply{err: ierror.ErrTransientNotCommitted}, true
 	case <-l.closed:
 		select {
@@ -127,6 +150,66 @@ func (l *tcpLink) exchange(ctx context.Context, frame *operationFrame) (linkRepl
 		}
 		return linkReply{err: ierror.ErrTransientNotCommitted}, true
 	}
+}
+
+// replyContext is the context of the wait for the reply of frame once it is
+// sent. The caller of an uncancellable frame waits for its reply until the
+// deadline of ctx, also after ctx is cancelled.
+func replyContext(ctx context.Context, frame *operationFrame) (context.Context, context.CancelFunc) {
+	if !frame.uncancellable {
+		return ctx, func() {}
+	}
+	detached := context.WithoutCancel(ctx)
+	if deadline, bounded := ctx.Deadline(); bounded {
+		return context.WithDeadline(detached, deadline)
+	}
+	return detached, func() {}
+}
+
+// cancelDeferred removes the pending entry of a deferred poll or fetch whose caller stopped waiting, and queues its cancellation behind it,
+// so that the server frees the parked request. A reply that comes later
+// finds no entry and is dropped. The cancellation keeps the capacity slot of
+// the request until it is queued, so a stalled writer holds a bounded number
+// of them. It returns false when nothing was cancelled.
+func (l *tcpLink) cancelDeferred(id uint64, pending *linkPending, frame []byte) bool {
+	cancellation, deferred := vsr.DeferredCancellation(frame)
+	if !deferred {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// The reply or the close of the link came first.
+	if l.pending[id] != pending {
+		return false
+	}
+	delete(l.pending, id)
+	l.senders.Add(1)
+	go func() {
+		defer func() { <-l.capacity }()
+		defer l.senders.Done()
+		select {
+		case l.writes <- newOperationFrame(cancellation, nil):
+		case <-l.closed:
+		}
+	}()
+	return true
+}
+
+// queueCancellation queues the cancellation of a deferred request whose caller
+// stopped waiting and keeps its pending entry, so its reply still arrives.
+func (l *tcpLink) queueCancellation(frame []byte) {
+	cancellation, deferred := vsr.DeferredCancellation(frame)
+	if !deferred {
+		return
+	}
+	l.senders.Add(1)
+	go func() {
+		defer l.senders.Done()
+		select {
+		case l.writes <- newOperationFrame(cancellation, nil):
+		case <-l.closed:
+		}
+	}()
 }
 
 func (l *tcpLink) close(err error) {
@@ -219,14 +302,17 @@ func (l *tcpLink) readLoop() {
 	}
 }
 
-func (l *tcpLink) markBound(fence, watermark uint64) {
+func (l *tcpLink) markBound(fence uint64) {
 	l.mu.Lock()
 	l.boundFence = fence
-	l.boundWatermark = watermark
 	l.mu.Unlock()
 }
-func (l *tcpLink) isBound(fence, watermark uint64) bool {
+
+// isBound reports whether the link carries the session of fence. A link binds
+// once per session: each request carries its own metadata floor, so a rising
+// watermark needs no new bind.
+func (l *tcpLink) isBound(fence uint64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.boundFence == fence && l.boundWatermark >= watermark
+	return l.boundFence == fence
 }

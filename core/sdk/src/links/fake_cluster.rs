@@ -24,13 +24,16 @@ use super::{Dialer, ReconnectPolicy, ReplicaLinks};
 use crate::session_owner::SessionOwner;
 use futures::FutureExt;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE,
-    LOGIN_REGISTER_CODE, LOGOUT_USER_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DELETE_CONSUMER_OFFSET_CODE,
+    FETCH_MESSAGES_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
+    GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, LOGIN_REGISTER_CODE, LOGOUT_USER_CODE,
+    STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{
     EvictionHeader, EvictionReason, HEADER_SIZE, NON_REPLICATED_CODE_RANGE, Operation,
     PrepareHeader, REJECTION_SECTION_LEN, ReplyHeader, RequestHeader, write_rejection_section,
 };
+use iggy_binary_protocol::requests::messages::FetchMessagesRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::streams::get_stream::TopicHeader;
@@ -38,15 +41,14 @@ use iggy_binary_protocol::responses::system::{ClusterMetadataResponse, ClusterNo
 use iggy_binary_protocol::responses::topics::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{PartitionContext, WireDecode, WireEncode, WireName, WireOptions};
-use iggy_common::{
-    AutoLogin, ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Credentials, IggyError,
-};
+use iggy_common::{AutoLogin, ClusterNodeRole, ClusterNodeStatus, Credentials, IggyError};
 use secrecy::SecretString;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -58,12 +60,20 @@ pub(crate) const TEST_BUDGET: Duration = Duration::from_secs(120);
 /// A request code that the fake replicas never answer.
 pub(crate) const UNANSWERED_CODE: u32 = GET_STATS_CODE;
 const USER_ID: u32 = 1;
+/// The partition that a refused offset write names: the fake does not decode request bodies.
+const REFUSED_PARTITION: u32 = 0;
 const POLL_STEP: Duration = Duration::from_millis(10);
 
 /// How a replica answers one scripted request.
 #[derive(Debug, Clone)]
 pub(crate) enum Answer {
     Body(Vec<u8>),
+    /// Keeps the old operation live independently of its connection until released.
+    GatedBody {
+        release: Arc<Notify>,
+        completed: Arc<AtomicBool>,
+        body: Vec<u8>,
+    },
     /// A refusal with the status of this error.
     Refuse(IggyError),
     /// The reply of a committed metadata request at this commit.
@@ -103,6 +113,7 @@ pub(crate) struct FakeCluster {
     /// Usernames whose Register registers a session at once, but whose reply
     /// waits until the name leaves the set.
     pub(crate) held_registers: Mutex<HashSet<String>>,
+    held_replies: Mutex<HashMap<u32, Vec<HeldReply>>>,
     pub(crate) reject_credentials: Mutex<bool>,
     pub(crate) session: Mutex<Option<u64>>,
     /// The username of each client id that registered with a password. As on
@@ -111,6 +122,8 @@ pub(crate) struct FakeCluster {
     registered_users: Mutex<HashMap<u128, String>>,
     /// The answer of every replica to a route lookup without a script.
     pub(crate) route: Mutex<Option<PartitionRouteResponse>>,
+    /// The owner of every group partition, set by [`Self::install_owner`].
+    owner: Mutex<Option<PartitionContext>>,
     /// Answers by endpoint and code, used before the answer by code.
     script: Mutex<HashMap<(String, u32), VecDeque<Answer>>>,
     registered: AtomicU64,
@@ -122,7 +135,40 @@ pub(crate) struct FakeCluster {
     pub(crate) cut_dials: Mutex<Vec<Duration>>,
 }
 
+struct HeldReply {
+    sender: flume::Sender<Vec<u8>>,
+    frame: Vec<u8>,
+}
+
 impl FakeCluster {
+    pub(crate) fn hold(&self, code: u32) {
+        assert!(
+            self.held_replies
+                .lock()
+                .unwrap()
+                .insert(code, Vec::new())
+                .is_none()
+        );
+    }
+
+    pub(crate) fn release(&self, code: u32) {
+        for reply in self.held_replies.lock().unwrap().remove(&code).unwrap() {
+            reply.sender.send(reply.frame).unwrap();
+        }
+    }
+
+    pub(crate) fn release_latest(&self, code: u32) {
+        let reply = self
+            .held_replies
+            .lock()
+            .unwrap()
+            .get_mut(&code)
+            .unwrap()
+            .pop()
+            .unwrap();
+        reply.sender.send(reply.frame).unwrap();
+    }
+
     /// `count` replicas, the first one the metadata primary.
     pub(crate) fn new(count: u8) -> Arc<Self> {
         let cluster = Self::default();
@@ -152,6 +198,23 @@ impl FakeCluster {
             .entry((endpoint.to_owned(), code))
             .or_default()
             .extend(answers);
+    }
+
+    /// Installs the owner of every group partition: its history, generation and installation op.
+    pub(crate) fn install_owner(&self, owner: PartitionContext) {
+        *self.owner.lock().unwrap() = Some(owner);
+    }
+
+    /// The rule of a server for an offset write: it names the history of the installed owner,
+    /// and owner 0 binds to that owner only under a metadata op at or after its installation.
+    fn binds_owner(&self, request: &RequestHeader) -> bool {
+        self.owner.lock().unwrap().is_none_or(|owner| {
+            request.partition_incarnation == owner.incarnation
+                && match request.owner_generation {
+                    0 => owner.metadata_op <= request.minimum_metadata_op,
+                    generation => generation == owner.owner_generation,
+                }
+        })
     }
 
     /// Makes `id` the metadata primary of the roster that the replicas send.
@@ -244,50 +307,88 @@ impl FakeCluster {
 
     async fn serve(self: Arc<Self>, endpoint: String, stream: DuplexStream) {
         let (mut reader, mut writer) = tokio::io::split(stream);
-        let mut header = [0; HEADER_SIZE];
-        while reader.read_exact(&mut header).await.is_ok() {
-            let request = read_request_header(&header);
-            let mut body = vec![0; request.size as usize - HEADER_SIZE];
-            if reader.read_exact(&mut body).await.is_err() {
-                return;
-            }
-            let code = request_code(&request);
-            let username = register_username(code, &body);
-            self.received.lock().unwrap().push((
-                code,
-                Received {
-                    endpoint: endpoint.clone(),
-                    header: request,
-                    body,
-                },
-            ));
-            let frame = match self.answer(&endpoint, &request, code, username.as_deref()) {
-                Answer::Body(body) => reply(request.request, &body),
-                Answer::Refuse(error) => refusal(request.request, &error),
-                Answer::Detached => refusal(request.request, &IggyError::StaleClient),
-                Answer::Commit(commit) => committed(&request, commit, None, &[]),
-                Answer::CommitBody(commit, body) => committed(&request, commit, None, &body),
-                Answer::CommitRejected(commit, error) => {
-                    committed(&request, commit, Some(&error), &[])
-                }
-                Answer::Evict(reason) => {
-                    let header = EvictionHeader::new(0, 0, 0, request.client, reason);
-                    let _ = writer.write_all(bytemuck::bytes_of(&header)).await;
+        let (replies, responses) = flume::unbounded::<Vec<u8>>();
+        let receive = async move {
+            let mut header = [0; HEADER_SIZE];
+            while reader.read_exact(&mut header).await.is_ok() {
+                let request = read_request_header(&header);
+                let mut body = vec![0; request.size as usize - HEADER_SIZE];
+                if reader.read_exact(&mut body).await.is_err() {
                     return;
                 }
-                Answer::HangUp => return,
-                Answer::Silence => continue,
-            };
-            while username
-                .as_ref()
-                .is_some_and(|username| self.held_registers.lock().unwrap().contains(username))
-            {
-                sleep(POLL_STEP).await;
+                let code = request_code(&request);
+                let username = register_username(code, &body);
+                // The server refuses a fetch that does not validate, for example a fetch from a
+                // start other than an offset or `Next`.
+                let invalid = code == FETCH_MESSAGES_CODE
+                    && FetchMessagesRequest::decode_from(&body).is_err();
+                self.received.lock().unwrap().push((
+                    code,
+                    Received {
+                        endpoint: endpoint.clone(),
+                        header: request,
+                        body,
+                    },
+                ));
+                let answer = if invalid {
+                    Answer::Refuse(IggyError::InvalidCommand)
+                } else {
+                    self.answer(&endpoint, &request, code, username.as_deref())
+                };
+                let frame = match answer {
+                    Answer::Body(body) => reply(request.request, &body),
+                    Answer::GatedBody {
+                        release,
+                        completed,
+                        body,
+                    } => {
+                        let replies = replies.clone();
+                        tokio::spawn(async move {
+                            release.notified().await;
+                            completed.store(true, Ordering::SeqCst);
+                            let _ = replies.send(reply(request.request, &body));
+                        });
+                        continue;
+                    }
+                    Answer::Refuse(error) => refusal(request.request, &error),
+                    Answer::Detached => refusal(request.request, &IggyError::StaleClient),
+                    Answer::Commit(commit) => committed(&request, commit, None, &[]),
+                    Answer::CommitBody(commit, body) => committed(&request, commit, None, &body),
+                    Answer::CommitRejected(commit, error) => {
+                        committed(&request, commit, Some(&error), &[])
+                    }
+                    Answer::Evict(reason) => {
+                        let header = EvictionHeader::new(0, 0, 0, request.client, reason);
+                        let _ = replies.send(bytemuck::bytes_of(&header).to_vec());
+                        return;
+                    }
+                    Answer::HangUp => return,
+                    Answer::Silence => continue,
+                };
+                while username
+                    .as_ref()
+                    .is_some_and(|username| self.held_registers.lock().unwrap().contains(username))
+                {
+                    sleep(POLL_STEP).await;
+                }
+                if let Some(held) = self.held_replies.lock().unwrap().get_mut(&code) {
+                    held.push(HeldReply {
+                        sender: replies.clone(),
+                        frame,
+                    });
+                } else if replies.send(frame).is_err() {
+                    return;
+                }
             }
-            if writer.write_all(&frame).await.is_err() {
-                return;
+        };
+        let send = async move {
+            while let Ok(frame) = responses.recv_async().await {
+                if writer.write_all(&frame).await.is_err() {
+                    return;
+                }
             }
-        }
+        };
+        tokio::join!(receive, send);
     }
 
     fn answer(
@@ -342,7 +443,24 @@ impl FakeCluster {
                 Some(route) => Answer::Body(route.to_bytes().to_vec()),
                 None => Answer::Refuse(IggyError::TransientNotAccepted),
             },
+            // No partition has the history 0, and a server checks the history first.
+            STORE_CONSUMER_OFFSET_CODE | DELETE_CONSUMER_OFFSET_CODE | GET_CONSUMER_OFFSET_CODE
+                if request.partition_incarnation == 0 =>
+            {
+                Answer::Refuse(IggyError::HistoryUnavailable)
+            }
+            STORE_CONSUMER_OFFSET_CODE | DELETE_CONSUMER_OFFSET_CODE
+                if !self.binds_owner(request) =>
+            {
+                Answer::Refuse(IggyError::ConsumerGroupPartitionNotOwned(
+                    request.client,
+                    REFUSED_PARTITION,
+                ))
+            }
             UNANSWERED_CODE => Answer::Silence,
+            // The server answers the cancelled request, never the cancel.
+            CANCEL_DEFERRED_REQUEST_CODE => Answer::Silence,
+            FETCH_MESSAGES_CODE => Answer::Body(0_u32.to_le_bytes().to_vec()),
             _ if !matches!(
                 request.operation,
                 Operation::NonReplicated | Operation::Logout
@@ -408,9 +526,6 @@ pub(crate) fn topic_body(partitions_count: u32) -> Vec<u8> {
             id: 1,
             created_at: 0,
             partitions_count,
-            message_expiry: 0,
-            compression_algorithm: CompressionAlgorithm::None.as_code(),
-            max_topic_size: 0,
             size_bytes: 0,
             messages_count: 0,
             name: WireName::new("topic").unwrap(),
@@ -430,6 +545,8 @@ pub(crate) fn topic_body(partitions_count: u32) -> Vec<u8> {
                     owner_generation: 0,
                     metadata_op: 11,
                 },
+                members: vec![0],
+                in_sync_members: vec![0],
             })
             .collect(),
     }
@@ -485,7 +602,16 @@ pub(crate) fn links(
 
 /// Connects, and waits until `count` slots serve the session.
 pub(crate) async fn connected(cluster: &Arc<FakeCluster>, count: usize) -> ReplicaLinks {
-    let links = links(cluster, &endpoint(0), policy());
+    connected_with(cluster, count, policy()).await
+}
+
+/// Connects under `policy`, and waits until `count` slots serve the session.
+pub(crate) async fn connected_with(
+    cluster: &Arc<FakeCluster>,
+    count: usize,
+    policy: ReconnectPolicy,
+) -> ReplicaLinks {
+    let links = links(cluster, &endpoint(0), policy);
     links.connect().await.unwrap();
     eventually("every slot is ready", || {
         links.ready_replicas().len() == count

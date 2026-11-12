@@ -22,22 +22,34 @@ import type {
 } from './client.type.js';
 import { DeserializeError, ResponseError, responseError } from '../wire/error.utils.js';
 import { IggyConnection, endpointKey, type Endpoint } from './client.connection.js';
-import { normalizeClientConfig } from './client.config.js';
+import { DEFAULT_MAX_RESPONSE_FRAME_SIZE, normalizeClientConfig } from './client.config.js';
 import {
-  ChangeSignal, MutationLanes, NotConnectedError, OperationUncertainError, OperationNotRetainedError,
-  OPERATION_TIMEOUT_MS, VsrResponseTimeoutError, pause, waitWithin, type ClientOperation
+  ChangeSignal, FetchProgressUncertainError, MutationLanes, NotConnectedError, OperationUncertainError, OperationNotRetainedError,
+  OPERATION_TIMEOUT_MS, PermitPool, VsrResponseTimeoutError, pause, waitWithin, type ClientOperation
 } from './client.operation.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT, PING } from '../wire/index.js';
 import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.command.js';
 import { deserializePartitionRoute, type PartitionRoute } from '../wire/partition/partition-route.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
-import { serializeIdentifier } from '../wire/identifier.utils.js';
+import { serializeIdentifier, type Id } from '../wire/identifier.utils.js';
+import { uint32ToBuf } from '../wire/number.utils.js';
+import { deserializeOptions } from '../wire/options.utils.js';
+import { OptionsScope } from '../wire/system/describe-options.command.js';
 import { PartitionKind } from '../wire/message/partitioning.utils.js';
 import { PollingStrategyKind } from '../wire/message/poll.utils.js';
+import { CommitErrorScope, provesNothingStored } from '../wire/message/commit-outcome.js';
+import {
+  DEFERRED_POLL_OFFSET, DEFERRED_POLL_OPTIONS_SIZE, MAX_PARTITIONS_PER_REQUEST, MIN_DEFERRED_POLL_MAX_BYTES,
+  MIN_DEFERRED_POLL_REPLY_MARGIN_US, US_PER_MS, isDeferredBudget, isFetchBudget
+} from '../wire/message/deferred-poll.utils.js';
+import {
+  FETCH_MESSAGES, FETCH_MESSAGES_FIELD, FETCH_MESSAGES_FIELDS_SIZE, FETCH_SECTION_FIELD, FETCH_SECTION_SIZE, FETCH_TARGET_FIELD,
+  FETCH_TARGET_SIZE, fetchReplyHeadSize
+} from '../wire/message/fetch-messages.command.js';
 import {
   EvictionReason, HEADER_SIZE, REPLY_OFFSET, hasCommittedResult, type PartitionContext,
-  EMPTY_PARTITION_CONTEXT, readReplyOperation
+  EMPTY_PARTITION_CONTEXT, readReplyOperation, sameContext
 } from '../wire/vsr/header.js';
 import { Operation, isMetadata, operationForCode } from '../wire/vsr/operation.js';
 import {
@@ -48,8 +60,8 @@ import { validateReplyForRequest } from '../wire/vsr/reply.js';
 import { debug } from './client.debug.js';
 
 export {
-  LaneBlockedError, NotConnectedError, OperationNotRetainedError, OperationUncertainError,
-  VsrResponseTimeoutError
+  FETCH_PROGRESS_UNCERTAIN, FetchProgressUncertainError, LANE_BLOCKED, LaneBlockedError, NotConnectedError,
+  OperationNotRetainedError, OperationUncertainError, PARTITION_LANE_BLOCKED, VsrResponseTimeoutError
 } from './client.operation.js';
 
 const RETRY_INTERVAL_MS = 50;
@@ -67,11 +79,35 @@ const OPERATION_NOT_RETAINED = 85;
 const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
 const NOT_PRIMARY = 89;
+const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
+const GROUP_PARTITION_NOT_OWNED = 5009;
+/** The refusals of a partition after which its route can be stale: it moved, or its history or owner changed. */
+const STALE_ROUTE_CODES = new Set([NOT_PRIMARY, HISTORY_UNAVAILABLE, GROUP_PARTITION_NOT_OWNED]);
 const INVALID_COMMAND = 3;
 const FEATURE_UNAVAILABLE = 5;
+const INVALID_IDENTIFIER = 6;
+const INVALID_SIZE_BYTES = 80;
+// Session control, and the partition reads that need the primary and its incarnation.
+const REPLICA_REFUSED_CODES = new Set<number>([
+  COMMAND_CODE.LoginUser,
+  COMMAND_CODE.LogoutUser,
+  COMMAND_CODE.LoginRegister,
+  COMMAND_CODE.LoginWithAccessToken,
+  COMMAND_CODE.LoginRegisterWithAccessToken,
+  COMMAND_CODE.PollMessages,
+  COMMAND_CODE.PollMessagesDeferred,
+  COMMAND_CODE.FetchMessages,
+  COMMAND_CODE.GetOffset,
+]);
 const INVALID_SESSION_BINDING = 14004;
 const ROUTE_NAMESPACE_MISSING = new Set([1009, 1010, 2010, 2011, 3007]);
 const POLL_OPTIONS_SIZE = 9 + 4 + 1;
+const POLL_COUNT_SIZE = 4;
+const POLL_AUTOCOMMIT_SIZE = 1;
+// Deferred polls and fetches together, as MAX_DEFERRED_REQUESTS
+// in core/sdk/src/driver.rs. The server parks as many per session and shard.
+const MAX_DEFERRED_REQUESTS = 64;
+const MAX_ROUTE_LOOKUPS_IN_FLIGHT = 16;
 const IDENTIFIER_PREFIX_SIZE = 2;
 const SEND_METADATA_LENGTH_SIZE = 4;
 const PARTITION_ID_SIZE = 4;
@@ -86,11 +122,14 @@ const TOPIC_DISCOVERY_RESETS = new Set<number>([
 ]);
 const READ_COMMANDS = new Set<number>([
   COMMAND_CODE.Ping, COMMAND_CODE.GetStats, COMMAND_CODE.GetClusterMetadata,
-  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMe, COMMAND_CODE.GetClient,
-  COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
+  COMMAND_CODE.DescribeOptions, COMMAND_CODE.GetMetadataChanges, COMMAND_CODE.GetMe,
+  COMMAND_CODE.GetClient, COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
   COMMAND_CODE.GetAccessTokens, COMMAND_CODE.GetPartitionRoute, COMMAND_CODE.GetOffset,
   COMMAND_CODE.GetStream, COMMAND_CODE.GetStreams, COMMAND_CODE.GetTopic,
-  COMMAND_CODE.GetTopics, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups, COMMAND_CODE.SyncGroup
+  COMMAND_CODE.GetTopics, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups, COMMAND_CODE.SyncGroup,
+]);
+const OFFSET_COMMANDS = new Set<number>([
+  COMMAND_CODE.GetOffset, COMMAND_CODE.StoreOffset, COMMAND_CODE.DeleteConsumerOffset
 ]);
 
 type ReplicaSlot = {
@@ -120,6 +159,25 @@ type Attempt = {
   committed: boolean,
   started: boolean
 };
+/**
+ * The wait and the request timeout of a deferred poll or a
+ * fetch, in microseconds, and where its body carries them.
+ */
+type DeferredBudget = {
+  readonly started: number,
+  readonly wait: bigint,
+  readonly timeout: bigint,
+  readonly waitOffset: number,
+  readonly timeoutOffset: number
+};
+type DriveOptions = SendCommandOptions & { budget?: DeferredBudget };
+
+/** A replica link used its retry budget, and nothing restarts it. */
+class ReconnectExhaustedError extends Error {
+  constructor() {
+    super('replica reconnect attempts exhausted');
+  }
+}
 
 /** One logical session owns every link, mutation lane and retained operation. */
 export class CommandResponseStream extends EventEmitter {
@@ -128,20 +186,39 @@ export class CommandResponseStream extends EventEmitter {
   private readonly lanes: MutationLanes;
   private readonly replicas = new Map<number, ReplicaSlot>();
   private readonly partitionRoutes = new Map<string, CachedRoute>();
+  private readonly deferredRequests = new PermitPool(MAX_DEFERRED_REQUESTS);
   private readonly changed = new ChangeSignal();
   private readonly lifetime = new AbortController();
   private sessionLifetime = new AbortController();
   private bootstrap?: IggyConnection;
   private bootstrapPromise?: Promise<IggyConnection>;
+  /**
+   * What the running bootstrap reports when it gives up: the bind failure of
+   * the last endpoint that accepted a dial, else NotConnectedError with the
+   * last dial failure.
+   */
+  private bootstrapFailure?: unknown;
   private authenticationPromise?: Promise<boolean>;
   private sessionAction: Promise<unknown> = Promise.resolve();
   private recoveryPromise?: Promise<void>;
   private rosterPromise?: Promise<void>;
-  private rememberedCredentials?: ClientCredentials;
+  /**
+   * Whom the client signs in as by itself: the caller's last sign-in, else the
+   * configured credentials while the caller never signed in. A logout, a
+   * sign-in of the caller that fails and a refused sign-in clear it.
+   */
+  private signInCredentials?: ClientCredentials;
+  /**
+   * Raised by each sign-in and sign-out of the caller. A call continues under
+   * a new session only while the lineage it started with is unchanged.
+   */
+  private sessionLineage = 0;
   private knownEndpoints: Endpoint[] = [];
   private readonly configuredEndpoint: Endpoint;
   private metadataReplica?: number;
   private metadataWatermark = 0n;
+  /** The assignment that the last sync of each group in this session returned, by the body of the sync. */
+  private readonly groupAssignments = new Map<string, Buffer>();
   private routingGeneration = 0;
   private activeDials = 0;
   private pendingSubmissions = 0;
@@ -152,39 +229,109 @@ export class CommandResponseStream extends EventEmitter {
   constructor(config: ClientConfigOrString) {
     super();
     this.options = normalizeClientConfig(config);
+    this.signInCredentials = this.options.credentials;
     this.configuredEndpoint = { host: this.options.options.host ?? '127.0.0.1', port: this.options.options.port };
     this.lanes = new MutationLanes(this.options.maxPendingOperations!, this.options.maxPendingOperationBytes!);
   }
 
+  get lineage(): number { return this.sessionLineage; }
+
   get busy(): boolean { return this.pendingSubmissions > 0; }
 
   async sendCommand(command: number, payload: Buffer, options: SendCommandOptions = {}): Promise<CommandResponse> {
+    // Only a link cancels a deferred request, the one that it sent.
+    if (command === COMMAND_CODE.CancelDeferredRequest)
+      throw responseError(command, INVALID_COMMAND);
+    if (options.replica !== undefined && !isReplicaCommand(command))
+      throw responseError(command, INVALID_COMMAND);
+    if (options.replica !== undefined && !(Number.isInteger(options.replica) && options.replica >= 0 && options.replica < MAX_REPLICAS))
+      throw responseError(command, INVALID_IDENTIFIER);
+    if (isLoginCommand(command)) return this.loginByCaller(command, () => Buffer.from(payload), options);
+    const lineage = options.lineage ?? this.lineage;
     payload = Buffer.from(payload);
+    const budget = deferredBudget(command, payload,
+      (this.options.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE) - HEADER_SIZE);
+    const release = this.hold();
+    // A deferred request gives up at its own request timeout.
+    const deadline = budget
+      ? Math.min(options.deadline ?? Number.POSITIVE_INFINITY, budget.started + Number(budget.timeout / US_PER_MS))
+      : options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
+    const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
+    try {
+      if (command === LOGOUT.code) {
+        const signedOut = ++this.sessionLineage;
+        this.signInCredentials = undefined;
+        return await this.serializeSession(async () => {
+          this.ensureLineage(signedOut, command);
+          try {
+            if (!this.isAuthenticated)
+              throw responseError(command, UNAUTHENTICATED);
+            return await this.drive(command, payload, options, deadline, signal, signedOut);
+          } finally {
+            if (signedOut === this.lineage) {
+              this.signInCredentials = undefined;
+              this.resetSession();
+            }
+          }
+        });
+      }
+      await this.ready(command, lineage, deadline, signal);
+      if (!budget) return await this.drive(command, payload, options, deadline, signal, lineage);
+      const lease = await this.deferredLease(command, deadline, signal);
+      try {
+        if (command === COMMAND_CODE.FetchMessages)
+          return await this.fetchMessages(payload, { ...options, budget }, deadline, signal, lineage);
+        return await this.drive(command, payload, { ...options, budget }, deadline, signal, lineage);
+      } finally {
+        lease();
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * The partitions of a topic grouped by their primary, in replica id order,
+   * and split to fit one fetch each. Each group keeps the order of
+   * `partitions`. The routes come from the cache, so only the partitions
+   * without a fresh route are looked up.
+   */
+  async readinessGroups(streamId: Id, topicId: Id, partitions: number[],
+    options: SendCommandOptions = {}): Promise<number[][]> {
+    const command = COMMAND_CODE.GetPartitionRoute;
+    const lineage = options.lineage ?? this.lineage;
     const release = this.hold();
     const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
     const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
     try {
-      if (isLoginCommand(command))
-        return await this.serializeSession(() => this.login(command, payload, deadline, signal));
-      if (command === LOGOUT.code)
-        return await this.serializeSession(async () => {
-          try {
-            if (!this.isAuthenticated)
-              throw responseError(command, UNAUTHENTICATED);
-            return await this.drive(command, payload, options, deadline, signal);
-          } finally {
-            this.rememberedCredentials = undefined;
-            this.resetSession();
-          }
-        });
-      if (!this.isAuthenticated && command !== PING.code)
-        await waitWithin(this.authenticate(this._signInCredentials()), deadline, signal);
-      const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
-      if (this.isAuthenticated && this.replicas.size === 0)
-        await this.refreshRoster(deadline, sessionSignal);
-      return await this.drive(command, payload, options, deadline, sessionSignal);
+      await this.ready(command, lineage, deadline, signal);
+      const topic = Buffer.concat([serializeIdentifier(streamId), serializeIdentifier(topicId)]);
+      const groups = await this.primaryGroups(command, topic, partitions.map(uint32ToBuf), deadline, signal, lineage);
+      return groups.flatMap((group) => Array.from(
+        { length: Math.ceil(group.length / MAX_PARTITIONS_PER_REQUEST) },
+        (_, index) => group.slice(index * MAX_PARTITIONS_PER_REQUEST, (index + 1) * MAX_PARTITIONS_PER_REQUEST)
+          .map((target) => target.readUInt32LE(0))
+      ));
     } finally {
       release();
+    }
+  }
+
+  /** Waits for a session of `lineage` and for the roster that routes a call of it. */
+  private async ready(command: number, lineage: number, deadline: number, signal: AbortSignal): Promise<void> {
+    if (lineage !== this.lineage) throw responseError(command, UNAUTHENTICATED);
+    if (!this.isAuthenticated && command !== PING.code) {
+      void this.signIn();
+      await this.nextSession(command, lineage, deadline, signal);
+    }
+    if (this.isAuthenticated && this.replicas.size === 0) {
+      const generation = this.routingGeneration;
+      // The call waits for a session lost meanwhile itself.
+      await this.refreshRoster(deadline, signal).catch((error: unknown) => {
+        if (generation !== this.routingGeneration) return;
+        // The call sent nothing yet, so a deadline leaves it not accepted.
+        throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+      });
     }
   }
 
@@ -203,6 +350,7 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private async replay(operation: ClientOperation, options: SendCommandOptions): Promise<void> {
+    const lineage = options.lineage ?? this.lineage;
     operation.frame.retain();
     const release = this.hold();
     const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
@@ -212,7 +360,7 @@ export class CommandResponseStream extends EventEmitter {
     try {
       unlock = await this.lanes.acquireResolution(operation, deadline, signal);
       await this.drive(operation.command, operation.frame.buffer.subarray(HEADER_SIZE),
-        { context: operation.context }, deadline, signal, operation);
+        { context: operation.context }, deadline, signal, lineage, operation);
     } finally {
       unlock?.();
       operation.frame.release();
@@ -220,18 +368,49 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
-  private async drive(command: number, body: Buffer, options: SendCommandOptions,
-    deadline: number, signal: AbortSignal, retained?: ClientOperation): Promise<CommandResponse> {
-    const generation = this.routingGeneration;
+  private async drive(command: number, body: Buffer, options: DriveOptions,
+    deadline: number, signal: AbortSignal, lineage: number, retained?: ClientOperation): Promise<CommandResponse> {
+    /** The session that the frame of the call belongs to. */
+    let generation = this.routingGeneration;
     const target = partitionRoute(command, body);
+    const fetch = command === COMMAND_CODE.FetchMessages ? readFetch(body) : undefined;
     const replicated = command !== LOGOUT.code && operationForCode(command) !== Operation.NonReplicated;
-    const progress = command === COMMAND_CODE.PollMessages &&
-      (body[body.length - 1] !== 0 || body[body.length - POLL_OPTIONS_SIZE] === PollingStrategyKind.Next);
-    const safeRead = READ_COMMANDS.has(command) || (command === COMMAND_CODE.PollMessages && !progress);
+    const pollEnd = command === COMMAND_CODE.PollMessagesDeferred ? body.length - DEFERRED_POLL_OPTIONS_SIZE : body.length;
+    const progress = fetch ? fetch.progress : isPoll(command) &&
+      (body[pollEnd - POLL_AUTOCOMMIT_SIZE] !== 0 || body[pollEnd - POLL_OPTIONS_SIZE] === PollingStrategyKind.Next);
+    const safeRead = READ_COMMANDS.has(command) || ((isPoll(command) || fetch !== undefined) && !progress);
+    // A read that stores its offset can store it before a cancel arrives, so once it is sent the caller's abort only
+    // cancels it on the server and the call waits for its one reply.
+    const commits = fetch ? fetch.commits : isPoll(command) && body[pollEnd - POLL_AUTOCOMMIT_SIZE] !== 0;
+    // A progress fetch holds the progress lane of each target, in ascending
+    // partition order, as offset stores take them.
+    const fetchPartitions = fetch?.progress
+      ? new Map(fetch.targets
+        .map((fetchTarget) => [fetchTarget.readUInt32LE(FETCH_TARGET_FIELD.partitionId),
+          fetchTarget.readBigUInt64LE(FETCH_TARGET_FIELD.incarnation)] as const)
+        .sort(([left], [right]) => left - right)
+        .map(([partition, incarnation]) => [progressLaneOf(laneKey(incarnation, partition)), partition]))
+      : undefined;
+    const fetchLanes = fetchPartitions ? [...fetchPartitions.keys()] : [];
+    // A replay and a logout belong to their session. Any other call that
+    // needs a session waits for the one that replaces a lost one.
+    const restartable = !retained && command !== LOGOUT.code && (command !== PING.code || this.isAuthenticated);
     let operation = retained;
     let frameLease = false;
+    /** The frame of the operation belongs to a replaced session, or an 88 spent its request id. */
+    let staleFrame = false;
     let frame: Buffer | undefined;
-    let context = options.context ? { ...options.context } : undefined;
+    // The server fences the history that a poll or an offset call names, and no partition has history 0.
+    const fencesHistory = isPoll(command) || OFFSET_COMMANDS.has(command);
+    /**
+     * The context of the caller. A fully zero context names nothing, so it counts as none, as in the Rust SDK. Only a
+     * fetch keeps it, as its header, because each target of a fetch carries its own fence. A fenced call of history 0
+     * takes the history of its first route, so every attempt names the same history and keeps the owner and op of the
+     * caller.
+     */
+    let callerContext = !fetch && options.context && sameContext(options.context, EMPTY_PARTITION_CONTEXT)
+      ? undefined : options.context;
+    let context = callerContext ? { ...callerContext } : undefined;
     let selected: CachedRoute | undefined;
     let historyRefreshed = false;
     let lifecycleDelay = RETRY_INTERVAL_MS;
@@ -240,50 +419,174 @@ export class CommandResponseStream extends EventEmitter {
     let refresh = false;
     let lastRefusal: ResponseError | undefined;
     let previousLink: IggyConnection | undefined;
+    let sent = false;
+    let mayHaveCommitted = false;
     try {
-      if (target) {
-        selected = await this.routeFor(target, deadline, signal, generation);
-        context ??= { ...selected.route.context };
-      }
-      context ??= { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark };
       for (;;) {
-        this.ensureGeneration(generation, command);
+        this.ensureLineage(lineage, command);
         signal.throwIfAborted();
         if (Date.now() >= deadline)
           throw new VsrResponseTimeoutError(0);
-        if (!operation && (replicated || progress)) {
-          const lane = target ? groupKey(context, target) : 'metadata';
-          operation = await this.lanes.enter(lane, command, body, context, generation,
-            replicated, this.vsrSession, deadline, signal);
+        if (generation !== this.routingGeneration || (restartable && !this.isAuthenticated)) {
+          // No session but the one of a frame can apply it. A frame that can
+          // have taken effect ends uncertain and never goes out again.
+          if (operation?.uncertain)
+            throw new OperationUncertainError(operation.id, responseError(command, TRANSIENT_NOT_ACCEPTED));
+          if (!restartable)
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+          await this.nextSession(command, lineage, deadline, signal);
+          generation = this.routingGeneration;
+          selected = undefined;
+          previousLink = undefined;
+          refresh = false;
+          frame = undefined;
+          // A frame of the new session carries the context of the route that
+          // the new session looks up.
+          context = callerContext ? { ...callerContext } : undefined;
+          if (operation) {
+            if (frameLease) operation.frame.release();
+            frameLease = false;
+            staleFrame = true;
+          }
+        }
+        const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
+        if (target && !selected) {
+          try {
+            selected = await this.routeFor(target, deadline, sessionSignal, generation);
+          } catch (error) {
+            // A session failure answered the lookup of the call itself.
+            if (restartable && generation !== this.routingGeneration && !isSessionFailure(error)) continue;
+            throw error;
+          }
+          if (fencesHistory && (callerContext?.incarnation ?? 0n) === 0n) {
+            if (selected.route.context.incarnation === 0n) {
+              // The route has no history yet, so its lookup goes again, as after a transient refusal.
+              this.invalidateRoute(selected, false);
+              selected = undefined;
+              lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+              lastRefusal.fromServer = true;
+              retryDelay = await backOff(retryDelay, deadline, signal);
+              continue;
+            }
+            if (callerContext) {
+              callerContext = { ...callerContext, incarnation: selected.route.context.incarnation };
+              context = { ...callerContext };
+            }
+          }
+          context ??= { ...selected.route.context };
+        }
+        context ??= { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark };
+        // Raised here, past the sign-in of a new session, whose Register installs the owners again at its op.
+        if (callerContext && body[0] === ConsumerKind.Group && context.ownerGeneration === 0n &&
+            (command === COMMAND_CODE.StoreOffset || command === COMMAND_CODE.DeleteConsumerOffset) &&
+            context.metadataOp < this.metadataWatermark)
+          context = { ...context, metadataOp: this.metadataWatermark };
+        this.ensureLineage(lineage, command);
+        // A caller's zero wire fence must not bypass the resolved history's local recovery block.
+        const laneContext = context.incarnation === 0n && selected ? selected.route.context : context;
+        const mutationLane = target ? groupKey(laneContext, target) : 'metadata';
+        // Offset calls and progress polls keep their order in a progress lane
+        // apart from sends, so a parked poll does not delay a send. An offset
+        // store or delete holds both lanes, as in core/sdk/src/session_owner/lanes.rs.
+        const progressLanes = fetch ? fetchLanes
+          : target && (progress || OFFSET_COMMANDS.has(command)) ? [progressLaneOf(mutationLane)] : [];
+        const lane = replicated ? mutationLane : progressLanes.at(-1);
+        if (operation && staleFrame && operation.lane !== lane) {
+          // A definitive refusal released the old history. The replacement
+          // must enter the lane that orders writes to its current incarnation.
+          this.lanes.complete(operation);
+          operation = undefined;
+        }
+        if (operation && staleFrame) {
+          staleFrame = false;
+          try {
+            await this.lanes.restart(operation, body, context, this.vsrSession, deadline, signal);
+          } catch (error) {
+            if (generation === this.routingGeneration) throw error;
+            this.lanes.complete(operation);
+            operation = undefined;
+            continue;
+          }
+        } else if (!operation && lane) {
+          try {
+            // A committing poll keeps a recovery record for its partition, as a committing fetch does for each target.
+            const recovered = fetchPartitions ?? (commits && target
+              ? new Map([[lane, target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE)]]) : undefined);
+            operation = await this.lanes.enter(lane, command, body, context, replicated,
+              this.vsrSession, deadline, signal, replicated ? progressLanes : progressLanes.slice(0, -1), recovered,
+              commits);
+            staleFrame = false;
+          } catch (error) {
+            // A lane can free while no session is bound to encode the frame.
+            if (restartable && generation !== this.routingGeneration) continue;
+            throw error;
+          }
         }
         if (operation && !frameLease) {
           operation.frame.retain();
           frameLease = true;
         }
         const attemptSignal = operation
-          ? AbortSignal.any([signal, operation.lifetime.signal]) : signal;
+          ? AbortSignal.any([sessionSignal, operation.lifetime.signal]) : sessionSignal;
         let attempt: Attempt;
+        let exchanged = false;
         try {
           if (refresh && target)
             selected = await this.routeFor(target, deadline, attemptSignal, generation, true);
-          else if (refresh)
+          else if (refresh && options.replica === undefined)
             await this.refreshRoster(deadline, attemptSignal);
           refresh = false;
           const link = target
             ? await this.primaryLink(selected!, deadline, attemptSignal)
-            : await this.readyLink(deadline, attemptSignal, safeRead ? previousLink : undefined);
+            : options.replica !== undefined
+              ? await this.replicaLink(command, options.replica, deadline, attemptSignal)
+              : await this.readyLink(deadline, attemptSignal, safeRead ? previousLink : undefined);
           previousLink = link;
           this.ensureGeneration(generation, command);
           attempt = await this.exchange(link, command, () => {
             this.ensureGeneration(generation, command);
-            return operation?.frame.buffer ?? (frame ??= this.vsrSession.encode(command, body, context));
-          }, deadline, attemptSignal, operation);
+            this.ensureLineage(lineage, command);
+            const bytes = operation?.frame.buffer ?? (frame ??= this.vsrSession.encode(command, body, context));
+            return options.budget ? deferredFrame(command, bytes, options.budget, deadline) : bytes;
+          }, deadline, attemptSignal, operation, commits
+            ? AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal,
+              ...(operation ? [operation.lifetime.signal] : [])]) : undefined);
+          exchanged = true;
         } catch (error) {
           attempt = { error, committed: false, started: false };
         }
-        if (generation !== this.routingGeneration && attempt.started && (replicated || progress))
-          throw new OperationUncertainError(operation?.retainable ? operation.id : undefined,
-            attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
+        sent ||= attempt.started;
+        // The server refused the read because the cancel won, so it stored nothing.
+        if (commits && attempt.started && options.signal?.aborted && attempt.error instanceof ResponseError &&
+            attempt.error.fromServer && attempt.error.errorCode === TRANSIENT_NOT_ACCEPTED)
+          throw options.signal.reason;
+        if (commits && attempt.started)
+          mayHaveCommitted = !(attempt.error instanceof ResponseError && attempt.error.fromServer &&
+            provesNothingStored(CommitErrorScope.Request, attempt.error.errorCode));
+        if (fetch?.commits && operation && !attempt.error) {
+          const sections = FETCH_MESSAGES.deserialize(attempt.response!);
+          const requested = new Set(fetch.targets.map((target) => target.readUInt32LE(FETCH_TARGET_FIELD.partitionId)));
+          const seen = new Set<number>();
+          for (const section of sections) {
+            if (!requested.has(section.partitionId) || seen.has(section.partitionId))
+              throw new DeserializeError('fetch reply names a duplicate or unrequested partition');
+            seen.add(section.partitionId);
+          }
+          const uncertain = new Set(sections.filter(({ status }) =>
+            status !== 0 && !provesNothingStored(CommitErrorScope.Section, status))
+            .map(({ partitionId }) => partitionId));
+          if (uncertain.size > 0) {
+            this.lanes.retainFetch(operation, uncertain);
+            attempt.response!.fetchProgress = { operationId: operation.id, partitions: uncertain };
+          }
+          mayHaveCommitted = false;
+          this.ensureLineage(lineage, command);
+        } else if (commits && !attempt.error) {
+          mayHaveCommitted = false;
+        }
+        const hasCommittingReply = commits && !attempt.error;
+        if (!hasCommittingReply && generation !== this.routingGeneration && attempt.started && (replicated || progress))
+          throw uncertainOutcome(command, operation, attempt.error ?? responseError(command, TRANSIENT_NOT_ACCEPTED));
         // A committed rejection proves the outcome even when it also ends the session.
         if (operation?.uncertain && attempt.committed && attempt.error) {
           operation.uncertain = false;
@@ -298,20 +601,26 @@ export class CommandResponseStream extends EventEmitter {
             (attempt.started && (replicated || progress) && attempt.error instanceof VsrEvictionError);
           this.recoverSession(generation);
           if (uncertain)
-            throw new OperationUncertainError(operation?.retainable ? operation.id : undefined, attempt.error);
+            throw uncertainOutcome(command, operation, attempt.error);
+          // An eviction fails every exchange of its link, also one never written.
+          if (restartable && exchanged && !attempt.started && generation !== this.routingGeneration) continue;
           throw attempt.error;
         }
-        this.ensureGeneration(generation, command);
+        if (!hasCommittingReply && generation !== this.routingGeneration) {
+          if (restartable && (!attempt.started || safeRead)) continue;
+          throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+        }
+        if (mayHaveCommitted && attempt.error)
+          throw new FetchProgressUncertainError(operation!.id, attempt.error);
         if (!attempt.error) {
           if (operation?.uncertain && !attempt.committed)
             throw new OperationUncertainError(operation.id, new Error('reply does not prove the retained result'));
           if (command === COMMAND_CODE.GetPartitionRoute &&
               !this.rememberRoute({ query: body, key: body.toString('hex') }, attempt.response!)) {
-            await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal);
-            retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
+            retryDelay = await backOff(retryDelay, deadline, signal);
             continue;
           }
-          this._rememberCredentials(command, body);
+          if (lineage === this.lineage) this._rememberCredentials(command, body);
           if (command === GET_CLUSTER_METADATA.code)
             this.installRoster(attempt.response!);
           if (TOPIC_DISCOVERY_RESETS.has(command)) {
@@ -328,17 +637,28 @@ export class CommandResponseStream extends EventEmitter {
         notPrimary = code === NOT_PRIMARY;
         if (code === TRANSIENT_NOT_COMMITTED) {
           if (operation?.retainable) operation.uncertain = true;
-          else if (!safeRead) throw new OperationUncertainError(undefined, error);
+          else if (!safeRead) throw error;
         } else if (code === OPERATION_NOT_RETAINED) {
           if (operation?.retainable) operation.uncertain = true;
-          throw new OperationUncertainError(operation?.retainable ? operation.id : undefined, error);
+          throw uncertainOutcome(command, operation, error);
+        } else if (code === NOT_PRIMARY &&
+            (options.replica !== undefined || fetch)) {
+          // The caller chose the replica, so its refusal is the answer. A
+          // fetch does not say which of its partitions moved, so its caller
+          // looks up the route of each one again.
+          throw error;
         } else if (code === NOT_PRIMARY || code === TRANSIENT_NOT_ACCEPTED) {
           if (selected) this.invalidateRoute(selected, code === NOT_PRIMARY);
           refresh = true;
+          if (code === NOT_PRIMARY) {
+            // Neither 58 nor 89 admitted the call, so the deadline reports both as 58.
+            lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+            lastRefusal.fromServer = true;
+          }
           if (code === NOT_PRIMARY && !repeatedNotPrimary) continue;
         } else if (code === HISTORY_UNAVAILABLE && !operation?.uncertain) {
           if (selected) this.invalidateRoute(selected, false);
-          if (target && command === COMMAND_CODE.SendMessages && !options.context && !historyRefreshed) {
+          if (target && command === COMMAND_CODE.SendMessages && !callerContext && !historyRefreshed) {
             historyRefreshed = true;
             if (operation) {
               this.lanes.complete(operation);
@@ -346,22 +666,41 @@ export class CommandResponseStream extends EventEmitter {
               frameLease = false;
               operation = undefined;
             }
-            selected = await this.routeFor(target, deadline, signal, generation, true);
-            context = { ...selected.route.context };
+            selected = undefined;
+            context = undefined;
             continue;
           }
           throw error;
         } else if (code === LIFECYCLE_BUSY && !operation?.uncertain) {
+          // The refusal spent the request id, so the call goes out again as a
+          // new operation in its lane, with the context of its route by then.
           if (operation) {
-            const retryBody = Buffer.from(operation.frame.buffer.subarray(HEADER_SIZE));
             operation.frame.release();
             frameLease = false;
-            await this.lanes.restart(operation, retryBody, this.vsrSession, deadline, signal);
+            staleFrame = true;
           }
           frame = undefined;
+          selected = undefined;
+          context = callerContext ? { ...callerContext } : undefined;
           await waitWithin(pause(lifecycleDelay, signal), deadline, signal);
           lifecycleDelay = Math.min(lifecycleDelay * 2, MAX_LIFECYCLE_INTERVAL_MS);
           continue;
+        } else if (code !== undefined && ROUTE_NAMESPACE_MISSING.has(code) && attempt.started &&
+            (selected || command === COMMAND_CODE.GetPartitionRoute) &&
+            !(await this.isMetadataPrimary(previousLink!, generation, deadline, attemptSignal))) {
+          // A backup can lag the metadata create that the metadata primary
+          // committed. A partition call retries with a new route, and a route
+          // lookup asks the next replica. A miss of the lookup that routes a
+          // partition call came before the request started and stays final.
+          if (selected) {
+            this.invalidateRoute(selected, false);
+            refresh = true;
+          }
+          lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+          lastRefusal.fromServer = true;
+        } else if (code === DEFERRED_POLL_CAPACITY_EXCEEDED) {
+          // The primary parks no more deferred requests of this session for
+          // now. It still leads the partition, so the call keeps its route.
         } else if (code !== undefined) {
           if (operation?.uncertain)
             throw new OperationUncertainError(operation.id, error);
@@ -369,42 +708,169 @@ export class CommandResponseStream extends EventEmitter {
         } else {
           if (attempt.started) {
             if (operation?.retainable) operation.uncertain = true;
-            else if (!safeRead) throw new OperationUncertainError(undefined, error);
+            else if (!safeRead) throw uncertainOutcome(command, operation, error);
           }
-          if (error instanceof TypeError || error instanceof ResponseError ||
-              error instanceof VsrEvictionError || signal.aborted)
+          // NotConnectedError and an exhausted link leave no link up or
+          // redialing, so the call fails now instead of at its deadline.
+          if (error instanceof TypeError || error instanceof ResponseError || error instanceof VsrEvictionError ||
+              signal.aborted || error instanceof NotConnectedError || error instanceof ReconnectExhaustedError)
             throw error;
           refresh = true;
         }
-        await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal);
-        retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
+        retryDelay = await backOff(retryDelay, deadline, signal);
       }
     } catch (error) {
-      if (error instanceof VsrResponseTimeoutError && lastRefusal) error = lastRefusal;
+      if (operation?.fetchProgress && mayHaveCommitted) {
+        this.lanes.retainFetch(operation);
+        throw error instanceof FetchProgressUncertainError ? error : new FetchProgressUncertainError(operation.id, error);
+      }
+      // A call that sent nothing and saw no refusal was not accepted either.
+      if (error instanceof VsrResponseTimeoutError && (lastRefusal || !sent))
+        error = lastRefusal ?? responseError(command, TRANSIENT_NOT_ACCEPTED);
       if (operation?.uncertain) {
-        if (this.lanes.owns(operation)) this.lanes.retain(operation);
+        // A frame of a replaced session must not block the lane of the new one.
+        if (generation === this.routingGeneration && this.lanes.owns(operation)) this.lanes.retain(operation);
         throw error instanceof OperationUncertainError ? error : new OperationUncertainError(operation.id, error);
       }
       if (retained && !this.lanes.owns(retained))
         throw error instanceof ResponseError ? error : new OperationNotRetainedError(retained.id);
-      if (error instanceof ResponseError && !(error instanceof VsrEvictionError) && error.commandCode !== command) {
-        const remapped = responseError(command, error.errorCode);
-        remapped.fromServer = error.fromServer;
-        remapped.committed = error.committed;
-        throw remapped;
-      }
-      throw error;
+      throw refusalOf(command, error);
     } finally {
       if (operation && !operation.retained) this.lanes.complete(operation);
       if (operation && frameLease) operation.frame.release();
     }
   }
 
+  /**
+   * A fetch goes to the primary of its targets.
+   * The header names only the metadata that the session saw, and each target
+   * its own fence. A replica that has not applied that metadata answers 58
+   * instead of judging the targets against older group state.
+   * A target of history 0 takes the incarnation of its route once, before
+   * the first attempt, and keeps its owner. A route names no owner, so a
+   * fully zero target ends with the route context. A route of history 0
+   * goes stale and is looked up again, as after a transient refusal. A
+   * refusal of the fetch as not the primary, or for a history or an owner
+   * that changed, does not say which partition it is about, so the routes of
+   * all targets go stale. A section refused so names its partition, so only
+   * that route goes stale. The next `readinessGroups` then looks them up.
+   */
+  private async fetchMessages(body: Buffer, options: DriveOptions, deadline: number,
+    signal: AbortSignal, lineage: number): Promise<CommandResponse> {
+    const command = COMMAND_CODE.FetchMessages;
+    const { topic, targets } = readFetch(body);
+    const unfenced = targets.filter((target) => target.readBigUInt64LE(FETCH_TARGET_FIELD.incarnation) === 0n);
+    let retryDelay = RETRY_INTERVAL_MS;
+    for (;;) {
+      const routes = await this.routesOf(command, topic, unfenced, deadline, signal, lineage);
+      const historyless = routes.filter(({ route }) => route.context.incarnation === 0n);
+      if (historyless.length === 0) {
+        unfenced.forEach((target, index) =>
+          target.writeBigUInt64LE(routes[index].route.context.incarnation, FETCH_TARGET_FIELD.incarnation));
+        break;
+      }
+      for (const route of historyless) this.invalidateRoute(route, false);
+      try {
+        retryDelay = await backOff(retryDelay, deadline, signal);
+      } catch (error) {
+        // No request of these targets went out.
+        throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+      }
+    }
+    let response: CommandResponse;
+    try {
+      response = await this.drive(command, body,
+        { ...options, context: { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark } },
+        deadline, signal, lineage);
+    } catch (error) {
+      if (error instanceof ResponseError && error.fromServer && STALE_ROUTE_CODES.has(error.errorCode))
+        this.staleRoutes(topic, targets);
+      throw error;
+    }
+    const data = options.handleResponse === false
+      ? (response as unknown as Buffer).subarray(HEADER_SIZE) : response.data;
+    this.staleRoutes(topic, fetchSections(data)
+      .filter((section) => STALE_ROUTE_CODES.has(section.readUInt32LE(FETCH_SECTION_FIELD.status))));
+    return response;
+  }
+
+  /** Marks the routes of the partitions that lead `targets` stale. */
+  private staleRoutes(topic: Buffer, targets: Buffer[]): void {
+    for (const target of targets) {
+      const route = this.partitionRoutes.get(readinessTarget(topic, target).key);
+      if (route) this.invalidateRoute(route, false);
+    }
+  }
+
+  /** `targets` grouped by the primary of their partition, in replica id order, each group in the order of `targets`. */
+  private async primaryGroups(command: number, topic: Buffer, targets: Buffer[], deadline: number,
+    signal: AbortSignal, lineage: number): Promise<Buffer[][]> {
+    const routes = await this.routesOf(command, topic, targets, deadline, signal, lineage);
+    const groups = new Map<number, Buffer[]>();
+    targets.forEach((target, index) => {
+      const primary = routes[index].route.primaryReplica;
+      const group = groups.get(primary);
+      if (group) group.push(target);
+      else groups.set(primary, [target]);
+    });
+    return [...groups].sort(([left], [right]) => left - right).map(([, group]) => group);
+  }
+
+  /**
+   * The routes of the partitions that lead `targets`, in their order. At most
+   * MAX_ROUTE_LOOKUPS_IN_FLIGHT routes are looked up at once, as
+   * `readiness_groups` in core/sdk/src/driver.rs does.
+   */
+  private async routesOf(command: number, topic: Buffer, targets: Buffer[], deadline: number,
+    signal: AbortSignal, lineage: number): Promise<CachedRoute[]> {
+    let generation = this.routingGeneration;
+    for (;;) {
+      this.ensureLineage(lineage, command);
+      // As in `drive`, a lookup goes out only under a live session.
+      if (generation !== this.routingGeneration || !this.isAuthenticated) {
+        await this.nextSession(command, lineage, deadline, signal);
+        generation = this.routingGeneration;
+      }
+      const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
+      const routes: CachedRoute[] = [];
+      let next = 0;
+      let failed = false;
+      try {
+        await Promise.all(Array.from({ length: Math.min(MAX_ROUTE_LOOKUPS_IN_FLIGHT, targets.length) }, async () => {
+          while (next < targets.length && !failed) {
+            const index = next++;
+            try {
+              routes[index] = await this.routeFor(readinessTarget(topic, targets[index]), deadline, sessionSignal, generation);
+            } catch (error) {
+              failed = true;
+              throw error;
+            }
+          }
+        }));
+      } catch (error) {
+        // A session failure answered a lookup of the call itself.
+        if (generation !== this.routingGeneration && !isSessionFailure(error)) continue;
+        // No request of these targets went out.
+        throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+      }
+      return routes;
+    }
+  }
+
+  /** A deferred request waits for one of the MAX_DEFERRED_REQUESTS leases within its deadline. */
+  private async deferredLease(command: number, deadline: number, signal: AbortSignal): Promise<() => void> {
+    try {
+      return await this.deferredRequests.acquire(deadline, signal);
+    } catch (error) {
+      throw error instanceof VsrResponseTimeoutError ? responseError(command, TRANSIENT_NOT_ACCEPTED) : error;
+    }
+  }
+
   private async exchange(link: IggyConnection, command: number, frame: () => Buffer,
-    deadline: number, signal: AbortSignal, operation?: ClientOperation): Promise<Attempt> {
+    deadline: number, signal: AbortSignal, operation?: ClientOperation, afterSend?: AbortSignal): Promise<Attempt> {
     const generation = this.routingGeneration;
     let request: Buffer | undefined;
-    const attempt = await link.exchange(() => request = frame(), deadline, signal, operation?.frame);
+    const attempt = await link.exchange(() => request = frame(), deadline, signal, operation?.frame, afterSend);
     if (attempt.error || !attempt.response) {
       const error = this.isAuthenticated && command !== COMMAND_CODE.BindSession &&
         isDetachedFailure(attempt.error)
@@ -414,7 +880,8 @@ export class CommandResponseStream extends EventEmitter {
     try {
       validateReplyForRequest(attempt.response, request!, command);
       const response = decodeVsrResponse(attempt.response, command);
-      if (generation === this.routingGeneration) this.observeMetadata(attempt.response);
+      if (generation === this.routingGeneration) this.observeMetadata(attempt.response,
+        command === COMMAND_CODE.SyncGroup && this.rememberAssignment(request!, response.data));
       return { response, raw: attempt.response, committed: hasCommittedResult(attempt.response), started: attempt.started };
     } catch (error) {
       if (this.isAuthenticated && command !== COMMAND_CODE.BindSession && isDetachedFailure(error) &&
@@ -441,9 +908,8 @@ export class CommandResponseStream extends EventEmitter {
       if (!(attempt.error instanceof ResponseError) || !attempt.error.fromServer ||
           !isTransient(attempt.error.errorCode))
         throw attempt.error;
-      try { await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal); }
+      try { retryDelay = await backOff(retryDelay, deadline, signal); }
       catch (error) { throw error instanceof VsrResponseTimeoutError ? attempt.error : error; }
-      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
       if (command === GET_CLUSTER_METADATA.code) {
         const alternative = [...this.replicas.values()].find((slot) =>
           slot.attached && slot.connection?.connected && slot.connection !== link);
@@ -467,9 +933,11 @@ export class CommandResponseStream extends EventEmitter {
       const link = await this.readyLink(deadline, signal, previous);
       if (visited.has(link)) {
         visited.clear();
-        try { await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), signal), deadline, signal); }
+        // Each pass starts at the metadata primary, which a roster read after
+        // a namespace miss can have moved.
+        previous = undefined;
+        try { retryDelay = await backOff(retryDelay, deadline, signal); }
         catch (error) { throw error instanceof VsrResponseTimeoutError && lastRefusal ? lastRefusal : error; }
-        retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
         continue;
       }
       visited.add(link);
@@ -498,7 +966,7 @@ export class CommandResponseStream extends EventEmitter {
         }
         this.ensureGeneration(generation, COMMAND_CODE.GetPartitionRoute);
         if (error instanceof ResponseError && ROUTE_NAMESPACE_MISSING.has(error.errorCode) &&
-            (this.metadataReplica === undefined || this.replicas.get(this.metadataReplica)?.connection !== link)) {
+            !(await this.isMetadataPrimary(link, generation, deadline, signal))) {
           // A backup can lag a metadata create while the primary materializes the route.
           lastRefusal = responseError(COMMAND_CODE.GetPartitionRoute, TRANSIENT_NOT_ACCEPTED);
           lastRefusal.fromServer = error.fromServer;
@@ -508,6 +976,33 @@ export class CommandResponseStream extends EventEmitter {
         if (error instanceof ResponseError) lastRefusal = error;
       }
     }
+  }
+
+  /**
+   * Whether the replica that answered a namespace miss on `link` is the
+   * metadata primary. The belief can predate a view change, so one roster read
+   * on `link`, without a retry or another link, must still name that replica.
+   * No lookup reaches a believed metadata primary without a link, so then that
+   * roster also moves the belief.
+   */
+  private async isMetadataPrimary(link: IggyConnection, generation: number, deadline: number,
+    signal: AbortSignal): Promise<boolean> {
+    const replica = [...this.replicas.values()].find((slot) => slot.connection === link)?.replica;
+    const believed = this.metadataReplica === undefined ? undefined : this.replicas.get(this.metadataReplica);
+    if (replica !== this.metadataReplica && believed?.attached && believed.connection?.connected)
+      return false;
+    try {
+      const attempt = await this.exchange(link, GET_CLUSTER_METADATA.code, () => this.vsrSession.encode(
+        GET_CLUSTER_METADATA.code, GET_CLUSTER_METADATA.serialize(),
+        { ...EMPTY_PARTITION_CONTEXT, metadataOp: this.metadataWatermark }), deadline, signal);
+      if (attempt.error) throw attempt.error;
+      this.ensureGeneration(generation, GET_CLUSTER_METADATA.code);
+      this.installRoster(attempt.response!);
+    } catch (error) {
+      debug('roster read after a namespace miss failed', error);
+      return false;
+    }
+    return replica !== undefined && replica === this.metadataReplica;
   }
 
   private rememberRoute(target: PartitionTarget, response: CommandResponse): CachedRoute | undefined {
@@ -564,6 +1059,30 @@ export class CommandResponseStream extends EventEmitter {
       catch (error) {
         if (!(error instanceof VsrResponseTimeoutError)) throw error;
         const refusal = responseError(COMMAND_CODE.GetPartitionRoute, TRANSIENT_NOT_ACCEPTED);
+        refusal.fromServer = true;
+        throw refusal;
+      }
+    }
+  }
+
+  /** The link of the replica the caller chose, waited for while it reconnects. An id the roster does not name is looked up in one fresh roster, then refused. */
+  private async replicaLink(command: number, replica: number, deadline: number, signal: AbortSignal): Promise<IggyConnection> {
+    let rosterRead = false;
+    for (;;) {
+      const slot = this.replicas.get(replica);
+      if (slot?.attached && slot.connection?.connected) return slot.connection;
+      if (slot?.failure instanceof ResponseError) throw slot.failure;
+      if (slot?.failure instanceof TypeError) throw slot.failure;
+      if (!slot) {
+        if (rosterRead) throw responseError(command, INVALID_IDENTIFIER);
+        rosterRead = true;
+        await this.refreshRoster(deadline, signal);
+        continue;
+      }
+      try { await waitWithin(this.changed.promise, deadline, signal); }
+      catch (error) {
+        if (!(error instanceof VsrResponseTimeoutError)) throw error;
+        const refusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
         refusal.fromServer = true;
         throw refusal;
       }
@@ -711,10 +1230,7 @@ export class CommandResponseStream extends EventEmitter {
         this.changed.pulse();
         if (!reconnect.enabled || failures >= reconnect.maxRetries) {
           slot.restartable = reconnect.enabled;
-          // Only a heartbeat restarts a link that used its budget, so without
-          // one the link stays down for good.
-          slot.failure = slot.restartable && this.heartbeatIntervalHandler
-            ? new NotConnectedError() : new Error('replica reconnect attempts exhausted');
+          slot.failure = this.budgetFailure(slot);
           return;
         }
         const base = Math.min(reconnect.interval * 2 ** Math.min(failures, 16), MAX_RECONNECT_INTERVAL_MS);
@@ -730,6 +1246,14 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
+  /**
+   * Only a heartbeat restarts a link that used its budget, so without one the
+   * link stays down for good.
+   */
+  private budgetFailure(slot: ReplicaSlot): Error {
+    return slot.restartable && this.heartbeatIntervalHandler ? new NotConnectedError() : new ReconnectExhaustedError();
+  }
+
   private connectionFor(endpoint: Endpoint): IggyConnection {
     const connection = new IggyConnection({ ...this.options, options: { ...this.options.options, ...endpoint } });
     connection.on('eviction', (error) => this.emit('eviction', error));
@@ -741,16 +1265,20 @@ export class CommandResponseStream extends EventEmitter {
     if (!this.bootstrapPromise) {
       const generation = this.routingGeneration;
       const ownerSignal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal]);
+      this.bootstrapFailure = undefined;
       const pending = (async () => {
         const endpoints = [...new Map([this.configuredEndpoint, ...this.knownEndpoints].map((endpoint) => [endpointKey(endpoint), endpoint])).values()];
         const reconnect = this.options.reconnect ?? { enabled: true, interval: 5_000, maxRetries: 12 };
-        let last: unknown;
+        let dialed = false;
         for (let pass = 0; ; pass += 1) {
           for (const endpoint of endpoints) {
             const link = this.connectionFor(endpoint);
             this.bootstrap = link;
+            let accepted = false;
             try {
               await link.connect(ownerSignal);
+              accepted = dialed = true;
+              this.bootstrapFailure = undefined;
               if (this.isAuthenticated) {
                 const body = this.vsrSession.resumePayload(this.metadataWatermark);
                 if (!body) throw responseError(COMMAND_CODE.BindSession, UNAUTHENTICATED);
@@ -762,24 +1290,32 @@ export class CommandResponseStream extends EventEmitter {
               return link;
             } catch (error) {
               link._destroy();
-              last = error;
               if (this.isAuthenticated && isSessionFailure(error, true)) {
                 this.recoverSession(generation);
                 throw error;
               }
               if (error instanceof TypeError || ownerSignal.aborted) throw error;
+              if (accepted) this.bootstrapFailure = error;
+              else if (!dialed) this.bootstrapFailure = new NotConnectedError(error);
             }
           }
-          // A refusal keeps its own error, so that a 40 still ends the session.
           if (!reconnect.enabled || pass >= reconnect.maxRetries)
-            throw last instanceof ResponseError ? last : new NotConnectedError(last);
+            throw this.bootstrapFailure;
           const base = Math.min(reconnect.interval * 2 ** Math.min(pass, 16), MAX_RECONNECT_INTERVAL_MS);
           await pause(Math.floor(Math.random() * (base + 1)), ownerSignal, true);
         }
       })().finally(() => { if (this.bootstrapPromise === pending) this.bootstrapPromise = undefined; });
       this.bootstrapPromise = pending;
     }
-    return await waitWithin(this.bootstrapPromise, deadline, signal);
+    try {
+      return await waitWithin(this.bootstrapPromise, deadline, signal);
+    } catch (error) {
+      // With the default reconnect values the deadline usually ends the dials
+      // before the retry budget does, so it reports the last failure the same way.
+      if (error instanceof VsrResponseTimeoutError && this.bootstrapFailure !== undefined)
+        throw this.bootstrapFailure;
+      throw error;
+    }
   }
 
   private serializeSession<T>(action: () => Promise<T>): Promise<T> {
@@ -788,10 +1324,13 @@ export class CommandResponseStream extends EventEmitter {
     return pending;
   }
 
-  private async login(command: number, body: Buffer, deadline: number, signal: AbortSignal): Promise<CommandResponse> {
+  private async login(command: number, body: Buffer, deadline: number, signal: AbortSignal, lineage: number): Promise<CommandResponse> {
+    this.ensureLineage(lineage, command);
+    signal.throwIfAborted();
     if (this.isAuthenticated)
       await this.drive(LOGOUT.code, LOGOUT.serialize(), {}, deadline,
-        AbortSignal.any([signal, this.sessionLifetime.signal]));
+        AbortSignal.any([signal, this.sessionLifetime.signal]), lineage);
+    this.ensureLineage(lineage, command);
     this.resetSession();
     const generation = this.routingGeneration;
     const sessionSignal = AbortSignal.any([signal, this.sessionLifetime.signal]);
@@ -800,37 +1339,69 @@ export class CommandResponseStream extends EventEmitter {
     let retryDelay = RETRY_INTERVAL_MS;
     for (;;) {
       const link = await this.connectBootstrap(deadline, sessionSignal);
+      this.ensureLineage(lineage, command);
       const attempt = await this.exchange(link, prepared.command,
         () => frame ??= this.vsrSession.encode(prepared.command, prepared.payload), deadline, sessionSignal);
+      this.ensureLineage(lineage, command);
       this.ensureGeneration(generation, command);
       if (!attempt.error) {
         this.vsrSession.bind(readRegisteredSession(attempt.response!));
         this.userId = attempt.response!.data.readUInt32LE(0);
         this.isAuthenticated = true;
-        this._rememberCredentials(command, body);
         this.heartbeat(this.options.heartbeatInterval);
         await this.refreshRoster(deadline, sessionSignal);
+        this.ensureLineage(lineage, command);
+        this._rememberCredentials(command, body);
         return attempt.response!;
       }
-      if (attempt.error instanceof ResponseError && !isTransient(attempt.error.errorCode)) throw attempt.error;
+      if (attempt.error instanceof ResponseError && !isTransient(attempt.error.errorCode)) {
+        throw attempt.error;
+      }
       if (attempt.error instanceof VsrEvictionError || attempt.error instanceof TypeError) throw attempt.error;
-      await waitWithin(pause(Math.floor(Math.random() * (retryDelay + 1)), sessionSignal), deadline, sessionSignal);
-      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_INTERVAL_MS);
+      retryDelay = await backOff(retryDelay, deadline, sessionSignal);
     }
   }
 
   private recoverSession(generation: number): void {
     if (generation !== this.routingGeneration || this.recoveryPromise || this.lifetime.signal.aborted) return;
-    const credentials = this._signInCredentials();
     this.resetSession();
     this.authenticationPromise = undefined;
-    this.recoveryPromise = this.authenticate(credentials).then(() => undefined)
+    this.recoveryPromise = this.signIn().then(() => undefined)
       .catch((error) => { debug('session recovery failed', error); })
       .finally(() => { this.recoveryPromise = undefined; });
   }
 
+  /**
+   * Waits for the sign-in that runs or is queued now, and fails unless it binds
+   * a session of the call's lineage. Only the client's own sign-in continues a
+   * call: after a sign-in or sign-out of the caller, or a refused sign-in, the
+   * call ends with 40, and at its deadline with 58.
+   */
+  private async nextSession(command: number, lineage: number, deadline: number, signal: AbortSignal): Promise<void> {
+    let failure: unknown;
+    if (lineage === this.lineage) {
+      try {
+        await waitWithin(this.authenticationPromise ?? this.sessionAction, deadline, signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        failure = error;
+      }
+    }
+    if (lineage !== this.lineage) throw unauthenticated(command, failure);
+    if (failure instanceof VsrResponseTimeoutError) throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+    if (!this.isAuthenticated && !this.signInCredentials) throw unauthenticated(command, failure);
+    if (failure !== undefined) throw failure;
+    if (!this.isAuthenticated)
+      throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+  }
+
+  /**
+   * The `sessionReset` event says whether the reset ended a signed-in session.
+   * A reset after a refused sign-in ends none.
+   */
   private resetSession(): void {
-    const hadActivity = this.isAuthenticated || this.vsrSession.hasActivity;
+    const signedIn = this.isAuthenticated;
+    const hadActivity = signedIn || this.vsrSession.hasActivity;
     this.routingGeneration += 1;
     this.sessionLifetime.abort(responseError(0, TRANSIENT_NOT_ACCEPTED));
     this.sessionLifetime = new AbortController();
@@ -845,6 +1416,7 @@ export class CommandResponseStream extends EventEmitter {
     this.bootstrapPromise = undefined;
     this.rosterPromise = undefined;
     this.partitionRoutes.clear();
+    this.groupAssignments.clear();
     this.metadataReplica = undefined;
     this.isAuthenticated = false;
     this.userId = undefined;
@@ -852,7 +1424,11 @@ export class CommandResponseStream extends EventEmitter {
     clearInterval(this.heartbeatIntervalHandler);
     this.heartbeatIntervalHandler = undefined;
     this.changed.pulse();
-    if (hadActivity) this.emit('sessionReset');
+    if (hadActivity) this.emit('sessionReset', signedIn);
+  }
+
+  private ensureLineage(lineage: number, command: number): void {
+    if (lineage !== this.lineage) throw responseError(command, UNAUTHENTICATED);
   }
 
   private ensureGeneration(generation: number, command: number): void {
@@ -860,46 +1436,65 @@ export class CommandResponseStream extends EventEmitter {
       throw responseError(command, TRANSIENT_NOT_ACCEPTED);
   }
 
-  private observeMetadata(frame: Buffer): void {
+  /**
+   * A sync that returned a new assignment raises the watermark too: a handover installs the owner of a partition in a
+   * later op than the join, and a primary that has not applied it refuses a read of the member as not owned.
+   */
+  private observeMetadata(frame: Buffer, newAssignment = false): void {
     const operation = readReplyOperation(frame);
-    if (!hasCommittedResult(frame) || !(isMetadata(operation) || operation === Operation.DeleteSegments || operation === Operation.Register)) return;
+    if (!newAssignment && (!hasCommittedResult(frame) ||
+        !(isMetadata(operation) || operation === Operation.DeleteSegments || operation === Operation.Register))) return;
     const commit = frame.readBigUInt64LE(REPLY_OFFSET.commit);
     if (commit > this.metadataWatermark) this.metadataWatermark = commit;
+  }
+
+  /**
+   * Remembers the assignment that a sync returned for its group, and says whether it differs from the last one. An
+   * empty assignment names no member.
+   */
+  private rememberAssignment(sync: Buffer, assignment: Buffer): boolean {
+    const group = sync.subarray(HEADER_SIZE).toString('hex');
+    const cached = this.groupAssignments.get(group);
+    if (assignment.length === 0) this.groupAssignments.delete(group);
+    else this.groupAssignments.set(group, Buffer.from(assignment));
+    return assignment.length > 0 && !cached?.equals(assignment);
   }
 
   private _rememberCredentials(command: number, payload: Buffer): void {
     if (command === LOGIN.code) {
       const username = readWireName(payload, 0);
-      this.rememberedCredentials = {
+      this.signInCredentials = {
         username: username.value, password: readWireName(payload, username.next).value
       };
     } else if (command === LOGIN_WITH_TOKEN.code) {
-      this.rememberedCredentials = { token: readWireName(payload, 0).value };
-    } else if ((command === COMMAND_CODE.ChangePassword || command === COMMAND_CODE.UpdateUser) &&
-        this.userId !== undefined && this.rememberedCredentials &&
-        'username' in this.rememberedCredentials) {
-      const credentials = this.rememberedCredentials;
+      this.signInCredentials = { token: readWireName(payload, 0).value };
+    } else if ((command === COMMAND_CODE.ChangePassword ||
+        (command === COMMAND_CODE.UpdateResource && payload[0] === OptionsScope.User)) &&
+        this.userId !== undefined && this.signInCredentials &&
+        'username' in this.signInCredentials) {
+      const credentials = this.signInCredentials;
+      // An update leads with its scope byte, a password change with the user id.
+      const start = command === COMMAND_CODE.ChangePassword ? 0 : 1;
       const identifier = [serializeIdentifier(this.userId), serializeIdentifier(credentials.username)]
-        .find((encoded) => payload.subarray(0, encoded.length).equals(encoded));
+        .find((encoded) => payload.subarray(start, start + encoded.length).equals(encoded));
       if (!identifier)
         return;
       if (command === COMMAND_CODE.ChangePassword) {
         const currentPassword = readWireName(payload, identifier.length);
         const password = readWireName(payload, currentPassword.next).value;
-        this.rememberedCredentials = { ...credentials, password };
-        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
-          this.options.credentials = { ...this.options.credentials, password };
-      } else if (payload[identifier.length] === 1) {
-        const username = readWireName(payload, identifier.length + 1).value;
-        this.rememberedCredentials = { ...credentials, username };
-        if ('username' in this.options.credentials && this.options.credentials.username === credentials.username)
-          this.options.credentials = { ...this.options.credentials, username };
+        this.signInCredentials = { ...credentials, password };
+        return;
       }
+      let position = start + identifier.length;
+      const resetCount = payload.readUInt8(position);
+      position += 1;
+      for (let index = 0; index < resetCount; index++)
+        position = readWireName(payload, position).next;
+      const username = deserializeOptions(payload, position).username;
+      if (typeof username !== 'string')
+        return;
+      this.signInCredentials = { ...credentials, username };
     }
-  }
-
-  private _signInCredentials(): ClientCredentials {
-    return this.rememberedCredentials ?? this.options.credentials;
   }
 
   hold(): () => void {
@@ -914,13 +1509,66 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   async authenticate(credentials: ClientCredentials): Promise<boolean> {
-    if (this.isAuthenticated) return true;
+    if (credentials && typeof credentials === 'object' && 'token' in credentials)
+      await this._authWithToken(credentials);
+    else await this._authWithPassword(credentials as PasswordCredentials);
+    return true;
+  }
+
+  private async loginByCaller(command: number, payload: () => Buffer, options: SendCommandOptions = {}): Promise<CommandResponse> {
+    const lineage = ++this.sessionLineage;
+    this.signInCredentials = undefined;
+    const release = this.hold();
+    const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
+    const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
+    try {
+      const body = payload();
+      let admit!: () => void;
+      const admitted = new Promise<void>((resolve) => { admit = resolve; });
+      const pending = this.serializeSession(() => {
+        admit();
+        return this.login(command, body, deadline, signal, lineage);
+      });
+      const authentication = pending.then(() => true)
+        .finally(() => { if (this.authenticationPromise === authentication) this.authenticationPromise = undefined; });
+      this.authenticationPromise = authentication;
+      void authentication.catch(() => undefined);
+      // Bound the queue wait separately so dial timeouts keep their last transport error.
+      await waitWithin(admitted, deadline, signal);
+      return await pending;
+    } catch (error) {
+      if (lineage === this.lineage) {
+        this.sessionLineage += 1;
+        this.signInCredentials = undefined;
+        this.resetSession();
+      }
+      if (error instanceof VsrResponseTimeoutError)
+        throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+      throw error;
+    } finally { release(); }
+  }
+
+  /** Only SDK recovery shares a sign-in. Callers always own a fresh attempt. */
+  private signIn(): Promise<boolean> {
+    if (this.isAuthenticated) return Promise.resolve(true);
     if (!this.authenticationPromise) {
+      const lineage = this.lineage;
+      const identity = this.signInCredentials;
       const pending = this.serializeSession(async () => {
-        const command = 'token' in credentials ? LOGIN_WITH_TOKEN : LOGIN;
-        const body = 'token' in credentials ? LOGIN_WITH_TOKEN.serialize(credentials) : LOGIN.serialize(credentials);
-        await this.login(command.code, body, Date.now() + OPERATION_TIMEOUT_MS, this.lifetime.signal);
-        return this.isAuthenticated;
+        this.ensureLineage(lineage, LOGIN.code);
+        if (this.isAuthenticated) return true;
+        if (!identity) return false;
+        const command = 'token' in identity ? LOGIN_WITH_TOKEN : LOGIN;
+        try {
+          const body = 'token' in identity ? LOGIN_WITH_TOKEN.serialize(identity) : LOGIN.serialize(identity);
+          await this.login(command.code, body, Date.now() + OPERATION_TIMEOUT_MS, this.lifetime.signal, lineage);
+          return this.isAuthenticated;
+        } catch (error) {
+          if (lineage === this.lineage && (error instanceof TypeError || error instanceof VsrEvictionError ||
+              (error instanceof ResponseError && !isTransient(error.errorCode))))
+            this.signInCredentials = undefined;
+          throw error;
+        }
       }).finally(() => { if (this.authenticationPromise === pending) this.authenticationPromise = undefined; });
       this.authenticationPromise = pending;
     }
@@ -928,11 +1576,11 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   async _authWithPassword(credentials: PasswordCredentials) {
-    return LOGIN.deserialize(await this.sendCommand(LOGIN.code, LOGIN.serialize(credentials)));
+    return LOGIN.deserialize(await this.loginByCaller(LOGIN.code, () => LOGIN.serialize(credentials)));
   }
 
   async _authWithToken(credentials: TokenCredentials) {
-    return LOGIN_WITH_TOKEN.deserialize(await this.sendCommand(LOGIN_WITH_TOKEN.code, LOGIN_WITH_TOKEN.serialize(credentials)));
+    return LOGIN_WITH_TOKEN.deserialize(await this.loginByCaller(LOGIN_WITH_TOKEN.code, () => LOGIN_WITH_TOKEN.serialize(credentials)));
   }
 
   async ping() {
@@ -941,28 +1589,33 @@ export class CommandResponseStream extends EventEmitter {
 
   heartbeat(interval?: number): void {
     clearInterval(this.heartbeatIntervalHandler);
-    if (!interval || !this.isAuthenticated) return;
-    this.heartbeatIntervalHandler = setInterval(() => {
-      for (const slot of this.replicas.values()) {
-        // A retry budget limits one reconnect burst, not the life of the
-        // session, so a long outage cannot leave the client down for good.
-        if (slot.restartable) {
-          slot.restartable = false;
-          slot.failure = undefined;
-          void this.runReplica(slot);
+    this.heartbeatIntervalHandler = undefined;
+    if (interval && this.isAuthenticated) {
+      this.heartbeatIntervalHandler = setInterval(() => {
+        for (const slot of this.replicas.values()) {
+          // A retry budget limits one reconnect burst, not the life of the
+          // session, so a long outage cannot leave the client down for good.
+          if (slot.restartable) {
+            slot.restartable = false;
+            slot.failure = undefined;
+            void this.runReplica(slot);
+          }
+          if (!slot.attached || !slot.connection?.connected || slot.heartbeat) continue;
+          slot.heartbeat = true;
+          const signal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal, slot.lifetime.signal]);
+          void this.control(slot.connection, PING.code, PING.serialize(), Date.now() + OPERATION_TIMEOUT_MS, signal)
+            .then(() => { this.emit('heartbeat'); })
+            .catch((error) => {
+              if (isSessionFailure(error)) this.recoverSession(slot.generation);
+              debug('replica heartbeat failed', error);
+            }).finally(() => { slot.heartbeat = false; });
         }
-        if (!slot.attached || !slot.connection?.connected || slot.heartbeat) continue;
-        slot.heartbeat = true;
-        const signal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal, slot.lifetime.signal]);
-        void this.control(slot.connection, PING.code, PING.serialize(), Date.now() + OPERATION_TIMEOUT_MS, signal)
-          .then(() => { this.emit('heartbeat'); })
-          .catch((error) => {
-            if (isSessionFailure(error)) this.recoverSession(slot.generation);
-            debug('replica heartbeat failed', error);
-          }).finally(() => { slot.heartbeat = false; });
-      }
-    }, interval);
-    this.heartbeatIntervalHandler.unref();
+      }, interval);
+      this.heartbeatIntervalHandler.unref();
+    }
+    // A link that used its budget reports whether a heartbeat restarts it.
+    for (const slot of this.replicas.values())
+      if (slot.restartable) slot.failure = this.budgetFailure(slot);
   }
 
   getReadStream() {
@@ -972,7 +1625,7 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   destroy(): void {
-    this.rememberedCredentials = undefined;
+    this.signInCredentials = undefined;
     this.lifetime.abort(new Error('client destroyed'));
     this.resetSession();
   }
@@ -986,6 +1639,19 @@ const isLoginCommand = (command: number): boolean =>
   command === COMMAND_CODE.LoginUser || command === COMMAND_CODE.LoginWithAccessToken;
 const isTransient = (code: number): boolean =>
   code === TRANSIENT_NOT_COMMITTED || code === TRANSIENT_NOT_ACCEPTED || code === NOT_PRIMARY;
+/** A 40 that keeps why the call has no session, such as a refused sign-in. */
+const unauthenticated = (command: number, cause: unknown): ResponseError => {
+  const error = responseError(command, UNAUTHENTICATED);
+  if (cause !== undefined) error.cause = cause;
+  return error;
+};
+/** An unknown outcome. Only a retainable operation has an ID to resolve, any other call ends with 57. */
+const uncertainOutcome = (command: number, operation: ClientOperation | undefined, cause: unknown): Error => {
+  if (operation?.retainable) return new OperationUncertainError(operation.id, cause);
+  const error = responseError(command, TRANSIENT_NOT_COMMITTED);
+  error.cause = cause;
+  return error;
+};
 const isDetachedFailure = (error: unknown): boolean =>
   error instanceof VsrEvictionError
     ? error.reason === EvictionReason.NoSession || error.reason === EvictionReason.StaleClient
@@ -996,8 +1662,28 @@ const isSessionFailure = (error: unknown, binding = false): boolean =>
   (error instanceof ResponseError && error.fromServer &&
     ((error.errorCode === UNAUTHENTICATED && (binding || error.committed)) ||
       (error.errorCode === STALE_CLIENT && error.committed)));
+const laneKey = (incarnation: bigint, partitionId: number): string => `${incarnation}:${partitionId}`;
 const groupKey = (context: PartitionContext, target: PartitionTarget): string =>
-  `${context.incarnation}:${target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE)}`;
+  laneKey(context.incarnation, target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE));
+const progressLaneOf = (lane: string): string => `progress:${lane}`;
+const isPoll = (command: number): boolean =>
+  command === COMMAND_CODE.PollMessages || command === COMMAND_CODE.PollMessagesDeferred;
+
+/** Waits a random part of `delay`, so the retries of many clients spread out, and gives the next delay. */
+const backOff = async (delay: number, deadline: number, signal: AbortSignal): Promise<number> => {
+  await waitWithin(pause(Math.floor(Math.random() * (delay + 1)), signal), deadline, signal);
+  return Math.min(delay * 2, MAX_RETRY_INTERVAL_MS);
+};
+
+/** `error` as the refusal of `command`, also when a step for it failed, such as a route lookup. */
+const refusalOf = (command: number, error: unknown): unknown => {
+  if (!(error instanceof ResponseError) || error instanceof VsrEvictionError || error.commandCode === command)
+    return error;
+  const remapped = responseError(command, error.errorCode);
+  remapped.fromServer = error.fromServer;
+  remapped.committed = error.committed;
+  return remapped;
+};
 
 type PartitionTarget = {
   query: Buffer,
@@ -1009,21 +1695,25 @@ const partitionRoute = (command: number, payload: Buffer): PartitionTarget | und
     const { query } = sendTarget(payload);
     return { query, key: query.toString('hex') };
   }
-  if (command !== COMMAND_CODE.PollMessages && command !== COMMAND_CODE.GetOffset &&
-      command !== COMMAND_CODE.StoreOffset && command !== COMMAND_CODE.DeleteConsumerOffset)
+  if (command === COMMAND_CODE.FetchMessages) {
+    const { topic, targets } = readFetch(payload);
+    return readinessTarget(topic, targets[0]);
+  }
+  if (!isPoll(command) && !OFFSET_COMMANDS.has(command))
     return undefined;
   let position = 1;
   const consumerEnd = identifierEnd(payload, position, command);
   const streamEnd = identifierEnd(payload, consumerEnd, command);
   position = identifierEnd(payload, streamEnd, command);
   const suffix = command === COMMAND_CODE.PollMessages ? POLL_OPTIONS_SIZE
-    : command === COMMAND_CODE.StoreOffset ? STORE_OFFSET_SUFFIX_SIZE
-      : command === COMMAND_CODE.DeleteConsumerOffset ? DELETE_OFFSET_SUFFIX_SIZE : 0;
+    : command === COMMAND_CODE.PollMessagesDeferred ? POLL_OPTIONS_SIZE + DEFERRED_POLL_OPTIONS_SIZE
+      : command === COMMAND_CODE.StoreOffset ? STORE_OFFSET_SUFFIX_SIZE
+        : command === COMMAND_CODE.DeleteConsumerOffset ? DELETE_OFFSET_SUFFIX_SIZE : 0;
   if (payload.length !== position + 1 + PARTITION_ID_SIZE + suffix || payload[position] > 1)
     throw responseError(command, INVALID_COMMAND);
   if (payload[position] === 0) {
     if (command === COMMAND_CODE.StoreOffset || command === COMMAND_CODE.DeleteConsumerOffset ||
-        (command === COMMAND_CODE.PollMessages && payload[0] === ConsumerKind.Group))
+        (isPoll(command) && payload[0] === ConsumerKind.Group))
       throw responseError(command, INVALID_COMMAND);
   }
   const query = Buffer.concat([payload.subarray(consumerEnd, position),
@@ -1031,6 +1721,138 @@ const partitionRoute = (command: number, payload: Buffer): PartitionTarget | und
       : payload.subarray(position + 1, position + 1 + PARTITION_ID_SIZE)]);
   return { query, key: query.toString('hex') };
 };
+
+/** The parts of a fetch body that the client reads. */
+type Fetch = {
+  /** Where the fields after the topic start. */
+  fieldsAt: number,
+  /** The stream and topic identifiers, which lead each route lookup of the fetch. */
+  topic: Buffer,
+  /** One view into the body per target, each led by its partition id. */
+  targets: Buffer[],
+  /** The fetch commits on read, or a target starts at the stored offset. */
+  progress: boolean,
+  commits: boolean
+};
+
+/** Reads a fetch body, after the checks that the server's decoder makes. */
+const readFetch = (payload: Buffer): Fetch => {
+  const command = COMMAND_CODE.FetchMessages;
+  const consumerEnd = identifierEnd(payload, 1, command);
+  const topicEnd = identifierEnd(payload, identifierEnd(payload, consumerEnd, command), command);
+  const targetsAt = topicEnd + FETCH_MESSAGES_FIELDS_SIZE;
+  if (payload.length < targetsAt)
+    throw responseError(command, INVALID_COMMAND);
+  const count = payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.targetsCount);
+  const minCount = payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.minCount);
+  const maxBytes = payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.maxBytes);
+  if (count === 0 || count > MAX_PARTITIONS_PER_REQUEST || payload.length !== targetsAt + count * FETCH_TARGET_SIZE ||
+      !isFetchBudget(payload.readBigUInt64LE(topicEnd + FETCH_MESSAGES_FIELD.wait),
+        payload.readBigUInt64LE(topicEnd + FETCH_MESSAGES_FIELD.requestTimeout)) ||
+      minCount === 0 || minCount > payload.readUInt32LE(topicEnd + FETCH_MESSAGES_FIELD.count) ||
+      maxBytes < MIN_DEFERRED_POLL_MAX_BYTES)
+    throw responseError(command, INVALID_COMMAND);
+  const targets = Array.from({ length: count }, (_, index) =>
+    payload.subarray(targetsAt + index * FETCH_TARGET_SIZE, targetsAt + (index + 1) * FETCH_TARGET_SIZE));
+  const kinds = targets.map((target) => target[FETCH_TARGET_FIELD.kind]);
+  const limits = targets.map((target) => target.readUInt32LE(FETCH_TARGET_FIELD.maxBytes));
+  if (new Set(targets.map((target) => target.readUInt32LE(FETCH_TARGET_FIELD.partitionId))).size !== count ||
+      kinds.some((kind) => kind !== PollingStrategyKind.Offset && kind !== PollingStrategyKind.Next) ||
+      limits.some((limit) => limit < MIN_DEFERRED_POLL_MAX_BYTES || limit > maxBytes))
+    throw responseError(command, INVALID_COMMAND);
+  return {
+    fieldsAt: topicEnd, topic: payload.subarray(consumerEnd, topicEnd), targets,
+    progress: payload[topicEnd + FETCH_MESSAGES_FIELD.autoCommit] !== 0 || kinds.includes(PollingStrategyKind.Next),
+    commits: payload[topicEnd + FETCH_MESSAGES_FIELD.autoCommit] !== 0
+  };
+};
+
+/**
+ * The section headers of a fetch reply, each led by its partition id. A reply
+ * whose table does not fit is left to the decoder of the caller.
+ */
+const fetchSections = (data: Buffer): Buffer[] => {
+  const count = data.length >= POLL_COUNT_SIZE ? data.readUInt32LE(0) : 0;
+  if (data.length < fetchReplyHeadSize(count))
+    return [];
+  return Array.from({ length: count }, (_, index) => data.subarray(
+    POLL_COUNT_SIZE + index * FETCH_SECTION_SIZE, POLL_COUNT_SIZE + (index + 1) * FETCH_SECTION_SIZE));
+};
+
+/** The route lookup of a target partition. */
+const readinessTarget = (topic: Buffer, target: Buffer): PartitionTarget => {
+  const query = Buffer.concat([topic, target.subarray(0, PARTITION_ID_SIZE)]);
+  return { query, key: query.toString('hex') };
+};
+
+/**
+ * The budget of a deferred poll or a fetch, after the checks
+ * that the server's decoder makes, which fail with 3 before anything is sent.
+ * A deferred poll fills at most `replyBodyLimit` bytes, and a fetch that many
+ * with its section table, because a link fails on a larger reply. A fetch
+ * that cannot fit one message then fails with 80. Other commands have no
+ * budget.
+ */
+const deferredBudget = (command: number, payload: Buffer, replyBodyLimit: number): DeferredBudget | undefined => {
+  if (command === COMMAND_CODE.FetchMessages) {
+    const { fieldsAt, targets } = readFetch(payload);
+    if (payload.readBigUInt64LE(fieldsAt + FETCH_MESSAGES_FIELD.requestTimeout) <= MIN_DEFERRED_POLL_REPLY_MARGIN_US)
+      throw responseError(command, INVALID_COMMAND);
+    const maxBytes = Math.min(payload.readUInt32LE(fieldsAt + FETCH_MESSAGES_FIELD.maxBytes),
+      replyBodyLimit - fetchReplyHeadSize(targets.length));
+    if (maxBytes < MIN_DEFERRED_POLL_MAX_BYTES)
+      throw responseError(command, INVALID_SIZE_BYTES);
+    payload.writeUInt32LE(maxBytes, fieldsAt + FETCH_MESSAGES_FIELD.maxBytes);
+    for (const target of targets)
+      target.writeUInt32LE(Math.min(target.readUInt32LE(FETCH_TARGET_FIELD.maxBytes), maxBytes), FETCH_TARGET_FIELD.maxBytes);
+    const waitOffset = fieldsAt + FETCH_MESSAGES_FIELD.wait;
+    const timeoutOffset = fieldsAt + FETCH_MESSAGES_FIELD.requestTimeout;
+    return {
+      started: Date.now(), wait: payload.readBigUInt64LE(waitOffset), timeout: payload.readBigUInt64LE(timeoutOffset),
+      waitOffset, timeoutOffset
+    };
+  }
+  if (command !== COMMAND_CODE.PollMessagesDeferred)
+    return undefined;
+  partitionRoute(command, payload);
+  const pollEnd = payload.length - DEFERRED_POLL_OPTIONS_SIZE;
+  const count = payload.readUInt32LE(pollEnd - POLL_AUTOCOMMIT_SIZE - POLL_COUNT_SIZE);
+  const waitOffset = pollEnd + DEFERRED_POLL_OFFSET.wait;
+  const timeoutOffset = pollEnd + DEFERRED_POLL_OFFSET.requestTimeout;
+  const wait = payload.readBigUInt64LE(waitOffset);
+  const timeout = payload.readBigUInt64LE(timeoutOffset);
+  const minCount = payload.readUInt32LE(pollEnd + DEFERRED_POLL_OFFSET.minCount);
+  const maxBytes = payload.readUInt32LE(pollEnd + DEFERRED_POLL_OFFSET.maxBytes);
+  if (!isDeferredBudget(wait, timeout) || minCount === 0 || minCount > count || maxBytes < MIN_DEFERRED_POLL_MAX_BYTES)
+    throw responseError(command, INVALID_COMMAND);
+  payload.writeUInt32LE(Math.min(maxBytes, replyBodyLimit), pollEnd + DEFERRED_POLL_OFFSET.maxBytes);
+  return { started: Date.now(), wait, timeout, waitOffset, timeoutOffset };
+};
+
+/**
+ * A frame of a deferred request that waits only for what remains of its wait,
+ * and leaves its reply margin before the deadline of the call, as
+ * `Call::deferred_payload` in core/sdk/src/driver.rs does. The frame is a
+ * copy, because a link can still hold the bytes of an earlier attempt.
+ */
+const deferredFrame = (command: number, frame: Buffer, budget: DeferredBudget, deadline: number): Buffer => {
+  const now = Date.now();
+  const elapsed = BigInt(Math.max(0, now - budget.started)) * US_PER_MS;
+  const timeout = smaller(budget.timeout - elapsed, BigInt(Math.floor(deadline - now)) * US_PER_MS);
+  if (timeout <= 0n || (command === COMMAND_CODE.FetchMessages && timeout < MIN_DEFERRED_POLL_REPLY_MARGIN_US))
+    throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+  const wait = smaller(budget.wait - elapsed, timeout - MIN_DEFERRED_POLL_REPLY_MARGIN_US);
+  const bytes = Buffer.from(frame);
+  bytes.writeBigUInt64LE(wait > 0n ? wait : 0n, HEADER_SIZE + budget.waitOffset);
+  bytes.writeBigUInt64LE(timeout, HEADER_SIZE + budget.timeoutOffset);
+  return bytes;
+};
+
+const smaller = (left: bigint, right: bigint): bigint => left < right ? left : right;
+
+/** A command the caller may send to a replica it chooses: non-replicated, not a partition read, not session control. */
+const isReplicaCommand = (command: number): boolean =>
+  !REPLICA_REFUSED_CODES.has(command) && operationForCode(command) === Operation.NonReplicated;
 
 const identifierEnd = (payload: Buffer, position: number, command: number): number => {
   if (position + IDENTIFIER_PREFIX_SIZE > payload.length)

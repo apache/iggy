@@ -75,6 +75,20 @@ final class RawCommandFeatureTest extends TestCase
             }
             return;
         }
+        if (preg_match('/^I send a raw command with code (\d+) and an empty payload to replica (\d+)$/', $step, $matches) === 1) {
+            try {
+                $this->lastResponse = $this->requireClient()->sendBinaryRequestToReplica(
+                    (int) $matches[1],
+                    '',
+                    (int) $matches[2],
+                );
+                $this->lastError = null;
+            } catch (Throwable $error) {
+                $this->lastResponse = null;
+                $this->lastError = $error;
+            }
+            return;
+        }
         if ($step === 'the raw command should succeed with an empty response') {
             assert_same(null, $this->lastError);
             assert_same('', $this->lastResponse);
@@ -89,6 +103,12 @@ final class RawCommandFeatureTest extends TestCase
             assert_same(null, $this->lastResponse);
             assert_instance_of(IggyException::class, $this->lastError);
             assert_true(str_contains(strtolower((string) $this->lastError?->getMessage()), 'invalid command'));
+            return;
+        }
+        if ($step === 'the raw command should fail with an invalid identifier error') {
+            assert_same(null, $this->lastResponse);
+            assert_instance_of(IggyException::class, $this->lastError);
+            assert_true(str_contains(strtolower((string) $this->lastError?->getMessage()), 'invalid identifier'));
             return;
         }
 

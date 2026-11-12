@@ -36,42 +36,58 @@
 //! `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure so a broken CI step cannot
 //! leave these silently green.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use iggy::prelude::IggyTimestamp;
 use secrecy::SecretString;
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, ProduceSessionLimits,
-    TopicMapping,
+    DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
+    KnownNodes, ProduceSessionLimits, TopicDefaults, TopicMapping,
 };
-use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol, parse_brokers};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
-use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
+use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
 #[path = "common/certs.rs"]
 mod certs;
+#[path = "common/codec.rs"]
+mod codec;
+#[path = "common/gateways.rs"]
+mod gateways;
 #[path = "common/server.rs"]
 mod server;
+#[path = "common/tcp.rs"]
+mod tcp;
+#[path = "common/wire.rs"]
+mod wire;
 
 use certs::{Issued, TestPki};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use server::{spawn_gateway as spawn_listeners, spawn_test_server_with_authenticator};
 
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
-const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
+/// The newest Kafka release: the Java tools of every test that names no other image.
+const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
+/// The oldest Kafka 4 release, for the one test that runs both ends of the Kafka 4 range.
+const KAFKA_4_0_IMAGE: &str = "apache/kafka:4.0.2";
+/// The newest Kafka 3 release, for the one test of a Kafka 3 client.
+const KAFKA_3_9_IMAGE: &str = "apache/kafka:3.9.2";
 const ROOT_USER: &str = "iggy";
 const ROOT_PASSWORD: &str = "iggy";
 /// Password for every non-root principal these tests create.
@@ -83,6 +99,21 @@ const RECORDS: [(&str, &str); 3] = [("k1", "alpha"), ("k2", "beta"), ("k3", "gam
 /// The topic the group member test shares. Two partitions, so two members get one each.
 const GROUP_TOPIC: &str = "payments";
 const GROUP_TOPIC_PARTITIONS: u32 = 2;
+/// The topic the producer writes while one of two gateways stops.
+const FAILOVER_TOPIC: &str = "failover";
+/// The topic of the consumer group that moves to another gateway.
+const GROUP_FAILOVER_TOPIC: &str = "group-failover";
+/// Records of each batch that the moving group reads.
+const GROUP_FAILOVER_BATCH: usize = 100;
+/// Records the producer writes there, at [`FAILOVER_RATE`] a second.
+const FAILOVER_RECORDS: u32 = 600;
+const FAILOVER_RATE: u32 = 60;
+
+/// The topic that a relay loses Produce responses for, and the records written there.
+const LOST_REPLY_TOPIC: &str = "lost-replies";
+const LOST_REPLY_RECORDS: u32 = 600;
+/// Produce responses the relay drops. Each drop closes that connection, as a lost reply does.
+const LOST_REPLIES: usize = 3;
 
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
@@ -352,6 +383,51 @@ async fn start_bridged_gateway_with(
     start_gateway(server, topics, false, gateway_config).await
 }
 
+/// Two bridged gateways that list each other in `IGGY_KAFKA_BROKERS`, as nodes 1 and 2. A short
+/// drain lets a stop take effect at once. With `coordinator_log`, they share their groups.
+async fn start_listed_gateways(
+    server: &TestServer,
+    coordinator_log: CoordinatorLog,
+) -> (BridgedGateway, BridgedGateway) {
+    let sockets = [
+        bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
+        bind_listener("127.0.0.1:0").expect("bind ephemeral port"),
+    ];
+    let addrs = sockets
+        .each_ref()
+        .map(|socket| socket.local_addr().expect("local addr"));
+    let brokers =
+        parse_brokers(&format!("1@{},2@{}", addrs[0], addrs[1])).expect("two listed gateways");
+    let mut gateways = Vec::with_capacity(2);
+    for ((node_id, socket), addr) in (1_u16..).zip(sockets).zip(addrs) {
+        let config = GatewayConfig {
+            node_id,
+            brokers: brokers.clone(),
+            shutdown_drain_timeout: Duration::from_secs(1),
+            coordinator_log,
+            ..GatewayConfig::default()
+        };
+        let listener = BoundListener::new(
+            ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
+            socket,
+        );
+        let bridge = Arc::new(root_bridge(server).await);
+        let gateway = KafkaGateway::new(config).with_bridge(Some(bridge));
+        let (shutdown, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(async move {
+            let _ = gateway.run(vec![listener], receiver).await;
+        });
+        gateways.push(BridgedGateway {
+            addr,
+            shutdown,
+            task,
+        });
+    }
+    let second = gateways.pop().expect("the second gateway");
+    let first = gateways.pop().expect("the first gateway");
+    (first, second)
+}
+
 /// A bridge to `server` as the root user, with the default topic mapping.
 async fn root_bridge(server: &TestServer) -> IggyBridge {
     let config = IggyBridgeConfig {
@@ -361,8 +437,12 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
+        idempotent_producers: true,
+        nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     };
     IggyBridge::connect(config)
         .await
@@ -964,6 +1044,107 @@ async fn given_the_java_client_should_authenticate_and_list_the_sasl_apis() {
     );
 }
 
+/// Java clients 4.0 to 4.3 open `ApiVersions` at v4, and 4.4 clients at v5 (KIP-1242). Each finds
+/// its version in the advertisement, so neither asks again at v3 (KIP-511). The oldest Kafka 4
+/// client then produces and reads back in a group, as the newest one does in the other tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_4_0_and_4_4_clients_should_use_their_own_api_versions_and_serve_records() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    if image_missing(KAFKA_4_0_IMAGE) {
+        return;
+    }
+    let bootstrap = gateway.to_string();
+    for (image, usable) in [(KAFKA_4_0_IMAGE, 4), (KAFKA_IMAGE, 5)] {
+        assert_usable_api_versions(image, &bootstrap, usable);
+    }
+    produce_and_read_back_in_a_group(KAFKA_4_0_IMAGE, &bootstrap, "kafka-4-0");
+}
+
+/// Java clients 3.0 to 3.8 open `ApiVersions` at v3, and 3.9 clients at v4, as 4.0 to 4.3 do. The
+/// newest Kafka 3 client finds v4 in the advertisement, then produces and reads back in a group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_kafka_3_9_client_should_use_api_versions_v4_and_serve_records() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    if image_missing(KAFKA_3_9_IMAGE) {
+        return;
+    }
+    let bootstrap = gateway.to_string();
+    assert_usable_api_versions(KAFKA_3_9_IMAGE, &bootstrap, 4);
+    produce_and_read_back_in_a_group(KAFKA_3_9_IMAGE, &bootstrap, "kafka-3-9");
+}
+
+/// Whether to skip because `image` is not pulled. [`ready_server`] checks the images that every
+/// test needs, and this one the image of a single test.
+fn image_missing(image: &str) -> bool {
+    !image_present(image)
+        && skip(&format!(
+            "client image {image} is not pulled; run `docker pull {image}`"
+        ))
+}
+
+/// The Java client of `image` lists the gateway's `ApiVersions` range and uses v`usable` of it.
+fn assert_usable_api_versions(image: &str, bootstrap: &str, usable: i16) {
+    let versions = run_client(
+        image,
+        &[
+            "/opt/kafka/bin/kafka-broker-api-versions.sh",
+            "--bootstrap-server",
+            bootstrap,
+        ],
+        &[],
+    )
+    .expect_ran("java client api-versions");
+    assert!(
+        versions.contains(&format!("ApiVersions(18): 0 to 5 [usable: {usable}]")),
+        "{image} must use ApiVersions v{usable}, got: {versions}"
+    );
+}
+
+/// Writes two records to `TOPIC` with the console producer of `image`, and reads them back with
+/// its console consumer in `group`.
+fn produce_and_read_back_in_a_group(image: &str, bootstrap: &str, group: &str) {
+    let produce = format!(
+        "printf 'k1:alpha\\nk2:beta\\n' | /opt/kafka/bin/kafka-console-producer.sh \
+         --bootstrap-server {bootstrap} --topic {TOPIC} --property parse.key=true \
+         --property key.separator=: --producer-property max.block.ms=20000"
+    );
+    let produced =
+        run_client(image, &["sh", "-c", &produce], &[]).expect_ran("java console producer");
+    assert!(
+        !produced.contains("ERROR"),
+        "the producer of {image} must send, got: {produced}"
+    );
+    let consumed = run_client(
+        image,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            bootstrap,
+            "--topic",
+            TOPIC,
+            "--group",
+            group,
+            "--from-beginning",
+            "--max-messages",
+            "2",
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer in a group");
+    assert!(
+        consumed.contains("k1\talpha") && consumed.contains("k2\tbeta"),
+        "the consumer of {image} must read both records, got: {consumed}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_distinct_principals_when_listing_acls_should_describe_each_differently() {
     // The spec's category T procedure. Root alone proves nothing about the mapping, because it
@@ -1155,6 +1336,378 @@ fn kafka_topics(gateway: SocketAddr, args: &[&str]) -> ClientRun {
     run_client(KAFKA_IMAGE, &full_args, &[])
 }
 
+/// Runs `kafka-configs.sh` with `args` against `gateway`, with SASL off like [`kafka_topics`].
+fn kafka_configs(gateway: SocketAddr, args: &[&str]) -> ClientRun {
+    let bootstrap = gateway.to_string();
+    let mut full_args: Vec<&str> = vec![
+        "/opt/kafka/bin/kafka-configs.sh",
+        "--bootstrap-server",
+        &bootstrap,
+    ];
+    full_args.extend_from_slice(args);
+    run_client(KAFKA_IMAGE, &full_args, &[])
+}
+
+/// `kafka-configs.sh --alter` on a topic sends only `IncrementalAlterConfigs` (44): a `SET` for
+/// `--add-config` and a `DELETE` for `--delete-config`, after a describe of the topic's dynamic
+/// configs. This is the real-tool round trip for that key through the bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_configs_sh_when_adding_then_deleting_retention_should_round_trip_through_the_bridge()
+ {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    let completed = format!("Completed updating config for topic {TOPIC}.");
+
+    let added = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--add-config",
+            "retention.ms=8000",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --add-config");
+    assert!(
+        added.contains(&completed),
+        "kafka-configs.sh must report the alter completed, got: {added}"
+    );
+
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --add-config");
+    assert!(
+        described.contains("retention.ms=8000 sensitive=false"),
+        "the describe must show the stored retention.ms, got: {described}"
+    );
+
+    let deleted = kafka_configs(
+        gateway,
+        &[
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+            "--delete-config",
+            "retention.ms",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --delete-config");
+    assert!(
+        deleted.contains(&completed),
+        "kafka-configs.sh must report the delete completed, got: {deleted}"
+    );
+
+    let described_after = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            TOPIC,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe after --delete-config");
+    assert!(
+        described_after.contains(&format!("Dynamic configs for topic {TOPIC} are:")),
+        "kafka-configs.sh must describe the topic, got: {described_after}"
+    );
+    assert!(
+        !described_after.contains("retention.ms="),
+        "a deleted retention.ms is back at its default, which is not a dynamic config, got: \
+         {described_after}"
+    );
+}
+
+/// `kafka-topics.sh --create --config` sends the configs on `CreateTopics`. Iggy stores
+/// `retention.ms`, `retention.bytes` and `segment.bytes`, the gateway accepts the other keys at
+/// the values it reports, and `retention.bytes` stays per partition when the topic grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_with_configs_should_store_them_per_partition() {
+    const CONFIGURED: &str = "configured-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            CONFIGURED,
+            "--partitions",
+            "2",
+            "--config",
+            "retention.ms=60000",
+            "--config",
+            "retention.bytes=134217728",
+            "--config",
+            "segment.bytes=67108864",
+            "--config",
+            "cleanup.policy=delete",
+            "--config",
+            "min.insync.replicas=1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config");
+    assert!(
+        created.contains(&format!("Created topic {CONFIGURED}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+
+    let describe_topic = || {
+        kafka_configs(
+            gateway,
+            &[
+                "--describe",
+                "--entity-type",
+                "topics",
+                "--entity-name",
+                CONFIGURED,
+            ],
+        )
+        .expect_ran("kafka-configs.sh --describe")
+    };
+    let described = describe_topic();
+    for stored in [
+        "retention.ms=60000 sensitive=false",
+        "retention.bytes=134217728 sensitive=false",
+        "segment.bytes=67108864 sensitive=false",
+    ] {
+        assert!(
+            described.contains(stored),
+            "the describe must show {stored}, got: {described}"
+        );
+    }
+    assert!(
+        !described.contains("min.insync.replicas="),
+        "a key at its default is not a dynamic config, got: {described}"
+    );
+
+    let grown = kafka_topics(
+        gateway,
+        &["--alter", "--topic", CONFIGURED, "--partitions", "4"],
+    )
+    .expect_ran("kafka-topics.sh --alter --partitions");
+    assert!(
+        !grown.to_lowercase().contains("error"),
+        "the topic must grow, got: {grown}"
+    );
+    let described_after = describe_topic();
+    assert!(
+        described_after.contains("retention.bytes=134217728 sensitive=false"),
+        "each new partition keeps the same retention.bytes, got: {described_after}"
+    );
+
+    let under_min_isr = kafka_topics(gateway, &["--describe", "--under-min-isr-partitions"])
+        .expect_ran("kafka-topics.sh --describe --under-min-isr-partitions");
+    assert!(
+        !under_min_isr.contains("Exception"),
+        "the tool reads min.insync.replicas of every topic, got: {under_min_isr}"
+    );
+}
+
+/// Kafka accepts a `retention.bytes` below one segment, and so does the gateway. Iggy keeps the
+/// newest sealed segment of each partition and refuses a topic cap below one segment, so the
+/// topic of one partition reports one segment of 1 GiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_with_a_retention_below_one_segment_should_keep_one() {
+    const SMALL: &str = "small-retention-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            SMALL,
+            "--config",
+            "retention.bytes=1048576",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config retention.bytes=1048576");
+    assert!(
+        created.contains(&format!("Created topic {SMALL}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            SMALL,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe");
+    assert!(
+        described.contains("retention.bytes=1073741824 sensitive=false"),
+        "Iggy keeps one segment of the partition, got: {described}"
+    );
+}
+
+/// `kafka-topics.sh --create --config cleanup.policy=compact`, as Kafka Connect and Schema
+/// Registry create their topics. Iggy does not compact, so the topic keeps every record, and the
+/// gateway does not report the policy. Keys that change nothing a client sees are accepted, while
+/// a replication factor above the one Iggy node and `LogAppendTime` are refused with the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_a_compacted_topic_should_keep_every_record() {
+    const COMPACTED: &str = "compacted-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            COMPACTED,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+            "--config",
+            "cleanup.policy=compact",
+            "--config",
+            "retention.ms=60000",
+            "--config",
+            "min.insync.replicas=1",
+            "--config",
+            "compression.type=lz4",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config cleanup.policy=compact");
+    assert!(
+        created.contains(&format!("Created topic {COMPACTED}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+
+    let described = kafka_topics(gateway, &["--describe", "--topic", COMPACTED])
+        .expect_ran("kafka-topics.sh --describe");
+    assert!(
+        described.contains("ReplicationFactor: 1"),
+        "the describe must show the stored factor, got: {described}"
+    );
+    let configs = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            COMPACTED,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe");
+    assert!(
+        configs.contains("retention.ms=-1 sensitive=false"),
+        "a compacted topic never expires, got: {configs}"
+    );
+    assert!(
+        !configs.contains("cleanup.policy") && !configs.contains("min.insync.replicas"),
+        "the policy is not stored, and min.insync.replicas reports the majority as a default, \
+         got: {configs}"
+    );
+
+    let refused_factor = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-factor",
+            "--replication-factor",
+            "2",
+        ],
+    )
+    .text();
+    assert!(
+        refused_factor.contains("only 1 Iggy node(s) are in the cluster"),
+        "a factor above the node count must be refused with its reason, got: {refused_factor}"
+    );
+    let refused_timestamps = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-timestamps",
+            "--config",
+            "message.timestamp.type=LogAppendTime",
+        ],
+    )
+    .text();
+    assert!(
+        refused_timestamps.contains("accepts only CreateTime"),
+        "LogAppendTime must be refused with its reason, got: {refused_timestamps}"
+    );
+    let refused_min_isr = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-min-isr",
+            "--config",
+            "min.insync.replicas=2",
+        ],
+    )
+    .text();
+    assert!(
+        refused_min_isr.contains("accepts at most 1"),
+        "Iggy commits on a majority of one node, got: {refused_min_isr}"
+    );
+}
+
+/// `kafka-configs.sh --describe --entity-type brokers` reads a BROKER resource, as the Strimzi
+/// Topic Operator does at startup for `auto.create.topics.enable` and `min.insync.replicas`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_configs_sh_when_describing_the_broker_should_report_the_gateway_settings() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "brokers",
+            "--entity-name",
+            "1",
+            "--all",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe --entity-type brokers --all");
+    for setting in [
+        "auto.create.topics.enable=false",
+        "min.insync.replicas=1",
+        "log.retention.ms=-1",
+        "num.partitions=1",
+        "default.replication.factor=1",
+    ] {
+        assert!(
+            described.contains(setting),
+            "the broker describe must show {setting}, got: {described}"
+        );
+    }
+}
+
 /// #3546's own acceptance criterion: `kafka-topics.sh` must work against the gateway for create
 /// and delete. (`--describe` needs `DescribeConfigs`, not yet implemented, so it is not covered
 /// here.) Runs against the bridged stack, since this exercises the real `CreateTopics`/
@@ -1210,6 +1763,70 @@ async fn given_kafka_topics_sh_when_creating_then_deleting_a_topic_should_round_
         listed_after.lines().any(|line| line.trim() == TOPIC),
         "deleting one topic must not take the shared default stream, and `{TOPIC}`, with it, got: \
          {listed_after}"
+    );
+}
+
+/// `kafka-topics.sh --alter --partitions N` grows a topic through
+/// the bridge and `--describe` (Metadata) reports the new count, while a smaller count fails
+/// with `INVALID_PARTITIONS` and leaves the count alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_altering_the_partition_count_should_grow_the_topic_through_the_bridge()
+ {
+    const NEW_TOPIC: &str = "kafka-topics-grow";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            NEW_TOPIC,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create");
+    assert!(
+        created.contains(&format!("Created topic {NEW_TOPIC}")),
+        "kafka-topics.sh must report the topic created, got: {created}"
+    );
+
+    let altered = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "3"],
+    )
+    .expect_ran("kafka-topics.sh --alter --partitions 3");
+    assert!(
+        !altered.to_lowercase().contains("error"),
+        "kafka-topics.sh --alter must succeed, got: {altered}"
+    );
+
+    let described = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the grow");
+    assert!(
+        described.contains("PartitionCount: 3"),
+        "Metadata must report the grown count, got: {described}"
+    );
+
+    let shrunk = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "2"],
+    )
+    .text();
+    assert!(
+        shrunk.contains("InvalidPartitionsException"),
+        "a smaller count must fail with INVALID_PARTITIONS, got: {shrunk}"
+    );
+
+    let described_after = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the refused shrink");
+    assert!(
+        described_after.contains("PartitionCount: 3"),
+        "a refused shrink must leave the count alone, got: {described_after}"
     );
 }
 
@@ -1335,6 +1952,198 @@ fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
         &[],
     )
     .expect_ran("java console consumer in a group")
+}
+
+/// KIP-345 with the Java client. A static consumer sends no `LeaveGroup` on close, so its
+/// member stays in the group, holding the only partition, for its whole session. The second run
+/// comes back under the same `group.instance.id` and must take that member over at once. Without
+/// replacement it would join as a new member, wait out a rebalance its old incarnation never
+/// rejoins, and exit after `--timeout-ms` with nothing read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_java_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_member(gateway, RECORDS.len());
+    assert_eq!(
+        records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_member(gateway, 1);
+    assert_eq!(
+        records_read(&second),
+        vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// [`consume_as_group`] as static member `e2e-static-0` of group `e2e-static`, with a session long
+/// enough that its previous incarnation is still a member when it returns.
+fn consume_as_static_member(gateway: SocketAddr, count: usize) -> String {
+    let count = count.to_string();
+    run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-static",
+            "--consumer-property",
+            "group.instance.id=e2e-static-0",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &count,
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer as a static member")
+}
+
+/// `kafka-consumer-groups --describe --members` shows the client id and host of each member, as
+/// Kafka does (#4511). A static member stays in its group for its whole session after its
+/// consumer exits, so the tool still finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_java_consumer_when_describing_the_members_should_show_its_client_id_and_host() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let consumed = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--topic",
+            TOPIC,
+            "--group",
+            "e2e-members",
+            "--consumer-property",
+            "group.instance.id=e2e-members-0",
+            "--consumer-property",
+            "client.id=e2e-members-client",
+            "--consumer-property",
+            "session.timeout.ms=60000",
+            "--from-beginning",
+            "--max-messages",
+            &RECORDS.len().to_string(),
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer with a client id");
+    assert_eq!(
+        records_read(&consumed).len(),
+        RECORDS.len(),
+        "the consumer must join the group and read every record, got: {consumed}"
+    );
+
+    let described = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--describe",
+            "--group",
+            "e2e-members",
+            "--members",
+        ],
+        &[],
+    )
+    .expect_ran("kafka-consumer-groups --describe --members");
+    // GROUP, CONSUMER-ID, GROUP-INSTANCE-ID, HOST, CLIENT-ID, then #PARTITIONS. Matched as a
+    // run of fields, as the reset test above does.
+    let fields: Vec<&str> = described.split_whitespace().collect();
+    let shown = fields.windows(5).any(|row| {
+        row[0] == "e2e-members"
+            && row[1].starts_with("e2e-members-0-")
+            && row[2] == "e2e-members-0"
+            && row[3] == "/127.0.0.1"
+            && row[4] == "e2e-members-client"
+    });
+    assert!(
+        shown,
+        "the member must show its client id and host, got: {described}"
+    );
+}
+
+/// KIP-345 with librdkafka, which sends `JoinGroup` below v9: the returning member is told the
+/// previous leader, acts as a follower, and gets its old assignment back through `SyncGroup`.
+/// Without replacement the second run would wait on a rebalance its old incarnation never rejoins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_static_kcat_consumer_when_it_restarts_within_its_session_should_resume_at_once() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    let first = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&first).len(),
+        RECORDS.len(),
+        "the first run must read every record, got: {first}"
+    );
+
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+    let second = consume_as_static_kcat(gateway);
+    assert_eq!(
+        kcat_records_read(&second),
+        vec![format!("record {} k4=delta", RECORDS.len())],
+        "the returning static member must take its partition back, got: {second}"
+    );
+}
+
+/// kcat in balanced mode as static member `e2e-kcat-0` of group `e2e-kcat-static`, reading to
+/// the end of its partitions. It commits as it closes and sends no `LeaveGroup`.
+fn consume_as_static_kcat(gateway: SocketAddr) -> String {
+    run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &gateway.to_string(),
+            "-G",
+            "e2e-kcat-static",
+            "-X",
+            "group.instance.id=e2e-kcat-0",
+            "-X",
+            "session.timeout.ms=60000",
+            "-X",
+            "auto.offset.reset=earliest",
+            "-e",
+            "-f",
+            "record %o %k=%s\n",
+            TOPIC,
+        ],
+        &[],
+    )
+    .expect_ran("kcat as a static member")
+}
+
+fn kcat_records_read(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("record "))
+        .collect()
 }
 
 /// With auto topic creation on, a stock Java producer sends to a topic nobody created and succeeds.
@@ -1490,6 +2299,44 @@ async fn given_a_group_that_committed_when_the_gateway_restarts_should_resume_af
         vec![format!("Offset:{}\tk4\tdelta", RECORDS.len())],
         "the group must resume after its commit on a gateway that never saw it, got: {second}"
     );
+}
+
+/// The id `kafka-cluster.sh cluster-id` prints, which it reads through `DescribeCluster`.
+fn cluster_id(gateway: SocketAddr) -> String {
+    let bootstrap = gateway.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-cluster.sh",
+            "cluster-id",
+            "--bootstrap-server",
+            &bootstrap,
+        ],
+        &[],
+    )
+    .expect_ran("kafka-cluster.sh cluster-id");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("Cluster ID: "))
+        .unwrap_or_else(|| panic!("no cluster id printed, got: {output}"))
+        .trim()
+        .to_string()
+}
+
+/// The Java tool prints the same id before and after a gateway restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_gateway_restart_when_kafka_cluster_prints_the_id_should_print_the_same_one() {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let gateway = start_bridged_gateway(&server, &[]).await;
+    let before = cluster_id(gateway.addr);
+    gateway.stop().await;
+
+    let restarted = start_bridged_gateway(&server, &[]).await;
+    let after = cluster_id(restarted.addr);
+    assert_eq!(before, after, "the id must survive a restart");
+    assert_ne!(before, "None", "a null id prints as None");
 }
 
 /// G11 of `docs/MANUAL_TESTING.md`. Two members split the topic. When one leaves, the other
@@ -1867,8 +2714,12 @@ async fn tls_stack() -> Option<TlsStack> {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         produce_sessions: ProduceSessionLimits::default(),
         tls: IggyTls::default(),
+        idempotent_producers: true,
+        nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     })
     .await
     .expect("the bridge connects to a ready server");
@@ -2158,4 +3009,414 @@ async fn given_the_java_client_with_a_client_certificate_should_be_described_as_
         grants(&listing, "TOPIC", "READ"),
         "the mapped user's read_topics grant renders, got: {listing}"
     );
+}
+
+/// A Java producer that knows only the first gateway learns the second from Metadata. When the
+/// first stops, the producer goes on through the second. It is idempotent by default, so each
+/// record lands once, also the ones it sends again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_two_listed_gateways_when_the_first_stops_should_write_each_record_once_through_the_second()
+ {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(FAILOVER_TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let (first, second) = start_listed_gateways(&server, CoordinatorLog::Off).await;
+    let (first_addr, second_addr) = (first.addr.to_string(), second.addr.to_string());
+
+    let listing = run_client(KCAT_IMAGE, &["-b", &first_addr, "-L"], &[]).expect_ran("kcat -L");
+    assert!(
+        listing.contains(&format!("broker 1 at {first_addr}"))
+            && listing.contains(&format!("broker 2 at {second_addr}")),
+        "the first gateway must list both gateways: {listing}"
+    );
+
+    let bootstrap = format!("bootstrap.servers={first_addr}");
+    let (records, rate) = (FAILOVER_RECORDS.to_string(), FAILOVER_RATE.to_string());
+    let mut producer = RunningClient::start(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-producer-perf-test.sh",
+            "--topic",
+            FAILOVER_TOPIC,
+            "--num-records",
+            &records,
+            "--throughput",
+            &rate,
+            "--record-size",
+            "64",
+            "--producer-props",
+            &bootstrap,
+            "acks=all",
+            "request.timeout.ms=10000",
+            "delivery.timeout.ms=60000",
+        ],
+    );
+    producer.wait_for("the producer reports progress", |line| {
+        line.contains("records sent").then_some(())
+    });
+    first.stop().await;
+
+    let output = producer.wait_exit("the producer finishes");
+    assert!(
+        output
+            .iter()
+            .any(|line| line.starts_with(&format!("{FAILOVER_RECORDS} records sent"))),
+        "every record must be acknowledged: {output:#?}"
+    );
+    assert!(
+        !output.iter().any(|line| line.contains("Exception")),
+        "no send may fail: {output:#?}"
+    );
+    let read = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &second_addr,
+            "-C",
+            "-t",
+            FAILOVER_TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "%o\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat reads the topic through the second gateway");
+    let stored = read
+        .lines()
+        .filter(|line| line.parse::<u64>().is_ok())
+        .count();
+    assert_eq!(
+        stored, FAILOVER_RECORDS as usize,
+        "{stored} of {FAILOVER_RECORDS} records stored"
+    );
+}
+
+/// A Java consumer group reads through two gateways that share their groups through the
+/// coordinator log. The gateway that coordinates the group stops between two batches. The
+/// consumer finds the group at the other gateway and reads every record of the second batch,
+/// with no record read twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_two_gateways_with_the_coordinator_log_when_the_coordinator_stops_should_keep_the_group_reading()
+ {
+    const GROUP: &str = "e2e-moving";
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(GROUP_FAILOVER_TOPIC, 2)
+        .await
+        .expect("create the topic");
+    let (first, second) = start_listed_gateways(&server, CoordinatorLog::Required).await;
+    let bootstrap = format!("{},{}", first.addr, second.addr);
+    let coordinator = gateways::eventually(gateways::SETTLE, "a coordinator", || async {
+        let named = gateways::coordinators(first.addr, &[GROUP.to_string()]).await?;
+        Some(named[0])
+    })
+    .await;
+
+    produce_batch(&bootstrap);
+    let total = (2 * GROUP_FAILOVER_BATCH).to_string();
+    let mut consumer = RunningClient::start(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            GROUP_FAILOVER_TOPIC,
+            "--group",
+            GROUP,
+            "--from-beginning",
+            "--max-messages",
+            &total,
+            "--timeout-ms",
+            "60000",
+            "--property",
+            "print.partition=true",
+            "--property",
+            "print.offset=true",
+        ],
+    );
+    let mut read = 0;
+    consumer.wait_for("the first batch", |line| {
+        read += usize::from(line.starts_with("Partition:"));
+        (read == GROUP_FAILOVER_BATCH).then_some(())
+    });
+
+    let (stopped, survivor) = if coordinator == 1 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    stopped.stop().await;
+    produce_batch(&survivor.addr.to_string());
+
+    let output = consumer.wait_exit("the consumer reads the second batch");
+    let records: Vec<&String> = output
+        .iter()
+        .filter(|line| line.starts_with("Partition:"))
+        .collect();
+    let distinct: std::collections::BTreeSet<(&str, &str)> = records
+        .iter()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            Some((fields.next()?, fields.next()?))
+        })
+        .collect();
+    assert_eq!(
+        distinct.len(),
+        2 * GROUP_FAILOVER_BATCH,
+        "every record must be read once through the moved group: {output:#?}"
+    );
+    survivor.stop().await;
+}
+
+/// Writes one batch of `GROUP_FAILOVER_BATCH` records to `GROUP_FAILOVER_TOPIC` through
+/// `bootstrap`.
+fn produce_batch(bootstrap: &str) {
+    let records = GROUP_FAILOVER_BATCH.to_string();
+    let servers = format!("bootstrap.servers={bootstrap}");
+    run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-producer-perf-test.sh",
+            "--topic",
+            GROUP_FAILOVER_TOPIC,
+            "--num-records",
+            &records,
+            "--throughput",
+            "-1",
+            "--record-size",
+            "16",
+            "--producer-props",
+            &servers,
+            "acks=all",
+        ],
+        &[],
+    )
+    .expect_ran("the batch is produced");
+}
+
+/// A Java producer behind a relay that loses Produce responses sends those batches again, on a new
+/// connection. The partitions hold its producer state, so each record lands once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn given_lost_produce_responses_when_an_idempotent_producer_retries_should_write_each_record_once()
+ {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let relay_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    let gateway = start_gateway_behind(&server, (LOST_REPLY_TOPIC, 1), relay_addr).await;
+    let relay = LosingRelay::start(relay_listener, gateway.addr, LOST_REPLIES);
+
+    let bootstrap = format!("bootstrap.servers={relay_addr}");
+    let records = LOST_REPLY_RECORDS.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-producer-perf-test.sh",
+            "--topic",
+            LOST_REPLY_TOPIC,
+            "--num-records",
+            &records,
+            "--throughput",
+            "200",
+            "--record-size",
+            "64",
+            "--producer-props",
+            &bootstrap,
+            "acks=all",
+            "request.timeout.ms=10000",
+            "delivery.timeout.ms=60000",
+        ],
+        &[],
+    )
+    .expect_ran("the producer runs");
+    assert!(
+        output
+            .lines()
+            .any(|line| line.starts_with(&format!("{LOST_REPLY_RECORDS} records sent"))),
+        "every record must be acknowledged: {output}"
+    );
+    assert_eq!(
+        relay.lost(),
+        LOST_REPLIES,
+        "the relay must lose that many responses: {output}"
+    );
+
+    let read = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &relay_addr.to_string(),
+            "-C",
+            "-t",
+            LOST_REPLY_TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "%o\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat reads the topic");
+    let stored = read
+        .lines()
+        .filter(|line| line.parse::<u64>().is_ok())
+        .count();
+    assert_eq!(
+        stored, LOST_REPLY_RECORDS as usize,
+        "{stored} of {LOST_REPLY_RECORDS} records stored"
+    );
+    gateway.stop().await;
+}
+
+/// A bridged gateway that advertises `relay` in place of its own address, so a client that learns
+/// the brokers from Metadata stays behind the relay.
+async fn start_gateway_behind(
+    server: &TestServer,
+    (topic, partitions): (&str, u32),
+    relay: SocketAddr,
+) -> BridgedGateway {
+    let bridge = root_bridge(server).await;
+    bridge
+        .ensure_stream_and_topic(topic, partitions)
+        .await
+        .expect("create the topic");
+    let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = socket.local_addr().expect("local addr");
+    let listener = BoundListener::new(
+        ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string())
+            .with_advertised(relay.ip().to_string(), relay.port()),
+        socket,
+    );
+    let gateway = KafkaGateway::new(GatewayConfig::default()).with_bridge(Some(Arc::new(bridge)));
+    let (shutdown, receiver) = broadcast::channel(1);
+    let task = tokio::spawn(async move {
+        let _ = gateway.run(vec![listener], receiver).await;
+    });
+    BridgedGateway {
+        addr,
+        shutdown,
+        task,
+    }
+}
+
+/// A TCP relay to a gateway that loses its first Produce responses. It reads the Kafka frames of
+/// each connection, and drops a Produce response together with its connection.
+struct LosingRelay {
+    lost: Arc<AtomicUsize>,
+}
+
+impl LosingRelay {
+    fn start(listener: TcpListener, gateway: SocketAddr, losses: usize) -> Self {
+        let lost = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(AtomicUsize::new(losses));
+        let counted = Arc::clone(&lost);
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(upstream) = TcpStream::connect(gateway).await else {
+                    continue;
+                };
+                tokio::spawn(relay_frames(
+                    client,
+                    upstream,
+                    Arc::clone(&budget),
+                    Arc::clone(&counted),
+                ));
+            }
+        });
+        Self { lost }
+    }
+
+    fn lost(&self) -> usize {
+        self.lost.load(Ordering::SeqCst)
+    }
+}
+
+/// Copies frames both ways until one side closes, or until a Produce response is lost.
+async fn relay_frames(
+    client: TcpStream,
+    upstream: TcpStream,
+    budget: Arc<AtomicUsize>,
+    lost: Arc<AtomicUsize>,
+) {
+    const API_KEY_PRODUCE: i16 = 0;
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    let produce_requests = Arc::new(Mutex::new(HashSet::new()));
+    let requests = {
+        let produce_requests = Arc::clone(&produce_requests);
+        async move {
+            while let Some(frame) = read_frame(&mut client_read).await {
+                // After the length: api key, api version, correlation id.
+                if frame.len() >= 12 && i16::from_be_bytes([frame[4], frame[5]]) == API_KEY_PRODUCE
+                {
+                    let correlation =
+                        i32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
+                    produce_requests
+                        .lock()
+                        .expect("the request set")
+                        .insert(correlation);
+                }
+                if upstream_write.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let responses = async move {
+        while let Some(frame) = read_frame(&mut upstream_read).await {
+            let correlation = i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
+            let produce = produce_requests
+                .lock()
+                .expect("the request set")
+                .remove(&correlation);
+            if produce
+                && budget
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                lost.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            if client_write.write_all(&frame).await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        () = requests => {}
+        () = responses => {}
+    }
+}
+
+/// One length-prefixed Kafka frame, the length included.
+async fn read_frame(read: &mut OwnedReadHalf) -> Option<Vec<u8>> {
+    let mut length = [0; 4];
+    read.read_exact(&mut length).await.ok()?;
+    let size = usize::try_from(i32::from_be_bytes(length)).ok()?;
+    let mut frame = vec![0; 4 + size];
+    frame[..4].copy_from_slice(&length);
+    read.read_exact(&mut frame[4..]).await.ok()?;
+    Some(frame)
 }

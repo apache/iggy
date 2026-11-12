@@ -64,7 +64,9 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     ///     Sends a command code with a payload and returns the raw response bytes.
     /// </summary>
     /// <remarks>
-    ///     Session-control codes are rejected with an invalid-command error.
+    ///     Session-control codes and the deferred codes (PollMessagesDeferred, CancelDeferredRequest and FetchMessages)
+    ///     are rejected with an invalid-command error. A deferred poll or a fetch
+    ///     goes through the typed calls of <see cref="IIggyConsumer" />, which own its deadline and its cancel.
     ///     HTTP clients report that this operation is unavailable.
     /// </remarks>
     /// <param name="code">The numeric command code to send.</param>
@@ -72,6 +74,26 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
     Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
+
+    /// <summary>
+    ///     Sends a command code with a payload to the replica with the given id and returns its raw response bytes.
+    /// </summary>
+    /// <remarks>
+    ///     The replica id is the one that cluster metadata names for the node. Every node answers non-replicated
+    ///     commands such as GetStats from its own state, so this reads the state of the chosen node. The request carries
+    ///     the metadata watermark of the session. Replicated commands, PollMessages, GetConsumerOffset, session-control
+    ///     and deferred codes are rejected with an invalid-command error before anything is sent. An id that cluster metadata does not name
+    ///     after one read of it fails with an invalid-identifier error. A replica that cannot be reached, or that answers
+    ///     with TransientNotAccepted, is asked again until the request timeout. Any other refusal, NotPrimary included, is
+    ///     returned and never sent to another replica. HTTP clients report that this operation is unavailable.
+    /// </remarks>
+    /// <param name="code">The numeric command code to send.</param>
+    /// <param name="payload">The request payload.</param>
+    /// <param name="replicaId">The replica id that cluster metadata names.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
+    Task<byte[]> SendBinaryRequestToReplicaAsync(uint code, byte[] payload, byte replicaId,
+        CancellationToken token = default);
 
     /// <summary>
     ///     Replays a retained operation within one timeout. Success proves commit; a proved business rejection
@@ -85,6 +107,8 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     ///     send or another caller of this client replayed it first. <see cref="VsrOperationNotRetainedException" />
     ///     means that the outcome is unknown and this client can no longer recover it: a session reset or an abandon
     ///     dropped the operation before a replay proved its outcome, or that outcome aged out.
+    ///     An uncertain committing poll or fetch instead throws <see cref="VsrFetchProgressUncertainException" />
+    ///     without I/O. Its recovery id cannot prove completion by replay or offset inspection.
     /// </remarks>
     Task ResolveOperationAsync(ulong operationId, TimeSpan timeout, CancellationToken token = default) =>
         Task.FromException(new FeatureUnavailableException());
@@ -95,6 +119,8 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     ///     operation that is already running is not canceled. It keeps the lane until it ends, so later mutations of
     ///     the lane still wait behind it, and the client keeps the outcome it proves for
     ///     <see cref="ResolveOperationAsync" />.
+    ///     For an uncertain committing poll or fetch, this releases every affected partition locally and accepts
+    ///     that the old server request may still commit. It does not cancel or fence that request.
     /// </summary>
     Task AbandonOperationAsync(ulong operationId) => Task.FromException(new FeatureUnavailableException());
 }

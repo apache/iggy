@@ -31,6 +31,11 @@ const TOPIC: &str = "metrics-topic";
 const METRICS_USER: &str = "metrics-reader";
 const METRICS_PASSWORD: &str = "metrics-reader-pass";
 const TOPIC_SERIES: [&str; 3] = ["topic_size_bytes", "topic_messages", "topic_max_size_bytes"];
+/// The host volume's series, gated by the same rule as the per-topic ones.
+/// `volume_used_bytes` waits for the first disk sample, so only the counter is
+/// certain to be in a privileged scrape.
+const DISK_SERIES: [&str; 2] = ["volume_used_bytes", "disk_allocated_bytes"];
+const DISK_COUNTER: &str = "disk_allocated_bytes_total ";
 
 /// The value of the unlabelled `name` gauge.
 fn gauge(exposition: &str, name: &str) -> Option<u64> {
@@ -59,7 +64,10 @@ async fn given_topic_with_messages_when_scraping_metrics_should_report_its_size_
     harness: &TestHarness,
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
-    client.create_stream(STREAM).await.expect("create stream");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
     let stream_id = Identifier::from_str_value(STREAM).expect("stream identifier");
     let topic_id = Identifier::from_str_value(TOPIC).expect("topic identifier");
     client
@@ -175,7 +183,7 @@ async fn given_scraped_topic_when_deleted_should_drop_its_series_on_next_scrape(
 }
 
 #[iggy_harness(cluster_nodes = 1)]
-async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_series(
+async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_and_disk_series(
     harness: &TestHarness,
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
@@ -196,6 +204,7 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             METRICS_PASSWORD,
             UserStatus::Active,
             Some(permissions),
+            &UserCreateOptions::default(),
         )
         .await
         .expect("create metrics user");
@@ -211,6 +220,12 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             "root must see the {name} series:\n{privileged_before}"
         );
     }
+    assert!(
+        privileged_before
+            .lines()
+            .any(|line| line.starts_with(DISK_COUNTER)),
+        "root must see the disk series:\n{privileged_before}"
+    );
 
     let restricted = scrape_as(&user).await;
     assert_eq!(
@@ -231,6 +246,12 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             "a user without server read must not see any {name} series:\n{restricted}"
         );
     }
+    for name in DISK_SERIES {
+        assert!(
+            !restricted.lines().any(|line| line.contains(name)),
+            "a user without server read must not see the {name} series:\n{restricted}"
+        );
+    }
 
     let privileged_after = scrape_as(&root).await;
     for name in TOPIC_SERIES {
@@ -239,10 +260,19 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             "a denied scrape must not empty the next privileged one ({name}):\n{privileged_after}"
         );
     }
+    assert!(
+        privileged_after
+            .lines()
+            .any(|line| line.starts_with(DISK_COUNTER)),
+        "a denied scrape must not hide the disk series from the next privileged one:\n{privileged_after}"
+    );
 }
 
 async fn create_topic(client: &IggyClient, max_topic_size: MaxTopicSize) {
-    client.create_stream(STREAM).await.expect("create stream");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
     let stream_id = Identifier::from_str_value(STREAM).expect("stream identifier");
     client
         .create_topic(

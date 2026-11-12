@@ -55,7 +55,7 @@ use crate::boot::threads::{
     install_panic_hook, join_partial_shard_survivors, resolve_shard_assignments, run_shard_thread,
     spawn_shutdown_watchdog, validate_sharding_runtime_knobs,
 };
-use crate::boot::topology::{RosterCells, resolve_tcp_topology};
+use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::server_error::ServerError;
@@ -66,6 +66,7 @@ use iggy_binary_protocol::Operation;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
+use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
@@ -87,7 +88,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-4\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-METADATA-CHANGE-LOG-1\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -295,6 +296,7 @@ pub fn bootstrap(
     install_default_crypto_provider();
     let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
+    crate::external_auth::preflight(&config.external_auth)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -340,7 +342,15 @@ pub fn bootstrap(
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
     // shard's installer / disconnect path writes.
-    let owner_table = Arc::new(ReplicaOwnerTable::new());
+    let owner_table = Arc::new(ReplicaOwnerTable::with_layout(replica_link_layout(
+        &config,
+        total_shards,
+    )?));
+    let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
+        usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
+            ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
+        })?,
+    ));
 
     // Single-shot bundle handoff (see `MetadataHandoff`): shard 0 sends
     // one cloned `ServerMetadataBundle` per peer; each peer drains
@@ -375,7 +385,14 @@ pub fn bootstrap(
     // would gate reads on a number nothing moves - and it carries the held
     // reads' budget, which is sized from the configured commit-broadcast
     // cadence and which a peer shard has no other way to learn.
-    let metadata_applied_frontier = Arc::new(AppliedFrontier::new(read_frontier_budget(&config)));
+    let mut metadata_applied_frontier = AppliedFrontier::new(read_frontier_budget(&config));
+    if config.cluster.enabled && config.cluster.nodes.len() > 1 {
+        metadata_applied_frontier = metadata_applied_frontier.with_partition_freshness(
+            std::time::Instant::now(),
+            config.cluster.heartbeat_timeout.get_duration(),
+        );
+    }
+    let metadata_applied_frontier = Arc::new(metadata_applied_frontier);
     // Every shard's metric handles, minted before the threads spawn: each
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the
@@ -396,6 +413,7 @@ pub fn bootstrap(
         let config_for_shard = Arc::clone(&config);
         let shutdown_flag_for_shard = Arc::clone(&shutdown_flag);
         let owner_table_for_shard = Arc::clone(&owner_table);
+        let repair_memory_for_shard = Arc::clone(&repair_memory);
         let metadata_handoff_for_shard = if shard_id == 0 {
             MetadataHandoff::Owner {
                 bundle_tx: metadata_bundle_tx.clone(),
@@ -437,6 +455,7 @@ pub fn bootstrap(
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
+                    repair_memory_for_shard,
                     roster_cells_for_shard,
                     applied_frontier_for_shard,
                     shard_metrics_for_shard,
@@ -511,6 +530,7 @@ async fn shard_main(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    repair_memory: Arc<partitions::RepairMemoryBudget>,
     roster_cells: RosterCells,
     metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
@@ -562,72 +582,91 @@ async fn shard_main(
     // so the writer must first be parked in a binding that outlives the peer
     // wait armed below. A `recover()` failure inside the arm is safe for the
     // same reason -- no peer holds a handle yet.
-    let (mux_stm, pending_bundle_tx, owner_state, root_credentials) = match metadata_handoff {
-        MetadataHandoff::Owner {
-            bundle_tx,
-            root_credentials,
-        } => {
-            let recovered = recover::<ServerMuxStateMachine>(
-                data_dir,
-                ReplicaIdentity {
-                    cluster: topology.cluster_id,
-                    replica_id: topology.self_replica_id,
-                    replica_count: topology.replica_count,
-                },
-                config.metadata.journal_slots,
-                config.metadata.clients_table_max,
-                |_| {},
-                |mux_stm, header| {
-                    if header.operation == iggy_binary_protocol::Operation::Register {
-                        mux_stm.streams().refresh_consumer_group_session(
-                            header.client,
-                            header.op,
-                            header.op,
-                            iggy_common::IggyTimestamp::from(header.timestamp),
-                        );
-                    } else {
-                        mux_stm.streams().remove_consumer_group_member(
-                            header.client,
-                            iggy_common::IggyTimestamp::from(header.timestamp),
-                            header.op,
-                        );
-                    }
-                },
-            )
-            .await
-            .map_err(ServerError::MetadataRecovery)?;
-            (
-                Rc::new(recovered.mux_stm),
-                Some(bundle_tx),
-                Some(RecoveredOwnerState {
-                    journal: recovered.journal,
-                    snapshot: recovered.snapshot,
-                    last_applied_op: recovered.last_applied_op,
-                    last_journaled_op: recovered.last_journaled_op,
-                    client_table: recovered.client_table,
-                    superblock: recovered.superblock,
-                    recovered_state: recovered.recovered_state,
-                    snapshot_checkpoint: recovered.snapshot_checkpoint,
-                }),
+    let (mux_stm, change_log, pending_bundle_tx, owner_state, root_credentials) =
+        match metadata_handoff {
+            MetadataHandoff::Owner {
+                bundle_tx,
                 root_credentials,
-            )
-        }
-        MetadataHandoff::Waiter { bundle_rx } => {
-            let bundle = await_metadata_bundle(
-                shard_id,
-                &bundle_rx,
-                &shutdown_flag_for_handoff,
-                poll_interval,
-            )
-            .await?;
-            (
-                Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle)),
-                None,
-                None,
-                None,
-            )
-        }
-    };
+            } => {
+                let recovered = recover::<ServerMuxStateMachine>(
+                    data_dir,
+                    ReplicaIdentity {
+                        cluster: topology.cluster_id,
+                        replica_id: topology.self_replica_id,
+                        replica_count: topology.replica_count,
+                    },
+                    config.metadata.journal_slots,
+                    config.metadata.clients_table_max,
+                    |_| {},
+                    ChangeLogCapacities {
+                        resource: config.metadata.change_log_resource_capacity,
+                        activity: config.metadata.change_log_activity_capacity,
+                    },
+                )
+                .await
+                .map_err(ServerError::MetadataRecovery)?;
+                let fresh_storage = recovered.last_journaled_op.unwrap_or_else(|| {
+                    recovered
+                        .snapshot
+                        .as_ref()
+                        .map_or(0, metadata::stm::snapshot::Snapshot::sequence_number)
+                }) == 0
+                    && recovered.recovered_state.is_none();
+                if let Some((namespace, node)) = recovered
+                    .mux_stm
+                    .streams()
+                    .member_outside_cluster(topology.replica_count)
+                {
+                    return Err(ServerError::PartitionMemberOutsideCluster {
+                        namespace_raw: namespace.inner(),
+                        node,
+                        nodes: topology.replica_count,
+                    });
+                }
+                // Peers may already hold partitions this node stored before
+                // it lost its storage; see `load_partition_or_fence`.
+                if fresh_storage && topology.replica_count > 1 {
+                    crate::partition_helpers::record_storage_epoch(
+                        &config.get_system_path(),
+                        iggy_common::IggyTimestamp::now().as_micros(),
+                    )
+                    .await?;
+                }
+                (
+                    Rc::new(recovered.mux_stm),
+                    Rc::new(recovered.change_log),
+                    Some(bundle_tx),
+                    Some(RecoveredOwnerState {
+                        journal: recovered.journal,
+                        snapshot: recovered.snapshot,
+                        last_applied_op: recovered.last_applied_op,
+                        last_journaled_op: recovered.last_journaled_op,
+                        client_table: recovered.client_table,
+                        superblock: recovered.superblock,
+                        recovered_state: recovered.recovered_state,
+                        snapshot_checkpoint: recovered.snapshot_checkpoint,
+                        history: recovered.history,
+                    }),
+                    root_credentials,
+                )
+            }
+            MetadataHandoff::Waiter { bundle_rx } => {
+                let bundle = await_metadata_bundle(
+                    shard_id,
+                    &bundle_rx,
+                    &shutdown_flag_for_handoff,
+                    poll_interval,
+                )
+                .await?;
+                (
+                    Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle.states)),
+                    Rc::new(MetadataChangeLog::from_factory(bundle.change_log)),
+                    None,
+                    None,
+                    None,
+                )
+            }
+        };
 
     // Shard 0 owns the metadata state machine's only write handle, and the
     // peers read through it until their runtimes are gone. Declared after
@@ -647,7 +686,10 @@ async fn shard_main(
         broadcast_metadata_bundle(
             shard_id,
             &bundle_tx,
-            mux_stm.factory_bundle(),
+            ServerMetadataBundle {
+                states: mux_stm.factory_bundle(),
+                change_log: change_log.factory(),
+            },
             total_shards.saturating_sub(1),
             &shutdown_flag_for_handoff,
             poll_interval,
@@ -692,7 +734,8 @@ async fn shard_main(
         Rc::clone(&mux_stm),
         Some(PathBuf::from(&config.path)),
     )
-    .with_applied_frontier(metadata_applied_frontier);
+    .with_applied_frontier(metadata_applied_frontier)
+    .with_change_log(Rc::clone(&change_log));
     metadata.seed_applied_frontier_from_consensus();
     // Size the VSR client table before listeners bind and any client registers.
     // Must precede the recovered-table install below: the setter rebuilds the
@@ -700,6 +743,14 @@ async fn shard_main(
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
     metadata.set_partitions_max(config.metadata.partitions_max);
+    metadata.set_default_replication_factor(config.cluster.default_replication_factor.factor());
+    let mut racks = vec![None; config.cluster.nodes.len()];
+    for node in &config.cluster.nodes {
+        if let Some(rack) = racks.get_mut(usize::from(node.replica_id)) {
+            rack.clone_from(&node.rack);
+        }
+    }
+    metadata.set_node_racks(&racks);
     metadata.set_max_tokens_per_user(config.personal_access_token.max_tokens_per_user);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
@@ -732,6 +783,7 @@ async fn shard_main(
         sessions,
         consumer_group_liveness,
         shard_handle,
+        unbuilt,
     } = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
@@ -744,6 +796,7 @@ async fn shard_main(
         reply_inbox,
         shard_metrics,
         &roster_cells,
+        repair_memory,
     ))
     .await?;
 
@@ -850,6 +903,7 @@ async fn shard_main(
         topology.self_replica_id,
         topology.replica_count,
     ));
+    reconciler_ctx.mark_unbuilt(unbuilt);
     let reconcile_periodic = config.sharding.reconcile_periodic_interval.get_duration();
     let reconciler_handle = compio::runtime::spawn({
         let ctx = Rc::clone(&reconciler_ctx);
@@ -911,6 +965,39 @@ async fn shard_main(
         None
     };
 
+    // Stream key rewrapper: shard 0 only, and only while this node's keys call
+    // for a rotation, since otherwise no stored set can differ from its target.
+    // Retired fingerprints matter only to the rewrapper, so only its context
+    // holds them. Each sweep no-ops unless this node is the caught-up metadata
+    // primary, so a rotation is replicated once to every replica.
+    let rewrap_context = if shard_id == 0 {
+        Some(
+            (*shard.plane.partitions().key_context())
+                .clone()
+                .with_retired_kek_fingerprints(&config.encryption.retired_kek_fingerprints)
+                .map_err(|error| ServerError::Iggy(Box::new(error)))?,
+        )
+    } else {
+        None
+    };
+    let stream_key_rewrapper_stop = match rewrap_context {
+        Some(rewrap_context) if rewrap_context.rotating() => {
+            let (rewrapper_stop_tx, rewrapper_stop_rx) = channel(1);
+            let rewrapper_shard = Rc::clone(&shard);
+            let rewrapper_handle = compio::runtime::spawn(async move {
+                crate::stream_key_rewrapper::run_stream_key_rewrapper(
+                    rewrapper_shard,
+                    rewrap_context,
+                    rewrapper_stop_rx,
+                )
+                .await;
+            });
+            bus.track_background(rewrapper_handle);
+            Some(rewrapper_stop_tx)
+        }
+        _ => None,
+    };
+
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
     // data-maintenance config.
@@ -931,6 +1018,7 @@ async fn shard_main(
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
+        stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
@@ -995,6 +1083,10 @@ async fn shard_main(
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
+        let close_coord = Rc::clone(&coord);
+        bus.set_replica_link_close_fn(Box::new(move |owner, link| {
+            close_coord.close_replica_link(owner, link);
+        }));
         let connections = Rc::new(client_connection_cap(config.message_bus.connections_max));
         let accepted_client = make_shard_zero_client_accept_fns(
             coord,
@@ -1043,6 +1135,7 @@ async fn shard_main(
     if shard_id == 0 {
         let (stop_tx, stop_rx) = channel(1);
         let cleaner_shard = Rc::clone(&shard);
+        let shutdown = bus.token();
         let interval = config.consumer_group.heartbeat_interval.get_duration();
         let timeout = config.heartbeat.session_timeout();
         let system_path = config.get_system_path();
@@ -1051,6 +1144,7 @@ async fn shard_main(
                 cleaner_shard,
                 consumer_group_liveness,
                 stop_rx,
+                shutdown,
                 interval,
                 timeout,
                 system_path,
@@ -1087,7 +1181,7 @@ async fn shard_main(
     // Await the watchdog even when the drain verdict is an error: the token
     // has fired, so it either stands down within one poll interval or is
     // mid-`bus.shutdown()`, and dropping it there truncates in-flight
-    // `ClientForwardFailed` replies.
+    // client replies.
     let pump_verdict = await_pump_drain(pump_handle.take(), config, shard_id).await;
     if let Some(watchdog) = shutdown_watchdog.take() {
         let _ = watchdog.await;
@@ -1240,7 +1334,10 @@ mod tests {
             b"IGGY-OWNERSHIP-HISTORY-5\n",
             b"IGGY-BOUND-GRANTS-2\n",
             b"IGGY-BOUND-GRANTS-3\n",
+            b"IGGY-BOUND-GRANTS-4\n",
+            b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
+            b"IGGY-RESOURCE-OPTIONS-1\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();
@@ -1269,23 +1366,27 @@ mod tests {
     }
 
     #[test]
-    fn given_different_root_bootstrap_formats_when_identifying_replicas_should_reject_mixing() {
-        assert_ne!(
-            message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),
-            message_bus::replica::handshake::binary_identity(
-                crate::VERSION,
-                b"IGGY-BOUND-GRANTS-3\n"
-            ),
-        );
+    fn given_different_storage_formats_when_identifying_replicas_should_reject_mixing() {
+        for older_format in [
+            b"IGGY-BOUND-GRANTS-3\n".as_slice(),
+            b"IGGY-BOUND-GRANTS-4\n",
+            b"IGGY-BOUND-GRANTS-5\n",
+            b"IGGY-RESOURCE-OPTIONS-1\n",
+        ] {
+            assert_ne!(
+                message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),
+                message_bus::replica::handshake::binary_identity(crate::VERSION, older_format),
+            );
+        }
     }
 
     #[test]
     fn reconciler_driven_ops_broadcast_a_commit_tick() {
         // `TruncatePartition` commits without touching the partition set, so
-        // nothing else signals the reconciler: `reconcile_segment_truncations`
-        // is the only code that turns it into on-disk effect, and it runs only
-        // when a pass runs. Dropping it from the filter silently downgrades it
-        // to the periodic tick.
+        // nothing else signals the reconciler: its trim check is the only code
+        // that turns it into on-disk effect, and it runs only when a pass runs.
+        // Dropping it from the filter silently downgrades it to the periodic
+        // tick.
         assert!(
             operation_triggers_partition_reconcile(Operation::TruncatePartition),
             "TruncatePartition is enforced by the reconciler and must wake it on commit"

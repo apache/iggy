@@ -20,13 +20,15 @@
 
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
-    CompressionAlgorithm, HttpClientConfig, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp,
-    MaxTopicSize, Partition, PartitionContext, StreamDetails, TopicDetails,
+    HttpClientConfig, IggyByteSize, IggyError, IggyTimestamp, Partition, PartitionContext,
+    PolledMessages, StreamDetails, TopicDetails,
 };
+use reqwest::Url;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -36,6 +38,8 @@ const UNSCRIPTED_STATUS: u16 = 418;
 const HEAD_END: &[u8] = b"\r\n\r\n";
 const STREAM_ID: u32 = 1;
 const TOPIC_ID: u32 = 1;
+/// Resolves the target of a request line, which holds only a path and a query.
+const REQUEST_ORIGIN: &str = "http://localhost";
 
 /// One request the client sent.
 #[derive(Debug)]
@@ -48,31 +52,66 @@ pub(super) struct Recorded {
 }
 
 impl Recorded {
-    /// The `context` the request body carries, `None` when the field is absent.
+    /// The `context` the request body carries, `None` when the field is absent or null.
     pub(super) fn context(&self) -> Option<PartitionContext> {
         let body: serde_json::Value = serde_json::from_slice(&self.body).unwrap();
         body.get("context")
-            .map(|context| serde_json::from_value(context.clone()).unwrap())
+            .and_then(|context| serde_json::from_value(context.clone()).unwrap())
+    }
+
+    /// The value of `key` in the query of the request, `None` when the key is absent.
+    pub(super) fn query(&self, key: &str) -> Option<String> {
+        let target = self.line.split_whitespace().nth(1).unwrap();
+        Url::parse(&format!("{REQUEST_ORIGIN}{target}"))
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.into_owned())
     }
 }
 
 pub(super) struct Reply {
-    status: u16,
+    /// `None` closes the connection without an answer.
+    status: Option<u16>,
     body: String,
+    /// Closes the connection after the head, so the body it announces never arrives.
+    cut: bool,
+    /// Without a status, keeps the connection open instead of closing it.
+    stall: bool,
 }
 
 impl Reply {
     pub(super) fn empty(status: u16) -> Self {
         Self {
-            status,
+            status: Some(status),
             body: String::new(),
+            cut: false,
+            stall: false,
+        }
+    }
+
+    /// A server that fails after it read the request.
+    pub(super) fn hang_up() -> Self {
+        Self {
+            status: None,
+            body: String::new(),
+            cut: false,
+            stall: false,
+        }
+    }
+
+    /// A server that never answers the request it read.
+    pub(super) fn stall() -> Self {
+        Self {
+            stall: true,
+            ..Self::hang_up()
         }
     }
 
     /// The error body the server renders for `error`.
     pub(super) fn error(status: u16, error: &IggyError) -> Self {
         Self {
-            status,
+            status: Some(status),
             body: serde_json::json!({
                 "id": error.as_code(),
                 "code": error.as_string(),
@@ -80,14 +119,38 @@ impl Reply {
                 "field": null,
             })
             .to_string(),
+            cut: false,
+            stall: false,
         }
     }
 
     pub(super) fn topic(contexts: &[(u32, PartitionContext)]) -> Self {
         Self {
-            status: 200,
+            status: Some(200),
             body: topic_details_json(contexts),
+            cut: false,
+            stall: false,
         }
+    }
+
+    /// The answer to a poll that found no messages.
+    pub(super) fn polled() -> Self {
+        Self::batch(&PolledMessages::empty())
+    }
+
+    /// The answer to a poll that found `batch`.
+    pub(super) fn batch(batch: &PolledMessages) -> Self {
+        Self {
+            status: Some(200),
+            body: serde_json::to_string(batch).unwrap(),
+            cut: false,
+            stall: false,
+        }
+    }
+
+    /// This answer with its body lost after the head.
+    pub(super) fn cut(self) -> Self {
+        Self { cut: true, ..self }
     }
 
     pub(super) fn stream() -> Self {
@@ -102,8 +165,10 @@ impl Reply {
             options: Default::default(),
         };
         Self {
-            status: 200,
+            status: Some(200),
             body: serde_json::to_string(&stream).unwrap(),
+            cut: false,
+            stall: false,
         }
     }
 }
@@ -111,6 +176,7 @@ impl Reply {
 pub(super) struct ScriptedServer {
     api_url: String,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    arrived: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -120,9 +186,12 @@ impl ScriptedServer {
         let api_url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
+        let arrived = Arc::new(Notify::new());
+        let notify = Arc::clone(&arrived);
         let started = Instant::now();
         let task = tokio::spawn(async move {
             let mut replies = replies.into_iter();
+            let mut stalled = Vec::new();
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (line, body) = read_request(&mut stream).await;
@@ -131,24 +200,40 @@ impl ScriptedServer {
                     body,
                     at: started.elapsed(),
                 });
+                notify.notify_one();
                 let reply = replies
                     .next()
                     .unwrap_or_else(|| Reply::empty(UNSCRIPTED_STATUS));
-                let response = format!(
+                let Some(status) = reply.status else {
+                    if reply.stall {
+                        stalled.push(stream);
+                    }
+                    continue;
+                };
+                let head = format!(
                     "HTTP/1.1 {} Scripted\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{}",
-                    reply.status,
+                     content-length: {}\r\nconnection: close\r\n\r\n",
+                    status,
                     reply.body.len(),
-                    reply.body
                 );
-                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(head.as_bytes()).await.unwrap();
+                if !reply.cut {
+                    stream.write_all(reply.body.as_bytes()).await.unwrap();
+                }
             }
         });
         Self {
             api_url,
             requests,
+            arrived,
             task,
         }
+    }
+
+    /// Waits until the server read a request, or returns at once if it read one since the last
+    /// wait.
+    pub(super) async fn request_arrived(&self) {
+        self.arrived.notified().await;
     }
 
     /// A client logged in with a token, so every path passes the authentication check.
@@ -185,6 +270,8 @@ pub(crate) fn topic_details_json(contexts: &[(u32, PartitionContext)]) -> String
             size: IggyByteSize::default(),
             messages_count: 0,
             context,
+            members: Vec::new(),
+            in_sync_members: Vec::new(),
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&TopicDetails {
@@ -192,9 +279,6 @@ pub(crate) fn topic_details_json(contexts: &[(u32, PartitionContext)]) -> String
         created_at: IggyTimestamp::zero(),
         name: "topic".to_owned(),
         size: IggyByteSize::default(),
-        message_expiry: IggyExpiry::NeverExpire,
-        compression_algorithm: CompressionAlgorithm::None,
-        max_topic_size: MaxTopicSize::Unlimited,
         messages_count: 0,
         partitions_count: u32::try_from(partitions.len()).unwrap(),
         partitions,

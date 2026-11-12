@@ -35,31 +35,30 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			name := createRandomString(32)
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			partitions := uint32(2)
+			expiry := iggcon.Millisecond
+			maxTopicSize := uint64(math.MaxUint64)
 			_, err := client.CreateTopic(
 				context.Background(),
 				streamIdentifier,
 				name,
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.Millisecond,
-				math.MaxUint64)
+				&iggcon.TopicOptions{PartitionsCount: &partitions, MessageExpiry: &expiry, MaxTopicSize: &maxTopicSize})
 
 			itShouldNotReturnError(err)
 		})
 
 		ginkgo.Context("and tries to create topic for a non existing stream", func() {
 			client := createAuthorizedConnection()
-			streamId := createRandomUInt32()
 			name := createRandomString(32)
-			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			streamIdentifier := nonExistingStreamIdentifier(client)
+			partitions := uint32(2)
+			expiry := iggcon.Millisecond
+			maxTopicSize := uint64(math.MaxUint64)
 			_, err := client.CreateTopic(
 				context.Background(),
 				streamIdentifier,
 				name,
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.Millisecond,
-				math.MaxUint64)
+				&iggcon.TopicOptions{PartitionsCount: &partitions, MessageExpiry: &expiry, MaxTopicSize: &maxTopicSize})
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
@@ -71,14 +70,13 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			_, name := successfullyCreateTopic(streamId, client)
 
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			partitions := uint32(2)
+			maxTopicSize := uint64(math.MaxUint64)
 			_, err := client.CreateTopic(
 				context.Background(),
 				streamIdentifier,
 				name,
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.IggyExpiryServerDefault,
-				math.MaxUint64)
+				&iggcon.TopicOptions{PartitionsCount: &partitions, MaxTopicSize: &maxTopicSize})
 			itShouldReturnSpecificError(err, ierror.ErrTopicNameAlreadyExists)
 		})
 
@@ -88,14 +86,13 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			partitions := uint32(2)
+			maxTopicSize := uint64(math.MaxUint64)
 			_, err := client.CreateTopic(
 				context.Background(),
 				streamIdentifier,
 				createRandomString(256),
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.IggyExpiryServerDefault,
-				math.MaxUint64)
+				&iggcon.TopicOptions{PartitionsCount: &partitions, MaxTopicSize: &maxTopicSize})
 
 			itShouldReturnSpecificError(err, ierror.ErrInvalidTopicName)
 		})
@@ -105,14 +102,13 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 		ginkgo.Context("and tries to create topic", func() {
 			client := createClient()
 			streamIdentifier, _ := iggcon.NewIdentifier[uint32](10)
+			partitions := uint32(2)
+			maxTopicSize := uint64(math.MaxUint64)
 			_, err := client.CreateTopic(
 				context.Background(),
 				streamIdentifier,
 				"name",
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.IggyExpiryServerDefault,
-				math.MaxUint64)
+				&iggcon.TopicOptions{PartitionsCount: &partitions, MaxTopicSize: &maxTopicSize})
 
 			itShouldReturnUnauthenticatedError(err)
 		})

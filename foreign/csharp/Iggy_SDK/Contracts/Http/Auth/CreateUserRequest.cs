@@ -15,9 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-internal sealed record CreateUserRequest(string Username, string Password, UserStatus Status, Permissions? Permissions);
+internal sealed record CreateUserRequest(
+    string Username,
+    string Password,
+    UserStatus Status,
+    Permissions? Permissions,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    Dictionary<string, object>? Options);

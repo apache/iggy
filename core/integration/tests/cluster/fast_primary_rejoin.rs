@@ -78,7 +78,7 @@ fn build_message(payload: &str) -> IggyMessage {
 async fn create_stream_and_topic(harness: &TestHarness) {
     let setup_client = harness.tcp_root_client().await.unwrap();
     setup_client
-        .create_stream(STREAM_NAME)
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     let options = TopicCreateOptions {
@@ -213,11 +213,13 @@ async fn require_readback(producer: &IggyClient, expected: &[(u64, String)]) {
             .poll_messages(
                 &stream,
                 &topic,
-                Some(PARTITION_ID),
+                PARTITION_ID,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                count,
-                false,
+                PollOptions {
+                    count,
+                    ..PollOptions::default()
+                },
             )
             .await
         {

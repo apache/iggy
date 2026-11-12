@@ -43,6 +43,11 @@ public sealed class PartitionContextTests
     private const uint PartitionId = 3;
     private const ulong Offset = 100;
 
+    /// <summary>
+    ///     A metadata op above the one of the route, as the reader raises it for an owner it did not see.
+    /// </summary>
+    private const ulong CallerMetadataOp = 100;
+
     /// <summary>The context the golden poll body carries.</summary>
     private static readonly PartitionContext Polled = new(17, 9, 52);
 
@@ -229,6 +234,114 @@ public sealed class PartitionContextTests
         Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
+    /// <summary>
+    ///     The server refuses an offset write of incarnation 0. Such a context takes only the incarnation of the route,
+    ///     so the write keeps the owner generation and the metadata op of the caller.
+    /// </summary>
+    [Theory]
+    [InlineData(9ul)]
+    [InlineData(0ul)]
+    public async Task given_a_context_without_an_incarnation_when_storing_an_offset_should_take_only_the_incarnation_of_the_route(
+        ulong owner)
+    {
+        using var node = new MockNode();
+        var stores = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
+            {
+                stores.Enqueue(request);
+                return Reply(request.Operation, new byte[4]);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+        var caller = new PartitionContext(0, owner, CallerMetadataOp);
+
+        await client.StoreOffsetAsync(Consumer.New(1), Identifier.Numeric(1), Identifier.Numeric(2), Offset,
+            PartitionId, caller, TestContext.Current.CancellationToken);
+
+        Assert.Equal(caller with { Incarnation = AnsweredRoute.Incarnation }, Assert.Single(stores).Context);
+    }
+
+    /// <summary>
+    ///     A fully zero context carries nothing, so a request of one partition history takes the context of the
+    ///     route, as a request without one does. A group write under owner 0 and metadata op 0 binds to no installed
+    ///     owner.
+    /// </summary>
+    [Theory]
+    [InlineData(CommandCodes.STORE_CONSUMER_OFFSET_CODE)]
+    [InlineData(CommandCodes.DELETE_CONSUMER_OFFSET_CODE)]
+    [InlineData(CommandCodes.POLL_MESSAGES_CODE)]
+    public async Task given_a_fully_zero_context_when_sending_a_partition_request_should_take_the_context_of_the_route(
+        int code)
+    {
+        using var node = new MockNode();
+        var sent = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Code == CommandCodes.POLL_MESSAGES_CODE
+                || request.Operation == (byte)VsrOperation.StoreConsumerOffset
+                || request.Operation == (byte)VsrOperation.DeleteConsumerOffset)
+            {
+                sent.Enqueue(request);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+        var group = Consumer.Group(1);
+        var token = TestContext.Current.CancellationToken;
+
+        await (code switch
+        {
+            CommandCodes.STORE_CONSUMER_OFFSET_CODE => client.StoreOffsetAsync(group, Identifier.Numeric(1),
+                Identifier.Numeric(2), Offset, PartitionId, default(PartitionContext), token),
+            CommandCodes.DELETE_CONSUMER_OFFSET_CODE => client.DeleteOffsetAsync(group, Identifier.Numeric(1),
+                Identifier.Numeric(2), PartitionId, default(PartitionContext), token),
+            _ => client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), PartitionId, group,
+                PollingStrategy.Offset(Offset).WithContext(default), 10, false, token)
+        });
+
+        Assert.Equal(AnsweredRoute, Assert.Single(sent).Context);
+    }
+
+    /// <summary>
+    ///     A route without an incarnation names a partition that is not ready. The lookup goes on as after a
+    ///     transient refusal, so the store waits for a route with an incarnation instead of naming incarnation 0.
+    /// </summary>
+    [Fact]
+    public async Task given_a_route_without_an_incarnation_when_storing_an_offset_should_look_it_up_again_until_it_has_one()
+    {
+        using var node = new MockNode();
+        var lookups = 0;
+        var stores = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE && Interlocked.Increment(ref lookups) == 1)
+            {
+                return RouteReply(request, AnsweredRoute with { Incarnation = 0 }, 0);
+            }
+
+            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
+            {
+                stores.Enqueue(request);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        await StoreAsync(client);
+
+        Assert.Equal(AnsweredRoute, Assert.Single(stores).Context);
+        Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+    }
+
     [Fact]
     public async Task given_plain_polls_at_different_offsets_should_capture_their_context_once()
     {
@@ -242,57 +355,6 @@ public sealed class PartitionContextTests
 
         Assert.Equal(2, node.Requests(CommandCodes.POLL_MESSAGES_CODE));
         Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-    }
-
-    /// <summary>
-    ///     A recreation between the poll and the commit replaces the incarnation. The commit carries the
-    ///     incarnation its messages came from, so the server refuses it instead of storing the offset in the
-    ///     replacement.
-    /// </summary>
-    [Fact]
-    public async Task given_an_after_receive_consumer_when_committing_should_store_the_polled_context()
-    {
-        using var node = new MockNode();
-        var stores = new ConcurrentQueue<MockRequest>();
-        node.Serve(request =>
-        {
-            if (request.Code == CommandCodes.POLL_MESSAGES_CODE)
-            {
-                return Reply(OPERATION_NON_REPLICATED, Convert.FromHexString(MessageBatchGoldenVectorTests.POLL_BODY));
-            }
-
-            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
-            {
-                stores.Enqueue(request);
-                return Reply(request.Operation, new byte[4]);
-            }
-
-            return Standalone(node, request);
-        });
-        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
-        await using var consumer = new IggyConsumer(client, new IggyConsumerConfig
-        {
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(2),
-            PartitionId = PartitionId,
-            Consumer = Consumer.New(1),
-            PollingStrategy = PollingStrategy.Next(),
-            AutoCommitMode = AutoCommitMode.AfterReceive,
-            PollingIntervalMs = 0,
-            Login = "iggy",
-            Password = "iggy"
-        }, NullLoggerFactory.Instance);
-        await consumer.InitAsync(TestContext.Current.CancellationToken);
-
-        await using (var messages = consumer.ReceiveAsync(TestContext.Current.CancellationToken)
-                         .GetAsyncEnumerator(TestContext.Current.CancellationToken))
-        {
-            Assert.True(await messages.MoveNextAsync());
-            Assert.True(await messages.MoveNextAsync());
-        }
-
-        var store = Assert.Single(stores);
-        Assert.Equal(Polled, store.Context);
     }
 
     [Fact]
@@ -356,7 +418,7 @@ public sealed class PartitionContextTests
         using var node = new MockNode();
         node.Serve(request =>
         {
-            if (request.Operation == (byte)VsrOperation.UpdateStream)
+            if (request.Operation == (byte)VsrOperation.UpdateResource)
             {
                 var reply = Reply(request.Operation, new byte[4]);
                 BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), UpdateCommit);
@@ -371,7 +433,8 @@ public sealed class PartitionContextTests
         await SignInAsync(client);
 
         await SendAsync(client);
-        await client.UpdateStreamAsync(Identifier.Numeric(1), "renamed", TestContext.Current.CancellationToken);
+        await client.UpdateStreamAsync(Identifier.Numeric(1), new StreamUpdate { Name = "renamed" },
+            TestContext.Current.CancellationToken);
         await SendAsync(client);
 
         Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
@@ -393,7 +456,7 @@ public sealed class PartitionContextTests
         await SignInAsync(client);
 
         await SendAsync(client);
-        await client.CreateStreamAsync("created", TestContext.Current.CancellationToken);
+        await client.CreateStreamAsync("created", token: TestContext.Current.CancellationToken);
         await client.CreateTopicAsync(Identifier.Numeric(1), "created", 1,
             token: TestContext.Current.CancellationToken);
         await SendAsync(client);

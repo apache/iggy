@@ -78,6 +78,41 @@ public sealed class VsrMultiplexingTests
         Assert.Equal(0, pair.Dropped);
     }
 
+    /// <summary>
+    ///     The server answers neither a cancel nor the canceled request. The cancel names the parked request on its
+    ///     link, a late reply for it is dropped, and the silence watchdog does not wait for replies that never come.
+    /// </summary>
+    [Theory]
+    [InlineData(CommandCodes.POLL_MESSAGES_DEFERRED_CODE)]
+    public async Task given_a_parked_deferred_request_when_canceled_should_send_a_header_only_cancel_and_keep_the_link(
+        int code)
+    {
+        const int FrameDeadlineMs = 100;
+        using var pair = await LinkPair.ConnectAsync(frameTimeoutMs: FrameDeadlineMs);
+        using var canceled = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var parked = pair.SendAsync(code, canceled.Token);
+        var request = await pair.ReadAsync();
+
+        await canceled.CancelAsync();
+
+        Assert.IsType<OperationCanceledException>((await parked).Error);
+        var cancel = await pair.ReadAsync();
+        Assert.Equal(CommandCodes.CANCEL_DEFERRED_REQUEST_CODE, cancel.Code);
+        Assert.Equal(OPERATION_NON_REPLICATED, cancel.Operation);
+        Assert.Empty(cancel.Body);
+        Assert.Equal(request.RequestId, cancel.RequestId);
+        Assert.Equal(request.ClientId, cancel.ClientId);
+        Assert.Equal(request.Session, cancel.Session);
+        await Task.Delay(3 * FrameDeadlineMs, TestContext.Current.CancellationToken);
+        await pair.ReplyAsync(request, [1]);
+        var next = pair.SendAsync(token: TestContext.Current.CancellationToken);
+        await pair.ReplyAsync(await pair.ReadAsync(), [2]);
+        using var reply = (await next).Response;
+        Assert.NotNull(reply);
+        Assert.Equal([2], reply.Memory.ToArray());
+        Assert.Equal(0, pair.Dropped);
+    }
+
     [Theory]
     [InlineData((byte)0, false)]
     [InlineData((byte)1, true)]
@@ -231,7 +266,7 @@ public sealed class VsrMultiplexingTests
         var session = new ConsensusSession(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
         var lanes = new MutationLanes(session, new IggyClientConfigurator { BaseAddress = "127.0.0.1:1", Protocol = Protocol.Tcp });
         var operation = await lanes.EnterAsync(new MutationLane(17, 0), CommandCodes.STORE_CONSUMER_OFFSET_CODE,
-            ReadOnlyMemory<byte>.Empty, default, true, TestContext.Current.CancellationToken);
+            ReadOnlyMemory<byte>.Empty, default, true, session.Generation, TestContext.Current.CancellationToken);
         try
         {
             BinaryPrimitives.WriteUInt128LittleEndian(operation.Frame.Bytes.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET), RequestStamp);
@@ -261,6 +296,73 @@ public sealed class VsrMultiplexingTests
         }
     }
 
+    /// <summary>
+    ///     The server commits an update under the resolved operation of its scope, so the reply names 72, 73 or 74
+    ///     while the request carried 150. The rewrite must not relax the request identity the reply has to prove.
+    /// </summary>
+    [Theory]
+    [InlineData((byte)VsrOperation.UpdateStreamResolved, false)]
+    [InlineData((byte)VsrOperation.UpdateTopicResolved, false)]
+    [InlineData((byte)VsrOperation.UpdateUserResolved, false)]
+    [InlineData((byte)VsrOperation.UpdateUserResolved, true)]
+    public async Task given_resolved_update_reply_when_correlating_should_accept_only_matching_request_identity(
+        byte resolved, bool wrongChecksum)
+    {
+        const ulong RequestStamp = 11;
+        using var pair = await LinkPair.ConnectAsync();
+        var session = new ConsensusSession(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
+        var lanes = new MutationLanes(session, new IggyClientConfigurator { BaseAddress = "127.0.0.1:1", Protocol = Protocol.Tcp });
+        var operation = await lanes.EnterAsync(MutationLane.Metadata, CommandCodes.UPDATE_RESOURCE_CODE,
+            new byte[] { 2, 1, 4, 3, 0, 0, 0, 0 }, default, true, session.Generation, TestContext.Current.CancellationToken);
+        try
+        {
+            BinaryPrimitives.WriteUInt128LittleEndian(operation.Frame.Bytes.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET), RequestStamp);
+            var pending = pair.SendFrozenAsync(operation);
+            var request = await pair.ReadAsync();
+            Assert.Equal((byte)VsrOperation.UpdateResource, request.Operation);
+            await pair.ReplyAsync(request, new byte[4], VsrHeader.COMMITTED_RESULT_MARKER,
+                checksum: wrongChecksum ? RequestStamp + 1 : RequestStamp, operation: resolved);
+            var result = await pending;
+            using var reply = result.Response;
+            Assert.Equal(!wrongChecksum, result.Committed);
+            if (wrongChecksum)
+            {
+                var error = Assert.IsType<IggyInvalidStatusCodeException>(result.Error);
+                Assert.False(error.Committed);
+            }
+            else
+            {
+                Assert.Null(result.Error);
+            }
+        }
+        finally
+        {
+            lanes.Complete(operation);
+        }
+
+        Assert.Equal(0, pair.Dropped);
+
+        // A resolved update answers only the generic update: another request, or the update answered by an
+        // operation that is not its rewrite, fails the link instead of completing the call.
+        foreach (var (code, replyOperation) in new[]
+                 {
+                     (CommandCodes.CREATE_STREAM_CODE, resolved),
+                     (CommandCodes.UPDATE_RESOURCE_CODE, (byte)VsrOperation.RewrapStreamKeys),
+                     (CommandCodes.UPDATE_RESOURCE_CODE, (byte)VsrOperation.CreateTopicWithAssignments)
+                 })
+        {
+            using var mismatched = await LinkPair.ConnectAsync();
+            var call = mismatched.SendAsync(code, TestContext.Current.CancellationToken);
+            await mismatched.ReplyAsync(await mismatched.ReadAsync(), new byte[4], VsrHeader.COMMITTED_RESULT_MARKER,
+                operation: replyOperation);
+            var refused = await call;
+            Assert.NotNull(refused.Error);
+            Assert.Null(refused.Response);
+            await mismatched.DropNotified.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.Equal(1, mismatched.Dropped);
+        }
+    }
+
     [Fact]
     public async Task given_a_sensitive_frozen_request_when_its_reply_is_disposed_should_clear_the_pooled_token()
     {
@@ -268,7 +370,7 @@ public sealed class VsrMultiplexingTests
         var session = new ConsensusSession(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]);
         var lanes = new MutationLanes(session, new IggyClientConfigurator { BaseAddress = "127.0.0.1:1", Protocol = Protocol.Tcp });
         var operation = await lanes.EnterAsync(MutationLane.Metadata, CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE,
-            ReadOnlyMemory<byte>.Empty, default, true, TestContext.Current.CancellationToken);
+            ReadOnlyMemory<byte>.Empty, default, true, session.Generation, TestContext.Current.CancellationToken);
         try
         {
             var pending = pair.SendFrozenAsync(operation, clearSensitiveReply: true);
@@ -343,13 +445,15 @@ public sealed class VsrMultiplexingTests
             {
                 Body = body,
                 ClientId = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CLIENT_OFFSET)),
-                RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET))
+                RequestChecksum = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(VsrHeader.REQUEST_CHECKSUM_OFFSET)),
+                Session = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(VsrHeader.REQUEST_SESSION_OFFSET))
             };
         }
 
-        internal async Task ReplyAsync(MockRequest request, byte[] body, byte marker = 0, UInt128? checksum = null)
+        internal async Task ReplyAsync(MockRequest request, byte[] body, byte marker = 0, UInt128? checksum = null,
+            byte? operation = null)
         {
-            var reply = Reply(request.Operation, body);
+            var reply = Reply(operation ?? request.Operation, body);
             reply[VsrHeader.REPLY_COMMITTED_OFFSET] = marker;
             CorrelateReply(request, reply);
             if (checksum is { } stamp)

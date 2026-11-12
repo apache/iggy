@@ -28,6 +28,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::warn;
 
@@ -70,6 +71,15 @@ pub trait DurableStorage {
     /// Returns an error if the absolute identity cannot be resolved.
     fn writer_identity(&self, _path: &Path) -> io::Result<Option<std::path::PathBuf>> {
         Ok(None)
+    }
+
+    /// Timer bounding a wait. The future must not resolve before `duration`
+    /// has elapsed, and one that never resolves disables the timeout. The
+    /// default needs a compio runtime and panics outside one. Only the
+    /// writer-lease drain wait on partition WAL reopen uses it, so overriding
+    /// it does not make other partition WAL timers executor-agnostic.
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+        compio::runtime::time::sleep(duration)
     }
 
     /// # Errors
@@ -132,9 +142,16 @@ pub trait DurableStorage {
 
 pub trait DurableFile {
     /// Best-effort reservation that must not change bytes or logical length.
-    /// Backends without physical allocation may ignore this hint.
-    fn preallocate(&self, _path: &Path, _length: u64) -> impl Future<Output = ()> {
-        async {}
+    /// Backends without physical allocation may ignore this hint. Returns how
+    /// much of the file the reservation covers, 0 when it reserved nothing.
+    ///
+    /// An implementation that reserves space charges the reservation to
+    /// [`DISK_USAGE`](server_common::DISK_USAGE) itself. Callers charge only
+    /// the part of each write past the returned length, since the blocks below
+    /// it are charged already. The default reserves nothing and returns 0, so
+    /// callers charge every write.
+    fn preallocate(&self, _path: &Path, _length: u64) -> impl Future<Output = u64> {
+        async { 0 }
     }
 
     /// # Errors
@@ -396,8 +413,8 @@ impl DurableStorage for DiskStorage {
 }
 
 impl DurableFile for File {
-    async fn preallocate(&self, path: &Path, length: u64) {
-        server_common::fs_utils::preallocate_file(self, path, length).await;
+    async fn preallocate(&self, path: &Path, length: u64) -> u64 {
+        server_common::fs_utils::preallocate_file(self, path, length).await
     }
 
     async fn read(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {

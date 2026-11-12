@@ -98,6 +98,8 @@ docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 \
 | S4 | No credentials | `docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 -L` | No metadata served; client suggests SASL may be required | Pass |
 | S5 | Java client | see below | Authenticates, and lists `SaslHandshake(17): 0 to 1 [usable: 1]` and `SaslAuthenticate(36): 0 to 2 [usable: 2]` | Pass |
 | S6 | Feature off | restart without `IGGY_KAFKA_SASL_ENABLED`, rerun S1 | Client reports no broker SASL support; plaintext `-L` still served | Pass |
+| S7 | kafka-python 2.0.2 | see below | Produces 10 records and reads them back in a group. With the password `WRONG`, it ends with `NoBrokersAvailable` | Pass |
+| S8 | Sarama 1.40.1 | see below | Produces 10 records and reads them back. With the password `WRONG`, it ends with `client has run out of available brokers to talk to: EOF` | Pass |
 
 S5 is the case that matters most, because the Java client negotiates `SaslAuthenticate` **v2**, the
 compact framing no other case here exercises, and it sends `ApiVersions` both before and after
@@ -110,9 +112,37 @@ sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="iggy" password="iggy";
 EOF
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
 ```
+
+S7 and S8 send `SaslHandshake` v0 and then the token in a bare frame with no request header
+(KIP-152). kafka-python 2.0.2 always does this, and Sarama does it by default up to 1.40.1. Both
+cases produce, so add `IGGY_KAFKA_BRIDGE_ENABLED=true IGGY_KAFKA_IGGY_USERNAME=iggy
+IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway in
+terminal 2. kafka-python 2.0.2 needs Python 3.11 or older:
+
+```bash
+uv venv --python 3.11 /tmp/kafka-python-2.0.2
+uv pip install --python /tmp/kafka-python-2.0.2/bin/python kafka-python==2.0.2
+/tmp/kafka-python-2.0.2/bin/python - <<'EOF'
+from kafka import KafkaConsumer, KafkaProducer
+common = dict(bootstrap_servers="127.0.0.1:9095", security_protocol="SASL_PLAINTEXT",
+              sasl_mechanism="PLAIN", sasl_plain_username="iggy", sasl_plain_password="iggy")
+producer = KafkaProducer(**common)
+for i in range(10):
+    producer.send("v0-kafka-python", f"kafka-python {i}".encode()).get(timeout=10)
+producer.close()
+consumer = KafkaConsumer("v0-kafka-python", group_id="v0", auto_offset_reset="earliest",
+                         consumer_timeout_ms=15000, **common)
+print(len(list(consumer)), "records read")
+EOF
+```
+
+For S8, a Go program on `github.com/IBM/sarama v1.40.1` does the same. It sets
+`config.Net.SASL.Version = sarama.SASLHandshakeV0`, sends 10 records with a `SyncProducer`, and
+reads them back with `ConsumePartition` from `OffsetOldest`. With `RUST_LOG=debug`, the gateway logs
+`SASL mechanism negotiated` with `api_version=0` for each connection of both clients.
 
 ### Category T — ACL view
 
@@ -141,7 +171,7 @@ Then list each principal's ACLs with the real admin client, swapping the usernam
 
 ```bash
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-acls.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-acls.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties --list
 ```
 
@@ -217,7 +247,7 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://
 ```
 
 `KC` below is `docker run --rm --network host -v /tmp/certs:/certs:ro edenhill/kcat:1.7.1`, and
-`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:3.9.0`.
+`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:4.4.0`.
 
 | ID | Test | Command | Pass criteria | Last run |
 | ---- | ------ | --------- | --------------- | ---------- |
@@ -311,6 +341,44 @@ Run it four ways, with `CA_FILE=/tmp/certs/ca.pem` exported: `go run . 127.0.0.1
 and certificate runs also list `User:iggy`'s bindings, and the last reports the broker closing the
 connection during `ApiVersions`.
 
+### Category V — Node failover in a 3-node cluster
+
+Run against a 3-node Iggy cluster, because a single node has no partition primaries to move. A
+partition primary is the node that orders the writes of a partition. `scripts/cluster-failover.sh`
+starts 3 Iggy nodes and one gateway on 127.0.0.1, and creates a topic with 6 partitions. Each node
+holds the primary of 2 partitions. Through the gateway, `kafka-producer-perf-test.sh` sends 2000
+records a second, and a `kafka-verifiable-consumer.sh` group reads them.
+
+Under this load, the script stops a node that holds partition primaries and restarts it. Then it
+does the same to the metadata primary. At the end, `tests/java/ReadYourCommitsProbe.java` commits an
+offset in each partition and reads it back at once, 300 times. The gateway's node is a backup for 4
+of the 6 partitions. Since the fix for [#4409](https://github.com/apache/iggy/issues/4409), offset
+reads go to the partition primary. If a backup answers one instead, the probe gets a wrong offset.
+
+The script needs Linux, Docker, jq, perl and a JDK 17 or later. A run takes about 5 minutes:
+
+```bash
+cargo build --release --bin iggy-server
+cargo build --release -p iggy-gateway-kafka --bin iggy-gateway-kafka --example partition_routes
+docker pull apache/kafka:4.4.0
+./gateways/kafka/scripts/cluster-failover.sh /tmp/failover-term
+STOP_SIGNAL=KILL ./gateways/kafka/scripts/cluster-failover.sh /tmp/failover-kill
+```
+
+The work dir keeps every log. To print the report of a run again, run `cluster-failover.sh --report
+<work dir>`. For each phase, the report shows the slowest send, the time until sends recovered and
+the client retries. It also counts how often the gateway's Iggy session dialed another node.
+
+| ID | Test | Command | Pass criteria | Last run |
+| ---- | ------ | --------- | --------------- | ---------- |
+| V1 | Graceful stop | `cluster-failover.sh` | Prints `pass` and exits 0. No record is missing, and no offset reads back wrong | Pass |
+| V2 | Crash | `STOP_SIGNAL=KILL cluster-failover.sh` | Same as V1 | Pass |
+
+In the last runs, the gateway's session stayed on its node, and the producer got no error. A stop
+paused sends for about 5 s. Then new partition primaries took over, and sends continued. After a
+restart, the restarted node caught up for up to 25 s, and sends through the gateway were slow in
+that time.
+
 ### Category A — Smoke tests (must pass before check-in)
 
 The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:9092` (a real Kafka
@@ -338,9 +406,13 @@ unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists
 
 For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-message-gen send --host 127.0.0.1:9093` with `--version N`.
 
+`kafka-protocol` 0.18 encodes ApiVersions only up to v4, so `kafka-message-gen` writes the v5
+request itself. To check v5 with a real client, run `kafka-broker-api-versions.sh` from
+`apache/kafka:4.4.0`. It prints `ApiVersions(18): 0 to 5 [usable: 5]`.
+
 | API key | Name | Min | Max | Test versions |
 | --------- | ------ | ----- | ----- | --------------- |
-| 18 | ApiVersions | 0 | 3 | −1, 0, 3, 4 |
+| 18 | ApiVersions | 0 | 5 | −1, 0, 5, 6 |
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
@@ -359,13 +431,15 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 22 | InitProducerId | 0 | 5 | −1, 0, 5, 6 |
 | 32 | DescribeConfigs | 1 | 4 | 0, 1, 4, 5 |
 | 33 | AlterConfigs | 0 | 2 | −1, 0, 2, 3 |
+| 37 | CreatePartitions | 0 | 3 | −1, 0, 3, 4 |
+| 44 | IncrementalAlterConfigs | 0 | 1 | −1, 0, 1, 2 |
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
 | ---- | ------ | ---------------------- | --------------------------- |
-| B1 | ApiVersions negotiation | `error_code=0`; body lists 14 API keys with correct min/max | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
+| B1 | ApiVersions negotiation | `error_code=0`; body lists 20 API keys with correct min/max (SASL off) | KIP-511 exception: still answers, `error_code=35` (UNSUPPORTED_VERSION), v0 response header regardless of the request's own encoding |
 | B2 | Metadata out-of-range | N/A | **Connection closes**, no response sent - Metadata has no top-level error field to carry a version-correct error in |
-| B3 | Produce/Fetch/ListOffsets/CreateTopics/DeleteTopics/InitProducerId/OffsetCommit/OffsetFetch out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these eight messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
-| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,8,9,10,11,12,13,14,15,16,18,19,20,22,32,33 only, and no transaction keys (24, 25, 26, 28) |
+| B3 | Produce/Fetch/ListOffsets/CreateTopics/DeleteTopics/CreatePartitions/InitProducerId/OffsetCommit/OffsetFetch out-of-range | N/A | **Connection closes** for both above-max and below-min - `kafka_protocol`'s schema floor for each of these nine messages equals `SUPPORTED_RANGES`' own min, so there is no encodable error response below min either (see `SCOPE.md`'s Governance model) |
+| B4 | ApiVersions lists only scoped keys | Decode response | Contains keys 0,1,2,3,8,9,10,11,12,13,14,15,16,18,19,20,22,32,33,37,44 only, and no transaction keys (24, 25, 26, 28) |
 
 An out-of-range version only ever produces `error_code=35` on ApiVersions (B1); every other API
 key's out-of-range case closes the connection - see B2/B3. InitProducerId and Produce also send
@@ -452,13 +526,18 @@ success. This category predates the bridge landing: G2/G3's "fails at metadata" 
 | G5 | Java console consumer | `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g2 --topic test` | Exercises JoinGroup v9, SyncGroup v5, Heartbeat v4, FindCoordinator v4. `group.protocol` defaults to `classic` in 4.x; `--consumer-property group.protocol=consumer` sends ConsumerGroupHeartbeat (68) instead and the connection closes |
 | G6 | Graceful kcat exit | G3's two kcats, then Ctrl-C one (kcat closes its consumer, which sends LeaveGroup v0/v1) | The survivor rebalances within one heartbeat interval, not `session.timeout.ms`. Join, leave and sync are real, but the assignment is empty: the Metadata stub reports the topic unknown, so the assignor has no partitions to hand out |
 | G7 | Graceful Java exit | G5 in two terminals, then Ctrl-C one | Same as G6 |
-| G8 | Static member exit | G7 with `--consumer-property group.instance.id=x` on the one stopped | No LeaveGroup is sent; the survivor waits out the session timeout before rebalancing |
+| G8 | Static member exit | G7 with `--consumer-property group.instance.id=x` on the one stopped | No LeaveGroup is sent; the survivor waits out the session timeout before rebalancing. Restarting the stopped one with the same `group.instance.id` before then takes its partitions back with no rebalance |
 | G9 | Group resumes from its commit | Bridge on and topic `orders` made as in Category I. Run `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g9 --topic orders --from-beginning`, stop it, produce one record, run it again | The second run prints only the new record. `--from-beginning` applies only to a group with no committed offset |
 | G10 | Resume after a gateway restart | G9 with a gateway restart before the second run | Same as G9, because the offsets live in Iggy ([#3542](https://github.com/apache/iggy/issues/3542)) |
 | G11 | Two members share a topic | Bridge on and a topic with 2 partitions. Run `kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --group g11 --topic <topic> --property print.partition=true --property print.offset=true` in two terminals, produce to both partitions, stop one, produce again | Each prints one partition. After the stop, the other prints the new records of both partitions, and none twice |
-| G12 | List groups | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --list` after G5 has joined | Prints the group. `--list --state Empty` matches a group that was issued a member id and has not joined yet. A group whose members have all expired is absent |
+| G12 | List groups | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --list` after G5 joined | Prints the group. `--list --state Empty` matches a group that was issued a member id and did not join yet. With the bridge on, it also matches a group whose members left or expired and that holds offsets. A group with neither members nor offsets is absent |
 | G13 | Describe members | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --members --group g2` | Prints member ids. Assignment and protocol are filled only while the group is Stable |
-| G14 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). The default `--describe` (no `--members` or `--state`) calls OffsetFetch and fails, because that API is not implemented |
+| G14 | Describe state | `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --describe --state --group g2` | Prints the state string (`Stable`, `PreparingRebalance`, `CompletingRebalance`, or `Empty`). With the bridge on, the default `--describe` (no `--members` or `--state`) prints each committed offset and its lag. Without the bridge, its OffsetFetch answers `COORDINATOR_LOAD_IN_PROGRESS` (14) |
+| G15 | Grow a topic | Bridge on and topic `orders` made as in Category I. `kafka-topics.sh --bootstrap-server 127.0.0.1:9093 --alter --topic orders --partitions 3`, then `--describe --topic orders`, then `--alter --topic orders --partitions 2` | The describe prints `PartitionCount: 3`. The second alter fails with `InvalidPartitionsException` naming the current count, and a describe still prints 3. Automated in `kafka_client_e2e_tests.rs` |
+| G16 | Alter retention with `kafka-configs.sh` | Bridged, topic `orders` as in Category I. `kafka-configs.sh --bootstrap-server 127.0.0.1:9093 --alter --entity-type topics --entity-name orders --add-config retention.ms=8000`, then the same with `--describe`, then with `--delete-config retention.ms` | Sends IncrementalAlterConfigs (44) only. Each alter prints `Completed updating config for topic orders.`; describe shows `retention.ms=8000` after the add and `retention.ms=-1` after the delete |
+| G17 | Group with no live members | Bridge on. After G9's second run ends, `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --list --state`, then `--describe --group g9` | The group is listed as `Empty`. `--describe` prints `Consumer group 'g9' has no active members.` and then each committed offset and its lag |
+| G18 | Delete offsets | Bridge on. While a G9 consumer runs, `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --delete-offsets --group g9 --topic orders`. Stop the consumer and run the command again | The first run fails for each partition with `GroupSubscribedToTopicException`. The second prints `Successful` for each partition, and the default `--describe` prints no offsets for `orders` |
+| G19 | Delete a group | Bridge on. While a G9 consumer runs, `kafka-consumer-groups.sh --bootstrap-server 127.0.0.1:9093 --delete --group g9`. Stop the consumer and run the command again, then `--list` and `--describe --group g9` | The first run fails with `GroupNotEmptyException`. The second prints `Deletion of requested consumer groups ('g9') was successful.`. `--list` leaves out `g9`, and `--describe` prints `Consumer group 'g9' does not exist.` |
 
 Record kcat version and exact error strings in your test log. G1 passing is the minimum bar for client compatibility smoke.
 
@@ -549,9 +628,9 @@ docker run -d --name akhq-iggy --network host \
 | 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
 | 29 | TOPIC_AUTHORIZATION_FAILED | Produce with a bridge: Iggy user lacks permission |
 | 35 | UNSUPPORTED_VERSION | Out of range: **ApiVersions only** (KIP-511 exception); every other API key's out-of-range version closes the connection instead - see Category B. In range: InitProducerId with a `transactional_id`; Produce with a `transactional_id`, on every partition with or without a bridge (an `acks=0` one closes instead); and, with a bridge, a transactional or control batch - transactions are not supported, see `SCOPE.md` |
-| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` |
+| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1`. CreatePartitions with a bridge: count not above the current one |
 | 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` |
-| 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
+| 41 | NOT_CONTROLLER | CreateTopics and CreatePartitions stub (nothing created or grown) |
 | 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. Not Produce: it closes the connection (H1) |
 | 76 | UNSUPPORTED_COMPRESSION_TYPE | Produce with a bridge: zstd before v7 |
 | 87 | INVALID_RECORD | Produce with a bridge: a record batch this gateway cannot map, including a missing, empty or second one, or bytes after it |
@@ -563,7 +642,7 @@ build a version-correct response against, so it closes the connection rather tha
 ### Response header rules
 
 Header version selection now delegates entirely to `kafka_protocol::messages::ApiKey` (see
-`src/protocol/header.rs`) - there is no lookup table in this codebase to consult.
+`core/kafka_wire/src/header.rs`) - there is no lookup table in this codebase to consult.
 
 | API key | Request flexible? | Response header version |
 | --------- | -------------------- | ------------------------- |
@@ -620,7 +699,7 @@ kcat version (if used): ___________
 [ ] D1–D10 Flexible vs legacy encoding
 [ ] E1–E4  Metadata stub semantics
 [ ] F1–F6  TCP / connection behavior
-[ ] G1–G11  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3; G11's default `--describe` is expected to fail)
+[ ] G1–G19  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3)
 [ ] H1–H6  Adversarial input
 [ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 [ ] J1–J4  AKHQ ListOffsets by timestamp

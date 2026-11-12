@@ -1,0 +1,44 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "iggy-web-ui"
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+dioxus = { workspace = true }
+gloo-net = { workspace = true }
+js-sys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+web-sys = { workspace = true, features = ["Storage"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+iggy_common = { workspace = true }
+
+[lints]
+workspace = true

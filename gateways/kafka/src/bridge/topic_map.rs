@@ -21,6 +21,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::bridge::error::BridgeError;
+use crate::bridge::iggy_bridge::cluster_id_stream;
 
 /// Upper bound `Identifier::named` itself enforces (`identifier/mod.rs`). Checked here too so a
 /// too-long name in the mapping file fails at config load with a message that names the file and
@@ -192,13 +193,22 @@ impl TopicMapping {
     /// Returns [`BridgeError::InvalidConfig`] if `default_stream` or any override's `stream`/
     /// `topic` is empty, has leading/trailing whitespace, or exceeds `MAX_IDENTIFIER_LEN`; if any
     /// override key fails Kafka's own topic-naming rules (see
-    /// `validate_kafka_topic_name`); or if two override entries are not injective (see
-    /// [`resolve`](Self::resolve)).
+    /// `validate_kafka_topic_name`); if two override entries are not injective (see
+    /// [`resolve`](Self::resolve)); if `default_stream` with `.meta` appended, the stream that
+    /// holds the cluster id, exceeds `MAX_IDENTIFIER_LEN`; or if an override targets that
+    /// stream.
     pub fn new(
         default_stream: String,
         topics: HashMap<String, TopicOverride>,
     ) -> Result<Self, BridgeError> {
         validate_identifier_name("topic mapping's default_stream", &default_stream)?;
+        // The gateway keeps its cluster id in this stream. It is checked here so a default
+        // stream too long to name it fails at config load, not at the first start against Iggy.
+        let meta_stream = cluster_id_stream(&default_stream);
+        validate_identifier_name(
+            "topic mapping's default_stream with the `.meta` suffix of its cluster id stream",
+            &meta_stream,
+        )?;
 
         let mut targets = HashSet::with_capacity(topics.len());
         for (kafka_topic, over) in &topics {
@@ -225,6 +235,15 @@ impl TopicMapping {
                 &format!("topic mapping override for '{kafka_topic}': its topic"),
                 &over.topic,
             )?;
+
+            // A Kafka client could then read or delete the topic that holds the cluster id.
+            if over.stream == meta_stream {
+                return Err(BridgeError::InvalidConfig(format!(
+                    "topic mapping override for '{kafka_topic}' targets Iggy stream '{}', which \
+                     holds this gateway's cluster id; target another stream",
+                    over.stream
+                )));
+            }
 
             let target = (over.stream.clone(), over.topic.clone());
             if !targets.insert(target) {
@@ -282,6 +301,25 @@ impl TopicMapping {
             || (self.default_stream.as_str(), kafka_topic),
             |over| (over.stream.as_str(), over.topic.as_str()),
         )
+    }
+
+    /// The Kafka name that lists Iggy topic `topic` of stream `stream`, by the rules of
+    /// `IggyBridge::list_kafka_topics`: an override's key for its target, else the topic's own name
+    /// in the default stream when no override claims that name and Kafka accepts it. `None` for a
+    /// topic that no Kafka name lists.
+    #[must_use]
+    pub fn kafka_topic_of<'a>(&'a self, stream: &str, topic: &'a str) -> Option<&'a str> {
+        if let Some((kafka_topic, _)) = self
+            .topics
+            .iter()
+            .find(|(_, over)| over.stream == stream && over.topic == topic)
+        {
+            return Some(kafka_topic);
+        }
+        (stream == self.default_stream
+            && !self.topics.contains_key(topic)
+            && is_valid_kafka_topic_name(topic))
+        .then_some(topic)
     }
 
     /// Whether `kafka_topic` is no override's key yet resolves to the Iggy stream and topic an
@@ -405,6 +443,44 @@ mod tests {
         "#;
         let err = TopicMapping::from_toml_str(toml).unwrap_err();
         assert!(matches!(err, BridgeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn given_a_default_stream_whose_meta_stream_is_too_long_should_reject_it() {
+        // A 250-byte name leaves its `.meta` stream at the 255-byte limit; one byte more crosses
+        // it.
+        let longest = "s".repeat(MAX_IDENTIFIER_LEN - ".meta".len());
+        assert!(TopicMapping::new(longest.clone(), HashMap::new()).is_ok());
+        let err = TopicMapping::new(format!("{longest}s"), HashMap::new()).unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidConfig(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn given_an_override_into_the_cluster_id_stream_should_reject_it() {
+        let toml = r#"
+            default_stream = "kafka"
+
+            [topics.ids]
+            stream = "kafka.meta"
+            topic = "cluster_id"
+        "#;
+        let err = TopicMapping::from_toml_str(toml).unwrap_err();
+        assert!(
+            matches!(&err, BridgeError::InvalidConfig(message) if message.contains("cluster id")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn given_an_override_into_another_meta_stream_should_accept_it() {
+        let toml = r#"
+            default_stream = "kafka"
+
+            [topics.ids]
+            stream = "other.meta"
+            topic = "ids"
+        "#;
+        assert!(TopicMapping::from_toml_str(toml).is_ok());
     }
 
     #[test]
@@ -652,5 +728,53 @@ mod tests {
         };
         assert!(mapping.aliases_an_override("orders_v2"));
         assert!(!mapping.aliases_an_override("orders"));
+    }
+
+    #[test]
+    fn given_iggy_topics_should_name_the_kafka_topic_that_lists_each() {
+        let mut topics = HashMap::new();
+        topics.insert(
+            "orders".to_string(),
+            TopicOverride {
+                stream: "billing".to_string(),
+                topic: "orders_v2".to_string(),
+            },
+        );
+        topics.insert(
+            "audit".to_string(),
+            TopicOverride {
+                stream: "kafka".to_string(),
+                topic: "audit_log".to_string(),
+            },
+        );
+        topics.insert(
+            "audit_log".to_string(),
+            TopicOverride {
+                stream: "logs".to_string(),
+                topic: "audit_log".to_string(),
+            },
+        );
+        let mapping = mapping_with("kafka", topics);
+
+        assert_eq!(
+            mapping.kafka_topic_of("kafka", "payments"),
+            Some("payments")
+        );
+        assert_eq!(
+            mapping.kafka_topic_of("billing", "orders_v2"),
+            Some("orders")
+        );
+        assert_eq!(mapping.kafka_topic_of("kafka", "audit_log"), Some("audit"));
+        assert_eq!(
+            mapping.kafka_topic_of("logs", "audit_log"),
+            Some("audit_log")
+        );
+        assert_eq!(
+            mapping.kafka_topic_of("kafka", "orders"),
+            None,
+            "an override's key in the default stream is not its topic"
+        );
+        assert_eq!(mapping.kafka_topic_of("billing", "payments"), None);
+        assert_eq!(mapping.kafka_topic_of("kafka", "not kafka"), None);
     }
 }

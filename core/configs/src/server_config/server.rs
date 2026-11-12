@@ -17,6 +17,7 @@
 
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
@@ -194,6 +195,8 @@ pub struct ServerConfig {
     pub metadata: MetadataConfig,
     pub partition: PartitionConfig,
     pub message_bus: MessageBusConfig,
+    #[serde(default)]
+    pub external_auth: ExternalAuthConfig,
 }
 
 /// One client-facing listener, as the client-facing address derivation and
@@ -458,6 +461,25 @@ mod tests {
         unsafe { env::remove_var(NAME) };
         let cfg = cfg.expect("config with the env override deserializes");
         assert_eq!(cfg.message_bus.connections_max, Some(0));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_change_log_capacity_env_var_when_loading_should_override_the_default() {
+        const NAME: &str = "IGGY_METADATA_CHANGE_LOG_ACTIVITY_CAPACITY";
+        assert!(ServerConfig::all_env_var_names().contains(&NAME));
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "4096") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("config with the env override deserializes");
+        assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
     }
 
     #[test]

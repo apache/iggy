@@ -20,9 +20,8 @@
 
 services:
   iggy-server:
-    # Prebuilt. :edge refreshes on a master push only when `server` or `iggy-cli` is
-    # affected, or `web` or `core/server/Dockerfile` changes - avoids a full from-scratch workspace
-    # release build on first `up --build`. Testing a local server change: comment this out
+    # Prebuilt. :edge refreshes after affected changes merge to master.
+    # Testing a local server change: comment this out
     # and uncomment `build:` below instead - `core/server/Dockerfile`'s `runtime` target is
     # the same Dockerfile and target `apache/iggy:edge` itself is published from
     # (.github/config/publish.yml), so the healthcheck/volume/listener-address settings below
@@ -93,6 +92,8 @@ services:
       retries: 30
 
   iggy-gateway-kafka:
+    # image: apache/iggy-kafka-gateway:edge
+    # pull_policy: always
     build:
       context: ../..
       dockerfile: gateways/kafka/Dockerfile

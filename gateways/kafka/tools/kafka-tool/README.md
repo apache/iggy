@@ -33,6 +33,8 @@ This tool solves all three: generate the binary messages once, then `cat` them d
 
 This tool is built on the [`kafka-protocol`](https://crates.io/crates/kafka-protocol) Rust crate, which is itself **code-generated from Kafka's official JSON schema files**. This ensures byte-perfect correctness — the same schemas that generate Kafka's own Java serialization code generate the Rust structs used here.
 
+ApiVersions v5 is the exception. `kafka-protocol` 0.18 stops at v4, so the tool writes the v5 request (KIP-1242) itself. A v5 response has the fields of v4, so the tool decodes it as v4.
+
 ---
 
 ## Installation
@@ -230,8 +232,8 @@ Kafka introduced "flexible" encoding (compact ULEB128 strings/arrays) starting a
 
 ### API Key Coverage
 
-- **Explicit builders (26 API keys):** Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups, SaslHandshake, ApiVersions, CreateTopics, DeleteTopics, DeleteRecords, InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit, DescribeConfigs, AlterConfigs, SaslAuthenticate
-- **Header-framing test (38 API keys):** All remaining API keys are framed correctly with an empty payload — useful for testing that your server returns a proper error response rather than crashing
+- **Explicit builders (29 API keys):** Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups, SaslHandshake, ApiVersions, CreateTopics, DeleteTopics, DeleteRecords, InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit, DescribeConfigs, AlterConfigs, SaslAuthenticate, CreatePartitions, IncrementalAlterConfigs, DescribeCluster
+- **Header-framing test (35 API keys):** All remaining API keys are framed correctly with an empty payload — useful for testing that your server returns a proper error response rather than crashing
 
 ---
 

@@ -16,7 +16,7 @@
 // under the License.
 
 import { createRequire } from 'node:module';
-import { xxh3 } from '@node-rs/xxhash';
+import { randomFillSync } from 'node:crypto';
 import type { CommandResponse } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
@@ -123,8 +123,14 @@ export class VsrSession {
       nonReplicatedCode:
         operation === Operation.NonReplicated ? command : undefined,
     });
-    if (operation !== Operation.NonReplicated && operation < Operation.SendMessages)
-      header.writeBigUInt64LE(xxh3.xxh64(payload), REQUEST_OFFSET.requestChecksum);
+    if (operation === Operation.Register) {
+      this.state.registerRequestIdentifier.copy(header, REQUEST_OFFSET.requestChecksum);
+    } else if (operation !== Operation.NonReplicated && operation < Operation.SendMessages) {
+      do {
+        randomFillSync(header, REQUEST_OFFSET.requestChecksum, 16);
+      } while (header.subarray(REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16)
+        .every(byte => byte === 0));
+    }
     return payload.length === 0 ? header : Buffer.concat([header, payload]);
   }
 }

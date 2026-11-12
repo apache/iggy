@@ -30,7 +30,7 @@ pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-pub use consumer_group_client_state::ConsumerGroupClientState;
+pub use consumer_group_client_state::{AssignmentVersion, ConsumerGroupClientState};
 
 /// Sentinel `partition_id` in an otherwise-empty poll reply that tells the
 /// client its cached consumer-group assignment is stale (a generation fence
@@ -42,10 +42,10 @@ pub use consumer_group_client_state::ConsumerGroupClientState;
 pub const RESYNC_REQUIRED_PARTITION_SENTINEL: u32 = u32::MAX;
 
 /// Client-side `partition_id` of an empty poll reply for a consumer-group
-/// member that currently holds no partitions. The server never sends it: the
-/// transport fills it in when the synced assignment is empty, so a caller can
-/// tell "nothing assigned" from a genuine empty poll, which echoes the real
-/// partition id. Same value as the Go and Node SDKs use for that case.
+/// member that currently holds no partitions, as the Go and Swift SDKs fill it
+/// in. The server never sends it, and the Rust SDK never fills it in, because
+/// its polls always name a partition. It stays as the source of the Swift
+/// golden vectors.
 pub const NO_ASSIGNED_PARTITION: u32 = u32::MAX - 1;
 
 /// Frozen ceiling on the widest batch record any admission path can persist.
@@ -69,6 +69,7 @@ pub const MAX_MESSAGE_SIZE_UPPER_BYTES: u64 = 256 * 1024 * 1024;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;
 pub use http::messages::*;
+pub use http::options::{OptionInputMap, OptionInputValue, OptionsUpdate, RESET_FIELD};
 pub use http::partitions::*;
 pub use http::personal_access_tokens::*;
 pub use http::segments::*;
@@ -76,6 +77,11 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
+pub use iggy_binary_protocol::batch::BatchProducer;
+pub use iggy_binary_protocol::requests::messages::{
+    MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
+    MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+};
 pub use iggy_binary_protocol::responses::messages::{
     SendMessagesConfirmationResponse, SendMessagesResponse,
 };
@@ -83,14 +89,14 @@ pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
 #[doc(hidden)]
 pub use traits::binary_transport::{
-    BINARY_OPERATION_TIMEOUT, binary_operation_deadline, with_binary_deadline,
+    BINARY_OPERATION_TIMEOUT, BinaryOperationLineage, binary_deadline_in_force,
+    binary_operation_deadline, binary_operation_lineage, with_binary_deadline, with_binary_lineage,
 };
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed, decode_session_binding};
 pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;
 pub use traits::consumer_group_client::ConsumerGroupClient;
 pub use traits::consumer_offset_client::ConsumerOffsetClient;
-pub use traits::decode_send_confirmations;
 pub use traits::message_client::MessageClient;
 pub use traits::partition_client::PartitionClient;
 pub use traits::partitioner::Partitioner;
@@ -103,8 +109,11 @@ pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
 #[doc(hidden)]
-pub use traits::{BinarySendPartitioning, send_binary_messages};
-pub use traits::{rust_sdk_version_info, sign_in_request};
+pub use traits::{
+    BinarySendPartitioning, fetch_binary_messages, select_send_partition, send_binary_messages,
+};
+pub use traits::{binary_sign_in, rust_sdk_version_info, sign_in_request};
+pub use traits::{decode_send_confirmations, group_cache_key, sync_group_assignment};
 pub use types::args::*;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;
@@ -143,6 +152,7 @@ pub use types::either::Either;
 pub use types::http::HttpMethod;
 pub use types::identifier::*;
 pub use types::message::*;
+pub use types::metadata_changes::*;
 pub use types::options::*;
 pub use types::partition::*;
 pub use types::permissions::permissions_global::*;
@@ -168,6 +178,11 @@ pub use utils::net::validate_server_address;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::random_id;
 pub use utils::serde_secret;
+pub use utils::stream_key::{
+    MAX_PREVIOUS_KEYS, MAX_WRAP_SET_ENVELOPES, RewrapPlanError, STREAM_KEY_LENGTH,
+    ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WRAPPED_STREAM_KEY_LENGTH, WrapSet,
+    WrappedStreamKey, stream_key_fingerprint,
+};
 pub use utils::text;
 pub use utils::timestamp::*;
 pub use utils::topic_size::MaxTopicSize;

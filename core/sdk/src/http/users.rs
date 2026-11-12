@@ -19,14 +19,14 @@ use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Identifier, IggyError};
 use async_trait::async_trait;
-use iggy_common::UserClient;
-use iggy_common::UserUpdateOptions;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
 use iggy_common::login_user::LoginUser;
 use iggy_common::update_permissions::UpdatePermissions;
-use iggy_common::update_user::UpdateUser;
-use iggy_common::{IdentityInfo, Permissions, UserInfo, UserInfoDetails, UserStatus};
+use iggy_common::{
+    IdentityInfo, OptionInputMap, Permissions, UserClient, UserCreateOptions, UserInfo,
+    UserInfoDetails, UserStatus, UserUpdateOptions,
+};
 use secrecy::SecretString;
 
 const PATH: &str = "/users";
@@ -65,6 +65,7 @@ impl UserClient for HttpClient {
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
+        options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError> {
         let response = self
             .post(
@@ -74,6 +75,7 @@ impl UserClient for HttpClient {
                     password: SecretString::from(password),
                     status,
                     permissions,
+                    options: OptionInputMap(options.to_input_map()?),
                 },
             )
             .await?;
@@ -93,18 +95,11 @@ impl UserClient for HttpClient {
     async fn update_user(
         &self,
         user_id: &Identifier,
-        username: Option<&str>,
-        status: Option<UserStatus>,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
         self.put(
             &format!("{PATH}/{}", user_id.as_cow_str()),
-            &UpdateUser {
-                user_id: user_id.clone(),
-                username: username.map(|s| s.to_string()),
-                status,
-                options: options.raw.clone(),
-            },
+            &options.to_update_body()?,
         )
         .await?;
         Ok(())

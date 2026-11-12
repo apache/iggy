@@ -152,7 +152,7 @@ func TestClose_InterruptsAnInFlightReplayWait(t *testing.T) {
 
 	select {
 	case err := <-done:
-		assert.ErrorIs(t, err, ierror.ErrUncertainOutcome)
+		assert.ErrorIs(t, err, ierror.ErrOperationUncertain)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the in-flight request never returned after Close")
 	}
@@ -224,8 +224,12 @@ func TestLoginUser_ConcurrentSignInsAreSingleFlight(t *testing.T) {
 	}
 	group.Wait()
 
-	assert.NoError(t, errs[0])
-	assert.NoError(t, errs[1])
+	assert.True(t, errs[0] == nil || errs[1] == nil, "the newest sign-in must succeed: %v", errs)
+	for _, err := range errs {
+		if err != nil {
+			assert.ErrorIs(t, err, ierror.ErrUnauthenticated)
+		}
+	}
 	assert.True(t, client.session.Bound(),
 		"the surviving sign-in leaves one bound session, not an orphaned register")
 }
@@ -265,8 +269,11 @@ func TestTopicCache_ClearCountsKeepsTheBalancedCursors(t *testing.T) {
 }
 
 func TestSendMessages_InvalidatesTheCountWhenThePartitionVanished(t *testing.T) {
-	client, serverConn := newPipeClient(t)
+	client, serverConn := newRosterPipeClient(t)
 	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, "127.0.0.1:8090")
+		}
 		if read.operation() == vsr.OperationSendMessages {
 			return statusReplyFrame(vsr.OperationSendMessages,
 				uint32(ierror.PartitionNotFoundCode), nil)
@@ -288,13 +295,15 @@ func TestSendMessages_InvalidatesTheCountWhenThePartitionVanished(t *testing.T) 
 		"the topic was likely recreated smaller; the count must be reread")
 }
 
+// A namespace miss marks the route stale, so the first send fails with 41,
+// which leaves the route and its context.
 func TestSendMessages_KeepsTheContextAfterAFailureThatIsNotARefusal(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	sends := 0
 	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
 		sends++
 		if sends == 1 {
-			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.PartitionNotFoundCode), nil)
+			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.UnauthorizedCode), nil)
 		}
 		return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 	})
@@ -307,7 +316,7 @@ func TestSendMessages_KeepsTheContextAfterAFailureThatIsNotARefusal(t *testing.T
 		return err
 	}
 
-	require.ErrorIs(t, send(), ierror.ErrPartitionNotFound)
+	require.ErrorIs(t, send(), ierror.ErrUnauthorized)
 	require.NoError(t, send())
 
 	assert.Equal(t, 1, requestCount(server.recorded(), command.GetPartitionRouteCode),

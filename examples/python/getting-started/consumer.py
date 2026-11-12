@@ -23,10 +23,12 @@ from datetime import timedelta
 
 from apache_iggy import (
     AutoLogin,
+    CommitPolicy,
     Consumer,
     HttpConfig,
     IggyClient,
     PollingStrategy,
+    PollOptions,
     QuicConfig,
     ReceiveMessage,
     TcpConfig,
@@ -158,7 +160,7 @@ async def main():
         config = build_config(args)
     except ValueError as error:
         logger.error(f"Invalid client configuration: {error}")
-        return
+        raise
     logger.info(f"Connecting with {config}")
 
     client = IggyClient(config)
@@ -170,6 +172,7 @@ async def main():
         await consume_messages(client)
     except Exception as error:
         logger.exception(f"Exception occurred in main function: {error}")
+        raise
 
 
 async def consume_messages(client: IggyClient):
@@ -185,28 +188,30 @@ async def consume_messages(client: IggyClient):
     while n_consumed_batches < BATCHES_LIMIT:
         try:
             logger.debug("Polling for messages...")
-            polled_messages = await client.poll_messages(
+            polled = await client.poll_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
-                consumer=Consumer.Single(CONSUMER_NAME),
                 partition_id=PARTITION_ID,
+                consumer=Consumer.Single(CONSUMER_NAME),
                 polling_strategy=PollingStrategy.Next(),
-                count=messages_per_batch,
-                auto_commit=True,
+                options=PollOptions(
+                    count=messages_per_batch,
+                    commit=CommitPolicy.OnRead(),
+                ),
             )
-            if not polled_messages:
+            if not polled.messages:
                 logger.info("No messages found in current poll")
                 await asyncio.sleep(interval)
                 continue
 
-            offset += len(polled_messages)
-            for message in polled_messages:
+            offset += len(polled.messages)
+            for message in polled.messages:
                 handle_message(message)
             n_consumed_batches += 1
             await asyncio.sleep(interval)
         except Exception as error:
             logger.exception(f"Exception occurred while consuming messages: {error}")
-            break
+            raise
 
     logger.info(f"Consumed {n_consumed_batches} batches of messages, exiting.")
 

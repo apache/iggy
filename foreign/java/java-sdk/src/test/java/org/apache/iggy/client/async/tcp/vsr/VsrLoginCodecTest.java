@@ -23,6 +23,7 @@ import io.netty.buffer.AbstractByteBufAllocator;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
+import org.apache.iggy.RustSources;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.serde.BytesSerializer;
 import org.junit.jupiter.api.Test;
@@ -32,8 +33,6 @@ import org.junit.jupiter.params.provider.NullSource;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -45,15 +44,9 @@ class VsrLoginCodecTest {
 
     @Test
     void protocolVersionMatchesRustWireVersion() throws IOException {
-        Path versionPath = Path.of("core/binary_protocol/src/version.rs");
-        Path root = Path.of("").toAbsolutePath();
-        while (root != null && !Files.isRegularFile(root.resolve(versionPath))) {
-            root = root.getParent();
-        }
-        assertThat(root).as("repository containing %s", versionPath).isNotNull();
         Matcher version = Pattern.compile(
                         "pub const IGGY_PROTOCOL_VERSION:\\s*u32\\s*=\\s*pack_protocol_version\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)")
-                .matcher(Files.readString(root.resolve(versionPath)));
+                .matcher(RustSources.read("core/binary_protocol/src/version.rs"));
         assertThat(version.find()).as("Rust wire protocol version declaration").isTrue();
         int major = Integer.parseInt(version.group(1));
         int minor = Integer.parseInt(version.group(2));

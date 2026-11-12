@@ -25,6 +25,7 @@ from apache_iggy import (
     IggyClient,
     IggyExpiry,
     MaxTopicSize,
+    TopicOptions,
 )
 
 from .utils import (
@@ -75,7 +76,9 @@ class TestCreateTopic:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=2
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=2),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -121,9 +124,7 @@ class TestCreateTopic:
         await iggy_client.create_stream(stream_name)
 
         with pytest.raises(RuntimeError):
-            await iggy_client.create_topic(
-                stream=stream_name, name=topic_name, partitions_count=1
-            )
+            await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
     @pytest.mark.asyncio
     async def test_create_and_get_topic_with_numeric_stream_id(
@@ -138,7 +139,7 @@ class TestCreateTopic:
         assert stream is not None
 
         await iggy_client.create_topic(
-            stream=stream.id, name=topic_name, partitions_count=2
+            stream=stream.id, name=topic_name, options=TopicOptions(partitions_count=2)
         )
 
         topic_by_name = await iggy_client.get_topic(stream.id, topic_name)
@@ -158,14 +159,10 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError) as exc_info:
-            await iggy_client.create_topic(
-                stream=stream_name, name=topic_name, partitions_count=1
-            )
+            await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         assert "already exists" in str(exc_info.value)
 
@@ -181,12 +178,8 @@ class TestCreateTopic:
         await iggy_client.create_stream(first_stream_name)
         await iggy_client.create_stream(second_stream_name)
 
-        await iggy_client.create_topic(
-            stream=first_stream_name, name=topic_name, partitions_count=1
-        )
-        await iggy_client.create_topic(
-            stream=second_stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=first_stream_name, name=topic_name)
+        await iggy_client.create_topic(stream=second_stream_name, name=topic_name)
 
         first_topic = await iggy_client.get_topic(first_stream_name, topic_name)
         second_topic = await iggy_client.get_topic(second_stream_name, topic_name)
@@ -211,8 +204,7 @@ class TestCreateTopic:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            compression_algorithm=compression_algorithm,
+            options=TopicOptions(compression_algorithm=compression_algorithm),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -237,8 +229,7 @@ class TestCreateTopic:
             await iggy_client.create_topic(
                 stream=stream_name,
                 name=topic_name,
-                partitions_count=1,
-                compression_algorithm=compression_algorithm,
+                options=TopicOptions(compression_algorithm=compression_algorithm),
             )
 
     @pytest.mark.asyncio
@@ -268,8 +259,7 @@ class TestCreateTopic:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            message_expiry=message_expiry,
+            options=TopicOptions(message_expiry=message_expiry),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -304,8 +294,9 @@ class TestCreateTopic:
             await iggy_client.create_topic(
                 stream=stream_name,
                 name=topic_name,
-                partitions_count=1,
-                message_expiry=IggyExpiry.ExpireDuration(invalid_duration),
+                options=TopicOptions(
+                    message_expiry=IggyExpiry.ExpireDuration(invalid_duration)
+                ),
             )
 
     @pytest.mark.asyncio
@@ -325,8 +316,7 @@ class TestCreateTopic:
             await iggy_client.create_topic(
                 stream=stream_name,
                 name=topic_name,
-                partitions_count=1,
-                message_expiry=invalid_message_expiry,
+                options=TopicOptions(message_expiry=invalid_message_expiry),
             )
 
     @pytest.mark.asyncio
@@ -353,8 +343,7 @@ class TestCreateTopic:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            max_topic_size=max_topic_size,
+            options=TopicOptions(max_topic_size=max_topic_size),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -395,8 +384,9 @@ class TestCreateTopic:
             await iggy_client.create_topic(
                 stream=stream_name,
                 name=topic_name,
-                partitions_count=1,
-                max_topic_size=MaxTopicSize.Custom(max_topic_size_bytes),
+                options=TopicOptions(
+                    max_topic_size=MaxTopicSize.Custom(max_topic_size_bytes)
+                ),
             )
 
     @pytest.mark.asyncio
@@ -412,7 +402,9 @@ class TestCreateTopic:
 
         with pytest.raises(RuntimeError) as exc_info:
             await iggy_client.create_topic(
-                stream=stream_name, name=topic_name, partitions_count=partitions_count
+                stream=stream_name,
+                name=topic_name,
+                options=TopicOptions(partitions_count=partitions_count),
             )
 
         assert "Too many partitions" in str(exc_info.value)
@@ -437,7 +429,9 @@ class TestCreateTopic:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=partitions_count
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=partitions_count),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -460,12 +454,8 @@ class TestCreateTopic:
         assert stream_before is not None
         assert stream_before.topics_count == 0
 
-        await iggy_client.create_topic(
-            stream=stream_name, name=first_topic_name, partitions_count=1
-        )
-        await iggy_client.create_topic(
-            stream=stream_name, name=second_topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=first_topic_name)
+        await iggy_client.create_topic(stream=stream_name, name=second_topic_name)
 
         stream_after = await iggy_client.get_stream(stream_name)
         assert stream_after is not None
@@ -480,9 +470,7 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         host, port = get_server_config()
         wait_for_server(host, port)
@@ -506,9 +494,7 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         with pytest.raises(RuntimeError):
-            await iggy_client.create_topic(
-                stream=nonexistent_stream, name=topic_name, partitions_count=1
-            )
+            await iggy_client.create_topic(stream=nonexistent_stream, name=topic_name)
 
     @pytest.mark.asyncio
     async def test_create_topic_requires_connection_and_auth(self, unique_name):
@@ -518,15 +504,11 @@ class TestCreateTopic:
 
         client = IggyClient(f"{host}:{port}")
         with pytest.raises(RuntimeError):
-            await client.create_topic(
-                stream=unique_name(), name=unique_name(), partitions_count=1
-            )
+            await client.create_topic(stream=unique_name(), name=unique_name())
 
         await client.connect()
         with pytest.raises(RuntimeError):
-            await client.create_topic(
-                stream=unique_name(), name=unique_name(), partitions_count=1
-            )
+            await client.create_topic(stream=unique_name(), name=unique_name())
 
 
 class TestGetTopic:
@@ -539,9 +521,7 @@ class TestGetTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         topic_by_name = await iggy_client.get_topic(stream_name, topic_name)
         assert topic_by_name is not None
@@ -564,7 +544,9 @@ class TestGetTopic:
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=3
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(partitions_count=3),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -647,9 +629,7 @@ class TestGetTopics:
 
         await iggy_client.create_stream(stream_name)
         for name in topic_names:
-            await iggy_client.create_topic(
-                stream=stream_name, name=name, partitions_count=1
-            )
+            await iggy_client.create_topic(stream=stream_name, name=name)
 
         topics = await iggy_client.get_topics(stream_name)
         assert len(topics) == len(topic_names)
@@ -671,9 +651,7 @@ class TestGetTopics:
 
         await iggy_client.create_stream(stream_name)
         for name in topic_names:
-            await iggy_client.create_topic(
-                stream=stream_name, name=name, partitions_count=1
-            )
+            await iggy_client.create_topic(stream=stream_name, name=name)
 
         first = await iggy_client.get_topics(stream_name)
         second = await iggy_client.get_topics(stream_name)
@@ -690,9 +668,7 @@ class TestGetTopics:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
 
@@ -757,9 +733,7 @@ class TestUpdateTopic:
         invalid_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(RuntimeError):
             await iggy_client.update_topic(
@@ -776,9 +750,7 @@ class TestUpdateTopic:
         new_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.update_topic(
             stream_id=stream_name, topic_id=topic_name, name=new_name
@@ -801,9 +773,7 @@ class TestUpdateTopic:
         new_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         before = await iggy_client.get_topic(stream_name, topic_name)
         assert before is not None
 
@@ -825,9 +795,7 @@ class TestUpdateTopic:
         new_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
 
@@ -841,51 +809,41 @@ class TestUpdateTopic:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("compression_algorithm", ["gzip", "none"])
-    async def test_update_topic_with_valid_compression_algorithm(
+    async def test_update_topic_keeps_the_compression_algorithm_set_at_creation(
         self, iggy_client: IggyClient, unique_name, compression_algorithm: str
     ):
-        """Test update_topic accepts a supported compression algorithm."""
+        """Test compression is fixed at creation and no update can change it."""
         stream_name = unique_name()
         topic_name = unique_name()
+        other_algorithm = "none" if compression_algorithm == "gzip" else "gzip"
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
+            stream=stream_name,
+            name=topic_name,
+            options=TopicOptions(compression_algorithm=compression_algorithm),
         )
 
+        with pytest.raises(TypeError):
+            await iggy_client.update_topic(
+                stream_id=stream_name,
+                topic_id=topic_name,
+                # pyrefly: ignore  # unexpected-keyword
+                compression_algorithm=other_algorithm,
+            )
+        with pytest.raises(RuntimeError, match="Option cannot be updated"):
+            await iggy_client.update_topic(
+                stream_id=stream_name,
+                topic_id=topic_name,
+                options={"compression_algorithm": other_algorithm},
+            )
         await iggy_client.update_topic(
-            stream_id=stream_name,
-            topic_id=topic_name,
-            name=topic_name,
-            compression_algorithm=compression_algorithm,
+            stream_id=stream_name, topic_id=topic_name, name=topic_name
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
-        assert topic.name == topic_name
         assert topic.compression_algorithm == compression_algorithm
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("compression_algorithm", ["brotli", "gzipp", ""])
-    async def test_update_topic_invalid_compression_algorithm(
-        self, iggy_client: IggyClient, unique_name, compression_algorithm: str
-    ):
-        """Test update_topic rejects unsupported compression algorithm values."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        with pytest.raises(RuntimeError, match="Unknown compression type"):
-            await iggy_client.update_topic(
-                stream_id=stream_name,
-                topic_id=topic_name,
-                name=topic_name,
-                compression_algorithm=compression_algorithm,
-            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -899,9 +857,7 @@ class TestUpdateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(TypeError):
             await iggy_client.update_topic(
@@ -933,9 +889,7 @@ class TestUpdateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(expected_exception):
             await iggy_client.update_topic(
@@ -954,9 +908,7 @@ class TestUpdateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.update_topic(
             stream_id=stream_name,
@@ -992,9 +944,7 @@ class TestUpdateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         with pytest.raises(ValueError):
             await iggy_client.update_topic(
@@ -1025,9 +975,7 @@ class TestUpdateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         created = await iggy_client.get_topic(stream_name, topic_name)
         assert created is not None
@@ -1044,11 +992,9 @@ class TestUpdateTopic:
         assert topic is not None
         assert topic.name == topic_name
         if expected_kind == "server_default":
-            # Every setting rides the options block and 0 is its "resolve the
-            # default" sentinel, so a ServerDefault update carries no key at all
-            # and the topic keeps the value admission resolved when it was
-            # created. Resetting a setting back to the node default is
-            # deliberately not expressible.
+            # A ServerDefault update carries no key at all, so the topic keeps
+            # the value admission resolved when it was created. Returning to
+            # the default is a reset of `OptionKey.MaxTopicSize` instead.
             assert isinstance(topic.max_topic_size, type(resolved_at_creation))
             assert not isinstance(topic.max_topic_size, MaxTopicSize.ServerDefault)
         elif expected_kind == "unlimited":
@@ -1069,9 +1015,7 @@ class TestUpdateTopic:
         second_rename = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.update_topic(
             stream_id=stream_name, topic_id=topic_name, name=first_rename
@@ -1123,12 +1067,8 @@ class TestUpdateTopic:
         second_topic = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=first_topic, partitions_count=1
-        )
-        await iggy_client.create_topic(
-            stream=stream_name, name=second_topic, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=first_topic)
+        await iggy_client.create_topic(stream=stream_name, name=second_topic)
 
         with pytest.raises(RuntimeError):
             await iggy_client.update_topic(
@@ -1166,9 +1106,7 @@ class TestDeleteTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.delete_topic(stream_name, topic_name)
 
@@ -1188,9 +1126,7 @@ class TestDeleteTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
 
@@ -1208,12 +1144,8 @@ class TestDeleteTopic:
         topic_to_keep = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_to_delete, partitions_count=1
-        )
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_to_keep, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_to_delete)
+        await iggy_client.create_topic(stream=stream_name, name=topic_to_keep)
 
         await iggy_client.delete_topic(stream_name, topic_to_delete)
 
@@ -1242,9 +1174,7 @@ class TestDeleteTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.delete_topic(stream_name, topic_name)
         with pytest.raises(RuntimeError):
@@ -1278,9 +1208,9 @@ class TestTopicOptions:
         await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
-            partitions_count=1,
-            durability=Durability.PERSISTED,
-            options={"segment_size": "128 MiB"},
+            options=TopicOptions(
+                durability=Durability.PERSISTED, raw={"segment_size": "128 MiB"}
+            ),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -1309,30 +1239,32 @@ class TestTopicOptions:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
+        await iggy_client.create_topic(stream=stream_name, name=topic_name)
 
         await iggy_client.update_topic(
             stream_id=stream_name,
             topic_id=topic_name,
-            name=topic_name,
-            options={"compression_algorithm": "gzip"},
+            options={"message_expiry": "3600000000"},
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
-        assert topic.compression_algorithm == "gzip"
+        assert topic.name == topic_name
+        assert isinstance(topic.message_expiry, IggyExpiry.ExpireDuration)
+        assert topic.message_expiry.duration == timedelta(hours=1)
 
         # A create-time key is refused by name, so nothing re-pushes it to the
         # partitions of a live topic.
-        with pytest.raises(RuntimeError):
-            await iggy_client.update_topic(
-                stream_id=stream_name,
-                topic_id=topic_name,
-                name=topic_name,
-                options={"segment_size": "2 MiB"},
-            )
+        for create_only in (
+            {"segment_size": "2 MiB"},
+            {"compression_algorithm": "gzip"},
+        ):
+            with pytest.raises(RuntimeError, match="Option cannot be updated"):
+                await iggy_client.update_topic(
+                    stream_id=stream_name,
+                    topic_id=topic_name,
+                    options=create_only,
+                )
 
     @pytest.mark.asyncio
     async def test_describe_options_lists_the_topic_catalog(
@@ -1354,9 +1286,29 @@ class TestTopicOptions:
         assert default.value == 1024 * 1024 * 1024
         assert segment_size.description
 
-        # Streams and users have no catalog keys yet.
-        assert await iggy_client.describe_options("stream") == []
-        assert await iggy_client.describe_options("user") == []
+        flags = {
+            spec.key: (spec.updatable, spec.resettable, spec.secret, spec.read_only)
+            for spec in specs
+        }
+        assert flags["message_expiry"] == (True, True, False, False)
+        assert flags["compression_algorithm"] == (False, False, False, False)
+
+        streams = await iggy_client.describe_options("stream")
+        assert {
+            spec.key: (spec.updatable, spec.secret, spec.read_only, spec.critical)
+            for spec in streams
+        } == {
+            "name": (True, False, False, False),
+            "encryption_key": (False, True, False, True),
+            "encryption_key_source": (False, False, True, False),
+            "encryption_key_fingerprint": (False, False, True, False),
+            "encryption_kek_fingerprint": (False, False, True, False),
+        }
+        users = await iggy_client.describe_options("user")
+        assert [(spec.key, spec.updatable) for spec in users] == [
+            ("username", True),
+            ("status", True),
+        ]
 
     @pytest.mark.asyncio
     async def test_describe_options_rejects_an_unknown_scope(

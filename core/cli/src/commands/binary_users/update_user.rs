@@ -18,12 +18,7 @@
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::Client;
-use iggy_common::Identifier;
-use iggy_common::UserStatus;
-use iggy_common::UserUpdateOptions;
-use iggy_common::update_user::UpdateUser;
-use std::collections::BTreeMap;
+use iggy_common::{Client, Identifier, UserStatus, UserUpdateOptions};
 use tracing::{Level, event};
 
 #[derive(Debug, Clone)]
@@ -33,25 +28,27 @@ pub enum UpdateUserType {
 }
 
 pub struct UpdateUserCmd {
+    user_id: Identifier,
     update_type: UpdateUserType,
-    update_user: UpdateUser,
+    options: UserUpdateOptions,
 }
 
 impl UpdateUserCmd {
     pub fn new(user_id: Identifier, update_type: UpdateUserType) -> Self {
-        let (username, status) = match update_type.clone() {
-            UpdateUserType::Name(username) => (Some(username), None),
-            UpdateUserType::Status(status) => (None, Some(status)),
-        };
-
-        UpdateUserCmd {
-            update_type,
-            update_user: UpdateUser {
-                user_id,
-                username,
-                status,
-                options: BTreeMap::new(),
+        let options = match update_type.clone() {
+            UpdateUserType::Name(username) => UserUpdateOptions {
+                username: Some(username),
+                ..UserUpdateOptions::default()
             },
+            UpdateUserType::Status(status) => UserUpdateOptions {
+                status: Some(status),
+                ..UserUpdateOptions::default()
+            },
+        };
+        UpdateUserCmd {
+            user_id,
+            update_type,
+            options,
         }
     }
 
@@ -68,33 +65,26 @@ impl CliCommand for UpdateUserCmd {
     fn explain(&self) -> String {
         format!(
             "update user with ID: {} with {}",
-            self.update_user.user_id,
+            self.user_id,
             self.get_message()
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .update_user(
-                &self.update_user.user_id,
-                self.update_user.username.as_deref(),
-                self.update_user.status,
-                // `iggy user name` / `iggy user status` are single-purpose
-                // commands; users have no option keys to set yet.
-                &UserUpdateOptions::default(),
-            )
+            .update_user(&self.user_id, &self.options)
             .await
             .with_context(|| {
                 format!(
                     "Problem updating user with ID: {} with {}",
-                    self.update_user.user_id,
+                    self.user_id,
                     self.get_message()
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
             "User with ID: {} updated with {}",
-            self.update_user.user_id, self.get_message()
+            self.user_id, self.get_message()
         );
 
         Ok(())

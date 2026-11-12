@@ -18,11 +18,11 @@
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::UserClient;
-use iggy_common::UserUpdateOptions;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
 };
+use iggy_common::{UserCreateOptions, UserUpdateOptions};
 
 #[async_trait]
 impl UserClient for IggyClient {
@@ -40,8 +40,9 @@ impl UserClient for IggyClient {
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
+        options: &UserCreateOptions,
     ) -> Result<UserInfoDetails, IggyError> {
-        super::with_client!(self, client => client.create_user(username, password, status, permissions).await)
+        super::with_client!(self, client => client.create_user(username, password, status, permissions, options).await)
     }
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
@@ -51,11 +52,9 @@ impl UserClient for IggyClient {
     async fn update_user(
         &self,
         user_id: &Identifier,
-        username: Option<&str>,
-        status: Option<UserStatus>,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
-        super::with_client!(self, client => client.update_user(user_id, username, status, options).await)
+        super::with_client!(self, client => client.update_user(user_id, options).await)
     }
 
     async fn update_permissions(

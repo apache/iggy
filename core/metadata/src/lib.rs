@@ -18,18 +18,19 @@
 //! Iggy metadata module
 
 pub mod applied_frontier;
+pub mod change_log;
 pub mod impls;
 pub mod permissioner;
 pub mod stm;
 
 // The node-wide read frontier the read gates park on; minted by the bootstrap
 // before any shard exists, so it is named outside `impls::`.
-pub use applied_frontier::{AppliedFrontier, Reached};
+pub use applied_frontier::{AppliedFrontier, PartitionRecovery, Reached};
 
 // Re-export IggyMetadata for use in other modules
 pub use impls::metadata::{
-    BoundSession, CommitNotifier, IggyMetadata, MetadataSubmitError, StateTransferOffer,
-    apply_committed_prepare,
+    BoundSession, CommitNotifier, CommitWalkStop, CommittedApply, IggyMetadata,
+    MetadataSubmitError, StateTransferOffer, apply_committed_prepare,
 };
 
 // Recovery vocabulary other crates name in their own signatures and error

@@ -541,6 +541,28 @@ async fn should_create_personal_access_token(harness: &TestHarness) {
     assert!(!token.token.is_empty());
 }
 
+#[iggy_harness(server(mcp))]
+async fn should_refuse_personal_access_token_with_unparsable_expiry(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let name = "test_token";
+    let arguments = json!({"name": name, "expiry": "tomorrow"});
+    let params = CallToolRequestParams::new("create_personal_access_token".to_owned())
+        .with_arguments(arguments.as_object().expect("Tool arguments").clone());
+    let result = mcp_client.call_tool(params).await;
+
+    assert!(
+        matches!(&result, Err(ServiceError::McpError(error))
+            if error.message.starts_with("Failed to parse personal access token expiry")),
+        "Expected an expiry parse error, got {result:?}"
+    );
+    let tokens: Vec<PersonalAccessTokenInfo> =
+        invoke(&mcp_client, "get_personal_access_tokens", None).await;
+    assert!(
+        tokens.iter().all(|token| token.name != name),
+        "A refused expiry must not create a token: {tokens:?}"
+    );
+}
+
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
 async fn should_delete_personal_access_token(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
@@ -728,16 +750,6 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
             json!({"name": seeds::names::PERSONAL_ACCESS_TOKEN}),
             "delete",
         ),
-        (
-            "resolve_operation",
-            json!({"operation_id": "1"}),
-            "write recovery",
-        ),
-        (
-            "abandon_operation",
-            json!({"operation_id": "1"}),
-            "write recovery",
-        ),
     ] {
         let params = CallToolRequestParams::new(method.to_owned())
             .with_arguments(arguments.as_object_mut().expect("Tool arguments").clone());
@@ -788,6 +800,24 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
     let offset: Option<ConsumerOffsetInfo> =
         invoke(&client, "get_consumer_offset", Some(partition)).await;
     assert_eq!(offset.expect("Next strategy offset").stored_offset, 1);
+
+    // Read starts offset writes, so it must also reach their recovery.
+    for method in ["resolve_operation", "abandon_operation"] {
+        let operation_id = u64::MAX.to_string();
+        let arguments = json!({"operation_id": operation_id});
+        let params = CallToolRequestParams::new(method.to_owned())
+            .with_arguments(arguments.as_object().expect("Tool arguments").clone());
+        let result = client.call_tool(params).await;
+        let Err(ServiceError::McpError(error)) = result else {
+            panic!("Expected an operation-not-retained error from {method}, got {result:?}");
+        };
+        assert_eq!(
+            error.data.expect("Recovery error data")["operation_id"],
+            operation_id,
+            "{method} must reach recovery with read permission, got {}",
+            error.message
+        );
+    }
 
     let tokens: Vec<PersonalAccessTokenInfo> =
         invoke(&client, "get_personal_access_tokens", None).await;

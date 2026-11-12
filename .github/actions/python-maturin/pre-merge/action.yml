@@ -54,6 +54,8 @@ runs:
       uses: ./.github/actions/utils/server-start
       with:
         bin: target/debug/iggy-server
+        encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 
     - name: Setup Python
       uses: actions/setup-python@v6
@@ -213,6 +215,45 @@ runs:
       with:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
+
+    - name: Start Iggy server (shipped default)
+      if: inputs.task == 'test'
+      id: iggy-default
+      uses: ./.github/actions/utils/server-start
+      with:
+        bin: target/debug/iggy-server
+        pid-file: ${{ runner.temp }}/iggy-server-default.pid
+        log-file: ${{ runner.temp }}/iggy-server-default.log
+      env:
+        IGGY_PATH: ${{ runner.temp }}/iggy-python-default-data
+
+    # The resource options cases need a server key, and the TLS cases start
+    # their own server, so both run on the lane above.
+    - name: Run Python integration tests (shipped default)
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/python
+        tcp_port="${{ steps.iggy-default.outputs.tcp_address }}"
+        http_port="${{ steps.iggy-default.outputs.http_address }}"
+        IGGY_SERVER_HOST=127.0.0.1 \
+        IGGY_SERVER_TCP_PORT="${tcp_port##*:}" \
+        IGGY_SERVER_QUIC_PORT=8080 \
+        IGGY_SERVER_HTTP_PORT="${http_port##*:}" \
+        IGGY_SERVER_WS_PORT=8092 \
+          uv run --no-sync pytest tests/ -v \
+            --ignore=tests/test_resource_options.py \
+            --ignore=tests/test_tls.py \
+            --junitxml=../../reports/python-junit-default.xml \
+            --tb=short \
+            --capture=no
+      shell: bash
+
+    - name: Stop Iggy server (shipped default)
+      if: always() && inputs.task == 'test'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-default.outputs.pid_file }}
+        log-file: ${{ steps.iggy-default.outputs.log_file }}
 
     - name: Generate coverage report
       if: inputs.task == 'test'

@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -33,11 +34,38 @@ type completedResultError struct{ err error }
 func (e *completedResultError) Error() string { return e.err.Error() }
 func (e *completedResultError) Unwrap() error { return e.err }
 
-func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, frame []byte, exact *iggcon.PartitionContext) ([]byte, error) {
-	ctx, cancel := operationContext(ctx)
+func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, frame []byte, exact *iggcon.PartitionContext, replica *uint8) ([]byte, error) {
+	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
+	epoch := c.callEpoch(ctx)
+	_, mutation := vsr.ReplicatedOperation(uint32(code))
+	progress := isProgressPoll(code, frame[vsr.HeaderSize:])
+	// Offset calls queue with the progress polls of their partition, so an
+	// offset read does not overtake a poll that moves the offset.
+	progressLane := progress || code == command.GetOffsetCode || changesProgress(code)
+	// A plain read reports a context that is done before its first attempt.
+	// Later, also when a session recovery restarts the call, it ends with 58.
+	if err := ctx.Err(); err != nil && !mutation && !progress {
+		return nil, err
+	}
+	budget := newDeferredBudget(code, frame)
+	// A poll or fetch that stores its offset blocks the progress of its
+	// partitions until the caller abandons it when its outcome is unknown.
+	committing := storesOnRead(code, frame[vsr.HeaderSize:])
+	slotTaken := false
+	defer func() {
+		if slotTaken {
+			<-c.deferred
+		}
+	}()
 	historyRefreshed := false
 	keptContext := exact
+	// A zero context carries nothing, so it counts as none and takes the
+	// context of the route. A fetch keeps a header without a history, since
+	// each of its targets names its own.
+	if exact != nil && *exact == (iggcon.PartitionContext{}) && fencedByHistory(code) {
+		keptContext = nil
+	}
 	lifecycleDelay := replayInterval
 	lookupDelay := replayInterval
 	var ticket *laneTicket
@@ -48,15 +76,15 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 	}()
 	for {
 		if ctx.Err() != nil {
-			if _, mutation := vsr.ReplicatedOperation(uint32(code)); !mutation && !isProgressPoll(code, frame[vsr.HeaderSize:]) {
-				return nil, ctx.Err()
-			}
 			return nil, ierror.ErrTransientNotAccepted
 		}
 		select {
 		case <-c.closed:
 			return nil, ierror.ErrClientShutdown
 		default:
+		}
+		if err := c.waitForRecovery(ctx); err != nil {
+			return nil, err
 		}
 		var route pollRoute
 		var captured iggcon.PartitionContext
@@ -70,65 +98,129 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 					}
 					return nil, ierror.ErrTransientNotAccepted
 				}
-				return nil, c.sessionLossError(err)
+				if c.sessionRecovers(ctx, err) {
+					continue
+				}
+				return nil, err
 			}
 			captured = route.context
 		} else {
 			captured.MetadataOp = c.metadataWatermark.Load()
 		}
 		if keptContext != nil {
+			if keptContext.Incarnation == 0 && fencedByHistory(code) {
+				// A caller context without a history takes the incarnation of
+				// the route, once, so every attempt names the same history. It
+				// keeps its owner and op, so the owner check still applies.
+				filled := *keptContext
+				filled.Incarnation = route.context.Incarnation
+				keptContext = &filled
+			}
 			captured = *keptContext
 		} else if query != nil {
 			saved := captured
 			keptContext = &saved
 		}
-		_, mutation := vsr.ReplicatedOperation(uint32(code))
-		progress := isProgressPoll(code, frame[vsr.HeaderSize:])
-		if ticket == nil && (mutation || progress) {
+		// A route without a history is not ready yet. The next call looks it
+		// up again.
+		if captured.Incarnation == 0 && fencedByHistory(code) {
+			c.polls.invalidate(route, false)
+			return nil, ierror.ErrTransientNotAccepted
+		}
+		if ticket == nil && (mutation || progressLane) {
 			key := laneKey{}
 			if query != nil {
 				key = laneKey{incarnation: captured.Incarnation, partition: route.key.partition}
 			}
 			var err error
-			ticket, err = c.operations.enter(ctx, key)
+			switch {
+			case code == command.FetchMessagesCode:
+				// Each target of a fetch carries its own incarnation.
+				ticket, err = c.operations.enterLanes(ctx, fetchLanes(frame[vsr.HeaderSize:]))
+			case code == command.GetOffsetCode:
+				ticket, err = c.operations.enterLane(ctx, key.progressLane(), true)
+			case progressLane:
+				ticket, err = c.operations.enterProgress(ctx, key, mutation)
+			default:
+				ticket, err = c.operations.enter(ctx, key)
+			}
 			if err != nil {
-				return nil, c.sessionLossError(err)
+				return nil, err
+			}
+		}
+		// After the lanes, so that a poll queued behind a parked poll of its
+		// partition leaves the slot to deferred calls of other partitions.
+		if budget != nil && !slotTaken {
+			select {
+			case c.deferred <- struct{}{}:
+				slotTaken = true
+			case <-ctx.Done():
+				return nil, ierror.ErrTransientNotAccepted
+			case <-c.closed:
+				return nil, ierror.ErrClientShutdown
 			}
 		}
 		if mutation {
 			if err := ticket.reserve(ctx, len(frame)); err != nil {
-				return nil, c.sessionLossError(err)
+				if c.sessionRecovers(ctx, err) {
+					continue
+				}
+				return nil, err
+			}
+		}
+		if committing {
+			if err := ticket.reserveFetch(); err != nil {
+				return nil, err
 			}
 		}
 		frozen := append([]byte(nil), frame...)
 		c.mtx.Lock()
 		fence := c.sessionFence
-		var err error
-		if ticket != nil && !ticket.current() {
-			err = ierror.ErrUnauthenticated
-		} else {
-			err = vsr.StampRequestHeader(c.session, uint32(code), frozen)
+		err := epoch.err()
+		if err == nil {
+			if ticket != nil && !ticket.renew() {
+				err = ierror.ErrUnauthenticated
+			} else {
+				err = vsr.StampRequestHeader(c.session, uint32(code), frozen)
+			}
 		}
 		if err == nil {
 			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frozen), captured)
 		}
 		c.mtx.Unlock()
 		if err != nil {
+			if c.sessionRecovers(ctx, err) {
+				if ticket != nil {
+					ticket.releaseOperation()
+				}
+				continue
+			}
 			if ticket != nil {
 				ticket.finish(false)
 			}
-			return nil, c.sessionLossError(err)
+			return nil, err
 		}
 		var operation *pendingOperation
 		if ticket != nil {
 			operation = ticket.freeze(code, query, frozen)
 		} else {
-			operation = &pendingOperation{id: vsr.StampedRequestID(frozen), code: code, query: append([]byte(nil), query...), fence: fence, frame: newOperationFrame(frozen, nil)}
+			operation = &pendingOperation{id: vsr.StampedRequestID(frozen), code: code, query: append([]byte(nil), query...), fence: fence, frame: newOperationFrame(frozen, nil), replica: replica}
+		}
+		operation.budget = budget
+		operation.frame.uncancellable = committing
+		if committing && !c.startCommit() {
+			return nil, ierror.ErrClientShutdown
 		}
 		response, err := c.driveOperation(ctx, operation, ticket, false, mutation)
+		if committing {
+			c.commits.Done()
+		}
 		var completed *completedResultError
 		if errors.As(err, &completed) {
 			return nil, completed.err
+		}
+		if c.sessionRecovers(ctx, err) {
+			continue
 		}
 		if errors.Is(err, ierror.ErrLifecycleBusy) {
 			if waitErr := c.pause(ctx, lifecycleDelay); waitErr != nil {
@@ -141,7 +233,6 @@ func (c *IggyTcpClient) drive(ctx context.Context, code command.Code, query, fra
 			ticket = nil
 			historyRefreshed = true
 			keptContext = nil
-			c.polls.invalidate(route, false)
 			continue
 		}
 		return response, err
@@ -163,7 +254,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 	notPrimarySeen := false
 	lookupDelay := replayInterval
 	progress := isProgressPoll(operation.code, operation.frame.data[vsr.HeaderSize:])
+	committing := storesOnRead(operation.code, operation.frame.data[vsr.HeaderSize:])
+	possiblySent := false
 	defer func() {
+		if committing && possiblySent && err != nil {
+			err = ticket.retainFetch(ticket.fetch.keys)
+		}
 		if ticket == nil {
 			operation.frame.release()
 			return
@@ -171,7 +267,10 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		// A replay returns nil or a completed result only with a committed proof.
 		var completed *completedResultError
 		switch {
-		case !uncertain && errors.Is(err, ierror.ErrLifecycleBusy):
+		// The call keeps its lane to start a new operation. Unauthenticated
+		// ends only a call that cannot have changed server state, and it can
+		// restart under the session that replaces the lost one.
+		case !uncertain && (errors.Is(err, ierror.ErrLifecycleBusy) || errors.Is(err, ierror.ErrUnauthenticated)):
 			ticket.releaseOperation()
 		case err == nil:
 			ticket.prove(nil)
@@ -186,7 +285,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			ticket.finish(retain)
 		}
 	}()
-	finishUncertain := func() error { retain = mutation; return ierror.UncertainOutcome{OperationID: operation.id} }
+	finishUncertain := func() error { retain = mutation; return ierror.OperationUncertain{OperationID: operation.id} }
 	sessionChanged := func(sent bool) error {
 		if progress && sent {
 			return ierror.ErrTransientNotCommitted
@@ -194,7 +293,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		if mutation && (sent || uncertain) {
 			return finishUncertain()
 		}
-		return c.sessionLossError(ierror.ErrUnauthenticated)
+		return ierror.ErrUnauthenticated
 	}
 	for {
 		c.mtx.Lock()
@@ -226,6 +325,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		}
 		var link *tcpLink
 		var route pollRoute
+		readyLink := c.links.nextReadyLink()
 		if operation.query != nil {
 			route, err = c.consumerRoute(ctx, operation.query)
 			if err == nil {
@@ -235,6 +335,17 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 					_ = c.refreshRoster(ctx, c.links.any())
 					link = c.links.replica(route.primary)
 				}
+			}
+		} else if operation.replica != nil {
+			link = c.links.replica(*operation.replica)
+			if link == nil && !c.links.contains(*operation.replica) {
+				if !rosterRefreshed {
+					rosterRefreshed = c.refreshRoster(ctx, nil) == nil
+				}
+				if rosterRefreshed && !c.links.contains(*operation.replica) {
+					return nil, ierror.ErrInvalidIdentifier
+				}
+				link = c.links.replica(*operation.replica)
 			}
 		} else {
 			link = c.links.metadata()
@@ -251,9 +362,9 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				if uncertain && mutation {
 					return nil, finishUncertain()
 				}
-				return nil, c.sessionLossError(err)
+				return nil, err
 			}
-			if waitErr := c.pause(ctx, nextLookupBackoff(&lookupDelay)); waitErr != nil {
+			if waitErr := c.pauseUntil(ctx, nextLookupBackoff(&lookupDelay), readyLink); waitErr != nil {
 				if uncertain && mutation {
 					return nil, finishUncertain()
 				}
@@ -295,14 +406,27 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				continue
 			}
 		}
-		reply, sent := link.exchange(ctx, operation.frame)
+		attempt := operation.frame
+		if operation.budget != nil {
+			if attempt, err = operation.budget.attempt(ctx, operation.frame.data); err != nil {
+				if uncertain {
+					return nil, ierror.ErrTransientNotCommitted
+				}
+				return nil, err
+			}
+		}
+		reply, sent := link.exchange(ctx, attempt)
+		possiblySent = possiblySent || sent
+		if attempt != operation.frame {
+			attempt.release()
+		}
 		c.mtx.Lock()
 		current = c.sessionFence == operation.fence
 		c.mtx.Unlock()
 		if ticket != nil {
 			current = current && ticket.current()
 		}
-		if !current {
+		if !current && (!committing || reply.err != nil) {
 			return nil, sessionChanged(sent)
 		}
 		if reply.err != nil {
@@ -324,8 +448,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				return nil, reply.err
 			}
 			if operation.query != nil {
-				c.polls.invalidate(route, false)
-			} else if sent && linkReady(link) {
+				// A caller that stopped waiting for a parked deferred request
+				// says nothing about its route.
+				if operation.budget == nil || ctx.Err() == nil {
+					c.polls.invalidate(route, false)
+				}
+			} else if sent && linkReady(link) && operation.replica == nil {
 				c.links.invalidateMetadataPrimary(link)
 			}
 			if ctx.Err() != nil {
@@ -371,7 +499,11 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			}
 			return nil, ierror.ErrInvalidCommand
 		}
-		if !c.observeMetadataFor(operation.fence, &reply.header) {
+		publishCredentials := outcome.Err == nil && (!uncertain || !mutation || outcome.Committed)
+		// A correlated fetch table settles progress even if recovery replaced
+		// its session or the caller's sign-in ended.
+		accepted := c.acceptOperationReply(c.callEpoch(ctx), operation, &reply.header, publishCredentials)
+		if !accepted && !committing {
 			return nil, sessionChanged(sent)
 		}
 		if outcome.Err == nil {
@@ -381,9 +513,32 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				}
 				continue
 			}
-			c.refreshSignIn(operation.code, operation.frame.data[vsr.HeaderSize:])
+			if committing {
+				if operation.code == command.FetchMessagesCode {
+					if err = classifyFetchReply(ctx, operation, ticket, outcome.Body); err != nil {
+						return nil, err
+					}
+				}
+				possiblySent = false
+			}
 			c.refreshMembership(operation.code, operation.frame.data[vsr.HeaderSize:])
+			c.refreshAssignment(operation, &reply.header, outcome.Body)
 			return outcome.Body, nil
+		}
+		if committing {
+			if !fetchRefusedBeforeAdmission(outcome.Err, false) {
+				if !closeIfDetached(link, outcome, bound) && isSessionError(outcome.Err) {
+					c.recoverSession(operation.fence)
+				}
+				return nil, outcome.Err
+			}
+			possiblySent = false
+			if !accepted {
+				if ended := c.callEpoch(ctx).err(); ended != nil {
+					return nil, ended
+				}
+				return nil, outcome.Err
+			}
 		}
 		if uncertain && outcome.Committed {
 			return nil, &completedResultError{err: outcome.Err}
@@ -398,9 +553,21 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		case errors.Is(err, ierror.ErrTransientNotAccepted):
 			if operation.query != nil {
 				c.polls.invalidate(route, false)
-			} else if operation.code != command.GetClusterMetadataCode {
+			} else if operation.code != command.GetClusterMetadataCode && operation.replica == nil {
 				_ = c.refreshRoster(ctx, link)
 			}
+		case errors.Is(err, ierror.ErrDeferredPollCapacityExceeded):
+			// The primary parks as many deferred requests of the session as it
+			// admits. The route is right, so the same primary is asked again.
+		case errors.Is(err, ierror.ErrNotPrimary) && operation.replica != nil:
+			// The caller chose the replica, so its refusal is the answer.
+			return nil, err
+		case errors.Is(err, ierror.ErrNotPrimary) &&
+			operation.code == command.FetchMessagesCode:
+			// The refusal does not name the partition that moved, so the
+			// sender of the wait or the fetch marks the route of each of its
+			// partitions.
+			return nil, err
 		case errors.Is(err, ierror.ErrNotPrimary):
 			firstRefusal := !notPrimarySeen
 			notPrimarySeen = true
@@ -418,6 +585,8 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				return nil, finishUncertain()
 			}
 			return nil, err
+		case operation.query != nil && isNamespaceMiss(err) && !c.isMetadataPrimary(ctx, link):
+			c.polls.relookup(route)
 		default:
 			if closeIfDetached(link, outcome, bound) {
 				if errors.Is(err, ierror.ErrUnauthenticated) {
@@ -427,8 +596,8 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			} else if isSessionError(err) {
 				c.recoverSession(operation.fence)
 			}
-			if operation.query != nil && (errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrLifecycleBusy) || errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned)) {
-				c.polls.invalidate(route, false)
+			if operation.query != nil && needsRelookup(err) {
+				c.polls.relookup(route)
 			}
 			if uncertain && mutation {
 				return nil, finishUncertain()
@@ -461,11 +630,36 @@ func retryBeforeAdmission(err error) bool {
 }
 
 func isProgressPoll(code command.Code, body []byte) bool {
-	if code != command.PollMessagesCode || len(body) < pollParametersSize {
+	switch code {
+	case command.PollMessagesCode:
+	case command.PollMessagesDeferredCode:
+		if len(body) < deferredParametersSize {
+			return false
+		}
+		body = body[:len(body)-deferredParametersSize]
+	case command.FetchMessagesCode:
+		return isProgressFetch(body)
+	default:
+		return false
+	}
+	if len(body) < pollParametersSize {
 		return false
 	}
 	parameters := body[len(body)-pollParametersSize:]
 	return parameters[0] == byte(iggcon.POLLING_NEXT) || parameters[len(parameters)-1] != 0
+}
+
+// fencedByHistory reports whether the server refuses a request of code with
+// HistoryUnavailable when its header names a partition history other than
+// the current one, which is never 0.
+func fencedByHistory(code command.Code) bool {
+	switch code {
+	case command.PollMessagesCode, command.PollMessagesDeferredCode, command.GetOffsetCode,
+		command.StoreOffsetCode, command.DeleteConsumerOffsetCode:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *IggyTcpClient) readOnLink(ctx context.Context, link *tcpLink, code command.Code, body []byte, captured *iggcon.PartitionContext) ([]byte, error) {
@@ -530,6 +724,21 @@ func isDetachedError(err error) bool {
 	return errors.As(err, &eviction) && (eviction.Reason == vsr.EvictionNoSession || eviction.Reason == vsr.EvictionStaleClient)
 }
 
+// Acceptance and credential publication share a lock: a concurrent refusal
+// must compare the credentials from every successful reply already accepted.
+func (c *IggyTcpClient) acceptOperationReply(epoch *signInEpoch, operation *pendingOperation, header *[vsr.HeaderSize]byte, publishCredentials bool) bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.sessionFence != operation.fence {
+		return false
+	}
+	c.observeMetadata(header)
+	if publishCredentials {
+		c.refreshSignInLocked(epoch, operation.code, operation.frame.data[vsr.HeaderSize:])
+	}
+	return true
+}
+
 func (c *IggyTcpClient) observeMetadataFor(fence uint64, header *[vsr.HeaderSize]byte) bool {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -541,13 +750,25 @@ func (c *IggyTcpClient) observeMetadataFor(fence uint64, header *[vsr.HeaderSize
 }
 
 func (c *IggyTcpClient) observeMetadata(header *[vsr.HeaderSize]byte) {
-	commit := vsr.MetadataCommit(header)
+	c.raiseMetadataWatermark(vsr.MetadataCommit(header))
+}
+
+func (c *IggyTcpClient) raiseMetadataWatermark(commit uint64) {
 	for {
 		previous := c.metadataWatermark.Load()
 		if commit <= previous || c.metadataWatermark.CompareAndSwap(previous, commit) {
 			return
 		}
 	}
+}
+
+// MetadataWatermark returns the highest metadata op that the replies of the
+// client reported as committed: the reply that bound its session, every reply
+// of a replicated metadata command and each sync reply that changed the cached
+// assignment. A request without a partition context names it as its minimum
+// metadata op.
+func (c *IggyTcpClient) MetadataWatermark() uint64 {
+	return c.metadataWatermark.Load()
 }
 
 func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time) error {
@@ -575,19 +796,64 @@ func (c *IggyTcpClient) stopped() error {
 	return nil
 }
 
-// sessionLossError is the error of a call that ends without a current session
-// and cannot have changed server state. While an automatic recovery runs, or
-// once it bound a new session, that is 58, because a retry is safe and finds
-// a session. After a failed recovery, a logout or a disconnect, and while the
-// application signs in itself, it stays Unauthenticated.
-func (c *IggyTcpClient) sessionLossError(err error) error {
-	if !errors.Is(err, ierror.ErrUnauthenticated) {
-		return err
+// sessionRecovers reports whether err ends a call without a current session
+// while an automatic recovery runs or after it bound a new session. Such a
+// call cannot have changed server state, so it restarts under the new
+// session. After a failed recovery, and once the caller signs in, logs out or
+// disconnects or the server refuses an automatic sign-in after the call
+// started, the call ends with err.
+func (c *IggyTcpClient) sessionRecovers(ctx context.Context, err error) bool {
+	if !errors.Is(err, ierror.ErrUnauthenticated) || c.callEpoch(ctx).over() {
+		return false
 	}
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	if c.recovery != nil && !c.loggedOut && (c.recovery.Err() == nil || c.session.Bound()) {
-		return ierror.ErrTransientNotAccepted
+	return c.recovery != nil && !c.loggedOut && (c.recovery.Err() == nil || c.session.Bound())
+}
+
+// waitForRecovery waits while an automatic recovery replaces a lost session,
+// or a Connect signs in, so a call that starts or restarts meanwhile runs
+// under the new session. A sign-in that binds no session by the deadline ends
+// the call with 58, and so does a Connect that the server refuses for a reason
+// other than its credentials. A sign-in, logout or disconnect of the caller,
+// and a refusal of the credentials of an automatic sign-in, end the calls that
+// started before them with 40.
+func (c *IggyTcpClient) waitForRecovery(ctx context.Context) error {
+	epoch := c.callEpoch(ctx)
+	for {
+		c.mtx.Lock()
+		recovery := c.recovery
+		unbound := !c.loggedOut && !c.session.Bound()
+		_, signsIn := c.signInCredentialsLocked()
+		c.mtx.Unlock()
+		if err := epoch.err(); err != nil {
+			return err
+		}
+		var signInEnded <-chan struct{}
+		var attempt *connectAttempt
+		if unbound && recovery != nil && recovery.Err() == nil {
+			signInEnded = recovery.Done()
+		} else if unbound && signsIn {
+			c.connectMu.Lock()
+			if attempt = c.connectionAttempt; attempt != nil {
+				signInEnded = attempt.done
+			}
+			c.connectMu.Unlock()
+		}
+		if signInEnded == nil {
+			return nil
+		}
+		select {
+		case <-signInEnded:
+			var refusal *signInRefusal
+			if attempt != nil && errors.As(attempt.err, &refusal) && !epoch.over() {
+				return fmt.Errorf("%w: %w", ierror.ErrTransientNotAccepted, refusal.err)
+			}
+		case <-epoch.ended:
+		case <-ctx.Done():
+			return ierror.ErrTransientNotAccepted
+		case <-c.closed:
+			return ierror.ErrClientShutdown
+		}
 	}
-	return err
 }

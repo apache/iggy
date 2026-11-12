@@ -44,7 +44,8 @@ public sealed class IggyInvalidStatusCodeException : Exception
     /// </summary>
     internal bool FromResultSection { get; init; }
 
-    internal IggyInvalidStatusCodeException(int statusCode, string message, bool fromServer = false) : base(message)
+    internal IggyInvalidStatusCodeException(int statusCode, string message, bool fromServer = false,
+        Exception? innerException = null) : base(message, innerException)
     {
         StatusCode = statusCode;
         FromServer = fromServer;

@@ -64,6 +64,22 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
     return v;
 }
 
+inline iggy::ffi::PollingStrategy make_polling_strategy(const std::string &kind, const std::uint64_t value) {
+    iggy::ffi::PollingStrategy strategy{};
+    strategy.kind  = kind;
+    strategy.value = value;
+    return strategy;
+}
+
+inline iggy::ffi::PollOptions make_poll_options(
+    const std::uint32_t count,
+    const iggy::ffi::CommitPolicy commit = iggy::ffi::CommitPolicy::Manual) {
+    iggy::ffi::PollOptions options = iggy::ffi::default_poll_options();
+    options.count                  = count;
+    options.commit                 = commit;
+    return options;
+}
+
 inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
     rust::Vec<rust::String> snapshot_types;
     for (const auto *const value : values) {
@@ -121,6 +137,16 @@ inline iggy::ffi::TopicCreateOptions make_topic_create_options(
     opts.has_max_topic_size        = true;
     opts.max_topic_size            = max_topic_size;
     return opts;
+}
+
+inline iggy::ffi::UserUpdateOptions make_user_update_options(const std::string &username,
+                                                             const iggy::ffi::UserStatus status) {
+    iggy::ffi::UserUpdateOptions options{};
+    options.has_username = true;
+    options.username     = username;
+    options.has_status   = true;
+    options.status       = status;
+    return options;
 }
 
 // Joining commits the membership at once, but a member owns its partitions only after every
@@ -242,7 +268,7 @@ class E2ETestFixture : public ::testing::Test {
                                           iggy::ffi::Permissions permissions = {}) {
         iggy::ffi::ErrorInfo error_info{};
         auto user =
-            client->create_user(username, password, status, has_permissions, std::move(permissions), error_info);
+            client->create_user(username, password, status, has_permissions, std::move(permissions), {}, error_info);
         tracked_user_names_.push_back(username);
         return user;
     }
@@ -251,8 +277,9 @@ class E2ETestFixture : public ::testing::Test {
                                      const std::string &username,
                                      const std::string &password,
                                      const iggy::UserStatus status,
-                                     std::optional<iggy::Permissions> permissions = std::nullopt) {
-        auto user = client.CreateUser(username, password, status, permissions);
+                                     std::optional<iggy::Permissions> permissions = std::nullopt,
+                                     const iggy::UserCreateOptions &options       = {}) {
+        auto user = client.CreateUser(username, password, status, permissions, options);
         tracked_user_names_.push_back(username);
         return user;
     }

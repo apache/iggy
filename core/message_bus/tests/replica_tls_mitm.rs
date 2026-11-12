@@ -32,6 +32,7 @@ use common::{
     install_dialed_replicas_locally, install_replicas_locally, loopback,
     self_signed_replica_tls_ctx, set_replica_ctx_with_tls,
 };
+use compio::io::AsyncWriteExt;
 use compio::io::compat::AsyncStream;
 use compio::net::{TcpListener, TcpStream};
 use futures::AsyncReadExt;
@@ -40,6 +41,7 @@ use message_bus::connector::start as start_connector;
 use message_bus::replica::auth::ReplicaAuth;
 use message_bus::replica::handshake::ReplicaTlsCtx;
 use message_bus::replica::listener::{MessageHandler, bind, run};
+use message_bus::replica::preamble::read_preamble;
 use rustls::pki_types::ServerName;
 use std::cell::Cell;
 use std::net::SocketAddr;
@@ -48,6 +50,7 @@ use std::time::Duration;
 
 const CLUSTER: u128 = 0x4174;
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+const PREAMBLE_WAIT: Duration = Duration::from_secs(2);
 
 #[compio::test]
 async fn tls_relay_mitm_is_rejected_by_channel_binding() {
@@ -126,10 +129,10 @@ async fn tls_relay_mitm_is_rejected_by_channel_binding() {
     bus1.shutdown(Duration::from_secs(2)).await;
 }
 
-/// Accept one connection at a time, terminate TLS on both legs, and
-/// shuttle plaintext between them until either leg closes. Bumps
-/// `relayed` once both legs are established (the attack reached the
-/// PSK layer).
+/// Accept one connection at a time, pass the plaintext placement preamble
+/// on, terminate TLS on both legs, and shuttle plaintext between them
+/// until either leg closes. Bumps `relayed` once both legs are
+/// established (the attack reached the PSK layer).
 #[allow(clippy::future_not_send)]
 async fn run_relay(
     listener: TcpListener,
@@ -138,12 +141,18 @@ async fn run_relay(
     relayed: Rc<Cell<u32>>,
 ) {
     loop {
-        let Ok((inbound, _)) = listener.accept().await else {
+        let Ok((mut inbound, _)) = listener.accept().await else {
             return;
         };
-        let Ok(outbound) = TcpStream::connect(target).await else {
+        let Ok(mut outbound) = TcpStream::connect(target).await else {
             return;
         };
+        let Ok(preamble) = read_preamble(&mut inbound, PREAMBLE_WAIT).await else {
+            continue;
+        };
+        if outbound.write_all(preamble.to_vec()).await.0.is_err() {
+            continue;
+        }
         let Ok(victim_leg) = futures_rustls::TlsAcceptor::from(tls.server.clone())
             .accept(Box::pin(AsyncStream::new(inbound)))
             .await

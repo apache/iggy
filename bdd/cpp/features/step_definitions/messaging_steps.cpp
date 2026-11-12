@@ -46,7 +46,7 @@ WHEN("^I create a stream with name \"([^\"]{1,255})\"$") {
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    context->client->create_stream(name, error_info);
+    context->client->create_stream(name, {}, error_info);
 }
 
 THEN("^the stream should be created successfully$") {
@@ -154,8 +154,8 @@ WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) 
     const auto polled = context->client->poll_messages(
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
-        "consumer", bdd::make_numeric_identifier(1), "offset", static_cast<std::uint64_t>(offset), 100, false,
-        error_info);
+        "consumer", bdd::make_numeric_identifier(1), bdd::make_offset_strategy(static_cast<std::uint64_t>(offset)),
+        bdd::make_poll_options(100), error_info);
 
     context->polled.count = polled.count;
     context->polled.offsets.clear();

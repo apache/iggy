@@ -49,7 +49,7 @@ var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
 						PollMessages:  true,
 						SendMessages:  true,
 					},
-				})
+				}, nil)
 			itShouldNotReturnError(err)
 			identifier, _ := iggcon.NewIdentifier(username)
 			defer deleteUserAfterTests(identifier, client)

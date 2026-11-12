@@ -70,7 +70,7 @@ func TestReconnect_BindVerdictPreservesOrReplacesOnlyTheLogicalSession(t *testin
 			_, err := client.do(ctx, &command.CreateStream{Name: "lost-reply"})
 			terminal := refusal == ierror.StaleClientCode || refusal == ierror.UnauthenticatedCode
 			if terminal {
-				var uncertain ierror.UncertainOutcome
+				var uncertain ierror.OperationUncertain
 				require.ErrorAs(t, err, &uncertain)
 				require.Eventually(t, func() bool {
 					client.mtx.Lock()
@@ -230,7 +230,7 @@ func TestFailover_ServerEvictionReplaysTheRememberedSignIn(t *testing.T) {
 	registersBefore := registers.Load()
 
 	evict.Store(true)
-	require.ErrorIs(t, client.Ping(ctx), ierror.ErrTransientNotAccepted)
+	require.NoError(t, client.Ping(ctx), "the evicted ping completes under the recovered session")
 	_, remembered := client.signInCredentials()
 	require.True(t, remembered)
 	require.Eventually(t, func() bool {
@@ -340,7 +340,7 @@ func TestFailover_SessionEndingReplyRegistersANewSessionWithoutABind(t *testing.
 	}{
 		{"committed/first_attempt", []func(request) []byte{committed}, ierror.ErrStaleClient, ierror.ErrOperationNotRetained},
 		{"committed/after_uncertain", []func(request) []byte{notCommitted, committed}, ierror.ErrStaleClient, ierror.ErrOperationNotRetained},
-		{"committed/resolve", []func(request) []byte{notCommitted, unproved, committed}, ierror.ErrUncertainOutcome, ierror.ErrStaleClient},
+		{"committed/resolve", []func(request) []byte{notCommitted, unproved, committed}, ierror.ErrOperationUncertain, ierror.ErrStaleClient},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := scriptedWrites(t, test.answers, false)
@@ -390,9 +390,9 @@ func TestFailover_StaleClientDenyClosesTheLinkAndTheBindDecides(t *testing.T) {
 		resolved error
 	}{
 		{"first_attempt/live", []func(request) []byte{deny}, false, ierror.ErrStaleClient, ierror.ErrOperationNotRetained},
-		{"after_uncertain/live", []func(request) []byte{notCommitted, deny}, false, ierror.ErrUncertainOutcome, nil},
+		{"after_uncertain/live", []func(request) []byte{notCommitted, deny}, false, ierror.ErrOperationUncertain, nil},
 		{"first_attempt/ended", []func(request) []byte{deny}, true, ierror.ErrStaleClient, ierror.ErrOperationNotRetained},
-		{"after_uncertain/ended", []func(request) []byte{notCommitted, deny}, true, ierror.ErrUncertainOutcome, ierror.ErrOperationNotRetained},
+		{"after_uncertain/ended", []func(request) []byte{notCommitted, deny}, true, ierror.ErrOperationUncertain, ierror.ErrOperationNotRetained},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := scriptedWrites(t, test.answers, test.ended)
@@ -484,6 +484,110 @@ func TestFailover_StaleClientDenyOfARouteLookupKeepsTheSession(t *testing.T) {
 	sends := requestsFor(reads, vsr.OperationSendMessages)
 	require.Len(t, sends, 1)
 	require.Equal(t, registers[0].clientID(), sends[0].clientID(), "the next write keeps its client id")
+}
+
+// sessionEnd ends the session of a write whose reply was lost.
+type sessionEnd struct {
+	name        string
+	credentials Credentials
+	// replay answers the replay of the write, and the session ends with it.
+	// Without it, the session ends with the lost reply.
+	replay func(read request) []byte
+	// signIn answers each sign-in after the first. Without it, the server
+	// registers a new session.
+	signIn func(read request) []byte
+}
+
+// A write whose reply was lost may have committed, and a session that ends
+// afterwards proves nothing about it. The call ends uncertain with the id of
+// the write when its replay meets a deny with status 30 or an eviction, and
+// when the bind finds the session ended and the server refuses the sign-in
+// that follows, as for a deleted or deactivated user. The write goes out as
+// one frame and never under another session.
+func TestFailover_ASessionEndAfterALostReplyLeavesTheWriteUncertain(t *testing.T) {
+	const endedSession = managedLinkSession + 1
+	password := NewUsernamePasswordCredentials("iggy", "iggy")
+	token := NewPersonalAccessTokenCredentials("token")
+	evict := func(reason vsr.EvictionReason) func(request) []byte {
+		return func(request) []byte { return evictionFrame(reason, 0, 0) }
+	}
+	ends := []sessionEnd{{name: "stale_client", credentials: password, replay: func(read request) []byte {
+		return statusReplyFrame(read.operation(), uint32(ierror.StaleClientCode), nil)
+	}}}
+	for _, reason := range []vsr.EvictionReason{vsr.EvictionStaleClient, vsr.EvictionNoSession, vsr.EvictionSessionTooLow,
+		vsr.EvictionSessionReleaseMismatch, vsr.EvictionUserInactive, vsr.EvictionSessionError} {
+		ends = append(ends, sessionEnd{name: fmt.Sprintf("eviction_%d", reason), credentials: password, replay: evict(reason)})
+	}
+	ends = append(ends,
+		sessionEnd{name: "refused_sign_in/status", credentials: password, signIn: func(read request) []byte {
+			return statusReplyFrame(read.operation(), uint32(ierror.InvalidCredentialsCode), nil)
+		}},
+		sessionEnd{name: "refused_sign_in/invalid_credentials", credentials: password, signIn: evict(vsr.EvictionInvalidCredentials)},
+		sessionEnd{name: "refused_sign_in/invalid_token", credentials: token, signIn: evict(vsr.EvictionInvalidToken)},
+		sessionEnd{name: "refused_sign_in/user_inactive", credentials: token, signIn: evict(vsr.EvictionUserInactive)},
+	)
+	for _, end := range ends {
+		for _, write := range sentWrites(t) {
+			t.Run(end.name+"/"+write.name, func(t *testing.T) {
+				var ended atomic.Bool
+				var registrations, writes atomic.Int32
+				var server *testListener
+				server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+					switch {
+					case read.operation() == vsr.OperationRegister:
+						number := registrations.Add(1)
+						if number > 1 && end.signIn != nil {
+							return end.signIn(read)
+						}
+						return registerReplyFrame(7, managedLinkSession+uint64(number))
+					case read.code() == uint32(command.BindSessionCode) && ended.Load() && read.sessionID() == endedSession:
+						return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
+					case read.code() == uint32(command.BindSessionCode):
+						return bindReplyFrame(7, read.sessionID())
+					case read.code() == uint32(command.GetClusterMetadataCode):
+						return clusterMetadataFrame(t, 0, server.address())
+					case read.code() == uint32(command.GetPartitionRouteCode):
+						return pollRoutingReply(t, read, 0, 100)
+					case read.operation() == write.operation:
+						if writes.Add(1) > 1 && end.replay != nil {
+							ended.Store(true)
+							return end.replay(read)
+						}
+						// The reply is lost with the connection.
+						ended.Store(end.replay == nil)
+						return nil
+					default:
+						return replyFrame(read.operation(), nil)
+					}
+				})
+				client := newDialingClient(t, server.address(), WithAutoLogin(end.credentials))
+				ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+				defer cancel()
+				require.NoError(t, client.Connect(ctx))
+
+				err := write.send(ctx, client)
+
+				var uncertain ierror.OperationUncertain
+				require.ErrorAs(t, err, &uncertain)
+				require.Eventually(t, func() bool { return registrations.Load() == 2 }, managedLinkTestBudget, managedLinkPoll,
+					"the client signs in again after the session ended")
+				awaitRecoveryEnd(t, client)
+				require.Equal(t, end.signIn == nil, sessionBound(client), "only an accepted sign-in binds a new session")
+				require.ErrorIs(t, client.ResolveOperation(ctx, uncertain.OperationID), ierror.ErrOperationNotRetained)
+				written := requestsFor(server.recorded(), write.operation)
+				attempts := 1
+				if end.replay != nil {
+					attempts = 2
+				}
+				require.Len(t, written, attempts)
+				for _, attempt := range written {
+					require.Equal(t, written[0], attempt, "a replay repeats the lost frame")
+					require.Equal(t, endedSession, attempt.sessionID())
+				}
+				require.Equal(t, written[0].requestID(), uncertain.OperationID)
+			})
+		}
+	}
 }
 
 // An explicit sign-out is caller intent: the reconnect must not sign back in
@@ -713,7 +817,8 @@ func TestFailover_BoundsTheDialWhenOtherEndpointsAreQueuedBehindIt(t *testing.T)
 	done := make(chan error, 1)
 	go func() { done <- client.Connect(context.Background()) }()
 	select {
-	case <-done:
+	case err := <-done:
+		require.Error(t, err, "neither endpoint completes a TLS handshake")
 	case <-time.After(3 * failoverDialTimeout):
 		t.Fatal("the sweep never got past an endpoint that answers nothing")
 	}

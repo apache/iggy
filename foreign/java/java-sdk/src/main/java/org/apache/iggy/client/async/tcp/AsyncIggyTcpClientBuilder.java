@@ -24,12 +24,15 @@ import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandle;
 import io.netty.util.concurrent.EventExecutor;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.config.TcpConnectionString;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
+import org.apache.iggy.message.DeferredPollOptions;
+import org.apache.iggy.serde.BytesDeserializer;
 
 import java.io.File;
 import java.time.Duration;
@@ -78,6 +81,12 @@ import java.util.function.Function;
  * @see AsyncIggyTcpClient#builder()
  */
 public final class AsyncIggyTcpClientBuilder {
+    /** The smallest frame that holds a fetch reply of the most partitions with one record of the largest size. */
+    static final long MIN_MAX_VSR_FRAME_SIZE = VsrHeaders.HEADER_SIZE
+            + BytesDeserializer.FETCH_SECTIONS_COUNT_BYTES
+            + (long) FetchMessages.MAX_PARTITIONS_PER_REQUEST * BytesDeserializer.FETCH_SECTION_BYTES
+            + DeferredPollOptions.MAX_RECORD_SIZE;
+
     private String host = "localhost";
     private Integer port = 8090;
     private String username;
@@ -89,11 +98,13 @@ public final class AsyncIggyTcpClientBuilder {
     private RetryPolicy retryPolicy;
     private Duration acquireTimeout;
     private Duration heartbeatInterval = Duration.ofSeconds(5);
-    private int maxPendingOperations = 256;
-    private long maxPendingOperationBytes = 64L * 1024 * 1024;
+    private int maxPendingOperations = ConsensusSession.DEFAULT_MAX_PENDING_OPERATIONS;
+    private long maxPendingOperationBytes = ConsensusSession.DEFAULT_MAX_PENDING_OPERATION_BYTES;
     private long maxVsrFrameSize = VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE;
     private int ioThreads = AsyncTcpConnection.DEFAULT_IO_THREADS;
     private IoEventLoopGroup eventLoopGroup;
+    private Duration shutdownQuietPeriod;
+    private Duration shutdownTimeout;
 
     public AsyncIggyTcpClientBuilder() {}
 
@@ -318,8 +329,43 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
-     * Bounds active and retained mutations; defaults are 256 operations and 64 MiB. The count also bounds the
-     * proved replay outcomes that the client keeps for later resolves.
+     * Sets how long a close waits for new tasks before it stops the event loop group that the client created for
+     * itself. Netty runs every task that arrives in this period, and each such task starts the period again, so the
+     * close of an idle client takes at least this long.
+     *
+     * <p>If this value is not set, the client reads the {@code iggy.tcp.shutdownQuietPeriodMillis} system property,
+     * in milliseconds. Without the property, the Netty default of 2 seconds applies. The value has no effect on a
+     * group supplied through {@link #eventLoopGroup(IoEventLoopGroup)}.
+     *
+     * @param shutdownQuietPeriod the quiet period, zero or more
+     * @return this builder
+     */
+    public AsyncIggyTcpClientBuilder shutdownQuietPeriod(Duration shutdownQuietPeriod) {
+        this.shutdownQuietPeriod = shutdownQuietPeriod;
+        return this;
+    }
+
+    /**
+     * Sets the longest time that a close waits for the event loop group that the client created for itself to
+     * stop, even when tasks keep arriving in the quiet period. It cannot be shorter than the quiet period.
+     *
+     * <p>If this value is not set, the client reads the {@code iggy.tcp.shutdownTimeoutMillis} system property, in
+     * milliseconds. Without the property, the Netty default of 15 seconds applies. The value has no effect on a group
+     * supplied through {@link #eventLoopGroup(IoEventLoopGroup)}.
+     *
+     * @param shutdownTimeout the shutdown timeout, zero or more
+     * @return this builder
+     * @see #shutdownQuietPeriod(Duration)
+     */
+    public AsyncIggyTcpClientBuilder shutdownTimeout(Duration shutdownTimeout) {
+        this.shutdownTimeout = shutdownTimeout;
+        return this;
+    }
+
+    /**
+     * Bounds active and retained mutations; defaults are {@value ConsensusSession#DEFAULT_MAX_PENDING_OPERATIONS}
+     * operations and {@value ConsensusSession#DEFAULT_MAX_PENDING_OPERATION_BYTES} bytes (64 MiB). The count also
+     * bounds the proved replay outcomes that the client keeps for later resolves.
      */
     public AsyncIggyTcpClientBuilder pendingOperations(int count, long bytes) {
         if (count <= 0 || bytes <= 0) {
@@ -330,12 +376,23 @@ public final class AsyncIggyTcpClientBuilder {
         return this;
     }
 
+    /** The pending operation count that {@link #build()} applies, for tests in this package. */
+    int maxPendingOperations() {
+        return maxPendingOperations;
+    }
+
+    /** The pending operation bytes that {@link #build()} applies, for tests in this package. */
+    long maxPendingOperationBytes() {
+        return maxPendingOperationBytes;
+    }
+
     /**
      * Builds and returns a configured AsyncIggyTcpClient instance.
      * Note: You still need to call {@link AsyncIggyTcpClient#connect()} on the returned client.
      *
      * @return a new AsyncIggyTcpClient instance
-     * @throws IggyInvalidArgumentException if the host is null or empty, or if the port is not positive
+     * @throws IggyInvalidArgumentException if the host is null or empty, if the port is not positive, or if a
+     *     setting or its system property is invalid
      */
     public AsyncIggyTcpClient build() {
         validateHost();
@@ -347,6 +404,7 @@ public final class AsyncIggyTcpClientBuilder {
         validateMaxVsrFrameSize();
         validateIoThreads();
         validateEventLoopGroup();
+        EventLoopShutdown eventLoopShutdown = EventLoopShutdown.resolve(shutdownQuietPeriod, shutdownTimeout);
 
         AsyncIggyTcpClient client = new AsyncIggyTcpClient(
                 host,
@@ -362,7 +420,8 @@ public final class AsyncIggyTcpClientBuilder {
                 enableTls,
                 Optional.ofNullable(tlsCertificate),
                 Optional.ofNullable(eventLoopGroup),
-                ioThreads);
+                ioThreads,
+                eventLoopShutdown);
         client.configurePendingOperations(maxPendingOperations, maxPendingOperationBytes);
         return client;
     }
@@ -411,9 +470,9 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     private void validateMaxVsrFrameSize() {
-        if (maxVsrFrameSize < VsrHeaders.HEADER_SIZE || maxVsrFrameSize > Integer.MAX_VALUE) {
-            throw new IggyInvalidArgumentException("MaxVsrFrameSize must be between " + VsrHeaders.HEADER_SIZE + " and "
-                    + Integer.MAX_VALUE + " bytes");
+        if (maxVsrFrameSize < MIN_MAX_VSR_FRAME_SIZE || maxVsrFrameSize > Integer.MAX_VALUE) {
+            throw new IggyInvalidArgumentException("MaxVsrFrameSize must be between " + MIN_MAX_VSR_FRAME_SIZE + " and "
+                    + Integer.MAX_VALUE + " bytes, so a reply holds the largest message");
         }
     }
 

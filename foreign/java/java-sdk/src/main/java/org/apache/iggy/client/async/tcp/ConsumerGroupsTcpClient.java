@@ -35,8 +35,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
@@ -46,6 +48,9 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerGroupsTcpClient.class);
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    // The assignment of the last sync reply of each group. A reply that names no membership removes it, and so does a
+    // join.
+    private final Map<ClientRoutingState.GroupKey, ConsumerGroupAssignment> synced = new ConcurrentHashMap<>();
 
     public ConsumerGroupsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
         this.connectionSupplier = connectionSupplier;
@@ -144,6 +149,10 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
+        // A group that was deleted and created again counts its sync generation from 0, so its sync reply can equal
+        // the one of the old group. A client becomes a member only by its own join, so the first sync after a join
+        // counts as a changed assignment.
+        synced.remove(ClientRoutingState.groupKey(streamId, topicId, groupId));
         return connection().sendAndRelease(CommandCode.ConsumerGroup.JOIN, payload);
     }
 
@@ -173,6 +182,15 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
     CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
             StreamId streamId, TopicId topicId, ConsumerId groupId, long deadline) {
+        return syncConsumerGroup(streamId, topicId, groupId, deadline, new AsyncTcpConnection.TransientFailoverState());
+    }
+
+    CompletableFuture<Optional<ConsumerGroupAssignment>> syncConsumerGroup(
+            StreamId streamId,
+            TopicId topicId,
+            ConsumerId groupId,
+            long deadline,
+            AsyncTcpConnection.TransientFailoverState state) {
         var payload = Unpooled.buffer();
         payload.writeBytes(BytesSerializer.toBytes(streamId));
         payload.writeBytes(BytesSerializer.toBytes(topicId));
@@ -180,15 +198,26 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Syncing consumer group assignment - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
+        var group = ClientRoutingState.groupKey(streamId, topicId, groupId);
         // An empty body means "not a member", which exchangeForOptional maps
         // to an empty Optional; a member owning zero partitions still gets a
         // non-empty body with a zero partition count.
         return AsyncTcpConnection.mapResponse(
-                connection().send(CommandCode.ConsumerGroup.SYNC.getValue(), payload, deadline), response -> {
+                connection().send(CommandCode.ConsumerGroup.SYNC.getValue(), payload, deadline, state), response -> {
                     try {
-                        return response.isReadable()
-                                ? Optional.of(BytesDeserializer.readConsumerGroupAssignment(response))
-                                : Optional.empty();
+                        if (!response.isReadable()) {
+                            synced.remove(group);
+                            return Optional.empty();
+                        }
+                        var assignment = BytesDeserializer.readConsumerGroupAssignment(response);
+                        // A handover installs each owner in a later metadata op than the join, and a primary that has
+                        // not applied it refuses a read as not owned. So the reads of a changed assignment wait for
+                        // the commit that the reply was read at.
+                        if (!assignment.equals(synced.get(group))) {
+                            connection().sessionOwner().observeMetadata(state.replyCommit());
+                            synced.put(group, assignment);
+                        }
+                        return Optional.of(assignment);
                     } finally {
                         response.release();
                     }

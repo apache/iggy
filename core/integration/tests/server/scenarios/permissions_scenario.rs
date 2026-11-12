@@ -85,12 +85,12 @@ pub async fn run(harness: &TestHarness) {
 
 async fn setup_test_resources(root_client: &IggyClient) {
     root_client
-        .create_stream(STREAM_1)
+        .create_stream(STREAM_1, &StreamCreateOptions::default())
         .await
         .expect("create stream 1");
 
     root_client
-        .create_stream(STREAM_2)
+        .create_stream(STREAM_2, &StreamCreateOptions::default())
         .await
         .expect("create stream 2");
 
@@ -135,7 +135,13 @@ async fn create_test_user(
         .await;
 
     root_client
-        .create_user(username, "password123", UserStatus::Active, permissions)
+        .create_user(
+            username,
+            "password123",
+            UserStatus::Active,
+            permissions,
+            &UserCreateOptions::default(),
+        )
         .await
         .expect("create test user");
 }
@@ -182,7 +188,12 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
     assert_unauthorized(client.get_stream(&stream_id).await, "get_stream");
     assert_unauthorized(client.get_topics(&stream_id).await, "get_topics");
     assert_unauthorized(client.get_topic(&stream_id, &topic_id).await, "get_topic");
-    assert_unauthorized(client.create_stream("x").await, "create_stream");
+    assert_unauthorized(
+        client
+            .create_stream("x", &StreamCreateOptions::default())
+            .await,
+        "create_stream",
+    );
     assert_unauthorized(
         client
             .create_topic(
@@ -215,11 +226,13 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "poll_messages",
@@ -379,6 +392,7 @@ async fn test_user_permissions(harness: &TestHarness, root_client: &IggyClient) 
                 "validpassword123",
                 UserStatus::Active,
                 None,
+                &UserCreateOptions::default(),
             )
             .await,
         "read_users: create_user",
@@ -415,7 +429,13 @@ async fn test_user_permissions(harness: &TestHarness, root_client: &IggyClient) 
 
     // Create a temporary user
     client
-        .create_user("temp-user", "temp", UserStatus::Active, None)
+        .create_user(
+            "temp-user",
+            "temp",
+            UserStatus::Active,
+            None,
+            &UserCreateOptions::default(),
+        )
         .await
         .expect("manage_users: create_user should work");
 
@@ -423,9 +443,10 @@ async fn test_user_permissions(harness: &TestHarness, root_client: &IggyClient) 
     client
         .update_user(
             &Identifier::named("temp-user").unwrap(),
-            Some("temp-user-updated"),
-            None,
-            &UserUpdateOptions::default(),
+            &UserUpdateOptions {
+                username: Some("temp-user-updated".to_owned()),
+                ..UserUpdateOptions::default()
+            },
         )
         .await
         .expect("manage_users: update_user should work");
@@ -472,12 +493,20 @@ async fn test_stream_permissions(harness: &TestHarness, root_client: &IggyClient
 
     // Cannot create/update/delete streams
     assert_unauthorized(
-        client.create_stream("x").await,
+        client
+            .create_stream("x", &StreamCreateOptions::default())
+            .await,
         "read_streams: create_stream",
     );
     assert_unauthorized(
         client
-            .update_stream(&stream_id, "new-name", &StreamUpdateOptions::default())
+            .update_stream(
+                &stream_id,
+                &StreamUpdateOptions {
+                    name: Some("new-name".to_owned()),
+                    ..StreamUpdateOptions::default()
+                },
+            )
             .await,
         "read_streams: update_stream",
     );
@@ -511,15 +540,17 @@ async fn test_stream_permissions(harness: &TestHarness, root_client: &IggyClient
 
     // Create, update, delete stream
     client
-        .create_stream("temp-stream")
+        .create_stream("temp-stream", &StreamCreateOptions::default())
         .await
         .expect("manage_streams: create_stream should work");
 
     client
         .update_stream(
             &Identifier::named("temp-stream").unwrap(),
-            "temp-stream-v2",
-            &StreamUpdateOptions::default(),
+            &StreamUpdateOptions {
+                name: Some("temp-stream-v2".to_owned()),
+                ..StreamUpdateOptions::default()
+            },
         )
         .await
         .expect("manage_streams: update_stream should work");
@@ -602,8 +633,10 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
             .update_topic(
                 &stream_id,
                 &topic_id,
-                "new-name",
-                &TopicUpdateOptions::default(),
+                &TopicUpdateOptions {
+                    name: Some("new-name".to_owned()),
+                    ..TopicUpdateOptions::default()
+                },
             )
             .await,
         "read_topics: update_topic",
@@ -647,8 +680,10 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
         .update_topic(
             &stream_id,
             &Identifier::named("temp-topic").unwrap(),
-            "temp-topic-v2",
-            &TopicUpdateOptions::default(),
+            &TopicUpdateOptions {
+                name: Some("temp-topic-v2".to_owned()),
+                ..TopicUpdateOptions::default()
+            },
         )
         .await
         .expect("manage_topics: update_topic should work");
@@ -661,7 +696,9 @@ async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient)
 
     // Cannot create streams
     assert_unauthorized(
-        client.create_stream("x").await,
+        client
+            .create_stream("x", &StreamCreateOptions::default())
+            .await,
         "manage_topics: create_stream",
     );
 
@@ -698,11 +735,13 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll_messages: poll_messages should work");
@@ -766,11 +805,13 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "send_messages: poll_messages",
@@ -811,11 +852,13 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("both: poll_messages should work");
@@ -893,11 +936,13 @@ async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &I
         .poll_messages(
             &stream1_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream-specific: poll_messages 1 should work");
@@ -933,11 +978,13 @@ async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &I
             .poll_messages(
                 &stream2_id,
                 &topic_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "stream-specific: poll_messages 2",
@@ -1026,11 +1073,13 @@ async fn test_topic_specific_permissions(harness: &TestHarness, root_client: &Ig
         .poll_messages(
             &stream_id,
             &topic1_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("topic-specific: poll_messages 1 should work");
@@ -1058,11 +1107,13 @@ async fn test_topic_specific_permissions(harness: &TestHarness, root_client: &Ig
             .poll_messages(
                 &stream_id,
                 &topic2_id,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "topic-specific: poll_messages 2",
@@ -1121,11 +1172,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("read_streams → poll_messages");
@@ -1152,7 +1205,9 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
 
     // manage operations NOT implied
     assert_unauthorized(
-        client.create_stream("x").await,
+        client
+            .create_stream("x", &StreamCreateOptions::default())
+            .await,
         "read_streams does NOT imply manage_streams",
     );
     assert_unauthorized(
@@ -1233,11 +1288,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("manage_streams → poll_messages");
@@ -1297,11 +1354,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("manage_topics → poll_messages");
@@ -1353,11 +1412,13 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("read_topics → poll_messages");
@@ -1491,11 +1552,13 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream.read_stream → poll_messages");
@@ -1583,8 +1646,10 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .update_topic(
             &stream_id,
             &Identifier::named("temp-manage-stream-topic").unwrap(),
-            "temp-manage-stream-topic-v2",
-            &TopicUpdateOptions::default(),
+            &TopicUpdateOptions {
+                name: Some("temp-manage-stream-topic-v2".to_owned()),
+                ..TopicUpdateOptions::default()
+            },
         )
         .await
         .expect("stream.manage_stream → manage_topics: update_topic");
@@ -1611,11 +1676,13 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream.manage_stream → poll_messages");
@@ -1692,11 +1759,13 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("stream.manage_topics implies poll_messages: poll_messages should work");
@@ -1775,11 +1844,13 @@ async fn test_topic_permission_inheritance(harness: &TestHarness, root_client: &
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("topic.read_topic implies poll_messages: poll_messages should work");
@@ -1844,11 +1915,13 @@ async fn test_topic_permission_inheritance(harness: &TestHarness, root_client: &
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("topic.manage_topic implies poll_messages: poll_messages should work");
@@ -1894,11 +1967,13 @@ async fn test_consumer_group_operations(harness: &TestHarness, root_client: &Igg
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll_messages: poll should work");
@@ -2248,11 +2323,13 @@ async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
         .poll_messages(
             &stream1_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("additive: poll topic 1 should work");
@@ -2262,11 +2339,13 @@ async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
         .poll_messages(
             &stream1_id,
             &topic2_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("additive: poll topic 2 should work (via stream.read_stream)");
@@ -2349,11 +2428,13 @@ async fn test_missing_resource_behavior(harness: &TestHarness, root_client: &Igg
             .poll_messages(
                 &nonexistent_stream,
                 &nonexistent_topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "authorized: poll from non-existent stream/topic",
@@ -2401,11 +2482,13 @@ async fn test_missing_resource_behavior(harness: &TestHarness, root_client: &Igg
             .poll_messages(
                 &nonexistent_stream,
                 &nonexistent_topic,
-                Some(0),
+                0,
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
-                1,
-                false,
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
             )
             .await,
         "unauthorized: poll from non-existent",
@@ -2621,11 +2704,13 @@ async fn test_live_permission_revocation(harness: &TestHarness, root_client: &Ig
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(0),
+            0,
             &Consumer::default(),
             &PollingStrategy::offset(0),
-            1,
-            false,
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
         )
         .await
         .expect("poll must still work (poll grant retained)");
@@ -2712,7 +2797,7 @@ async fn test_deleted_stream_grant_not_inherited(harness: &TestHarness, root_cli
 
 async fn create_stream_with_topic(root_client: &IggyClient, name: &str) -> StreamDetails {
     let stream = root_client
-        .create_stream(name)
+        .create_stream(name, &StreamCreateOptions::default())
         .await
         .expect("create stream");
     root_client
@@ -2752,6 +2837,7 @@ async fn test_grant_on_missing_resource_refused(root_client: &IggyClient) {
                     global: GlobalPermissions::default(),
                     streams: Some(BTreeMap::from([(MISSING_ID, StreamPermissions::default())])),
                 }),
+                &UserCreateOptions::default(),
             )
             .await,
         IggyError::StreamIdNotFound(dummy_id.clone()),

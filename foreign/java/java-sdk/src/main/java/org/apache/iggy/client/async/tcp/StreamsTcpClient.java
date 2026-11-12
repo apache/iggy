@@ -22,13 +22,16 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+import org.apache.iggy.stream.StreamUpdate;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
@@ -63,8 +66,8 @@ public class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public CompletableFuture<StreamDetails> createStream(String name) {
-        var payload = BytesSerializer.toBytes(name, "name");
+    public CompletableFuture<StreamDetails> createStream(String name, Map<String, HeaderValue> options) {
+        var payload = BytesSerializer.toCreateStream(name, options);
 
         return AsyncTcpConnection.mapResponse(
                 connection().send(CommandCode.Stream.CREATE.getValue(), payload), response -> {
@@ -105,14 +108,10 @@ public class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public CompletableFuture<Void> updateStream(StreamId streamId, String name) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(BytesSerializer.toBytes(name, "name"));
-        // No trailing options block: streams have no catalog keys yet and the
-        // server reads an absent block as empty. Settings will ride one here,
-        // as topics do.
+    public CompletableFuture<Void> updateStream(StreamId streamId, StreamUpdate update) {
+        var payload = BytesSerializer.toUpdateResource(streamId, update);
 
-        return connection().sendAndRelease(CommandCode.Stream.UPDATE, payload);
+        return connection().sendAndRelease(CommandCode.System.UPDATE_RESOURCE, payload);
     }
 
     @Override

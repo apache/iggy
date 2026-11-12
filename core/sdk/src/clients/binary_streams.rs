@@ -18,9 +18,9 @@
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::StreamClient;
-use iggy_common::StreamUpdateOptions;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
+use iggy_common::{StreamCreateOptions, StreamUpdateOptions};
 
 #[async_trait]
 impl StreamClient for IggyClient {
@@ -32,17 +32,20 @@ impl StreamClient for IggyClient {
         super::with_client!(self, client => client.get_streams().await)
     }
 
-    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
-        super::with_client!(self, client => client.create_stream(name).await)
+    async fn create_stream(
+        &self,
+        name: &str,
+        options: &StreamCreateOptions,
+    ) -> Result<StreamDetails, IggyError> {
+        super::with_client!(self, client => client.create_stream(name, options).await)
     }
 
     async fn update_stream(
         &self,
         stream_id: &Identifier,
-        name: &str,
         options: &StreamUpdateOptions,
     ) -> Result<(), IggyError> {
-        super::with_client!(self, client => client.update_stream(stream_id, name, options).await)
+        super::with_client!(self, client => client.update_stream(stream_id, options).await)
     }
 
     async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {

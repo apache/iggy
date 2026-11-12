@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod fetch_messages;
 pub mod partition_route;
 pub mod poll_messages;
 pub mod send_messages;
 
+pub use fetch_messages::{
+    FetchMessagesResponse, FetchMessagesSection, FetchMessagesSectionHeader,
+    FetchMessagesSectionIterator,
+};
 pub use partition_route::PartitionRouteResponse;
 pub use poll_messages::{PollMessagesResponse, PollMessagesResponseHeader};
 pub use send_messages::{SendMessagesConfirmationResponse, SendMessagesResponse};

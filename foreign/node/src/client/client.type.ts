@@ -19,6 +19,7 @@ import type { Readable } from 'stream';
 import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
 import type { PartitionContext } from '../wire/vsr/header.js';
+import type { Id } from '../wire/identifier.utils.js';
 
 /**
  * TCP socket connection options.
@@ -43,7 +44,9 @@ export type CommandResponse = {
   /** Length of the response data in bytes */
   length: number,
   /** Response payload data */
-  data: Buffer
+  data: Buffer,
+  /** Local recovery metadata for uncertain sections. The wire bytes stay unchanged. */
+  fetchProgress?: { operationId: bigint, partitions: ReadonlySet<number> }
 };
 
 export type SendCommandOptions = {
@@ -62,12 +65,32 @@ export type SendCommandOptions = {
   deadline?: number,
   /**
    * Partition context of a poll, an offset store or delete, or a send to an
-   * explicit partition, taken from an earlier reply. It replaces the context
+   * explicit partition, taken from an earlier reply. A context that is all
+   * zero counts as none. Any other context replaces the context
    * the client would capture, stays on every retry, and is never refreshed
    * after a history refusal (87): work from one partition incarnation must
-   * not land in another.
+   * not land in another. A group offset store or delete with owner generation
+   * 0 binds to the owner installed when it is sent: it names at least the last
+   * metadata op that the client saw, and the server binds owner 0 only to an
+   * owner installed by that op.
    */
-  context?: PartitionContext
+  context?: PartitionContext,
+  /**
+   * Sends the command to the replica with this id instead of the replica the
+   * client picks, for example to read the stats that replica keeps for itself.
+   * Replica ids are the ones the cluster metadata returns. Only non-replicated
+   * commands other than a poll, a consumer-offset read or session control are
+   * accepted, others fail with status 3 before anything is sent. An id the roster does not name fails with status 6. The
+   * replica's reply is returned as it is, a `NotPrimary` (89) refusal
+   * included, and nothing is retried on another replica.
+   */
+  replica?: number,
+  /**
+   * The `RawClient.lineage` that a call of several commands started with. A
+   * command of an older lineage fails with status 40 and sends nothing, so no
+   * part of the call runs under a session the caller opened after it started.
+   */
+  lineage?: number
 };
 
 /**
@@ -83,10 +106,15 @@ export type RawClient = {
   ) => Promise<CommandResponse>,
   /** Whether the client has been authenticated */
   isAuthenticated: boolean
-  /** Authenticates the client with the server */
+  /** Raised by each sign-in and logout of the caller. */
+  readonly lineage?: number
+  /** Uses caller credentials. Any failed attempt withdraws automatic sign-in. */
   authenticate: (c: ClientCredentials) => Promise<boolean>
+  /** Typed login delegates validation to the session owner when supported. */
+  _authWithPassword?: (c: PasswordCredentials) => Promise<{ userId: number }>
+  _authWithToken?: (c: TokenCredentials) => Promise<{ userId: number }>
   /**
-   * Resolves the original frozen operation; never sends it under a fresh identity.
+   * Resolves the original frozen operation. Never sends it under a fresh identity.
    * The client keeps the proved outcomes of its last `maxPendingOperations`
    * replays, also across a session reset, so a later resolve of the same
    * operation returns the same outcome without a request.
@@ -100,6 +128,12 @@ export type RawClient = {
    * client keeps the outcome that it proves.
    */
   abandonOperation?: (operationId: bigint) => void,
+  /**
+   * Groups partitions of a topic by their primary, from the cached routes,
+   * so a partition reader can keep one fetch in flight per group.
+   */
+  readinessGroups?: (streamId: Id, topicId: Id, partitions: number[], options?: SendCommandOptions) =>
+    Promise<number[][]>,
   /** Destroys the client connection */
   destroy: () => void,
   /** Tracks one facade operation across multiple command submissions. */
@@ -108,6 +142,8 @@ export type RawClient = {
   on: (ev: string, cb: (e?: unknown) => void) => void
   /** Registers a one-time event listener */
   once: (ev: string, cb: (e?: unknown) => void) => void
+  /** Removes an event listener */
+  off?: (ev: string, cb: (e?: unknown) => void) => void
   /** Returns the underlying readable stream */
   getReadStream: () => Readable
 }
@@ -182,9 +218,9 @@ export type ClientCredentials = TokenCredentials | PasswordCredentials;
  * Legacy logical-client count. Replica links are managed independently.
  */
 export type PoolSizeOption = {
-  /** Minimum logical clients; normalized to one */
+  /** Minimum logical clients. Normalized to one */
   min?: number,
-  /** Maximum logical clients; only one is supported */
+  /** Maximum logical clients. Only one is supported */
   max?: number
 }
 
@@ -204,7 +240,7 @@ export type ClientConfig = {
   options: TransportOption,
   /** Authentication credentials */
   credentials: ClientCredentials,
-  /** Legacy logical-client count; does not limit replica links. */
+  /** Legacy logical-client count. Does not limit replica links. */
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,

@@ -26,15 +26,22 @@ covered by `test_client_config.py`.
 """
 
 import ast
+import json
 import socket
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
 from apache_iggy import AutoLogin, IggyClient, QuicConfig, QuicReconnectionConfig
 
 from .utils import get_quic_server_config, wait_for_ping
+
+# One reply that holds the largest message, as the Rust SDK sizes the QUIC buffer.
+MAX_RECORD_REPLY_SIZE = json.loads(
+    (Path(__file__).parent / "fixtures" / "deferred_polling.json").read_text()
+)["constants"]["max_record_reply_size"]
 
 
 @pytest.mark.unit
@@ -163,7 +170,7 @@ class TestQuicConfig:
         assert config.auto_login.enabled is False
         assert config.reconnection.enabled is True
         assert config.heartbeat_interval == timedelta(seconds=5)
-        assert config.response_buffer_size == 10_000_000
+        assert config.response_buffer_size == MAX_RECORD_REPLY_SIZE
         assert config.max_concurrent_bidi_streams == 10_000
         assert config.datagram_send_buffer_size == 100_000
         assert config.initial_mtu == 1200
@@ -415,6 +422,13 @@ class TestQuicClientConstruction:
     def test_accepts_the_default_config(self):
         """Test that an explicit default `QuicConfig` is accepted."""
         assert IggyClient(QuicConfig()) is not None
+
+    def test_accepts_a_connection_string_without_a_running_loop(self):
+        """QUIC construction opens no endpoint, so it needs no Tokio runtime."""
+        client = IggyClient.from_connection_string(
+            "iggy+quic://iggy:iggy@127.0.0.1:8080"
+        )
+        assert client is not None
 
 
 @pytest.mark.integration

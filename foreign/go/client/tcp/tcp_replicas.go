@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -58,7 +59,7 @@ type replicaLinks struct {
 	slots           map[uint8]*replicaSlot
 	primary         uint8
 	hasPrimary      bool
-	hasRoster       bool
+	hasRoster       atomic.Bool // changes under mu, read without it by routed calls
 	roster          []string
 	rosterOrder     []uint8
 	ctx             context.Context
@@ -66,15 +67,31 @@ type replicaLinks struct {
 	heartbeatCancel context.CancelFunc
 	connectAttempt  *connectAttempt
 	permits         chan struct{}
-	changed         chan struct{}
 	tasks           *sync.WaitGroup
+	// readyLinks closes when a slot installs a ready link. It changes under mu
+	// and is read without it by calls that wait for a link.
+	readyLinks atomic.Pointer[chan struct{}]
 }
 
 func newReplicaLinks(client *IggyTcpClient) *replicaLinks {
-	return &replicaLinks{client: client, slots: make(map[uint8]*replicaSlot), permits: make(chan struct{}, maxConcurrentDials), changed: make(chan struct{})}
+	links := &replicaLinks{client: client, slots: make(map[uint8]*replicaSlot), permits: make(chan struct{}, maxConcurrentDials)}
+	readyLinks := make(chan struct{})
+	links.readyLinks.Store(&readyLinks)
+	return links
 }
 
-func (r *replicaLinks) notifyLocked() { close(r.changed); r.changed = make(chan struct{}) }
+// nextReadyLink closes when a slot next installs a ready link. A call takes it
+// before it looks for its link, so a link installed after the look still
+// wakes the call.
+func (r *replicaLinks) nextReadyLink() <-chan struct{} {
+	return *r.readyLinks.Load()
+}
+
+func (r *replicaLinks) wakeRequestsLocked() {
+	next := make(chan struct{})
+	close(*r.readyLinks.Swap(&next))
+}
+
 func linkReady(link *tcpLink) bool {
 	if link == nil {
 		return false
@@ -178,7 +195,6 @@ func (r *replicaLinks) connect(ctx context.Context) (*tcpLink, error) {
 		err = ierror.ErrNotConnected
 	} else if link != nil {
 		r.bootstrap = link
-		r.notifyLocked()
 	}
 	attempt.link, attempt.err = link, err
 	if r.connectAttempt == attempt {
@@ -250,7 +266,7 @@ func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata) error {
 		return ierror.ErrNotConnected
 	}
 	r.primary, r.hasPrimary = primary, hasPrimary
-	r.hasRoster = true
+	r.hasRoster.Store(true)
 	r.roster = r.roster[:0]
 	r.rosterOrder = order
 	for id, slot := range r.slots {
@@ -272,12 +288,12 @@ func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata) error {
 		if linkReady(r.bootstrap) && (len(endpoints) == 1 || r.bootstrap.endpoint == endpoint) {
 			slot.link = r.bootstrap
 			r.bootstrap = nil
+			r.wakeRequestsLocked()
 		}
 		r.slots[id] = slot
 		r.startSlotLocked(id, slot)
 	}
 	r.retireBootstrapLocked()
-	r.notifyLocked()
 	return nil
 }
 
@@ -290,14 +306,18 @@ func (r *replicaLinks) retireBootstrapLocked() {
 	}
 }
 
-func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot) {
+// runSlot keeps the link of replica id up. A new slot dials at once, because
+// requests wait for its link. Every later dial waits its jitter, including the
+// first redial after a stable link resets the backoff. After a restart of a
+// slot that ran out of retries, the first dial waits its jitter too, so
+// clients that restart their slots together spread their dials.
+func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot, restart bool) {
 	exhausted := false
 	defer func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if r.slots[id] == slot && ctx.Err() == nil {
 			slot.retriesExhausted = exhausted
-			r.notifyLocked()
 		}
 	}()
 	failures := uint32(0)
@@ -323,8 +343,10 @@ func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot)
 			exhausted = configuration.enabled
 			return
 		}
-		if err := r.client.pause(ctx, reconnectDelay(configuration.interval, failures)); err != nil {
-			return
+		if restart || !initial {
+			if err := r.client.pause(ctx, reconnectDelay(configuration.interval, failures)); err != nil {
+				return
+			}
 		}
 		initial = false
 		connection, err := r.dial(ctx, slot.endpoint)
@@ -358,7 +380,7 @@ func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot)
 		}
 		slot.link = link
 		r.retireBootstrapLocked()
-		r.notifyLocked()
+		r.wakeRequestsLocked()
 		r.mu.Unlock()
 	}
 }
@@ -369,10 +391,11 @@ func (r *replicaLinks) startSlotLocked(id uint8, slot *replicaSlot) {
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
 	slot.cancel = cancel
+	restart := slot.retriesExhausted
 	slot.retriesExhausted = false
 	tasks := r.tasks
 	tasks.Add(1)
-	go func() { defer tasks.Done(); r.runSlot(ctx, id, slot) }()
+	go func() { defer tasks.Done(); r.runSlot(ctx, id, slot, restart) }()
 }
 
 func (r *replicaLinks) anyLocked() *tcpLink {
@@ -412,10 +435,18 @@ func (r *replicaLinks) metadata() *tcpLink {
 		}
 		return nil
 	}
-	if r.hasRoster {
+	if r.hasRoster.Load() {
 		return nil
 	}
 	return r.anyLocked()
+}
+
+// metadataPrimary is the replica that the client believes is the metadata
+// primary.
+func (r *replicaLinks) metadataPrimary() (uint8, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.primary, r.hasPrimary
 }
 
 func (r *replicaLinks) any() *tcpLink { r.mu.Lock(); defer r.mu.Unlock(); return r.anyLocked() }
@@ -561,6 +592,11 @@ func (r *replicaLinks) stopHeartbeat() {
 }
 
 func (r *replicaLinks) disconnect(wait bool) {
+	r.detach()(wait)
+}
+
+// detach removes ownership; its result closes sockets outside the session lock.
+func (r *replicaLinks) detach() func(bool) {
 	r.mu.Lock()
 	if r.cancel != nil {
 		r.cancel()
@@ -584,13 +620,15 @@ func (r *replicaLinks) disconnect(wait bool) {
 	}
 	clear(r.slots)
 	r.hasPrimary = false
-	r.hasRoster = false
-	r.notifyLocked()
+	r.hasRoster.Store(false)
 	r.mu.Unlock()
-	for link := range links {
-		link.close(ierror.ErrClientShutdown)
-	}
-	if wait {
+	return func(wait bool) {
+		for link := range links {
+			link.close(ierror.ErrClientShutdown)
+		}
+		if !wait {
+			return
+		}
 		if attempt != nil {
 			<-attempt.done
 		}

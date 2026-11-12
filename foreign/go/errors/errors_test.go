@@ -56,7 +56,7 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			err:      TransientNotCommitted{},
 			sentinel: ErrTransientNotCommitted,
 			code:     TransientNotCommittedCode,
-			message:  "request transiently not committed; retry",
+			message:  "request outcome unknown; it may have applied",
 		},
 		{
 			err:      TransientNotAccepted{},
@@ -77,10 +77,10 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			message:  "partition history changed after the request was resolved",
 		},
 		{
-			err:      ConsumerGroupPartitionNotOwned{ClientId: 4, PartitionId: 9},
+			err:      ConsumerGroupPartitionNotOwned{PartitionId: 9},
 			sentinel: ErrConsumerGroupPartitionNotOwned,
 			code:     ConsumerGroupPartitionNotOwnedCode,
-			message:  "consumer group member with client id: 4 does not own partition: 9 at the current generation (rebalance in progress).",
+			message:  "consumer group member does not own partition: 9 at the current generation (rebalance in progress).",
 		},
 		{
 			err:      TooManyConsumerGroups{},

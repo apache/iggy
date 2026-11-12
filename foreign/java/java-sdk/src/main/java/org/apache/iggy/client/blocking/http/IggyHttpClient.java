@@ -118,6 +118,22 @@ public class IggyHttpClient implements IggyBaseClient, Closeable {
         throw new IggyOperationNotSupportedException("sendBinaryRequest", "HTTP");
     }
 
+    /** {@inheritDoc} */
+    @Override
+    public byte[] sendBinaryRequestToReplica(int code, byte[] payload, int replicaId) {
+        throw new IggyOperationNotSupportedException("sendBinaryRequestToReplica", "HTTP");
+    }
+
+    /**
+     * Lifts the block of a committing poll whose outcome stayed unknown, without reversing what the server stored.
+     *
+     * @throws org.apache.iggy.exception.IggyOperationException with {@code OPERATION_NOT_RETAINED} for an operation
+     *         that blocks nothing
+     */
+    public void abandonOperation(long operationId) {
+        internalHttpClient.abandon(operationId);
+    }
+
     @Override
     public SystemClient system() {
         return systemClient;

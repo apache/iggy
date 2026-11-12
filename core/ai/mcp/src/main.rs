@@ -222,12 +222,14 @@ pub struct Permissions {
 }
 
 impl Permissions {
+    /// Recovery only touches operations this process started, and `read` can
+    /// start offset writes and committing polls.
     pub fn ensure_recovery(&self) -> Result<(), ErrorData> {
-        if self.create || self.update || self.delete {
+        if self.read || self.create || self.update || self.delete {
             Ok(())
         } else {
             Err(ErrorData::invalid_request(
-                "Insufficient 'write recovery' permissions",
+                "Insufficient 'recovery' permissions",
                 None,
             ))
         }

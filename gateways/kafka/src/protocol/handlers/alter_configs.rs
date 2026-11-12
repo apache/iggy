@@ -20,18 +20,18 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::IggyError;
 use kafka_protocol::messages::AlterConfigsRequest;
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::alter_configs_response::{
     AlterConfigsResourceResponse, AlterConfigsResponse,
 };
 use kafka_protocol::protocol::StrBytes;
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicLoad};
+use crate::bridge::{IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
@@ -39,9 +39,10 @@ use crate::protocol::api::{
     GatewayState, HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_alter_configs_shape;
+use crate::protocol::handlers::topic_config::keys::ConfigContext;
 use crate::protocol::handlers::topic_config::{
-    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure, name_reason, plan_retention_update,
-    topic_cap_and_duplicates, topic_cap_message,
+    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure, name_reason,
+    null_values, plan_replace, topic_cap_and_duplicates, topic_cap_message, write_alter,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -116,36 +117,26 @@ pub async fn handle(
     };
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let responses = alter_all(bridge, &req, &duplicate_names, deadline).await;
+    let alter = Alter {
+        bridge,
+        partition_growth: &state.partition_growth,
+        context: ConfigContext::of(bridge, state.max_frame_size),
+        deadline,
+    };
+    let responses = alter_all(&alter, &req, &duplicate_names).await;
     respond_or_close(
         encode_message(&response(responses), api_version, 256),
         "AlterConfigs",
     )
 }
 
-/// Denies every resource when `principal` is not allowed to alter topic configuration, or when
-/// its permissions could not be read. `None` means no listener of this gateway names principals,
-/// so there is nothing to enforce against; once one does, a connection that proved no identity
-/// carries [`AuthenticatedPrincipal::anonymous`] instead and is denied here.
+/// Denies every resource when [`alter_denial`] says `principal` may not alter topic
+/// configuration.
 fn authorize(
     principal: Option<&AuthenticatedPrincipal>,
     resources: &[AlterConfigsResource],
 ) -> Option<Vec<AlterConfigsResourceResponse>> {
-    let principal = principal?;
-    if principal.permissions_known && principal.permissions.manage_topics {
-        return None;
-    }
-    if !principal.permissions_known {
-        // The permission read failed after a successful login, so this connection holds no
-        // real answer. Denying is the fail-closed choice: granting would authorize a write off
-        // a value nothing ever actually read.
-        tracing::warn!(
-            principal = %principal.username,
-            "AlterConfigs asked on a connection whose permissions were never read; denying"
-        );
-    }
-    let message =
-        StrBytes::from_static_str("the principal is not authorized to alter topic configuration");
+    let message = alter_denial(principal, "AlterConfigs")?;
     Some(
         resources
             .iter()
@@ -180,12 +171,20 @@ fn response(responses: Vec<AlterConfigsResourceResponse>) -> AlterConfigsRespons
         .with_responses(responses)
 }
 
+/// What every resource of one request alters through.
+struct Alter<'a> {
+    bridge: &'a IggyBridge,
+    partition_growth: &'a Mutex<()>,
+    context: ConfigContext<'a>,
+    deadline: Instant,
+}
+
 async fn alter_all(
-    bridge: &IggyBridge,
+    alter: &Alter<'_>,
     req: &AlterConfigsRequest,
     duplicate_names: &HashSet<&str>,
-    deadline: Instant,
 ) -> Vec<AlterConfigsResourceResponse> {
+    let deadline = alter.deadline;
     let mut cache = StreamTopicCache::default();
     let mut responses = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
@@ -208,7 +207,7 @@ async fn alter_all(
             continue;
         }
 
-        let result = alter_one(bridge, &mut cache, resource, req.validate_only, deadline).await;
+        let result = alter_one(alter, &mut cache, resource, req.validate_only).await;
         if Instant::now() >= deadline {
             deadline_exceeded = true;
         }
@@ -218,12 +217,12 @@ async fn alter_all(
 }
 
 async fn alter_one(
-    bridge: &IggyBridge,
+    alter: &Alter<'_>,
     cache: &mut StreamTopicCache,
     resource: &AlterConfigsResource,
     validate_only: bool,
-    deadline: Instant,
 ) -> AlterConfigsResourceResponse {
+    let (bridge, deadline) = (alter.bridge, alter.deadline);
     if resource.resource_type != RESOURCE_TYPE_TOPIC {
         return resource_error(
             resource,
@@ -240,11 +239,28 @@ async fn alter_one(
         );
     }
 
+    let configs = || {
+        resource.configs.iter().map(|config| {
+            (
+                config.name.as_str(),
+                config.value.as_ref().map(StrBytes::as_str),
+            )
+        })
+    };
+    // A request fault, as Kafka's broker answers it before it forwards the alter.
+    if let Some(fault) = null_values(configs()) {
+        return resource_error(
+            resource,
+            ERROR_INVALID_REQUEST,
+            Some(StrBytes::from(fault.message())),
+        );
+    }
+
     // Existence is checked before config keys. A missing topic is
     // UNKNOWN_TOPIC_OR_PARTITION even when a key would also be invalid.
     // A deadline that has already passed must not start the lockstep Iggy call.
-    match cache.lookup(bridge, name, deadline, "AlterConfigs").await {
-        TopicLoad::Found(_) => {}
+    let topic = match cache.lookup(bridge, name, deadline, "AlterConfigs").await {
+        TopicLoad::Found(topic) => *topic,
         TopicLoad::Missing => {
             return resource_error(resource, ERROR_UNKNOWN_TOPIC_OR_PARTITION, None);
         }
@@ -255,15 +271,12 @@ async fn alter_one(
         TopicLoad::NotStarted | TopicLoad::TimedOut => {
             return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
         }
-    }
+    };
 
-    let expiry = match plan_retention_update(resource.configs.iter().map(|config| {
-        (
-            config.name.as_str(),
-            config.value.as_ref().map(StrBytes::as_str),
-        )
-    })) {
-        Ok(expiry) => expiry,
+    // Kafka's AlterConfigs replaces the whole configuration, so a stored key the resource
+    // leaves out, or an empty list, goes back to its default.
+    let update = match plan_replace(configs(), &topic, &alter.context) {
+        Ok(update) => update,
         Err(fault) => {
             return resource_error(
                 resource,
@@ -272,18 +285,6 @@ async fn alter_one(
             );
         }
     };
-    // Kafka's AlterConfigs replaces the whole set, so an empty list is a reset.
-    // This gateway patches named keys. Reporting success would hide that the
-    // previous expiry is still stored.
-    let Some(expiry) = expiry else {
-        return resource_error(
-            resource,
-            ERROR_INVALID_CONFIG,
-            Some(StrBytes::from_static_str(
-                "an empty configs list is rejected because this gateway patches named keys and does not replace the topic configuration",
-            )),
-        );
-    };
 
     // `validate_only` already performed the existence read and the same key checks.
     // It does not call `update_topic`.
@@ -291,31 +292,17 @@ async fn alter_one(
         return resource_error(resource, ERROR_NONE, None);
     }
 
-    // Do not start the write once the deadline has passed, and do not wrap it in
-    // `timeout_at`. Dropping that future does not abort the SDK task, so
-    // `UpdateTopic` can commit after this handler has already answered
-    // REQUEST_TIMED_OUT. A short retention then deletes sealed segments. This is a
-    // policy choice about *this* handler's own deadline, independent of
-    // `update_kafka_topic_message_expiry` itself: that bridge call already wraps its
-    // SDK round trip in `with_request_timeout` (see `topics.rs`), so the write it
-    // starts is never unbounded - it can simply still be in flight when this
-    // handler's own, shorter deadline has already elapsed.
-    if Instant::now() >= deadline {
-        tracing::warn!(
-            resource = name,
-            "AlterConfigs deadline passed before update_topic; not starting the write"
-        );
-        return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
-    }
-    match bridge.update_kafka_topic_message_expiry(name, expiry).await {
-        Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
-            resource_error(resource, ERROR_NONE, None)
-        }
-        Err(error) => {
-            let (code, message) = bridge_failure(&error, "AlterConfigs", "altering");
-            resource_error(resource, code, message)
-        }
-    }
+    let (code, message) = write_alter(
+        bridge,
+        alter.partition_growth,
+        name,
+        update,
+        |topic| plan_replace(configs(), topic, &alter.context),
+        deadline,
+        "AlterConfigs",
+    )
+    .await;
+    resource_error(resource, code, message)
 }
 
 fn resource_error(
@@ -332,16 +319,20 @@ fn resource_error(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::protocol::acl::PrincipalPermissions;
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
         AuthenticatedPrincipal {
             username: "alice".to_string(),
+            user: None,
             permissions: PrincipalPermissions {
                 manage_topics,
                 ..PrincipalPermissions::default()
             },
+            topic_reads: Arc::default(),
             permissions_known,
         }
     }
