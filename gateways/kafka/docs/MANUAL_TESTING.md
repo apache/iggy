@@ -565,6 +565,10 @@ suite except `tests/phase1_e2e_tests.rs` does.
 | I4 | Read-back via Kafka Fetch | `kcat -b 127.0.0.1:9093 -C -t orders -o beginning -e` | The produced record's payload is printed - validates the actual Kafka Fetch path, not just Iggy's own side |
 | I5 | Volume persistence across a restart | `docker compose restart iggy-server`, wait for its health check to go healthy again, re-run I4's poll command | The same record is still readable after the container restarts against the same named volume |
 | I6 | Teardown | `docker compose down -v` | Both containers stop; volume removed |
+| I7 | Health check and readiness | After I1, run `docker compose ps`, then `curl -i 127.0.0.1:9096/ready` | The gateway shows `(healthy)`. `/ready` answers `200` and `ready` |
+| I8 | Metrics | After I4, run `curl -s 127.0.0.1:9096/metrics \| grep -E 'requests_total\|response_errors_total'` | `iggy_kafka_gateway_requests_total` has a line for `Produce` and for `Fetch`. A Fetch of a missing topic adds a `response_errors_total` line with `code="3"` |
+| I9 | Iggy lost | `docker compose stop iggy-server`, then run `curl -i 127.0.0.1:9096/ready` for about 10 s | `/ready` answers `503` with `Iggy is unreachable` within about 5 s. `curl 127.0.0.1:9096/live` still answers `200`. `docker compose start iggy-server` makes `/ready` answer `200` again |
+| I10 | Non-root image | `docker compose exec iggy-gateway-kafka id` | `uid=10001(iggy) gid=10001(iggy)` |
 
 I5 is a graceful restart (`docker compose restart` sends SIGTERM, which flushes on the way down) -
 it checks that the named volume actually persists data across a container restart, not that a
@@ -700,7 +704,7 @@ kcat version (if used): ___________
 [ ] F1–F6  TCP / connection behavior
 [ ] G1–G19  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3)
 [ ] H1–H6  Adversarial input
-[ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
+[ ] I1–I10 Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 [ ] J1–J4  AKHQ ListOffsets by timestamp
 
 Automated regression:
