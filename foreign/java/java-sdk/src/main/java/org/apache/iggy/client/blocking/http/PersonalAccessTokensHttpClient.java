@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.client.blocking.PersonalAccessTokensClient;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
@@ -27,7 +28,10 @@ import org.apache.iggy.user.TokenInfo;
 import tools.jackson.core.type.TypeReference;
 
 import java.math.BigInteger;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Objects;
 
 class PersonalAccessTokensHttpClient implements PersonalAccessTokensClient {
 
@@ -53,7 +57,14 @@ class PersonalAccessTokensHttpClient implements PersonalAccessTokensClient {
 
     @Override
     public void deletePersonalAccessToken(String name) {
-        var request = httpClient.prepareDeleteRequest(PERSONAL_ACCESS_TOKENS + "/" + name);
+        // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
+        if (".".equals(name) || "..".equals(name)) {
+            throw new IggyInvalidArgumentException("Personal access token name must not be '.' or '..': " + name);
+        }
+        // URLEncoder writes a space as '+', which in a path means a literal plus.
+        var segment = URLEncoder.encode(Objects.requireNonNull(name, "name"), StandardCharsets.UTF_8)
+                .replace("+", "%20");
+        var request = httpClient.prepareDeleteRequest(PERSONAL_ACCESS_TOKENS + "/" + segment);
         httpClient.execute(request);
     }
 
