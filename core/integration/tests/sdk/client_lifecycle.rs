@@ -134,7 +134,7 @@ fn auto_login_client(harness: &TestHarness, heartbeat_interval: &str) -> IggyCli
     let (address, cooldown_key) = match transport {
         TransportProtocol::Tcp => (server.tcp_addr(), "reestablish_after"),
         TransportProtocol::WebSocket => (server.websocket_addr(), "reestablish_after"),
-        TransportProtocol::Quic => (server.quic_addr(), "reconnection_reestablish_after"),
+        TransportProtocol::Quic => (server.quic_addr(), "reestablish_after"),
         TransportProtocol::Http => panic!("HTTP has no connection to disconnect"),
     };
     let connection_string = format!(
