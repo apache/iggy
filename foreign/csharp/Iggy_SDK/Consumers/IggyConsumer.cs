@@ -36,7 +36,7 @@ namespace Apache.Iggy.Consumers;
 ///         <see cref="IggyConsumerConfig.PollOptions" /> holds the <see cref="CommitPolicy" />. With
 ///         <see cref="CommitMode.Manual" /> the application commits <see cref="ReceivedMessage.Checkpoint" /> with
 ///         <see cref="CommitAsync" />. With <see cref="CommitMode.OnRead" /> the server stores the offset of each read,
-///         and <see cref="ShutdownAsync" /> moves it back to the last message handed over. With
+///         and <see cref="ShutdownAsync(CancellationToken)" /> moves it back to the last message handed over. With
 ///         <see cref="CommitMode.Auto" /> the consumer counts each message, with <see cref="CommitAfter.Delivery" />
 ///         when it is handed over, with <see cref="CommitAfter.Processing" /> once the stream is read again, or once
 ///         the handler of <see cref="ConsumeAsync" /> returns with success, and with <see cref="CommitAfter.Marked" />
@@ -48,7 +48,9 @@ namespace Apache.Iggy.Consumers;
 ///         <see cref="SubscribeToErrorEvents" />. An error that stops a partition (<see cref="ReadException.StopsPartition" />)
 ///         ends the stream with its <see cref="ReadException" />, as a message that does not decode does, and the
 ///         partition reads nothing until <see cref="SeekAsync" />. <see cref="ReadException.IsResumable" /> says that a
-///         seek to <see cref="PollingStrategy.Next" /> reads it again after its stored offset.
+///         seek to <see cref="PollingStrategy.Next" /> reads it again after its stored offset. A lost range
+///         (<see cref="ReadException.Lost" />, status 14010) also ends the stream with its <see cref="ReadException" />,
+///         as the Rust consumer does. It stops no partition, so the next stream reads on after the range.
 ///     </para>
 /// </remarks>
 public partial class IggyConsumer : IAsyncDisposable
@@ -90,7 +92,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
     protected bool IsInitialized => Volatile.Read(ref _state) == StateReading;
 
-    /// <summary>Whether <see cref="ShutdownAsync" /> has started. The receive loops end once it has.</summary>
+    /// <summary>
+    ///     Whether <see cref="ShutdownAsync(CancellationToken)" /> has started. The receive loops end once it has.
+    /// </summary>
     private protected bool IsDisposed => Volatile.Read(ref _state) == StateShutDown;
 
     /// <summary>
@@ -99,7 +103,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     public IReadOnlyList<uint> Partitions => _reader?.Partitions ?? [];
 
-    /// <summary>Shuts the consumer down as <see cref="ShutdownAsync" /> does, and logs its error instead of throwing it.</summary>
+    /// <summary>
+    ///     Shuts the consumer down as <see cref="ShutdownAsync()" /> does, and logs its error instead of throwing it.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         try
@@ -119,6 +125,11 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     configuration asks for it, and starts the reader, which joins the group.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The consumer was shut down.</exception>
+    /// <exception cref="VsrRequestOutcomeUnknownException">
+    ///     The create of the group or the join has an unknown outcome. The consumer abandons it in the client first, so
+    ///     the next init can create the group and join. A join that landed keeps the member in the group until the
+    ///     session ends.
+    /// </exception>
     public async Task InitAsync(CancellationToken ct = default)
     {
         await _initialization.WaitAsync(ct);
@@ -204,7 +215,7 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Hands each message to <paramref name="handler" /> until the consumer shuts down or a handler fails. With
     ///     <see cref="CommitAfter.Delivery" /> a message counts before its handler runs, with
     ///     <see cref="CommitAfter.Processing" /> only after its handler returned with success. A
-    ///     <see cref="ShutdownAsync" /> from outside the handler waits for the handler that runs.
+    ///     <see cref="ShutdownAsync(CancellationToken)" /> from outside the handler waits for the handler that runs.
     /// </summary>
     /// <exception cref="Exception">The error of the first handler that failed. Its message is not counted.</exception>
     public async Task ConsumeAsync(Func<ReceivedMessage, CancellationToken, Task> handler,
@@ -252,9 +263,15 @@ public partial class IggyConsumer : IAsyncDisposable
         }
     }
 
-    /// <summary>Stores the offset of a checkpoint that this consumer handed over.</summary>
+    /// <summary>
+    ///     Stores the offset of a checkpoint that this consumer handed over, as
+    ///     <see cref="PartitionReader.CommitAsync" /> does. A cancel of <paramref name="ct" />, or the close of the
+    ///     reader in <see cref="ShutdownAsync(CancellationToken)" />, ends the reads for the owner of a store refused
+    ///     as not owned. The commit then fails with that refusal.
+    /// </summary>
     /// <exception cref="IggyInvalidStatusCodeException">
-    ///     Status 3 with <see cref="CommitMode.OnRead" />, and for a checkpoint of another consumer.
+    ///     Status 3 with <see cref="CommitMode.OnRead" />, and for a checkpoint of another consumer. The errors of the
+    ///     offset store, such as status 5009 (ConsumerGroupPartitionNotOwned).
     /// </exception>
     public Task CommitAsync(Checkpoint checkpoint, CancellationToken ct = default)
     {
@@ -280,12 +297,19 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     Stops reading. It waits for a handler of <see cref="ConsumeAsync" /> that runs, unless that handler calls
     ///     it, counts the last message of <see cref="ReceiveAsync" /> under <see cref="CommitAfter.Processing" />,
-    ///     closes the reader, which stores the counted positions or moves an on read offset back and leaves the
-    ///     group, and disposes a client that the consumer created. A later call waits for the first shutdown and
-    ///     ends as it does, unless the handler that the first one waits for makes it.
+    ///     closes the reader through <see cref="PartitionReader.CloseAsync(CancellationToken)" /> with
+    ///     <paramref name="token" />, which stores the counted positions or moves an on read offset back and leaves the
+    ///     group, and disposes a client that the consumer created. <paramref name="token" /> does not end the wait for
+    ///     the handler.
     /// </summary>
+    /// <remarks>
+    ///     The shutdown belongs to its first call. A later call waits for the first shutdown and ends as it does,
+    ///     unless the handler that the first one waits for makes it, and its token does not end that shutdown. As for
+    ///     the close of the reader, during an outage a shutdown can take about one request timeout for each partition
+    ///     with a pending store.
+    /// </remarks>
     /// <exception cref="Exception">The first failed store of the close.</exception>
-    public async Task ShutdownAsync()
+    public async Task ShutdownAsync(CancellationToken token)
     {
         var shutdown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         if (Interlocked.CompareExchange(ref _shutdown, shutdown, null) is { } running)
@@ -301,7 +325,7 @@ public partial class IggyConsumer : IAsyncDisposable
         Volatile.Write(ref _state, StateShutDown);
         try
         {
-            await ShutdownOnceAsync();
+            await ShutdownOnceAsync(token);
             shutdown.SetResult();
         }
         catch (Exception error)
@@ -312,7 +336,15 @@ public partial class IggyConsumer : IAsyncDisposable
         await shutdown.Task;
     }
 
-    private async Task ShutdownOnceAsync()
+    /// <summary>
+    ///     Stops reading as <see cref="ShutdownAsync(CancellationToken)" /> does, with a token that is never canceled.
+    /// </summary>
+    public Task ShutdownAsync()
+    {
+        return ShutdownAsync(CancellationToken.None);
+    }
+
+    private async Task ShutdownOnceAsync(CancellationToken token)
     {
         await _lifetime.CancelAsync();
         // The message of a running handler counts only once the handler returns with success.
@@ -327,7 +359,7 @@ public partial class IggyConsumer : IAsyncDisposable
             CountProcessed();
             try
             {
-                await reader.CloseAsync();
+                await reader.CloseAsync(token);
             }
             catch (Exception error)
             {
@@ -384,8 +416,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     The next batch of the reader, or null once the consumer shut down or <paramref name="ct" /> was canceled. A
     ///     read error that the reader retries goes to the error events and the reader goes on. A message that does
-    ///     not decode, whose <see cref="ReadException.Skip" /> passes it, and an error that stops a partition end the
-    ///     stream with their <see cref="ReadException" />.
+    ///     not decode, whose <see cref="ReadException.Skip" /> passes it, an error that stops a partition and a lost
+    ///     range end the stream with their <see cref="ReadException" />. Only the error tells of a lost range, and
+    ///     the error events can have no subscriber.
     /// </summary>
     private protected async Task<PolledMessages?> NextBatchAsync(CancellationToken ct)
     {
@@ -396,7 +429,7 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 return await Reader.NextAsync(cancellation.Token);
             }
-            catch (ReadException error) when (error.Skip is null && !error.StopsPartition)
+            catch (ReadException error) when (error.Skip is null && !error.StopsPartition && error.Lost is null)
             {
                 _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(error, error.Message));
             }
@@ -474,6 +507,13 @@ public partial class IggyConsumer : IAsyncDisposable
             }
             catch (IggyInvalidStatusCodeException error) when (error.StatusCode == ConsumerGroupAlreadyExists)
             {
+            }
+            catch (VsrRequestOutcomeUnknownException error)
+            {
+                // Otherwise the metadata writes of the client stay blocked. The next init finds the group or creates
+                // it again.
+                await PartitionReader.AbandonLostAsync(_client, _logger, error);
+                throw;
             }
         }
 

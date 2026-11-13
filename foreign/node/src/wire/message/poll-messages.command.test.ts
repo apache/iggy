@@ -599,6 +599,21 @@ describe('VSR poll context', () => {
       ]
     );
   });
+
+  it('resynchronizes stale ownership under a context that is all zero and polls again, as without a context',
+    async () => {
+      const { client, commands } = stubClient([
+        assignment(1n, [4]),
+        new ResponseError(COMMAND_CODE.PollMessages, 5009),
+        assignment(2n, [7]),
+        pollResponse(7)
+      ]);
+      const polled = await pollMessages(async () => client)({ ...groupRequest, context: EMPTY_PARTITION_CONTEXT });
+      assert.deepEqual(
+        [polled.partitionId, commands.map(({ command }) => command)],
+        [7, [COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages, COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages]]
+      );
+    });
 });
 
 describe('deferred poll encoding', () => {

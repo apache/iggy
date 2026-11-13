@@ -196,6 +196,8 @@ jobs:
         with:
           install-system-dependencies: "false"
 
+      # The one CI build without LICENSE_STAGE=license-skip: it keeps the
+      # default `license-gen` stage of the Dockerfile under test.
       - name: Build Iggy server Docker image
         id: docker_build
         run: |
@@ -279,6 +281,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust
         with:
           save-cache: "false"
+          free-disk-space: "false"
 
       - name: Download runtime binaries
         uses: ./.github/actions/utils/download-runtime
@@ -292,6 +295,7 @@ jobs:
             --target runtime-prebuilt \
             --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
             --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+            --build-arg LICENSE_STAGE=license-skip \
             -t iggy-server:local .
         shell: bash
 

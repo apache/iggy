@@ -40,7 +40,10 @@ import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.math.BigInteger;
@@ -99,6 +102,8 @@ class AsyncIggyTcpClientPartitionContextTest {
     private static final long ROUTE_INCARNATION = 1;
     private static final PartitionContext CALLER_CONTEXT =
             new PartitionContext(BigInteger.valueOf(41), BigInteger.valueOf(42), BigInteger.valueOf(43));
+    private static final PartitionContext CALLER_CONTEXT_WITHOUT_INCARNATION =
+            new PartitionContext(BigInteger.ZERO, BigInteger.valueOf(9), BigInteger.valueOf(100));
 
     @Test
     void shouldKeepCoordinatorWhenAPlainPollIsCanceledDuringContextDiscovery() throws Exception {
@@ -431,8 +436,14 @@ class AsyncIggyTcpClientPartitionContextTest {
         }
     }
 
-    @Test
-    void shouldKeepTheCallerPollContextWhenAPrimaryPollIsRerouted() throws Exception {
+    /**
+     * A reroute keeps the context of the first attempt. The server refuses incarnation 0, so a context with incarnation
+     * 0 takes the incarnation of the first route, and a context that is all zero takes the whole context of that route.
+     */
+    @ParameterizedTest
+    @MethodSource("callerPollContexts")
+    void shouldKeepTheCallerPollContextWhenAPrimaryPollIsRerouted(
+            PartitionContext caller, PartitionContext sent, boolean deferred) throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
                 ServerSocket primarySocket = new ServerSocket(0, 4, loopback)) {
@@ -463,7 +474,8 @@ class AsyncIggyTcpClientPartitionContextTest {
                 if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
                 }
-                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)
+                        || request.is(CommandCode.Messages.POLL_DEFERRED.getValue(), OPERATION_NON_REPLICATED)) {
                     stamped.add(stampedContext(request));
                     return polls.incrementAndGet() == 1
                             ? Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED)
@@ -475,18 +487,31 @@ class AsyncIggyTcpClientPartitionContextTest {
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
                 client.login().get(5, TimeUnit.SECONDS);
-                pollPartition(client, PollingStrategy.next().withContext(CALLER_CONTEXT))
+                PollingStrategy strategy = PollingStrategy.next().withContext(caller);
+                (deferred ? pollPartitionDeferred(client, strategy) : pollPartition(client, strategy))
                         .get(5, TimeUnit.SECONDS);
                 assertThat(routes).hasValue(2);
                 pollPartition(client, PollingStrategy.next()).get(5, TimeUnit.SECONDS);
                 assertThat(routes).hasValue(2);
-                assertThat(stamped).containsExactly(CALLER_CONTEXT, CALLER_CONTEXT, routeContext(2));
+                assertThat(stamped).containsExactly(sent, sent, routeContext(2));
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
             coordinator.get(5, TimeUnit.SECONDS);
             primary.get(5, TimeUnit.SECONDS);
         }
+    }
+
+    static List<Arguments> callerPollContexts() {
+        PartitionContext filled = new PartitionContext(
+                routeContext(1).incarnation(),
+                CALLER_CONTEXT_WITHOUT_INCARNATION.ownerGeneration(),
+                CALLER_CONTEXT_WITHOUT_INCARNATION.metadataOp());
+        return List.of(
+                Arguments.of(CALLER_CONTEXT, CALLER_CONTEXT, false),
+                Arguments.of(PartitionContext.EMPTY, routeContext(1), false),
+                Arguments.of(CALLER_CONTEXT_WITHOUT_INCARNATION, filled, false),
+                Arguments.of(CALLER_CONTEXT_WITHOUT_INCARNATION, filled, true));
     }
 
     @Test
@@ -813,6 +838,43 @@ class AsyncIggyTcpClientPartitionContextTest {
         }
     }
 
+    /**
+     * The server refuses an offset write that names incarnation 0. So a caller context without one takes the
+     * incarnation of the route once and keeps its owner and op, and the attempt after a reroute names the same history.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldFillTheRouteIncarnationOfAnOffsetWriteContextWithoutOneOnce(boolean delete) throws Exception {
+        try (OffsetCluster cluster = new OffsetCluster(1, TRANSIENT_NOT_ACCEPTED, STORED)) {
+            AsyncIggyTcpClient client = client(cluster.coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                CompletableFuture<Void> write = delete
+                        ? ((ConsumerOffsetsTcpClient) client.consumerOffsets())
+                                .deleteConsumerOffset(
+                                        StreamId.of(1L),
+                                        TopicId.of(1L),
+                                        0L,
+                                        Consumer.of(7L),
+                                        CALLER_CONTEXT_WITHOUT_INCARNATION)
+                        : storeOffset(client, 1, CALLER_CONTEXT_WITHOUT_INCARNATION);
+                write.get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            cluster.awaitServed();
+            assertThat(cluster.routings).hasSize(2);
+            PartitionContext filled = new PartitionContext(
+                    BigInteger.valueOf(ROUTE_INCARNATION),
+                    CALLER_CONTEXT_WITHOUT_INCARNATION.ownerGeneration(),
+                    CALLER_CONTEXT_WITHOUT_INCARNATION.metadataOp());
+            assertThat(cluster.primaryWrites)
+                    .extracting(AsyncIggyTcpClientPartitionContextTest::stampedContext)
+                    .containsExactly(filled, filled);
+        }
+    }
+
     @Test
     void shouldNumberPrimaryOffsetWritesFromTheCoordinatorSession() throws Exception {
         try (OffsetCluster cluster = new OffsetCluster(1, HISTORY_UNAVAILABLE, STORED)) {
@@ -920,6 +982,20 @@ class AsyncIggyTcpClientPartitionContextTest {
             AsyncIggyTcpClient client, PollingStrategy strategy) {
         return client.messages()
                 .pollMessages(StreamId.of(1L), TopicId.of(1L), Optional.of(0L), Consumer.of(7L), strategy, 1L, false);
+    }
+
+    private static CompletableFuture<PolledMessages> pollPartitionDeferred(
+            AsyncIggyTcpClient client, PollingStrategy strategy) {
+        return client.messages()
+                .pollMessagesDeferred(
+                        StreamId.of(1L),
+                        TopicId.of(1L),
+                        Optional.of(0L),
+                        Consumer.of(7L),
+                        strategy,
+                        1L,
+                        false,
+                        DeferredPollOptions.defaults());
     }
 
     private static CompletableFuture<PolledMessages> pollGroup(AsyncIggyTcpClient client, PollingStrategy strategy) {
