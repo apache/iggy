@@ -287,7 +287,7 @@ impl IggyService {
     }
 
     #[tool(
-        description = "Poll messages. Requires read permission; auto_commit=true or strategy=next also requires update permission because it stores the consumer offset."
+        description = "Poll messages. Requires read permission. auto_commit=true or strategy=next stores this server's consumer offset."
     )]
     pub async fn poll_messages(
         &self,
@@ -321,7 +321,6 @@ impl IggyService {
         };
         let auto_commit = auto_commit.unwrap_or(false) || strategy.kind == PollingKind::Next;
         let commit = if auto_commit {
-            self.permissions.ensure_update()?;
             CommitPolicy::OnRead
         } else {
             CommitPolicy::Manual
@@ -413,7 +412,7 @@ impl IggyService {
     }
 
     #[tool(
-        description = "Resolve a retained write using operation_id from an uncertain or blocked tool error. Success proves the original write committed and releases its lane; it does not return the original response body. An uncertain result keeps the operation available for another resolve. A committing poll (auto_commit=true or strategy=next) cannot be resolved and stays uncertain; use abandon_operation for it. Requires write permission."
+        description = "Resolve a retained write using operation_id from an uncertain or blocked tool error. Success proves the original write committed and releases its lane; it does not return the original response body. An uncertain result keeps the operation available for another resolve. A committing poll (auto_commit=true or strategy=next) cannot be resolved and stays uncertain; use abandon_operation for it. Requires any MCP permission, including read."
     )]
     pub async fn resolve_operation(
         &self,
@@ -431,7 +430,7 @@ impl IggyService {
     }
 
     #[tool(
-        description = "Explicitly abandon a retained write or a committing poll using operation_id from an uncertain or blocked tool error. A committing poll (auto_commit=true or strategy=next) with an unknown outcome, such as a lost reply, blocks later polls and offset writes of its partition until it is abandoned. Releases local recovery state without undoing the operation or establishing its outcome, so the stored offset of such a poll stays unknown. Requires write permission."
+        description = "Explicitly abandon a retained write or a committing poll using operation_id from an uncertain or blocked tool error. A committing poll (auto_commit=true or strategy=next) with an unknown outcome, such as a lost reply, blocks later polls and offset writes of its partition until it is abandoned. Releases local recovery state without undoing the operation or establishing its outcome, so the stored offset of such a poll stays unknown. Requires any MCP permission, including read."
     )]
     pub async fn abandon_operation(
         &self,
@@ -590,7 +589,7 @@ impl IggyService {
             offset,
         }): Parameters<StoreConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_update()?;
+        self.permissions.ensure_read()?;
         request(
             self.client
                 .store_consumer_offset(
@@ -613,7 +612,7 @@ impl IggyService {
             partition_id,
         }): Parameters<DeleteConsumerOffset>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_delete()?;
+        self.permissions.ensure_read()?;
         request(
             self.client
                 .delete_consumer_offset(
