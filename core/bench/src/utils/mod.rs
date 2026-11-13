@@ -16,13 +16,24 @@
 // under the License.
 
 use bench_report::{
-    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
-    numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
+    benchmark_kind::BenchmarkKind,
+    individual_metrics::BenchmarkIndividualMetrics,
+    numeric_parameter::BenchmarkNumericParameter,
+    options::{
+        BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkDurability,
+        BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions, BenchmarkTcpOptions,
+        BenchmarkTopicOptions,
+    },
+    params::{BenchmarkDataVolume, BenchmarkParams},
     transport::BenchmarkTransport,
 };
 use configs::{ConfigEnvMappings, server::ServerConfig};
 use iggy::prelude::*;
-use std::{fs, path::Path};
+use std::{
+    fs, io,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+};
 use tracing::{error, info};
 
 use crate::args::{
@@ -35,15 +46,20 @@ use crate::args::{
         DEFAULT_PINNED_NUMBER_OF_STREAMS, DEFAULT_QUIC_SERVER_ADDRESS, DEFAULT_TCP_SERVER_ADDRESS,
         DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME, DEFAULT_WEBSOCKET_SERVER_ADDRESS,
     },
+    transport::BenchmarkTransportCommand,
 };
 
 pub use client_factory::ClientFactory;
 
 pub mod batch_generator;
 pub mod client_factory;
+pub mod command_line;
 pub mod cpu_name;
 pub mod finish_condition;
 pub mod rate_limiter;
+
+/// Runs of one command that start within the same second get the suffixes `_2` up to this.
+const MAX_RUN_DIR_ATTEMPTS: u32 = 100;
 
 const BENCHMARK_SERVER_ENV_VARS: &[&str] = &[
     "IGGY_CONFIG_PATH",
@@ -88,6 +104,27 @@ pub async fn collect_server_logs_and_save_to_file(
         error!("Failed to write server logs to file: {:?}", e);
         IggyError::CannotWriteToFile
     })
+}
+
+/// Creates the directory for one run. It never reuses an existing directory, so no run replaces
+/// another's results.
+pub fn create_run_dir(output_dir: &Path, dir_name: &str) -> io::Result<PathBuf> {
+    fs::create_dir_all(output_dir)?;
+    for attempt in 1..=MAX_RUN_DIR_ATTEMPTS {
+        let path = match attempt {
+            1 => output_dir.join(dir_name),
+            _ => output_dir.join(format!("{dir_name}_{attempt}")),
+        };
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{dir_name} exists with every suffix up to _{MAX_RUN_DIR_ATTEMPTS}"),
+    ))
 }
 
 fn message_batches_from_metrics(individual_metrics: &[BenchmarkIndividualMetrics]) -> u64 {
@@ -150,6 +187,14 @@ pub fn params_from_args_and_metrics(
 
     let params_identifier = params_identifier.join("_");
 
+    let data_volume = args
+        .total_data()
+        .map(|total_data| BenchmarkDataVolume::TotalDataBytes(total_data.as_bytes_u64()))
+        .or_else(|| {
+            args.message_batches()
+                .map(|batches| BenchmarkDataVolume::MessageBatchesPerActor(batches.get()))
+        });
+
     BenchmarkParams {
         benchmark_kind,
         transport,
@@ -170,6 +215,77 @@ pub fn params_from_args_and_metrics(
         pretty_name,
         bench_command,
         params_identifier,
+        options: Some(options_from_args(args)),
+        data_volume,
+        suite: args.suite(),
+        workload: args.workload(),
+        command_line: Some(command_line::from_argv(std::env::args_os())),
+    }
+}
+
+/// Every flag that changes a result, with the bench defaults applied.
+pub fn options_from_args(args: &IggyBenchArgs) -> BenchmarkOptions {
+    let tcp = match args.transport_command() {
+        BenchmarkTransportCommand::Tcp(tcp) => BenchmarkTcpOptions {
+            nodelay: tcp.nodelay,
+            tls: tcp.tls,
+        },
+        BenchmarkTransportCommand::Http(_)
+        | BenchmarkTransportCommand::Quic(_)
+        | BenchmarkTransportCommand::WebSocket(_) => BenchmarkTcpOptions {
+            nodelay: false,
+            tls: false,
+        },
+    };
+    BenchmarkOptions {
+        topic: BenchmarkTopicOptions {
+            durability: benchmark_durability(args.durability()),
+            messages_required_to_save: args.messages_required_to_save().map(NonZeroU32::get),
+            max_topic_size: benchmark_max_topic_size(args.new_topic_max_size()),
+            message_expiry: benchmark_message_expiry(args.message_expiry()),
+        },
+        consumer: args.polls().then(|| BenchmarkConsumerOptions {
+            consumer_offset_durability: benchmark_durability(args.consumer_offset_durability()),
+            max_wait_us: args.max_wait.as_micros(),
+            min_count: args.min_count,
+            max_bytes: args.max_bytes,
+            read_amplification: args.read_amplification(),
+        }),
+        client: BenchmarkClientOptions {
+            warmup_time_us: args.warmup_time().as_micros(),
+            high_level_api: args.high_level_api(),
+            reuse_streams: args.reuse_streams(),
+        },
+        tcp,
+    }
+}
+
+const fn benchmark_durability(durability: Durability) -> BenchmarkDurability {
+    match durability {
+        Durability::Replicated => BenchmarkDurability::Replicated,
+        Durability::Persisted => BenchmarkDurability::Persisted,
+    }
+}
+
+/// The server reads the size as a number, where 0 is its default and `u64::MAX` is
+/// unlimited. `--max-topic-size 0` and `--max-topic-size unlimited` both send 0.
+fn benchmark_max_topic_size(max_topic_size: MaxTopicSize) -> BenchmarkMaxTopicSize {
+    match MaxTopicSize::from(u64::from(max_topic_size)) {
+        MaxTopicSize::ServerDefault => BenchmarkMaxTopicSize::ServerDefault,
+        MaxTopicSize::Unlimited => BenchmarkMaxTopicSize::Unlimited,
+        MaxTopicSize::Custom(size) => BenchmarkMaxTopicSize::Bytes(size.as_bytes_u64()),
+    }
+}
+
+/// The server reads the expiry as microseconds, where 0, sent by `--message-expiry 0s`, is
+/// its default.
+fn benchmark_message_expiry(message_expiry: IggyExpiry) -> BenchmarkMessageExpiry {
+    match IggyExpiry::from(u64::from(message_expiry)) {
+        IggyExpiry::ServerDefault => BenchmarkMessageExpiry::ServerDefault,
+        IggyExpiry::NeverExpire => BenchmarkMessageExpiry::NeverExpire,
+        IggyExpiry::ExpireDuration(duration) => {
+            BenchmarkMessageExpiry::AfterUs(duration.as_micros())
+        }
     }
 }
 
@@ -385,9 +501,75 @@ fn add_output_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
 
 #[cfg(test)]
 mod tests {
-    use super::recreate_bench_command;
+    use super::{MAX_RUN_DIR_ATTEMPTS, create_run_dir, options_from_args, recreate_bench_command};
     use crate::args::common::IggyBenchArgs;
-    use clap::Parser;
+    use bench_report::options::{
+        BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkDurability,
+        BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions, BenchmarkTcpOptions,
+        BenchmarkTopicOptions,
+    };
+    use clap::{Command, CommandFactory, Parser};
+    use std::io;
+
+    /// Args that the report holds as typed params.
+    const TYPED_PARAM_ARGS: &[&str] = &[
+        "message_size",
+        "messages_per_batch",
+        "message_batches",
+        "total_data",
+        "rate_limit",
+        "streams",
+        "partitions",
+        "producers",
+        "producing_consumers",
+        "consumers",
+        "consumer_groups",
+    ];
+
+    /// Args that `options_from_args` records.
+    const RECORDED_OPTION_ARGS: &[&str] = &[
+        "durability",
+        "messages_required_to_save",
+        "max_topic_size",
+        "message_expiry",
+        "consumer_offset_durability",
+        "max_wait",
+        "min_count",
+        "max_bytes",
+        "read_amplification",
+        "warmup_time",
+        "high_level_api",
+        "reuse_streams",
+        "nodelay",
+        "tls",
+    ];
+
+    /// Args that don't change a result: addresses, certificates, credentials, output and labels.
+    const NEUTRAL_ARGS: &[&str] = &[
+        "server_address",
+        "client_address",
+        "server_name",
+        "validate_certificate",
+        "tls_domain",
+        "tls_validate_certificate",
+        "tls_ca_file",
+        "username",
+        "password",
+        "output_dir",
+        "identifier",
+        "remark",
+        "extra_info",
+        "gitref",
+        "gitref_date",
+        "open_charts",
+        "suite",
+        "workload",
+        "sampling_time",
+        "moving_average_window",
+        "pretty",
+    ];
+
+    const EXAMPLES_SUBCOMMAND: &str = "examples";
 
     #[test]
     fn reproduced_commands_preserve_consumer_only_and_end_to_end_topologies() {
@@ -506,5 +688,188 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_bench_arg_should_be_a_typed_param_a_recorded_option_or_neutral() {
+        let mut args = Vec::new();
+        collect_arg_ids(&IggyBenchArgs::command(), "iggy-bench", &mut args);
+        let listed = [TYPED_PARAM_ARGS, RECORDED_OPTION_ARGS, NEUTRAL_ARGS].concat();
+
+        let unlisted: Vec<String> = args
+            .iter()
+            .filter(|(_, id)| !listed.contains(&id.as_str()))
+            .map(|(path, id)| format!("{path} / {id}"))
+            .collect();
+        let stale: Vec<&str> = listed
+            .iter()
+            .copied()
+            .filter(|listed_id| args.iter().all(|(_, id)| id != listed_id))
+            .collect();
+
+        assert!(
+            unlisted.is_empty(),
+            "add each arg to one list, and record it if it changes a result: {unlisted:#?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "listed args that no longer exist: {stale:?}"
+        );
+    }
+
+    fn collect_arg_ids(command: &Command, path: &str, args: &mut Vec<(String, String)>) {
+        for arg in command.get_arguments() {
+            args.push((path.to_owned(), arg.get_id().to_string()));
+        }
+        for subcommand in command.get_subcommands() {
+            collect_arg_ids(
+                subcommand,
+                &format!("{path} {}", subcommand.get_name()),
+                args,
+            );
+        }
+    }
+
+    #[test]
+    fn given_non_default_recorded_flags_when_building_options_should_record_each_one() {
+        let args = IggyBenchArgs::try_parse_from([
+            "iggy-bench",
+            "--durability",
+            "persisted",
+            "--messages-required-to-save",
+            "128",
+            "--consumer-offset-durability",
+            "persisted",
+            "--max-wait",
+            "250ms",
+            "--min-count",
+            "10",
+            "--max-bytes",
+            "2097152",
+            "--warmup-time",
+            "5s",
+            "--high-level-api",
+            "--reuse-streams",
+            "pinned-producer-and-consumer",
+            "--max-topic-size",
+            "1GiB",
+            "--message-expiry",
+            "1h",
+            "--read-amplification",
+            "1.5",
+            "tcp",
+            "--nodelay",
+            "--tls",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            options_from_args(&args),
+            BenchmarkOptions {
+                topic: BenchmarkTopicOptions {
+                    durability: BenchmarkDurability::Persisted,
+                    messages_required_to_save: Some(128),
+                    max_topic_size: BenchmarkMaxTopicSize::Bytes(1_073_741_824),
+                    message_expiry: BenchmarkMessageExpiry::AfterUs(3_600_000_000),
+                },
+                consumer: Some(BenchmarkConsumerOptions {
+                    consumer_offset_durability: BenchmarkDurability::Persisted,
+                    max_wait_us: 250_000,
+                    min_count: 10,
+                    max_bytes: Some(2_097_152),
+                    read_amplification: Some(1.5),
+                }),
+                client: BenchmarkClientOptions {
+                    warmup_time_us: 5_000_000,
+                    high_level_api: true,
+                    reuse_streams: true,
+                },
+                tcp: BenchmarkTcpOptions {
+                    nodelay: true,
+                    tls: true,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn given_default_flags_when_building_options_should_match_legacy_options_of_each_kind() {
+        let command = IggyBenchArgs::command();
+        let kinds = command
+            .get_subcommands()
+            .filter(|kind| kind.get_name() != EXAMPLES_SUBCOMMAND);
+        for kind in kinds {
+            let args =
+                IggyBenchArgs::try_parse_from(["iggy-bench", kind.get_name(), "tcp"]).unwrap();
+            assert_eq!(
+                options_from_args(&args),
+                BenchmarkOptions::legacy(args.kind()),
+                "{}",
+                kind.get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn given_topic_limit_spellings_when_building_options_should_record_what_the_server_applies() {
+        let cases: &[(&[&str], BenchmarkMaxTopicSize, BenchmarkMessageExpiry)] = &[
+            (
+                &[],
+                BenchmarkMaxTopicSize::Unlimited,
+                BenchmarkMessageExpiry::NeverExpire,
+            ),
+            (
+                &["-T", "0"],
+                BenchmarkMaxTopicSize::ServerDefault,
+                BenchmarkMessageExpiry::NeverExpire,
+            ),
+            // `unlimited` parses to 0 bytes, which the server reads as its default.
+            (
+                &["-T", "unlimited"],
+                BenchmarkMaxTopicSize::ServerDefault,
+                BenchmarkMessageExpiry::NeverExpire,
+            ),
+            (
+                &["-e", "server_default"],
+                BenchmarkMaxTopicSize::Unlimited,
+                BenchmarkMessageExpiry::ServerDefault,
+            ),
+            (
+                &["-e", "0s"],
+                BenchmarkMaxTopicSize::Unlimited,
+                BenchmarkMessageExpiry::ServerDefault,
+            ),
+            (
+                &["-e", "never_expire"],
+                BenchmarkMaxTopicSize::Unlimited,
+                BenchmarkMessageExpiry::NeverExpire,
+            ),
+        ];
+        for &(flags, max_topic_size, message_expiry) in cases {
+            let arguments = ["iggy-bench", "pinned-producer"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .chain(["tcp"]);
+            let topic = options_from_args(&IggyBenchArgs::try_parse_from(arguments).unwrap()).topic;
+            assert_eq!(topic.max_topic_size, max_topic_size, "{flags:?}");
+            assert_eq!(topic.message_expiry, message_expiry, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn given_existing_run_dirs_when_creating_another_should_add_a_suffix_up_to_the_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let output_dir = root.path().join("results");
+
+        let first = create_run_dir(&output_dir, "run").unwrap();
+        let second = create_run_dir(&output_dir, "run").unwrap();
+        assert_eq!(first, output_dir.join("run"));
+        assert_eq!(second, output_dir.join("run_2"));
+
+        for _ in 3..=MAX_RUN_DIR_ATTEMPTS {
+            create_run_dir(&output_dir, "run").unwrap();
+        }
+        let error = create_run_dir(&output_dir, "run").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 }

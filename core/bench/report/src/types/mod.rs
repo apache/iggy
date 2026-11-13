@@ -26,6 +26,7 @@ pub mod individual_metrics;
 pub mod individual_metrics_summary;
 pub mod latency_distribution;
 pub mod numeric_parameter;
+pub mod options;
 pub mod params;
 pub mod report;
 pub mod server_stats;
