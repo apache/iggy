@@ -1,0 +1,10 @@
+2026-11-04T08:38:56.872910Z  INFO iggy_bench: Starting the benchmarks...
+2026-11-04T08:38:56.872938Z  INFO iggy_bench::runner: Starting to benchmark: tcp with server: 10.0.0.169:8090
+2026-11-04T08:38:56.872959Z  INFO iggy_bench::benchmarks::pinned_producer: Staring benchmark PinnedProducer, streams: 20, producers: 20,  max topic size: server_default, message size: 1000 b, messages per batch: 250 b, total batches to send: 12400, global rate limit: 800.00 MB/s
+2026-11-04T08:38:56.872999Z  INFO iggy::links::replicas: Connecting to 10.0.0.169:8090...
+2026-11-04T08:38:56.873256Z  INFO iggy::links::replicas: Connected to 10.0.0.169:8090.
+2026-11-04T08:38:56.873260Z  INFO iggy::links::replicas: No credentials to sign in with.
+2026-11-04T08:38:56.900208Z  INFO iggy_bench::benchmarks::benchmark: Creating the test stream 'bench-stream-1'
+2026-11-04T08:38:56.904248Z  INFO iggy_bench::benchmarks::benchmark: Creating the test topic 'topic-1' for stream 'bench-stream-1' with max topic size: Unlimited, message expiry: never_expire, durability: replicated, messages required to save: None
+2026-11-04T08:38:56.907751Z  INFO iggy_bench::benchmarks::benchmark: Creating the test stream 'bench-stream-2'
+2026-11-04T08:38:56.910372Z  INFO iggy_bench::benchmarks::benchmark: Creating the test topic 'topic-1' for stream 'bench-stream-2' with max topic size: Unlimited, message expiry: never_expire, durability: replicated, messages required to save: None

@@ -29,17 +29,14 @@ actix-web = { workspace = true }
 bench-dashboard-shared = { workspace = true }
 bench-report = { workspace = true }
 charming = { workspace = true, features = ["ssr", "ssr-raster"] }
-chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true }
-dashmap = { workspace = true }
-file-operation = { workspace = true }
 notify = { workspace = true }
-octocrab = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
