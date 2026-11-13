@@ -132,6 +132,7 @@ asyncio.run(main())
 - **Consumer groups**: `await client.consumer_group(...)` returns an `IggyConsumer` that creates and joins the group by default and commits offsets according to the `commit` policy in `poll_options`, which defaults to manual commits. Groups require a binary transport. HTTP supports ordinary consumers only.
 - **User headers**: `SendMessage(data, user_headers=...)` accepts a plain `dict` with `str`, `bytes`, `bool`, `int`, or `float` values. `HeaderKey`/`HeaderValue` give explicit control over the wire type. See the [message-headers examples](https://github.com/apache/iggy/tree/server-0.10.0/examples/python/message-headers).
 - **Topic options**: `create_topic(..., options=TopicOptions(...))` accepts typed options. `TopicOptions.raw` accepts extra keys as `dict[str, str]`, validated by the server. `client.describe_options("topic")` lists the keys a server accepts.
+- **Create results**: `create_stream`, `create_topic`, `create_consumer_group` and `create_user` resolve to `StreamDetails`, `TopicDetails`, `ConsumerGroupDetails` and `UserInfoDetails` for the created resource. The created id and name are ready to use; live counters, such as a topic partition's `segments_count`, are zero in the create reply, so read them with `get_*`.
 - **Administration**: user and permission management. Personal access tokens can be used for login via `AutoLogin.personal_access_token(...)` in the connection config. PAT management isn't exposed yet.
 
 ## Examples

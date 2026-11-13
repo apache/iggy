@@ -1815,7 +1815,7 @@ class IggyClient:
         stream: builtins.str | builtins.int,
         name: builtins.str,
         options: TopicOptions | None = None,
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[TopicDetails]:
         r"""
         Creates a new topic.
 
@@ -1827,7 +1827,7 @@ class IggyClient:
                 server default at admission.
 
         Returns:
-            An awaitable that resolves to `None` when the topic is created.
+            An awaitable that resolves to the created `TopicDetails`.
 
         Raises:
             RuntimeError: If an argument is invalid or the request fails.
@@ -2141,7 +2141,7 @@ class IggyClient:
         stream_id: builtins.str | builtins.int,
         topic_id: builtins.str | builtins.int,
         name: builtins.str,
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[ConsumerGroupDetails]:
         r"""
         Create a consumer group for a stream and topic.
 
@@ -2151,7 +2151,7 @@ class IggyClient:
             name: Consumer group name as `str`.
 
         Returns:
-            An awaitable that resolves to `None` when the consumer group is created.
+            An awaitable that resolves to the created `ConsumerGroupDetails`.
 
         Raises:
             ValueError: If an identifier is invalid.

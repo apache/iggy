@@ -17,7 +17,7 @@
 
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, StreamDetails
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
@@ -55,13 +55,18 @@ class TestStreamOperations:
         min_bytes: int,
         max_bytes: int,
     ):
-        """Test stream creation and retrieval."""
+        """Test stream creation returns details and the stream is retrievable."""
         stream_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
-        await iggy_client.create_stream(stream_name)
+        created = await iggy_client.create_stream(stream_name)
+        assert isinstance(created, StreamDetails)
+        assert isinstance(created.id, int)
+        assert created.name == stream_name
+        assert created.topics_count == 0
 
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
+        assert stream.id == created.id
         assert stream.created_at > 0
         assert stream.name == stream_name
         assert stream.size == 0

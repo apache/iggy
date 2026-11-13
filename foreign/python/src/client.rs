@@ -1307,12 +1307,12 @@ impl IggyClient {
     ///         server default at admission.
     ///
     /// Returns:
-    ///     An awaitable that resolves to `None` when the topic is created.
+    ///     An awaitable that resolves to the created `TopicDetails`.
     ///
     /// Raises:
     ///     RuntimeError: If an argument is invalid or the request fails.
     #[pyo3(signature = (stream, name, options=None))]
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails]", imports=("collections.abc")))]
     fn create_topic<'a>(
         &self,
         py: Python<'a>,
@@ -1325,11 +1325,11 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
+            let topic = inner
                 .create_topic(&stream, &name, &topic_options)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(())
+            Ok(TopicDetails::from(topic))
         })
     }
 
@@ -1812,12 +1812,12 @@ impl IggyClient {
     ///     name: Consumer group name as `str`.
     ///
     /// Returns:
-    ///     An awaitable that resolves to `None` when the consumer group is created.
+    ///     An awaitable that resolves to the created `ConsumerGroupDetails`.
     ///
     /// Raises:
     ///     ValueError: If an identifier is invalid.
     ///     RuntimeError: If the request fails.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerGroupDetails]", imports=("collections.abc")))]
     fn create_consumer_group<'a>(
         &self,
         py: Python<'a>,
@@ -1830,11 +1830,11 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
+            let group = inner
                 .create_consumer_group(&stream_id, &topic_id, &name)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(())
+            Ok(PyConsumerGroupDetails::from(group))
         })
     }
 
