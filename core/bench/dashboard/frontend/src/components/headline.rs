@@ -16,7 +16,8 @@
 // under the License.
 
 //! A headline number with its change against the previous version: the run page's KPIs and the
-//! Overview's cards. They share one look, so a change reads the same on every page.
+//! Overview's cards, for iggy-bench and OMB runs. They share one look, so a change reads the same
+//! on every page.
 
 use bench_dashboard_shared::delta::{DeltaVerdict, Metric};
 use yew::prelude::*;
@@ -51,25 +52,54 @@ pub fn headline_card(
         || NO_VALUE.to_owned(),
         |value| metric_value_text(headline.metric, value),
     );
+    let change = headline
+        .change
+        .as_ref()
+        .map(change_chip)
+        .unwrap_or_default();
+    kpi_card(
+        label,
+        Some(metric_hint(headline.metric)),
+        value,
+        detail,
+        html! { <>{ change }{ extra }</> },
+    )
+}
+
+/// One headline number in a card: its label, which shows `hint` on hover, the value as text, an
+/// optional detail line below it, and `change` after that, for example a change chip.
+pub fn kpi_card(
+    label: &str,
+    hint: Option<&str>,
+    value: String,
+    detail: Option<String>,
+    change: Html,
+) -> Html {
     html! {
         <div class="run-kpi">
-            <span class="run-kpi-label" title={metric_hint(headline.metric)}>
+            <span class="run-kpi-label" title={hint.map(str::to_owned)}>
                 { label.to_owned() }
             </span>
             <strong class="run-kpi-value">{ value }</strong>
             if let Some(detail) = detail {
                 <small>{ detail }</small>
             }
-            if let Some(change) = &headline.change {
-                { change_chip(change) }
-            }
-            { extra }
+            { change }
         </div>
     }
 }
 
 pub fn change_chip(change: &Change) -> Html {
     judged_chip(
+        change.text(),
+        change.ranges.clone(),
+        Judgment::Rule(change.verdict),
+    )
+}
+
+/// [`change_chip`] with its judgment in the hover text, for a card row too narrow for the note.
+pub fn compact_change_chip(change: &Change) -> Html {
+    compact_judged_chip(
         change.text(),
         change.ranges.clone(),
         Judgment::Rule(change.verdict),
@@ -99,6 +129,15 @@ pub fn compact_judged_chip(text: String, ranges: String, judgment: Judgment) -> 
     };
     html! {
         <span class={classes!("run-change", judgment_look(judgment))} {title}>{ text }</span>
+    }
+}
+
+/// A change without a verdict, in the gray of a change between runs whose parameters differ, for
+/// example a percent change between OMB runs, which have no noise rule. `values` names the values
+/// that it compares, on hover.
+pub fn neutral_chip(text: String, values: String) -> Html {
+    html! {
+        <span class={classes!("run-change", GRAY_LOOK)} title={values}>{ text }</span>
     }
 }
 

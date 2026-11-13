@@ -247,7 +247,7 @@ pub(super) fn link_cell(summary: &BenchmarkSummary, run: &BenchmarkSummary) -> H
         .collect();
     html! {
         <td class="run-table-link">
-            <Link<AppRoute> to={AppRoute::Benchmark { uuid: summary.uuid.to_string() }}>
+            <Link<AppRoute> to={AppRoute::Run { uuid: summary.uuid.to_string() }}>
                 { OPEN_LABEL }
             </Link<AppRoute>>
             <CompareLink runs={compared} title={COMPARE_TITLE}>{ COMPARE_LABEL }</CompareLink>
