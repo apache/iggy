@@ -13630,6 +13630,92 @@ mod partition_repair_driver_tests {
         );
     }
 
+    #[test]
+    fn given_a_restarted_partition_wal_when_adopting_the_same_view_should_fence_recovered_history()
+    {
+        let (mut sim, client) = cluster(178);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            CLIENT_ID,
+            0,
+            client.send_messages(namespace, &[Bytes::from_static(b"before restart")]),
+        );
+        assert_eq!(reply.header().status, 0);
+        let recovered_op = reply.header().op;
+        assert!(
+            (0..DRAIN_STEPS).any(|_| {
+                sim.step();
+                group_state(&sim, LAGGING, namespace).2 == recovered_op
+            }),
+            "replica {LAGGING} must apply op {recovered_op} before restarting"
+        );
+        sim.replica_crash(LAGGING);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            CLIENT_ID,
+            0,
+            client.send_messages(namespace, &[Bytes::from_static(b"during restart")]),
+        );
+        assert_eq!(reply.header().status, 0);
+        let head = reply.header().op;
+        assert!(
+            head > recovered_op,
+            "the primary must advance beyond {recovered_op}, got {head}"
+        );
+        sim.replica_restart(LAGGING);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        let view = partition.consensus().log_view();
+        assert_eq!(view, group_state(&sim, 0, namespace).1);
+        assert_eq!(partition.consensus().status(), Status::Recovering);
+        assert_eq!(partition.consensus().commit_min(), recovered_op);
+        assert!(
+            !partition.view_fenced(),
+            "the fence must be installed by view adoption"
+        );
+        let start_view = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.cluster = partition.consensus().cluster();
+                header.replica = 0;
+                header.view = view;
+                header.group = namespace.inner();
+                header.partition_incarnation = partition.created_revision();
+                header.op = head;
+                header.commit = head;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                header.checksum_body = u128::from(iggy_common::calculate_checksum(&[]));
+                header.seal();
+            });
+        futures::executor::block_on(shard.on_message(MessageBag::StartView(start_view)));
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert_eq!(partition.consensus().status(), Status::Normal);
+        assert_eq!(partition.consensus().view(), view);
+        assert_eq!(partition.consensus().log_view(), view);
+        assert!(
+            partition.view_fenced(),
+            "recovered op {recovered_op} must fence the adopted head {head} in the unchanged view {view}"
+        );
+        assert_eq!(partition.consensus().commit_min(), recovered_op);
+
+        assert!(
+            (0..DRAIN_STEPS).any(|_| {
+                sim.step();
+                let partition = sim.replicas[usize::from(LAGGING)]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .unwrap();
+                partition.consensus().commit_min() == head && !partition.view_fenced()
+            }),
+            "replica {LAGGING} must prove the fenced history and commit through op {head}"
+        );
+    }
+
     fn resident_repair_window(
         namespace: IggyNamespace,
         total_ops: usize,

@@ -5700,10 +5700,11 @@ dependencies = [
 
 [[package]]
 name = "iggy-gateway-kafka"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "axum",
  "base64 0.23.1",
  "bytes",
  "futures",
@@ -5713,6 +5714,7 @@ dependencies = [
  "iggy_kafka_wire",
  "kafka-protocol",
  "libc",
+ "prometheus-client",
  "rcgen",
  "regex",
  "regex-syntax",

@@ -30,6 +30,13 @@ inputs:
     description: "Test selection: affected or workspace"
     required: false
     default: affected
+  stack-base:
+    description: >-
+      Base branch commit under a pull request stack. The merge ref of an upper
+      layer has the layer below as its first parent, so the top pull request
+      compares against this commit to cover every layer. Empty outside a stack.
+    required: false
+    default: ""
   partition:
     description: "One-based nextest partition index for the test task"
     required: false
@@ -101,12 +108,16 @@ runs:
 
     # Planning is an optimization. A planner or selector failure restores the
     # full-workspace build and test path below. The Action installs the one
-    # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
+    # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1). On the top
+    # pull request of a stack, `since` is the stack base, so the plan covers
+    # every layer. An empty `since` takes the comparison base from the event.
     - name: Plan affected Rust work
       id: rail
       if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
       continue-on-error: true
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
+      with:
+        since: ${{ inputs.stack-base }}
 
     # Individual lint tasks for parallel execution
     - name: Cargo check
@@ -187,6 +198,7 @@ runs:
         PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         PLAN_STATUS: ${{ steps.rail.outcome }}
         TEST_SELECTION: ${{ inputs.test-scope }}
+        STACK_BASE: ${{ inputs.stack-base }}
         ARTIFACT_TASK: ${{ inputs.task }}
       run: |
         set -euo pipefail
@@ -312,6 +324,8 @@ runs:
           # no merge base (so it failed on every full-workspace lane). Read the parent from
           # the raw object and fetch that one commit before diffing. A HEAD with one parent
           # (workflow_dispatch on a branch tip) has no PR base, so it takes the fail-safe.
+          # The top pull request of a stack diffs against the stack base instead: its
+          # first parent is the merge commit of the layer below.
           #
           # `2>&1` into a variable, not `2>/dev/null` piped straight to grep: the old form
           # silenced *any* git failure into empty output, which `grep -q` then reads
@@ -321,8 +335,8 @@ runs:
           # KAFKA_FIXTURES_REQUIRED never set - every fixture-backed test quietly passed by
           # skipping all its assertions instead of running them (0.005s for a test meant to
           # decode 9 real fixtures).
-          BASE_SHA=""
-          if [[ "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]]; then
+          BASE_SHA="$STACK_BASE"
+          if [[ -z "$BASE_SHA" && "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]]; then
             BASE_SHA=$(git cat-file -p HEAD | awk '/^parent /{print $2; exit}')
           fi
           if [[ -n "$BASE_SHA" ]] \
@@ -453,9 +467,19 @@ runs:
       shell: bash
 
     # Compare the shared HEAD runtime with a separately built baseline server.
+    # The script takes the first parent of the merge ref as the baseline. For
+    # the top pull request of a stack that is the layer below, so the stack
+    # base replaces it and a format break in any layer fails the check.
     - name: Storage format backwards compatibility
       if: inputs.task == 'test-storage-compat'
-      run: ./scripts/ci/storage-compat.sh --runtime-artifacts "$RUNNER_TEMP/rust-runtime"
+      env:
+        STACK_BASE: ${{ inputs.stack-base }}
+      run: |
+        compat_args=(--runtime-artifacts "$RUNNER_TEMP/rust-runtime")
+        if [[ -n "$STACK_BASE" ]]; then
+          compat_args+=(--baseline-ref "$STACK_BASE")
+        fi
+        ./scripts/ci/storage-compat.sh "${compat_args[@]}"
       shell: bash
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /
