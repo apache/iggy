@@ -439,11 +439,11 @@ impl IggyClient {
     ///
     /// # fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
-    ///     "iggy+ws://user:secret@localhost:8092?reconnection_max_retries=5&reestablish_after=500ms&tls_validate_certificate=true&tls=true&tls_domain=localhost",
-    /// )?
-    /// .build()?;
-    /// let legacy_client = IggyClient::builder_from_connection_string(
-    ///     "iggy+ws://user:secret@localhost:8092?reconnection_retries=5&reestablish_after=500ms&tls_validate_certificate=false",
+    ///     "iggy+ws://user:secret@localhost:8092\
+    ///      ?heartbeat_interval=5s&reconnection_max_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
+    ///      &read_buffer_size=131072&write_buffer_size=131072\
+    ///      &max_message_size=67108864&max_frame_size=16777216&accept_unmasked_frames=false\
+    ///      &tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem&tls_validate_certificate=true",
     /// )?
     /// .build()?;
     /// # Ok(())
