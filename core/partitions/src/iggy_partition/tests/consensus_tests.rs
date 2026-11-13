@@ -1085,6 +1085,45 @@ async fn live_retransmits_fill_an_announced_gap_only_after_the_matching_prefix()
     }
 }
 
+/// A backup keeps the log of its `StartView` parked for the whole view. The
+/// headers of that log decide which retransmit may fill a hole at the head.
+#[compio::test]
+async fn given_a_parked_view_log_when_retransmits_arrive_should_take_only_the_prepare_it_names() {
+    let (mut partition, _) = recording_partition_at(1, 3);
+    let named = checksummed_segment_prepare(1, 0, 0, b"named");
+    let abandoned = checksummed_segment_prepare(1, 0, 0, b"abandoned");
+    assert_ne!(abandoned.header().checksum, named.header().checksum);
+    let start = Message::<StartViewHeader>::new(size_of::<StartViewHeader>()).transmute_header(
+        |_, header: &mut StartViewHeader| {
+            header.command = Command::StartView;
+            header.cluster = TEST_CLUSTER;
+            header.group = partition.namespace().inner();
+            header.op = named.header().op;
+            header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+        },
+    );
+    partition.consensus().handle_start_view(
+        PlaneKind::Partitions,
+        start.header(),
+        bytemuck::bytes_of(named.header()),
+    );
+    assert!(partition.consensus().view_log_is_pending());
+
+    partition.on_replicate(abandoned).await;
+    let abandoned_journaled = partition.log.journal().inner.holds_op(1);
+    partition.on_replicate(named.clone()).await;
+
+    assert!(
+        !abandoned_journaled,
+        "the parked log names another prepare at op 1"
+    );
+    assert_eq!(
+        partition.log.journal().inner.header_by_op(1),
+        Some(*named.header()),
+        "the retransmit that the parked log names must fill the hole"
+    );
+}
+
 #[compio::test]
 async fn given_a_backup_that_cannot_journal_a_prepare_when_it_arrives_should_neither_forward_nor_ack()
  {
