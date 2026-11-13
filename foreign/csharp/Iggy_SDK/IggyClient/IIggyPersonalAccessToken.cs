@@ -54,6 +54,9 @@ public interface IIggyPersonalAccessToken
     /// <param name="name">The name of the token to delete.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="ArgumentException">
+    ///     Over HTTP, thrown when <paramref name="name" /> is null, "." or "..".
+    /// </exception>
     Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default);
 
     /// <summary>

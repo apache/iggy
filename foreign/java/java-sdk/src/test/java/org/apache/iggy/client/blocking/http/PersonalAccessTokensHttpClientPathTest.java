@@ -23,6 +23,8 @@ import com.sun.net.httpserver.HttpServer;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -58,8 +60,9 @@ class PersonalAccessTokensHttpClientPathTest {
     }
 
     @ParameterizedTest
-    @CsvSource({".", ".."})
-    void shouldRejectDotSegmentNamesWithoutSendingARequest(String name) throws IOException {
+    @NullSource
+    @ValueSource(strings = {".", "..", "\uD800"})
+    void shouldRejectInvalidNamesWithoutSendingARequest(String name) throws IOException {
         try (var server = new RecordingServer();
                 var client = new IggyHttpClient(server.url())) {
             assertThatThrownBy(() -> client.personalAccessTokens().deletePersonalAccessToken(name))

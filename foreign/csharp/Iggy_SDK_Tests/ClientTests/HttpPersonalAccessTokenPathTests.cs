@@ -46,12 +46,13 @@ public sealed class HttpPersonalAccessTokenPathTests
     [Theory]
     [InlineData(".")]
     [InlineData("..")]
-    public async Task given_a_dot_segment_name_when_deleting_should_throw_without_sending_a_request(string name)
+    [InlineData(null)]
+    public async Task given_an_invalid_name_when_deleting_should_throw_without_sending_a_request(string? name)
     {
         var handler = new RecordingHandler();
 
-        await Assert.ThrowsAsync<ArgumentException>(() =>
-            Client(handler).DeletePersonalAccessTokenAsync(name, TestContext.Current.CancellationToken));
+        await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+            Client(handler).DeletePersonalAccessTokenAsync(name!, TestContext.Current.CancellationToken));
 
         Assert.Empty(handler.Requests);
     }

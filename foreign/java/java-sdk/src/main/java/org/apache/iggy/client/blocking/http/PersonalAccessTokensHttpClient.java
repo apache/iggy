@@ -31,7 +31,6 @@ import java.math.BigInteger;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.Objects;
 
 class PersonalAccessTokensHttpClient implements PersonalAccessTokensClient {
 
@@ -57,13 +56,19 @@ class PersonalAccessTokensHttpClient implements PersonalAccessTokensClient {
 
     @Override
     public void deletePersonalAccessToken(String name) {
+        if (name == null) {
+            throw new IggyInvalidArgumentException("Personal access token name must not be null");
+        }
         // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
         if (".".equals(name) || "..".equals(name)) {
-            throw new IggyInvalidArgumentException("Personal access token name must not be '.' or '..': " + name);
+            throw new IggyInvalidArgumentException("Personal access token name must not be '.' or '..'");
+        }
+        // The encoder turns a lone surrogate into '?', which would delete a token named "?".
+        if (!name.equals(new String(name.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8))) {
+            throw new IggyInvalidArgumentException("Personal access token name must be valid Unicode");
         }
         // URLEncoder writes a space as '+', which in a path means a literal plus.
-        var segment = URLEncoder.encode(Objects.requireNonNull(name, "name"), StandardCharsets.UTF_8)
-                .replace("+", "%20");
+        var segment = URLEncoder.encode(name, StandardCharsets.UTF_8).replace("+", "%20");
         var request = httpClient.prepareDeleteRequest(PERSONAL_ACCESS_TOKENS + "/" + segment);
         httpClient.execute(request);
     }

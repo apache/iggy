@@ -1288,6 +1288,8 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default)
     {
+        ArgumentNullException.ThrowIfNull(name);
+
         // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
         if (name is "." or "..")
         {
