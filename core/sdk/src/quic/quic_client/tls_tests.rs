@@ -154,7 +154,7 @@ async fn explicit_quic_server_name_controls_hostname_verification() {
     ))
     .unwrap();
     let mut config = QuicClientConfig::from(connection);
-    assert_eq!(config.server_name, "localhost");
+    config.server_name = "wrong.example".into();
     assert_certificate_failure(handshake(&server, &config, tls.clone()).await);
     config.server_name = "remote.example".into();
     assert!(handshake(&server, &config, tls).await.is_ok());
