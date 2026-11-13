@@ -44,6 +44,7 @@ services:
         PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
         LIBC: glibc
         PROFILE: debug
+        LICENSE_STAGE: license-skip
     command: []
     cap_add:
       - SYS_NICE

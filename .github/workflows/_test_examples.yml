@@ -44,7 +44,7 @@ jobs:
         if: contains(fromJSON('["examples-rust","examples-python","examples-php"]'), matrix.task)
         uses: ./.github/actions/utils/setup-rust
         with:
-          free-disk-space: ${{ matrix.task != 'examples-python' }}
+          free-disk-space: "false"
 
       - name: Setup Node for examples
         if: matrix.task == 'examples-node'

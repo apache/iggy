@@ -1,0 +1,100 @@
+{{- /*
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+*/ -}}
+# {{ template "chart.name" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.versionBadge" . }}{{ template "chart.typeBadge" . }}{{ template "chart.appVersionBadge" . }}
+
+The chart runs the gateways as a StatefulSet. Each gateway is one Kafka broker: node id `ordinal + 1`,
+advertised under a headless Service, and listed to the others in `IGGY_KAFKA_BROKERS`. With more than
+one gateway they share the consumer groups through the coordinator log in Iggy, and a gateway that
+stops hands its groups to the others.
+
+## Prerequisites
+
+* Kubernetes 1.27+ (`unhealthyPodEvictionPolicy` of the PodDisruptionBudget)
+* Helm 3.2.0+
+* An Iggy server or cluster that the pods reach over TCP. The [iggy chart](../iggy) runs one.
+* With more than one gateway, an Iggy user with the `manage_servers` permission, or the gateways do
+  not start. The root user has it.
+* Prometheus Operator CRDs if `serviceMonitor.enabled=true`
+
+## Quick Start
+
+```bash
+helm install kafka ./helm/charts/iggy-kafka-gateway \
+  --set iggy.address=iggy.default.svc.cluster.local:8090 \
+  --set iggy.password=<password of the iggy user>
+```
+
+Kafka clients in the cluster bootstrap from the release's Service, for example
+`kafka-iggy-kafka-gateway.default.svc.cluster.local:9093`, and then connect to each gateway by its
+pod name under the headless Service.
+
+## Probes and Metrics
+
+Each gateway serves `/metrics`, `/ready` and `/live` on `http.port` (9096).
+
+* `/live` answers 200 while the process answers. The liveness probe restarts a gateway that hangs.
+* `/ready` answers 503 while the gateway starts, while it drains at shutdown, and from about 5 s
+  after it loses Iggy. The bootstrap Service then sends no new client to it.
+* `/metrics` serves Prometheus metrics: requests, latency and error codes per Kafka API, closed
+  connections per cause, slot use, consumer groups and the coordinator partitions each gateway
+  serves. See `gateways/kafka/docs/OBSERVABILITY.md`.
+
+The headless Service publishes every gateway, ready or not, so a client that holds metadata reaches
+a gateway that lost Iggy and gets a Kafka error code that it retries.
+
+## Limits
+
+* Clients connect to the per-pod DNS names, so they run inside the cluster. The chart has no
+  external access per gateway yet.
+* The Kafka listener is PLAINTEXT, or SASL_PLAINTEXT with `kafka.sasl.enabled`. The chart has no
+  TLS listener yet.
+* SASL is off by default: any pod that reaches the Kafka port can create and delete topics as
+  `iggy.username`. Set `kafka.sasl.enabled=true`, and give the bridge a user without root rights
+  where you can.
+* One release per Iggy stream (`iggy.stream`, default `kafka`). The stream holds the coordinator
+  log, and every release numbers its gateways from 1.
+* The image runs as user 10001 with a read-only root file system.
+
+{{ template "chart.requirementsSection" . }}
+
+## Development
+
+```bash
+# Format templates
+helmfmt helm/charts/iggy-kafka-gateway/
+
+# Lint YAML files
+yamllint -c helm/charts/iggy-kafka-gateway/.yamllint.yml helm/charts/iggy-kafka-gateway/
+
+# Regenerate README after changing values.yaml
+cd helm/charts/iggy-kafka-gateway && helm-docs
+
+# Run all validations
+scripts/ci/test-helm.sh validate
+```
+
+## Values
+
+{{ template "chart.valuesTable" . }}
+
+{{ template "helm-docs.versionFooter" . }}
