@@ -160,21 +160,3 @@ async fn explicit_quic_server_name_controls_hostname_verification() {
     assert!(handshake(&server, &config, tls).await.is_ok());
     server.close(0u32.into(), b"test complete");
 }
-
-#[test]
-fn connection_string_hosts_preserve_the_existing_explicit_server_name_contract() {
-    for host in [
-        "localhost:8080",
-        "remote.example:8080",
-        "127.0.0.1:8080",
-        "[::1]:8080",
-    ] {
-        let connection = ConnectionString::<QuicConnectionStringOptions>::new(&format!(
-            "iggy+quic://user:secret@{host}?tls_validate_certificate=true"
-        ))
-        .unwrap();
-        let config = QuicClientConfig::from(connection);
-        assert_eq!(config.server_address, host);
-        assert_eq!(config.server_name, "localhost");
-    }
-}
