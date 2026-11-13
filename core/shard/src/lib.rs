@@ -4234,6 +4234,15 @@ where
                                 && partition.consensus().is_follower()
                                 && !partition.consensus().is_transferring()
                             {
+                                // A retransmit can fill the op that the view-log
+                                // proof waits on. Nothing else runs that proof
+                                // again before journal repair reaches the
+                                // partition.
+                                if partition.consensus().view_log_repair_op() == Some(routing.2)
+                                    && partition.log.journal().inner.holds_op(routing.2)
+                                {
+                                    prove_partition_view_log_again(self.id, partition).await;
+                                }
                                 partition.commit_journal(config).await;
                             }
                         }
@@ -7157,9 +7166,7 @@ where
             .is_none_or(|op| op == header.op);
         let ingest = partition.apply_repaired_prepare(msg).await;
         if closes_proof_gap {
-            let pending = partition.consensus().pending_view_log();
-            reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
-            anchor_view_fence_from_view_log(partition, pending.as_ref()).await;
+            prove_partition_view_log_again(self.id, partition).await;
         }
         if ingest == RepairIngest::Unvouched {
             tracing::debug!(
@@ -14430,6 +14437,19 @@ async fn reconcile_partition_view_divergence<B, SB>(
             }
         }
     }
+}
+
+/// Run the view-log proof again after a prepare, repaired or live, that can
+/// close its gap.
+#[allow(clippy::future_not_send)]
+async fn prove_partition_view_log_again<B, SB>(shard: u16, partition: &mut IggyPartition<B, SB>)
+where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let pending = partition.consensus().pending_view_log();
+    reconcile_partition_view_divergence(shard, partition, pending.as_ref()).await;
+    anchor_view_fence_from_view_log(partition, pending.as_ref()).await;
 }
 
 /// The lowest header in a view's suffix that can anchor a fence. A blank slot

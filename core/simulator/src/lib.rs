@@ -13469,6 +13469,15 @@ mod partition_repair_driver_tests {
             .is_some_and(|partition| partition.log.journal().inner.holds_op(op))
     }
 
+    fn view_log_unproven(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> bool {
+        let shard = sim.replicas[replica as usize].partition_shard(namespace);
+        shard
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(|partition| partition.consensus().view_log_unproven())
+    }
+
     fn gap_drops(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> u64 {
         sim.replicas[replica as usize]
             .partition_shard(namespace)
@@ -13713,6 +13722,73 @@ mod partition_repair_driver_tests {
                 partition.consensus().commit_min() == head && !partition.view_fenced()
             }),
             "replica {LAGGING} must prove the fenced history and commit through op {head}"
+        );
+    }
+
+    /// A backup that was down for one send comes back with a hole at that op.
+    /// Its primary still retransmits the op, because the backup never
+    /// acknowledged it. The retransmit must fill the hole, also while journal
+    /// repair cannot: on a busy node a partition waits minutes for its turn.
+    #[test]
+    fn given_a_restarted_backup_that_missed_a_send_when_repair_cannot_reach_it_should_take_the_op_from_the_retransmit()
+     {
+        /// Far more than the retransmit interval of the primary.
+        const RETRANSMIT_STEPS: usize = 20_000;
+        let (mut sim, client) = cluster(0x5EED_0235);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            CLIENT_ID,
+            0,
+            client.send_messages(namespace, &[Bytes::from_static(b"before restart")]),
+        );
+        assert_eq!(reply.header().status, 0);
+        let recovered_op = reply.header().op;
+        assert!(
+            (0..DRAIN_STEPS).any(|_| {
+                sim.step();
+                group_state(&sim, LAGGING, namespace).2 == recovered_op
+            }),
+            "replica {LAGGING} must apply op {recovered_op} before restarting"
+        );
+        sim.replica_crash(LAGGING);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            CLIENT_ID,
+            0,
+            client.send_messages(namespace, &[Bytes::from_static(b"during restart")]),
+        );
+        assert_eq!(reply.header().status, 0);
+        let missed_op = reply.header().op;
+        for peer in 0..CLUSTER_REPLICAS {
+            if peer != LAGGING {
+                sim.network
+                    .link_filter_mut(ProcessId::Replica(peer), ProcessId::Replica(LAGGING))
+                    .remove(Command::RepairPrepare);
+            }
+        }
+        sim.replica_restart(LAGGING);
+
+        let mut retransmits = 0u64;
+        let caught_up = (0..RETRANSMIT_STEPS).any(|_| {
+            sim.step();
+            retransmits =
+                gap_drops(&sim, LAGGING, namespace) + buffered_gap_drops(&sim, LAGGING, namespace);
+            group_state(&sim, LAGGING, namespace).2 >= missed_op
+        });
+        let (status, view, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert!(
+            caught_up,
+            "replica {LAGGING} dropped {retransmits} prepares as gaps and never took op \
+             {missed_op}: status {status:?}, view {view}, commit {commit_min}/{commit_max}, \
+             journal holds the op: {}",
+            journal_holds(&sim, LAGGING, namespace, missed_op)
+        );
+        assert!(
+            !view_log_unproven(&sim, LAGGING, namespace),
+            "the retransmit that fills the hole must also prove the log of the view"
         );
     }
 

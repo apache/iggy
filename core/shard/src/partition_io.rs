@@ -10335,6 +10335,53 @@ mod tests {
         }
     }
 
+    /// The primary retransmits an op until the backup acknowledges it. Journal
+    /// repair can take minutes to reach one partition of a busy node. So the
+    /// retransmit of a missing head must prove the log of the view, as its
+    /// repaired copy does.
+    #[compio::test]
+    async fn given_a_hole_at_a_blank_start_view_head_when_its_retransmit_arrives_should_prove_the_view_log()
+     {
+        const HEAD: u64 = 1;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let prepare = prepares.into_iter().next().unwrap();
+        let mut partition =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                HEAD,
+                HEAD,
+                &[consensus::dvc_blank(HEAD)],
+            ))
+            .await;
+        let retransmit = consensus::restamp_prepare_view(prepare.into_frozen(), NEW_VIEW).unwrap();
+        let retransmit =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(retransmit.as_slice()))
+                .unwrap();
+
+        owner.on_message(MessageBag::Prepare(retransmit)).await;
+
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert!(
+            partition.log.journal().inner.holds_op(HEAD),
+            "the retransmit must fill the hole at the head"
+        );
+        assert!(
+            !partition.consensus().view_log_unproven(),
+            "the filled head must prove the log of the view"
+        );
+        assert_eq!(partition.consensus().commit_min(), HEAD);
+    }
+
     fn start_view_suffix(
         namespace: IggyNamespace,
         view: u32,
