@@ -54,45 +54,42 @@ use tracing::trace;
 /// | --- | --- |
 /// | [`stream_name()`], [`topic_name()`] | what is read |
 /// | [`consumer_name()`] | the name of the consumer, or of the group for [`ConsumerKind::ConsumerGroup`] |
-/// | [`consumer_kind()`] | whether the consumer joins a group or reads one partition alone |
+/// | [`consumer_kind()`] | whether the consumer joins a group or reads chosen partitions alone |
 /// | [`partitions_count()`] | the partition count of a topic that this call creates |
-/// | [`partition_id()`], [`with_partition_id()`] | for [`ConsumerKind::Consumer`], the ID of the single partition the consumer reads |
-/// | [`batch_length()`] | messages fetched per request |
-/// | [`polling_interval()`], [`polling_strategy()`] | how often reading happens, and where it starts |
-/// | [`auto_commit()`] | when offsets are committed |
-/// | [`polling_retry_interval()`] | the wait between attempts while polling is blocked |
+/// | [`partitions()`], [`with_partitions()`] | for [`ConsumerKind::Consumer`], the partitions the consumer reads |
+/// | [`poll_options()`] | the limits of each request, and whether and when offsets are stored |
+/// | [`polling_strategy()`] | where reading a partition without a position starts |
+/// | [`polling_retry_interval()`] | how long a refused partition waits before the next read |
+/// | [`prefetch_bytes()`], [`prefetch_messages()`] | the requested budget for buffered and in-flight batches |
 /// | [`init_retries()`], [`init_interval()`] | retries for a missing stream or topic |
 /// | [`encryptor()`] | decrypting payloads and user headers, and it replaces the client's own |
 ///
-/// [`partition_id()`] picks the single partition that a [`ConsumerKind::Consumer`] reads, and it
-/// defaults to 0. Set it through [`with_partition_id()`] when the topic has more than one
-/// partition. Run one consumer per partition to cover such a topic, or use
-/// [`ConsumerKind::ConsumerGroup`] and let the server divide the partitions.
+/// [`partitions()`] picks the partitions that a [`ConsumerKind::Consumer`] reads, and it
+/// defaults to partition 0. Set it through [`with_partitions()`] when the topic has more than one
+/// partition, or use [`ConsumerKind::ConsumerGroup`] and let the server divide the partitions.
 ///
-/// A consumer built here always creates its group when the group is missing, and always joins it.
+/// A consumer built as `ConsumerKind::ConsumerGroup` here always creates its group when the group is missing, and always joins it.
 /// Build through [`IggyClient::consumer()`] or [`IggyClient::consumer_group()`] when you need to
-/// pick the partition and the group name apart, to replay messages, or to join the group yourself.
+/// replay messages, set the offset drain timeout, or join the group yourself.
 ///
 /// # Defaults worth knowing
 ///
-/// [`IggyConsumerConfig`] does not repeat the defaults of [`IggyConsumerBuilder`]:
+/// [`IggyConsumerConfig`] takes most defaults of [`IggyConsumerBuilder`]: a
+/// [`PollOptions::wait`] of five seconds with [`CommitPolicy::Manual`],
+/// [`PollingStrategy::next()`], and a one-second retry interval. It differs in one place:
 ///
 /// | Option | [`IggyConsumerConfig`] | [`IggyConsumerBuilder`] |
 /// | --- | --- | --- |
-/// | [`polling_strategy()`] | [`PollingStrategy::last()`], so every poll starts [`batch_length()`] messages back from the end of the partition | [`PollingStrategy::next()`] |
-/// | [`auto_commit()`] | [`AutoCommitWhen::PollingMessages`], with no interval | the same trigger, plus a one-second interval |
-/// | [`batch_length()`] | 100 | 1000 |
 /// | [`init_retries()`] | five retries, three seconds apart | none |
 ///
-/// [`PollingStrategy::last()`] never consults the stored offset, so a restarted consumer re-reads
-/// up to [`batch_length()`] messages that it handled before. If more messages arrived while it was
-/// down, it skips the oldest of them. See
+/// [`CommitPolicy::Manual`] stores no offset by itself, so a restarted consumer reads the same
+/// messages again unless the application commits. See
 /// [the callouts on `IggyConsumerConfig`](IggyConsumerConfig#some-callouts-on-defaults), and set
-/// [`PollingStrategy::next()`] to resume where the previous run stopped.
+/// [`CommitPolicy::Auto`] or [`CommitPolicy::OnRead`] in the poll options to store offsets.
 ///
-/// An encryptor rules out the default [`auto_commit()`]. That setting commits a batch before it is
-/// decrypted, so [`IggyConsumer::init()`] rejects the pair with
-/// [`IggyError::InvalidConfiguration`]. Pick another [`AutoCommit`] variant next to an encryptor.
+/// An encryptor rules out [`CommitPolicy::OnRead`]. That policy stores the offset of a batch
+/// before it is decrypted, so [`IggyConsumer::init()`] rejects the pair with
+/// [`IggyError::InvalidConfiguration`]. Pick another [`CommitPolicy`] next to an encryptor.
 ///
 /// # Examples
 ///
@@ -106,8 +103,7 @@ use tracing::trace;
 /// let config = IggyConsumerConfig::from_stream_topic(
 ///     "my-stream",
 ///     "my-topic",
-///     100,
-///     IggyDuration::new_from_secs(1),
+///     PollOptions::wait(IggyDuration::ONE_SECOND),
 /// )?;
 /// let (client, mut consumer) =
 ///     IggyStreamConsumer::with_client_from_url("iggy://iggy:iggy@localhost:8090", &config)
@@ -126,8 +122,8 @@ use tracing::trace;
 /// # }
 /// ```
 ///
-/// A group member that creates the topic it reads, resumes from the stored offset, and commits
-/// once a message has been handled:
+/// A group member that creates the topic it reads, resumes from the stored offset, and stores an
+/// offset once a message has been handled:
 ///
 /// ```rust,no_run
 /// use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
@@ -152,11 +148,13 @@ use tracing::trace;
 ///     .create_stream_if_not_exists(true)
 ///     .create_topic_if_not_exists(true)
 ///     .partitions_count(3)
-///     .batch_length(100)
-///     .polling_interval(IggyDuration::new_from_secs(1))
+///     .poll_options(PollOptions {
+///         count: 100,
+///         commit: CommitPolicy::Auto(AutoCommit::default()),
+///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+///     })
 ///     .polling_strategy(PollingStrategy::next())
 ///     .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
-///     .auto_commit(AutoCommit::After(AutoCommitAfter::ConsumingEachMessage))
 ///     .init_interval(NonZeroIggyDuration::ONE_SECOND)
 ///     .build();
 ///
@@ -170,7 +168,7 @@ use tracing::trace;
 ///     let _ = sender.send(());
 /// });
 ///
-/// // The AutoCommitAfter variants only commit under consume_messages().
+/// // Under CommitAfter::Processing, a message counts once the handler returned Ok.
 /// consumer.consume_messages(&PrintMessage, receiver).await?;
 ///
 /// consumer.shutdown().await?;
@@ -182,11 +180,13 @@ use tracing::trace;
 /// # Shutting down
 ///
 /// `IggyStreamConsumer` builds the consumer and then steps out of the way, so stopping it is your
-/// job. [`IggyConsumer::shutdown()`] commits the reading position and leaves the group, and
+/// job. [`IggyConsumer::shutdown()`] stores the counted offsets and leaves the group, and
 /// [`IggyClient::shutdown()`] closes the connection.
 ///
-/// [`AutoCommit`]: crate::prelude::AutoCommit
-/// [`AutoCommitWhen::PollingMessages`]: crate::prelude::AutoCommitWhen::PollingMessages
+/// [`CommitPolicy`]: crate::prelude::CommitPolicy
+/// [`CommitPolicy::Auto`]: crate::prelude::CommitPolicy::Auto
+/// [`CommitPolicy::Manual`]: crate::prelude::CommitPolicy::Manual
+/// [`CommitPolicy::OnRead`]: crate::prelude::CommitPolicy::OnRead
 /// [`ConsumerKind::Consumer`]: crate::prelude::ConsumerKind::Consumer
 /// [`ConsumerKind::ConsumerGroup`]: crate::prelude::ConsumerKind::ConsumerGroup
 /// [`IggyClient`]: crate::prelude::IggyClient
@@ -198,10 +198,8 @@ use tracing::trace;
 /// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
 /// [`IggyConsumer::shutdown()`]: crate::prelude::IggyConsumer::shutdown
 /// [`IggyConsumerBuilder`]: crate::prelude::IggyConsumerBuilder
-/// [`PollingStrategy::last()`]: crate::prelude::PollingStrategy::last
+/// [`PollOptions::wait`]: crate::prelude::PollOptions::wait
 /// [`PollingStrategy::next()`]: crate::prelude::PollingStrategy::next
-/// [`auto_commit()`]: crate::prelude::IggyConsumerConfig::auto_commit
-/// [`batch_length()`]: crate::prelude::IggyConsumerConfig::batch_length
 /// [`consumer_kind()`]: crate::prelude::IggyConsumerConfig::consumer_kind
 /// [`consumer_name()`]: crate::prelude::IggyConsumerConfig::consumer_name
 /// [`create_stream_if_not_exists()`]: crate::prelude::IggyConsumerConfig::create_stream_if_not_exists
@@ -209,14 +207,16 @@ use tracing::trace;
 /// [`encryptor()`]: crate::prelude::IggyConsumerConfig::encryptor
 /// [`init_interval()`]: crate::prelude::IggyConsumerConfig::init_interval
 /// [`init_retries()`]: crate::prelude::IggyConsumerConfig::init_retries
-/// [`partition_id()`]: crate::prelude::IggyConsumerConfig::partition_id
+/// [`partitions()`]: crate::prelude::IggyConsumerConfig::partitions
 /// [`partitions_count()`]: crate::prelude::IggyConsumerConfig::partitions_count
-/// [`polling_interval()`]: crate::prelude::IggyConsumerConfig::polling_interval
+/// [`poll_options()`]: crate::prelude::IggyConsumerConfig::poll_options
 /// [`polling_retry_interval()`]: crate::prelude::IggyConsumerConfig::polling_retry_interval
 /// [`polling_strategy()`]: crate::prelude::IggyConsumerConfig::polling_strategy
+/// [`prefetch_bytes()`]: crate::prelude::IggyConsumerConfig::prefetch_bytes
+/// [`prefetch_messages()`]: crate::prelude::IggyConsumerConfig::prefetch_messages
 /// [`stream_name()`]: crate::prelude::IggyConsumerConfig::stream_name
 /// [`topic_name()`]: crate::prelude::IggyConsumerConfig::topic_name
-/// [`with_partition_id()`]: crate::prelude::IggyConsumerConfig::with_partition_id
+/// [`with_partitions()`]: crate::prelude::IggyConsumerConfig::with_partitions
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct IggyStreamConsumer;
 
@@ -349,14 +349,12 @@ impl IggyStreamConsumer {
     /// let orders = IggyConsumerConfig::from_stream_topic(
     ///     "my-stream",
     ///     "orders",
-    ///     100,
-    ///     IggyDuration::new_from_secs(1),
+    ///     PollOptions::wait(IggyDuration::ONE_SECOND),
     /// )?;
     /// let shipments = IggyConsumerConfig::from_stream_topic(
     ///     "my-stream",
     ///     "shipments",
-    ///     100,
-    ///     IggyDuration::new_from_secs(1),
+    ///     PollOptions::wait(IggyDuration::ONE_SECOND),
     /// )?;
     ///
     /// let order_consumer = IggyStreamConsumer::build(&client, &orders).await?;

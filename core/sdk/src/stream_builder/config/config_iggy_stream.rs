@@ -42,7 +42,7 @@ use bon::Builder;
 ///
 /// # Examples
 ///
-/// One topic, a batch of 100 messages, and one second between requests in both directions:
+/// One topic, a batch of 100 messages sent every second, and polls that wait up to one second:
 ///
 /// ```rust
 /// use iggy::prelude::*;
@@ -53,7 +53,7 @@ use bon::Builder;
 ///     "my-topic",
 ///     100,
 ///     IggyDuration::new_from_secs(1),
-///     IggyDuration::new_from_secs(1),
+///     PollOptions::wait(IggyDuration::ONE_SECOND),
 /// )?;
 ///
 /// assert_eq!(config.producer_config().stream_name(), "my-stream");
@@ -86,11 +86,13 @@ use bon::Builder;
 ///     .create_stream_if_not_exists(false)
 ///     .create_topic_if_not_exists(false)
 ///     .partitions_count(10)
-///     .batch_length(100)
-///     .polling_interval(IggyDuration::new_from_secs(1))
+///     .poll_options(PollOptions {
+///         count: 100,
+///         commit: CommitPolicy::OnRead,
+///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+///     })
 ///     .polling_strategy(PollingStrategy::next())
 ///     .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
-///     .auto_commit(AutoCommit::When(AutoCommitWhen::ConsumingEachMessage))
 ///     .init_interval(NonZeroIggyDuration::ONE_SECOND)
 ///     .build();
 ///

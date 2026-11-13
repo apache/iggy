@@ -44,6 +44,7 @@ use tracing::trace;
 /// | --- | --- |
 /// | [`stream_name()`], [`topic_name()`] | where messages are appended |
 /// | [`topic_partitions_count()`] | partitions of a topic this call creates |
+/// | [`topic_durability()`] | [`Durability`] of the topic |
 /// | [`batch_length()`], [`linger_time()`] | the [`DirectConfig`] of the producer |
 /// | [`partitioning()`] | which partition a batch lands in |
 /// | [`encryptor()`] | encrypting payloads and user headers, and it replaces the client's own |
@@ -113,6 +114,7 @@ use tracing::trace;
 /// [`IggyClient::shutdown()`] closes the connection.
 ///
 /// [`DirectConfig`]: crate::prelude::DirectConfig
+/// [`Durability`]: crate::prelude::Durability
 /// [`IggyClient`]: crate::prelude::IggyClient
 /// [`IggyStream`]: crate::prelude::IggyStream
 /// [`IggyClient::producer()`]: crate::prelude::IggyClient::producer
@@ -127,6 +129,7 @@ use tracing::trace;
 /// [`partitioning()`]: crate::prelude::IggyProducerConfig::partitioning
 /// [`send()`]: crate::prelude::IggyProducer::send
 /// [`stream_name()`]: crate::prelude::IggyProducerConfig::stream_name
+/// [`topic_durability()`]: crate::prelude::IggyProducerConfig::topic_durability
 /// [`topic_name()`]: crate::prelude::IggyProducerConfig::topic_name
 /// [`topic_partitions_count()`]: crate::prelude::IggyProducerConfig::topic_partitions_count
 #[derive(Debug, Default, Clone, Eq, PartialEq)]

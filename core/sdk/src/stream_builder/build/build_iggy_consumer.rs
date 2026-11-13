@@ -24,26 +24,29 @@ use tracing::{error, trace};
 
 /// Builds an [`IggyConsumer`] from `config` and awaits [`IggyConsumer::init()`].
 ///
-/// [`consumer_kind()`] picks between a single consumer and a member of a consumer group. A group
-/// is always created when it is missing, and the consumer always joins it. The consumer reads
-/// [`batch_length()`] messages per request, on the [`polling_strategy()`] and the
-/// [`polling_interval()`] of the configuration.
+/// [`consumer_kind()`] picks between a single consumer of [`partitions()`] and a member of a
+/// consumer group. A group is always created when it is missing, and the consumer always joins
+/// it. The consumer reads with the [`poll_options()`], the [`polling_strategy()`] and the
+/// prefetch limits of the configuration.
 ///
 /// An [`encryptor()`] in the configuration replaces the one of the client. When
-/// [`init_retries()`] is set, a failed [`IggyConsumer::init()`] is retried that many times.
+/// [`init_retries()`] is set, [`IggyConsumer::init()`] retries that many times while the stream
+/// or the topic is missing.
 ///
 /// # Errors
 ///
 /// - Any error raised while building the consumer, such as an invalid stream or topic name.
+/// - [`IggyError::FeatureUnavailable`] for [`ConsumerKind::ExternalGroup`], which cannot poll.
 /// - Any error returned by [`IggyConsumer::init()`], after the retries run out.
 ///
+/// [`ConsumerKind::ExternalGroup`]: crate::prelude::ConsumerKind::ExternalGroup
 /// [`IggyConsumer`]: crate::prelude::IggyConsumer
 /// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
-/// [`batch_length()`]: crate::prelude::IggyConsumerConfig::batch_length
 /// [`consumer_kind()`]: crate::prelude::IggyConsumerConfig::consumer_kind
 /// [`encryptor()`]: crate::prelude::IggyConsumerConfig::encryptor
 /// [`init_retries()`]: crate::prelude::IggyConsumerConfig::init_retries
-/// [`polling_interval()`]: crate::prelude::IggyConsumerConfig::polling_interval
+/// [`partitions()`]: crate::prelude::IggyConsumerConfig::partitions
+/// [`poll_options()`]: crate::prelude::IggyConsumerConfig::poll_options
 /// [`polling_strategy()`]: crate::prelude::IggyConsumerConfig::polling_strategy
 pub(crate) async fn build_iggy_consumer(
     client: &IggyClient,

@@ -48,8 +48,7 @@
 //! let config = IggyConsumerConfig::from_stream_topic(
 //!     "my-stream",
 //!     "my-topic",
-//!     100,
-//!     IggyDuration::new_from_secs(1),
+//!     PollOptions::wait(IggyDuration::ONE_SECOND),
 //! )?;
 //! let (client, mut consumer) =
 //!     IggyStreamConsumer::with_client_from_url("iggy://iggy:iggy@localhost:8090", &config)

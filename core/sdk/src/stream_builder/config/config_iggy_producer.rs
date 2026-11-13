@@ -33,7 +33,7 @@ use std::sync::Arc;
 /// | --- | --- |
 /// | [`builder()`](Self::builder) | naming every field you set |
 /// | [`from_stream_topic()`](Self::from_stream_topic) | one stream and one topic, defaults elsewhere |
-/// | [`new()`](Self::new) | every field, positional |
+/// | [`new()`](Self::new) | provide fields as arguments |
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
 /// The builder requires every field that is not an [`Option`] and carries no
@@ -46,8 +46,8 @@ use std::sync::Arc;
 /// # Fields and defaults
 ///
 /// The defaults below are what [`default()`](Self::default) and
-/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder leaves every field but
-/// [`topic_durability()`](Self::topic_durability) unset, so it takes the same default there too.
+/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder only uses a default for
+/// [`topic_durability()`](Self::topic_durability), everything else needs to be provided..
 ///
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
@@ -85,7 +85,7 @@ use std::sync::Arc;
 /// # }
 /// ```
 ///
-/// Ten partitions, every message keyed to one of them, and five retries:
+/// Ten partitions, every message keyed to one of them:
 ///
 /// ```rust
 /// use iggy::prelude::*;
@@ -154,7 +154,7 @@ impl IggyProducerConfig {
     ///
     /// # Examples
     ///
-    /// Describe a topic with three partitions and no retries:
+    /// Describe a topic with three partitions:
     ///
     /// ```rust
     /// use iggy::prelude::*;
@@ -198,7 +198,7 @@ impl IggyProducerConfig {
 
     /// Names one stream, one topic, `batch_length` and `linger_time`. The rest defaults.
     ///
-    /// The topic gets one partition, balanced partitioning, three send retries one second apart, and no encryptor.
+    /// The topic gets one partition, balanced partitioning and no encryptor.
     ///
     /// # Examples
     ///
@@ -280,6 +280,7 @@ impl IggyProducerConfig {
         self
     }
 
+    /// Returns the durability of the topic.
     pub fn topic_durability(&self) -> Durability {
         self.topic_durability
     }

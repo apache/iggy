@@ -55,8 +55,8 @@ use tracing::trace;
 ///
 /// Only the producer half creates a stream and topic, so if the
 /// consumer half names a topic that the producer half does not create, [`IggyConsumer::init()`]
-/// spends [`init_retries()`] and then fails with [`IggyError::TopicNameNotFound`]. Ensure both point
-/// to the same stream and topic unless the other topic exists already.
+/// spends [`init_retries()`] and then fails with [`IggyError::TopicNameNotFound`]/ [`IggyError::TopicNameNotFound`].
+/// Ensure both point to the same stream and topic unless the other topic exists already.
 ///
 /// # Examples
 ///
@@ -76,7 +76,7 @@ use tracing::trace;
 ///     "my-topic",
 ///     100,
 ///     IggyDuration::new_from_secs(1),
-///     IggyDuration::new_from_secs(1),
+///     PollOptions::wait(IggyDuration::ONE_SECOND),
 /// )?;
 /// let (producer, mut consumer) = IggyStream::build(&client, &config).await?;
 ///
@@ -116,7 +116,7 @@ use tracing::trace;
 ///     "my-topic",
 ///     100,
 ///     IggyDuration::new_from_secs(1),
-///     IggyDuration::new_from_secs(1),
+///     PollOptions::wait(IggyDuration::ONE_SECOND),
 /// )?;
 /// let (client, producer, mut consumer) = IggyStream::with_client_from_connection_string(
 ///     "iggy://iggy:iggy@localhost:8090",
@@ -127,7 +127,7 @@ use tracing::trace;
 /// let (sender, receiver) = oneshot::channel();
 /// let reader = tokio::spawn(async move {
 ///     consumer.consume_messages(&PrintMessage, receiver).await?;
-///     // The loop leaves the consumer usable, so commit and leave the group here.
+///     // The loop leaves the consumer usable, so store the offsets and leave the group here.
 ///     consumer.shutdown().await
 /// });
 ///
@@ -145,7 +145,7 @@ use tracing::trace;
 /// # What you give up
 ///
 /// The producer is always a direct producer with [`batch_length()`] messages per request and
-/// [`linger_time()`] between calls. The consumer always creates its group when it is missing, and
+/// [`linger_time()`] between calls. For a `ConsumerKind::ConsumerGroup` the consumer always creates its group when it is missing, and
 /// always joins it. Build through [`IggyClient::producer()`], [`IggyClient::consumer()`] or
 /// [`IggyClient::consumer_group()`] when you need another mode, a custom [`Partitioner`], or an
 /// option that [`IggyStreamConfig`] does not carry.
@@ -305,14 +305,14 @@ impl IggyStream {
     ///     "orders",
     ///     100,
     ///     IggyDuration::new_from_secs(1),
-    ///     IggyDuration::new_from_secs(1),
+    ///     PollOptions::wait(IggyDuration::ONE_SECOND),
     /// )?;
     /// let shipments = IggyStreamConfig::from_stream_topic(
     ///     "my-stream",
     ///     "shipments",
     ///     100,
     ///     IggyDuration::new_from_secs(1),
-    ///     IggyDuration::new_from_secs(1),
+    ///     PollOptions::wait(IggyDuration::ONE_SECOND),
     /// )?;
     ///
     /// let (order_producer, order_consumer) = IggyStream::build(&client, &orders).await?;

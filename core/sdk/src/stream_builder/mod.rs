@@ -68,7 +68,7 @@
 //!     "my-topic",
 //!     100,
 //!     IggyDuration::new_from_secs(1),
-//!     IggyDuration::new_from_secs(1),
+//!     PollOptions::wait(IggyDuration::ONE_SECOND),
 //! )?;
 //!
 //! let (client, producer, mut consumer) = IggyStream::with_client_from_connection_string(

@@ -37,52 +37,54 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// | Constructor | Use it for |
 /// | --- | --- |
 /// | [`builder()`](Self::builder) | naming every field you set |
-/// | [`from_stream_topic()`](Self::from_stream_topic) | `ConsumerGroup` for one stream and one topic, with `batch_length` and `polling_interval`, defaults elsewhere |
-/// | [`new()`](Self::new) | every field, positional |
+/// | [`from_stream_topic()`](Self::from_stream_topic) | `ConsumerGroup` for one stream and one topic, with `poll_options`, defaults elsewhere |
+/// | [`new()`](Self::new) | most fields, positional |
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
 /// The builder requires every field that is not an [`Option`] and carries no
-/// `#[builder(default)]`, so [`init_retries()`](Self::init_retries),
-/// [`encryptor()`](Self::encryptor) and [`partition_id()`](Self::partition_id) are the only three
-/// it lets you leave out. [`partition_id()`](Self::partition_id) is the one field the builder
-/// itself defaults, to 0.
+/// `#[builder(default)]`. It lets you leave out [`prefetch_messages()`](Self::prefetch_messages),
+/// [`init_retries()`](Self::init_retries) and [`encryptor()`](Self::encryptor), which stay
+/// unset, and [`prefetch_bytes()`](Self::prefetch_bytes), [`partitions()`](Self::partitions),
+/// [`poll_options()`](Self::poll_options) and [`polling_strategy()`](Self::polling_strategy),
+/// which take the defaults below.
 ///
 /// # Fields and defaults
 ///
-/// The defaults below are what [`default()`](Self::default) and
-/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder leaves every field but
-/// [`partition_id()`](Self::partition_id) unset, so it takes the same default there too.
+/// The defaults below are what [`default()`](Self::default) sets.
+/// [`from_stream_topic()`](Self::from_stream_topic) sets the same, except for the consumer name
+/// and the `poll_options` you pass.
 ///
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
 /// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | name of the stream and topic that is either looked up or automatically created if enabled |
 /// | [`consumer_name()`](Self::consumer_name) | `test_consumer`, or `consumer-{stream}-{topic}` | the name of the consumer, or of its group |
-/// | [`consumer_kind()`](Self::consumer_kind) | [`ConsumerKind::ConsumerGroup`] | whether the consumer joins a group or reads one partition alone |
-/// | [`partition_id()`](Self::partition_id) | 0 | partition id for ordinary consumers, ignored by groups |
+/// | [`consumer_kind()`](Self::consumer_kind) | [`ConsumerKind::ConsumerGroup`] | whether the consumer joins a group or reads chosen partitions alone |
+/// | [`partitions()`](Self::partitions) | partition 0 | partitions for ordinary consumers, ignored by groups |
 /// | [`partitions_count()`](Self::partitions_count) | 1 | see below |
 /// | [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) | off | creating a missing stream |
 /// | [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) | off | creating a missing topic |
-/// | [`batch_length()`](Self::batch_length) | 100 | messages fetched per request |
-/// | [`polling_interval()`](Self::polling_interval) | 5 milliseconds | smallest gap between two requests |
-/// | [`polling_strategy()`](Self::polling_strategy) | [`PollingStrategy::last()`] | where reading each partition starts |
-/// | [`auto_commit()`](Self::auto_commit) | [`AutoCommitWhen::PollingMessages`] | when offsets are committed |
-/// | [`polling_retry_interval()`](Self::polling_retry_interval) | one second | the wait while polling is blocked |
+/// | [`poll_options()`](Self::poll_options) | [`PollOptions::wait`] of five seconds | the limits of each request and the [`CommitPolicy`], [`CommitPolicy::Manual`] by default |
+/// | [`polling_strategy()`](Self::polling_strategy) | [`PollingStrategy::next()`] | where reading a partition without a position starts |
+/// | [`polling_retry_interval()`](Self::polling_retry_interval) | one second | how long a refused partition waits before the next read |
+/// | [`prefetch_bytes()`](Self::prefetch_bytes), [`prefetch_messages()`](Self::prefetch_messages) | 16 MiB, unset | the requested budget for buffered and in-flight batches |
 /// | [`init_retries()`](Self::init_retries), [`init_interval()`](Self::init_interval) | five retries, three seconds apart | retries for a missing stream or topic |
 /// | [`encryptor()`](Self::encryptor) | none | decrypting payloads and user headers |
 ///
 /// ## Some callouts on defaults
 ///
 /// - [`partitions_count()`](Self::partitions_count) is the number of partitions that the build
-///   creates per topic. The partition a consumer reads from is
-///   [`partition_id()`](Self::partition_id), which a [`ConsumerKind::ConsumerGroup`] ignores
+///   creates per topic. The partitions a consumer reads are
+///   [`partitions()`](Self::partitions), which a [`ConsumerKind::ConsumerGroup`] ignores
 ///   because the server assigns its partitions instead.
 /// - [`encryptor()`](Self::encryptor) if you build from an [`IggyClient`] that already has an `encryptor` the one you define here
 ///   replaces the encryptor of the [`IggyClient`] for consumer.
-///   An encryptor also rules out the default [`auto_commit()`](Self::auto_commit), because that setting commits a batch before it is
-///   decrypted. If decryption fails the offset would commit even though the message could not be consumed.
-///   Hence, the pair with [`IggyError::InvalidConfiguration`]. Pick any other [`auto_commit()`](Self::auto_commit) with an `encryptor`.
-/// - With [`PollingStrategy::last()`] the first and the first poll after a crash poll the latest `batch_length` messages.
-///   After that, only the newest messages are polled. This can be fewer than `batch_length`, but never more.
+///   An encryptor rules out [`CommitPolicy::OnRead`], because the server would store the offset
+///   of a batch before it is decrypted. If decryption fails the offset would be stored even though
+///   the message could not be consumed. Hence, [`IggyConsumer::init()`] refuses the pair with
+///   [`IggyError::InvalidConfiguration`].
+/// - [`CommitPolicy::Manual`] stores no offset by itself. With [`PollingStrategy::next()`] a
+///   restarted consumer reads the same messages again, unless the application commits. Set
+///   [`CommitPolicy::Auto`] or [`CommitPolicy::OnRead`] in the poll options to store them.
 /// - [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) and
 ///   [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) are off, so a consumer alone
 ///   creates nothing. It waits out [`init_retries()`](Self::init_retries) instead, which covers a
@@ -105,24 +107,22 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// let config = IggyConsumerConfig::from_stream_topic(
 ///     "my-stream",
 ///     "my-topic",
-///     100,
-///     IggyDuration::new_from_secs(1),
+///     PollOptions::wait(IggyDuration::ONE_SECOND),
 /// )?;
 ///
 /// assert_eq!(config.consumer_name(), "consumer-my-stream-my-topic");
 /// assert_eq!(config.consumer_kind(), ConsumerKind::ConsumerGroup);
-/// assert_eq!(config.polling_strategy(), PollingStrategy::last());
+/// assert_eq!(config.polling_strategy(), PollingStrategy::next());
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// A group that creates the topic it reads, resumes from the stored offset, and commits once a
-/// message has been handled:
+/// A group that creates the topic it reads, resumes from the stored offset, and stores an offset
+/// once a message has been handled:
 ///
 /// ```rust
 /// use iggy::prelude::*;
 ///
-/// # fn main() -> Result<(), IggyError> {
 /// let config = IggyConsumerConfig::builder()
 ///     .stream_name("my-stream")
 ///     .topic_name("my-topic")
@@ -131,33 +131,36 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 ///     .create_stream_if_not_exists(true)
 ///     .create_topic_if_not_exists(true)
 ///     .partitions_count(3)
-///     .batch_length(100)
-///     .polling_interval(IggyDuration::new_from_secs(1))
+///     .poll_options(PollOptions {
+///         count: 100,
+///         commit: CommitPolicy::Auto(AutoCommit::default()),
+///         ..PollOptions::wait(IggyDuration::ONE_SECOND)
+///     })
 ///     .polling_strategy(PollingStrategy::next())
 ///     .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
-///     .auto_commit(AutoCommit::After(AutoCommitAfter::ConsumingEachMessage))
 ///     .init_retries(5)
 ///     .init_interval(NonZeroIggyDuration::ONE_SECOND)
 ///     .build();
 ///
 /// assert_eq!(config.partitions_count(), 3);
-/// # Ok(())
-/// # }
 /// ```
 ///
-/// The [`AutoCommitAfter`] variants above only commit under
-/// [`IggyConsumerMessageExt::consume_messages`].
+/// [`AutoCommit::default()`](crate::prelude::AutoCommit) counts a message under
+/// [`CommitAfter::Processing`](crate::prelude::CommitAfter::Processing). On the stream that is
+/// when the next message is asked for. Under
+/// [`IggyConsumerMessageExt::consume_messages`] it is when the handler returned `Ok`.
 ///
-/// [`AutoCommitAfter`]: crate::prelude::AutoCommitAfter
-/// [`AutoCommitWhen::PollingMessages`]: crate::prelude::AutoCommitWhen::PollingMessages
-/// [`ConsumerKind::Consumer`]: crate::prelude::ConsumerKind::Consumer
+/// [`CommitPolicy`]: crate::prelude::CommitPolicy
+/// [`CommitPolicy::Auto`]: crate::prelude::CommitPolicy::Auto
+/// [`CommitPolicy::Manual`]: crate::prelude::CommitPolicy::Manual
+/// [`CommitPolicy::OnRead`]: crate::prelude::CommitPolicy::OnRead
 /// [`ConsumerKind::ConsumerGroup`]: crate::prelude::ConsumerKind::ConsumerGroup
 /// [`IggyClient`]: crate::prelude::IggyClient
 /// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
 /// [`IggyConsumerMessageExt::consume_messages`]: crate::prelude::IggyConsumerMessageExt::consume_messages
 /// [`IggyStream`]: crate::prelude::IggyStream
 /// [`IggyStreamConsumer`]: crate::prelude::IggyStreamConsumer
-/// [`PollingStrategy::last()`]: crate::prelude::PollingStrategy::last
+/// [`PollOptions::wait`]: crate::prelude::PollOptions::wait
 /// [`PollingStrategy::next()`]: crate::prelude::PollingStrategy::next
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
@@ -236,8 +239,6 @@ impl IggyConsumerConfig {
     /// The prefetch limits keep their defaults, and an ordinary consumer reads partition 0. Use
     /// [`with_partitions()`](Self::with_partitions) to select others. [`builder()`](Self::builder)
     /// sets the same fields by name and is easier to read.
-    ///
-    /// Return a new instance of a `IggyConsumerConfig`.
     ///
     /// # Examples
     ///
@@ -444,7 +445,7 @@ impl IggyConsumerConfig {
         self.encryptor.clone()
     }
 
-    /// Returns the wait between attempts while polling is blocked.
+    /// Returns how long a refused partition waits before the next read.
     pub fn polling_retry_interval(&self) -> NonZeroIggyDuration {
         self.polling_retry_interval
     }
