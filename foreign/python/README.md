@@ -208,6 +208,21 @@ async def main():
 asyncio.run(main())
 ```
 
+### Deprecated connection-string keys
+
+`IggyClient.from_connection_string()` uses the Rust SDK connection-string format.
+Use the canonical keys in new connection strings. Existing strings can still
+use these aliases.
+
+| Transport | Deprecated key | Canonical key |
+| --- | --- | --- |
+| TCP and WebSocket | `reconnection_retries` | `reconnection_max_retries` |
+| QUIC | `reconnection_reestablish_after` | `reestablish_after` |
+| QUIC | `validate_certificate` | `tls_validate_certificate` |
+
+When a key or its alias appears more than once, the last occurrence wins.
+A malformed value fails even if a later occurrence would override it.
+
 ## Stream, Topic and User Options
 
 `create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
