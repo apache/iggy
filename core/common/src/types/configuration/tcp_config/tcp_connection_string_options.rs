@@ -153,7 +153,9 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                         .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 "nodelay" => {
-                    nodelay = option_parts[1] == "true";
+                    nodelay = option_parts[1]
+                        .parse::<bool>()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 _ => {
                     return Err(IggyError::InvalidConnectionString);
@@ -455,5 +457,21 @@ mod tests {
         assert_eq!(config.tls_domain, "localhost");
         assert_eq!(config.tls_ca_file.as_deref(), Some("ca.pem"));
         assert_eq!(config.reconnection.max_retries, Some(2));
+    }
+
+    #[test]
+    fn nodelay_accepts_only_exact_booleans() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let query = format!("nodelay={value}");
+            let options = TcpConnectionStringOptions::parse_options(&query).unwrap();
+            assert_eq!(options.nodelay(), expected);
+        }
+        for value in ["1", "TRUE", ""] {
+            let query = format!("nodelay={value}");
+            assert!(matches!(
+                TcpConnectionStringOptions::parse_options(&query),
+                Err(IggyError::InvalidConnectionString)
+            ));
+        }
     }
 }

@@ -189,7 +189,10 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
                 }
 
                 "accept_unmasked_frames" => {
-                    parsed_options.accept_unmasked_frames = Some(parts[1] == "true");
+                    let accept_unmasked_frames = parts[1]
+                        .parse::<bool>()
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                    parsed_options.accept_unmasked_frames = Some(accept_unmasked_frames);
                 }
 
                 "tls" => {
@@ -345,5 +348,21 @@ mod tests {
             .unwrap_err(),
             IggyError::InvalidConnectionString,
         );
+    }
+
+    #[test]
+    fn accept_unmasked_frames_accepts_only_exact_booleans() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let query = format!("accept_unmasked_frames={value}");
+            let options = WebSocketConnectionStringOptions::parse_options(&query).unwrap();
+            assert_eq!(options.accept_unmasked_frames(), Some(expected));
+        }
+        for value in ["1", "TRUE", ""] {
+            let query = format!("accept_unmasked_frames={value}");
+            assert!(matches!(
+                WebSocketConnectionStringOptions::parse_options(&query),
+                Err(IggyError::InvalidConnectionString)
+            ));
+        }
     }
 }
