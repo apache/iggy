@@ -32,6 +32,8 @@ runs:
 
     - name: Setup Rust
       uses: ./.github/actions/utils/setup-rust
+      with:
+        free-disk-space: "false"
 
     - name: Install clang-format
       if: inputs.task == 'lint'

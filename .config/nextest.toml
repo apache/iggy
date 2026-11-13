@@ -27,6 +27,12 @@ nextest-version = { required = "0.9.127" }
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
+# This disk usage test compares the server's estimate with statvfs of the
+# volume every test writes to, so no other test may run beside it.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/server::disk_usage::given_a_file_written_outside_iggy/)'
+threads-required = "num-cpus"
+
 # Each test in these binaries spawns its own real iggy-server subprocess (isolated data dir, port
 # from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
 # under nextest - nextest runs every test as its own process, and #[serial]'s mutex only excludes
@@ -59,6 +65,7 @@ filter = '''
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
+    + binary_id(iggy-gateway-kafka::readiness_real_server_tests)
     + binary_id(iggy-gateway-kafka::sasl_real_server_tests)
 '''
 test-group = "kafka_bridge"

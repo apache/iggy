@@ -352,6 +352,29 @@ class TestPartitionReader:
         assert refusal.value.code == INVALID_COMMAND
 
     @pytest.mark.asyncio
+    async def test_commit_and_close_resolve_to_none(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test an awaitable without a result resolves to None, as its stub says."""
+        stream_name, topic_name = await _create_topic(iggy_client, unique_name)
+        await _send(iggy_client, stream_name, topic_name, [PARTITION_ID])
+
+        reader = await iggy_client.reader(
+            stream_name,
+            topic_name,
+            consumer=Consumer.Single(CONSUMER_ID),
+            partitions=[PARTITION_ID],
+        )
+        try:
+            checkpoint = (await _read(reader, MESSAGES_PER_PARTITION))[-1].checkpoint()
+            committed = await reader.commit(checkpoint)
+        finally:
+            closed = await reader.close()
+
+        assert committed is None
+        assert closed is None
+
+    @pytest.mark.asyncio
     async def test_close_is_safe_twice_and_ends_the_reader(
         self, iggy_client: IggyClient, unique_name
     ):
