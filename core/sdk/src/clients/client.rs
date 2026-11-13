@@ -418,8 +418,7 @@ impl IggyClient {
     ///
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
-    ///   The deprecated `reconnection_retries` alias is still accepted and logs a warning.
-    ///   When either spelling is repeated, the last occurrence takes effect.
+    /// - `reconnection_retries`: deprecated alias for `reconnection_max_retries`. If both are supplied, the last value wins.
     /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
     /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
@@ -433,8 +432,7 @@ impl IggyClient {
     /// - `tls`: bool. Enable/disable TLS. Default: `false`; only `true` and `false` are accepted.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
-    /// - `tls_validate_certificate`: Whether to verify the server certificate. Accepts exactly
-    ///   `true` or `false`. Other values return `IggyError::InvalidConnectionString`. Default: `false`.
+    /// - `tls_validate_certificate`: bool. Verify the server certificate. Default: `false`; only `true` and `false` are accepted.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
