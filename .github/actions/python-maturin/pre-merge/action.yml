@@ -171,7 +171,12 @@ runs:
         # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> "$GITHUB_ENV"
 
-        cargo llvm-cov clean --workspace
+        # cargo-llvm-cov adds the coverage flags through a rustc wrapper that
+        # cargo's freshness check does not see, so maturin would reuse the
+        # uninstrumented build of the "Build Python wheel" step. `cargo
+        # llvm-cov clean` cannot remove that build: it passes --target-dir,
+        # which cargo refuses for a directory without CACHEDIR.TAG.
+        cargo clean -p apache-iggy
         echo "Building Python wheel with coverage instrumentation..."
         uv run --no-sync maturin develop
       shell: bash
