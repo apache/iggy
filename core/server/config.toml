@@ -879,6 +879,14 @@ shutdown_drain_timeout = "10 s"
 # scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
 shutdown_poll_interval = "50 ms"
 
+# Longest time a node of a cluster spends on handing off the partitions it
+# leads before it shuts down. Without the handoff, each of those partitions
+# waits for a heartbeat timeout to elect a new primary. The handoff ends early
+# when no partition is left to hand off, or on a second stop signal. "0 s"
+# skips it, and so do "disabled", "none" and "unlimited", which also read as
+# zero. A single node never hands off.
+shutdown_primary_handoff_timeout = "15 s"
+
 # Hard wall-clock deadline for joining shard threads at process exit. A
 # shard whose pump or listener wedges past this budget is abandoned with
 # an error log instead of blocking exit forever. Must be at least

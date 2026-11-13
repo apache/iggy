@@ -52,6 +52,10 @@ pub const SHUTDOWN_DRAIN_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 /// at 5s so Ctrl-C latency stays bounded regardless of config.
 pub const SHUTDOWN_POLL_INTERVAL_MAX: Duration = Duration::from_secs(5);
 
+/// Hard upper bound on `shutdown_primary_handoff_timeout`. The handoff runs
+/// before the shutdown flag flips, so nothing else bounds a typo here.
+pub const SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+
 /// Hard upper bound on `shutdown_join_timeout`. Comfortably above the
 /// drain cap so a full drain always fits inside the join budget, while
 /// still guaranteeing process exit against a pathological config typo.
@@ -156,6 +160,14 @@ pub struct ShardingConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub shutdown_poll_interval: IggyDuration,
+    /// Longest time a clustered node hands off the partitions it leads
+    /// before the shutdown flag flips. Runs ahead of the drain and outside
+    /// `shutdown_join_timeout`. Zero skips the handoff, and so do
+    /// "disabled", "none" and "unlimited", which also parse as zero. At most
+    /// [`SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX`].
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub shutdown_primary_handoff_timeout: IggyDuration,
     /// Hard wall-clock deadline for joining shard threads at process
     /// exit. A shard whose pump or listener wedges past this budget is
     /// abandoned with an error log instead of blocking exit forever.
@@ -215,6 +227,11 @@ impl Default for ShardingConfig {
             shutdown_poll_interval: SERVER_CONFIG
                 .sharding
                 .shutdown_poll_interval
+                .parse()
+                .unwrap(),
+            shutdown_primary_handoff_timeout: SERVER_CONFIG
+                .sharding
+                .shutdown_primary_handoff_timeout
                 .parse()
                 .unwrap(),
             shutdown_join_timeout: SERVER_CONFIG
@@ -380,6 +397,17 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                  shutdown_drain_timeout {:?} (a poll cadence coarser than the drain budget makes \
                  the shutdown flag effectively unobservable)",
                 poll, drain
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let handoff = self.shutdown_primary_handoff_timeout.get_duration();
+        if handoff > SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_primary_handoff_timeout {:?} exceeds the \
+                 {:?} cap (the handoff runs before the shutdown starts, so a long one delays process \
+                 exit)",
+                handoff, SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -584,6 +612,26 @@ mod tests {
     }
 
     #[test]
+    fn over_cap_primary_handoff_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_primary_handoff_timeout: IggyDuration::new(
+                SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX + Duration::from_secs(1),
+            ),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zero_primary_handoff_is_accepted() {
+        let cfg = ShardingConfig {
+            shutdown_primary_handoff_timeout: IggyDuration::new(Duration::ZERO),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn join_shorter_than_drain_is_rejected() {
         // A join budget under the drain would abandon shards mid-drain.
         let cfg = ShardingConfig {
@@ -633,6 +681,10 @@ mod tests {
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(
+            sharding.shutdown_primary_handoff_timeout,
+            "15 s".parse().unwrap()
+        );
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }
@@ -653,6 +705,10 @@ mod tests {
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(
+            sharding.shutdown_primary_handoff_timeout,
+            "15 s".parse().unwrap()
+        );
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }
@@ -670,6 +726,10 @@ mod tests {
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(
+            sharding.shutdown_primary_handoff_timeout,
+            "15 s".parse().unwrap()
+        );
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }

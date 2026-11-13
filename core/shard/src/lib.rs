@@ -1918,7 +1918,6 @@ where
     /// `(namespace, requester replica id)`. Bounded by the replica count times
     /// the groups this shard serves; replaced per fresh nonce.
     state_transfer_offers: RefCell<HashMap<(u64, u8), ServedStateTransfer>>,
-    partition_recovery: metadata::PartitionRecovery,
     /// Partition groups with an offer build under way but no offer yet, keyed
     /// by namespace and carrying ticks since the last request that advanced it.
     ///
@@ -2139,6 +2138,7 @@ where
     /// cursor the leading groups would spend the whole budget on every pass and
     /// the tail would never be reached. See [`rotate_sweep_to_cursor`].
     partition_walk_cursor: Cell<Option<IggyNamespace>>,
+    primary_handoff: RefCell<primary_rebalance::PrimaryHandoff>,
     replication_replay_cursor: Cell<Option<(u64, u8)>>,
     /// Namespaces whose report to shard 0 changed, oldest first, each once:
     /// [`partitions::SentReport::queued`] marks the queued ones.
@@ -2364,7 +2364,6 @@ where
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         // Metadata admits a stream's wrap set with the keys its partitions open.
         let metadata = metadata.with_stream_key_context(partitions.key_context());
-        let partition_recovery = metadata.applied_frontier().track_partition_recovery();
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let poll_completions =
@@ -2417,7 +2416,6 @@ where
             metadata_gap_ticks: Cell::new(0),
             metadata_walk_stuck_op: Cell::new(0),
             state_transfer_offers: RefCell::new(HashMap::new()),
-            partition_recovery,
             partition_offer_builds: RefCell::new(HashMap::new()),
             partition_transfer_waiters: RefCell::new(Vec::new()),
             parked_partition_transfer_requests: RefCell::new(BTreeMap::new()),
@@ -2433,6 +2431,7 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            primary_handoff: RefCell::default(),
             replication_replay_cursor: Cell::new(None),
             partition_reports_queued: RefCell::default(),
             partition_retractions: RefCell::default(),
@@ -3330,7 +3329,6 @@ where
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
         // Metadata admits a stream's wrap set with the keys its partitions open.
         let metadata = metadata.with_stream_key_context(partitions.key_context());
-        let partition_recovery = metadata.applied_frontier().track_partition_recovery();
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let host: Rc<dyn ShardHost> = Rc::new(NoopHost);
@@ -3388,7 +3386,6 @@ where
             metadata_gap_ticks: Cell::new(0),
             metadata_walk_stuck_op: Cell::new(0),
             state_transfer_offers: RefCell::new(HashMap::new()),
-            partition_recovery,
             partition_offer_builds: RefCell::new(HashMap::new()),
             partition_transfer_waiters: RefCell::new(Vec::new()),
             parked_partition_transfer_requests: RefCell::new(BTreeMap::new()),
@@ -3404,6 +3401,7 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            primary_handoff: RefCell::default(),
             replication_replay_cursor: Cell::new(None),
             partition_reports_queued: RefCell::default(),
             partition_retractions: RefCell::default(),
@@ -5899,6 +5897,7 @@ where
         ) else {
             return;
         };
+        self.note_group_given_up(partition.consensus(), &header);
         if header.view == partition.consensus().view() && partition.consensus().is_normal() {
             return;
         }
@@ -9931,6 +9930,9 @@ where
         let mut repair_ring_entries = 0usize;
         let mut repair_ring_bytes = 0u64;
         let mut untrusted_logs = 0usize;
+        // Against `PARTITION_VIEW_CHANGES_INFLIGHT_MAX`. View changes that
+        // start in a frame handler show up in the count of the next sweep.
+        let mut view_changes_inflight = 0usize;
         let mut owing_retirement = 0usize;
         // The replication gauges are scraped, not driven: once per report
         // interval is enough.
@@ -9946,6 +9948,7 @@ where
                 partition.drive_persistence().await;
                 let consensus = partition.consensus();
                 untrusted_logs += usize::from(consensus.has_untrusted_log());
+                view_changes_inflight += usize::from(consensus.status() == Status::ViewChange);
                 owing_retirement +=
                     usize::from(replication_due && partition.owes_session_retirement());
                 let (entries, bytes) = partition.repair_ring_occupancy();
@@ -9993,6 +9996,10 @@ where
         // Repair sessions this sweep has opened, against
         // `PARTITION_REPAIR_ARMS_PER_TICK_MAX`.
         let mut repair_arms = 0usize;
+        // Heartbeat votes this sweep has cast, against
+        // `PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX`.
+        let mut view_change_votes = 0usize;
+        let mut view_change_votes_held = 0usize;
         // Commit walks this sweep has run, against
         // `PARTITION_WALKS_PER_TICK_MAX`.
         let mut walks = 0usize;
@@ -10081,11 +10088,19 @@ where
             let grid_tick = consensus
                 .heartbeat_schedule()
                 .is_grid_tick(self.shard_ticks.get());
+            let vote_held = view_change_votes >= PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX
+                || view_changes_inflight >= PARTITION_VIEW_CHANGES_INFLIGHT_MAX;
+            let voted_before = consensus.votes_to_leave_view();
+            let history_fenced = partition.history_writes_pending();
             let actions = consensus.tick_with_grid(
                 PlaneKind::Partitions,
-                partition.history_writes_pending(),
+                history_fenced,
                 grid_tick,
+                vote_held,
             );
+            view_change_votes += usize::from(!voted_before && consensus.votes_to_leave_view());
+            view_change_votes_held +=
+                usize::from(vote_held && !history_fenced && consensus.heartbeat_timed_out());
             partition.ensure_materialization_recovery();
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
@@ -10660,25 +10675,20 @@ where
         // Count after every rotation, transfer abandonment and scheduled arm,
         // including paths that skip the rest of their partition's sweep.
         let mut repairs_live = 0usize;
-        let mut recovering = false;
         // A stranded key stays until its own store or delete succeeds, so a
         // gauge that never falls is the operator's only signal.
         let mut stranded = [0usize; ConsumerKind::COUNT];
         for namespace in partitions.namespaces() {
             if let Some(partition) = partitions.get_by_ns(namespace) {
                 repairs_live += usize::from(partition.repair().is_some());
-                recovering |= partition.repair().is_some()
-                    || partition.transfer().is_some()
-                    || partition.transfer_rearm.is_some()
-                    || partition.consensus().is_transferring()
-                    || partition.consensus().has_untrusted_log();
                 for kind in ConsumerKind::ALL {
                     stranded[kind.index()] += partition.stranded_consumer_offset_count(kind);
                 }
             }
         }
         self.partition_repairs_inflight.set(repairs_live);
-        self.partition_recovery.set_active(recovering);
+        self.metrics
+            .set_partition_view_changes(view_changes_inflight, view_change_votes_held);
         for kind in ConsumerKind::ALL {
             self.metrics
                 .set_consumer_offsets_stranded(kind, stranded[kind.index()]);
@@ -13367,7 +13377,7 @@ where
         let grid_tick = consensus
             .heartbeat_schedule()
             .is_grid_tick(self.shard_ticks.get());
-        let actions = consensus.tick_with_grid(PlaneKind::Metadata, false, grid_tick);
+        let actions = consensus.tick_with_grid(PlaneKind::Metadata, false, grid_tick, false);
         if !consensus.is_primary() || !primary_rebalance::consensus_ready(consensus) {
             self.primary_rebalance.borrow_mut().reset_authority();
         }
@@ -14025,6 +14035,29 @@ const PARTITION_REPAIR_ARMS_PER_TICK_MAX: usize = 3;
 /// per-sweep budget can see. Over-cap groups stay gap-stopped with their
 /// debounce satisfied, so they arm as sessions complete.
 const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
+
+/// Heartbeat votes the partition tick sweep lets its backups CAST per pass.
+///
+/// A node that dies takes the primary of every group it led, and the heartbeat
+/// timers of those groups fire on a few ticks. Each vote that a peer joins
+/// becomes a view change: two superblock writes per replica through the
+/// partition I/O lane, on a status timer that votes for the next view after
+/// `view_change_status_timeout`. More view changes than the lane finishes in
+/// that time turn into a second round of them.
+///
+/// Only the vote of the heartbeat timeout is held, and its timer stays fired,
+/// so the sweep asks again on every tick. A backup with a held vote still joins
+/// the vote of a peer, so a group waits for the first of its backups to get a
+/// turn, not for all of them.
+const PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX: usize = 4;
+
+/// Groups in view change this shard holds before it casts no more heartbeat
+/// votes.
+///
+/// The concurrency half of the pair: the rate cap above cannot see how fast
+/// the I/O lane finishes view changes. View changes that a peer or a primary
+/// transfer started count too, and nothing here delays them.
+const PARTITION_VIEW_CHANGES_INFLIGHT_MAX: usize = 128;
 
 /// Commit walks the partition tick sweep will RUN per pass.
 ///

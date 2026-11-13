@@ -3492,7 +3492,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed. Every tick counts as a grid tick.
     pub fn tick(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        self.tick_with_grid(plane, false, true)
+        self.tick_with_grid(plane, false, true, false)
     }
 
     /// Timers and retransmissions continue while storage leases defer history
@@ -3502,18 +3502,26 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         plane: PlaneKind,
         history_fenced: bool,
     ) -> Vec<VsrAction> {
-        self.tick_with_grid(plane, history_fenced, true)
+        self.tick_with_grid(plane, history_fenced, true, false)
     }
 
     /// Process one shard tick. A heartbeat leaves only when `grid_tick` is
     /// true, and its timer then restarts from that tick. Eager Commits leave on
     /// any tick.
+    ///
+    /// With `heartbeat_vote_held`, a backup whose heartbeat timer fired casts no
+    /// vote on this tick. The timer stays fired, so the vote leaves on the first
+    /// tick that allows it, or with the vote of a peer
+    /// ([`Self::handle_start_view_change`]). Nothing else is held: a replica in
+    /// a view change still votes for the next view, and a recovering replica
+    /// still elects after unanswered probes.
     #[allow(clippy::too_many_lines)]
     pub fn tick_with_grid(
         &self,
         plane: PlaneKind,
         history_fenced: bool,
         grid_tick: bool,
+        heartbeat_vote_held: bool,
     ) -> Vec<VsrAction> {
         self.wake_idle_group();
         let mut actions = Vec::new();
@@ -3526,7 +3534,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
         if !history_fenced && timeouts.fired(TimeoutKind::NormalHeartbeat) {
             drop(timeouts);
-            actions.extend(self.handle_normal_heartbeat_timeout(plane));
+            actions.extend(self.handle_normal_heartbeat_timeout(plane, heartbeat_vote_held));
             timeouts = self.timeouts.borrow_mut();
         }
 
@@ -3669,8 +3677,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Called when `normal_heartbeat` timeout fires: the backup did not hear its
-    /// primary, so it votes to replace it.
-    fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
+    /// primary, so it votes to replace it, unless `vote_held` keeps the vote
+    /// for a later tick.
+    fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind, vote_held: bool) -> Vec<VsrAction> {
         // A recovering replica makes progress through RequestStartView
         // retries, not elections; it is quorum-invisible.
         if self.status.get() == Status::Recovering {
@@ -3714,6 +3723,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 "heartbeat timed out behind a newer view; probing to catch up"
             );
             self.begin_view_probe();
+            return Vec::new();
+        }
+
+        // The timer stays fired, so this runs again on the next tick, and a
+        // peer that votes meanwhile still gets this replica's vote.
+        if vote_held {
             return Vec::new();
         }
 
@@ -3779,6 +3794,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if !own_vote_is_new {
             return Vec::new();
         }
+        // A vote that waited for its tick leaves with the vote it joins. Its
+        // timer then runs on as after any vote, or the next tick would start a
+        // fresh round and drop the vote counted here.
+        if self.heartbeat_timed_out() {
+            self.timeouts
+                .borrow_mut()
+                .reset(TimeoutKind::NormalHeartbeat);
+        }
         self.sent_own_start_view_change.set(true);
         self.timeouts
             .borrow_mut()
@@ -3811,6 +3834,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             && !self.has_observed_newer_view()
             && (self.status.get() == Status::ViewChange
                 || self.votes_to_leave_view()
+                // Its own vote is due and only waits for a tick that allows it.
+                || self.heartbeat_timed_out()
                 // The primary left its view.
                 || voter == self.primary_index(current)
                 // The voter left this view already. Only a replica that entered a
@@ -3819,8 +3844,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Whether this replica votes to leave a view it has not left yet.
-    const fn votes_to_leave_view(&self) -> bool {
+    #[must_use]
+    pub const fn votes_to_leave_view(&self) -> bool {
         self.start_view_change_view.get() > self.view.get()
+    }
+
+    /// Whether the heartbeat vote of this backup is due: it stopped hearing its
+    /// primary, and no tick cast the vote for that timeout yet. A heartbeat
+    /// restarts the timer and so ends it.
+    #[must_use]
+    pub fn heartbeat_timed_out(&self) -> bool {
+        self.status.get() == Status::Normal
+            && !self.is_acting_primary()
+            && self.timeouts.borrow().fired(TimeoutKind::NormalHeartbeat)
     }
 
     /// Drop the vote of this replica to leave its view, and the votes it counted
@@ -7718,7 +7754,7 @@ mod timestamp_clamp_tests {
 
         assert!(
             !consensus
-                .handle_normal_heartbeat_timeout(PlaneKind::Metadata)
+                .handle_normal_heartbeat_timeout(PlaneKind::Metadata, false)
                 .is_empty()
         );
         let vote = make_start_view_change(VIEW + 1, PEER);
@@ -8244,7 +8280,7 @@ mod vsr_consensus_tests {
         // A newer-view frame arrived and was dropped by the ingress path.
         consensus.observe_newer_view(3);
 
-        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata, false);
 
         assert_eq!(
             consensus.status(),
@@ -8268,7 +8304,7 @@ mod vsr_consensus_tests {
         consensus.init();
         consensus.observe_newer_view(0);
 
-        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata, false);
 
         assert!(
             actions
@@ -8790,7 +8826,7 @@ mod vsr_consensus_tests {
         consensus.observe_newer_view(5);
         consensus.observe_newer_view(2);
         // Timeout at view 0 with the record still 5 must probe.
-        let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+        let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata, false);
         assert_eq!(consensus.status(), Status::Recovering);
     }
 
@@ -10801,7 +10837,7 @@ mod recovery_election_tests {
             consensus.set_recovered_log_complete(false);
             consensus.init();
             // Its primary crashed, so it votes to replace it.
-            let _ = consensus.handle_normal_heartbeat_timeout(plane);
+            let _ = consensus.handle_normal_heartbeat_timeout(plane, false);
             consensus
         };
         let view = OLD_VIEW + 1;
@@ -11430,6 +11466,21 @@ mod view_change_vote_tests {
         consensus.handle_start_view_change(PLANE, make_start_view_change(view, from).header())
     }
 
+    /// One tick on which the shard holds the heartbeat vote of `consensus`.
+    fn held_tick(consensus: &VsrConsensus<NoopBus, LocalPipeline>) -> Vec<VsrAction> {
+        consensus.tick_clock().advance();
+        consensus.tick_with_grid(PLANE, false, true, true)
+    }
+
+    /// Held ticks up to the one on which the heartbeat timer fires.
+    fn hold_vote_until_due(consensus: &VsrConsensus<NoopBus, LocalPipeline>) -> Vec<VsrAction> {
+        let actions = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            .flat_map(|_| held_tick(consensus))
+            .collect();
+        assert!(consensus.heartbeat_timed_out());
+        actions
+    }
+
     fn votes_for(actions: &[VsrAction], view: u32) -> bool {
         actions.iter().any(|action| {
             matches!(action, VsrAction::SendStartViewChange { view: voted, .. } if *voted == view)
@@ -11470,7 +11521,7 @@ mod view_change_vote_tests {
     #[test]
     fn given_a_later_view_change_before_its_do_view_change_when_the_timer_fires_should_stop_it() {
         let consensus = replica(BACKUP);
-        let _ = consensus.handle_normal_heartbeat_timeout(PLANE);
+        let _ = consensus.handle_normal_heartbeat_timeout(PLANE, false);
         let sent = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
         assert!(sends_do_view_change(&sent), "{sent:?}");
         let _ = consensus.enter_view_change(
@@ -11495,7 +11546,7 @@ mod view_change_vote_tests {
     fn given_a_heartbeat_timeout_should_vote_for_the_next_view_without_leaving_its_own() {
         let consensus = replica(BACKUP);
 
-        let actions = consensus.handle_normal_heartbeat_timeout(PLANE);
+        let actions = consensus.handle_normal_heartbeat_timeout(PLANE, false);
 
         assert!(votes_for(&actions, NEXT_VIEW), "{actions:?}");
         assert_eq!(consensus.status(), Status::Normal);
@@ -11517,7 +11568,7 @@ mod view_change_vote_tests {
     fn given_its_vote_when_a_peer_votes_too_should_enter_the_view_change_and_send_its_do_view_change()
      {
         let consensus = replica(BACKUP);
-        let _ = consensus.handle_normal_heartbeat_timeout(PLANE);
+        let _ = consensus.handle_normal_heartbeat_timeout(PLANE, false);
 
         let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
 
@@ -11529,7 +11580,7 @@ mod view_change_vote_tests {
     #[test]
     fn given_its_vote_when_the_primary_heartbeats_should_withdraw_the_vote() {
         let consensus = replica(BACKUP);
-        let _ = consensus.handle_normal_heartbeat_timeout(PLANE);
+        let _ = consensus.handle_normal_heartbeat_timeout(PLANE, false);
 
         let _ = consensus.handle_commit(&make_commit(VIEW, PRIMARY, 1));
 
@@ -11541,6 +11592,78 @@ mod view_change_vote_tests {
         assert!(actions.is_empty(), "{actions:?}");
         assert_eq!(consensus.status(), Status::Normal);
         assert_eq!(consensus.view(), VIEW);
+    }
+
+    #[test]
+    fn given_a_held_vote_when_the_heartbeat_timer_fires_should_send_nothing_until_released() {
+        let consensus = replica(BACKUP);
+
+        let mut held = hold_vote_until_due(&consensus);
+        held.extend(held_tick(&consensus));
+
+        assert!(held.is_empty(), "{held:?}");
+        assert!(!consensus.votes_to_leave_view());
+        assert!(consensus.heartbeat_timed_out());
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::Normal, VIEW)
+        );
+
+        let released = advance_and_tick(&consensus, PLANE);
+
+        assert!(votes_for(&released, NEXT_VIEW), "{released:?}");
+        assert!(!consensus.heartbeat_timed_out());
+    }
+
+    #[test]
+    fn given_a_held_vote_when_a_peer_votes_should_enter_the_view_change_and_send_its_do_view_change()
+     {
+        let consensus = replica(BACKUP);
+        let _ = hold_vote_until_due(&consensus);
+
+        let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+
+        assert!(sends_do_view_change(&actions), "{actions:?}");
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::ViewChange, NEXT_VIEW)
+        );
+    }
+
+    #[test]
+    fn given_a_held_vote_when_the_primary_heartbeats_should_not_join_a_peer() {
+        let consensus = replica(BACKUP);
+        let _ = hold_vote_until_due(&consensus);
+
+        let _ = consensus.handle_commit(&make_commit(VIEW, PRIMARY, 1));
+
+        assert!(!consensus.heartbeat_timed_out());
+        let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::Normal, VIEW)
+        );
+    }
+
+    /// With 5 replicas the vote of one peer is no quorum. The next tick must
+    /// not start a fresh round, which drops the vote of that peer.
+    #[test]
+    fn given_five_replicas_when_a_held_backup_joins_a_peer_should_keep_that_vote_on_the_next_tick()
+    {
+        const REPLICAS: u8 = 5;
+        const THIRD_VOTER: u8 = 3;
+        let consensus = replica_of(REPLICAS, BACKUP);
+        let _ = hold_vote_until_due(&consensus);
+
+        let joined = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+        let next_tick = advance_and_tick(&consensus, PLANE);
+        let quorum = start_view_change(&consensus, THIRD_VOTER, NEXT_VIEW);
+
+        assert!(votes_for(&joined, NEXT_VIEW), "{joined:?}");
+        assert!(!sends_do_view_change(&joined), "{joined:?}");
+        assert!(!votes_for(&next_tick, NEXT_VIEW), "{next_tick:?}");
+        assert!(sends_do_view_change(&quorum), "{quorum:?}");
     }
 
     #[test]
@@ -12615,7 +12738,7 @@ mod heartbeat_schedule_tests {
         for tick in ticks {
             let grid_tick = SCHEDULE.is_grid_tick(tick);
             consensus.tick_clock().advance();
-            for action in consensus.tick_with_grid(plane, false, grid_tick) {
+            for action in consensus.tick_with_grid(plane, false, grid_tick, false) {
                 if let VsrAction::SendCommit {
                     view,
                     timestamp_monotonic,
@@ -12744,11 +12867,11 @@ mod heartbeat_schedule_tests {
             primary.handle_check_quorum_timeout();
             for tick in 1..window {
                 primary.tick_clock().advance();
-                let _ = primary.tick_with_grid(PlaneKind::Metadata, false, false);
+                let _ = primary.tick_with_grid(PlaneKind::Metadata, false, false, false);
                 assert!(primary.is_acting_primary(), "idle {idle}: tick {tick}");
             }
             primary.tick_clock().advance();
-            let _ = primary.tick_with_grid(PlaneKind::Metadata, false, false);
+            let _ = primary.tick_with_grid(PlaneKind::Metadata, false, false, false);
             assert_eq!(primary.status(), Status::Recovering, "idle {idle}");
         }
     }

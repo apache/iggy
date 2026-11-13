@@ -22,11 +22,12 @@ use crate::boot::shard_main;
 use crate::boot::topology::RosterCells;
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::shard_allocator::{ShardAllocator, ShardInfo};
+use crate::shell::ServerShard;
 use compio::runtime::ResumeUnwind;
 use configs::server::ServerConfig;
 use configs::sharding::{
     INBOX_CAPACITY_MAX, RECONCILE_PERIODIC_INTERVAL_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX,
-    SHUTDOWN_JOIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
+    SHUTDOWN_JOIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX, SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX,
 };
 use iggy_object_store::s3::SharedCredentials;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
@@ -37,7 +38,7 @@ use shard::metrics::ShardMetrics;
 use shard::{Receiver as ShardReceiver, Sender, ShardFrame, TaggedSender};
 use std::backtrace::Backtrace;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use std::{panic, thread};
@@ -55,13 +56,16 @@ pub struct ShardHandles {
     pub(in crate::boot) shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)>,
     pub(in crate::boot) deadline: Arc<ShutdownDeadline>,
     pub(in crate::boot) first_panic: Arc<OnceLock<String>>,
+    pub(in crate::boot) primary_handoff: Arc<PrimaryHandoffGate>,
 }
 
 impl ShardHandles {
-    /// Install a SIGINT/Ctrl-C handler that flips the shutdown flag on
-    /// the first signal. A second signal is logged but otherwise
-    /// ignored so an in-flight WAL fsync or replica drain runs to
-    /// completion.
+    /// Install a SIGINT/Ctrl-C handler that starts the shutdown on the
+    /// first signal: the primary handoff where a shard can run one (see
+    /// `PrimaryHandoffGate`), the shutdown flag otherwise. A second
+    /// signal ends a handoff still in progress. A signal after the flag
+    /// flipped is logged but otherwise ignored so an in-flight WAL fsync
+    /// or replica drain runs to completion.
     ///
     /// # Errors
     ///
@@ -70,12 +74,15 @@ impl ShardHandles {
     /// signal).
     pub fn install_ctrlc_handler(&self) -> Result<(), ctrlc::Error> {
         let flag = Arc::clone(&self.shutdown_flag);
+        let handoff = Arc::clone(&self.primary_handoff);
         ctrlc::set_handler(move || {
-            if flag.swap(true, Ordering::Relaxed) {
-                // Second Ctrl-C: leave the shutdown machinery to drain.
-                // Refusing to abort here keeps the WAL fsync / replica
-                // drain from being interrupted mid-frame.
-                warn!("second Ctrl-C ignored; server is already shutting down");
+            if handoff.request() {
+                info!("Ctrl-C received; handing off partition primaries before shutdown");
+            } else if flag.swap(true, Ordering::Relaxed) {
+                // Leave the shutdown machinery to drain. Refusing to abort
+                // here keeps the WAL fsync / replica drain from being
+                // interrupted mid-frame.
+                warn!("Ctrl-C ignored; server is already shutting down");
             } else {
                 info!("Ctrl-C received; signalling server shutdown");
             }
@@ -126,9 +133,13 @@ impl ShardHandles {
                 Duration::ZERO
             };
             let waited = self.deadline.budget.saturating_add(grace);
-            let Some(joined) =
-                join_until_shutdown_deadline(handle, &self.shutdown_flag, &self.deadline, grace)
-            else {
+            let Some(joined) = join_until_shutdown_deadline(
+                handle,
+                &self.shutdown_flag,
+                &self.primary_handoff,
+                &self.deadline,
+                grace,
+            ) else {
                 error!(
                     shard_id,
                     ?waited,
@@ -233,13 +244,21 @@ const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// keeps running detached; process exit reaps it). `JoinHandle` has no
 /// timed join, so this polls `is_finished` at [`JOIN_POLL_INTERVAL`]; the
 /// closing `join()` on a finished thread returns immediately.
+///
+/// The poll also ends a primary handoff that ran out of time. It does so
+/// here because this thread runs no shard work, so no wedged shard can keep
+/// the shutdown from starting.
 fn join_until_shutdown_deadline(
     handle: thread::JoinHandle<Result<(), ServerError>>,
     shutdown_flag: &AtomicBool,
+    primary_handoff: &PrimaryHandoffGate,
     deadline: &ShutdownDeadline,
     grace: Duration,
 ) -> Option<thread::Result<Result<(), ServerError>>> {
     while !handle.is_finished() {
+        if primary_handoff.timed_out() && !shutdown_flag.swap(true, Ordering::Relaxed) {
+            warn!("primary handoff ran out of time; signalling server shutdown");
+        }
         if shutdown_flag.load(Ordering::Relaxed) && deadline.remaining_with_grace(grace).is_zero() {
             return None;
         }
@@ -330,6 +349,83 @@ impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
         if self.armed {
             self.flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A graceful stop that first hands off the partitions this node leads.
+///
+/// The first stop signal asks for the handoff in place of the shutdown.
+/// Each shard then moves its primaries to members that keep up, and counts
+/// itself out. The shutdown flag flips when the last shard is out, on a
+/// second signal, or after `sharding.shutdown_primary_handoff_timeout`.
+///
+/// One flag for all shards, not a stop per shard: a shard sends through
+/// replica links that other shards own, so a bus that shuts down early
+/// cuts the view changes of the shards still handing off.
+pub(in crate::boot) struct PrimaryHandoffGate {
+    timeout: Duration,
+    requested_at: OnceLock<Instant>,
+    /// Shards that can hand off and did not finish.
+    shards: AtomicUsize,
+}
+
+impl PrimaryHandoffGate {
+    pub(in crate::boot) const fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            requested_at: OnceLock::new(),
+            shards: AtomicUsize::new(0),
+        }
+    }
+
+    /// Whether a shard of a node with `replica_count` replicas hands off at
+    /// all. A single node has no member to hand a partition to, and a zero
+    /// timeout turns the handoff off.
+    pub(in crate::boot) const fn runs_on(&self, replica_count: u8) -> bool {
+        replica_count > 1 && !self.timeout.is_zero()
+    }
+
+    /// Ask for the handoff. False when no shard can run one, or when it was
+    /// asked for before: the caller starts the shutdown instead.
+    fn request(&self) -> bool {
+        self.shards.load(Ordering::Relaxed) > 0 && self.requested_at.set(Instant::now()).is_ok()
+    }
+
+    fn requested(&self) -> bool {
+        self.requested_at.get().is_some()
+    }
+
+    fn timed_out(&self) -> bool {
+        self.requested_at
+            .get()
+            .is_some_and(|requested_at| requested_at.elapsed() >= self.timeout)
+    }
+}
+
+/// One shard's place in a [`PrimaryHandoffGate`], held by its handoff task.
+/// Counts the shard out on drop, so a task that is cancelled cannot leave
+/// the other shards waiting for it.
+struct HandoffShard {
+    gate: Arc<PrimaryHandoffGate>,
+    shutdown_flag: Arc<AtomicBool>,
+}
+
+impl HandoffShard {
+    fn new(gate: Arc<PrimaryHandoffGate>, shutdown_flag: Arc<AtomicBool>) -> Self {
+        gate.shards.fetch_add(1, Ordering::Relaxed);
+        Self {
+            gate,
+            shutdown_flag,
+        }
+    }
+}
+
+impl Drop for HandoffShard {
+    fn drop(&mut self) {
+        let last = self.gate.shards.fetch_sub(1, Ordering::Relaxed) == 1;
+        if last && self.gate.requested() {
+            self.shutdown_flag.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -624,6 +720,13 @@ pub(in crate::boot) fn validate_sharding_runtime_knobs(
             drain: drain_timeout,
         });
     }
+    let handoff_timeout = sharding.shutdown_primary_handoff_timeout.get_duration();
+    if handoff_timeout > SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX {
+        return Err(ServerError::InvalidShutdownPrimaryHandoffTimeout {
+            value: handoff_timeout,
+            max: SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX,
+        });
+    }
     let join_timeout = sharding.shutdown_join_timeout.get_duration();
     if join_timeout > SHUTDOWN_JOIN_TIMEOUT_MAX {
         return Err(ServerError::InvalidShutdownJoinTimeout {
@@ -676,6 +779,7 @@ pub(in crate::boot) fn run_shard_thread(
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
     tiered_credentials: Option<SharedCredentials>,
+    primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -728,6 +832,7 @@ pub(in crate::boot) fn run_shard_thread(
             peer_exit,
             shutdown_deadline,
             tiered_credentials,
+            primary_handoff,
         ))
         .await
     });
@@ -815,6 +920,37 @@ pub(in crate::boot) async fn await_pump_drain(
     Err(ServerError::ShardPumpDied { shard_id, reason })
 }
 
+/// Spawn the task that runs this shard's part of a primary handoff. It
+/// waits for the request, starts the pass on the shard and holds the shard's
+/// place in `gate` until the pass ended. The pump does the pass itself: only
+/// the pump can hold a partition across its own awaits.
+///
+/// The caller keeps the handle until the shard exits. Dropping it cancels
+/// the task, which counts the shard out.
+pub(in crate::boot) fn spawn_primary_handoff(
+    shard: Rc<ServerShard>,
+    gate: Arc<PrimaryHandoffGate>,
+    shutdown_flag: Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> compio::runtime::JoinHandle<()> {
+    // Counted in before the task first runs, so a signal that arrives now
+    // already waits for this shard.
+    let place = HandoffShard::new(Arc::clone(&gate), Arc::clone(&shutdown_flag));
+    compio::runtime::spawn(async move {
+        let _place = place;
+        while !gate.requested() {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            compio::time::sleep(poll_interval).await;
+        }
+        shard.begin_primary_handoff();
+        while shard.primary_handoff_pending() && !shutdown_flag.load(Ordering::Relaxed) {
+            compio::time::sleep(poll_interval).await;
+        }
+    })
+}
+
 /// Spawn a per-shard polling task that watches the cross-thread shutdown
 /// flag and triggers this shard's bus shutdown on transition. The flag
 /// is the only Send signal we have; the bus' shutdown machinery is
@@ -895,6 +1031,8 @@ impl StopSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_common::IggyDuration;
+    use std::str::FromStr;
 
     #[test]
     fn given_invalid_poll_completion_capacity_when_boot_validates_should_report_setting() {
@@ -1010,6 +1148,114 @@ mod tests {
         }
     }
 
+    /// The gate of a node that never hands off.
+    const fn no_handoff() -> PrimaryHandoffGate {
+        PrimaryHandoffGate::new(Duration::ZERO)
+    }
+
+    const HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn given_a_zero_handoff_timeout_when_a_cluster_node_boots_should_run_no_handoff() {
+        const CLUSTER_REPLICAS: u8 = 3;
+        for value in ["0 s", "0", "disabled", "none", "unlimited"] {
+            let timeout = IggyDuration::from_str(value)
+                .expect("a valid duration")
+                .get_duration();
+            assert!(
+                !PrimaryHandoffGate::new(timeout).runs_on(CLUSTER_REPLICAS),
+                "{value:?} reads as zero and turns the handoff off"
+            );
+        }
+        assert!(PrimaryHandoffGate::new(HANDOFF_TIMEOUT).runs_on(CLUSTER_REPLICAS));
+        assert!(
+            !PrimaryHandoffGate::new(HANDOFF_TIMEOUT).runs_on(1),
+            "a single node has no member to hand a partition to"
+        );
+    }
+
+    #[test]
+    fn given_no_shard_that_hands_off_when_a_signal_asks_should_start_the_shutdown() {
+        let gate = PrimaryHandoffGate::new(HANDOFF_TIMEOUT);
+
+        assert!(
+            !gate.request(),
+            "a node that stops during boot must not wait for a handoff"
+        );
+        assert!(!gate.requested());
+    }
+
+    #[test]
+    fn given_shards_handing_off_when_the_last_one_ends_should_flip_the_shutdown_flag() {
+        let gate = Arc::new(PrimaryHandoffGate::new(HANDOFF_TIMEOUT));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let first = HandoffShard::new(Arc::clone(&gate), Arc::clone(&shutdown_flag));
+        let second = HandoffShard::new(Arc::clone(&gate), Arc::clone(&shutdown_flag));
+
+        assert!(gate.request(), "the first signal asks for the handoff");
+        assert!(
+            !gate.request(),
+            "a second signal starts the shutdown in place of a second handoff"
+        );
+        drop(first);
+        assert!(
+            !shutdown_flag.load(Ordering::Relaxed),
+            "one bus that shuts down early cuts the view changes of the other shard"
+        );
+        drop(second);
+        assert!(shutdown_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn given_no_handoff_request_when_every_shard_leaves_should_keep_the_shutdown_flag() {
+        let gate = Arc::new(PrimaryHandoffGate::new(HANDOFF_TIMEOUT));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        drop(HandoffShard::new(
+            Arc::clone(&gate),
+            Arc::clone(&shutdown_flag),
+        ));
+
+        assert!(!shutdown_flag.load(Ordering::Relaxed));
+        assert!(
+            !gate.request(),
+            "no shard is left to hand off, so a signal starts the shutdown"
+        );
+    }
+
+    #[test]
+    fn given_a_handoff_past_its_timeout_when_joining_should_start_the_shutdown() {
+        const SHARD_GIVES_UP_AFTER: Duration = Duration::from_secs(5);
+        let gate = Arc::new(PrimaryHandoffGate::new(Duration::from_millis(50)));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        // Never dropped by a shard: the stand-in for a shard that cannot
+        // finish its handoff.
+        let _wedged = HandoffShard::new(Arc::clone(&gate), Arc::clone(&shutdown_flag));
+        assert!(gate.request());
+        let handle = thread::spawn({
+            let shutdown_flag = Arc::clone(&shutdown_flag);
+            move || -> Result<(), ServerError> {
+                let started = Instant::now();
+                while !shutdown_flag.load(Ordering::Relaxed)
+                    && started.elapsed() < SHARD_GIVES_UP_AFTER
+                {
+                    thread::sleep(JOIN_POLL_INTERVAL);
+                }
+                Ok(())
+            }
+        });
+        let deadline = ShutdownDeadline::new(Duration::from_secs(10), Duration::from_secs(10));
+
+        let joined =
+            join_until_shutdown_deadline(handle, &shutdown_flag, &gate, &deadline, Duration::ZERO);
+
+        assert!(matches!(joined, Some(Ok(Ok(())))));
+        assert!(
+            shutdown_flag.load(Ordering::Relaxed),
+            "the handoff timeout must start the shutdown while a shard still hands off"
+        );
+    }
+
     /// A shard thread that never returns on its own: the stand-in for a
     /// wedged pump that the deadline tests need.
     fn spawn_wedged_shard() -> (thread::JoinHandle<Result<(), ServerError>>, ThreadStopper) {
@@ -1114,8 +1360,14 @@ mod tests {
         // budget before shard 0 can reach its peer wait.
         let (wedged_shard, _stopper) = spawn_wedged_shard();
         assert!(
-            join_until_shutdown_deadline(wedged_shard, &shutdown_flag, &deadline, Duration::ZERO)
-                .is_none(),
+            join_until_shutdown_deadline(
+                wedged_shard,
+                &shutdown_flag,
+                &no_handoff(),
+                &deadline,
+                Duration::ZERO,
+            )
+            .is_none(),
             "the join must spend the budget it armed"
         );
         assert!(deadline.remaining().is_zero(), "the budget must be spent");
@@ -1253,8 +1505,13 @@ mod tests {
             Ok(())
         });
         let deadline = ShutdownDeadline::new(Duration::from_millis(20), Duration::from_millis(20));
-        let joined =
-            join_until_shutdown_deadline(handle, &shutdown_flag, &deadline, Duration::ZERO);
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            &no_handoff(),
+            &deadline,
+            Duration::ZERO,
+        );
         assert!(
             matches!(joined, Some(Ok(Ok(())))),
             "a running server must be awaited indefinitely, not abandoned as wedged"
@@ -1283,6 +1540,7 @@ mod tests {
                 Duration::from_millis(500),
             )),
             first_panic,
+            primary_handoff: Arc::new(no_handoff()),
         };
         let error = handles
             .join_all()
@@ -1320,8 +1578,13 @@ mod tests {
         let shutdown_flag = AtomicBool::new(true);
         let (handle, _stopper) = spawn_wedged_shard();
         let deadline = ShutdownDeadline::new(Duration::from_millis(100), Duration::from_millis(50));
-        let joined =
-            join_until_shutdown_deadline(handle, &shutdown_flag, &deadline, Duration::ZERO);
+        let joined = join_until_shutdown_deadline(
+            handle,
+            &shutdown_flag,
+            &no_handoff(),
+            &deadline,
+            Duration::ZERO,
+        );
         assert!(
             joined.is_none(),
             "a shard still running past the post-shutdown budget must be abandoned"

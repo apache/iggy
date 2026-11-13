@@ -36,7 +36,7 @@ use metadata::{IggyMetadata, MuxStateMachine};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
 use server_common::MESSAGE_ALIGN;
 use server_common::iobuf::Frozen;
-use server_common::sharding::{METADATA_GROUP, ShardId};
+use server_common::sharding::{METADATA_GROUP, PartitionLocation, ShardId};
 use std::cell::{Cell, RefCell};
 use std::pin::pin;
 use std::rc::Rc;
@@ -59,6 +59,8 @@ struct RecordingBus {
     sent: RefCell<Vec<(u8, PrimaryRebalanceHeader)>>,
     now: Cell<Option<Instant>>,
     disconnected: Cell<bool>,
+    /// A mask of the nodes whose link is down.
+    links_down: Cell<u32>,
 }
 
 #[allow(clippy::future_not_send, clippy::unused_async_trait_impl)]
@@ -96,6 +98,10 @@ impl MessageBus for RecordingBus {
 
     fn set_connection_lost_fn(&self, _callback: message_bus::ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _callback: message_bus::ReplicaForwardFn) {}
+
+    fn replica_is_up(&self, replica: u8) -> bool {
+        self.links_down.get() & (1 << replica) == 0
+    }
 }
 
 type TestShard<SB = PingPongSuperblock> = IggyShard<
@@ -197,17 +203,20 @@ fn arm<SB: SuperblockStore>(shard: &TestShard<SB>, phase: MovePhase) -> PrimaryR
         peers: vec![Peer::default(); usize::from(REPLICAS)],
         eligible: vec![true; usize::from(REPLICAS)],
         backoffs: vec![TargetBackoff::default(); usize::from(REPLICAS)],
-        pending: Some(PendingMove {
-            plan: PartitionPrimaryTransfer {
-                namespace,
-                created_revision: CREATED_REVISION,
-                view: PARTITION_VIEW,
-                target: TARGET,
+        pending: BTreeMap::from([(
+            namespace,
+            PendingMove {
+                plan: PartitionPrimaryTransfer {
+                    namespace,
+                    created_revision: CREATED_REVISION,
+                    view: PARTITION_VIEW,
+                    target: TARGET,
+                },
+                probe,
+                phase,
+                since: Instant::now(),
             },
-            probe,
-            phase,
-            since: Instant::now(),
-        }),
+        )]),
         ..PrimaryRebalance::default()
     };
     probe.kind = if phase == MovePhase::Capture {
@@ -253,7 +262,8 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
                     .primary_rebalance
                     .borrow_mut()
                     .pending
-                    .as_mut()
+                    .values_mut()
+                    .next()
                     .unwrap()
                     .since = Instant::now()
                     .checked_sub(PROBE_TIMEOUT + PROBE_INTERVAL)
@@ -272,7 +282,8 @@ async fn given_pending_target_probe_when_reply_is_stale_or_mismatched_should_not
                 .primary_rebalance
                 .borrow()
                 .pending
-                .as_ref()
+                .values()
+                .next()
                 .is_some_and(|pending| pending.phase == MovePhase::Probe)
         );
     }
@@ -386,7 +397,7 @@ async fn given_the_coordinator_leads_the_partition_when_target_confirms_it_shoul
     assert_eq!(consensus.primary_index(led_view), consensus.replica());
     {
         let mut state = shard.primary_rebalance.borrow_mut();
-        let pending = state.pending.as_mut().unwrap();
+        let pending = state.pending.values_mut().next().unwrap();
         pending.plan.view = led_view;
         pending.probe.partition_view = led_view;
     }
@@ -424,7 +435,7 @@ async fn given_target_rejection_when_reply_is_correlated_should_drop_the_move_an
     let mut reply = arm(&shard, MovePhase::Probe);
     reply.ready = 0;
     shard.on_primary_rebalance(reply, Vec::new()).await;
-    assert!(shard.primary_rebalance.borrow().pending.is_none());
+    assert!(shard.primary_rebalance.borrow().pending.is_empty());
     reply.ready = 1;
     shard.on_primary_rebalance(reply, Vec::new()).await;
     assert!(inbox.try_recv().is_err());
@@ -464,11 +475,11 @@ async fn given_a_sent_grant_when_the_new_view_is_unseen_should_hold_the_move_unt
         let sent_at = shard.bus.monotonic_now();
         {
             let mut state = shard.primary_rebalance.borrow_mut();
-            let pending = state.pending.as_mut().unwrap();
+            let pending = state.pending.values_mut().next().unwrap();
             pending.plan.created_revision = created_revision;
             pending.since = sent_at;
         }
-        let pending = || shard.primary_rebalance.borrow().pending.is_some();
+        let pending = || !shard.primary_rebalance.borrow().pending.is_empty();
 
         tick_with_ready_peers(&shard, sent_at + GRANT_TIMEOUT * 2).await;
         assert!(
@@ -547,7 +558,7 @@ async fn given_a_move_inside_a_subset_group_when_the_target_holds_should_reset_i
     let moved_at = shard.bus.monotonic_now();
     {
         let mut state = shard.primary_rebalance.borrow_mut();
-        let pending = state.pending.as_mut().unwrap();
+        let pending = state.pending.values_mut().next().unwrap();
         pending.plan.created_revision = created_revision;
         pending.since = moved_at;
         state.backoffs[usize::from(TARGET)] = TargetBackoff {
@@ -597,7 +608,7 @@ async fn given_a_backed_off_target_when_its_probe_move_is_lost_or_held_should_do
         let moved_at = shard.bus.monotonic_now();
         {
             let mut state = shard.primary_rebalance.borrow_mut();
-            let pending = state.pending.as_mut().unwrap();
+            let pending = state.pending.values_mut().next().unwrap();
             pending.plan.created_revision = created_revision;
             pending.since = moved_at;
             // The wait after one failed move ran out, so this move probes the target.
@@ -652,7 +663,8 @@ async fn given_an_unsent_grant_when_the_coordinator_ticks_should_plan_again_befo
         .primary_rebalance
         .borrow_mut()
         .pending
-        .as_mut()
+        .values_mut()
+        .next()
         .unwrap()
         .plan
         .created_revision = views[0].created_revision;
@@ -677,12 +689,221 @@ async fn given_an_unsent_grant_when_the_coordinator_ticks_should_plan_again_befo
     );
 }
 
+/// A coordinator that planned no move yet, with `partitions` observed
+/// partitions that `SOURCE` leads.
+fn coordinator_with_primaries_on_source(partitions: usize) -> (TestShard, Receiver<ShardFrame>) {
+    let (shard, inbox) = owner();
+    arm(&shard, MovePhase::Capture);
+    shard.primary_rebalance.borrow_mut().pending.clear();
+    let metadata = shard.plane.metadata();
+    let streams = metadata.mux_stm.streams();
+    let last = IggyNamespace::new(1, 1, partitions - 1);
+    streams.seed_namespace(last, last.inner(), PARTITION_VIEW);
+    let views: Vec<_> = (0..partitions)
+        .map(|partition| {
+            let namespace = IggyNamespace::new(1, 1, partition);
+            PartitionPlacementView {
+                namespace,
+                created_revision: streams.created_revision_for_namespace(namespace).unwrap(),
+                view: PARTITION_VIEW,
+            }
+        })
+        .collect();
+    metadata.observe_partition_views(&views);
+    (shard, inbox)
+}
+
+/// How many planned moves go to `target`.
+fn planned_to(shard: &TestShard, target: u8) -> usize {
+    let state = shard.primary_rebalance.borrow();
+    state
+        .pending
+        .values()
+        .filter(|pending| pending.plan.target == target)
+        .count()
+}
+
+fn source_probes_sent(shard: &TestShard) -> usize {
+    let sent = shard.bus.sent.borrow();
+    sent.iter()
+        .filter(|(replica, probe)| {
+            *replica == SOURCE && probe.kind == PrimaryRebalanceKind::SourceProbe
+        })
+        .count()
+}
+
+#[compio::test]
+async fn given_every_primary_on_one_node_when_the_coordinator_ticks_should_plan_one_round_that_ends_in_balance()
+ {
+    const PARTITIONS: usize = 12;
+    const MOVES: usize = PARTITIONS - PARTITIONS / REPLICAS as usize;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    let planned_at = shard.bus.monotonic_now() + STABLE_INTERVAL * 2;
+
+    tick_with_ready_peers(&shard, planned_at).await;
+
+    assert_eq!(
+        (
+            planned_to(&shard, 0),
+            planned_to(&shard, SOURCE),
+            planned_to(&shard, TARGET)
+        ),
+        (MOVES / 2, 0, MOVES / 2),
+        "moves planned to each node"
+    );
+    assert_eq!(source_probes_sent(&shard), MOVES);
+
+    // The moves in flight count as done, so the next round plans nothing.
+    shard.bus.sent.borrow_mut().clear();
+    tick_with_ready_peers(&shard, planned_at + PROBE_INTERVAL).await;
+    assert_eq!(shard.primary_rebalance.borrow().pending.len(), MOVES);
+    assert_eq!(source_probes_sent(&shard), 0);
+}
+
+#[compio::test]
+async fn given_more_moves_than_the_inflight_limit_when_some_end_should_plan_up_to_the_limit_again()
+{
+    const PARTITIONS: usize = 3 * REBALANCE_MOVES_INFLIGHT_MAX + 3;
+    const ENDED: usize = 5;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    let planned_at = shard.bus.monotonic_now() + STABLE_INTERVAL * 2;
+
+    tick_with_ready_peers(&shard, planned_at).await;
+
+    assert_eq!(
+        shard.primary_rebalance.borrow().pending.len(),
+        REBALANCE_MOVES_INFLIGHT_MAX
+    );
+    assert_eq!(source_probes_sent(&shard), REBALANCE_MOVES_INFLIGHT_MAX);
+
+    // A report shows the target of each ended move as its primary.
+    let ended: Vec<_> = shard
+        .primary_rebalance
+        .borrow()
+        .pending
+        .values()
+        .take(ENDED)
+        .map(|pending| pending.plan)
+        .collect();
+    let nodes = u32::from(REPLICAS);
+    let views: Vec<_> = ended
+        .iter()
+        .map(|plan| PartitionPlacementView {
+            namespace: plan.namespace,
+            created_revision: plan.created_revision,
+            view: plan.view + (u32::from(plan.target) + nodes - plan.view % nodes) % nodes,
+        })
+        .collect();
+    shard.plane.metadata().observe_partition_views(&views);
+    shard.bus.sent.borrow_mut().clear();
+    tick_with_ready_peers(&shard, planned_at + PROBE_INTERVAL).await;
+
+    let state = shard.primary_rebalance.borrow();
+    assert_eq!(state.pending.len(), REBALANCE_MOVES_INFLIGHT_MAX);
+    assert!(
+        ended
+            .iter()
+            .all(|plan| !state.pending.contains_key(&plan.namespace)),
+        "a partition that moved must not move again"
+    );
+    drop(state);
+    assert_eq!(source_probes_sent(&shard), ENDED);
+}
+
+#[compio::test]
+async fn given_a_round_of_moves_when_replies_arrive_out_of_order_should_advance_each_move_alone() {
+    const PARTITIONS: usize = 12;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    tick_with_ready_peers(&shard, shard.bus.monotonic_now() + STABLE_INTERVAL * 2).await;
+    let planned: Vec<_> = shard
+        .primary_rebalance
+        .borrow()
+        .pending
+        .values()
+        .map(|pending| (pending.plan, pending.probe))
+        .collect();
+    let source_reply = |probe: PrimaryRebalanceHeader, ready: u8| PrimaryRebalanceHeader {
+        kind: PrimaryRebalanceKind::SourceReply,
+        replica: SOURCE,
+        commit: COMMITTED,
+        ready,
+        ..probe
+    };
+    let (ready, refused, stale, untouched) = (planned[7], planned[2], planned[4], planned[0]);
+    shard.bus.sent.borrow_mut().clear();
+
+    shard
+        .on_primary_rebalance(source_reply(ready.1, 1), Vec::new())
+        .await;
+    shard
+        .on_primary_rebalance(source_reply(refused.1, 0), Vec::new())
+        .await;
+    let mut other_nonce = source_reply(stale.1, 1);
+    other_nonce.nonce += 1;
+    shard.on_primary_rebalance(other_nonce, Vec::new()).await;
+
+    let phase = |plan: PartitionPrimaryTransfer| {
+        let state = shard.primary_rebalance.borrow();
+        state
+            .pending
+            .get(&plan.namespace)
+            .map(|pending| pending.phase)
+    };
+    assert!(phase(ready.0) == Some(MovePhase::Probe));
+    assert!(phase(refused.0).is_none());
+    assert!(phase(stale.0) == Some(MovePhase::Capture));
+    assert!(phase(untouched.0) == Some(MovePhase::Capture));
+    let sent = shard.bus.sent.borrow();
+    assert_eq!(sent.len(), 1, "only the ready move probes its target");
+    assert_eq!(
+        (sent[0].0, sent[0].1.kind, sent[0].1.namespace),
+        (
+            ready.0.target,
+            PrimaryRebalanceKind::PartitionProbe,
+            ready.0.namespace.inner()
+        )
+    );
+}
+
+/// A target whose wait after a failed move ran out is on probation: it gets
+/// one move, and no second one before the first holds.
+#[compio::test]
+async fn given_a_backed_off_target_when_planning_rounds_should_give_it_one_move_at_a_time() {
+    const PARTITIONS: usize = 12;
+    let (shard, _inbox) = coordinator_with_primaries_on_source(PARTITIONS);
+    let planned_at = shard.bus.monotonic_now() + STABLE_INTERVAL * 2;
+    shard.primary_rebalance.borrow_mut().backoffs[usize::from(TARGET)] = TargetBackoff {
+        until: Some(shard.bus.monotonic_now()),
+        wait: MOVE_HOLD_INTERVAL,
+    };
+
+    tick_with_ready_peers(&shard, planned_at).await;
+
+    // Without the target, the source and node 0 end one apart.
+    let to_other = (PARTITIONS - 1) / 2;
+    assert_eq!(
+        (planned_to(&shard, TARGET), planned_to(&shard, 0)),
+        (1, to_other)
+    );
+
+    tick_with_ready_peers(&shard, planned_at + PROBE_INTERVAL).await;
+    assert_eq!(
+        (planned_to(&shard, TARGET), planned_to(&shard, 0)),
+        (1, to_other)
+    );
+}
+
 fn suspect_primary(group: u64, view: u32) -> MessageBag {
+    vote_of_node_1(group, 0, view)
+}
+
+fn vote_of_node_1(group: u64, partition_incarnation: u64, view: u32) -> MessageBag {
     MessageBag::StartViewChange(
         Message::<StartViewChangeHeader>::new(HEADER_SIZE).transmute_header(
             |_, header: &mut StartViewChangeHeader| {
                 header.cluster = CLUSTER;
                 header.group = group;
+                header.partition_incarnation = partition_incarnation;
                 header.view = view;
                 header.replica = 1;
                 header.command = Command::StartViewChange;
@@ -708,7 +929,7 @@ async fn given_pending_target_probe_when_metadata_authority_changes_should_not_g
         "a reply handled during the suspension granted a move"
     );
     assert!(inbox.try_recv().is_err());
-    assert!(shard.primary_rebalance.borrow().pending.is_none());
+    assert!(shard.primary_rebalance.borrow().pending.is_empty());
 }
 
 #[derive(Default)]
@@ -779,7 +1000,7 @@ fn given_pending_move_when_unrelated_or_current_traffic_arrives_should_preserve_
             };
             shard.fence_rebalance_authority(&message);
             assert_eq!(
-                shard.primary_rebalance.borrow().pending.is_none(),
+                shard.primary_rebalance.borrow().pending.is_empty(),
                 should_revoke,
                 "group={group}, view={view}, command={command:?}"
             );
@@ -957,6 +1178,8 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
         "recovering",
         "unproved",
         "transfer",
+        "transfer session",
+        "transfer re-arm",
         "repair",
         "ceded",
         "recovery barrier",
@@ -978,6 +1201,30 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
             "transfer" => partition
                 .consensus()
                 .set_state_transfer_stage(StateTransferStage::AwaitingTarget),
+            "transfer session" => {
+                let (shard, _inbox) = owner();
+                partition.set_transfer(Some(
+                    partitions::state_transfer::PartitionTransferSession {
+                        nonce: NONCE,
+                        peer: SOURCE,
+                        commit_op: 0,
+                        artifacts: Vec::new(),
+                        target_accepted: false,
+                        idle_ticks: 0,
+                        spill: None,
+                        scan: None,
+                        seed: None,
+                        pulled_len: 0,
+                        slot: shard.plane.partitions().transfer_slot(),
+                    },
+                ));
+            }
+            "transfer re-arm" => {
+                partition.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
+                    peer: SOURCE,
+                    after_ticks: 1,
+                });
+            }
             "repair" => {
                 partition.set_repair(Some(partitions::RepairSession {
                     nonce: NONCE,
@@ -1003,6 +1250,500 @@ fn given_partition_probe_when_local_history_is_not_ready_should_refuse() {
     }
 }
 
+/// Only shard 0 of a node holds the metadata group, and every shard hands
+/// off. So the pass must find the primary of a view without that group.
+fn owner_with_no_metadata_group() -> (TestShard, Receiver<ShardFrame>) {
+    let (mut shard, inbox) = owner();
+    shard.plane.inner_mut().0.consensus = None;
+    (shard, inbox)
+}
+
+/// A group that this node leads in view 0, with its metadata and its route,
+/// so a handoff accepts it.
+fn insert_led_partition(shard: &TestShard, namespace: IggyNamespace) {
+    insert_partition(shard, namespace, 0);
+}
+
+/// A group in normal status in `view`, with its metadata and its route.
+fn insert_partition(shard: &TestShard, namespace: IggyNamespace, view: u32) {
+    let streams = shard.plane.metadata().mux_stm.streams();
+    streams.seed_namespace(namespace, namespace.inner(), 0);
+    let created_revision = streams.created_revision_for_namespace(namespace).unwrap();
+    shard.shards_table.insert(
+        namespace,
+        PartitionLocation::new(ShardId::new(0), created_revision),
+    );
+    let mut consensus = VsrConsensus::new(
+        CLUSTER,
+        0,
+        REPLICAS,
+        namespace.inner(),
+        Rc::clone(&shard.bus),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    consensus.set_view(view);
+    consensus.set_log_view(view);
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        shard.plane.partitions().config().segment_size,
+    );
+    partition.set_created_revision(created_revision);
+    shard.plane.partitions().insert(namespace, partition);
+}
+
+/// The vote of node 1 for `next_view` of a group in `view`, as this shard
+/// receives it.
+#[allow(clippy::future_not_send)]
+async fn node_1_votes(shard: &TestShard, namespace: IggyNamespace, view: u32, next_view: u32) {
+    insert_partition(shard, namespace, view);
+    let created_revision = shard
+        .plane
+        .partitions()
+        .get_by_ns(&namespace)
+        .unwrap()
+        .created_revision();
+    // Consensus answers the vote with frames that this bus does not record.
+    shard.bus.disconnected.set(true);
+    shard
+        .dispatch_message(
+            vote_of_node_1(namespace.inner(), created_revision, next_view),
+            None,
+        )
+        .await;
+    shard.bus.disconnected.set(false);
+}
+
+/// Peers that the pass in progress takes for nodes that leave, as a node mask.
+fn peers_taken_for_leaving(shard: &TestShard) -> u32 {
+    match &*shard.primary_handoff.borrow() {
+        PrimaryHandoff::Walking { leaving, .. } => *leaving,
+        other => panic!("no pass in progress: {other:?}"),
+    }
+}
+
+/// A handoff is a view change through the partition I/O lane. It starts as
+/// many per tick as a failover casts votes, and it holds as many in flight as
+/// a failover holds view changes.
+#[test]
+fn given_more_led_groups_than_the_limits_when_handing_off_should_pace_the_pass() {
+    let (shard, _inbox) = owner();
+    let partitions = shard.plane.partitions();
+    let namespaces: Vec<_> = (0..crate::PARTITION_VIEW_CHANGES_INFLIGHT_MAX + 2)
+        .map(|partition_id| IggyNamespace::new(1, 1, partition_id))
+        .collect();
+    for &namespace in &namespaces {
+        insert_led_partition(&shard, namespace);
+    }
+    // No pump serves the partition I/O here, so each transfer stays deferred.
+    let deferred = || {
+        namespaces
+            .iter()
+            .filter(|namespace| {
+                partitions
+                    .get_by_ns(namespace)
+                    .is_some_and(IggyPartition::primary_transfer_pending)
+            })
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    assert!(!shard.primary_handoff_pending());
+
+    shard.begin_primary_handoff();
+    shard.tick_primary_handoff();
+    assert_eq!(
+        deferred().len(),
+        crate::PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX,
+        "handoffs that one tick starts"
+    );
+
+    for _ in 0..namespaces.len() {
+        shard.tick_primary_handoff();
+    }
+    assert_eq!(
+        deferred().len(),
+        crate::PARTITION_VIEW_CHANGES_INFLIGHT_MAX,
+        "handoffs in flight at the limit"
+    );
+    assert!(shard.primary_handoff_pending());
+
+    partitions.remove(&deferred()[0]).unwrap();
+    shard.tick_primary_handoff();
+    assert_eq!(
+        deferred().len(),
+        crate::PARTITION_VIEW_CHANGES_INFLIGHT_MAX,
+        "one handoff ended, so the pass starts one more"
+    );
+}
+
+/// View changes that a peer or a failover started load the same I/O lane, so
+/// they count against the limit of the pass.
+#[test]
+fn given_view_changes_at_the_inflight_limit_when_handing_off_should_hold_the_pass_until_one_ends() {
+    let (shard, _inbox) = owner();
+    let partitions = shard.plane.partitions();
+    let led = IggyNamespace::new(1, 1, 0);
+    insert_led_partition(&shard, led);
+    let changing: Vec<_> = (1..=crate::PARTITION_VIEW_CHANGES_INFLIGHT_MAX)
+        .map(|partition_id| IggyNamespace::new(1, 1, partition_id))
+        .collect();
+    for &namespace in &changing {
+        insert_led_partition(&shard, namespace);
+        let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+        assert!(!consensus.request_primary_transfer(0, TARGET).is_empty());
+    }
+    let deferred = || {
+        partitions
+            .get_by_ns(&led)
+            .unwrap()
+            .primary_transfer_pending()
+    };
+
+    shard.begin_primary_handoff();
+    shard.tick_primary_handoff();
+    assert!(!deferred(), "the shard holds view changes at the limit");
+    assert!(shard.primary_handoff_pending());
+
+    partitions.remove(&changing[0]).unwrap();
+    shard.tick_primary_handoff();
+    assert!(deferred(), "one view change ended");
+}
+
+/// Partitions each node took from the pass in progress.
+fn handoffs_given(shard: &TestShard) -> [u32; HANDOFF_NODES] {
+    match &*shard.primary_handoff.borrow() {
+        PrimaryHandoff::Walking { given, .. } => *given,
+        other => panic!("no pass in progress: {other:?}"),
+    }
+}
+
+/// The in-sync mask of a quiet group still names a node that went away after
+/// the last heartbeat of the group. A handoff to it would wait for the status
+/// timeout of its view change.
+#[test]
+fn given_a_member_whose_link_is_down_when_handing_off_should_pick_a_member_that_is_up() {
+    let (shard, _inbox) = owner();
+    for partition_id in 0..crate::PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX {
+        insert_led_partition(&shard, IggyNamespace::new(1, 1, partition_id));
+    }
+    shard.bus.links_down.set(1 << SOURCE);
+
+    shard.begin_primary_handoff();
+    shard.tick_primary_handoff();
+
+    let mut given = [0; HANDOFF_NODES];
+    given[usize::from(TARGET)] =
+        u32::try_from(crate::PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX).unwrap();
+    assert_eq!(handoffs_given(&shard), given);
+}
+
+#[test]
+fn given_no_member_whose_link_is_up_when_handing_off_should_end_the_pass_at_once() {
+    let (shard, _inbox) = owner();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    insert_led_partition(&shard, namespace);
+    shard.bus.links_down.set((1 << SOURCE) | (1 << TARGET));
+
+    shard.begin_primary_handoff();
+    shard.tick_primary_handoff();
+
+    assert!(
+        !shard.primary_handoff_pending(),
+        "the last node of a cluster must not wait for a handoff"
+    );
+    let partitions = shard.plane.partitions();
+    assert!(
+        !partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .primary_transfer_pending()
+    );
+}
+
+/// The node waits for the view changes of its own handoffs, so that its bus
+/// does not cut them. It does not wait for one whose next primary went away.
+#[test]
+fn given_a_handoff_in_view_change_when_its_target_goes_away_should_end_the_pass() {
+    let (shard, _inbox) = owner_with_no_metadata_group();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    insert_led_partition(&shard, namespace);
+    let partitions = shard.plane.partitions();
+    let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+    assert!(!consensus.request_primary_transfer(0, TARGET).is_empty());
+    assert_eq!(consensus.status(), consensus::Status::ViewChange);
+    let now = shard.bus.monotonic_now();
+    shard.bus.now.set(Some(now));
+    *shard.primary_handoff.borrow_mut() = PrimaryHandoff::Walking {
+        remaining: Vec::new(),
+        handed_off: vec![(namespace, now + GRANT_TIMEOUT)],
+        given: [0; HANDOFF_NODES],
+        leaving: 0,
+    };
+
+    shard.tick_primary_handoff();
+    assert!(
+        shard.primary_handoff_pending(),
+        "the view change still needs this node"
+    );
+
+    shard.bus.links_down.set(1 << TARGET);
+    shard.tick_primary_handoff();
+    assert!(!shard.primary_handoff_pending());
+}
+
+/// A view change that a peer started ends without this node, and one that
+/// lost its quorum never ends. Neither may hold a stop.
+#[test]
+fn given_a_view_change_that_no_handoff_started_when_handing_off_should_not_wait_for_it() {
+    let (shard, _inbox) = owner();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    insert_led_partition(&shard, namespace);
+    let partitions = shard.plane.partitions();
+    let consensus = partitions.get_by_ns(&namespace).unwrap().consensus();
+    assert!(!consensus.request_primary_transfer(0, TARGET).is_empty());
+
+    shard.begin_primary_handoff();
+    shard.tick_primary_handoff();
+
+    assert!(!shard.primary_handoff_pending());
+}
+
+/// Nodes that stop at the same time would hand their partitions to each other
+/// until the timeout. A primary that gives a group to this node leaves too, so
+/// it gets none.
+#[compio::test]
+async fn given_a_primary_that_gives_a_group_to_this_node_when_handing_off_should_give_that_peer_nothing()
+ {
+    const SOURCE_VIEW: u32 = 1;
+    const OWN_NEXT_VIEW: u32 = 3;
+    let (shard, _inbox) = owner_with_no_metadata_group();
+    for partition_id in 0..crate::PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX {
+        insert_led_partition(&shard, IggyNamespace::new(1, 1, partition_id));
+    }
+    shard.begin_primary_handoff();
+
+    node_1_votes(
+        &shard,
+        IggyNamespace::new(1, 2, 0),
+        SOURCE_VIEW,
+        OWN_NEXT_VIEW,
+    )
+    .await;
+    shard.tick_primary_handoff();
+
+    assert_eq!(peers_taken_for_leaving(&shard), 1 << SOURCE);
+    let mut given = [0; HANDOFF_NODES];
+    given[usize::from(TARGET)] =
+        u32::try_from(crate::PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX).unwrap();
+    assert_eq!(handoffs_given(&shard), given);
+}
+
+/// A backup that votes for a view of this node suspects its primary. That
+/// says nothing about the nodes that stay.
+#[compio::test]
+async fn given_a_backup_that_votes_for_a_view_of_this_node_when_handing_off_should_take_no_peer_for_leaving()
+ {
+    const TARGET_VIEW: u32 = 2;
+    const OWN_NEXT_VIEW: u32 = 3;
+    let (shard, _inbox) = owner_with_no_metadata_group();
+    shard.begin_primary_handoff();
+
+    node_1_votes(
+        &shard,
+        IggyNamespace::new(1, 2, 0),
+        TARGET_VIEW,
+        OWN_NEXT_VIEW,
+    )
+    .await;
+
+    assert_eq!(peers_taken_for_leaving(&shard), 0);
+}
+
+/// The coordinator moves primaries between the peers that stay. Such a move
+/// is not a handoff to this node.
+#[compio::test]
+async fn given_a_primary_that_gives_a_group_to_another_peer_when_handing_off_should_take_no_peer_for_leaving()
+ {
+    const SOURCE_VIEW: u32 = 1;
+    const TARGET_NEXT_VIEW: u32 = 2;
+    let (shard, _inbox) = owner_with_no_metadata_group();
+    shard.begin_primary_handoff();
+
+    node_1_votes(
+        &shard,
+        IggyNamespace::new(1, 2, 0),
+        SOURCE_VIEW,
+        TARGET_NEXT_VIEW,
+    )
+    .await;
+
+    assert_eq!(peers_taken_for_leaving(&shard), 0);
+}
+
+/// A handoff waits for the drain of its partition before its view change
+/// starts. A node that stops in between hands off nothing.
+#[test]
+fn given_a_handoff_that_waits_for_its_drain_when_handing_off_should_keep_the_pass() {
+    let (shard, _inbox) = owner();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    insert_led_partition(&shard, namespace);
+
+    shard.begin_primary_handoff();
+    shard.tick_primary_handoff();
+    shard.tick_primary_handoff();
+
+    let partitions = shard.plane.partitions();
+    let partition = partitions.get_by_ns(&namespace).unwrap();
+    assert!(partition.primary_transfer_pending());
+    assert_eq!(partition.consensus().status(), consensus::Status::Normal);
+    assert!(
+        shard.primary_handoff_pending(),
+        "the drain still needs this node"
+    );
+}
+
+/// A node that leaves takes no primary. The coordinator counts itself out, a
+/// peer answers the metadata probe as not ready, and each partition refuses
+/// its probe, which covers the moves planned before the coordinator knew.
+#[compio::test]
+async fn given_a_node_that_leaves_when_asked_for_readiness_should_refuse() {
+    let (coordinator, _inbox) = owner();
+    coordinator.tick_primary_rebalance().await;
+    assert!(coordinator.primary_rebalance.borrow().eligible[0]);
+    coordinator.begin_primary_handoff();
+    coordinator.tick_primary_rebalance().await;
+    assert!(
+        !coordinator.primary_rebalance.borrow().eligible[0],
+        "the coordinator must plan no move to itself"
+    );
+
+    let (peer, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = peer.plane.metadata().consensus.as_ref().unwrap();
+    let mut probe = probe_header(consensus, NONCE);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    peer.on_primary_rebalance(probe, Vec::new()).await;
+    assert_eq!(peer.bus.sent.borrow().last().unwrap().1.ready, 1);
+    peer.begin_primary_handoff();
+    probe.nonce += 1;
+    peer.on_primary_rebalance(probe, Vec::new()).await;
+    assert_eq!(
+        peer.bus.sent.borrow().last().unwrap().1.ready,
+        0,
+        "the metadata probe"
+    );
+
+    let (source, _inbox) = owner();
+    let namespace = IggyNamespace::new(1, 1, 0);
+    insert_led_partition(&source, namespace);
+    let consensus = source.plane.metadata().consensus.as_ref().unwrap();
+    let mut capture = probe_header(consensus, NONCE);
+    capture.kind = PrimaryRebalanceKind::SourceProbe;
+    capture.replica = TARGET;
+    capture.namespace = namespace.inner();
+    capture.created_revision = source
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .created_revision_for_namespace(namespace)
+        .unwrap();
+    capture.partition_view = 0;
+    source
+        .on_local_rebalance(LocalRebalance::Capture(capture))
+        .await;
+    assert_eq!(source.bus.sent.borrow().last().unwrap().1.ready, 1);
+    source.begin_primary_handoff();
+    source
+        .on_local_rebalance(LocalRebalance::Capture(capture))
+        .await;
+    assert_eq!(
+        source.bus.sent.borrow().last().unwrap().1.ready,
+        0,
+        "the partition probe"
+    );
+}
+
+/// A target that cannot lead yet, such as a peer that restarted and still
+/// probes for the view, holds the view change until the status timeout. The
+/// pass waits for each handoff until one grant after its transfer expires.
+#[test]
+fn given_a_handoff_that_does_not_end_when_handing_off_should_stop_waiting_after_its_deadline() {
+    let (shard, _inbox) = owner();
+    insert_led_partition(&shard, IggyNamespace::new(1, 1, 0));
+    let start = shard.bus.monotonic_now();
+    shard.bus.now.set(Some(start));
+    let deadline = start + GRANT_TIMEOUT + GRANT_TIMEOUT;
+
+    shard.begin_primary_handoff();
+    shard.tick_primary_handoff();
+    // No pump serves the partition I/O here, so the transfer never ends.
+    shard
+        .bus
+        .now
+        .set(Some(deadline.checked_sub(Duration::from_nanos(1)).unwrap()));
+    shard.tick_primary_handoff();
+    assert!(
+        shard.primary_handoff_pending(),
+        "the handoff may still end before its deadline"
+    );
+
+    shard.bus.now.set(Some(deadline));
+    shard.tick_primary_handoff();
+    assert!(!shard.primary_handoff_pending());
+}
+
+/// A group in the view that `replica` leads, as the pass of that node sees it.
+fn group_led_by(replica: u8) -> VsrConsensus<Rc<RecordingBus>> {
+    let mut consensus = VsrConsensus::new(
+        CLUSTER,
+        replica,
+        REPLICAS,
+        0,
+        Rc::new(RecordingBus::default()),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    consensus.set_view(u32::from(replica));
+    consensus.set_log_view(u32::from(replica));
+    consensus
+}
+
+/// The members of a group share its primaries: each handoff goes to the member
+/// that took the fewest so far.
+#[test]
+fn given_groups_to_hand_off_when_picking_targets_should_give_each_member_the_same_number() {
+    let group = group_led_by(0);
+    let mut given = [0; HANDOFF_NODES];
+    let members = 0b0110;
+    for _ in 0..6 {
+        let target = least_given(&group, members, &given).unwrap();
+        given[usize::from(target)] += 1;
+    }
+    assert_eq!(given[..4], [0, 3, 3, 0]);
+    assert_eq!(least_given(&group, 0, &given), None, "no member keeps up");
+}
+
+/// Before the handoff, a stop left each group to an election, which picks the
+/// first member to lead after the current view. A tie keeps that order.
+#[test]
+fn given_a_tie_when_picking_a_target_should_pick_the_member_an_election_would_pick() {
+    let given = [0; HANDOFF_NODES];
+    for (leader, peers, elected) in [(0, 0b110, 1), (1, 0b101, 2), (2, 0b011, 0)] {
+        assert_eq!(
+            least_given(&group_led_by(leader), peers, &given),
+            Some(elected),
+            "a tie in a group that node {leader} leads"
+        );
+    }
+    assert_eq!(
+        least_given(&group_led_by(1), 0b001, &given),
+        Some(0),
+        "the next view of a group may belong to a member that is no target"
+    );
+}
+
 #[test]
 fn given_busy_source_history_when_capturing_frontier_should_allow_drain_but_not_target_readiness() {
     let (mut partition, probe) = ready_partition(SOURCE);
@@ -1022,43 +1763,21 @@ fn given_busy_source_history_when_capturing_frontier_should_allow_drain_but_not_
     assert!(!partition_ready(&partition, &probe));
 }
 
+/// A node is ready for primaries by its metadata consensus alone. What its
+/// partitions repair is the business of each partition probe.
 #[compio::test]
-async fn given_another_shard_recovering_when_metadata_is_probed_should_refuse_primary_moves_without_blocking_admission()
- {
+async fn given_a_metadata_probe_should_answer_ready_only_while_the_metadata_consensus_is_settled() {
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
     let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
-    let frontier = shard.plane.metadata().applied_frontier();
-    let other_shard = frontier.track_partition_recovery();
-    other_shard.set_active(true);
     let mut probe = probe_header(consensus, NONCE);
     probe.replica = 0;
     probe.quorum_age_ns = 0;
     shard.on_primary_rebalance(probe, Vec::new()).await;
+    assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 1);
+    consensus.observe_newer_view(consensus.view() + 1);
     probe.nonce += 1;
     shard.on_primary_rebalance(probe, Vec::new()).await;
     assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 0);
-    assert!(frontier.partition_requests_allowed(shard.bus.monotonic_now()));
-    drop(other_shard);
-    probe.nonce += 1;
-    shard.on_primary_rebalance(probe, Vec::new()).await;
-    assert_eq!(shard.bus.sent.borrow().last().unwrap().1.ready, 1);
-}
-
-#[compio::test]
-async fn given_local_partition_recovery_when_the_coordinator_probes_should_exclude_itself_until_recovery_finishes()
- {
-    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, 3, 0);
-    let recovery = shard
-        .plane
-        .metadata()
-        .applied_frontier()
-        .track_partition_recovery();
-    recovery.set_active(true);
-    shard.tick_primary_rebalance().await;
-    assert!(!shard.primary_rebalance.borrow().eligible[0]);
-    recovery.set_active(false);
-    shard.tick_primary_rebalance().await;
-    assert!(shard.primary_rebalance.borrow().eligible[0]);
 }
 
 #[compio::test]
