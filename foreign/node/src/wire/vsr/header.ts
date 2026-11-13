@@ -126,6 +126,10 @@ export const EMPTY_PARTITION_CONTEXT: PartitionContext = Object.freeze({
   metadataOp: 0n
 });
 
+export const sameContext = (left: PartitionContext, right: PartitionContext): boolean =>
+  left.incarnation === right.incarnation && left.ownerGeneration === right.ownerGeneration &&
+  left.metadataOp === right.metadataOp;
+
 export const deserializePartitionContext = (data: Buffer, offset = 0): PartitionContext => ({
   incarnation: data.readBigUInt64LE(offset),
   ownerGeneration: data.readBigUInt64LE(offset + 8),

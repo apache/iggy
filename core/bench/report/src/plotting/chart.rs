@@ -21,13 +21,11 @@ use charming::{
         Axis, DataView, DataZoom, DataZoomType, Feature, Grid, Legend, LegendSelectedMode,
         LegendType, Restore, SaveAsImage, Title, Toolbox, ToolboxDataZoom,
     },
-    datatype::DataPoint,
     element::{
-        AxisLabel, AxisPointer, AxisPointerType, AxisType, Emphasis, ItemStyle, Label,
-        LabelPosition, LineStyle, NameLocation, Orient, SplitLine, Symbol, TextAlign, TextStyle,
-        Tooltip,
+        AxisLabel, AxisPointer, AxisPointerType, AxisType, Emphasis, ItemStyle, LineStyle,
+        NameLocation, Orient, SplitLine, TextAlign, TextStyle, Tooltip, Trigger,
     },
-    series::{Bar, Line, Scatter},
+    series::{Bar, Line},
 };
 
 pub struct IggyChart {
@@ -35,6 +33,17 @@ pub struct IggyChart {
 }
 
 const AXIS_TEXT_SIZE: u32 = 16;
+const LEGEND_TEXT_SIZE: u32 = 12;
+/// Room for the y axis labels and the y axis name.
+const GRID_LEFT: i32 = 70;
+/// Margins of a card chart in pixels: the legend above the grid, the x axis labels below it.
+const CARD_GRID_TOP: i32 = 40;
+const CARD_GRID_RIGHT: i32 = 24;
+const CARD_GRID_BOTTOM: i32 = 32;
+/// Room under the grid of a zoomable card chart for the x axis labels and the slider below them.
+const ZOOM_CARD_GRID_BOTTOM: i32 = 76;
+const ZOOM_SLIDER_BOTTOM: i32 = 8;
+const TRANSPARENT: &str = "transparent";
 
 impl IggyChart {
     /// Create a new `IggyChart` with default tooltip, legend, grid, and toolbox.
@@ -69,14 +78,20 @@ impl IggyChart {
                     .top("middle")
                     .orient(Orient::Vertical)
                     .selected_mode(LegendSelectedMode::Multiple)
-                    .text_style(TextStyle::new().font_size(12))
+                    .text_style(TextStyle::new().font_size(LEGEND_TEXT_SIZE))
                     .padding(10)
                     .item_gap(10)
                     .item_width(25)
                     .item_height(14)
                     .type_(LegendType::Scroll),
             )
-            .grid(Grid::new().left(70).right("20%").top(grid_top).bottom("8%"))
+            .grid(
+                Grid::new()
+                    .left(GRID_LEFT)
+                    .right("20%")
+                    .top(grid_top)
+                    .bottom("8%"),
+            )
             .data_zoom(
                 DataZoom::new()
                     .show(true)
@@ -101,6 +116,49 @@ impl IggyChart {
             chart
         };
 
+        Self { inner: chart }
+    }
+
+    /// A chart for a card on a page: no title, no toolbox and no zoom slider, the legend above the
+    /// grid and margins in pixels, so a short chart keeps its axis labels clear. The card draws the
+    /// background.
+    pub fn card() -> Self {
+        Self::card_with_grid_bottom(CARD_GRID_BOTTOM)
+    }
+
+    /// A card chart with a zoom slider under the x axis, so a reader can narrow a long run down to
+    /// one peak. The slider takes no mouse wheel events, so the page still scrolls over the chart.
+    pub fn zoomable_card() -> Self {
+        let chart = Self::card_with_grid_bottom(ZOOM_CARD_GRID_BOTTOM)
+            .inner
+            .data_zoom(
+                DataZoom::new()
+                    .type_(DataZoomType::Slider)
+                    .bottom(ZOOM_SLIDER_BOTTOM)
+                    .start(0)
+                    .end(100),
+            );
+        Self { inner: chart }
+    }
+
+    fn card_with_grid_bottom(grid_bottom: i32) -> Self {
+        let chart = Chart::new()
+            .background_color(TRANSPARENT)
+            .tooltip(Tooltip::new().trigger(Trigger::Axis))
+            .legend(
+                Legend::new()
+                    .show(true)
+                    .top(0)
+                    .type_(LegendType::Scroll)
+                    .text_style(TextStyle::new().font_size(LEGEND_TEXT_SIZE)),
+            )
+            .grid(
+                Grid::new()
+                    .left(GRID_LEFT)
+                    .right(CARD_GRID_RIGHT)
+                    .top(CARD_GRID_TOP)
+                    .bottom(grid_bottom),
+            );
         Self { inner: chart }
     }
 
@@ -133,20 +191,14 @@ impl IggyChart {
     }
 
     /// Configure a Y axis for e.g. throughput in msg/s or MB/s.
-    pub fn with_y_axis(mut self, axis_label: &str) -> Self {
-        self.inner = self.inner.y_axis(
-            Axis::new()
-                .type_(AxisType::Value)
-                .name(axis_label)
-                .name_location(NameLocation::Middle)
-                .name_rotation(90)
-                .name_text_style(TextStyle::new().font_size(AXIS_TEXT_SIZE))
-                .name_gap(44)
-                .position("left")
-                .axis_label(AxisLabel::new())
-                .split_line(SplitLine::new().show(true)),
-        );
-        self
+    pub fn with_y_axis(self, axis_label: &str) -> Self {
+        self.with_left_y_axis(AxisType::Value, axis_label)
+    }
+
+    /// Configure a logarithmic Y axis, for values that span orders of magnitude, such as a run's
+    /// latency percentiles.
+    pub fn with_log_y_axis(self, axis_label: &str) -> Self {
+        self.with_left_y_axis(AxisType::Log, axis_label)
     }
 
     /// Configure dual Y axes for e.g. throughput in MB/s and msg/s.
@@ -177,40 +229,6 @@ impl IggyChart {
                 .axis_label(AxisLabel::new())
                 .split_line(SplitLine::new().show(true)),
         );
-        self
-    }
-
-    pub fn add_series(mut self, name: &str, data: Vec<f64>, symbol: Symbol, color: &str) -> Self {
-        let line = Line::new()
-            .name(name)
-            .data(data)
-            .symbol(symbol)
-            .symbol_size(8.0)
-            .line_style(LineStyle::new().width(3.0))
-            .item_style(ItemStyle::new().color(color));
-
-        self.inner = self.inner.series(line);
-        self
-    }
-
-    pub fn add_dual_series(
-        mut self,
-        name: &str,
-        data: Vec<f64>,
-        symbol: Symbol,
-        color: &str,
-        y_axis_index: usize,
-    ) -> Self {
-        let line = Line::new()
-            .name(name)
-            .data(data)
-            .symbol(symbol)
-            .symbol_size(8.0)
-            .line_style(LineStyle::new().width(3.0))
-            .item_style(ItemStyle::new().color(color))
-            .y_axis_index(y_axis_index as f64);
-
-        self.inner = self.inner.series(line);
         self
     }
 
@@ -275,31 +293,6 @@ impl IggyChart {
         self
     }
 
-    /// Add a scatter series with labels (for percentile markers).
-    pub fn add_scatter_series(
-        mut self,
-        name: &str,
-        data: Vec<DataPoint>,
-        symbol_size: f64,
-        color: &str,
-    ) -> Self {
-        let scatter = Scatter::new()
-            .name(name)
-            .data(data)
-            .symbol_size(symbol_size)
-            .item_style(ItemStyle::new().color(color))
-            .label(
-                Label::new()
-                    .show(true)
-                    .position(LabelPosition::Top)
-                    .font_size(11)
-                    .formatter("{b}"),
-            );
-
-        self.inner = self.inner.series(scatter);
-        self
-    }
-
     /// Add a new line series to the chart with specified Y axis.
     /// y_axis_index: 0 for left axis, 1 for right axis
     pub fn add_dual_time_line_series(
@@ -324,6 +317,22 @@ impl IggyChart {
         }
 
         self.inner = self.inner.series(line);
+        self
+    }
+
+    fn with_left_y_axis(mut self, axis_type: AxisType, axis_label: &str) -> Self {
+        self.inner = self.inner.y_axis(
+            Axis::new()
+                .type_(axis_type)
+                .name(axis_label)
+                .name_location(NameLocation::Middle)
+                .name_rotation(90)
+                .name_text_style(TextStyle::new().font_size(AXIS_TEXT_SIZE))
+                .name_gap(44)
+                .position("left")
+                .axis_label(AxisLabel::new())
+                .split_line(SplitLine::new().show(true)),
+        );
         self
     }
 }

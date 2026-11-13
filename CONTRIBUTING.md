@@ -10,6 +10,8 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
+Connector issues and PRs go to [apache/iggy-connectors](https://github.com/apache/iggy-connectors).
+
 ### Good First Issues
 
 The `good first issue` label marks issues for new contributors.
@@ -25,7 +27,6 @@ These require design discussion in the issue before coding:
 - Protocol (binary format, wire encoding)
 - Concurrency (shards, inter-shard)
 - Public API (HTTP, SDKs, CLI)
-- Connectors
 
 ## PR Requirements
 
@@ -122,6 +123,27 @@ runs CI again on GitHub Actions runners that all Apache projects share. A mainta
 updates the branch before the merge.
 
 If GitHub reports a merge conflict, or if a maintainer asks you to, update your branch.
+
+### Stacked PRs
+
+These rules apply to a GitHub native stack, for example one made with `gh stack`. Each PR
+in a stack builds on the one below it. CI runs for every PR in a stack, and the position
+decides what a run does:
+
+- The lowest unmerged PR runs the full CI for its own changes.
+- The top PR runs the full CI for its own changes and for the changes of the PRs between.
+- Each PR between them runs only `Common checks` and the Rust `fmt`, `sort`, `machete`
+  and `clippy` tasks. Its run shows a notice that says so.
+
+Merge the lowest PR alone, or merge the whole stack from the top PR. Do not merge a group
+that ends at a PR between them. GitHub permits that merge, but only lint ran for those
+PRs. To land only the lower part of a stack, merge its PRs one at a time from the bottom.
+
+GitHub keeps a closed PR in the stack count, so the PR below a closed top PR does not
+become the top. In that case, merge the remaining PRs one at a time from the bottom.
+
+To merge the whole stack, use the merge box of the top PR, or run `gh stack merge` from
+the `github/gh-stack` extension.
 
 ### Quality Checks
 

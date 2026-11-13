@@ -724,6 +724,33 @@ async fn given_http_only_routes_when_requested_should_return_expected_shapes(
     );
 }
 
+/// The POST-only login route shadows `{name}`, which used to answer this DELETE with 405.
+#[iggy_harness]
+async fn given_pat_named_login_when_deleted_over_http_should_return_204(harness: &TestHarness) {
+    let root = HttpClient::login_root(harness).await;
+    assert_eq!(
+        root.post_json(
+            "/personal-access-tokens",
+            &json!({ "name": "login", "expiry": 0 }),
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+        "create PAT named login must be 200"
+    );
+    assert_eq!(
+        root.delete("/personal-access-tokens/login").await.status(),
+        StatusCode::NO_CONTENT,
+        "DELETE of a PAT named login must be 204, not 405"
+    );
+    assert!(
+        pat_names(root.get("/personal-access-tokens").await)
+            .await
+            .is_empty(),
+        "the login-named PAT must be gone"
+    );
+}
+
 // === Change-password wire contract (status/body shape) ==========================
 
 /// The current-password check gates a self-service rotation: a wrong current

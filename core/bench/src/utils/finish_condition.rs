@@ -24,6 +24,7 @@ use std::{
         atomic::{AtomicI64, Ordering},
     },
 };
+use tokio::sync::Notify;
 
 const MINIMUM_MSG_PAYLOAD_SIZE: usize = 20;
 
@@ -57,6 +58,7 @@ pub struct BenchmarkFinishCondition {
     total: u64,
     left_total: Arc<AtomicI64>,
     mode: BenchmarkFinishConditionMode,
+    done: Notify,
 }
 
 impl BenchmarkFinishCondition {
@@ -106,6 +108,7 @@ impl BenchmarkFinishCondition {
                     total: u64::from(count_per_actor),
                     left_total: Arc::new(AtomicI64::new(i64::from(count_per_actor))),
                     mode,
+                    done: Notify::new(),
                 }
             }
             (Some(size), None) => {
@@ -118,6 +121,7 @@ impl BenchmarkFinishCondition {
                         i64::try_from(bytes_per_actor).unwrap_or(i64::MAX),
                     )),
                     mode,
+                    done: Notify::new(),
                 }
             }
             _ => unreachable!(),
@@ -132,6 +136,7 @@ impl BenchmarkFinishCondition {
             total: 0,
             left_total: Arc::new(AtomicI64::new(0)),
             mode: BenchmarkFinishConditionMode::Shared,
+            done: Notify::new(),
         })
     }
 
@@ -147,11 +152,26 @@ impl BenchmarkFinishCondition {
                 self.left_total.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        self.left_total.load(Ordering::Acquire) <= 0
+        let done = self.left_total.load(Ordering::Acquire) <= 0;
+        if done {
+            self.done.notify_waiters();
+        }
+        done
     }
 
     pub fn is_done(&self) -> bool {
         self.left() <= 0
+    }
+
+    /// Completes when any holder reaches the total. In shared mode, another actor can reach it
+    /// while this one waits for a batch.
+    pub async fn wait_until_done(&self) {
+        // The future takes each wake-up from the moment it exists, so a total reached after
+        // the check still ends the wait.
+        let notified = self.done.notified();
+        if !self.is_done() {
+            notified.await;
+        }
     }
 
     pub const fn total(&self) -> u64 {

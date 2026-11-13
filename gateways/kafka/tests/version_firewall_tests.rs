@@ -58,11 +58,11 @@ use tcp::{
 };
 use wire::{
     JoinGroupParams, OUT_OF_SCOPE_API_KEYS, SyncGroupParams, build_alter_configs_empty_request,
-    build_api_versions_flexible_request, build_create_partitions_empty_request,
-    build_create_topics_empty_request, build_delete_groups_request,
-    build_delete_topics_empty_request, build_describe_configs_empty_request,
-    build_describe_groups_request, build_fetch_empty_topics_request,
-    build_find_coordinator_request, build_heartbeat_request,
+    build_api_versions_flexible_request, build_api_versions_v5_request,
+    build_create_partitions_empty_request, build_create_topics_empty_request,
+    build_delete_groups_request, build_delete_topics_empty_request,
+    build_describe_configs_empty_request, build_describe_groups_request,
+    build_fetch_empty_topics_request, build_find_coordinator_request, build_heartbeat_request,
     build_incremental_alter_configs_empty_request, build_init_producer_id_request,
     build_join_group_request, build_leave_group_request, build_list_groups_request,
     build_list_offsets_request, build_metadata_all_topics_flexible,
@@ -187,17 +187,25 @@ async fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
 
 #[tokio::test]
 async fn apiversions_all_versions_return_success() {
-    for version in 0i16..=3 {
-        let request = if version >= 3 {
-            build_api_versions_flexible_request("iggy-test", "0.1.0")
-        } else {
-            Bytes::new()
-        };
+    for version in 0i16..=5 {
+        let request = api_versions_body(version);
         let body = handle_request(API_KEY_API_VERSIONS, version, request, &default_broker())
             .await
             .expect_response("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         assert_eq!(d.read_i16().unwrap(), 0, "ApiVersions v{version}");
+    }
+}
+
+/// The body a client sends at `version`. From v5, it names no broker, as on a connection to a
+/// bootstrap server.
+fn api_versions_body(version: i16) -> Bytes {
+    if version >= 5 {
+        build_api_versions_v5_request(None, -1)
+    } else if version >= 3 {
+        build_api_versions_flexible_request("iggy-test", "0.1.0")
+    } else {
+        Bytes::new()
     }
 }
 
@@ -470,13 +478,7 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
                 build_metadata_all_topics_legacy(version)
             }
         }
-        API_KEY_API_VERSIONS => {
-            if version >= 3 {
-                build_api_versions_flexible_request("iggy-test", "0.1.0")
-            } else {
-                Bytes::new()
-            }
-        }
+        API_KEY_API_VERSIONS => api_versions_body(version),
         API_KEY_PRODUCE => {
             // `_or_skip` (not bare `load_fixture_body`) so `KAFKA_FIXTURES_REQUIRED=1` panics on
             // a missing in-range fixture instead of this falling through to a synthetic body and
@@ -631,15 +633,15 @@ async fn apiversions_v0_and_v2_e2e_return_success() {
 }
 
 #[tokio::test]
-async fn apiversions_v4_out_of_range_e2e_returns_unsupported() {
+async fn apiversions_v6_out_of_range_e2e_returns_unsupported() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 4, 350, &[]).await;
+    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 6, 350, &[]).await;
     assert_eq!(corr, 350);
     let mut d = Decoder::new(body);
     assert_eq!(
         d.read_i16().unwrap(),
         ERROR_UNSUPPORTED_VERSION,
-        "ApiVersions v4 must return UNSUPPORTED_VERSION per KIP-511"
+        "ApiVersions v6 must return UNSUPPORTED_VERSION per KIP-511"
     );
 }
 
