@@ -34,7 +34,7 @@ pub fn SignIn() -> Element {
 
     use_effect(move || {
         if session.read().is_some() {
-            navigator.replace(Route::Streams {});
+            navigator.replace(Route::Overview {});
         }
     });
 
