@@ -82,6 +82,14 @@ describe('ChangePassword', () => {
       );
     });
 
+    it('throw on current password > 255 bytes - utf8 version', () => {
+      const password = '¥Ø£Ø'.repeat(33);
+      assert.throws(
+        () => CHANGE_PASSWORD.serialize({ ...input, currentPassword: password }),
+        currentPasswordError
+      );
+    });
+
     it('throw on new password > 255 bytes - utf8 version', () => {
       const password = '¥Ø£Ø'.repeat(33);
       assert.throws(
