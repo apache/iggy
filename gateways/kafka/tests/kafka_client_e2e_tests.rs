@@ -219,14 +219,16 @@ fn image_present(image: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Locates the already-built `iggy-server` alongside this test binary. Does not build it.
+/// Locates the already-built `iggy-server` in a parent directory of this test binary. Does not
+/// build it. Cargo puts final binaries in `target/<profile>/` and test binaries below it, at a
+/// depth that changes between cargo versions, so every parent is checked.
 fn iggy_server_binary() -> Option<PathBuf> {
-    let mut dir = std::env::current_exe().ok()?;
-    // .../target/<profile>/deps/<test binary> -> .../target/<profile>
-    dir.pop();
-    dir.pop();
-    let candidate = dir.join(format!("iggy-server{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+    let binary = format!("iggy-server{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .ok()?
+        .ancestors()
+        .map(|dir| dir.join(&binary))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Outcome of waiting for the spawned server to come up.

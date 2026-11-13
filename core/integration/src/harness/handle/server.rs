@@ -16,7 +16,7 @@
 // under the License.
 
 use super::client_builder::{ClientBuilder, ServerConnection};
-use super::common::SIGTERM_TIMEOUT;
+use super::common::{SIGTERM_TIMEOUT, cargo_bin_path};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
 use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
@@ -24,7 +24,6 @@ use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
 use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
-use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_common::{IggyDuration, TransportProtocol};
 use rand::RngExt as _;
@@ -1058,25 +1057,28 @@ impl TestBinary for ServerHandle {
             let _ = fs::remove_file(&config_path);
         }
 
-        #[allow(deprecated)]
         let launched_binary = self.launched_binary();
         let mut command = if let Some(ref path) = self.config.executable_path {
             let path_ref = Path::new(path);
             if path_ref.components().count() == 1 && !path_ref.exists() {
-                Command::cargo_bin(path).map_err(|e| TestBinaryError::ProcessSpawn {
-                    binary: launched_binary.clone(),
-                    source: std::io::Error::other(e.to_string()),
-                })?
+                Command::new(cargo_bin_path(path).map_err(|source| {
+                    TestBinaryError::ProcessSpawn {
+                        binary: launched_binary.clone(),
+                        source,
+                    }
+                })?)
             } else {
                 Command::new(path)
             }
         } else {
-            Command::cargo_bin(Self::default_server_binary()).map_err(|e| {
-                TestBinaryError::ProcessSpawn {
-                    binary: launched_binary.clone(),
-                    source: std::io::Error::other(e.to_string()),
-                }
-            })?
+            Command::new(
+                cargo_bin_path(Self::default_server_binary()).map_err(|source| {
+                    TestBinaryError::ProcessSpawn {
+                        binary: launched_binary.clone(),
+                        source,
+                    }
+                })?,
+            )
         };
 
         command.env("IGGY_PATH", data_path.display().to_string());

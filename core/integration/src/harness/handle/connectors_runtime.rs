@@ -27,7 +27,6 @@ use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::SinglePortReserver;
 use crate::harness::traits::{IggyServerDependent, TestBinary};
-use assert_cmd::prelude::CommandCargoExt;
 use configs::CONNECTORS_CONFIG_PATH_ENV;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -176,14 +175,15 @@ impl TestBinary for ConnectorsRuntimeHandle {
     fn start(&mut self) -> Result<(), TestBinaryError> {
         self.build_envs();
 
-        #[allow(deprecated)]
         let mut command = if let Some(ref path) = self.config.executable_path {
             Command::new(path)
         } else {
-            Command::cargo_bin("iggy-connectors").map_err(|e| TestBinaryError::ProcessSpawn {
-                binary: "iggy-connectors".to_string(),
-                source: std::io::Error::other(e.to_string()),
-            })?
+            Command::new(common::cargo_bin_path("iggy-connectors").map_err(|source| {
+                TestBinaryError::ProcessSpawn {
+                    binary: "iggy-connectors".to_string(),
+                    source,
+                }
+            })?)
         };
 
         command.envs(&self.envs);

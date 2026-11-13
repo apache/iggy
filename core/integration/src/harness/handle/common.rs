@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -27,6 +28,34 @@ pub const DEFAULT_HEALTH_CHECK_INTERVAL_MS: u64 = 20;
 /// How long a graceful stop waits after SIGTERM before it sends SIGKILL.
 pub const SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGKILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const CARGO_BIN_EXE_PREFIX: &str = "CARGO_BIN_EXE_";
+
+/// Returns the path of a binary that cargo built for the running test.
+///
+/// Cargo sets `CARGO_BIN_EXE_<name>` only for binaries of the test's own package. A binary of
+/// another package is looked up in every ancestor directory of the test binary: cargo puts final
+/// binaries in `target/<profile>/` and test binaries below it, at a depth that changes between
+/// cargo versions (`deps/` before 1.100, `build/<package>/<hash>/out/` since then).
+pub fn cargo_bin_path(name: &str) -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os(format!("{CARGO_BIN_EXE_PREFIX}{name}")) {
+        return Ok(PathBuf::from(path));
+    }
+    let file_name = format!("{name}{}", env::consts::EXE_SUFFIX);
+    let test_binary = env::current_exe()?;
+    test_binary
+        .ancestors()
+        .map(|directory| directory.join(&file_name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no {file_name} in any parent directory of {}, run `cargo build` first",
+                    test_binary.display()
+                ),
+            )
+        })
+}
 
 /// Collect stdout and stderr logs from file paths.
 pub fn collect_logs(
