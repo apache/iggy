@@ -765,6 +765,13 @@ pub trait MessageBus {
     fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
         ReplicaLinkMetrics::default()
     }
+
+    /// Whether frames flow to `replica` now. True by default: the simulator
+    /// bus and the test buses own no replica link, so their answer is the
+    /// result of the next send.
+    fn replica_is_up(&self, _replica: u8) -> bool {
+        true
+    }
 }
 
 /// Production message bus backed by real TCP connections.
@@ -1771,6 +1778,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
         (**self).take_replica_link_stats()
     }
+
+    fn replica_is_up(&self, replica: u8) -> bool {
+        (**self).replica_is_up(replica)
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -1870,6 +1881,10 @@ impl MessageBus for IggyMessageBus {
             bundles_up: self.bundles_up() as u64,
             ..self.replica_link_stats.take()
         }
+    }
+
+    fn replica_is_up(&self, replica: u8) -> bool {
+        self.owner_table.is_up(replica)
     }
 }
 

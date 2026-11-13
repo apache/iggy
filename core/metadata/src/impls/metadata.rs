@@ -96,6 +96,7 @@ use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io;
 #[cfg(feature = "simulator")]
 use std::io::Write;
@@ -4781,16 +4782,20 @@ where
 
     /// Suggest one count-balancing move only after normal failover has settled.
     /// `after` rotates candidates so a recovering target cannot starve other groups.
+    /// Each move in `inflight` counts as done, so a caller plans a round of
+    /// moves by adding each suggestion to `inflight` before the next call.
     pub fn primary_rebalance_candidate(
         &self,
         eligible: &[bool],
         after: Option<IggyNamespace>,
+        inflight: &BTreeMap<IggyNamespace, PartitionPrimaryTransfer>,
     ) -> Option<PartitionPrimaryTransfer> {
         self.placement.borrow_mut().primary_rebalance_candidate(
             self.mux_stm.streams(),
             self.consensus.as_ref()?.replica_count(),
             eligible,
             after,
+            inflight,
         )
     }
 

@@ -6603,6 +6603,15 @@ where
         true
     }
 
+    /// Whether a deferred primary transfer still waits for its drain.
+    #[must_use]
+    pub const fn primary_transfer_pending(&self) -> bool {
+        matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        )
+    }
+
     fn primary_transfer_is_current(&self, request: &crate::PreparedPrimaryTransfer) -> bool {
         request.is_active_at(self.consensus.message_bus().monotonic_now())
             && request.created_revision == self.created_revision()

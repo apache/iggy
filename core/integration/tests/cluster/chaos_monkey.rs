@@ -330,8 +330,10 @@ const CLEANER_INTERVAL: &str = "1s";
 /// The server's own shutdown budget has to end inside the harness's SIGTERM
 /// grace, or a wedged shard reads as a SIGKILL instead of the server's
 /// `abandoning it` line and its failure exit. Shard 0 may wait the join
-/// budget plus one drain and one poll interval, 3.05 s here against the 5 s
-/// grace; the defaults (10 s drain, 30 s join) outlast it.
+/// budget plus one drain and one poll interval, 3.05 s here, after a primary
+/// handoff of at most 1 s, against the 5 s grace; the defaults (15 s handoff,
+/// 10 s drain, 30 s join) outlast it.
+const SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT: &str = "1s";
 const SHUTDOWN_DRAIN_TIMEOUT: &str = "1s";
 const SHUTDOWN_POLL_INTERVAL: &str = "50ms";
 const SHUTDOWN_JOIN_TIMEOUT: &str = "2s";
@@ -1247,6 +1249,10 @@ fn build_cluster(config: &ChaosConfig) -> TestHarness {
         (
             "data_maintenance.messages.interval".to_owned(),
             CLEANER_INTERVAL.to_owned(),
+        ),
+        (
+            "sharding.shutdown_primary_handoff_timeout".to_owned(),
+            SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT.to_owned(),
         ),
         (
             "sharding.shutdown_drain_timeout".to_owned(),
