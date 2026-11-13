@@ -120,10 +120,12 @@ value fails with `invalidConnectionString`, and a bad retry count with
 `invalidNumberValue`, so a string is valid in every SDK or in none. Only the `iggy://`
 and `iggy+tcp://` schemes are accepted.
 
+Swift and Rust both reject values other than `true` or `false` for `tls`.
+
 Some options read differently than in Rust:
 
-- `tls` and `nodelay` take `true` or `false`, and any other value fails, where Rust
-  reads it as false.
+- Swift requires `true` or `false` for `nodelay`. Rust treats any value other
+  than `true` as false.
 - Without `nodelay` the client keeps Nagle off, its own default.
 - `reconnection_interval` is the full pause between rounds over the endpoints. Rust
   takes it as the base of a jittered backoff capped at 10 seconds.

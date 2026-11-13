@@ -35,10 +35,12 @@ extension ClientConfiguration {
     /// An unknown option fails the parse, so one string is valid in every
     /// SDK or in none.
     ///
+    /// Swift and Rust both reject values other than `true` or `false` for `tls`.
+    ///
     /// Some options read differently than in Rust:
     ///
-    /// - `tls` and `nodelay` take `true` or `false`, and any other value
-    ///   fails, where Rust reads it as false.
+    /// - Swift requires `true` or `false` for `nodelay`. Rust treats any
+    ///   value other than `true` as false.
     /// - Without `nodelay` the client keeps its own default, Nagle off.
     /// - `reconnection_interval` is the full pause between rounds over the
     ///   endpoints. Rust takes it as the base of a jittered backoff capped at
@@ -199,8 +201,7 @@ enum ConnectionString {
         }
     }
 
-    /// Rust reads any value but `true` as false, so `tls=1` would sign in
-    /// over plaintext. The Go, Node, Java and C# parsers refuse it instead.
+    /// Accepts only the literal values `true` and `false`.
     private static func flag(_ value: String, option: Substring) throws -> Bool {
         switch value {
         case "true": return true

@@ -6573,8 +6573,9 @@ class IggyBlockingClient final {
      * - `max_pending_operation_bytes=<positive integer>`
      *
      * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
-     * Certificate validation accepts exactly `true` or `false`. Disabling it
-     * leaves the connection vulnerable to server impersonation.
+     * Boolean values are `true` or `false`.
+     * The `tls` and `tls_validate_certificate` options reject all other values.
+     * Disabling certificate validation leaves the connection vulnerable to server impersonation.
      * For retry, cooldown and certificate validation options, the last occurrence
      * of a key or alias wins. Malformed values fail in any position.
      *
