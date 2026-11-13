@@ -1397,39 +1397,33 @@ describe('partition reader', () => {
       }
     });
 
-  for (const partitions of [[0, 1], [1, 3]]) {
-    for (const [name, start, firstOffset] of [
-      ['next', PollingStrategy.Next, 0n],
-      ['first', PollingStrategy.First, 0n],
-      ['offset 0', PollingStrategy.Offset(0n), 0n],
-      ['offset 4', PollingStrategy.Offset(4n), 4n]
-    ] as const) {
-      it(`rewinds unread on read batches on close from ${name}, partitions ${partitions}`, async () => {
-        const topic = new FakeTopic(firstOffset + 2n);
-        const client = topic.client();
-        const reader = await PartitionReader.open(async () => client, {
-          streamId: 1, topicId: 2, consumer, partitions, start,
-          options: { maxWait: 100, commit: CommitPolicy.OnRead }, retryInterval: 20
-        });
-        let taken: number;
-        try {
-          taken = (await reader.next()).partitionId;
-          await waitFor(() => partitions.every((partition) => topic.stored.get(partition) === firstOffset + 1n),
-            'both partitions were not committed by their reads');
-        } finally {
-          await reader.close();
-        }
-        assert.equal(topic.stored.get(taken), firstOffset + 1n);
-        const unread = partitions.find((partition) => partition !== taken)!;
-        assert.equal(topic.stored.get(unread), firstOffset === 0n ? undefined : firstOffset - 1n);
-        const resumed = await open(topic, [unread], { commit: CommitPolicy.OnRead });
-        try {
-          assert.deepEqual(offsets([await resumed.next()]), [firstOffset, firstOffset + 1n]);
-        } finally {
-          await resumed.close();
-        }
-      });
-    }
+  for (const [name, start, firstOffset, partitions] of [
+    ['next', PollingStrategy.Next, 0n, [0, 1]],
+    ['next', PollingStrategy.Next, 0n, [1, 3]],
+    ['offset 0', PollingStrategy.Offset(0n), 0n, [0, 1]],
+    ['offset 4', PollingStrategy.Offset(4n), 4n, [0, 1]]
+  ] as const) {
+    it(`rewinds unread on read batches on close from ${name}, partitions ${partitions}`, async () => {
+      const topic = new FakeTopic(firstOffset + 2n);
+      const reader = await open(topic, [...partitions], { commit: CommitPolicy.OnRead }, start);
+      let taken: number;
+      try {
+        taken = (await reader.next()).partitionId;
+        await waitFor(() => partitions.every((partition) => topic.stored.get(partition) === firstOffset + 1n),
+          'both partitions were not committed by their reads');
+      } finally {
+        await reader.close();
+      }
+      assert.equal(topic.stored.get(taken), firstOffset + 1n);
+      const unread = partitions.find((partition) => partition !== taken)!;
+      assert.equal(topic.stored.get(unread), firstOffset === 0n ? undefined : firstOffset - 1n);
+      const resumed = await open(topic, [unread], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [firstOffset, firstOffset + 1n]);
+      } finally {
+        await resumed.close();
+      }
+    });
   }
 
   it('stores the offset before an on read seek to an offset, so a restart resumes at the sought offset', async () => {
@@ -2975,6 +2969,12 @@ describe('partition reader', () => {
       assert.deepEqual(topic.fetches[0], [1, 3]);
       assert.deepEqual([topic.stored.get(taken.partitionId), topic.stored.get(undelivered), topic.offsetDeletes],
         [start + 1n, start === 0n ? undefined : start - 1n, start === 0n ? [undelivered] : []]);
+      const resumed = await open(topic, [undelivered], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [start, start + 1n]);
+      } finally {
+        await resumed.close();
+      }
     });
   }
 
