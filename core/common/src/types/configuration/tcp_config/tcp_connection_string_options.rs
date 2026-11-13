@@ -129,7 +129,7 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                 }
                 "reconnection_retries" => {
                     tracing::warn!(
-                        "Connection-string option 'reconnection_retries' is deprecated; use 'reconnection_max_retries' instead"
+                        "TCP connection string option `reconnection_retries` is deprecated; use `reconnection_max_retries` instead"
                     );
                     reconnection_max_retries = match option_parts[1] {
                         "unlimited" => None,

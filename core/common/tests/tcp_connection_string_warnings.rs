@@ -94,11 +94,11 @@ fn should_warn_for_each_deprecated_retry_option_even_if_overridden() {
     assert_eq!(warnings.len(), 6);
     for warning in warnings.iter() {
         assert!(
-            warning.contains("'reconnection_retries' is deprecated"),
+            warning.contains("TCP connection string option `reconnection_retries` is deprecated"),
             "{warning}"
         );
         assert!(
-            warning.contains("use 'reconnection_max_retries' instead"),
+            warning.contains("use `reconnection_max_retries` instead"),
             "{warning}"
         );
     }
