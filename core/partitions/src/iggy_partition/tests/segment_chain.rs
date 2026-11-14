@@ -24,7 +24,7 @@ use crate::segment_chain::{
     ChainError, ChainRecord, HashSource, ObjectPrefix, chain_path, hash_segment_file, read_chain,
 };
 
-const PREFIX: ObjectPrefix = ObjectPrefix {
+pub(super) const PREFIX: ObjectPrefix = ObjectPrefix {
     stream_id: 1,
     topic_id: 1,
     partition_id: 0,
@@ -33,7 +33,7 @@ const PREFIX: ObjectPrefix = ObjectPrefix {
 
 /// [`partition_with_sealed_segments`] whose chain opens once the first
 /// `before_chain` of `records` are committed.
-async fn tiered_partition(
+pub(super) async fn tiered_partition(
     records: &[Vec<u8>],
     before_chain: usize,
 ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
@@ -240,18 +240,6 @@ async fn given_a_single_replica_with_wal_written_bodies_when_a_segment_seals_sho
 async fn given_a_chain_opened_mid_segment_when_that_segment_seals_should_record_only_the_next() {
     let (directory, partition) =
         Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 1)).await;
-    assert!(partition.sealed_segment_record(0).is_none());
-    assert_records_hash_the_logs(&partition, directory.path(), &[2]).await;
-}
-
-/// Bytes that reach the active segment another way, as a state transfer
-/// install's do, leave it without a commit-path hash.
-#[compio::test]
-async fn given_a_discarded_digest_when_the_segment_seals_should_record_only_the_next() {
-    let records = segment_records(RECEIVER_OPS);
-    let (directory, mut partition) = Box::pin(tiered_partition(&records[..1], 0)).await;
-    partition.discard_segment_digest();
-    Box::pin(commit_records(&mut partition, 2, &records[1..])).await;
     assert!(partition.sealed_segment_record(0).is_none());
     assert_records_hash_the_logs(&partition, directory.path(), &[2]).await;
 }

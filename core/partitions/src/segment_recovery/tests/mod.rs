@@ -17,3 +17,4 @@
 
 use super::*;
 mod segment_recovery_tests;
+mod tiered;
