@@ -88,6 +88,11 @@ pub fn stage_owned_partitions(
     let now = IggyTimestamp::now();
     let namespaces: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
     let streams = shard.plane.metadata().mux_stm.streams();
+    let tiered_storage_ready = shard
+        .plane
+        .metadata()
+        .applied_frontier()
+        .tiered_storage_ready();
     let max_message_size = u64::try_from(shard.bus_max_message_size()).unwrap_or(u64::MAX);
     let mut tiered = Vec::new();
     for namespace in namespaces {
@@ -119,11 +124,16 @@ pub fn stage_owned_partitions(
         if let Some((age, size)) =
             streams.topic_local_retention(namespace.stream_id(), namespace.topic_id())
         {
-            shard.request_evict_partition(
-                namespace,
-                now,
-                local_envelope(age, size, partition_count),
-            );
+            // An evicted segment is read back from the store, so a node
+            // evicts only while it can tier topics: it passes the store
+            // identity check and its partitions read remote segments.
+            if tiered_storage_ready {
+                shard.request_evict_partition(
+                    namespace,
+                    now,
+                    local_envelope(age, size, partition_count),
+                );
+            }
             // One lookup, so both passes name the incarnation the watermark
             // was read for.
             let Some((created_revision, committed_up_to)) = streams

@@ -21,7 +21,8 @@
 //! put, a ranged get, head, a batch delete and a paged list. [`KeyLayout`]
 //! builds the keys of a partition's objects from its recorded
 //! [`ObjectPrefix`], and [`SegmentMetadata`] is the user metadata of a
-//! segment's `.log` object. [`TierExecutor`] is how uploads, cold reads and
+//! segment's `.log` object. [`StoreIdentity`] is the object that claims a
+//! root for one cluster. [`TierExecutor`] is how uploads, cold reads and
 //! deletes hand work to the tier service of a shard.
 //!
 //! [`FsStore`] keeps objects as files in a directory. [`MemoryStore`] and
@@ -34,6 +35,7 @@
 pub mod contract;
 mod error;
 mod fs;
+mod identity;
 mod inline;
 mod layout;
 mod memory;
@@ -43,6 +45,7 @@ mod tier;
 
 pub use error::{ErrorClass, ObjectStoreError};
 pub use fs::FsStore;
+pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
 pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, ObjectPrefix, SegmentKey, SegmentObject};
 pub use memory::MemoryStore;

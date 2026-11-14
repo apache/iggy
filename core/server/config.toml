@@ -1362,14 +1362,25 @@ handshake_grace = "10 s"
 
 # Tiered storage: an object store for the sealed segments of tiered topics.
 # Without this section, the backend is "none" and no topic can turn tiered.
-# Even with a backend, no topic can turn tiered yet: that waits for a boot
-# check that this cluster owns the prefix, which this version does not do.
+# Even with a backend, no topic can turn tiered yet: that waits for reads of
+# evicted segments from the store, which this version does not do.
 #[tiered_storage]
 # "none", "fs" (a directory) or "s3" (S3 and stores with its API). The s3
 # backend is not implemented yet, so the server refuses to start with it.
 #backend = "none"
 # The key prefix of this cluster's objects. Two clusters can share a bucket
-# under different prefixes, but never under the same one.
+# under different prefixes, but never under the same one. The cluster claims
+# its prefix with the object "<prefix>/meta/identity". Replica 0 writes it
+# while it is the caught-up metadata primary and no topic is tiered. While
+# another replica leads metadata, nothing claims the prefix: restart the
+# leader until replica 0 leads. A node uploads and deletes objects only while
+# it reads that claim back through its own store, which the gauge
+# object_store_identity_verified shows. Give every node the same store and
+# prefix: the check cannot tell two stores apart when replica 0 reaches an
+# empty one and the other nodes reach one that holds an earlier claim of this
+# cluster. At boot the server reads the claim once, and only a missing bucket
+# or rejected credentials stop the boot. The server README says how to keep
+# and restore the claim.
 #prefix = "iggy"
 # The fs backend: the directory that holds the objects.
 #path = "/var/lib/iggy-tiered"
@@ -1399,9 +1410,9 @@ handshake_grace = "10 s"
 #max_retry_delay = "5 s"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
-# alone. Only segment uploads go through these caps so far, so only 'uploads'
-# and 'upload_bytes' take effect. The other caps take effect once cold reads
-# and deletes go through the tier service.
+# alone. Only segment uploads and object deletes go through these caps so
+# far, so the fetch caps take no effect yet. They take effect once cold reads
+# go through the tier service.
 #[tiered_storage.jobs]
 #demand_fetches = 16
 #demand_fetch_bytes = "64 MiB"

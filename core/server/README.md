@@ -450,6 +450,76 @@ stream counters follow those reports too, so they trail the members.
 
 Topics created before replication factors keep every partition on every node.
 
+### Tiered storage
+
+The `[tiered_storage]` section of [config.toml](config.toml) names an object
+store for the sealed segments of tiered topics. The server still refuses to turn
+`tiered_storage` on for a topic. No partition can read its segments back from
+the store yet.
+
+At boot the server reads the store identity object `<prefix>/meta/identity`
+once. Only a missing bucket or rejected credentials stop the boot. If the store
+does not answer within `request_timeout`, or 5 seconds at most, the server
+starts with the `object_store_unreachable` gauge at 1. The store identity check
+judges any other answer.
+
+The store identity object claims the prefix for one cluster. While replica 0 is
+the caught-up metadata primary and no topic is tiered, it writes the object. If
+the key already holds an object, the write fails. Each node reads the object
+back through its own store every minute, or every 5 seconds while the object is
+missing or the store does not answer. While the object names the node's own
+cluster, the node runs uploads and object deletes.
+
+While another replica leads metadata, no node claims the prefix, and each node
+logs that no cluster claimed it yet. `iggy cluster metadata` shows the leader.
+Restart the leader, and the next replica takes over. Repeat until replica 0
+leads.
+
+Each shard exports two gauges for its node:
+
+- `object_store_identity_verified` is 1 while the node passes its check. It is
+  0 until replica 0 claims the prefix, and while the object is missing or names
+  another cluster.
+- `object_store_unreachable` is 1 while the store does not answer the check. A
+  node that passed keeps passing through an outage.
+
+Uploads that fail on a store that answers the check show in
+`partition_segment_upload_lag_seconds`, not in these gauges.
+
+The object holds two lines of text, and each line ends with a newline:
+
+```text
+iggy-store-identity 1
+cluster_uid 0123456789abcdef0011223344556677
+```
+
+`cluster_uid` is 32 lowercase hexadecimal digits. When the result of its check
+changes, each node logs its own `cluster_uid`. No node writes the object again
+once a topic is tiered.
+
+With the `fs` backend, the object is the file `<path>/<prefix>/meta/identity`.
+Copy it once a node logs that the object store root belongs to this cluster. If
+the file is lost or damaged later, put the copy back. A hand-written file does
+not work, because `fs` keeps a header before the body of each object file. A
+node that finds a wrong file still boots, but it runs no uploads or object
+deletes until the right file is back.
+
+A node logs that the object names another cluster when:
+
+- Another cluster uses the same prefix. Give this cluster another `prefix`.
+- This cluster's metadata was rebuilt, which gives it a new `cluster_uid`. The
+  objects under the prefix belong to its earlier lifetime. Give the cluster
+  another `prefix`, or delete every object under the prefix, and replica 0
+  claims it again.
+- The object holds bytes that no cluster wrote. Put the copy back.
+
+Give every node the same store and the same prefix. The check cannot tell every
+pair of stores apart. For example, replica 0 reaches an empty store, and the
+other nodes reach a store with an earlier claim of the same cluster. Then every
+node passes its check. Until a topic is tiered, replica 0 also claims again
+after any check that did not pass, so if its `fs` mount drops, it claims the
+empty mount point.
+
 ## Resource options
 
 Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.

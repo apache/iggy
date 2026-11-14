@@ -862,6 +862,7 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) pat_cleaner: Option<Sender<()>>,
     pub(in crate::boot) stream_key_rewrapper: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
+    pub(in crate::boot) store_identity: Option<Sender<()>>,
     pub(in crate::boot) sysinfo_printer: Option<Sender<()>>,
     pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
 }
@@ -876,6 +877,7 @@ impl StopSignals {
             &self.pat_cleaner,
             &self.stream_key_rewrapper,
             &self.segment_cleaner,
+            &self.store_identity,
             &self.sysinfo_printer,
             &self.consumer_group_liveness,
         ]

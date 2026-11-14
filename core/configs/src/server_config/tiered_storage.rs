@@ -76,7 +76,10 @@ pub struct TieredStorageConfig {
     #[config_env(leaf)]
     pub backend: TieredStorageBackend,
     /// The key prefix of this cluster's objects in the store. Two clusters
-    /// can share a bucket under different prefixes.
+    /// can share a bucket under different prefixes. The cluster claims its
+    /// prefix with the object `{prefix}/meta/identity`: replica 0 writes it
+    /// while it is the caught-up metadata primary and no topic is tiered, and
+    /// a node uploads and deletes objects only after it reads that claim back.
     #[serde(default = "default_prefix")]
     pub prefix: String,
     /// The directory that holds the objects of the `fs` backend.
@@ -136,9 +139,9 @@ pub struct TieredStorageConfig {
 /// How many jobs of each class the tier service of one shard runs at once,
 /// and how many bytes they hold.
 ///
-/// Only segment uploads go through the tier service so far, so only
-/// `uploads` and `upload_bytes` take effect. The other caps take effect once
-/// cold reads and deletes go through it.
+/// Only segment uploads and object deletes go through the tier service so
+/// far, so the fetch caps take no effect yet. They take effect once cold
+/// reads go through it.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct TierJobsConfig {

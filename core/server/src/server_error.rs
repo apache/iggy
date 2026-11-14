@@ -452,6 +452,17 @@ pub enum ServerError {
         #[source]
         source: iggy_object_store::ObjectStoreError,
     },
+    #[error("tiered storage cannot start: the object store refused the boot probe of {key:?}")]
+    TieredStorageProbe {
+        key: String,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
+    #[error("tiered storage cannot start: no runtime for the boot probe")]
+    TieredStorageProbeRuntime {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]
