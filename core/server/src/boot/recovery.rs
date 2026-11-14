@@ -43,7 +43,7 @@ use message_bus::IggyMessageBus;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
-use partitions::{IggyPartitions, PartitionsConfig, StreamKeyIdentity};
+use partitions::{IggyPartitions, PartitionsConfig, RepairRingBudget, StreamKeyIdentity};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
@@ -173,7 +173,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
     }
     refuse_unreadable_topics(metadata.mux_stm.streams())?;
-    let partitions = IggyPartitions::with_repair_memory(
+    let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
@@ -189,8 +189,13 @@ pub(in crate::boot) async fn build_shard_for_thread(
             },
         },
         owned_partitions_capacity,
-        repair_memory,
-    );
+    )
+    .with_repair_memory(repair_memory)
+    .with_repair_rings(Rc::new(RepairRingBudget::new(
+        // A share past the address space bounds nothing, as `usize::MAX` does.
+        usize::try_from(config.partition.evicted_ring_shard_bytes_max(total_shards))
+            .unwrap_or(usize::MAX),
+    )));
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by

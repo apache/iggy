@@ -354,6 +354,11 @@ pub struct ShardMetrics {
     partition_wal_group_commit_waits: Counter,
     partition_repair_ring_entries: Gauge,
     partition_repair_ring_bytes: Gauge,
+    partition_repair_ring_budget_bytes: Gauge,
+    partition_repair_ring_charged_bytes: Gauge,
+    partition_repair_ring_floor_bytes: Gauge,
+    partition_repair_ring_bodies_released: Counter,
+    partition_repair_ring_entries_dropped: Counter,
     partition_wal_checkpoints: Counter,
     partition_wal_errors: Counter,
     frame_drops: FrameDropMetrics,
@@ -459,6 +464,11 @@ impl ShardMetrics {
             partition_wal_group_commit_waits: Counter::default(),
             partition_repair_ring_entries: Gauge::default(),
             partition_repair_ring_bytes: Gauge::default(),
+            partition_repair_ring_budget_bytes: Gauge::default(),
+            partition_repair_ring_charged_bytes: Gauge::default(),
+            partition_repair_ring_floor_bytes: Gauge::default(),
+            partition_repair_ring_bodies_released: Counter::default(),
+            partition_repair_ring_entries_dropped: Counter::default(),
             partition_wal_checkpoints: Counter::default(),
             partition_wal_errors: Counter::default(),
             frame_drops: FrameDropMetrics {
@@ -684,6 +694,31 @@ impl ShardMetrics {
             self.partition_repair_ring_bytes.clone(),
         );
         registry.register(
+            "partition_repair_ring_budget_bytes",
+            "this shard's share of partition.evicted_ring_node_bytes_max",
+            self.partition_repair_ring_budget_bytes.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_charged_bytes",
+            "allocated bytes this shard's repair rings charge to its share, after the shed",
+            self.partition_repair_ring_charged_bytes.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_floor_bytes",
+            "charged bytes the shed cannot take: the newest entry of every repair ring",
+            self.partition_repair_ring_floor_bytes.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_bodies_released",
+            "repair ring entries whose batch the shard budget sent back to its segment",
+            self.partition_repair_ring_bodies_released.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_entries_dropped",
+            "repair ring entries the shard budget dropped, which peer repair no longer serves",
+            self.partition_repair_ring_entries_dropped.clone(),
+        );
+        registry.register(
             "partition_wal_checkpoints",
             "completed partition WAL checkpoints",
             self.partition_wal_checkpoints.clone(),
@@ -740,6 +775,42 @@ impl ShardMetrics {
             .set(i64::try_from(entries).unwrap_or(i64::MAX));
         self.partition_repair_ring_bytes
             .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Where the shed left this shard's repair ring budget, and what it took.
+    /// The floor above the budget means the budget is too small for the
+    /// partitions on the shard. Dropped entries send lagging replicas to
+    /// state transfer.
+    pub fn record_repair_ring_shed(&self, shed: &partitions::RepairRingShed) {
+        self.partition_repair_ring_budget_bytes
+            .set(i64::try_from(shed.usage.budget_bytes).unwrap_or(i64::MAX));
+        self.partition_repair_ring_charged_bytes
+            .set(i64::try_from(shed.usage.charged_bytes).unwrap_or(i64::MAX));
+        self.partition_repair_ring_floor_bytes
+            .set(i64::try_from(shed.usage.floor_bytes).unwrap_or(i64::MAX));
+        self.partition_repair_ring_bodies_released
+            .inc_by(shed.bodies_released as u64);
+        self.partition_repair_ring_entries_dropped
+            .inc_by(shed.entries_dropped as u64);
+    }
+
+    /// Snapshot of what [`Self::record_repair_ring_shed`] published: the
+    /// totals the sheds took, and the usage of the last one. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn repair_ring_shed_value(&self) -> partitions::RepairRingShed {
+        let gauge = |gauge: &Gauge| usize::try_from(gauge.get()).unwrap_or(usize::MAX);
+        let counter = |counter: &Counter| usize::try_from(counter.get()).unwrap_or(usize::MAX);
+        partitions::RepairRingShed {
+            bodies_released: counter(&self.partition_repair_ring_bodies_released),
+            entries_dropped: counter(&self.partition_repair_ring_entries_dropped),
+            usage: partitions::RepairRingUsage {
+                budget_bytes: gauge(&self.partition_repair_ring_budget_bytes),
+                charged_bytes: gauge(&self.partition_repair_ring_charged_bytes),
+                floor_bytes: gauge(&self.partition_repair_ring_floor_bytes),
+            },
+        }
     }
 
     /// Count consumer offset capacity denials from explicit client requests

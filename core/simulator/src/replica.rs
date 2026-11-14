@@ -38,7 +38,7 @@ use metadata::stm::snapshot::RestoreSnapshot;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use metadata::{AppliedFrontier, IggyMetadata, apply_committed_prepare};
-use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
+use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairRingBudget};
 use server::boot::ServerHost;
 use server::shell::ShellShardHandle;
 use server_common::crypto;
@@ -144,6 +144,10 @@ fn load_local_checkpoint(data_dir: &std::path::Path) -> Option<(IggySnapshot, u1
 /// for shard 0 and `Some` for every peer; the return bundle is `Some` only
 /// for shard 0.
 ///
+/// `repair_ring_bytes_max` is the repair ring budget of the shard, which the
+/// server bootstrap always sets. `None` leaves the rings to their
+/// per-partition caps.
+///
 /// # Panics
 /// Panics if `senders` is not in canonical order (a bug in the caller's
 /// mesh construction), or if `reader_bundle` disagrees with `shard_idx`
@@ -174,6 +178,7 @@ pub fn new_shard(
         iggy_common::Durability,
     )],
     applied_frontier: Arc<AppliedFrontier>,
+    repair_ring_bytes_max: Option<usize>,
 ) -> (
     Rc<Replica>,
     Option<SimMetadataBundle>,
@@ -497,6 +502,10 @@ pub fn new_shard(
     // `IggyShard::id`. Replica identity lives in `name` and in the VSR
     // ids carried by `PartitionConsensusConfig`.
     let partitions = IggyPartitions::new(ShardId::new(shard_idx), partitions_config);
+    let partitions = match repair_ring_bytes_max {
+        Some(bytes_max) => partitions.with_repair_rings(Rc::new(RepairRingBudget::new(bytes_max))),
+        None => partitions,
+    };
 
     // The host's handlers upgrade this weak self-reference per frame; it
     // stays `None` until the shard is built and downgraded into it below.

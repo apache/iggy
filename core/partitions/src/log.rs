@@ -27,7 +27,6 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-const SEGMENTS_CAPACITY: usize = 1024;
 /// Max sealed segments per partition that keep a resident read handle (fd +
 /// sparse index). Without a cap every sealed segment a reader ever touched pins
 /// one fd for the partition's lifetime; the server-wide budget is this cap times
@@ -163,12 +162,12 @@ where
     fn default() -> Self {
         Self {
             journal: JournalState::default(),
-            segments: Vec::with_capacity(SEGMENTS_CAPACITY),
-            storage: Vec::with_capacity(SEGMENTS_CAPACITY),
-            indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
-            messages_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
-            index_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
-            sealed_read_state: Vec::with_capacity(SEGMENTS_CAPACITY),
+            segments: Vec::new(),
+            storage: Vec::new(),
+            indexes: Vec::new(),
+            messages_writers: Vec::new(),
+            index_writers: Vec::new(),
+            sealed_read_state: Vec::new(),
             sealed_lru: VecDeque::with_capacity(SEALED_READ_STATE_CAP + 1),
         }
     }

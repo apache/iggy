@@ -130,6 +130,13 @@ pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 64 * 1024 * 1024;
 /// trips first evicts; this byte ceiling is the second typo guard.
 pub const MAX_EVICTED_RING_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Shipped default for [`PartitionConfig::evicted_ring_node_bytes_max`].
+pub const DEFAULT_EVICTED_RING_NODE_BYTES_MAX: u64 = 4 * 1024 * 1024 * 1024;
+
+fn default_evicted_ring_node_bytes_max() -> IggyByteSize {
+    IggyByteSize::from(DEFAULT_EVICTED_RING_NODE_BYTES_MAX)
+}
+
 /// Shipped default for [`PartitionConfig::dedup_clients_max`]; pinned against
 /// the runtime constant by a bootstrap assert.
 pub const PARTITION_DEDUP_CLIENTS_DEFAULT: usize = 4096;
@@ -275,6 +282,18 @@ pub struct PartitionConfig {
     #[config_env(leaf)]
     pub evicted_ring_bytes_max: IggyByteSize,
 
+    /// Node-wide budget for the memory that the evicted rings of all
+    /// partitions allocate: the buffer of each batch they hold in memory,
+    /// and 288 bytes for each slot of the batches they released to their
+    /// segments. Split evenly across the shards, because a shard can shed
+    /// only its own rings ([`Self::evicted_ring_shard_bytes_max`]). Past its
+    /// share a shard releases the oldest batches of the rings that grew
+    /// earliest, then drops their oldest entries. Every ring keeps its
+    /// newest entry. Must be > 0, and must leave each shard at least 1 byte.
+    #[serde(default = "default_evicted_ring_node_bytes_max")]
+    #[config_env(leaf)]
+    pub evicted_ring_node_bytes_max: IggyByteSize,
+
     /// Byte budget for segment payloads a SERVING shard keeps resident to
     /// answer state-transfer chunk requests, per shard (so the process-wide
     /// bound is this times the shard count).
@@ -404,7 +423,20 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.evicted_ring_node_bytes_max.as_bytes_u64() == 0 {
+            eprintln!("{COMPONENT} partition.evicted_ring_node_bytes_max must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         Ok(())
+    }
+}
+
+impl PartitionConfig {
+    /// The part of [`Self::evicted_ring_node_bytes_max`] that each of
+    /// `shards` shards sheds its rings against.
+    #[must_use]
+    pub fn evicted_ring_shard_bytes_max(&self, shards: u16) -> u64 {
+        self.evicted_ring_node_bytes_max.as_bytes_u64() / u64::from(shards).max(1)
     }
 }
 
@@ -662,6 +694,44 @@ mod tests {
             ..PartitionConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_node_ring_budget_when_loading_config_should_default_when_omitted_and_reject_zero() {
+        let omitted: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            omitted.evicted_ring_node_bytes_max.as_bytes_u64(),
+            DEFAULT_EVICTED_RING_NODE_BYTES_MAX,
+            "older configuration files use the shipped node-wide budget"
+        );
+        assert_eq!(
+            PartitionConfig::default()
+                .evicted_ring_node_bytes_max
+                .as_bytes_u64(),
+            DEFAULT_EVICTED_RING_NODE_BYTES_MAX,
+            "config.toml and the serde default ship the same budget"
+        );
+        let config = PartitionConfig {
+            evicted_ring_node_bytes_max: IggyByteSize::from(0_u64),
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_node_ring_budget_when_split_should_give_each_shard_an_equal_share() {
+        const NODE_BYTES: u64 = 1024;
+        let config = PartitionConfig {
+            evicted_ring_node_bytes_max: IggyByteSize::from(NODE_BYTES),
+            ..PartitionConfig::default()
+        };
+        assert_eq!(config.evicted_ring_shard_bytes_max(1), NODE_BYTES);
+        assert_eq!(config.evicted_ring_shard_bytes_max(4), NODE_BYTES / 4);
+        assert_eq!(
+            config.evicted_ring_shard_bytes_max(2048),
+            0,
+            "more shards than bytes leaves a share of nothing"
+        );
     }
 
     #[test]

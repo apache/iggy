@@ -78,7 +78,7 @@ fn sealed_size(partition: &IggyPartition<IggyMessageBus>, slot: usize) -> u64 {
 }
 
 fn commit_consumer_offset(partition: &IggyPartition<IggyMessageBus>, offset: u64) {
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         7,
         ConsumerOffset::new(ConsumerKind::Consumer, 7, offset, String::new()),
     );

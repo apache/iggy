@@ -5823,7 +5823,7 @@ mod tests {
             let partition = partitions
                 .get_mut_by_ns(&ns)
                 .expect("partition is materialised");
-            partition.repair = Some(RepairSession {
+            partition.set_repair(Some(RepairSession {
                 nonce: NONCE,
                 view: 0,
                 from_op: 1,
@@ -5834,7 +5834,7 @@ mod tests {
                 idle_ticks: 0,
                 floor_pulled_from: 0,
                 requested_from: Some(1),
-            });
+            }));
             for op in 1..=8 {
                 let parent = partition.consensus().last_prepare_checksum();
                 let group = partition.consensus().group();
@@ -5874,7 +5874,7 @@ mod tests {
             assert_eq!(partition.consensus().commit_min(), 7);
             partition.consensus().advance_commit_max(8);
             partition.recovered_durable_offset = Some(10);
-            let repair = partition.repair.as_mut().expect("repair remains armed");
+            let repair = partition.repair_mut().expect("repair remains armed");
             repair.floor = Some(5);
         }
 
@@ -5902,7 +5902,7 @@ mod tests {
                         .plane
                         .partitions()
                         .get_by_ns(&ns)
-                        .is_some_and(|partition| partition.repair.is_none())
+                        .is_some_and(|partition| partition.repair().is_none())
                     {
                         break;
                     }
@@ -5919,7 +5919,7 @@ mod tests {
             .expect("partition survives the reply");
         assert_eq!(partition.consensus().commit_min(), 8);
         assert!(
-            partition.repair.is_none(),
+            partition.repair().is_none(),
             "a walk that reached the fetch ceiling leaves nothing to request"
         );
     }
@@ -6838,7 +6838,7 @@ mod tests {
                     0,
                     0,
                 );
-                partition.consumer_group_offsets.pin().insert(
+                partition.consumer_group_offsets.borrow_mut().insert(
                     iggy_common::ConsumerGroupId(0),
                     iggy_common::ConsumerOffset::new(
                         iggy_common::ConsumerKind::ConsumerGroup,
@@ -7101,7 +7101,7 @@ mod tests {
                     0,
                     0,
                 );
-                partition.consumer_group_offsets.pin().insert(
+                partition.consumer_group_offsets.borrow_mut().insert(
                     iggy_common::ConsumerGroupId(0),
                     iggy_common::ConsumerOffset::new(
                         iggy_common::ConsumerKind::ConsumerGroup,
@@ -7727,7 +7727,7 @@ mod tests {
             .plane
             .partitions()
             .with_partition(&IggyNamespace::new(0, 0, 0), |partition| {
-                partition.consumer_group_offsets.pin().insert(
+                partition.consumer_group_offsets.borrow_mut().insert(
                     iggy_common::ConsumerGroupId(0),
                     iggy_common::ConsumerOffset::new(
                         iggy_common::ConsumerKind::ConsumerGroup,
@@ -7775,11 +7775,11 @@ mod tests {
             let partition = partitions.get_by_ns(&ns).expect("partition materialised");
             partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, dead_key, 7, 7);
             partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, live_key, 9, 9);
-            partition.consumer_group_offsets.pin().insert(
+            partition.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(dead_key as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, dead_key, 7, String::new()),
             );
-            partition.consumer_group_offsets.pin().insert(
+            partition.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(live_key as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, live_key, 9, String::new()),
             );

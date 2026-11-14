@@ -553,7 +553,7 @@ async fn given_foreign_session_retirement_when_replicated_or_repaired_should_pre
         let (mut backup, _) = recording_partition_at(1, 3);
         backup.set_created_revision(INCARNATION);
         if repaired {
-            backup.repair = Some(armed_session(NEXT_OP, 0));
+            backup.set_repair(Some(armed_session(NEXT_OP, 0)));
         }
         for foreign in [0, INCARNATION - 1, INCARNATION + 1] {
             for commit in [0, COMMITTED_ELSEWHERE] {
@@ -681,7 +681,7 @@ fn given_recorded_last_polled_when_retirement_prunes_the_group_should_clear_it()
     };
     partition.apply_consumer_group_owner(fence, 1).unwrap();
     // The fence install clears the entry, so the test seeds it after.
-    partition.last_polled_offsets.pin().insert(
+    partition.last_polled_offsets.borrow_mut().insert(
         ConsumerGroupId(GROUP_ID as usize),
         ConsumerOffset::new(
             ConsumerKind::ConsumerGroup,

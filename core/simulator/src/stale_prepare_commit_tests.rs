@@ -502,7 +502,8 @@ fn repair_session(
         .partitions()
         .get_by_ns(&namespace)
         .expect("replica hosts the group")
-        .repair
+        .repair()
+        .copied()
 }
 
 pub fn primary_of(sim: &Simulator, replica: u8, namespace: IggyNamespace, view: u32) -> u8 {

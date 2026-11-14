@@ -2165,8 +2165,9 @@ fn lagging_replica_in_cluster(namespace: IggyNamespace, replica_count: u8) -> Co
 fn arm_lagging_transfer<B, S>(partition: &mut IggyPartition<B, S>, peer: u8)
 where
     B: message_bus::MessageBus,
+    S: journal::superblock::SuperblockStore,
 {
-    partition.transfer = Some(PartitionTransferSession {
+    partition.set_transfer(Some(PartitionTransferSession {
         nonce: LAGGING_NONCE,
         peer,
         commit_op: 0,
@@ -2177,7 +2178,7 @@ where
         scan: None,
         seed: None,
         pulled_len: 0,
-    });
+    }));
 }
 
 /// A descriptor from `GROUP_PRIMARY` at `GROUP_VIEW`: an offer at
@@ -2295,8 +2296,7 @@ async fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_shou
     let session = partitions
         .get_by_ns(&namespace)
         .expect("the partition stays registered")
-        .transfer
-        .as_ref();
+        .transfer();
     assert!(
         session.is_some_and(|session| session.target_accepted),
         "the group primary's offer holds more committed state than this replica \
@@ -2642,7 +2642,7 @@ async fn tick_until_repair_peer_changes(
             .partitions()
             .get_by_ns(&namespace)
             .expect("the partition stays registered")
-            .repair
+            .repair()
             .map(|session| session.peer);
         if let Some(peer) = peer
             && Some(peer) != previous
@@ -2868,7 +2868,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
         let partition = partitions
             .get_mut_by_ns(&namespace)
             .expect("the fixture registers the partition");
-        partition.repair = Some(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: NONCE,
             view: partition.consensus().view(),
             from_op: partition.consensus().commit_min() + 1,
@@ -2879,7 +2879,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(partition.consensus().commit_min() + 1),
-        });
+        }));
         for op in FLOOR + 1..=FIRST_CHUNK_LAST {
             partition
                 .log
@@ -2964,7 +2964,7 @@ async fn resident_window_backup_with(
         let partition = partitions
             .get_mut_by_ns(&namespace)
             .expect("the fixture registers the partition");
-        partition.repair = Some(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce,
             view: partition.consensus().view(),
             from_op: partition.consensus().commit_min() + 1,
@@ -2975,7 +2975,7 @@ async fn resident_window_backup_with(
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(partition.consensus().commit_min() + 1),
-        });
+        }));
         for op in floor + 1..=to_op {
             partition
                 .log
@@ -3006,7 +3006,7 @@ async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_req
         .get_by_ns(&namespace)
         .expect("the partition stays registered");
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "the re-served RepairDone concludes the session"
     );
     assert_ne!(
@@ -3014,10 +3014,7 @@ async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_req
         consensus::StateTransferStage::Idle,
         "an unanchored floor over a complete window converts to state transfer"
     );
-    assert_eq!(
-        partition.transfer.as_ref().map(|session| session.peer),
-        Some(PEER)
-    );
+    assert_eq!(partition.transfer().map(|session| session.peer), Some(PEER));
     assert_eq!(partition.consensus().commit_min(), 0);
 }
 
@@ -3049,7 +3046,7 @@ async fn given_a_connecting_resident_window_when_the_last_repair_done_is_lost_sh
         .expect("the partition stays registered");
     assert_eq!(partition.consensus().commit_min(), TO_OP);
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "the re-served RepairDone concludes the session"
     );
     assert_eq!(
