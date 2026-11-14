@@ -70,6 +70,18 @@ impl ObjectStore for WithoutConditionalCreate {
     }
 }
 
+macro_rules! fs_store {
+    ($($case:ident),* $(,)?) => {$(
+        #[test]
+        fn $case() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let store = iggy_object_store::FsStore::new(directory.path());
+            iggy_object_store::contract::shard_runtime()
+                .block_on(iggy_object_store::contract::$case(&store, stringify!($case)));
+        }
+    )*};
+}
+
 macro_rules! memory_store {
     ($($case:ident),* $(,)?) => {$(
         #[test]
@@ -92,6 +104,11 @@ macro_rules! without_conditional_create {
             );
         }
     )*};
+}
+
+mod fs_store {
+    iggy_object_store::contract_cases!(fs_store);
+    iggy_object_store::if_absent_contract_cases!(fs_store);
 }
 
 mod memory_store {

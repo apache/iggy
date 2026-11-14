@@ -30,10 +30,15 @@ publish = false
 
 [dependencies]
 bytes = { workspace = true }
+compio = { workspace = true }
 crc32c = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"
