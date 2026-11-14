@@ -47,7 +47,10 @@ jobs:
   report:
     name: Report failure
     needs: miri
-    if: failure()
+    # A job timeout ends `miri` as cancelled, which `failure()` does not match.
+    if: ${{ !cancelled() && needs.miri.result != 'success' }}
+    # Two reports at once would both find no open issue and open one each.
+    concurrency: miri-nightly-report
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:

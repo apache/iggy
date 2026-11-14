@@ -511,9 +511,12 @@ runs:
         time cargo +"$MIRI_TOOLCHAIN" miri nextest run --no-run "${nextest_args[@]}"
         TIMEFORMAT='Miri tests: %3R seconds'
         time cargo +"$MIRI_TOOLCHAIN" miri nextest run "${nextest_args[@]}"
-        # Nextest does not run doctests.
-        TIMEFORMAT='Miri doctests: %3R seconds'
-        time cargo +"$MIRI_TOOLCHAIN" miri test --doc "${miri_args[@]}"
+        # Nextest does not run doctests. The filter does not select them either,
+        # so the nightly task would only repeat what the pre-merge task ran.
+        if [[ "$MIRI_TASK" == "miri" ]]; then
+          TIMEFORMAT='Miri doctests: %3R seconds'
+          time cargo +"$MIRI_TOOLCHAIN" miri test --doc "${miri_args[@]}"
+        fi
       shell: bash
 
     # aarch64 builds (run on ARM64 runners)
