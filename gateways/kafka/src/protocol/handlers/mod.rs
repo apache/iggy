@@ -261,8 +261,8 @@ async fn deletion_deadline(state: &GatewayState, connection: &ConnectionState) -
     Instant::now() + hold
 }
 
-/// What the operator can do about an offset call that the client sees as -1. The client sees no
-/// more, so the log is the one place the cause shows.
+/// What the operator can do about an offset call that Iggy refused. The client sees only a code,
+/// -1 for most of these, so the log is the one place the cause shows.
 const fn offset_refusal_cause(error: &BridgeError) -> &'static str {
     match error {
         BridgeError::Iggy(IggyError::TooManyConsumerOffsets) => {
@@ -270,6 +270,9 @@ const fn offset_refusal_cause(error: &BridgeError) -> &'static str {
         }
         BridgeError::Iggy(IggyError::InvalidCommand) => {
             "a server without the external group kind answers this"
+        }
+        BridgeError::Iggy(IggyError::DiskUsageLimitReached) => {
+            "the Iggy data volume is at disk.usage_limit_percent"
         }
         error if error.is_bridge_login_rejected() => "Iggy rejected the bridge's credentials",
         _ => "no Kafka code fits this Iggy error",

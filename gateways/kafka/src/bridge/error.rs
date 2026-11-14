@@ -339,6 +339,10 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         // The topic has no partition ids left to mint. A server-side rule refuses a valid
         // request, as with the two above.
         IggyError::PartitionIdSpaceExhausted => ERROR_POLICY_VIOLATION,
+        // The Iggy data volume is at `[disk] usage_limit_percent`. A rule on the server refuses
+        // a valid request, as with the three above. Not `KAFKA_STORAGE_ERROR` (56): it is
+        // retriable, so clients would resend until an operator frees space.
+        IggyError::DiskUsageLimitReached => ERROR_POLICY_VIOLATION,
         // A factor above the node count, as Kafka answers one above the broker count.
         IggyError::InvalidReplicationFactor => ERROR_INVALID_REPLICATION_FACTOR,
         // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
@@ -416,6 +420,17 @@ mod tests {
     fn partitions_limit_reached_maps_to_policy_violation() {
         let err = BridgeError::Iggy(IggyError::PartitionsLimitReached);
         assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn disk_usage_limit_reached_maps_to_policy_violation() {
+        let err = BridgeError::Iggy(IggyError::DiskUsageLimitReached);
+        assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+        assert_eq!(
+            err.to_offset_error_code(),
+            ERROR_POLICY_VIOLATION,
+            "an offset commit must not turn the refusal into a retriable code"
+        );
     }
 
     #[test]

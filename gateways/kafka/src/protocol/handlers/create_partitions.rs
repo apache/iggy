@@ -725,6 +725,7 @@ const fn refused_before_apply(error: &BridgeError) -> bool {
                     | IggyError::PartitionIdSpaceExhausted
                     // The op never entered Iggy's pipeline.
                     | IggyError::TransientNotAccepted
+                    | IggyError::DiskUsageLimitReached
             )
     )
 }
@@ -1164,6 +1165,13 @@ fn bridge_failure(kafka_topic: &str, err: &BridgeError) -> (i16, StrBytes) {
             );
             StrBytes::from_static_str("the Iggy node has reached its partition limit")
         }
+        BridgeError::Iggy(IggyError::DiskUsageLimitReached) => {
+            tracing::warn!(
+                kafka_topic,
+                "CreatePartitions refused: the Iggy data volume is at disk.usage_limit_percent"
+            );
+            StrBytes::from_static_str("the Iggy data volume has reached its usage limit")
+        }
         BridgeError::Iggy(IggyError::PartitionResizeDisabled) => {
             tracing::debug!(
                 kafka_topic,
@@ -1502,6 +1510,11 @@ mod tests {
                 &BridgeError::Iggy(IggyError::PartitionsLimitReached),
                 ERROR_POLICY_VIOLATION,
                 "the Iggy node has reached its partition limit",
+            ),
+            (
+                &BridgeError::Iggy(IggyError::DiskUsageLimitReached),
+                ERROR_POLICY_VIOLATION,
+                "the Iggy data volume has reached its usage limit",
             ),
             (
                 &BridgeError::Iggy(IggyError::PartitionResizeDisabled),
