@@ -286,6 +286,13 @@ is not the partition primary learns of a commit from the next prepare or from
 the periodic commit broadcast. It counts the message only then. While the
 cluster is idle, its counters can lag by up to `cluster.commit_busy_heartbeat_interval`.
 
+`GetStats` and the stream, topic, partition, segment and message gauges of
+`/metrics` read node totals. Each metadata change and each partition write
+keeps these totals up to date, so these reads walk no stream. The per-topic
+series of `/metrics` (`topic_size_bytes`, `topic_messages` and
+`topic_max_size_bytes`) still walk every topic on each scrape. On a node with
+many topics, set `[http.metrics] topic_gauges = false` to drop them.
+
 ### Sessions and retry receipts
 
 Protocol 0.11.1 and later use client-owned registration proofs and `BindSession` (15) to
