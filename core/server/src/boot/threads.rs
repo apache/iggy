@@ -28,6 +28,7 @@ use configs::sharding::{
     INBOX_CAPACITY_MAX, RECONCILE_PERIODIC_INTERVAL_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX,
     SHUTDOWN_JOIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
+use iggy_object_store::s3::SharedCredentials;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
 use metadata::AppliedFrontier;
 use partitions::FatalCommit;
@@ -674,6 +675,7 @@ pub(in crate::boot) fn run_shard_thread(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
+    tiered_credentials: Option<SharedCredentials>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -725,6 +727,7 @@ pub(in crate::boot) fn run_shard_thread(
             shard_metrics_all,
             peer_exit,
             shutdown_deadline,
+            tiered_credentials,
         ))
         .await
     });
@@ -862,6 +865,7 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) pat_cleaner: Option<Sender<()>>,
     pub(in crate::boot) stream_key_rewrapper: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
+    pub(in crate::boot) store_identity: Option<Sender<()>>,
     pub(in crate::boot) sysinfo_printer: Option<Sender<()>>,
     pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
 }
@@ -876,6 +880,7 @@ impl StopSignals {
             &self.pat_cleaner,
             &self.stream_key_rewrapper,
             &self.segment_cleaner,
+            &self.store_identity,
             &self.sysinfo_printer,
             &self.consumer_group_liveness,
         ]

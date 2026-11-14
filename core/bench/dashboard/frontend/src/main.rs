@@ -21,17 +21,22 @@ mod config;
 mod error;
 mod format;
 mod hooks;
+mod pages;
 mod router;
 mod state;
-mod version;
+#[cfg(test)]
+mod test_support;
 
-use crate::{
-    components::{app_content::AppContent, footer::Footer},
-    state::hardware::HardwareProvider,
-};
 use components::theme::theme_provider::ThemeProvider;
+use pages::compare::releases::ReleasesPage;
+use pages::compare::{ComparePage, RunList};
+use pages::explore::Explore;
+use pages::methodology::Methodology;
+use pages::not_found::NotFound;
+use pages::overview::Overview;
+use pages::run::RunPage;
 use router::AppRoute;
-use state::{benchmark::BenchmarkProvider, gitref::GitrefProvider, ui::UiProvider};
+use state::{data::DataProvider, selection::SelectionProvider};
 use yew::prelude::*;
 use yew_router::{BrowserRouter, Switch};
 
@@ -39,30 +44,33 @@ use yew_router::{BrowserRouter, Switch};
 pub fn app() -> Html {
     html! {
         <BrowserRouter>
-            <Switch<AppRoute> render={switch} />
+            <ThemeProvider>
+                <DataProvider>
+                    <SelectionProvider>
+                        <Switch<AppRoute> render={switch} />
+                    </SelectionProvider>
+                </DataProvider>
+            </ThemeProvider>
         </BrowserRouter>
     }
 }
 
 fn switch(routes: AppRoute) -> Html {
     match routes {
-        AppRoute::Benchmark { .. } | AppRoute::Compare { .. } | AppRoute::Home => html! {
-            <ThemeProvider>
-                <UiProvider>
-                    <div class="app-container">
-                        <HardwareProvider>
-                            <GitrefProvider>
-                                <BenchmarkProvider>
-                                    <AppContent />
-                                </BenchmarkProvider>
-                            </GitrefProvider>
-                        </HardwareProvider>
-                        <Footer />
-                    </div>
-                </UiProvider>
-            </ThemeProvider>
+        AppRoute::Home => html! { <Overview /> },
+        AppRoute::Compare => html! { <ComparePage /> },
+        AppRoute::CompareReleases => html! { <ReleasesPage /> },
+        AppRoute::ComparePair { left, right } => html! {
+            <ComparePage alias={RunList::from_iter([left.as_str(), right.as_str()])} />
         },
-        AppRoute::NotFound => html! { "404 Not Found" },
+        // Keyed by the uuid, so another run's page starts with fresh state.
+        AppRoute::Benchmark { uuid } => {
+            let key = uuid.clone();
+            html! { <RunPage {key} {uuid} /> }
+        }
+        AppRoute::Explore => html! { <Explore /> },
+        AppRoute::Methodology => html! { <Methodology /> },
+        AppRoute::NotFound => html! { <NotFound /> },
     }
 }
 

@@ -1836,11 +1836,8 @@ mod tests {
         });
         let held = OffsetCalls::new(later());
         let mut lanes = Vec::with_capacity(OFFSET_SLOTS);
-        for slot in 0..OFFSET_SLOTS {
-            let turn = held
-                .take(slot, &bridge.offset_pool.slots[slot].reads)
-                .await
-                .expect("a free lane");
+        for (slot, OffsetSlot { reads, .. }) in bridge.offset_pool.slots.iter().enumerate() {
+            let turn = held.take(slot, reads).await.expect("a free lane");
             lanes.push(turn);
         }
 

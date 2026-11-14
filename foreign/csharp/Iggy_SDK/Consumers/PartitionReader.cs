@@ -61,7 +61,8 @@ namespace Apache.Iggy.Consumers;
 ///         <item>
 ///             The reader stays usable after a <see cref="ReadException" /> and retries by itself. Status 87
 ///             (HistoryUnavailable) stops its partition until a <see cref="SeekAsync" /> when the position came from an
-///             earlier read of a history that is gone. A refusal that a quick retry does not change, such as status 41
+///             earlier read of a history that is gone. Status 96 (TieredReadFailed) stops its partition at once,
+///             because no retry changes it. A refusal that a quick retry does not change, such as status 41
 ///             (Unauthorized), 3007 (PartitionNotFound) or 5009 (ConsumerGroupPartitionNotOwned), is retried after a
 ///             wait that doubles each time, and after six in a row it stops its partition until a
 ///             <see cref="SeekAsync" /> with one error. Status 5009 never stops it: each sixth in a row reports one
@@ -1252,7 +1253,7 @@ public sealed class PartitionReader : IAsyncDisposable
                     leaving.Add(Owned(state, counted));
                 }
 
-                GiveUpGap(partition, state);
+                GiveUpGap(partition, state, LossCause.Moved);
                 _states.Remove(partition);
             }
 
@@ -2149,12 +2150,12 @@ public sealed class PartitionReader : IAsyncDisposable
                 // The held batch keeps its messages, so only the offsets before it can be gone.
                 if (first >= (state.CatchUpBatch?.Messages[0].Header.Offset ?? gapEnd + 1))
                 {
-                    GiveUpGap(target.Partition, state, gone: true);
+                    GiveUpGap(target.Partition, state, LossCause.Gone);
                 }
                 else
                 {
                     Enqueue(target.Partition, target.Generation,
-                        LostRange(target.Partition, target.Sent.Value, first - 1, gone: true));
+                        LostRange(target.Partition, target.Sent.Value, first - 1, LossCause.Gone));
                 }
 
                 // The reply is dropped: it can run past the gap into offsets that no read stored. Nothing before its
@@ -2258,8 +2259,8 @@ public sealed class PartitionReader : IAsyncDisposable
     }
 
     /// <summary>
-    ///     A read that did not return its partition. A refusal before the read retries, and only a lasting or a
-    ///     history refusal stops the partition until a seek.
+    ///     A read that did not return its partition. A refusal before the read retries, and only a lasting, a
+    ///     history or a tiered read refusal stops the partition until a seek.
     /// </summary>
     private void Refuse(Target target, Exception error, bool commits)
     {
@@ -2320,17 +2321,20 @@ public sealed class PartitionReader : IAsyncDisposable
                         target.Partition);
                     state.RetryAt = now + interval;
                     return;
-                case IggyInvalidStatusCodeException { StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.INVALID_SIZE_BYTES } refusal:
-                    GiveUpGap(target.Partition, state);
+                case IggyInvalidStatusCodeException
+                {
+                    StatusCode: VsrError.HISTORY_UNAVAILABLE or VsrError.INVALID_SIZE_BYTES or VsrError.TIERED_READ_FAILED
+                } refusal:
+                    GiveUpGap(target.Partition, state, LossCause.Stopped);
                     report = StopReport(target.Partition, state, error,
-                        refusal.StatusCode == VsrError.HISTORY_UNAVAILABLE);
+                        refusal.StatusCode != VsrError.INVALID_SIZE_BYTES);
                     state.Stopped = report;
                     break;
                 case IggyInvalidStatusCodeException status when IsLasting(status.StatusCode):
                     state.Lasting++;
                     if (state.Lasting >= MaxLastingRefusals)
                     {
-                        GiveUpGap(target.Partition, state);
+                        GiveUpGap(target.Partition, state, LossCause.Stopped);
                         report = StopReport(target.Partition, state, error, true);
                         state.Stopped = report;
                         break;
@@ -2369,7 +2373,8 @@ public sealed class PartitionReader : IAsyncDisposable
     /// <summary>
     ///     The stop of a partition. A committing read that lost its reply stays pending until the next read shows what
     ///     it stored, and a seek to Next after the stop would skip that range without a word, so the stop reports the
-    ///     lost read instead of its own error.
+    ///     lost read instead of its own error. A catch-up that <see cref="GiveUpGap" /> ended reported that range
+    ///     before, so the stop then reports its own error.
     /// </summary>
     private static ReadException StopReport(uint partition, PartitionState state, Exception error, bool resumable)
     {
@@ -2382,10 +2387,10 @@ public sealed class PartitionReader : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Ends the read again of a gap: reports the offsets before the held batch, and queues that batch. With
-    ///     <paramref name="gone" /> the history no longer holds those offsets, else the partition moved first.
+    ///     Ends the read again of a gap: reports the offsets before the held batch with their
+    ///     <paramref name="cause" />, and queues that batch.
     /// </summary>
-    private void GiveUpGap(uint partition, PartitionState state, bool gone = false)
+    private void GiveUpGap(uint partition, PartitionState state, LossCause cause)
     {
         if (state.CatchUpUntil is not { } until)
         {
@@ -2397,7 +2402,7 @@ public sealed class PartitionReader : IAsyncDisposable
         var first = held?.Messages[0].Header.Offset ?? until + 1;
         if (state.Position.Value < first)
         {
-            Enqueue(partition, state.Generation, LostRange(partition, state.Position.Value, first - 1, gone));
+            Enqueue(partition, state.Generation, LostRange(partition, state.Position.Value, first - 1, cause));
         }
 
         var next = held is null ? until + 1 : held.Messages[^1].Header.Offset + 1;
@@ -2408,6 +2413,8 @@ public sealed class PartitionReader : IAsyncDisposable
 
         state.CatchUpUntil = null;
         state.CatchUpBatch = null;
+        // The catch-up accounted for what the lost read stored, so a stop that follows reports its own error.
+        state.Lost = false;
         state.Position = PollingStrategy.Continuation(partition, MessagePolling.Next, next,
             held?.Context ?? state.Position.Context!.Value);
         if (held is { Messages.Count: > 0 })
@@ -2417,11 +2424,15 @@ public sealed class PartitionReader : IAsyncDisposable
     }
 
     /// <summary>The report of offsets that a lost read stored and that the reader does not read again.</summary>
-    private static ReadException LostRange(uint partition, ulong from, ulong until, bool gone)
+    private static ReadException LostRange(uint partition, ulong from, ulong until, LossCause cause)
     {
         return new ReadException(partition, VsrError.Exception(VsrError.FETCH_PROGRESS_UNCERTAIN,
-            $"A lost read stored offsets {from} to {until} of partition {partition}, and " +
-            (gone ? "its history no longer holds them." : "the partition moved before they were read again.")))
+            $"A lost read stored offsets {from} to {until} of partition {partition}, and " + cause switch
+            {
+                LossCause.Gone => "its history no longer holds them.",
+                LossCause.Stopped => "the partition stopped before they were read again.",
+                _ => "the partition moved before they were read again."
+            }))
         {
             Lost = new OffsetRange(from, until)
         };
@@ -2805,6 +2816,19 @@ public sealed class PartitionReader : IAsyncDisposable
         ReadException? Error,
         long Messages,
         long Bytes);
+
+    /// <summary>Why the reader could not read again the offsets that a lost read stored.</summary>
+    private enum LossCause
+    {
+        /// <summary>The partition left the assignment of the reader.</summary>
+        Moved,
+
+        /// <summary>The history of the partition no longer holds the offsets.</summary>
+        Gone,
+
+        /// <summary>The partition stopped until a seek.</summary>
+        Stopped
+    }
 
     private sealed class PartitionState(PollingStrategy start, ulong generation)
     {

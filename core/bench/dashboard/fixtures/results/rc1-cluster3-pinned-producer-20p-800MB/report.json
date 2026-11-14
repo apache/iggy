@@ -1,0 +1,1826 @@
+{
+  "uuid": "48587edc-6d6b-4ab5-8316-c64be4a65135",
+  "timestamp": "2026-11-04T08:40:16.110756+00:00",
+  "server_stats": {
+    "process_id": 26812,
+    "cpu_usage": 39.26998,
+    "total_cpu_usage": 2.7061045,
+    "memory_usage": 23523328,
+    "total_memory": 132914745344,
+    "available_memory": 124145156096,
+    "run_time": 91000000,
+    "start_time": 1793781523000000,
+    "read_bytes": 17977344,
+    "written_bytes": 66071371776,
+    "messages_size_bytes": 65039225744,
+    "streams_count": 20,
+    "topics_count": 20,
+    "partitions_count": 20,
+    "segments_count": 80,
+    "messages_count": 61999750,
+    "clients_count": 1,
+    "consumer_groups_count": 0,
+    "hostname": "ip-10-0-0-169",
+    "os_name": "Ubuntu",
+    "os_version": "Linux (Ubuntu 24.04)",
+    "kernel_version": "7.0.0-1014-aws",
+    "iggy_server_version": "0.10.0",
+    "iggy_server_semver": 10000,
+    "cache_metrics": {}
+  },
+  "hardware": {
+    "identifier": "ip-10-0-0-224",
+    "cpu_name": "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+    "cpu_cores": 16,
+    "total_memory_mb": 126757,
+    "os_name": "Ubuntu",
+    "os_version": "7.0.0-1014-aws"
+  },
+  "params": {
+    "benchmark_kind": "pinned_producer",
+    "transport": "tcp",
+    "server_address": "10.0.0.169:8090",
+    "remark": "pp-0100rc1-91e020636-aws_i4i-cluster3@800MB",
+    "extra_info": null,
+    "gitref": "0.10.0",
+    "gitref_date": "2026-11-04T08:40:16.110756+00:00",
+    "messages_per_batch": 250,
+    "message_batches": 248000,
+    "message_size": 1000,
+    "producers": 20,
+    "consumers": 0,
+    "streams": 20,
+    "partitions": 1,
+    "consumer_groups": 0,
+    "rate_limit": "800.00 MB",
+    "pretty_name": "20 producers, 1000B msgs, 250 msgs/batch (pp-0100rc1-91e020636-aws_i4i-cluster3@800MB)",
+    "bench_command": "iggy-bench --durability replicated --consumer-offset-durability replicated --messages-per-batch 250 --message-batches 12400 --rate-limit '800.00 MB' pinned-producer --producers 20 --streams 20 tcp --server-address 10.0.0.169:8090 output -o performance_results --remark 'pp-0100rc1-91e020636-aws_i4i-cluster3@800MB'",
+    "params_identifier": "Pinned Producer_TCP_pp-0100rc1-91e020636-aws_i4i-cluster3@800MB_250_12400_1000_20_0_20_1_0_cluster3"
+  },
+  "cluster": {
+    "name": "bench-cluster",
+    "nodes": [
+      {
+        "name": "node-0",
+        "role": "leader",
+        "status": "healthy"
+      },
+      {
+        "name": "node-1",
+        "role": "follower",
+        "status": "healthy"
+      },
+      {
+        "name": "node-2",
+        "role": "follower",
+        "status": "healthy"
+      }
+    ]
+  },
+  "group_metrics": [
+    {
+      "summary": {
+        "kind": "producers",
+        "total_throughput_megabytes_per_second": 801.846,
+        "total_throughput_messages_per_second": 801845.991,
+        "average_throughput_megabytes_per_second": 40.092,
+        "average_throughput_messages_per_second": 40092.3,
+        "average_p50_latency_ms": 0.953,
+        "average_p90_latency_ms": 1.103,
+        "average_p95_latency_ms": 1.152,
+        "average_p99_latency_ms": 1.275,
+        "average_p999_latency_ms": 2.266,
+        "average_p9999_latency_ms": 20.518,
+        "average_latency_ms": 1.007,
+        "average_median_latency_ms": 0.953,
+        "min_latency_ms": 0.499,
+        "max_latency_ms": 1662.271,
+        "std_dev_latency_ms": 5.922
+      },
+      "avg_throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 121.934
+          },
+          {
+            "time_s": 0.01,
+            "value": 155.495
+          },
+          {
+            "time_s": 0.02,
+            "value": 168.272
+          }
+        ]
+      },
+      "avg_throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 121900.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 155475.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 168261.111
+          }
+        ]
+      },
+      "avg_latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 5.49
+          },
+          {
+            "time_s": 0.01,
+            "value": 3.227
+          },
+          {
+            "time_s": 0.02,
+            "value": 2.509
+          }
+        ]
+      },
+      "latency_distribution": {
+        "bins": [
+          {
+            "edge_ms": 0.499,
+            "density": 0.001
+          },
+          {
+            "edge_ms": 0.532,
+            "density": 0.008
+          },
+          {
+            "edge_ms": 0.565,
+            "density": 0.044
+          },
+          {
+            "edge_ms": 0.597,
+            "density": 0.126
+          },
+          {
+            "edge_ms": 0.63,
+            "density": 0.261
+          },
+          {
+            "edge_ms": 0.663,
+            "density": 0.488
+          },
+          {
+            "edge_ms": 0.696,
+            "density": 0.823
+          },
+          {
+            "edge_ms": 0.729,
+            "density": 1.276
+          },
+          {
+            "edge_ms": 0.762,
+            "density": 1.718
+          },
+          {
+            "edge_ms": 0.794,
+            "density": 2.016
+          },
+          {
+            "edge_ms": 0.827,
+            "density": 2.135
+          },
+          {
+            "edge_ms": 0.86,
+            "density": 2.246
+          },
+          {
+            "edge_ms": 0.893,
+            "density": 2.582
+          },
+          {
+            "edge_ms": 0.926,
+            "density": 2.728
+          },
+          {
+            "edge_ms": 0.959,
+            "density": 2.35
+          },
+          {
+            "edge_ms": 0.991,
+            "density": 1.92
+          },
+          {
+            "edge_ms": 1.024,
+            "density": 1.545
+          },
+          {
+            "edge_ms": 1.057,
+            "density": 1.315
+          },
+          {
+            "edge_ms": 1.09,
+            "density": 1.256
+          },
+          {
+            "edge_ms": 1.123,
+            "density": 1.156
+          },
+          {
+            "edge_ms": 1.156,
+            "density": 1.032
+          },
+          {
+            "edge_ms": 1.188,
+            "density": 0.815
+          },
+          {
+            "edge_ms": 1.221,
+            "density": 0.683
+          },
+          {
+            "edge_ms": 1.254,
+            "density": 0.525
+          },
+          {
+            "edge_ms": 1.287,
+            "density": 0.421
+          },
+          {
+            "edge_ms": 1.32,
+            "density": 0.293
+          },
+          {
+            "edge_ms": 1.353,
+            "density": 0.206
+          },
+          {
+            "edge_ms": 1.385,
+            "density": 0.154
+          },
+          {
+            "edge_ms": 1.418,
+            "density": 0.103
+          },
+          {
+            "edge_ms": 1.451,
+            "density": 0.057
+          },
+          {
+            "edge_ms": 1.484,
+            "density": 0.031
+          },
+          {
+            "edge_ms": 1.517,
+            "density": 0.021
+          },
+          {
+            "edge_ms": 1.55,
+            "density": 0.015
+          },
+          {
+            "edge_ms": 1.582,
+            "density": 0.012
+          },
+          {
+            "edge_ms": 1.615,
+            "density": 0.007
+          },
+          {
+            "edge_ms": 1.648,
+            "density": 0.005
+          },
+          {
+            "edge_ms": 1.681,
+            "density": 0.005
+          },
+          {
+            "edge_ms": 1.714,
+            "density": 0.003
+          },
+          {
+            "edge_ms": 1.747,
+            "density": 0.004
+          },
+          {
+            "edge_ms": 1.779,
+            "density": 0.005
+          },
+          {
+            "edge_ms": 1.812,
+            "density": 0.003
+          },
+          {
+            "edge_ms": 1.845,
+            "density": 0.003
+          },
+          {
+            "edge_ms": 1.878,
+            "density": 0.004
+          },
+          {
+            "edge_ms": 1.911,
+            "density": 0.004
+          },
+          {
+            "edge_ms": 1.944,
+            "density": 0.004
+          },
+          {
+            "edge_ms": 1.976,
+            "density": 0.004
+          },
+          {
+            "edge_ms": 2.009,
+            "density": 0.003
+          },
+          {
+            "edge_ms": 2.042,
+            "density": 0.002
+          },
+          {
+            "edge_ms": 2.075,
+            "density": 0.001
+          },
+          {
+            "edge_ms": 2.108,
+            "density": 0.041
+          }
+        ],
+        "log_normal_params": {
+          "mu": -0.049,
+          "sigma": 0.188
+        },
+        "percentiles": {
+          "p05_ms": 0.72,
+          "p50_ms": 0.944,
+          "p95_ms": 1.279,
+          "p99_ms": 1.427
+        }
+      }
+    }
+  ],
+  "individual_metrics": [
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 1,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 39.998,
+        "throughput_messages_per_second": 39997.851,
+        "p50_latency_ms": 0.946,
+        "p90_latency_ms": 1.057,
+        "p95_latency_ms": 1.094,
+        "p99_latency_ms": 1.275,
+        "p999_latency_ms": 2.588,
+        "p9999_latency_ms": 6.397,
+        "avg_latency_ms": 0.968,
+        "median_latency_ms": 0.946,
+        "min_latency_ms": 0.667,
+        "max_latency_ms": 20.065,
+        "std_dev_latency_ms": 0.222
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 29.177
+          },
+          {
+            "time_s": 0.01,
+            "value": 37.906
+          },
+          {
+            "time_s": 0.02,
+            "value": 39.054
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 29200.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 37900.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 39066.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 4.663
+          },
+          {
+            "time_s": 0.01,
+            "value": 0.981
+          },
+          {
+            "time_s": 0.02,
+            "value": 0.907
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 2,
+        "total_time_secs": 78.229,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.139,
+        "throughput_messages_per_second": 40138.903,
+        "p50_latency_ms": 0.829,
+        "p90_latency_ms": 0.905,
+        "p95_latency_ms": 0.931,
+        "p99_latency_ms": 1.045,
+        "p999_latency_ms": 2.673,
+        "p9999_latency_ms": 30.511,
+        "avg_latency_ms": 0.911,
+        "median_latency_ms": 0.829,
+        "min_latency_ms": 0.623,
+        "max_latency_ms": 835.13,
+        "std_dev_latency_ms": 7.502
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.83,
+            "value": 132.443
+          },
+          {
+            "time_s": 0.84,
+            "value": 214.522
+          },
+          {
+            "time_s": 0.85,
+            "value": 165.388
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.83,
+            "value": 132400.0
+          },
+          {
+            "time_s": 0.84,
+            "value": 214500.0
+          },
+          {
+            "time_s": 0.85,
+            "value": 165400.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.83,
+            "value": 139.952
+          },
+          {
+            "time_s": 0.84,
+            "value": 0.839
+          },
+          {
+            "time_s": 0.85,
+            "value": 0.947
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 3,
+        "total_time_secs": 78.397,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.15,
+        "throughput_messages_per_second": 40149.55,
+        "p50_latency_ms": 0.844,
+        "p90_latency_ms": 0.983,
+        "p95_latency_ms": 1.008,
+        "p99_latency_ms": 1.081,
+        "p999_latency_ms": 2.207,
+        "p9999_latency_ms": 18.121,
+        "avg_latency_ms": 0.948,
+        "median_latency_ms": 0.844,
+        "min_latency_ms": 0.611,
+        "max_latency_ms": 1003.856,
+        "std_dev_latency_ms": 9.01
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 1.0,
+            "value": 195.304
+          },
+          {
+            "time_s": 1.01,
+            "value": 227.279
+          },
+          {
+            "time_s": 1.02,
+            "value": 166.919
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 1.0,
+            "value": 195300.0
+          },
+          {
+            "time_s": 1.01,
+            "value": 227300.0
+          },
+          {
+            "time_s": 1.02,
+            "value": 166933.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 1.0,
+            "value": 126.178
+          },
+          {
+            "time_s": 1.01,
+            "value": 0.886
+          },
+          {
+            "time_s": 1.02,
+            "value": 0.895
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 4,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 39.997,
+        "throughput_messages_per_second": 39997.374,
+        "p50_latency_ms": 1.158,
+        "p90_latency_ms": 1.314,
+        "p95_latency_ms": 1.381,
+        "p99_latency_ms": 1.473,
+        "p999_latency_ms": 2.698,
+        "p9999_latency_ms": 7.593,
+        "avg_latency_ms": 1.164,
+        "median_latency_ms": 1.158,
+        "min_latency_ms": 0.746,
+        "max_latency_ms": 18.51,
+        "std_dev_latency_ms": 0.226
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 27.947
+          },
+          {
+            "time_s": 0.01,
+            "value": 37.737
+          },
+          {
+            "time_s": 0.02,
+            "value": 38.562
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 27900.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 37750.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 38566.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 4.765
+          },
+          {
+            "time_s": 0.01,
+            "value": 1.038
+          },
+          {
+            "time_s": 0.02,
+            "value": 1.102
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 5,
+        "total_time_secs": 77.897,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.149,
+        "throughput_messages_per_second": 40148.621,
+        "p50_latency_ms": 0.912,
+        "p90_latency_ms": 1.023,
+        "p95_latency_ms": 1.075,
+        "p99_latency_ms": 1.236,
+        "p999_latency_ms": 2.128,
+        "p9999_latency_ms": 29.779,
+        "avg_latency_ms": 0.962,
+        "median_latency_ms": 0.912,
+        "min_latency_ms": 0.647,
+        "max_latency_ms": 503.175,
+        "std_dev_latency_ms": 4.524
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.5,
+            "value": 181.08
+          },
+          {
+            "time_s": 0.51,
+            "value": 228.345
+          },
+          {
+            "time_s": 0.52,
+            "value": 167.94
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.5,
+            "value": 181100.0
+          },
+          {
+            "time_s": 0.51,
+            "value": 228350.0
+          },
+          {
+            "time_s": 0.52,
+            "value": 167933.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.5,
+            "value": 63.726
+          },
+          {
+            "time_s": 0.51,
+            "value": 0.83
+          },
+          {
+            "time_s": 0.52,
+            "value": 0.829
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 6,
+        "total_time_secs": 78.385,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.162,
+        "throughput_messages_per_second": 40161.641,
+        "p50_latency_ms": 0.745,
+        "p90_latency_ms": 0.859,
+        "p95_latency_ms": 0.896,
+        "p99_latency_ms": 0.983,
+        "p999_latency_ms": 1.856,
+        "p9999_latency_ms": 36.24,
+        "avg_latency_ms": 0.842,
+        "median_latency_ms": 0.745,
+        "min_latency_ms": 0.576,
+        "max_latency_ms": 991.151,
+        "std_dev_latency_ms": 8.904
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.99,
+            "value": 262.642
+          },
+          {
+            "time_s": 1.0,
+            "value": 233.858
+          },
+          {
+            "time_s": 1.01,
+            "value": 170.587
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.99,
+            "value": 262600.0
+          },
+          {
+            "time_s": 1.0,
+            "value": 233850.0
+          },
+          {
+            "time_s": 1.01,
+            "value": 170600.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.99,
+            "value": 90.846
+          },
+          {
+            "time_s": 1.0,
+            "value": 0.912
+          },
+          {
+            "time_s": 1.01,
+            "value": 1.144
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 7,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 39.998,
+        "throughput_messages_per_second": 39997.714,
+        "p50_latency_ms": 1.003,
+        "p90_latency_ms": 1.191,
+        "p95_latency_ms": 1.266,
+        "p99_latency_ms": 1.429,
+        "p999_latency_ms": 3.316,
+        "p9999_latency_ms": 7.694,
+        "avg_latency_ms": 1.029,
+        "median_latency_ms": 1.003,
+        "min_latency_ms": 0.678,
+        "max_latency_ms": 21.951,
+        "std_dev_latency_ms": 0.267
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 28.731
+          },
+          {
+            "time_s": 0.01,
+            "value": 38.062
+          },
+          {
+            "time_s": 0.02,
+            "value": 38.679
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 28700.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 38050.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 38666.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 4.703
+          },
+          {
+            "time_s": 0.01,
+            "value": 0.895
+          },
+          {
+            "time_s": 0.02,
+            "value": 1.114
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 8,
+        "total_time_secs": 77.962,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.117,
+        "throughput_messages_per_second": 40116.768,
+        "p50_latency_ms": 0.778,
+        "p90_latency_ms": 0.885,
+        "p95_latency_ms": 0.929,
+        "p99_latency_ms": 1.146,
+        "p999_latency_ms": 2.41,
+        "p9999_latency_ms": 35.76,
+        "avg_latency_ms": 0.849,
+        "median_latency_ms": 0.778,
+        "min_latency_ms": 0.614,
+        "max_latency_ms": 568.441,
+        "std_dev_latency_ms": 5.117
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.56,
+            "value": 41.419
+          },
+          {
+            "time_s": 0.57,
+            "value": 153.933
+          },
+          {
+            "time_s": 0.58,
+            "value": 161.062
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.56,
+            "value": 41400.0
+          },
+          {
+            "time_s": 0.57,
+            "value": 153950.0
+          },
+          {
+            "time_s": 0.58,
+            "value": 161066.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.56,
+            "value": 284.623
+          },
+          {
+            "time_s": 0.57,
+            "value": 0.952
+          },
+          {
+            "time_s": 0.58,
+            "value": 0.802
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 9,
+        "total_time_secs": 77.8,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.114,
+        "throughput_messages_per_second": 40113.528,
+        "p50_latency_ms": 0.749,
+        "p90_latency_ms": 0.91,
+        "p95_latency_ms": 0.959,
+        "p99_latency_ms": 1.05,
+        "p999_latency_ms": 1.307,
+        "p9999_latency_ms": 26.323,
+        "avg_latency_ms": 0.798,
+        "median_latency_ms": 0.749,
+        "min_latency_ms": 0.499,
+        "max_latency_ms": 406.626,
+        "std_dev_latency_ms": 3.658
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.4,
+            "value": 13.792
+          },
+          {
+            "time_s": 0.41,
+            "value": 137.369
+          },
+          {
+            "time_s": 0.42,
+            "value": 163.392
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.4,
+            "value": 13800.0
+          },
+          {
+            "time_s": 0.41,
+            "value": 137350.0
+          },
+          {
+            "time_s": 0.42,
+            "value": 163400.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.4,
+            "value": 406.626
+          },
+          {
+            "time_s": 0.41,
+            "value": 1.269
+          },
+          {
+            "time_s": 0.42,
+            "value": 0.751
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 10,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 39.998,
+        "throughput_messages_per_second": 39998.468,
+        "p50_latency_ms": 1.137,
+        "p90_latency_ms": 1.3,
+        "p95_latency_ms": 1.366,
+        "p99_latency_ms": 1.491,
+        "p999_latency_ms": 2.424,
+        "p9999_latency_ms": 5.434,
+        "avg_latency_ms": 1.139,
+        "median_latency_ms": 1.137,
+        "min_latency_ms": 0.694,
+        "max_latency_ms": 11.469,
+        "std_dev_latency_ms": 0.19
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 34.956
+          },
+          {
+            "time_s": 0.01,
+            "value": 38.436
+          },
+          {
+            "time_s": 0.02,
+            "value": 38.714
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 35000.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 38450.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 38700.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 3.377
+          },
+          {
+            "time_s": 0.01,
+            "value": 0.89
+          },
+          {
+            "time_s": 0.02,
+            "value": 1.045
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 11,
+        "total_time_secs": 78.432,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.112,
+        "throughput_messages_per_second": 40111.793,
+        "p50_latency_ms": 1.032,
+        "p90_latency_ms": 1.332,
+        "p95_latency_ms": 1.385,
+        "p99_latency_ms": 1.481,
+        "p999_latency_ms": 2.044,
+        "p9999_latency_ms": 28.138,
+        "avg_latency_ms": 1.16,
+        "median_latency_ms": 1.032,
+        "min_latency_ms": 0.678,
+        "max_latency_ms": 1038.845,
+        "std_dev_latency_ms": 9.326
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 1.03,
+            "value": 23.249
+          },
+          {
+            "time_s": 1.04,
+            "value": 135.68
+          },
+          {
+            "time_s": 1.05,
+            "value": 159.963
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 1.03,
+            "value": 23200.0
+          },
+          {
+            "time_s": 1.04,
+            "value": 135700.0
+          },
+          {
+            "time_s": 1.05,
+            "value": 159966.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 1.03,
+            "value": 1038.845
+          },
+          {
+            "time_s": 1.04,
+            "value": 1.018
+          },
+          {
+            "time_s": 1.05,
+            "value": 1.087
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 12,
+        "total_time_secs": 77.581,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.131,
+        "throughput_messages_per_second": 40131.25,
+        "p50_latency_ms": 0.909,
+        "p90_latency_ms": 1.198,
+        "p95_latency_ms": 1.275,
+        "p99_latency_ms": 1.379,
+        "p999_latency_ms": 1.643,
+        "p9999_latency_ms": 21.857,
+        "avg_latency_ms": 0.963,
+        "median_latency_ms": 0.909,
+        "min_latency_ms": 0.596,
+        "max_latency_ms": 187.057,
+        "std_dev_latency_ms": 1.697
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.18,
+            "value": 94.349
+          },
+          {
+            "time_s": 0.19,
+            "value": 209.856
+          },
+          {
+            "time_s": 0.2,
+            "value": 162.722
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.18,
+            "value": 94300.0
+          },
+          {
+            "time_s": 0.19,
+            "value": 209850.0
+          },
+          {
+            "time_s": 0.2,
+            "value": 162733.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.18,
+            "value": 47.363
+          },
+          {
+            "time_s": 0.19,
+            "value": 0.763
+          },
+          {
+            "time_s": 0.2,
+            "value": 0.86
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 13,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.061,
+        "throughput_messages_per_second": 40061.259,
+        "p50_latency_ms": 0.949,
+        "p90_latency_ms": 1.038,
+        "p95_latency_ms": 1.076,
+        "p99_latency_ms": 1.25,
+        "p999_latency_ms": 2.951,
+        "p9999_latency_ms": 23.394,
+        "avg_latency_ms": 0.965,
+        "median_latency_ms": 0.949,
+        "min_latency_ms": 0.639,
+        "max_latency_ms": 46.832,
+        "std_dev_latency_ms": 0.5
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.04,
+            "value": 100.941
+          },
+          {
+            "time_s": 0.05,
+            "value": 118.101
+          },
+          {
+            "time_s": 0.06,
+            "value": 92.155
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.04,
+            "value": 100900.0
+          },
+          {
+            "time_s": 0.05,
+            "value": 118100.0
+          },
+          {
+            "time_s": 0.06,
+            "value": 92166.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.04,
+            "value": 9.993
+          },
+          {
+            "time_s": 0.05,
+            "value": 0.805
+          },
+          {
+            "time_s": 0.06,
+            "value": 0.897
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 14,
+        "total_time_secs": 77.897,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.149,
+        "throughput_messages_per_second": 40148.903,
+        "p50_latency_ms": 0.901,
+        "p90_latency_ms": 1.093,
+        "p95_latency_ms": 1.154,
+        "p99_latency_ms": 1.241,
+        "p999_latency_ms": 1.929,
+        "p9999_latency_ms": 29.416,
+        "avg_latency_ms": 0.964,
+        "median_latency_ms": 0.901,
+        "min_latency_ms": 0.594,
+        "max_latency_ms": 503.311,
+        "std_dev_latency_ms": 4.525
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.5,
+            "value": 183.722
+          },
+          {
+            "time_s": 0.51,
+            "value": 229.258
+          },
+          {
+            "time_s": 0.52,
+            "value": 167.859
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.5,
+            "value": 183700.0
+          },
+          {
+            "time_s": 0.51,
+            "value": 229250.0
+          },
+          {
+            "time_s": 0.52,
+            "value": 167866.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.5,
+            "value": 63.714
+          },
+          {
+            "time_s": 0.51,
+            "value": 0.792
+          },
+          {
+            "time_s": 0.52,
+            "value": 0.825
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 15,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.11,
+        "throughput_messages_per_second": 40109.72,
+        "p50_latency_ms": 0.962,
+        "p90_latency_ms": 1.109,
+        "p95_latency_ms": 1.158,
+        "p99_latency_ms": 1.253,
+        "p999_latency_ms": 1.909,
+        "p9999_latency_ms": 13.873,
+        "avg_latency_ms": 0.984,
+        "median_latency_ms": 0.962,
+        "min_latency_ms": 0.639,
+        "max_latency_ms": 87.702,
+        "std_dev_latency_ms": 0.8
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.08,
+            "value": 66.12
+          },
+          {
+            "time_s": 0.09,
+            "value": 179.18
+          },
+          {
+            "time_s": 0.1,
+            "value": 145.608
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.08,
+            "value": 66100.0
+          },
+          {
+            "time_s": 0.09,
+            "value": 179200.0
+          },
+          {
+            "time_s": 0.1,
+            "value": 145600.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.08,
+            "value": 29.814
+          },
+          {
+            "time_s": 0.09,
+            "value": 0.859
+          },
+          {
+            "time_s": 0.1,
+            "value": 0.703
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 16,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 39.994,
+        "throughput_messages_per_second": 39994.021,
+        "p50_latency_ms": 1.177,
+        "p90_latency_ms": 1.365,
+        "p95_latency_ms": 1.418,
+        "p99_latency_ms": 1.566,
+        "p999_latency_ms": 2.745,
+        "p9999_latency_ms": 8.889,
+        "avg_latency_ms": 1.187,
+        "median_latency_ms": 1.177,
+        "min_latency_ms": 0.729,
+        "max_latency_ms": 26.548,
+        "std_dev_latency_ms": 0.295
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 1.123
+          },
+          {
+            "time_s": 0.01,
+            "value": 36.914
+          },
+          {
+            "time_s": 0.02,
+            "value": 38.817
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 1100.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 36900.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 38833.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 9.942
+          },
+          {
+            "time_s": 0.01,
+            "value": 1.019
+          },
+          {
+            "time_s": 0.02,
+            "value": 1.188
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 17,
+        "total_time_secs": 78.428,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.136,
+        "throughput_messages_per_second": 40136.266,
+        "p50_latency_ms": 0.872,
+        "p90_latency_ms": 0.956,
+        "p95_latency_ms": 0.99,
+        "p99_latency_ms": 1.125,
+        "p999_latency_ms": 2.152,
+        "p9999_latency_ms": 20.587,
+        "avg_latency_ms": 0.965,
+        "median_latency_ms": 0.872,
+        "min_latency_ms": 0.659,
+        "max_latency_ms": 1035.031,
+        "std_dev_latency_ms": 9.29
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 1.03,
+            "value": 133.394
+          },
+          {
+            "time_s": 1.04,
+            "value": 189.969
+          },
+          {
+            "time_s": 1.05,
+            "value": 165.394
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 1.03,
+            "value": 133400.0
+          },
+          {
+            "time_s": 1.04,
+            "value": 189950.0
+          },
+          {
+            "time_s": 1.05,
+            "value": 165400.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 1.03,
+            "value": 173.262
+          },
+          {
+            "time_s": 1.04,
+            "value": 1.02
+          },
+          {
+            "time_s": 1.05,
+            "value": 1.01
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 18,
+        "total_time_secs": 77.61,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.13,
+        "throughput_messages_per_second": 40130.142,
+        "p50_latency_ms": 1.043,
+        "p90_latency_ms": 1.185,
+        "p95_latency_ms": 1.229,
+        "p99_latency_ms": 1.333,
+        "p999_latency_ms": 2.346,
+        "p9999_latency_ms": 24.699,
+        "avg_latency_ms": 1.072,
+        "median_latency_ms": 1.043,
+        "min_latency_ms": 0.683,
+        "max_latency_ms": 216.969,
+        "std_dev_latency_ms": 1.962
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.21,
+            "value": 88.563
+          },
+          {
+            "time_s": 0.22,
+            "value": 205.842
+          },
+          {
+            "time_s": 0.23,
+            "value": 162.811
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.21,
+            "value": 88600.0
+          },
+          {
+            "time_s": 0.22,
+            "value": 205850.0
+          },
+          {
+            "time_s": 0.23,
+            "value": 162800.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.21,
+            "value": 54.897
+          },
+          {
+            "time_s": 0.22,
+            "value": 0.766
+          },
+          {
+            "time_s": 0.23,
+            "value": 0.83
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 19,
+        "total_time_secs": 77.494,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.054,
+        "throughput_messages_per_second": 40054.312,
+        "p50_latency_ms": 1.141,
+        "p90_latency_ms": 1.288,
+        "p95_latency_ms": 1.335,
+        "p99_latency_ms": 1.46,
+        "p999_latency_ms": 2.203,
+        "p9999_latency_ms": 18.724,
+        "avg_latency_ms": 1.153,
+        "median_latency_ms": 1.141,
+        "min_latency_ms": 0.647,
+        "max_latency_ms": 32.308,
+        "std_dev_latency_ms": 0.367
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.03,
+            "value": 156.521
+          },
+          {
+            "time_s": 0.04,
+            "value": 98.273
+          },
+          {
+            "time_s": 0.05,
+            "value": 78.544
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.03,
+            "value": 156500.0
+          },
+          {
+            "time_s": 0.04,
+            "value": 98250.0
+          },
+          {
+            "time_s": 0.05,
+            "value": 78533.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.03,
+            "value": 5.242
+          },
+          {
+            "time_s": 0.04,
+            "value": 0.926
+          },
+          {
+            "time_s": 0.05,
+            "value": 0.992
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer",
+        "actor_kind": "producer",
+        "actor_id": 20,
+        "total_time_secs": 79.056,
+        "total_user_data_bytes": 3100000000,
+        "total_bytes": 3298400000,
+        "total_messages": 3100000,
+        "total_message_batches": 12400,
+        "throughput_megabytes_per_second": 40.148,
+        "throughput_messages_per_second": 40147.907,
+        "p50_latency_ms": 0.975,
+        "p90_latency_ms": 1.075,
+        "p95_latency_ms": 1.107,
+        "p99_latency_ms": 1.205,
+        "p999_latency_ms": 1.792,
+        "p9999_latency_ms": 16.932,
+        "avg_latency_ms": 1.109,
+        "median_latency_ms": 0.975,
+        "min_latency_ms": 0.628,
+        "max_latency_ms": 1662.271,
+        "std_dev_latency_ms": 14.92
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 1.66,
+            "value": 178.805
+          },
+          {
+            "time_s": 1.67,
+            "value": 216.729
+          },
+          {
+            "time_s": 1.68,
+            "value": 168.596
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 1.66,
+            "value": 178800.0
+          },
+          {
+            "time_s": 1.67,
+            "value": 216750.0
+          },
+          {
+            "time_s": 1.68,
+            "value": 168600.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 1.66,
+            "value": 208.727
+          },
+          {
+            "time_s": 1.67,
+            "value": 0.985
+          },
+          {
+            "time_s": 1.68,
+            "value": 1.074
+          }
+        ]
+      }
+    }
+  ]
+}

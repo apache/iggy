@@ -16,6 +16,7 @@
 // under the License.
 
 use assert_cmd::Command;
+use integration::harness::cargo_bin_path;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -32,7 +33,7 @@ where
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
-    let mut cmd = Command::cargo_bin(binary).expect("binary should be built");
+    let mut cmd = Command::new(cargo_bin_path(binary).expect("binary should be built"));
     cmd.current_dir(directory)
         .arg("--list-config-env-vars")
         .envs(env)
@@ -140,7 +141,7 @@ fn config_env_listing_includes_vector_index_templates() {
 
 #[test]
 fn mcp_rejects_unknown_arguments() {
-    let mut command = Command::cargo_bin("iggy-mcp").expect("binary should be built");
+    let mut command = Command::new(cargo_bin_path("iggy-mcp").expect("binary should be built"));
     let output = command
         .arg("--unknown")
         .timeout(LIST_ENV_VARS_TIMEOUT)

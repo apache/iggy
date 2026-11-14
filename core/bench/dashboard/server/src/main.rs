@@ -16,9 +16,11 @@
 // under the License.
 
 mod args;
+mod artifacts;
 mod cache;
+mod config;
+mod dedicated_thread;
 mod error;
-mod github;
 mod handlers;
 mod render;
 
@@ -31,10 +33,11 @@ use actix_web::{
     middleware::{Compress, Logger},
     web,
 };
-use args::{IggyBenchDashboardServerArgs, PollGithub};
-use cache::BenchmarkCache;
-use github::IggyBenchDashboardGithubPoller;
+use args::IggyBenchDashboardServerArgs;
+use bench_dashboard_shared::config::DashboardConfig;
+use cache::{BenchmarkCache, SeriesBuilder};
 use handlers::AppState;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::{
@@ -48,7 +51,10 @@ use tracing_subscriber::{
 struct ServerState {
     cache: Arc<BenchmarkCache>,
     _watcher: Arc<CacheWatcher>,
+    series_builder: Arc<SeriesBuilder>,
     render_pool: Arc<render::PngRenderPool>,
+    cache_dir: PathBuf,
+    config: Arc<DashboardConfig>,
 }
 
 async fn index() -> actix_web::Result<NamedFile> {
@@ -73,10 +79,18 @@ async fn main() -> Result<(), std::io::Error> {
     let addr = args.server_addr();
     let cors_origins = args.cors_origins_list();
 
-    let cache = Arc::new(BenchmarkCache::new(results_dir.clone()).await);
+    let config = match config::load(&args.config) {
+        Ok(config) => Arc::new(config),
+        Err(e) => {
+            error!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let cache = Arc::new(BenchmarkCache::new(results_dir.clone(), config.thresholds));
     info!("Starting cache load...");
     let start = std::time::Instant::now();
-    if let Err(e) = cache.load().await {
+    if let Err(e) = cache.load() {
         error!("Failed to load cache: {}", e);
         std::process::exit(1);
     }
@@ -91,33 +105,35 @@ async fn main() -> Result<(), std::io::Error> {
         }
     };
 
-    let poller = if let Some(poller) = args.github {
-        match poller {
-            PollGithub::PollGithub(args) => {
-                info!("Starting GithubPoller for branch {}", args.branch);
-
-                Some(IggyBenchDashboardGithubPoller::start(
-                    results_dir.clone(),
-                    args.branch,
-                    args.interval_seconds,
-                    cache.clone(),
-                ))
-            }
+    let series_builder = match SeriesBuilder::start(Arc::clone(&cache)) {
+        Ok(builder) => Arc::new(builder),
+        Err(e) => {
+            error!("Failed to start the series build thread: {}", e);
+            std::process::exit(1);
         }
-    } else {
-        None
     };
 
-    let render_pool = Arc::new(render::PngRenderPool::default_pool());
+    let render_pool = match render::PngRenderPool::default_pool() {
+        Ok(pool) => Arc::new(pool),
+        Err(e) => {
+            error!("Failed to start the PNG render thread: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let state = ServerState {
         cache: Arc::clone(&cache),
         _watcher: Arc::clone(&watcher),
+        series_builder,
         render_pool,
+        cache_dir: args.cache_dir.clone(),
+        config,
     };
 
     info!("Starting server on {}", addr);
     info!("Results directory: {}", results_dir.display());
+    info!("Cache directory: {}", args.cache_dir.display());
+    info!("Config file: {}", args.config.display());
     info!("Log level: {}", args.log_level);
     info!("CORS origins: {}", args.cors_origins);
 
@@ -153,20 +169,23 @@ async fn main() -> Result<(), std::io::Error> {
             .wrap(Compress::default())
             .app_data(web::Data::new(AppState {
                 cache: Arc::clone(&state.cache),
+                series_builder: Arc::clone(&state.series_builder),
                 render_pool: Arc::clone(&state.render_pool),
+                cache_dir: state.cache_dir.clone(),
+                config: Arc::clone(&state.config),
             }))
             .service(handlers::health_check)
-            .service(handlers::list_hardware)
-            .service(handlers::list_gitrefs_for_hardware)
-            .service(handlers::get_recent_benchmarks) // Register this before the generic gitref endpoint
-            .service(handlers::list_benchmarks_for_gitref)
-            .service(handlers::list_benchmarks_for_hardware_and_gitref)
+            .service(handlers::list_benchmark_summaries)
+            .service(handlers::get_dashboard_config)
             .service(handlers::get_benchmark_report_full)
             .service(handlers::get_benchmark_report_light)
-            .service(handlers::get_benchmark_trend)
+            .service(handlers::get_benchmark_series)
             .service(handlers::get_test_artifacts_zip)
             .service(handlers::embed_chart_png)
             .service(handlers::embed_chart)
+            // Keep this after every /api handler: actix matches services in registration order,
+            // so the scope hides an /api handler registered after it.
+            .service(web::scope("/api").default_service(web::to(handlers::unknown_api_path)))
             .service(
                 fs::Files::new("/", "frontend/dist")
                     .index_file("index.html")
@@ -178,10 +197,6 @@ async fn main() -> Result<(), std::io::Error> {
     .run();
 
     server.await?;
-
-    if let Some(poller) = poller {
-        poller.shutdown().await;
-    }
 
     Ok(())
 }

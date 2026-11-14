@@ -1090,6 +1090,9 @@ pub enum PartitionChangeKind {
     /// A consumer group of the partition's topic was deleted, so the group's
     /// offsets on the partition are now dead.
     ConsumerGroupDeleted,
+    /// The partition's topic turned tiered storage on, so every replica of
+    /// the partition starts its chain file.
+    TieringEnabled,
 }
 
 /// One partition change.
@@ -1751,6 +1754,35 @@ impl Streams {
                 topic.partitions.len(),
                 topic.resolved.runtime.segment_size,
             ))
+        })
+    }
+
+    /// What a tiered topic keeps on local disk: its `local_retention_age`
+    /// and `local_retention_size`. `None` for a topic that is not tiered.
+    #[must_use]
+    pub fn topic_local_retention(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Option<(IggyExpiry, MaxTopicSize)> {
+        self.inner.read(|inner| {
+            let resolved = &inner.items.get(stream_id)?.topics.get(topic_id)?.resolved;
+            resolved
+                .tiered_storage
+                .then_some((resolved.local_retention_age, resolved.local_retention_size))
+        })
+    }
+
+    /// Whether any topic is tiered. A node claims the object store's root for
+    /// this cluster only while no topic is tiered.
+    #[must_use]
+    pub fn has_tiered_topic(&self) -> bool {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .any(|(_, topic)| topic.resolved.tiered_storage)
         })
     }
 
@@ -3508,10 +3540,7 @@ fn encode_create_topic_reply(
                 },
                 // A new topic always lists its members. Nothing is in sync
                 // before the partition's primary first reports.
-                members: p
-                    .members
-                    .map(|members| members.nodes().to_vec())
-                    .unwrap_or_default(),
+                members: p.members.map_or_default(|members| members.nodes().to_vec()),
                 in_sync_members: Vec::new(),
             })
         })
@@ -3597,7 +3626,13 @@ impl StateHandler for UpdateTopicResolvedRequest {
             topic.name = name.clone();
             stream.topic_index.insert(name, topic_id);
         }
+        let was_tiered = topic.resolved.tiered_storage;
         topic.set_options(options);
+        // Only a build that knows the option admits its enable, and only once
+        // every member of the cluster runs one, so every replica that applies
+        // this takes the same branch and bumps the same revision.
+        let newly_tiered =
+            !was_tiered && topic.resolved.tiered_storage && !topic.partitions.is_empty();
         // An equal patch commits as ok but changes nothing public.
         let after = stream
             .topics
@@ -3613,6 +3648,14 @@ impl StateHandler for UpdateTopicResolvedRequest {
             })
             .into_iter()
             .collect();
+        if newly_tiered {
+            state.revision = state.revision.wrapping_add(1);
+            state.record_topic_partition_changes(
+                stream_id,
+                topic_id,
+                PartitionChangeKind::TieringEnabled,
+            );
+        }
         ApplyReply {
             changes,
             ..ApplyReply::ok(Bytes::new())
@@ -4072,8 +4115,7 @@ impl Snapshotable for Streams {
                                             deleted_up_to_offset: p.deleted_up_to_offset,
                                             members: p
                                                 .members
-                                                .map(|members| members.nodes().to_vec())
-                                                .unwrap_or_default(),
+                                                .map_or_default(|members| members.nodes().to_vec()),
                                             retirement_debt_op: p.retirement_debt_op,
                                         })
                                         .collect(),
@@ -6007,6 +6049,109 @@ mod tests {
             IggyTimestamp::now(),
         );
         assert_eq!(apply.code, 0);
+    }
+
+    #[test]
+    fn given_topic_turned_tiered_when_checking_should_report_tiered_topic() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 1);
+        assert!(!Streams::from(inner.clone()).has_tiered_topic());
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert!(Streams::from(inner).has_tiered_topic());
+    }
+
+    /// Every replica of every partition starts its chain file when the topic
+    /// turns tiered storage on, so the enable records one change per
+    /// partition. A patch that leaves the topic tiered records nothing.
+    #[test]
+    fn given_a_topic_when_tiered_storage_is_enabled_should_record_each_partition_once() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 2);
+        let created = inner.revision;
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert!(inner.items[0].topics[0].resolved.tiered_storage);
+        let enabled = inner.revision;
+        assert_eq!(enabled, created + 1);
+        let change = |partition_id| {
+            (
+                enabled,
+                PartitionChange {
+                    namespace: IggyNamespace::new(0, 0, partition_id),
+                    created_revision: created,
+                    kind: PartitionChangeKind::TieringEnabled,
+                },
+            )
+        };
+        assert_eq!(changes_since(&inner, created), [change(0), change(1)]);
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert_eq!(inner.revision, enabled);
+        assert_eq!(changes_since(&inner, enabled), []);
+    }
+
+    #[test]
+    fn given_a_topic_without_partitions_when_tiered_storage_is_enabled_should_keep_the_revision() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 0);
+        let created = inner.revision;
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        assert!(inner.items[0].topics[0].resolved.tiered_storage);
+        assert_eq!(inner.revision, created);
     }
 
     /// Readers act on every partition a commit touched, so each applied

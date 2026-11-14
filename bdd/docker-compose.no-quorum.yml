@@ -47,6 +47,7 @@ services:
         PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
         LIBC: glibc
         PROFILE: debug
+        LICENSE_STAGE: license-skip
     command: [ "--replica-id", "0" ]
     cap_add:
       - SYS_NICE

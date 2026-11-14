@@ -105,7 +105,10 @@ public final class ReadException extends IggyException {
 
     /**
      * For messages that a read whose reply was lost stored, and that the reader could not read again: their first and
-     * last offset. The reader reads on after them. Empty for every other error.
+     * last offset. Empty for every other error. This report stops nothing and needs no {@link PartitionReader#seek}.
+     * A batch that the reader holds after the range follows it. If the partition stopped, the error that stopped it
+     * comes after that batch: {@code HISTORY_UNAVAILABLE} (87), {@code INVALID_SIZE_BYTES} (80), or the sixth
+     * lasting refusal of a read in a row.
      */
     public Optional<OffsetRange> lost() {
         return lost;

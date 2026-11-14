@@ -246,7 +246,8 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   The key, the `loginUser()` password and the `fromConnectionString()` string are marked `#[\SensitiveParameter]`, so exception traces hold a `SensitiveParameterValue` in their place. The `raw` arrays of `createStream()`, `updateStream()`, `createTopic()` and `updateTopic()` are marked as well, because an unknown key may hold a secret.
 
   Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
-- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros` and `max_topic_size`. Null arguments keep stored values. `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry and size cap are resettable, every other case is refused with the server's error.
+- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros`, `max_topic_size`, `local_retention_age_micros` and `local_retention_size`, and turns `tiered_storage` on, never off. Null arguments keep stored values.
+- `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry, size cap, local retention age and local retention size are resettable, every other case is refused with the server's error.
 - `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
 - `createTopic()` takes `replication_factor`, how many nodes store each partition: 1 to 32 and at most the cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply. The factor is create-only, and a value out of range is refused as `Invalid replication factor` (code 2018).
 - A topic read's `partitions` holds one `Iggy\Partition` per partition with `id`, `segments_count`, `current_offset`, `size_bytes`, `messages_count`, `members` (the node ids that store the partition) and `in_sync_members` (the members its primary last reported in sync and that are up, empty until it first reports).
@@ -444,8 +445,12 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   a message that does not decode. The reader retries by itself. `HistoryUnavailable`
   (87) stops the partition until `seek()`. A lost read can commit messages that the
   reader cannot read again. Then the reader throws `FetchProgressUncertain` (14010)
-  once. Its `lost` holds the first and last offset of those messages as `[first, last]`,
-  and `skip` the continuation after them.
+  once. Its `lost` holds the first and last offset of those messages as `[first, last]`.
+  This error stops nothing and needs no seek. A seek after it drops the batch that
+  follows the range. If the reader stopped the partition, the error that stopped it
+  comes after that batch. Earlier versions gave this error a `skip` after the range.
+  Code that handles `FetchProgressUncertain` with `abandonOperation()` and a `seek()`
+  must now check `lost` first and do neither for this error.
 - Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered

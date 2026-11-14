@@ -15,25 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use crate::error::IggyBenchDashboardServerError;
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Subcommand, Deserialize)]
-pub enum PollGithub {
-    PollGithub(PollGithubArgs),
-}
-
-#[derive(Debug, Parser, Deserialize)]
-pub struct PollGithubArgs {
-    /// How often to poll GitHub for new artifacts, in seconds
-    #[arg(short, long, default_value = "60")]
-    pub interval_seconds: u64,
-
-    /// Branch to filter artifacts by
-    #[arg(short, long, default_value = "master")]
-    pub branch: String,
-}
+const CACHE_DIR_NAME: &str = "iggy-bench-dashboard";
 
 #[derive(Debug, Deserialize, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -58,9 +47,13 @@ pub struct IggyBenchDashboardServerArgs {
     #[arg(long, default_value = "*")]
     pub cors_origins: String,
 
-    /// Poll GitHub for new artifacts
-    #[command(subcommand)]
-    pub github: Option<PollGithub>,
+    /// Directory for cached PNG files and artifact zips
+    #[arg(long, default_value_os_t = default_cache_dir())]
+    pub cache_dir: PathBuf,
+
+    /// Dashboard configuration file: official suites, headline workloads, and thresholds
+    #[arg(long, default_value = "dashboard.toml")]
+    pub config: PathBuf,
 }
 
 impl IggyBenchDashboardServerArgs {
@@ -90,13 +83,8 @@ impl IggyBenchDashboardServerArgs {
             )
             .exit();
         }
-
-        if self.github.is_some() && std::env::var("GITHUB_TOKEN").is_err() {
-            cmd.error(
-                ErrorKind::InvalidValue,
-                "GITHUB_TOKEN env variable not set, but GitHub polling enabled",
-            )
-            .exit();
+        if let Err(e) = prepare_cache_dir(&self.results_dir, &self.cache_dir) {
+            cmd.error(ErrorKind::InvalidValue, e.to_string()).exit();
         }
     }
 
@@ -109,5 +97,135 @@ impl IggyBenchDashboardServerArgs {
             .split(',')
             .map(|s| s.trim().to_string())
             .collect()
+    }
+}
+
+fn default_cache_dir() -> PathBuf {
+    std::env::temp_dir().join(CACHE_DIR_NAME)
+}
+
+/// Creates `cache_dir` once it's known not to be `results_dir` or inside it. The check runs before
+/// anything is created, so a rejected cache dir never adds a directory to the results.
+fn prepare_cache_dir(
+    results_dir: &Path,
+    cache_dir: &Path,
+) -> Result<(), IggyBenchDashboardServerError> {
+    let results_dir = results_dir
+        .canonicalize()
+        .map_err(|e| path_error(e, "resolve", results_dir))?;
+    let resolved_cache_dir =
+        resolve_path(cache_dir).map_err(|e| path_error(e, "resolve", cache_dir))?;
+    if resolved_cache_dir.starts_with(&results_dir) {
+        return Err(IggyBenchDashboardServerError::InvalidPath(format!(
+            "--cache-dir '{}' is inside --results-dir '{}'. Use a cache directory outside the \
+             results directory, because the server must not write into it",
+            resolved_cache_dir.display(),
+            results_dir.display()
+        )));
+    }
+    fs::create_dir_all(cache_dir).map_err(|e| path_error(e, "create", cache_dir))?;
+    Ok(())
+}
+
+/// Resolves `path` like `canonicalize`, even when some of its components don't exist yet. A missing
+/// component counts as a plain directory, which is what `create_dir_all` turns it into.
+fn resolve_path(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        if component == Component::ParentDir {
+            resolved.pop();
+        } else {
+            resolved.push(component);
+        }
+        if let Ok(canonical) = resolved.canonicalize() {
+            resolved = canonical;
+        }
+    }
+    Ok(resolved)
+}
+
+fn path_error(error: io::Error, action: &str, path: &Path) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("Can't {action} '{}': {error}", path.display()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn temp_results_dir() -> (TempDir, PathBuf) {
+        let root = tempfile::tempdir().expect("create temp dir");
+        let results_dir = root.path().join("results");
+        fs::create_dir(&results_dir).expect("create results dir");
+        (root, results_dir)
+    }
+
+    fn is_inside_results_error(result: &Result<(), IggyBenchDashboardServerError>) -> bool {
+        matches!(result, Err(IggyBenchDashboardServerError::InvalidPath(_)))
+    }
+
+    #[test]
+    fn given_cache_dir_inside_results_dir_when_preparing_should_fail_without_creating_it() {
+        let (_root, results_dir) = temp_results_dir();
+        let cache_dir = results_dir.join("cache");
+
+        let result = prepare_cache_dir(&results_dir, &cache_dir);
+
+        assert!(is_inside_results_error(&result), "got {result:?}");
+        assert!(!cache_dir.exists());
+    }
+
+    #[test]
+    fn given_cache_dir_equal_to_results_dir_when_preparing_should_fail() {
+        let (_root, results_dir) = temp_results_dir();
+
+        let result = prepare_cache_dir(&results_dir, &results_dir);
+
+        assert!(is_inside_results_error(&result), "got {result:?}");
+    }
+
+    #[test]
+    fn given_cache_dir_next_to_results_dir_when_preparing_should_create_it() {
+        let (root, results_dir) = temp_results_dir();
+        // Shares the text prefix "results" with the results dir, but no path component.
+        let cache_dir = root.path().join("results-cache").join("nested");
+
+        let result = prepare_cache_dir(&results_dir, &cache_dir);
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert!(cache_dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_symlink_into_results_dir_when_preparing_should_fail_without_creating_it() {
+        let (root, results_dir) = temp_results_dir();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&results_dir, &link).expect("create symlink");
+
+        let result = prepare_cache_dir(&results_dir, &link.join("cache"));
+
+        assert!(is_inside_results_error(&result), "got {result:?}");
+        assert!(!results_dir.join("cache").exists());
+    }
+
+    #[test]
+    fn given_parent_dir_steps_into_results_dir_when_preparing_should_fail_without_creating_it() {
+        let (root, results_dir) = temp_results_dir();
+        let cache_dir = root
+            .path()
+            .join("missing")
+            .join("..")
+            .join("results")
+            .join("cache");
+
+        let result = prepare_cache_dir(&results_dir, &cache_dir);
+
+        assert!(is_inside_results_error(&result), "got {result:?}");
+        assert!(!results_dir.join("cache").exists());
+        assert!(!root.path().join("missing").exists());
     }
 }

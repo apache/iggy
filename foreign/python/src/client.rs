@@ -55,6 +55,9 @@ use crate::reader::PartitionReader;
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 use crate::resource_options::{OptionKey, StreamOptions, TopicOptions, UserOptions};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
+use crate::snapshot::{
+    SnapshotCompression as PySnapshotCompression, SystemSnapshotType as PySystemSnapshotType,
+};
 use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
@@ -128,12 +131,16 @@ pub struct ReadError {
     offset: Option<u64>,
     record: Option<Bytes>,
     /// Whether the reader stopped the partition after six refusals in a row that a retry does
-    /// not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+    /// not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+    /// of the partition reads it again.
     #[pyo3(get)]
     is_lasting_refusal: bool,
     /// For messages that a lost read committed and that the reader could not read again: their
     /// first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
-    /// (14010). `None` for every other error.
+    /// (14010). `None` for every other error. This error stops nothing and needs no `seek()`.
+    /// A batch that the reader holds after the range comes next, and a `seek()` before the
+    /// application takes it drops it. If the reader stopped the partition, the error that
+    /// stopped it comes after that batch.
     #[pyo3(get)]
     lost: Option<(u64, u64)>,
 }
@@ -151,8 +158,7 @@ impl ReadError {
 
     /// For a message that does not decode: the continuation after it. The messages before it
     /// arrive in a batch before this error, and the reader reads the message again until
-    /// `seek()` to this continuation skips it. For a lost range: the continuation after the
-    /// last offset of `lost`. `None` for every other error.
+    /// `seek()` to this continuation skips it. `None` for every other error.
     #[gen_stub(override_return_type(type_repr = "PollingStrategy | None"))]
     #[getter]
     fn skip(&self) -> Option<PollingStrategy> {
@@ -429,6 +435,59 @@ impl IggyClient {
         future_into_py(py, async move {
             let stats = inner.get_stats().await.map_err(to_runtime_error)?;
             Ok(PyStats::from(stats))
+        })
+    }
+
+    /// Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+    ///
+    /// Requires an authenticated session whose user holds the `manage_servers`
+    /// global permission.
+    ///
+    /// Args:
+    ///     snapshot_compression: Archive compression method as a
+    ///         `SnapshotCompression` enum.
+    ///     snapshot_types: Data to include in the snapshot as a list of
+    ///         `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+    ///         combined with any other snapshot type.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the ZIP archive `bytes`.
+    ///
+    /// Raises:
+    ///     TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+    ///         or `snapshot_types` contains elements other than `SystemSnapshotType`.
+    ///     ValueError: If `snapshot_types` is empty.
+    ///     RuntimeError: If the client is not connected, the session is not
+    ///         authenticated, the user lacks the permission, `SystemSnapshotType.All` is
+    ///         combined with another snapshot type, the 30-second binary
+    ///         operation deadline expires, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn snapshot<'a>(
+        &self,
+        py: Python<'a>,
+        snapshot_compression: PySnapshotCompression,
+        snapshot_types: Vec<PySystemSnapshotType>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        if snapshot_types.is_empty() {
+            return Err(PyValueError::new_err("snapshot_types must not be empty"));
+        }
+
+        let mut parsed_types = Vec::with_capacity(snapshot_types.len());
+        for snapshot_type in snapshot_types {
+            let rust_type = SystemSnapshotType::from(snapshot_type);
+            if !parsed_types.contains(&rust_type) {
+                parsed_types.push(rust_type);
+            }
+        }
+
+        let inner = self.inner.clone();
+        let compression = SnapshotCompression::from(snapshot_compression);
+        future_into_py(py, async move {
+            let snapshot = inner
+                .snapshot(compression, parsed_types)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &snapshot.0).unbind()))
         })
     }
 
@@ -1213,26 +1272,41 @@ impl IggyClient {
     ///         nothing either, reset `OptionKey.MaxTopicSize` to return to the
     ///         default.
     ///     reset: Keys to return to their defaults as `list[OptionKey] | None`:
-    ///         `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+    ///         `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+    ///         `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
     ///     options: Additional option keys as `dict[str, str] | None`, sent
     ///         verbatim so an updatable server key can be set from this build.
     ///         A create-only key is refused by name.
     ///     raw_reset: Additional reset names as `list[str] | None`, sent
     ///         verbatim so a key newer than this build can be reset. The
     ///         server decides them.
+    ///     tiered_storage: `True` turns tiered storage on, unchanged when
+    ///         `None`. The server refuses `False`, an update never turns it
+    ///         off, and refuses `True` with `FeatureUnavailable` until it
+    ///         tiers topics.
+    ///     local_retention_age: How long a tiered topic keeps an uploaded
+    ///         segment on local disk as `IggyExpiry | None`, unchanged when
+    ///         `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+    ///         reset `OptionKey.LocalRetentionAge` to return to the default.
+    ///     local_retention_size: Topic-wide cap on the uploaded segments a
+    ///         tiered topic keeps on local disk as `MaxTopicSize | None`,
+    ///         unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+    ///         nothing either, reset `OptionKey.LocalRetentionSize` to return
+    ///         to the default.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     ValueError: If `message_expiry`, `max_topic_size`,
+    ///         `local_retention_age` or `local_retention_size` is out of range.
     ///     OptionError: A `RuntimeError` carrying the error `code` and
     ///         `kind` when the client or the server refuses an option.
     ///     RuntimeError: Before anything is sent, if the update changes
     ///         nothing, names a key both set and reset, the name does not fit,
     ///         or a reset key cannot be reset. Otherwise if the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None)
+        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -1255,11 +1329,25 @@ impl IggyClient {
         options: Option<BTreeMap<String, String>>,
         #[gen_stub(override_type(type_repr = "builtins.list[builtins.str] | None"))]
         raw_reset: Option<Vec<String>>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tiered_storage: Option<bool>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] local_retention_age: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let update_options = TopicUpdateOptions {
             name,
             message_expiry: message_expiry.map(RustIggyExpiry::try_from).transpose()?,
             max_topic_size: max_topic_size.map(RustMaxTopicSize::try_from).transpose()?,
+            tiered_storage,
+            local_retention_age: local_retention_age
+                .map(RustIggyExpiry::try_from)
+                .transpose()?,
+            local_retention_size: local_retention_size
+                .map(RustMaxTopicSize::try_from)
+                .transpose()?,
             reset: reset_keys(reset),
             raw_reset: raw_reset.into_iter().flatten().collect(),
             raw: options.unwrap_or_default(),
@@ -2641,6 +2729,53 @@ mod tests {
     }
 
     #[test]
+    fn given_tiered_read_failure_when_mapping_should_keep_its_code_and_flag_the_stop() {
+        const TIERED_READ_FAILED_CODE: u32 = 96;
+        const PARTITION_ID: u32 = 1;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::TieredReadFailed);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            assert_eq!(
+                raised
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+
+            let read = to_read_error(RustReadError::new(
+                Some(PARTITION_ID),
+                IggyError::TieredReadFailed,
+            ));
+
+            assert!(read.is_instance_of::<ReadError>(py));
+            let value = read.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+            assert!(
+                value
+                    .getattr("is_lasting_refusal")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                "the first tiered read failure stops its partition"
+            );
+            let cause = value.getattr("error").unwrap();
+            assert_eq!(
+                cause.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+        });
+    }
+
+    #[test]
     fn given_read_error_of_the_whole_reader_when_mapping_should_have_no_partition_or_skip() {
         Python::initialize();
         Python::attach(|py| {
@@ -2668,12 +2803,12 @@ mod tests {
                 Some(PARTITION_ID),
                 IggyError::FetchProgressUncertain(OPERATION_ID),
             );
-            read_error.skip = Some(RustPollingStrategy::offset(LAST + 1));
             read_error.lost = Some(FIRST..=LAST);
 
             let error = to_read_error(read_error);
 
             let value = error.value(py);
+            assert!(value.getattr("skip").unwrap().is_none());
             assert_eq!(
                 value
                     .getattr("lost")

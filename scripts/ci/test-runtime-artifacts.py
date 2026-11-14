@@ -21,6 +21,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,13 @@ DOWNLOAD_RUNTIME = "./.github/actions/utils/download-runtime"
 
 def run(*args, cwd=REPO_ROOT, env=None):
     return subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True)
+
+
+def env_without_git(**extra):
+    """Drop GIT_* variables: under a hook or `git rebase --exec`, GIT_DIR and
+    GIT_INDEX_FILE aim git at the caller's repository, not at its working directory."""
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    return env | extra
 
 
 class RuntimeArtifacts(unittest.TestCase):
@@ -130,7 +138,7 @@ class RuntimeBuildSelection(unittest.TestCase):
                            if step.get("name") == "Build coverage artifacts")
         self.revision = run("git", "rev-parse", "HEAD").stdout.strip()
         self.env = dict(os.environ, RUNNER_TEMP=str(self.root), ARTIFACT_TASK="test-build",
-                        TEST_SELECTION="affected", PLAN_STATUS="failure", PLAN_FILE="",
+                        TEST_SELECTION="affected", PLAN_STATUS="failure", PLAN_FILE="", STACK_BASE="",
                         GITHUB_WORKSPACE=str(self.root), PATH=f"{self.root}:{os.environ['PATH']}")
         git = self.root / "git"
         git.write_text(f"#!/bin/sh\ncase $1 in\n  rev-parse) echo {self.revision} ;;\n  cat-file) echo 'parent fixture' ;;\n  *) exit 1 ;;\nesac\n")
@@ -206,6 +214,21 @@ elif sys.argv[1] in ('build', 'metadata'):
         self.env["TEST_SELECTION"] = "workspace"
         self.assert_workspace_fallback()
 
+    def test_stack_top_diffs_fixtures_against_the_stack_base(self):
+        # The first parent of the top merge ref is the layer below, and only a
+        # lower layer changed gateways/. The fixtures must still be generated.
+        (self.root / "git").write_text(f"""#!/bin/sh
+case $1 in
+  rev-parse) echo {self.revision} ;;
+  cat-file) printf 'parent layer-below\\nparent top-head\\n' ;;
+  fetch) ;;
+  diff) if [ "$3" = stack-base ]; then echo gateways/kafka/src/lib.rs; else echo docs/unrelated.md; fi ;;
+  *) exit 1 ;;
+esac
+""")
+        self.env["STACK_BASE"] = "stack-base"
+        self.assert_workspace_fallback()
+
     def select(self, packages, *, tests=(), runtime_packages=()):
         outputs = {
             "cargo-scope:cargo.test": "packages\n" if packages else "skipped\n",
@@ -277,25 +300,83 @@ esac
 
 
 class RuntimeSelection(unittest.TestCase):
-    def select(self, files):
+    def detect(self, files, *, pull_request=None, cwd=REPO_ROOT):
         workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/_detect.yml").read_text())
         components = yaml.safe_load((REPO_ROOT / ".github/config/components.yml").read_text())
         step = next(step for step in workflow["jobs"]["detect"]["steps"] if step.get("id") == "mk")
         script = step["with"]["script"]
         script = script.replace("${{ steps.config.outputs.components }}", json.dumps(components))
         script = script.replace("${{ steps.changed.outputs.all_files || '[]' }}", json.dumps(files))
+        context = {"eventName": "pull_request", "payload": {"pull_request": pull_request}}
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "outputs"
-            env = dict(os.environ, GITHUB_OUTPUT=str(output))
-            result = run("node", "-e", "const context = {eventName: 'pull_request'};\n" + script, env=env)
+            env = env_without_git(GITHUB_OUTPUT=str(output))
+            result = run("node", "-e", f"const context = {json.dumps(context)};\n" + script, cwd=cwd, env=env)
+            lines = output.read_text().splitlines() if output.exists() else []
+            return result, dict(line.split("=", 1) for line in lines)
+
+    def select(self, files, **kwargs):
+        result, outputs = self.detect(files, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return outputs
+
+    @staticmethod
+    def stack_layer(position, size, base, stack_base="master"):
+        return {"base": {"ref": base},
+                "stack": {"number": 7, "position": position, "size": size, "base": {"ref": stack_base}}}
+
+    @staticmethod
+    def tasks(matrix):
+        return {(entry["component"], entry["task"]) for entry in json.loads(matrix)["include"]}
+
+    def stack_checkout(self):
+        """Build the checkout of a top layer: master, three layers, and a merge ref per
+        layer on top of the merge ref below it, as GitHub builds them. HEAD is the top one.
+
+        Return it with the master commit that the stack forked from."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        checkout = Path(temp.name)
+        env = env_without_git(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                              GIT_AUTHOR_NAME="Stack test", GIT_AUTHOR_EMAIL="stack@example.com",
+                              GIT_COMMITTER_NAME="Stack test", GIT_COMMITTER_EMAIL="stack@example.com")
+
+        def git(*args):
+            result = run("git", *args, cwd=checkout, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            return dict(line.split("=", 1) for line in output.read_text().splitlines())
+            return result.stdout.strip()
+
+        def commit(path, content):
+            (checkout / path).parent.mkdir(parents=True, exist_ok=True)
+            (checkout / path).write_text(content)
+            git("add", "--all")
+            git("commit", "--quiet", "-m", path)
+
+        git("init", "--quiet", "--initial-branch=master")
+        commit("helm/values.yaml", "replicas: 1\n")
+        fork = git("rev-parse", "HEAD")
+        git("switch", "--quiet", "-c", "layer-1")
+        commit("core/server/src/main.rs", "fn main() {}\n")
+        git("switch", "--quiet", "-c", "layer-2")
+        (checkout / "docs").mkdir()
+        git("mv", "helm/values.yaml", "docs/values.yaml")
+        git("commit", "--quiet", "-m", "move the values file")
+        git("switch", "--quiet", "-c", "layer-3")
+        commit("docs/unrelated.md", "notes\n")
+        git("switch", "--quiet", "--detach", "master")
+        for layer in ("layer-1", "layer-2", "layer-3"):
+            git("merge", "--quiet", "--no-ff", "-m", f"Merge {layer}", layer)
+        merge = git("rev-parse", "HEAD")
+        # The base branch moves after GitHub built the merge commit.
+        git("switch", "--quiet", "master")
+        commit("web/package.json", "{}\n")
+        git("update-ref", "refs/remotes/origin/master", "master")
+        git("switch", "--quiet", "--detach", merge)
+        return checkout, fork
 
     def test_component_config_change_runs_selection_validation(self):
         outputs = self.select([".github/config/components.yml"])
-        self.assertIn(("ci-workflows", "validate"),
-                      [(entry["component"], entry["task"])
-                       for entry in json.loads(outputs["other_matrix"])["include"]])
+        self.assertIn(("ci-workflows", "validate"), self.tasks(outputs["other_matrix"]))
 
     def test_nextest_config_change_runs_miri(self):
         outputs = self.select([".config/nextest.toml"])
@@ -306,9 +387,7 @@ class RuntimeSelection(unittest.TestCase):
         outputs = self.select(["scripts/ci/restore-runtime.sh"])
         self.assertEqual(outputs["runtime"], "true")
         self.assertTrue(json.loads(outputs["rust_runtime_plan"])["tests"])
-        self.assertIn(("ci-workflows", "validate"),
-                      [(entry["component"], entry["task"])
-                       for entry in json.loads(outputs["other_matrix"])["include"]])
+        self.assertIn(("ci-workflows", "validate"), self.tasks(outputs["other_matrix"]))
 
     def test_python_only_change_builds_runtime_without_rust_tests(self):
         outputs = self.select(["foreign/python/src/lib.rs"])
@@ -331,6 +410,66 @@ class RuntimeSelection(unittest.TestCase):
 
     def test_unrelated_documentation_does_not_build_server(self):
         self.assertEqual(self.select(["docs/unrelated.md"])["runtime"], "false")
+
+    def test_stack_middle_layer_runs_rust_lint_only(self):
+        files = ["core/server/src/main.rs", "foreign/python/src/lib.rs", "helm/values.yaml"]
+        result, outputs = self.detect(files, pull_request=self.stack_layer(2, 3, "layer-1"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(entry["task"] for entry in json.loads(outputs["rust_plan"])["checks"]),
+                         ["clippy", "fmt", "machete", "sort"])
+        self.assertEqual(outputs["rust_runtime_plan"], "")
+        self.assertEqual(outputs["stack_base"], "")
+        self.assertEqual(outputs["runtime"], "false")
+        for name, matrix in outputs.items():
+            if name.endswith("_matrix"):
+                self.assertEqual(self.tasks(matrix), {("noop", "noop")}, name)
+        self.assertIn("::notice title=Stack 7::Pull request 2 of 3 runs lint only.", result.stdout)
+
+    def test_stack_lowest_unmerged_layer_runs_the_full_plan(self):
+        files = ["core/server/src/main.rs"]
+        unstacked = self.select(files)
+        # GitHub retargets a layer to the base branch of the stack after the layers
+        # below it merge. Position 3 is then the top too, and it has no layer left to cover.
+        for position in (1, 2, 3):
+            with self.subTest(position=position):
+                self.assertEqual(self.select(files, pull_request=self.stack_layer(position, 3, "master")),
+                                 unstacked)
+
+    def test_stack_layer_without_a_size_runs_the_full_plan(self):
+        files = ["core/server/src/main.rs"]
+        pull_request = self.stack_layer(2, 3, "layer-1")
+        del pull_request["stack"]["size"]
+        self.assertEqual(self.select(files, pull_request=pull_request), self.select(files))
+
+    def test_stack_of_two_keeps_the_top_layer_on_its_own_diff(self):
+        files = ["foreign/python/src/lib.rs"]
+        self.assertEqual(self.select(files, pull_request=self.stack_layer(2, 2, "layer-1")),
+                         self.select(files))
+
+    def test_stack_top_layer_tests_every_layer(self):
+        checkout, fork = self.stack_checkout()
+        result, outputs = self.detect(["docs/unrelated.md"], cwd=checkout,
+                                      pull_request=self.stack_layer(3, 3, "layer-2"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Layer 1 changed the server, so the top layer runs its tests and its storage check.
+        runtime_plan = json.loads(outputs["rust_runtime_plan"])
+        self.assertTrue(runtime_plan["tests"])
+        self.assertEqual([entry["task"] for entry in runtime_plan["checks"]], ["test-storage-compat"])
+        # Both compare against the commit the stack forked from. The first parent of
+        # HEAD would hide the layers below, and the tip of master is not in HEAD.
+        self.assertEqual(outputs["stack_base"], fork)
+        other = self.tasks(outputs["other_matrix"])
+        # Layer 2 moved this file out of helm/, and a rename counts for both paths.
+        self.assertIn(("helm", "validate"), other)
+        # Only the base branch changed web/, after the stack forked.
+        self.assertFalse({task for task in other if task[0] == "web-ui"})
+        self.assertIn("::notice title=Stack 7::The top pull request tests", result.stdout)
+
+    def test_stack_top_layer_fails_without_the_stack_diff(self):
+        pull_request = self.stack_layer(3, 3, "layer-2", stack_base="branch-that-was-never-fetched")
+        result, outputs = self.detect(["docs/unrelated.md"], pull_request=pull_request)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outputs, {})
 
 
 class RuntimeConsumers(unittest.TestCase):
@@ -595,6 +734,29 @@ const console = { log() {} };
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not appear to be a git repository", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+class FinalizeStatus(unittest.TestCase):
+    def check(self, *results):
+        workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/pre-merge.yml").read_text())
+        step = next(step for step in workflow["jobs"]["finalize_pr"]["steps"]
+                    if step.get("name") == "Check status")
+        self.assertEqual(step["env"]["NEEDS_RESULTS"], "${{ join(needs.*.result, ' ') }}")
+        # Every expression left in the script only fills the summary table.
+        script = re.sub(r"\$\{\{.*?\}\}", "-", step["run"])
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, NEEDS_RESULTS=" ".join(results),
+                       GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
+            return run("bash", "-c", script, env=env).returncode
+
+    def test_success_and_skipped_jobs_pass(self):
+        self.assertEqual(self.check("success", "skipped", "success"), 0)
+
+    def test_every_other_result_fails(self):
+        # GitHub ends a job that never got a runner as `abandoned`.
+        for result in ("failure", "cancelled", "abandoned"):
+            with self.subTest(result=result):
+                self.assertEqual(self.check("success", result, "skipped"), 1)
 
 
 if __name__ == "__main__":
