@@ -124,6 +124,9 @@ export class IggyConnection extends EventEmitter {
   failure?: unknown;
   readonly closed: Promise<void>;
   private close!: () => void;
+  /** Physical closure is later than logical failure and request cancellation. */
+  readonly socketClosed: Promise<void>;
+  private closeSocket!: () => void;
   private connectPromise?: Promise<this>;
   private readonly decoder: ResponseFrameDecoder;
   private readonly pending = new Map<bigint, Pending>();
@@ -138,6 +141,7 @@ export class IggyConnection extends EventEmitter {
     super();
     this.decoder = new ResponseFrameDecoder(config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE);
     this.closed = new Promise<void>((resolve) => { this.close = resolve; });
+    this.socketClosed = new Promise<void>((resolve) => { this.closeSocket = resolve; });
   }
 
   connect(signal?: AbortSignal): Promise<this> {
@@ -156,10 +160,17 @@ export class IggyConnection extends EventEmitter {
       signal?.throwIfAborted();
       const socket = getTransport(this.config);
       this.socket = socket;
+      process.nextTick(() => {
+        if (!this.ending && !this.failed)
+          this.emit('connecting');
+      });
       const ready = this.config.transport === 'TLS' ? 'secureConnect' : 'connect';
       socket.on('data', (data) => this.onData(data));
       socket.on('error', (error) => this.fail(this.connected ? new ConnectionClosedError(error) : error));
-      socket.once('close', () => this.fail(this.failure ?? new ConnectionClosedError()));
+      socket.once('close', () => {
+        this.closeSocket();
+        this.fail(this.failure ?? new ConnectionClosedError());
+      });
       await waitWithin(new Promise<void>((resolve, reject) => {
         const cleanup = () => {
           socket.removeListener(ready, established);
@@ -342,6 +353,7 @@ export class IggyConnection extends EventEmitter {
     for (const pending of this.writes.splice(0))
       pending.owner?.release();
     this.socket?.destroy();
+    if (!this.socket) this.closeSocket();
     this.close();
     this.changed.pulse();
     if (this.listenerCount('error') > 0)
