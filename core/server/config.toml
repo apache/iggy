@@ -1360,6 +1360,78 @@ handshake_grace = "10 s"
 # requests in flight.
 #max_concurrent_callouts = 64
 
+# Tiered storage: an object store for the sealed segments of tiered topics.
+# Without this section, the backend is "none" and no topic can turn tiered.
+# Even with a backend, no topic can turn tiered yet: that waits for reads of
+# evicted segments from the store, which this version does not do.
+#[tiered_storage]
+# "none", "fs" (a directory) or "s3" (S3 and stores with its API, such as
+# Ceph RGW and R2).
+#backend = "none"
+# The key prefix of this cluster's objects. Two clusters can share a bucket
+# under different prefixes, but never under the same one. The cluster claims
+# its prefix with the object "<prefix>/meta/identity". Replica 0 writes it
+# while it is the caught-up metadata primary and no topic is tiered. While
+# another replica leads metadata, nothing claims the prefix: restart the
+# leader until replica 0 leads. A node uploads and deletes objects only while
+# it reads that claim back through its own store, which the gauge
+# object_store_identity_verified shows. Give every node the same store and
+# prefix: the check cannot tell two stores apart when replica 0 reaches an
+# empty one and the other nodes reach one that holds an earlier claim of this
+# cluster. At boot the server reads the claim once, and only a missing bucket
+# or rejected credentials stop the boot. The server README says how to keep
+# and restore the claim.
+#prefix = "iggy"
+# The fs backend: the directory that holds the objects.
+#path = "/var/lib/iggy-tiered"
+# The s3 backend: the bucket, the region and, for a store other than AWS,
+# its URL without a path.
+#bucket = "iggy-segments"
+#region = "eu-central-1"
+#endpoint = "https://storage.example.com"
+# Where the bucket goes in a request URL: "path" (endpoint/bucket/key),
+# "virtual_hosted" (bucket.endpoint/key) or "auto", which picks
+# "virtual_hosted" for AWS and "path" for any other endpoint.
+#url_style = "auto"
+# Static s3 credentials. Set them in the environment, with
+# IGGY_TIERED_STORAGE_ACCESS_KEY_ID and IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY,
+# rather than in this file. The printed configuration never shows them.
+# Without static keys, the s3 backend takes temporary credentials, in the
+# order of the AWS SDKs: from web identity (AWS_WEB_IDENTITY_TOKEN_FILE and
+# AWS_ROLE_ARN, as on EKS), and then from the role of the EC2 instance
+# (AWS_EC2_METADATA_DISABLED=true turns that off). The node fetches new
+# credentials 5 minutes before the old ones expire, and every shard uses them.
+#access_key_id = ""
+#secret_access_key = ""
+# The tuning values below are provisional.
+# The longest wait for one attempt at a store call other than a put, from
+# 1 s to 1 h.
+#request_timeout = "30 s"
+# If the store takes no piece of a put's body for this long, or gives no
+# answer for this long after the last piece, the put fails. A put has no
+# total deadline. From 1 s to 1 h.
+#progress_timeout = "30 s"
+# The most attempts at a store call other than a put that keeps failing for
+# a transient reason, the first one included, and the backoff between them,
+# each wait from 1 ms to 1 h.
+#max_attempts = 3
+#retry_delay = "200 ms"
+#max_retry_delay = "5 s"
+# Per shard: how many jobs of each class run at once, and the bytes that
+# fetches and uploads hold. A segment larger than 'upload_bytes' uploads
+# alone. Only segment uploads and object deletes go through these caps so
+# far, so the fetch caps take no effect yet. They take effect once cold reads
+# go through the tier service.
+#[tiered_storage.jobs]
+#demand_fetches = 16
+#demand_fetch_bytes = "64 MiB"
+#uploads = 2
+#upload_bytes = "2 GiB"
+#speculative_fetches = 4
+#speculative_fetch_bytes = "32 MiB"
+#deletes = 2
+#housekeeping = 1
+
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]
 # A literal IP or a DNS hostname, without a port. Named to match its roster
@@ -1369,3 +1441,21 @@ handshake_grace = "10 s"
 # out here because the shipped 'tcp.address' binds a concrete address and needs
 # no declaration.
 #advertised_address = "broker-1.example.com"
+
+# Free space this node keeps on the disk of its data directory. While less is
+# free, the node refuses new messages for the partitions it leads with a
+# transient error that SDKs retry, and accepts them again once space returns.
+# Retention, segment deletion and consumer offsets keep working, so the node
+# can still free space. Without the reserve a full disk fails a WAL write and
+# stops the node.
+#
+# The free space is the last sample of the disk, taken once a second, minus
+# what the node wrote since, so a burst between two samples is counted, and
+# minus the messages the node accepted and has not written yet, so the WAL
+# backlogs of its partitions cannot write through the reserve together. A
+# backup does not refuse what its primary replicates: give every node of a
+# cluster the same disk size, or watch 'data_disk_below_free_space_reserve' on
+# each node.
+#
+# "0" disables the reserve.
+free_space_reserve = "1 GiB"

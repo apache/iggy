@@ -24,15 +24,17 @@ use crate::journal::{
 };
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
+use crate::object_delete::{RetiredSegment, RetiredSegments};
 use crate::persistence::{
     FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
 use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
-    PollTier, ResidentTailSnapshot,
+    PollTier, ResidentTailSnapshot, SegmentSource,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
-use crate::segment::Segment;
+use crate::remote_segments::{IndexFetches, RemoteRange};
+use crate::segment::{Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
@@ -81,6 +83,7 @@ use iggy_common::{
     EncryptorKind, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
     TopicRuntimeOptions,
 };
+use iggy_object_store::{SegmentKey, SegmentObject};
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
 use journal::superblock::{
@@ -107,6 +110,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, warn};
 
@@ -176,6 +180,39 @@ where
     pub(crate) history_transition: Option<InstalledPartitionHistory>,
     /// The partition's state machines, applied at commit in op order.
     pub(crate) state_machines: StateMachines,
+    /// The chain of a tiered partition, `None` until it opens one.
+    pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
+    /// Where polls read segments whose `.log` left the disk.
+    remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// The floor advances this replica applied that its chain does not record
+    /// yet, oldest first. Recorded ones leave from the front.
+    pub(crate) pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
+    /// How much of the partition stays on local disk, as the segment cleaner
+    /// last resolved it from the topic. `None` until it has.
+    local_envelope: Option<LocalEnvelope>,
+    /// The upload in flight: its attempt, and the scope whose end stops the
+    /// job.
+    segment_upload: Option<(crate::SegmentUploadAttempt, iggy_object_store::TierScope)>,
+    /// Attempts started so far, so that no two share a number.
+    segment_upload_attempts: u64,
+    /// The offset after the last segment this primary stored, when uploads
+    /// have run oldest first up to it. Only where the search for the next
+    /// upload starts: see [`Self::slot_after_uploaded`].
+    upload_cursor: Option<u64>,
+    /// Set when a sealed segment became uploadable, for the shard to turn into
+    /// an upload pass: the partition cannot send itself a frame.
+    upload_wanted: Cell<bool>,
+    /// The highest committed truncation watermark a timed pass read from
+    /// metadata for this partition. The watermark only rises, so the one
+    /// metadata holds now is never below it.
+    committed_truncation: u64,
+    /// What this replica deletes from the object store while it is the
+    /// primary.
+    object_deletes: ObjectDeletes,
+    /// Number of the last object-delete job this partition started.
+    object_delete_jobs: u64,
+    /// The fetches of remote segments' indexes that polls have in flight.
+    index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -289,6 +326,12 @@ where
     /// Commit point the recovered WAL names. Entries at or below it are
     /// committed history, so a fence neither holds them back nor proves them.
     recovered_commit: u64,
+    /// Commit point the WAL names on a replica that booted awaiting a state
+    /// transfer. Boot skipped the replay, so the journal is empty and
+    /// `commit_min` reads 0 while the WAL still holds those ops. Above 0 it
+    /// proves that the group committed an op, which an offer at op 0 would
+    /// erase.
+    pub(crate) unreplayed_commit: u64,
     /// First op of a broken fenced window the I/O lane is truncating. The fence's
     /// follow-up runs when that truncation lands.
     unproven_drop_from: Option<u64>,
@@ -306,6 +349,11 @@ where
     incarnation: crate::PartitionIncarnation,
     workerless_offset_files: Rc<crate::offset_storage::RetainedOffsetFiles<compio::fs::File>>,
     poll_notifier: Option<Rc<dyn Fn()>>,
+    /// The node's reserve on the data disk. `None` never refuses.
+    free_space_reserve: Option<Arc<crate::FreeSpaceReserve>>,
+    /// Bytes of the send the reserve admitted and this partition is turning
+    /// into a prepare. The reserve counts them as pending until the WAL does.
+    admitted_send_bytes: Cell<u64>,
     /// Committed consumer-offset membership and values. This is deliberately
     /// separate from the eager poll maps because follower-local and uncommitted
     /// auto-commit progress must never consume a durable slot or enter a state
@@ -736,6 +784,7 @@ struct PendingMaterialization {
     phase: MaterializationPhase,
     save: Option<PendingMaterializationSave>,
     checksum: Option<Box<consensus::StateArtifactHasher>>,
+    digest: Option<Box<crate::segment_chain::SegmentDigest>>,
 }
 
 #[derive(Clone, Copy)]
@@ -755,7 +804,45 @@ struct PendingPartitionMaintenance {
     checkpoint: Option<PendingCheckpoint>,
     retention: Option<u64>,
     removing: Option<Segment>,
+    /// The trim point the removal appends before it unlinks.
+    removal_trim: Option<u64>,
+    eviction: Option<u64>,
+    tiering: Option<PendingTiering>,
 }
+
+/// A request to complete the partition's chain, which may still lack the
+/// trim point or the record of a sealed segment, and how far it got.
+struct PendingTiering {
+    prefix: iggy_object_store::ObjectPrefix,
+    /// Every sealed segment that starts below this offset has its record or
+    /// needs none.
+    scan_from: u64,
+    /// The hash of a sealed segment between its steps.
+    digest: Option<Box<crate::segment_chain::SegmentDigest>>,
+    /// Bytes the next job reads into one buffer.
+    read_len: usize,
+    /// A job just ran, so work that waited behind it goes first once.
+    yielding: bool,
+    failures: u32,
+    retry_after_micros: u64,
+}
+
+impl PendingTiering {
+    const fn new(prefix: iggy_object_store::ObjectPrefix) -> Self {
+        Self {
+            prefix,
+            scan_from: 0,
+            digest: None,
+            read_len: 0,
+            yielding: false,
+            failures: 0,
+            retry_after_micros: 0,
+        }
+    }
+}
+
+const TIERING_RETRY_BACKOFF_BASE_MICROS: u64 = 1_000_000;
+const TIERING_RETRY_BACKOFF_MAX_SHIFT: u32 = 6;
 
 struct PendingWireActions {
     view: u32,
@@ -897,6 +984,9 @@ impl<B: MessageBus, SB> Drop for IggyPartition<B, SB> {
         if let Some(persistence) = &self.persistence {
             persistence.retire();
         }
+        if let Some(reserve) = &self.free_space_reserve {
+            reserve.release_pending(self.admitted_send_bytes.take());
+        }
     }
 }
 
@@ -909,6 +999,8 @@ where
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
         let observed_view = consensus.view();
         let single_replica = consensus.replica_count() == 1;
+        let io_active = Rc::<crate::io::PartitionIoQuiescence>::default();
+        let poll_history = PollHistoryId::default();
         let partition = Self {
             consensus,
             dedup: ClientTable::with_mode(
@@ -930,6 +1022,18 @@ where
             pending_history_transition: Cell::new(None),
             history_transition: None,
             state_machines: StateMachines::default(),
+            segment_chain: None,
+            remote_segments: None,
+            pending_advances: VecDeque::new(),
+            local_envelope: None,
+            segment_upload: None,
+            segment_upload_attempts: 0,
+            upload_cursor: None,
+            upload_wanted: Cell::new(false),
+            committed_truncation: 0,
+            object_deletes: ObjectDeletes::default(),
+            object_delete_jobs: 0,
+            index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -961,6 +1065,7 @@ where
             view_fence: None,
             recovered_unproven: false,
             recovered_commit: 0,
+            unreplayed_commit: 0,
             unproven_drop_from: None,
             proof_walk: (0, 0),
             proof_walk_memory: None,
@@ -974,13 +1079,15 @@ where
             io_notifier: RefCell::new(None),
             io_bytes_max: Cell::new(isize::MAX as usize),
             io_sequence: Cell::new(0),
-            io_active: Rc::default(),
+            io_active,
             transition: None,
             deferred_views: Vec::new(),
-            poll_history: PollHistoryId::default(),
+            poll_history,
             incarnation: crate::PartitionIncarnation::default(),
             workerless_offset_files: Rc::default(),
             poll_notifier: None,
+            free_space_reserve: None,
+            admitted_send_bytes: Cell::new(0),
             durable_consumer_offsets: DurableConsumerOffsets::default(),
             explicit_offset_stores: ExplicitOffsetStores::default(),
             consumer_offset_capacities: ConsumerKind::ALL
@@ -1783,8 +1890,13 @@ where
                         .checked_add(1)
                         .ok_or(IggyError::CannotReadFile)?
                 },
+                first_timestamp: segment.start_timestamp,
             };
-            persistence.enable_segment_storage(initial, segment.max_size.as_bytes_u64());
+            persistence.enable_segment_storage(
+                initial,
+                segment.max_size.as_bytes_u64(),
+                self.effective_segment_max_age(),
+            );
             if persistence.start() {
                 self.consensus
                     .message_bus()
@@ -1803,14 +1915,21 @@ where
             self.consensus.set_recovery_election_allowed(true);
         }
         self.workerless_offset_files.clear();
+        let checkpoint = persistence.checkpoint_op();
+        let head = persistence.head();
+        let mut commit = prepares
+            .iter()
+            .filter(|message| message.header().op != checkpoint)
+            .fold(checkpoint, |commit, message| {
+                commit.max(message.header().commit.min(head))
+            });
         if self.materialization_missing {
+            self.unreplayed_commit = commit;
             self.persistence = Some(persistence);
+            self.report_wal_backlog_to_reserve();
             self.consensus.resume_adopted_view();
             return Ok(());
         }
-        let checkpoint = persistence.checkpoint_op();
-        let head = persistence.head();
-        let mut commit = checkpoint;
         for message in prepares {
             let header = *message.header();
             if header.op == checkpoint {
@@ -1820,7 +1939,6 @@ where
                     .restore_checkpoint_prepare(checkpoint, message.into_frozen());
                 continue;
             }
-            commit = commit.max(header.commit.min(head));
             if header.operation == Operation::SendMessages {
                 self.append_repaired_send_messages(message).await?;
             } else {
@@ -1854,6 +1972,7 @@ where
             });
         }
         self.persistence = Some(persistence);
+        self.report_wal_backlog_to_reserve();
         self.consensus.resume_adopted_view();
         Ok(())
     }
@@ -1879,7 +1998,16 @@ where
                 .await
                 .map_err(|_| IggyError::CannotSyncFile)?;
         }
-        if !self.materialization_missing {
+        self.restore_recovered_log_view(persistence, !self.materialization_missing);
+        Ok(())
+    }
+
+    fn restore_recovered_log_view(
+        &mut self,
+        persistence: &PartitionPersistence,
+        restore_certificate: bool,
+    ) {
+        if restore_certificate {
             match persistence.certified_log_view() {
                 Some(view) if view >= self.consensus.log_view() => {
                     if view > self.consensus.view() {
@@ -1894,7 +2022,6 @@ where
             }
         }
         self.recovered_unproven = persistence.head() > 0;
-        Ok(())
     }
 
     pub const fn requires_state_transfer(&self) -> bool {
@@ -1967,6 +2094,7 @@ where
         (self.fatal.is_none()
             && self.maintenance.checkpoint.is_none()
             && !self.checkpoint_waits_for_commit()
+            && !self.checkpoint_waits_for_advances()
             && persistence.needs_checkpoint()
             && through_op > persistence.checkpoint_op()
             && through_op <= persistence.head())
@@ -2084,13 +2212,15 @@ where
                     .sum::<usize>(),
         );
         for start_offset in segments {
-            // Retention may already have removed a dirty sealed segment.
-            if self
+            // Retention may already have removed a dirty sealed segment, and
+            // an evicted one has no `.log` left to sync: boot marks every
+            // recovered segment dirty, remote ones included.
+            let local = self
                 .log
                 .segments()
                 .binary_search_by_key(&start_offset, |segment| segment.start_offset)
-                .is_err()
-            {
+                .is_ok_and(|slot| self.log.segments()[slot].location != SegmentLocation::Remote);
+            if !local {
                 continue;
             }
             paths.push(config.get_messages_path(
@@ -2209,6 +2339,7 @@ where
     pub(crate) fn cancel_history_maintenance(&mut self) {
         self.maintenance.checkpoint = None;
         self.maintenance.retention = None;
+        self.maintenance.eviction = None;
     }
 
     fn capture_checkpoint_phase(
@@ -2933,10 +3064,30 @@ where
     /// restart below where the group already is (a transfer install of an
     /// all-GC'd origin, a crash inside the install's swap window, the
     /// fence-and-rebuild path, which needs no crash at all, and a crash while
-    /// acked messages were still resident in the journal). Restarting the
-    /// counter is not a lag -- replicas re-stamp `base_offset` from it and
-    /// recompute `batch_checksum` over the result, so the next replicated
-    /// prepare would persist different bytes here than on every peer, silently.
+    /// acked messages were still resident in the journal). A solo group that
+    /// restarts its counter mints those offsets a second time, and a rebuilt
+    /// replica of a persisted group has nothing else to anchor its chain to.
+    ///
+    /// A multi-replica group that acks before it persists ignores the record.
+    /// A crash can take from every member a tail that the record names, and
+    /// the group then reuses those offsets. A replica that recovered a log
+    /// resumes where that log ends: its WAL only extends its own segment
+    /// tail, and a backup refuses a batch whose `base_offset` does not
+    /// continue its own counter. A rebuilt replica recovered no log and
+    /// awaits a state transfer. A counter at the record makes that replica
+    /// refuse every offer of a group that resumed below the record, and a
+    /// group of two then never commits again, because a waiting replica
+    /// acknowledges nothing. A counter below the group is a lag there: repair
+    /// journals the missing ops at the offsets the group stamped and raises
+    /// the counter with them, and an install takes the frontier of its offer.
+    ///
+    /// A persisted group keeps the raise. Its record never names an offset
+    /// that the group lost: a replica acknowledges a persisted send only once
+    /// its own WAL holds it durably, and the record takes the committed
+    /// counter or the frontier of an installed offer, never an uncommitted
+    /// counter. A record writer that breaks this, or a quorum that loses
+    /// durable data, leaves the counter above the group, and the group stalls
+    /// on the batch check above instead of handing those offsets out twice.
     ///
     /// The two counters are seeded separately, because the record carries two
     /// bounds. `offset_frontier` is what messages reached, so it seeds the
@@ -2949,8 +3100,8 @@ where
     /// The reservation is SOLO ONLY and applies to weaker durability. Persisted
     /// topics recover exact append positions from their prepare WAL. Advancing
     /// them to a reservation before replay would strand the retained segment tail.
-    /// A backup mints nothing: it re-stamps what
-    /// the primary sends and rejects anything that does not continue its own
+    /// A backup mints nothing: it journals what
+    /// the primary stamped and rejects anything that does not continue its own
     /// counter, so an append point a lease block above its group would have every
     /// peer refuse the batch. A replicated group is also less exposed, since an
     /// ack there means a quorum journaled the batch and the hole needs a
@@ -2964,6 +3115,9 @@ where
         let Some(state) = recovered else {
             return;
         };
+        if self.consensus.replica_count() > 1 && !self.durability().is_persisted() {
+            return;
+        }
         let frontier = state.offset_frontier;
         let reserved = if self.consensus.replica_count() == 1 && !self.durability().is_persisted() {
             state.offset_reserved
@@ -3112,7 +3266,9 @@ where
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
             producers: std::mem::take(&mut self.producers),
-            machines: (!self.state_machines.is_empty())
+            machines: self
+                .state_machines
+                .holds_state()
                 .then(|| self.state_machines.capture(self.consensus().commit_min())),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),
@@ -3248,29 +3404,18 @@ where
     #[cfg(feature = "simulator")]
     pub fn attach_simulated_persistence(&mut self, persistence: Rc<PartitionPersistence>) {
         // New empty WALs carry view zero; positive certificates belong to recovered history.
-        if self.recovered_log_view.is_none()
+        let empty_wal = self.recovered_log_view.is_none()
             && persistence.head() == 0
-            && matches!(persistence.certified_log_view(), None | Some(0))
-        {
+            && matches!(persistence.certified_log_view(), None | Some(0));
+        if empty_wal {
             persistence.certify_log_view(self.consensus.log_view(), 0, 0);
-        } else {
-            match persistence.certified_log_view() {
-                Some(view) if view >= self.consensus.log_view() => {
-                    if view > self.consensus.view() {
-                        self.consensus.set_view(view);
-                    }
-                    self.consensus.set_log_view(view);
-                }
-                _ => {
-                    self.materialization_missing = true;
-                    self.ensure_materialization_recovery();
-                }
-            }
         }
+        self.restore_recovered_log_view(&persistence, !empty_wal);
         if !self.materialization_missing && persistence.recovered_frontier() {
             self.consensus.set_recovery_election_allowed(true);
         }
         self.persistence = Some(persistence);
+        self.report_wal_backlog_to_reserve();
         self.start_persistence();
     }
 
@@ -3863,6 +4008,13 @@ where
         self.runtime_options.effective_segment_size()
     }
 
+    /// Microseconds past a segment's first batch at which a batch starts the
+    /// next one, shared by materialization and the WAL. `None` rolls by size.
+    #[must_use]
+    pub fn effective_segment_max_age(&self) -> Option<u64> {
+        self.runtime_options.effective_segment_max_age()
+    }
+
     /// The stable-storage requirement for message acknowledgment.
     #[must_use]
     pub const fn durability(&self) -> iggy_common::Durability {
@@ -3924,9 +4076,7 @@ where
         self.consumer_offset_dirs = dirs.map(Some);
     }
 
-    /// Seed committed membership from one recovered offset file. The logical
-    /// value may be clamped to the recovered message frontier while the file
-    /// high-water retains the value read from disk.
+    /// Seed committed membership from one recovered offset file.
     pub fn seed_recovered_consumer_offset(
         &self,
         kind: ConsumerKind,
@@ -3942,22 +4092,21 @@ where
         );
     }
 
-    /// Lower the logical value of a recovered offset that lies past the partition's offset space,
-    /// keeping the high-water read from its file.
-    pub fn clamp_recovered_consumer_offset(
-        &self,
-        kind: ConsumerKind,
-        consumer_id: u32,
-        committed_offset: u64,
-    ) {
-        if let Some(state) = self.durable_consumer_offsets.get(kind, consumer_id) {
-            self.durable_consumer_offsets.record_explicit(
-                kind,
-                consumer_id,
-                committed_offset,
-                state.persisted_high_water,
-            );
+    /// Drop a recovered offset whose file boot removed, as if it had never been loaded.
+    pub(crate) fn forget_recovered_consumer_offset(&self, kind: ConsumerKind, consumer_id: u32) {
+        match kind {
+            ConsumerKind::Consumer => {
+                self.consumer_offsets.pin().remove(&(consumer_id as usize));
+            }
+            ConsumerKind::ConsumerGroup => {
+                self.consumer_group_offsets
+                    .pin()
+                    .remove(&ConsumerGroupId(consumer_id as usize));
+            }
+            // The durable table below is the only store of an external offset.
+            ConsumerKind::ExternalGroup => {}
         }
+        self.durable_consumer_offsets.remove(kind, consumer_id);
     }
 
     pub fn seed_stranded_consumer_offset(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
@@ -4181,7 +4330,7 @@ where
         outcome
     }
 
-    fn retire_consumer_offset_file(&self, path: &str) {
+    pub(crate) fn retire_consumer_offset_file(&self, path: &str) {
         if let Some(persistence) = &self.persistence {
             persistence.retire_offset_file(path);
         } else {
@@ -4438,6 +4587,11 @@ where
                 return Err(IggyError::TransientNotAccepted);
             }
         }
+        // Only now: the store failing a read of a history or an owner that
+        // was replaced meanwhile says nothing about the ones served now.
+        if let Some(error) = result.tiered_read_failure() {
+            return Err(error);
+        }
         let mut replication = None;
         if let Some(offset) = result
             .last_matching_offset
@@ -4511,6 +4665,7 @@ where
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.workerless_offset_files.clear();
         self.poll_history = PollHistoryId::default();
+        self.index_fetches.replace_history(self.poll_history);
         self.publish_poll_visibility();
         self.discard_queued_auto_commits();
         self.transfer_plan.borrow_mut().take();
@@ -4536,6 +4691,60 @@ where
     /// and it must not re-enter the partition.
     pub fn set_poll_notifier(&mut self, notifier: Option<Rc<dyn Fn()>>) {
         self.poll_notifier = notifier;
+    }
+
+    /// While the reserve is short, this partition refuses new messages as a
+    /// primary. A backup keeps journalling, because a replica that refuses
+    /// prepares stalls the commit of every group that needs its ack.
+    pub fn set_free_space_reserve(&mut self, reserve: Option<Arc<crate::FreeSpaceReserve>>) {
+        self.release_send_space();
+        self.free_space_reserve = reserve;
+        self.report_wal_backlog_to_reserve();
+    }
+
+    /// The WAL counts what it accepted and has not written as pending bytes
+    /// of the reserve. Call after either of the two is installed.
+    fn report_wal_backlog_to_reserve(&self) {
+        if let Some(persistence) = &self.persistence {
+            persistence.report_pending_bytes_to(self.free_space_reserve.as_ref());
+        }
+    }
+
+    /// Whether the reserve leaves room for this send. Its bytes stay pending
+    /// until [`Self::release_send_space`], so no other partition of the node
+    /// is given the same room while this one awaits.
+    ///
+    /// A batch the partition already holds passes a short disk: its sender
+    /// is owed the outcome, and answering it takes no new space.
+    fn reserve_send_space(&self, message: &Message<RoutedRequestHeader>) -> bool {
+        let Some(reserve) = &self.free_space_reserve else {
+            return true;
+        };
+        self.release_send_space();
+        let frame_bytes = Self::prepared_request_size(message) as u64;
+        if reserve.admit(frame_bytes) {
+            self.admitted_send_bytes.set(frame_bytes);
+            return true;
+        }
+        if matches!(
+            self.check_producer_batch(message),
+            Ok(ProducerAdmission::Duplicate { .. } | ProducerAdmission::DuplicateInFlight)
+        ) {
+            return true;
+        }
+        reserve.count_refusal();
+        false
+    }
+
+    /// Call once the admitted send is a prepare in the WAL queue, which
+    /// counts it from then on, or was refused or queued on the way there.
+    fn release_send_space(&self) {
+        let admitted = self.admitted_send_bytes.take();
+        if admitted > 0
+            && let Some(reserve) = &self.free_space_reserve
+        {
+            reserve.release_pending(admitted);
+        }
     }
 
     pub(crate) fn publish_poll_visibility(&self) {
@@ -5829,12 +6038,35 @@ where
 
     /// Snapshot read resources synchronously on the partition owner.
     /// Only the owned snapshot crosses a suspension during disk I/O.
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub(crate) fn build_poll_plan(
         &mut self,
         consumer: PollingConsumer,
         args: &PollingArgs,
         validate_checksum: bool,
+    ) -> PollPlan {
+        self.build_poll_plan_within(consumer, args, validate_checksum, usize::MAX)
+    }
+
+    /// Hand polls the store that holds this partition's remote segments.
+    pub fn set_remote_segments(&mut self, remote: Rc<crate::RemoteSegments>) {
+        self.remote_segments = Some(remote);
+    }
+
+    /// [`Self::build_poll_plan`] for a poll whose reply holds at most
+    /// `byte_budget` bytes of messages.
+    ///
+    /// The snapshot ends at the segment that covers the poll's count or its
+    /// budget, whichever comes first. Remote segments make the list as long
+    /// as total retention, so a snapshot that ran to the tail would cost a
+    /// poll near the front of a long topic a clone per segment.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn build_poll_plan_within(
+        &mut self,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+        validate_checksum: bool,
+        byte_budget: usize,
     ) -> PollPlan {
         // Reads the durable commit frontier (`self.offset`, stored only on
         // commit). Also used below as the poll's high-water bound: this function
@@ -5951,7 +6183,14 @@ where
         // segment carries its shared read-state handle so the off-borrow read
         // reuses (or fills) the cached fd; only a sealed one also resolves its
         // start byte from the shared sparse index.
-        let segments = self.log.segments()[start_segment..]
+        let object_prefix = self.object_prefix();
+        let walked = walked_segments(
+            &self.log.segments()[start_segment..],
+            args.count,
+            byte_budget,
+        );
+        let cut = start_segment + walked < self.log.segments().len();
+        let segments = self.log.segments()[start_segment..start_segment + walked]
             .iter()
             .zip(self.log.sealed_read_state()[start_segment..].iter())
             .map(|(segment, read_state)| DiskSegment {
@@ -5959,11 +6198,29 @@ where
                 persisted: segment.size.as_bytes_u64(),
                 read_state: Rc::clone(read_state),
                 sealed: segment.sealed,
+                source: match object_prefix {
+                    Some(prefix) if segment.location == SegmentLocation::Remote => {
+                        SegmentSource::Remote(RemoteRange {
+                            key: SegmentKey {
+                                prefix,
+                                start_offset: segment.start_offset,
+                                object: SegmentObject::Log,
+                            },
+                            range: 0..segment.size.as_bytes_u64(),
+                        })
+                    }
+                    _ => SegmentSource::Local,
+                },
             })
             .collect();
         let disk = DiskReadPlan {
             partition_dir: self.partition_dir_resolution(),
+            remote: self.remote_segments.clone(),
+            object_prefix,
+            index_fetches: self.index_fetches.fence(),
             segments,
+            cut,
+            deadline: None,
             start_position,
             start_index_offset,
             namespace_raw: self.namespace().inner(),
@@ -6139,6 +6396,8 @@ where
                 || self.maintenance.flush_through.is_some()
                 || self.maintenance.checkpoint.is_some()
                 || self.maintenance.retention.is_some()
+                || self.maintenance.eviction.is_some()
+                || self.maintenance.tiering.is_some()
                 || self
                     .maintenance
                     .shutdown
@@ -6636,6 +6895,15 @@ where
         {
             return self.io_plan(crate::PartitionIoContinuation::Retention);
         }
+        if let Some(through) = self.maintenance.eviction
+            && self.eviction_is_ready(through)
+        {
+            return self.io_plan(crate::PartitionIoContinuation::Eviction);
+        }
+        let tiering = self.tiering_is_ready();
+        if tiering && !self.tiering_yields() {
+            return self.io_plan(crate::PartitionIoContinuation::Tiering);
+        }
         if self.maintenance.shutdown.is_some() && self.consensus.request_queue_len() > 0 {
             self.deny_queued_requests("shutdown queued request reply failed")
                 .await;
@@ -6656,6 +6924,9 @@ where
         }
         if self.select_commit(headers, config, reply) {
             return Ok(crate::PartitionIoStep::Progress);
+        }
+        if tiering {
+            return self.io_plan(crate::PartitionIoContinuation::Tiering);
         }
         Ok(self.drive_shutdown_io())
     }
@@ -6702,6 +6973,13 @@ where
         {
             allocation_charge = allocation_charge
                 .checked_mul(pending.offset_batch.len() + 1)
+                .ok_or(IggyError::CannotWriteToFile)?;
+        }
+        if continuation == crate::PartitionIoContinuation::Tiering
+            && let Some(pending) = &self.maintenance.tiering
+        {
+            allocation_charge = allocation_charge
+                .checked_add(pending.read_len)
                 .ok_or(IggyError::CannotWriteToFile)?;
         }
         if continuation == crate::PartitionIoContinuation::Checkpoint
@@ -6769,6 +7047,10 @@ where
                 })
             }
             crate::PartitionIoContinuation::Retention => self.capture_segment_removal(),
+            crate::PartitionIoContinuation::Eviction => self.capture_segment_eviction(),
+            crate::PartitionIoContinuation::Tiering => self
+                .next_tiering_job()
+                .map(|job| crate::PartitionIoJob::Tiering(Box::new(job))),
             crate::PartitionIoContinuation::Checkpoint => self.capture_checkpoint_phase()?,
             crate::PartitionIoContinuation::Superblock => {
                 let Some(guard) = self.superblock_lock.try_acquire_owned() else {
@@ -6872,6 +7154,10 @@ where
                 .accept_segment_removal(&result)
                 .map(|_| ())
                 .ok_or(IggyError::CannotDeleteFile),
+            crate::PartitionIoContinuation::Eviction => {
+                self.accept_segment_eviction(result).map(|_| ())
+            }
+            crate::PartitionIoContinuation::Tiering => self.accept_tiering(result),
             crate::PartitionIoContinuation::Checkpoint => self.accept_checkpoint_io(result),
             crate::PartitionIoContinuation::Superblock => {
                 let Some((intent, backoff)) = self.superblock_running.take() else {
@@ -6926,6 +7212,8 @@ where
                 }
             }
             crate::PartitionIoContinuation::Retention => self.maintenance.retention = None,
+            crate::PartitionIoContinuation::Eviction => self.maintenance.eviction = None,
+            crate::PartitionIoContinuation::Tiering => self.maintenance.tiering = None,
             _ => self.fail_io_work(
                 &error,
                 continuation == crate::PartitionIoContinuation::Checkpoint,
@@ -7425,10 +7713,7 @@ where
         let segments = self.log.segments();
         match query {
             MessageLookup::Offset { offset, .. } => {
-                let segment_index = segments
-                    .iter()
-                    .rposition(|segment| segment.start_offset <= *offset)
-                    .unwrap_or(0);
+                let segment_index = segment_holding(segments, *offset);
                 let entry = self
                     .log
                     .segment_indexes(segment_index)
@@ -7479,8 +7764,18 @@ where
     /// # Panics
     /// Panics if called when this partition's consensus instance is not the
     /// primary, is not in normal status, or is currently syncing.
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
     pub async fn on_request(
+        &mut self,
+        message: Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) {
+        self.admit_request(message, reply).await;
+        self.release_send_space();
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn admit_request(
         &mut self,
         message: Message<RoutedRequestHeader>,
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
@@ -8067,6 +8362,25 @@ where
                 }
             }
 
+            // Only messages grow the disk without bound. Offsets, segment
+            // deletion and every other operation stay admitted, so a consumer
+            // and retention can still make room. Below the dedup lookup: a
+            // retry is owed the outcome of its original, which this refusal
+            // would replace with a claim that nothing was admitted.
+            if message.header().operation == Operation::SendMessages
+                && !self.reserve_send_space(&message)
+            {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "data disk is below its free-space reserve",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+
             // A group's offsets wait for its installation, or they would land
             // behind the install under the old owner token. The latch names only
             // the last install, so after a view change every group waits for the
@@ -8574,6 +8888,25 @@ where
                 }
                 continue;
             }
+            // The disk can fall short while a send waits in the queue. It
+            // holds no op yet, so its client can safely retry it.
+            if header.operation == Operation::SendMessages
+                && !self.reserve_send_space(&request.message)
+            {
+                if self
+                    .deny_queued_request(
+                        &header,
+                        IggyError::TransientNotAccepted.as_code(),
+                        "data disk fell below its free-space reserve",
+                        reply_sender.take(),
+                        &mut consecutive_denials,
+                    )
+                    .await
+                {
+                    break;
+                }
+                continue;
+            }
             consecutive_denials = 0;
             if queued_install.is_some() {
                 self.pending_owner_install.set(queued_install);
@@ -8581,6 +8914,7 @@ where
             let prepare = self.pipeline_local_request(request.message, reply_sender, order);
             promoted += 1;
             self.on_replicate(prepare).await;
+            self.release_send_space();
             drop(context);
         }
         self.drain_no_ack().await;
@@ -9841,9 +10175,10 @@ where
         self.history_is_busy() || self.transition.is_some()
     }
 
-    /// An installed snapshot replaces the history the recovered commit point named.
+    /// An installed snapshot replaces the history that the WAL commit points named.
     pub(crate) const fn forget_recovered_commit(&mut self) {
         self.recovered_commit = 0;
+        self.unreplayed_commit = 0;
     }
 
     /// Whether a fenced walk still has recovered committed ops to take.
@@ -10430,6 +10765,7 @@ where
             phase: MaterializationPhase::Inspect,
             save: None,
             checksum: None,
+            digest: None,
         });
         Ok(true)
     }
@@ -10471,7 +10807,9 @@ where
             return Ok(MaterializationStep::Pending);
         }
         let segment = self.log.active_segment();
-        if segment.size.as_bytes_u64() >= segment.max_size.as_bytes_u64() {
+        if segment.size.as_bytes_u64() >= segment.max_size.as_bytes_u64()
+            || self.next_batch_rolls_by_age(pending.next_entry, pending.prefix_len)?
+        {
             let next_offset = segment
                 .end_offset
                 .checked_add(1)
@@ -10588,6 +10926,49 @@ where
         Ok(true)
     }
 
+    /// The last offset the active segment, or a recovered durable tail, already
+    /// holds. Batches at or below it are on disk and never materialized again.
+    fn materialization_persisted_end(&self) -> Option<u64> {
+        let segment = self.log.active_segment();
+        if segment.size.as_bytes_u64() == 0 {
+            segment.start_offset.checked_sub(1)
+        } else {
+            Some(segment.end_offset)
+        }
+        .max(self.recovered_durable_offset)
+    }
+
+    /// Whether the next batch the prefix still has to materialize is stamped
+    /// `segment_max_age` or more past the non-empty active segment's first
+    /// batch, so it starts the next segment, as the WAL decides at prepare.
+    fn next_batch_rolls_by_age(
+        &self,
+        first_entry: usize,
+        prefix_len: usize,
+    ) -> Result<bool, IggyError> {
+        let max_age = self.effective_segment_max_age();
+        let segment = self.log.active_segment();
+        if max_age.is_none() || segment.size.as_bytes_u64() == 0 {
+            return Ok(false);
+        }
+        let persisted_end = self.materialization_persisted_end();
+        self.log.journal().inner.with_entries(|entries| {
+            let entries = (first_entry <= prefix_len && prefix_len <= entries.len())
+                .then(|| entries.range(first_entry..prefix_len))
+                .ok_or(IggyError::CannotWriteToFile)?;
+            for entry in entries {
+                if let Some(meta) = materialization_batch_meta(entry, persisted_end)? {
+                    return Ok(rolls_by_age(
+                        max_age,
+                        segment.start_timestamp,
+                        meta.base_timestamp,
+                    ));
+                }
+            }
+            Ok(false)
+        })
+    }
+
     fn plan_materialization_chunk(
         &self,
         first_entry: usize,
@@ -10598,12 +10979,8 @@ where
         // retained index state. Coalesce adjacent index spans within that budget.
         let segment = self.log.active_segment();
         let position = segment.size.as_bytes_u64();
-        let persisted_end = if position == 0 {
-            segment.start_offset.checked_sub(1)
-        } else {
-            Some(segment.end_offset)
-        }
-        .max(self.recovered_durable_offset);
+        let persisted_end = self.materialization_persisted_end();
+        let max_age = self.effective_segment_max_age();
         let mut chunk = MaterializationChunk {
             first_entry,
             end_entry: first_entry,
@@ -10635,6 +11012,18 @@ where
                     chunk.end_entry += 1;
                     continue;
                 };
+                // The batch that ages the segment out starts the next one, which
+                // the drive rotates into before planning it.
+                let segment_first_timestamp = if position > 0 {
+                    Some(segment.start_timestamp)
+                } else {
+                    chunk.index.as_ref().map(|index| index.timestamp)
+                };
+                if segment_first_timestamp
+                    .is_some_and(|first| rolls_by_age(max_age, first, meta.base_timestamp))
+                {
+                    break;
+                }
                 let next_backing = backing
                     .checked_add(
                         Frozen::<4096>::allocation_size(entry.backing_capacity())
@@ -12311,7 +12700,9 @@ where
                 .as_mut()
                 .and_then(|pending| pending.checksum.take())
         };
-        let frozen_batches = if bodies_written.is_some() && checksum.is_none() {
+        let digest =
+            self.take_materialization_digest(target.segment_start, target.segment_size, written);
+        let frozen_batches = if bodies_written.is_some() && checksum.is_none() && digest.is_none() {
             Vec::new()
         } else {
             frozen_batches
@@ -12330,8 +12721,28 @@ where
             written,
             completes,
             checksum,
+            digest,
         };
         Ok(Some(job))
+    }
+
+    /// The digest a save `written` bytes into its chunk feeds: the chain's for
+    /// the first piece, the one the previous piece handed back after it.
+    fn take_materialization_digest(
+        &mut self,
+        segment_start: u64,
+        segment_size: u64,
+        written: u64,
+    ) -> Option<Box<crate::segment_chain::SegmentDigest>> {
+        if written == 0 {
+            self.segment_chain
+                .as_mut()
+                .and_then(|chain| chain.take_digest(segment_start, segment_size))
+        } else {
+            self.materialization
+                .as_mut()
+                .and_then(|pending| pending.digest.take())
+        }
     }
 
     fn accept_materialization(
@@ -12397,15 +12808,21 @@ where
         if saved == 0 {
             if let Some(pending) = self.materialization.as_mut() {
                 pending.checksum = result.checksum;
+                pending.digest = result.digest;
             }
-        } else if let Some(hasher) = result.checksum {
-            self.segment_checksum_cache.borrow_mut().insert(
-                target.segment_start,
-                crate::state_transfer::SegmentChecksumMemo::Hashing {
-                    hashed_len: size,
-                    hasher,
-                },
-            );
+        } else {
+            if let Some(hasher) = result.checksum {
+                self.segment_checksum_cache.borrow_mut().insert(
+                    target.segment_start,
+                    crate::state_transfer::SegmentChecksumMemo::Hashing {
+                        hashed_len: size,
+                        hasher,
+                    },
+                );
+            }
+            if let Some(chain) = self.segment_chain.as_mut() {
+                chain.restore_digest(result.digest);
+            }
         }
         Ok(())
     }
@@ -12477,7 +12894,12 @@ where
             .last()
             .and_then(Option::as_ref)
             .cloned();
+        let chain_append = self
+            .segment_chain
+            .as_ref()
+            .and_then(|chain| chain.seal(segment, self.created_revision()));
         let target = crate::io::RotationTarget {
+            chain_record: chain_append.as_ref().map(|append| append.record),
             incarnation: self.incarnation,
             poll_history: self.poll_history,
             segment_start: segment.start_offset,
@@ -12492,6 +12914,7 @@ where
         if self.persistence.is_some() {
             job.old_index.clone_from(&target.index_writer);
         }
+        job.chain_append = chain_append;
         (target, job)
     }
 
@@ -12528,6 +12951,19 @@ where
         self.log.indexes_mut()[sealed_index] = None;
         self.log.reset_read_state(sealed_index);
         self.stamp_sealed_segment(target.segment_start);
+        if let Some(chain) = self.segment_chain.as_mut() {
+            let diverged = chain.sealed(target.chain_record.as_ref(), start_offset);
+            // A segment whose bytes did not all pass through the digest seals
+            // without a record, so it gets one hashed from disk.
+            if target.chain_record.is_none() {
+                if let Some(prefix) = self.object_prefix() {
+                    self.request_tiering(prefix);
+                }
+            } else {
+                self.want_upload();
+            }
+            self.chain_settled(&diverged);
+        }
         debug!(
             namespace_raw = self.namespace().inner(),
             sealed_end = target.segment_end,
@@ -12560,7 +12996,8 @@ where
         consumers.chain(groups).min_by_key(|(offset, _, _)| *offset)
     }
 
-    /// Time-expiry plus size-retention in one pass: remove the leading sealed
+    /// Time-expiry plus size-retention in one pass, for a partition that is not
+    /// tiered: remove the leading sealed
     /// segments that have expired or that push the partition's SEALED bytes
     /// past `max_bytes`. Capped per call by
     /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
@@ -12572,6 +13009,13 @@ where
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
     ) -> SegmentRemoval {
+        // A tiered partition's retention is one decision for the local and
+        // the remote segments together, which the primary commits as a
+        // truncation. A replica that expired segments by itself could drop
+        // one that was never uploaded.
+        if self.is_tiered() {
+            return SegmentRemoval::default();
+        }
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
             max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
@@ -12579,6 +13023,45 @@ where
             return SegmentRemoval::default();
         };
         self.remove_sealed_segments_up_to(up_to).await
+    }
+
+    /// What the retention policy of a tiered topic removes from this
+    /// partition: the end offset of the last leading sealed segment that
+    /// expired or that pushes the SEALED bytes past `max_bytes`, held at the
+    /// consumer barrier as [`Self::remove_sealed_segments_up_to`] holds a
+    /// removal. Segments whose `.log` already left the disk count like local
+    /// ones, since the store still holds their bytes.
+    ///
+    /// Nothing is removed here. The caller commits the offset as a
+    /// truncation, which is what removes the segments on every replica.
+    ///
+    /// `None` on a partition without a chain, and on every replica but a
+    /// primary that applied the view it started: a backup's segment list can
+    /// trail the primary's, and one decision per partition is what keeps the
+    /// replicas and the store on the same front.
+    #[must_use]
+    pub fn total_retention_end(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> Option<u64> {
+        let consensus = &self.consensus;
+        if !self.is_tiered()
+            || !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || !consensus.applied_view_start()
+        {
+            return None;
+        }
+        retention_end(
+            self.log.segments(),
+            now,
+            message_expiry,
+            max_bytes,
+            self.min_committed_offset().map(|(barrier, _, _)| barrier),
+        )
     }
 
     /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
@@ -12665,10 +13148,36 @@ where
             .inner
             .forget_segment(segment.start_offset);
         let (messages, indexes) = storage.segment_and_index_paths();
+        // A segment that came here remote has no `.index` in its storage, and
+        // a poll may have fetched one since or be fetching it now.
+        self.index_fetches.retire_through(segment.end_offset);
+        let indexes = indexes.or_else(|| {
+            let dir = self.partition_dir.as_deref()?;
+            (segment.location == SegmentLocation::Remote)
+                .then(|| format!("{dir}/{:0>20}.index", segment.start_offset))
+        });
         let anchor = self.anchor_cleanup_path(segment.start_offset);
         self.segment_checksum_cache
             .borrow_mut()
             .remove(&segment.start_offset);
+        // Boot refuses a front above the trim point, and keeps no record at or
+        // below it, so the trim point must cover the segment before it goes.
+        // It runs up to the next segment: the anchor that certifies a gap
+        // between the two names the segment leaving now, so past this removal
+        // only the trim point vouches for the new front.
+        let trim_point = self
+            .log
+            .segments()
+            .first()
+            .map_or(segment.end_offset, |next| {
+                next.start_offset.saturating_sub(1).max(segment.end_offset)
+            });
+        let trim = self
+            .segment_chain
+            .as_ref()
+            .and_then(|chain| chain.trim(trim_point))
+            .map(Box::new);
+        self.maintenance.removal_trim = trim.as_ref().map(|_| trim_point);
         self.maintenance.removing = Some(segment);
         self.clear_state_transfer_offer_cache();
         Some(crate::PartitionIoJob::RemoveSegment {
@@ -12677,20 +13186,1152 @@ where
             // TODO: Retain failed retention unlinks for retry and sync the
             // partition directory before reporting cleanup complete.
             strict: false,
+            trim,
         })
     }
 
     fn accept_segment_removal(&mut self, result: &crate::PartitionIoResult) -> Option<u64> {
+        let trim_point = self.maintenance.removal_trim.take();
         if !matches!(result, crate::PartitionIoResult::SegmentRemoved(Ok(()))) {
             return None;
         }
         let segment = self.maintenance.removing.take()?;
+        if let (Some(trim_point), Some(chain)) = (trim_point, self.segment_chain.as_mut()) {
+            chain.note_appended(&crate::segment_chain::ChainRecord::TrimPoint(trim_point));
+        }
         let (messages, shortfall) = settle_cleaned_segment(&self.stats, &segment);
         shortfall.report(
             self.namespace(),
             Some((segment.start_offset, segment.end_offset)),
         );
+        self.retire_segment_objects(
+            segment.start_offset,
+            segment.end_offset,
+            IggyTimestamp::now(),
+        );
         Some(messages)
+    }
+
+    /// Evict the leading uploaded segments that left the local envelope. Each
+    /// one's remote record is made durable before its `.log` is unlinked, and
+    /// the segment stays in the list as `Remote`, so offsets and timestamps
+    /// resolve as before and the partition's sizes do not change.
+    ///
+    /// The run starts after the segments already remote and stops at the first
+    /// of: the active segment, a segment the WAL checkpoint still reaches, one
+    /// ending above `floor`, one whose hash no floor advance matched, or one the
+    /// envelope keeps. A partition without a chain evicts nothing.
+    ///
+    /// Capped per call like [`Self::remove_sealed_segments_up_to`], with the
+    /// same split between the I/O lane and an idle partition without a
+    /// dispatcher.
+    pub async fn evict_segments(
+        &mut self,
+        now: IggyTimestamp,
+        floor: u64,
+        envelope: LocalEnvelope,
+    ) -> SegmentEviction {
+        let Some(through) = self.eviction_end(now, floor, envelope) else {
+            return SegmentEviction::default();
+        };
+        self.maintenance.eviction = Some(
+            self.maintenance
+                .eviction
+                .map_or(through, |previous| previous.max(through)),
+        );
+        if self.has_io_dispatcher() || self.history_is_busy() {
+            self.notify_io();
+            return SegmentEviction::default();
+        }
+        let mut eviction = SegmentEviction::default();
+        for _ in 0..SEGMENT_REMOVAL_BUDGET_PER_PASS {
+            if !self.eviction_is_ready(through) {
+                break;
+            }
+            let Some(job) = self.capture_segment_eviction() else {
+                break;
+            };
+            if !matches!(self.accept_segment_eviction(job.execute().await), Ok(true)) {
+                break;
+            }
+            eviction.segments += 1;
+        }
+        eviction.budget_spent = self.eviction_is_ready(through);
+        self.maintenance.eviction = None;
+        eviction
+    }
+
+    /// The end offset of the last segment the pass may evict, judged by the
+    /// rules that do not move while it runs.
+    fn eviction_end(&self, now: IggyTimestamp, floor: u64, envelope: LocalEnvelope) -> Option<u64> {
+        let chain = self.segment_chain.as_ref()?;
+        let sealed = self.log.segments().split_last()?.1;
+        let mut local: u64 = sealed
+            .iter()
+            .filter(|segment| segment.location != SegmentLocation::Remote)
+            .map(|segment| segment.size.as_bytes_u64())
+            .sum();
+        let mut through = None;
+        for segment in sealed
+            .iter()
+            .filter(|segment| segment.location != SegmentLocation::Remote)
+        {
+            let outside = segment.is_expired(now, envelope.age)
+                || envelope.size.is_some_and(|size| local > size);
+            if !segment.sealed
+                || segment.end_offset > floor
+                || !chain.evictable(segment.start_offset, segment.end_offset)
+                || !outside
+            {
+                break;
+            }
+            local -= segment.size.as_bytes_u64();
+            through = Some(segment.end_offset);
+        }
+        through
+    }
+
+    /// Turn tiering on for this partition, or check that its chain is
+    /// complete when it is on already.
+    ///
+    /// The I/O lane creates the chain holding `prefix` when the directory has
+    /// none, which starts the hashing of the active segment on the commit
+    /// path. It then records the front that retention left, and hashes every
+    /// sealed segment without a record from its `.log`. Until the chain is
+    /// adopted the partition is not tiered, so it evicts nothing.
+    pub fn enable_tiering(&mut self, prefix: iggy_object_store::ObjectPrefix) {
+        self.request_tiering(prefix);
+        self.notify_io();
+    }
+
+    /// A request already under way keeps its progress and its retry delay.
+    fn request_tiering(&mut self, prefix: iggy_object_store::ObjectPrefix) {
+        if self
+            .maintenance
+            .tiering
+            .as_ref()
+            .is_none_or(|pending| pending.prefix != prefix)
+        {
+            self.maintenance.tiering = Some(PendingTiering::new(prefix));
+        }
+    }
+
+    /// The prefix of an enable that the I/O lane has not finished yet.
+    #[must_use]
+    pub fn pending_tiering(&self) -> Option<iggy_object_store::ObjectPrefix> {
+        self.maintenance
+            .tiering
+            .as_ref()
+            .map(|pending| pending.prefix)
+    }
+
+    /// Whether this partition keeps a chain.
+    #[must_use]
+    pub const fn is_tiered(&self) -> bool {
+        self.segment_chain.is_some()
+    }
+
+    /// The segments an install is replacing are not the ones the request
+    /// scanned and hashed.
+    pub(crate) fn restart_tiering(&mut self) {
+        if let Some(pending) = &mut self.maintenance.tiering {
+            *pending = PendingTiering::new(pending.prefix);
+        }
+    }
+
+    fn tiering_is_ready(&mut self) -> bool {
+        let Some(pending) = &self.maintenance.tiering else {
+            return false;
+        };
+        let (failures, retry_after_micros) = (pending.failures, pending.retry_after_micros);
+        // Before any job is chosen: the lane records only the front advance.
+        self.drop_recorded_advances();
+        // The next start asks again, and the shutdown flush does not wait for
+        // the rest of the history to be hashed. The applied advances are still
+        // recorded, each with one short append that goes before any hash: a
+        // checkpoint during the shutdown would otherwise outrun them.
+        if self.maintenance.shutdown.is_some()
+            && (failures > 0 || self.segment_chain.is_none() || self.pending_advances.is_empty())
+        {
+            self.maintenance.tiering = None;
+            return false;
+        }
+        if self.consensus.clock_realtime_micros() < retry_after_micros {
+            return false;
+        }
+        let Some(read_len) = self.next_tiering_read_len() else {
+            self.maintenance.tiering = None;
+            // No chain can be opened here, so nothing ever records these.
+            self.pending_advances.clear();
+            return false;
+        };
+        if let Some(pending) = &mut self.maintenance.tiering {
+            pending.read_len = read_len;
+        }
+        true
+    }
+
+    /// Take the committed truncation watermark that metadata holds for this
+    /// partition. Uploads and floor advances are judged against the highest
+    /// one taken, so a pass that cannot read metadata still judges against a
+    /// watermark that was committed.
+    pub fn note_committed_truncation(&mut self, committed_up_to: u64) {
+        self.committed_truncation = self.committed_truncation.max(committed_up_to);
+    }
+
+    /// The trim point this primary has to commit as a truncation before it
+    /// uploads: the last offset its own retention removed, when neither the
+    /// tiered floor nor `committed_up_to`, the truncation watermark metadata
+    /// holds, has reached it.
+    ///
+    /// The offsets up to it are gone here, but another replica can still
+    /// hold them, and a floor advance over them would declare them stored.
+    /// Only the recorded trim point is offered, never the front of the
+    /// segment list by itself.
+    ///
+    /// `None` on a partition without a chain or a trim point, and on every
+    /// replica but a primary that applied the view it started, as for
+    /// [`Self::total_retention_end`].
+    #[must_use]
+    pub fn trim_point_to_commit(&self, committed_up_to: u64) -> Option<u64> {
+        let consensus = &self.consensus;
+        if !self.is_tiered()
+            || !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || !consensus.applied_view_start()
+        {
+            return None;
+        }
+        let trim_point = self.chain_trim_point()?;
+        let above_floor = self.tiered_floor().is_none_or(|floor| trim_point > floor);
+        (above_floor && trim_point > committed_up_to).then_some(trim_point)
+    }
+
+    /// The segment the primary uploads next: the oldest sealed one that is
+    /// still local and above the tiered floor.
+    ///
+    /// `None` when there is none, and also while that segment has no usable
+    /// record: its hash from disk is still being taken, or an advance
+    /// contradicted it. A younger segment never goes first, so a seal does not
+    /// overtake a backlog. The caller checks that this replica is the primary.
+    #[must_use]
+    pub fn next_segment_upload(&self) -> Option<crate::SegmentUpload> {
+        let slot = self.oldest_unuploaded_segment()?;
+        let (segment, storage) = (&self.log.segments()[slot], &self.log.storages()[slot]);
+        let record = self.undisputed_segment_record(segment.start_offset)?;
+        let (log_path, index_path) = storage.segment_and_index_paths();
+        Some(crate::SegmentUpload {
+            prefix: self.object_prefix()?,
+            record,
+            log_path: log_path?,
+            index_path: index_path?,
+        })
+    }
+
+    /// Start the next upload, when this replica is the primary and none is in
+    /// flight. The caller runs it under the returned scope and hands the
+    /// result to [`Self::finish_segment_upload`] with the returned attempt.
+    ///
+    /// A replica that is no longer the primary cancels the upload it started,
+    /// so a scan of a demoted replica is what stops its job.
+    pub fn begin_segment_upload(&mut self) -> Option<crate::StartedSegmentUpload> {
+        self.begin_segment_upload_if(|_| true)
+    }
+
+    /// [`Self::begin_segment_upload`], unless `admit` refuses the segment's
+    /// size in bytes. `admit` is asked last, and only about an upload that
+    /// would start, so what it charges is charged to a started upload. A
+    /// refusal leaves the segment for a later call.
+    pub fn begin_segment_upload_if(
+        &mut self,
+        admit: impl FnOnce(u64) -> bool,
+    ) -> Option<crate::StartedSegmentUpload> {
+        if !self.consensus.is_primary() || !self.consensus.is_normal() {
+            self.segment_upload = None;
+            self.upload_cursor = None;
+            return None;
+        }
+        if self.segment_upload.is_some() {
+            return None;
+        }
+        let upload = self.next_segment_upload()?;
+        // A segment whose advance cannot be sent stays local: storing it
+        // would spend the budget on bytes no replica may evict.
+        self.floor_advance_over(&upload.record)?;
+        if !admit(upload.record.size) {
+            return None;
+        }
+        let scope = iggy_object_store::TierScope::new();
+        let token = scope.token();
+        self.segment_upload_attempts += 1;
+        let attempt = crate::SegmentUploadAttempt(self.segment_upload_attempts);
+        self.segment_upload = Some((attempt, scope));
+        Some((upload, token, attempt))
+    }
+
+    /// The upload this partition waits for the result of.
+    ///
+    /// A result of any other attempt is stale: its upload was cancelled, and
+    /// the segment may be on its way again under a later attempt.
+    #[must_use]
+    pub fn segment_upload_attempt(&self) -> Option<crate::SegmentUploadAttempt> {
+        self.segment_upload
+            .as_ref()
+            .filter(|(_, scope)| !scope.is_cancelled())
+            .map(|(attempt, _)| *attempt)
+    }
+
+    /// Take the result of upload `attempt`, of the segment in `record`.
+    /// Returns the advance to commit when the segment is stored and this
+    /// replica is still the primary that started the upload.
+    ///
+    /// The result of an attempt other than the one in flight changes nothing.
+    /// A failure leaves the segment local, so a later scan offers it again. A
+    /// failure that no retry changes is reported: the segment and everything
+    /// after it stay out of the store until someone repairs it.
+    ///
+    /// An upload whose segment left the list while it ran yields no advance,
+    /// and its objects are queued for their delete.
+    pub fn finish_segment_upload(
+        &mut self,
+        attempt: crate::SegmentUploadAttempt,
+        record: &crate::segment_chain::SegmentRecord,
+        outcome: &crate::UploadOutcome,
+    ) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        if self.segment_upload_attempt() != Some(attempt) {
+            return None;
+        }
+        self.segment_upload = None;
+        let listed = self
+            .log
+            .segments()
+            .binary_search_by_key(&record.start_offset, |segment| segment.start_offset)
+            .is_ok();
+        if !listed {
+            // Retention removed the segment while its upload ran. An advance
+            // over it would tell every replica the store holds a segment that
+            // is gone, and a failed upload can still have stored its `.log`.
+            self.retire_segment_objects(
+                record.start_offset,
+                record.end_offset,
+                IggyTimestamp::now(),
+            );
+            return None;
+        }
+        match outcome {
+            Ok(Ok(())) if self.consensus.is_primary() && self.consensus.is_normal() => {
+                self.note_segment_uploaded(record)
+            }
+            Ok(Ok(())) | Err(_) => None,
+            Ok(Err(failure)) => {
+                if failure.is_transient() {
+                    warn!(
+                        namespace_raw = self.namespace().inner(),
+                        start_offset = record.start_offset,
+                        %failure,
+                        "segment upload failed and is tried again"
+                    );
+                } else {
+                    error!(
+                        namespace_raw = self.namespace().inner(),
+                        start_offset = record.start_offset,
+                        %failure,
+                        "segment upload cannot succeed, and holds back every later segment"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Stop the upload in flight, as a partition does on its way out.
+    pub fn cancel_segment_upload(&mut self) {
+        self.segment_upload = None;
+    }
+
+    /// Whether a segment became uploadable since the last call. Only a
+    /// primary asks for a pass, since only a primary uploads.
+    pub fn take_upload_wanted(&self) -> bool {
+        self.upload_wanted.take()
+    }
+
+    fn want_upload(&self) {
+        if self.consensus.is_primary() {
+            self.upload_wanted.set(true);
+        }
+    }
+
+    /// The slot of the oldest sealed segment that is still local and above
+    /// the tiered floor.
+    fn oldest_unuploaded_segment(&self) -> Option<usize> {
+        let from = self
+            .first_slot_above_floor()
+            .max(self.slot_after_uploaded());
+        self.log.segments()[from..]
+            .iter()
+            .position(|segment| {
+                segment.sealed
+                    && segment.location == SegmentLocation::Local
+                    && segment.size.as_bytes_u64() > 0
+            })
+            .map(|slot| from + slot)
+    }
+
+    /// The slot of the first segment that holds an offset above the tiered
+    /// floor, found without walking the history below it.
+    fn first_slot_above_floor(&self) -> usize {
+        let Some(floor) = self.tiered_floor() else {
+            return 0;
+        };
+        let segments = self.log.segments();
+        let after = segments.partition_point(|segment| segment.start_offset <= floor);
+        match after.checked_sub(1) {
+            Some(last) if segments[last].end_offset > floor => last,
+            _ => after,
+        }
+    }
+
+    /// The slot after the segments [`Self::upload_cursor`] covers, or `0`
+    /// when the cursor does not describe the segment list.
+    ///
+    /// The cursor is trusted only while the segment that ends right before it
+    /// is still marked as stored: a segment list rebuilt from disk marks
+    /// every segment local again, and those have to be offered again.
+    fn slot_after_uploaded(&self) -> usize {
+        let Some(cursor) = self.upload_cursor else {
+            return 0;
+        };
+        let segments = self.log.segments();
+        let slot = segments.partition_point(|segment| segment.start_offset < cursor);
+        let stands = slot.checked_sub(1).is_some_and(|last| {
+            segments[last].location != SegmentLocation::Local
+                && segments[last].end_offset.checked_add(1) == Some(cursor)
+        });
+        if stands { slot } else { 0 }
+    }
+
+    /// How far this primary's uploads are behind at `now`: the age of the
+    /// newest message in the oldest segment that waits for its upload.
+    ///
+    /// `None` on a replica that uploads nothing, and when no segment waits.
+    /// A segment sealed without a known timestamp counts as no lag, as it
+    /// counts as not expired.
+    #[must_use]
+    pub fn upload_lag(&self, now: IggyTimestamp) -> Option<Duration> {
+        if !self.is_tiered() || !self.consensus.is_primary() {
+            return None;
+        }
+        let segment = &self.log.segments()[self.oldest_unuploaded_segment()?];
+        if segment.max_timestamp == 0 {
+            return None;
+        }
+        Some(Duration::from_micros(
+            now.as_micros().saturating_sub(segment.max_timestamp),
+        ))
+    }
+
+    /// Whether this primary holds a sealed segment that the local envelope
+    /// would evict at `now`, were it uploaded: the leading local segments are
+    /// outside the envelope up to one that is above the tiered floor.
+    ///
+    /// Judged against the envelope the segment cleaner last resolved, so it
+    /// is `false` until the first eviction pass.
+    #[must_use]
+    pub fn eviction_awaits_upload(&self, now: IggyTimestamp) -> bool {
+        let Some(envelope) = self.local_envelope else {
+            return false;
+        };
+        if !self.is_tiered() || !self.consensus.is_primary() {
+            return false;
+        }
+        let Some((_, sealed)) = self.log.segments().split_last() else {
+            return false;
+        };
+        let floor = self.tiered_floor();
+        let local = || {
+            sealed
+                .iter()
+                .filter(|segment| segment.location != SegmentLocation::Remote)
+        };
+        let mut local_bytes: u64 = local().map(|segment| segment.size.as_bytes_u64()).sum();
+        for segment in local() {
+            let outside = segment.is_expired(now, envelope.age)
+                || envelope.size.is_some_and(|size| local_bytes > size);
+            if !segment.sealed || !outside {
+                return false;
+            }
+            if floor.is_none_or(|floor| segment.end_offset > floor) {
+                return true;
+            }
+            local_bytes -= segment.size.as_bytes_u64();
+        }
+        false
+    }
+
+    /// Whether this replica is the one that deletes the partition's objects:
+    /// the primary of a tiered partition that applied the view it started,
+    /// as for [`Self::total_retention_end`].
+    fn deletes_objects(&self) -> bool {
+        let consensus = &self.consensus;
+        self.is_tiered()
+            && consensus.is_primary()
+            && consensus.is_normal()
+            && !consensus.is_transferring()
+            && consensus.applied_view_start()
+    }
+
+    /// The delete state of the current view. What an earlier view left is
+    /// dropped, and its job cancelled: a primary only acts on what it learned
+    /// while it has been the primary without a break.
+    fn object_deletes_of_this_view(&mut self) -> &mut ObjectDeletes {
+        let view = self.consensus.view();
+        if self.object_deletes.view != Some(view) {
+            self.object_deletes = ObjectDeletes {
+                view: Some(view),
+                ..ObjectDeletes::default()
+            };
+        }
+        &mut self.object_deletes
+    }
+
+    /// Queue the objects of the segment from `start_offset` to `end_offset`
+    /// for their delete, when this replica is the one that deletes. Any
+    /// other replica keeps nothing: the next primary finds the objects by
+    /// listing them.
+    fn retire_segment_objects(
+        &mut self,
+        start_offset: u64,
+        end_offset: u64,
+        retired_at: IggyTimestamp,
+    ) {
+        if !self.deletes_objects() {
+            return;
+        }
+        self.object_deletes_of_this_view()
+            .retired
+            .retire(start_offset, end_offset, retired_at);
+    }
+
+    /// The last offset a segment may hold for its objects to be deleted: the
+    /// lower of the committed truncation watermark and this replica's own
+    /// trim point. `None` while either is missing. A watermark of zero is
+    /// the one metadata starts with, so it proves nothing.
+    fn object_delete_bound(&self, committed_up_to: u64) -> Option<u64> {
+        let trim_point = self.chain_trim_point()?;
+        (committed_up_to > 0).then(|| committed_up_to.min(trim_point))
+    }
+
+    fn segment_start_offsets(&self) -> Vec<u64> {
+        self.log
+            .segments()
+            .iter()
+            .map(|segment| segment.start_offset)
+            .collect()
+    }
+
+    /// Start the next object-store job of this partition's deletes, when
+    /// this replica is the primary and none is in flight. The caller runs it
+    /// under the returned scope and hands the result to
+    /// [`Self::finish_object_delete`].
+    ///
+    /// The first job of a primary lists the incarnation's objects, since the
+    /// segments an earlier primary queued are not known here, and reads
+    /// where the ones that may be gone end. Every later
+    /// job deletes the objects of the queued segments whose grace period
+    /// ended by `now` and that end at or below both `committed_up_to`, the
+    /// truncation watermark metadata holds, and this replica's trim point.
+    ///
+    /// A replica that is not the primary drops what it queued and cancels
+    /// the job it started, so a pass over a demoted replica is what stops
+    /// its job.
+    pub fn begin_object_delete(
+        &mut self,
+        now: IggyTimestamp,
+        committed_up_to: u64,
+    ) -> Option<(crate::ObjectDeleteJob, iggy_object_store::TierScopeToken)> {
+        if !self.deletes_objects() {
+            self.object_deletes = ObjectDeletes::default();
+            return None;
+        }
+        let prefix = self.object_prefix()?;
+        let bound = self.object_delete_bound(committed_up_to)?;
+        let deletes = self.object_deletes_of_this_view();
+        if deletes.running.is_some() || (deletes.swept && deletes.retired.is_empty()) {
+            return None;
+        }
+        let (work, running) = if self.object_deletes.swept {
+            let segments = self.log.segments();
+            let due = self.object_deletes.retired.due(now, bound, |start_offset| {
+                segments
+                    .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+                    .is_ok()
+            });
+            if due.is_empty() {
+                return None;
+            }
+            let start_offsets = due.iter().map(|(start_offset, _)| *start_offset).collect();
+            (
+                crate::ObjectDeleteWork::Delete { start_offsets },
+                RunningObjectDelete::Delete(due),
+            )
+        } else {
+            (
+                crate::ObjectDeleteWork::Sweep {
+                    segment_starts: self.segment_start_offsets(),
+                    bound,
+                },
+                RunningObjectDelete::Sweep { committed_up_to },
+            )
+        };
+        let scope = iggy_object_store::TierScope::new();
+        let token = scope.token();
+        self.object_delete_jobs += 1;
+        let id = self.object_delete_jobs;
+        self.object_deletes.running = Some((id, running, scope));
+        Some((crate::ObjectDeleteJob { id, prefix, work }, token))
+    }
+
+    /// Take the result of the job numbered `id`. A result of a job this
+    /// partition does not wait for, or one that arrives after primacy moved,
+    /// changes nothing.
+    ///
+    /// A sweep queues the segments that [`crate::SweptObjects::ended_by`]
+    /// proves gone, each with the end its object records, to wait their
+    /// grace period from `now`. A sweep that failed is repeated by a later
+    /// pass. A delete forgets the segments it removed, and the ones it
+    /// did not stay queued.
+    pub fn finish_object_delete(
+        &mut self,
+        id: u64,
+        outcome: crate::ObjectDeleteOutcome,
+        now: IggyTimestamp,
+    ) {
+        let awaited = self
+            .object_deletes
+            .running
+            .as_ref()
+            .is_some_and(|(running, _, _)| *running == id);
+        if !awaited {
+            return;
+        }
+        if !self.deletes_objects() || self.object_deletes.view != Some(self.consensus.view()) {
+            self.object_deletes = ObjectDeletes::default();
+            return;
+        }
+        let Some((_, running, _scope)) = self.object_deletes.running.take() else {
+            return;
+        };
+        let namespace_raw = self.namespace().inner();
+        match (running, outcome) {
+            (
+                RunningObjectDelete::Sweep { committed_up_to },
+                Ok(crate::ObjectDeleteDone::Swept(Ok(swept))),
+            ) => {
+                // The watermark the pass came with only trails the one
+                // metadata holds now, so it never proves more than is true.
+                let found = self
+                    .object_delete_bound(committed_up_to)
+                    .map_or_default(|bound| swept.ended_by(&self.segment_start_offsets(), bound));
+                let deletes = &mut self.object_deletes;
+                for (start_offset, end_offset) in &found {
+                    deletes
+                        .retired
+                        .retire_swept(*start_offset, *end_offset, now);
+                }
+                deletes.swept = true;
+                debug!(
+                    namespace_raw,
+                    listed = swept.listed.len(),
+                    queued = found.len(),
+                    "listed the objects of the partition for the segments that are gone"
+                );
+            }
+            (RunningObjectDelete::Sweep { .. }, Ok(crate::ObjectDeleteDone::Swept(Err(error)))) => {
+                warn!(
+                    namespace_raw,
+                    %error,
+                    "sweeping the objects of the partition failed and is tried again"
+                );
+            }
+            (
+                RunningObjectDelete::Delete(sent),
+                Ok(crate::ObjectDeleteDone::Deleted { failed }),
+            ) => {
+                self.object_deletes.retired.settle(&sent, &failed);
+                if !failed.is_empty() {
+                    warn!(
+                        namespace_raw,
+                        failed = failed.len(),
+                        queued = self.object_deletes.retired.len(),
+                        "some objects of removed segments were not deleted and are tried again"
+                    );
+                }
+            }
+            // A cancelled job, or a result of the other kind of work, settles
+            // nothing: the queue is as the job found it, and a sweep that did
+            // not finish runs again.
+            (RunningObjectDelete::Sweep { .. } | RunningObjectDelete::Delete(_), _) => {}
+        }
+    }
+
+    /// Account for a finished upload of the segment in `record`, and return
+    /// the advance that tells every replica the store holds it.
+    ///
+    /// `None` when the advance would reach over offsets that this replica
+    /// removed and nothing committed as deleted, as for
+    /// `floor_advance_over`. The segment counts as uploaded either
+    /// way, and [`Self::pending_floor_advance`] offers its advance once the
+    /// watermark covers them.
+    pub fn note_segment_uploaded(
+        &mut self,
+        record: &crate::segment_chain::SegmentRecord,
+    ) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        let oldest = self.oldest_unuploaded_segment();
+        let slot = self
+            .log
+            .segments()
+            .binary_search_by_key(&record.start_offset, |segment| segment.start_offset)
+            .ok()
+            .filter(|slot| self.log.segments()[*slot].location == SegmentLocation::Local);
+        if let Some(slot) = slot {
+            self.log.segments_mut()[slot].location = SegmentLocation::Uploaded;
+            // A segment stored out of turn leaves an older one local, which
+            // the cursor must not step over.
+            if oldest == Some(slot) {
+                self.upload_cursor = record.end_offset.checked_add(1);
+            }
+        }
+        self.floor_advance_over(record)
+    }
+
+    /// The advance of an upload that finished and whose segment the floor has
+    /// not passed: its request was refused or lost, or has not committed yet.
+    ///
+    /// Only the oldest segment above the floor can owe one, since an advance
+    /// starts right after the floor. `None` while that segment is still
+    /// local, so no advance reaches over a segment the store does not hold,
+    /// and while offsets this replica removed are not committed as deleted.
+    #[must_use]
+    pub fn pending_floor_advance(&self) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        let segment = self.log.segments()[self.first_slot_above_floor()..]
+            .iter()
+            .find(|segment| segment.sealed && segment.size.as_bytes_u64() > 0)?;
+        if segment.location != SegmentLocation::Uploaded {
+            return None;
+        }
+        let record = self.undisputed_segment_record(segment.start_offset)?;
+        self.floor_advance_over(&record)
+    }
+
+    /// The chain's record of the sealed segment at `start_offset`, unless an
+    /// advance contradicted it.
+    fn undisputed_segment_record(
+        &self,
+        start_offset: u64,
+    ) -> Option<crate::segment_chain::SegmentRecord> {
+        let chain = self.segment_chain.as_ref()?;
+        self.sealed_segment_record(start_offset).filter(|record| {
+            // An advance that ends anywhere inside the segment and does
+            // not match it means the store holds other bytes there.
+            chain
+                .diverged()
+                .range(record.start_offset..=record.end_offset)
+                .next()
+                .is_none()
+        })
+    }
+
+    /// The advance that tells every replica the store holds the segment in
+    /// `record`. It starts right after the floor, which the floor machine
+    /// requires, so it also covers every offset between the floor and the
+    /// segment.
+    ///
+    /// The store holds the ones in this replica's earlier segments, since
+    /// uploads go oldest first. It holds none below this replica's first
+    /// segment, and only a committed truncation says no other replica holds
+    /// them either: each replica expired its own segments before the topic
+    /// was tiered. `None` while one of those is above the committed
+    /// truncation watermark.
+    fn floor_advance_over(
+        &self,
+        record: &crate::segment_chain::SegmentRecord,
+    ) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        let next = self
+            .tiered_floor()
+            .map_or(0, |floor| floor.saturating_add(1));
+        let front = self.log.segments().first()?.start_offset;
+        if let Some(last_removed) = front.checked_sub(1)
+            && last_removed >= next
+            && last_removed > self.committed_truncation
+        {
+            return None;
+        }
+        Some(crate::tiered_floor::AdvanceTieredFloor {
+            start: next.min(record.start_offset),
+            up_to: record.end_offset,
+            hash: record.hash,
+        })
+    }
+
+    /// Drop the leading advances that the chain holds or a segment settled,
+    /// so that choosing the next job looks at one advance however many wait.
+    fn drop_recorded_advances(&mut self) {
+        let Some(chain) = self.segment_chain.as_ref() else {
+            return;
+        };
+        while self
+            .pending_advances
+            .front()
+            .is_some_and(|advance| !chain.lacks_advance(advance))
+        {
+            self.pending_advances.pop_front();
+        }
+    }
+
+    /// A checkpoint keeps the floor and lets the WAL drop the advances that
+    /// moved it. One taken before the chain holds them would leave a restarted
+    /// replica unable to evict their segments, or any segment after them. It
+    /// waits only while the I/O lane is about to record them.
+    ///
+    /// A failed append is retried after a delay that keeps growing, and only
+    /// checkpoints bound the WAL, so a checkpoint does not wait for a retry.
+    /// Nor does it wait where the lane never reaches the tiering step.
+    fn checkpoint_waits_for_advances(&self) -> bool {
+        self.has_io_dispatcher()
+            && !self.materialization_missing
+            && self
+                .maintenance
+                .tiering
+                .as_ref()
+                .is_some_and(|pending| pending.failures == 0)
+            && !self.pending_advances.is_empty()
+    }
+
+    /// Take a floor advance this replica applied. The store holds the
+    /// segment, so this replica may evict its own copy, but only once it has
+    /// recorded the advance and its own sealed record carries the same hash.
+    pub(crate) fn note_tiered_advance(&mut self, advance: crate::tiered_floor::AdvanceTieredFloor) {
+        self.pending_advances.push_back(advance);
+        if let Some(prefix) = self.object_prefix() {
+            self.request_tiering(prefix);
+        }
+        self.notify_io();
+    }
+
+    /// Act on what the chain learned from a new record: report the advances
+    /// that this replica's segments contradict, and stage the eviction of the
+    /// segments an advance confirmed.
+    fn chain_settled(&mut self, diverged: &[u64]) {
+        for up_to in diverged {
+            error!(
+                namespace_raw = self.namespace().inner(),
+                up_to,
+                "a tiered floor advance does not match this replica's segment, which stays on disk"
+            );
+        }
+        self.stage_eviction(IggyTimestamp::now());
+    }
+
+    /// The last offsets of the floor advances that this replica's own
+    /// segments contradict. Any entry means the replica and the store
+    /// disagree about committed bytes.
+    #[must_use]
+    pub fn tiered_divergences(&self) -> Vec<u64> {
+        self.segment_chain
+            .as_ref()
+            .map_or_default(|chain| chain.diverged().iter().copied().collect())
+    }
+
+    /// Keep what the topic says stays on local disk, for the evictions that a
+    /// floor advance stages between two passes of the segment cleaner.
+    pub const fn set_local_envelope(&mut self, envelope: Option<LocalEnvelope>) {
+        self.local_envelope = envelope;
+    }
+
+    /// Hand the I/O lane the segments that may leave the disk now: sealed,
+    /// below the tiered floor, confirmed by an advance and outside the local
+    /// envelope.
+    pub fn stage_eviction(&mut self, now: IggyTimestamp) {
+        let (Some(envelope), Some(floor)) = (self.local_envelope, self.tiered_floor()) else {
+            return;
+        };
+        let Some(through) = self.eviction_end(now, floor, envelope) else {
+            return;
+        };
+        self.maintenance.eviction = Some(
+            self.maintenance
+                .eviction
+                .map_or(through, |previous| previous.max(through)),
+        );
+        self.notify_io();
+    }
+
+    /// Whether the tiering job that is ready lets other work go first. It
+    /// does so once after every job, so a long hash does not hold up commits.
+    fn tiering_yields(&mut self) -> bool {
+        self.maintenance
+            .tiering
+            .as_mut()
+            .is_some_and(|pending| std::mem::take(&mut pending.yielding))
+    }
+
+    /// Bytes the next step toward a complete chain reads into one buffer,
+    /// `None` when the chain is complete. Moves the scan to the sealed
+    /// segment the step hashes.
+    fn next_tiering_read_len(&mut self) -> Option<usize> {
+        let pending = self.maintenance.tiering.as_mut()?;
+        let Some(chain) = self.segment_chain.as_ref() else {
+            self.partition_dir.as_ref()?;
+            return Some(0);
+        };
+        let segments = self.log.segments();
+        if let Some(removed) = segments.first()?.start_offset.checked_sub(1)
+            && chain.trim(removed).is_some()
+        {
+            return Some(0);
+        }
+        if self
+            .pending_advances
+            .front()
+            .is_some_and(|advance| chain.lacks_advance(advance))
+        {
+            return Some(0);
+        }
+        let scanned = segments.partition_point(|segment| segment.start_offset < pending.scan_from);
+        let segment = segments[scanned..]
+            .iter()
+            .zip(&self.log.storages()[scanned..])
+            .find_map(|(segment, storage)| {
+                (segment.sealed
+                    && segment.size.as_bytes_u64() > 0
+                    && chain.lacks_record(segment)
+                    && storage.segment_and_index_paths().0.is_some())
+                .then_some(segment)
+            })?;
+        pending.scan_from = segment.start_offset;
+        let size = segment.size.as_bytes_u64();
+        if !pending
+            .digest
+            .as_ref()
+            .is_some_and(|digest| digest.resumes(segment.start_offset, size))
+        {
+            pending.digest = Some(Box::new(crate::segment_chain::SegmentDigest::new(
+                segment.start_offset,
+            )));
+        }
+        pending.digest.as_ref().map(|digest| digest.step_len(size))
+    }
+
+    /// The next step toward a complete chain, `None` when it is complete.
+    fn next_tiering_job(&mut self) -> Option<crate::segment_chain::TieringJob> {
+        self.next_tiering_read_len()?;
+        let pending = self.maintenance.tiering.as_ref()?;
+        let Some(chain) = self.segment_chain.as_ref() else {
+            return Some(crate::segment_chain::TieringJob::Open {
+                directory: self.partition_dir.clone()?,
+                prefix: pending.prefix,
+            });
+        };
+        let segments = self.log.segments();
+        // The trim point is the last offset retention removed, so a front at
+        // zero needs none.
+        if let Some(removed) = segments.first()?.start_offset.checked_sub(1)
+            && let Some(append) = chain.trim(removed)
+        {
+            return Some(crate::segment_chain::TieringJob::Append(append));
+        }
+        // Advances apply in offset order, and the recorded ones were dropped
+        // from the front.
+        if let Some(append) = self
+            .pending_advances
+            .front()
+            .and_then(|advance| chain.record_advance(advance))
+        {
+            return Some(crate::segment_chain::TieringJob::Append(append));
+        }
+        let digest = pending.digest.clone()?;
+        let index = segments
+            .binary_search_by_key(&pending.scan_from, |segment| segment.start_offset)
+            .ok()?;
+        Some(crate::segment_chain::TieringJob::Hash {
+            log_path: self.log.storages()[index].segment_and_index_paths().0?,
+            append: chain.hash_from_disk(&segments[index], self.created_revision())?,
+            digest,
+        })
+    }
+
+    /// A step that fails leaves the chain as it was and runs again after a
+    /// delay that grows with every failure in a row.
+    fn accept_tiering(&mut self, result: crate::PartitionIoResult) -> Result<(), IggyError> {
+        let crate::PartitionIoResult::Tiering(result) = result else {
+            return Err(IggyError::CannotWriteToFile);
+        };
+        let failure = match result {
+            crate::segment_chain::TieringResult::Opened(Ok(chain)) => {
+                self.adopt_segment_chain(&chain).err()
+            }
+            crate::segment_chain::TieringResult::Opened(Err(error)) => Some(error),
+            crate::segment_chain::TieringResult::Appended(Ok(record)) => {
+                let diverged = self
+                    .segment_chain
+                    .as_mut()
+                    .map(|chain| chain.note_appended(&record));
+                // A segment that sealed without a record is uploadable only
+                // from here on.
+                if matches!(record, crate::segment_chain::ChainRecord::Sealed(_)) {
+                    self.want_upload();
+                }
+                self.chain_settled(&diverged.unwrap_or_default());
+                None
+            }
+            crate::segment_chain::TieringResult::Appended(Err(error)) => Some(error.into()),
+            crate::segment_chain::TieringResult::Hashed(digest) => {
+                if let Some(pending) = &mut self.maintenance.tiering
+                    && pending
+                        .digest
+                        .as_ref()
+                        .is_some_and(|captured| digest.continues(captured))
+                {
+                    pending.digest = Some(digest);
+                }
+                None
+            }
+        };
+        let Some(failure) = failure else {
+            if let Some(pending) = &mut self.maintenance.tiering {
+                pending.failures = 0;
+                pending.yielding = true;
+            }
+            return Ok(());
+        };
+        let transient = matches!(failure, crate::segment_chain::ChainError::Io(_));
+        let now = self.consensus.clock_realtime_micros();
+        let retry_in_micros =
+            self.maintenance
+                .tiering
+                .as_mut()
+                .filter(|_| transient)
+                .map(|pending| {
+                    let backoff = TIERING_RETRY_BACKOFF_BASE_MICROS
+                        << pending.failures.min(TIERING_RETRY_BACKOFF_MAX_SHIFT);
+                    pending.failures = pending.failures.saturating_add(1);
+                    pending.retry_after_micros = now.saturating_add(backoff);
+                    backoff
+                });
+        if retry_in_micros.is_none() {
+            self.maintenance.tiering = None;
+        }
+        error!(
+            namespace_raw = self.namespace().inner(),
+            %failure,
+            retry_in_micros,
+            "cannot complete the partition's segment chain"
+        );
+        Ok(())
+    }
+
+    fn eviction_is_ready(&mut self, through: u64) -> bool {
+        let segments = self.log.segments();
+        let slot = self.first_local_slot();
+        let next = segments
+            .get(slot)
+            .filter(|_| slot + 1 < segments.len())
+            .filter(|segment| {
+                segment.sealed
+                    && segment.end_offset <= through
+                    && self.segment_chain.as_ref().is_some_and(|chain| {
+                        chain.evictable(segment.start_offset, segment.end_offset)
+                    })
+            });
+        let Some(segment) = next else {
+            self.maintenance.eviction = None;
+            return false;
+        };
+        let (start_offset, end_offset) = (segment.start_offset, segment.end_offset);
+        if self.persistence_checkpoint_pending() {
+            return false;
+        }
+        // The WAL links its tail and checkpoint-cursor segments and boot reads
+        // the latter, so evicting either would wedge every replica's boot.
+        if let Some(persistence) = &self.persistence
+            && let Some(checkpoint) = persistence.segment_checkpoint()
+            && (start_offset >= checkpoint.start_offset || end_offset >= checkpoint.next_offset)
+        {
+            persistence.request_checkpoint();
+            return false;
+        }
+        true
+    }
+
+    /// The slot of the first segment still on local disk. Remote segments are
+    /// always the front of the list, so a binary search finds where they end
+    /// without walking a prefix that grows with every eviction.
+    fn first_local_slot(&self) -> usize {
+        self.log
+            .segments()
+            .partition_point(|segment| segment.location == SegmentLocation::Remote)
+    }
+
+    fn capture_segment_eviction(&self) -> Option<crate::PartitionIoJob<SB>> {
+        let slot = self.first_local_slot();
+        let start_offset = self.log.segments().get(slot)?.start_offset;
+        let messages_path = self.log.storages()[slot].segment_and_index_paths().0;
+        let job = self
+            .segment_chain
+            .as_ref()?
+            .evict(start_offset, messages_path)?;
+        self.clear_state_transfer_offer_cache();
+        Some(crate::PartitionIoJob::EvictSegment(Box::new(job)))
+    }
+
+    /// Mark the evicted segment `Remote` and drop what still names its `.log`,
+    /// as retention does after an unlink. Returns whether the segment left the
+    /// disk.
+    ///
+    /// A record or an unlink that may not be durable fails like any other
+    /// durability failure. A failed unlink only ends the pass: the record is
+    /// durable, so the next pass retries the unlink alone.
+    fn accept_segment_eviction(
+        &mut self,
+        result: crate::PartitionIoResult,
+    ) -> Result<bool, IggyError> {
+        let crate::PartitionIoResult::SegmentEvicted(evicted) = result else {
+            return Err(IggyError::CannotDeleteFile);
+        };
+        let start_offset = evicted.start_offset;
+        if evicted.appended
+            && let Some(chain) = self.segment_chain.as_mut()
+        {
+            chain.note_evicted(start_offset);
+        }
+        match evicted.outcome {
+            Ok(()) => {}
+            Err(crate::segment_chain::EvictionFailure::Unlink) => {
+                self.maintenance.eviction = None;
+                return Ok(false);
+            }
+            Err(crate::segment_chain::EvictionFailure::Record) => {
+                return Err(IggyError::CannotWriteToFile);
+            }
+            Err(crate::segment_chain::EvictionFailure::Sync) => {
+                return Err(IggyError::CannotSyncFile);
+            }
+        }
+        let slot = self
+            .log
+            .segments()
+            .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+            .map_err(|_| IggyError::CannotDeleteFile)?;
+        self.log.segments_mut()[slot].location = SegmentLocation::Remote;
+        self.log.storages_mut()[slot].messages_reader = None;
+        self.log.reset_read_state(slot);
+        self.log.journal().inner.forget_segment(start_offset);
+        self.segment_checksum_cache
+            .borrow_mut()
+            .remove(&start_offset);
+        self.clear_state_transfer_offer_cache();
+        Ok(true)
     }
 
     pub(crate) async fn install_empty_segment(
@@ -12752,6 +14393,7 @@ where
             preallocate: self.effective_preallocate_segments(config),
             segment_bodies: self.persistence.is_some(),
             old_index: None,
+            chain_append: None,
         }
     }
 
@@ -14138,6 +15780,17 @@ impl CommittedBatchStats {
     }
 }
 
+/// Whether a batch stamped `timestamp` starts a new segment rather than join
+/// one whose first batch was stamped `first`. The WAL applies the same rule at
+/// prepare time, so both sites roll at the same batch. A stamp behind `first`
+/// counts as no age.
+const fn rolls_by_age(max_age: Option<u64>, first: u64, timestamp: u64) -> bool {
+    match max_age {
+        Some(max_age) => timestamp.saturating_sub(first) >= max_age,
+        None => false,
+    }
+}
+
 /// Fold one `SendMessages` batch's accounting into a running `JournalInfo`,
 /// matching the field updates `append_messages` applies per append.
 /// `current_offset` is the batch's last message offset; the batch carries a
@@ -14195,6 +15848,30 @@ pub enum RetirementDebtStatus {
     Unpaid(Option<Vec<(u128, u64)>>),
 }
 
+/// What a replica deletes from the object store while it is the primary of
+/// a tiered partition. Nothing here is persisted.
+#[derive(Default)]
+struct ObjectDeletes {
+    /// The view this state belongs to, `None` until the replica acts as the
+    /// primary.
+    view: Option<u32>,
+    /// Whether the objects of the incarnation were listed in this view.
+    swept: bool,
+    /// The segments whose objects wait for their delete.
+    retired: RetiredSegments,
+    /// The job in flight: its number, what it does, and the scope whose end
+    /// stops it.
+    running: Option<(u64, RunningObjectDelete, iggy_object_store::TierScope)>,
+}
+
+/// What the object-delete job in flight was started with.
+enum RunningObjectDelete {
+    /// A sweep, with the truncation watermark its pass came with.
+    Sweep { committed_up_to: u64 },
+    /// A delete of these segments, as they were queued when it started.
+    Delete(Vec<(u64, RetiredSegment)>),
+}
+
 /// What one call to [`IggyPartition::remove_sealed_segments_up_to`] reclaimed.
 ///
 /// `budget_spent` reports that the pass stopped on
@@ -14208,6 +15885,25 @@ pub struct SegmentRemoval {
     pub segments: u64,
     pub messages: u64,
     pub budget_spent: bool,
+}
+
+/// What one [`IggyPartition::evict_segments`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentEviction {
+    pub segments: u64,
+    /// Segments the pass would evict are still waiting for the next call.
+    pub budget_spent: bool,
+}
+
+/// How much of a tiered partition stays on local disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalEnvelope {
+    /// Uploaded segments whose newest message is older than this leave the
+    /// disk.
+    pub age: IggyExpiry,
+    /// Uploaded segments leave the disk, oldest first, until the sealed
+    /// segments still local fit in this many bytes.
+    pub size: Option<u64>,
 }
 
 /// Counter shortfalls from removing one segment, reported with its offset range.
@@ -14282,6 +15978,41 @@ fn leading_expired_end(
     up_to
 }
 
+/// Index of the last of `segments` that starts at or below `offset`, or of the
+/// first one when they all start above it.
+///
+/// Segments are ordered by start offset, and remote ones make the list as
+/// long as total retention, so the lookup must not cost a step per segment.
+fn segment_holding(segments: &[Segment], offset: u64) -> usize {
+    segments
+        .partition_point(|segment| segment.start_offset <= offset)
+        .saturating_sub(1)
+}
+
+/// How many of `segments`, a poll's starting segment and the ones after it,
+/// the poll's snapshot holds.
+///
+/// Every message after the starting segment matches the poll, so the walk
+/// cannot use a segment past the one that completes `count` messages or
+/// `byte_budget` bytes. The starting segment counts toward neither: how much
+/// of it sits before the poll's first match is unknown until it is read.
+fn walked_segments(segments: &[Segment], count: u32, byte_budget: usize) -> usize {
+    let mut messages = 0_u64;
+    let mut bytes = 0_u64;
+    for (walked, segment) in segments.iter().enumerate().skip(1) {
+        if messages >= u64::from(count) || bytes >= byte_budget as u64 {
+            return walked;
+        }
+        let size = segment.size.as_bytes_u64();
+        if size > 0 {
+            messages = messages
+                .saturating_add(segment.end_offset.saturating_sub(segment.start_offset) + 1);
+            bytes = bytes.saturating_add(size);
+        }
+    }
+    segments.len()
+}
+
 /// Highest `end_offset` to drop so the SEALED resident size falls to
 /// `max_bytes`, or `None` when already under budget. The active segment (last
 /// element) is never dropped. The budget is per-partition: the cluster has no
@@ -14308,6 +16039,29 @@ fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
         up_to = Some(segment.end_offset);
     }
     up_to
+}
+
+/// Highest `end_offset` retention removes from `segments`: the longer of the
+/// expired and the over-budget leading runs, cut back to the last segment that
+/// ends at or below `barrier`. `None` when retention removes nothing. The
+/// active segment (last element) is never named.
+fn retention_end(
+    segments: &[Segment],
+    now: IggyTimestamp,
+    expiry: IggyExpiry,
+    max_bytes: Option<u64>,
+    barrier: Option<u64>,
+) -> Option<u64> {
+    let expired = leading_expired_end(segments, now, expiry);
+    let oversized = max_bytes.and_then(|max_bytes| leading_oversized_end(segments, max_bytes));
+    let up_to = expired.into_iter().chain(oversized).max()?;
+    let through = barrier.map_or(up_to, |barrier| up_to.min(barrier));
+    // `up_to` ends a sealed segment, so the walk stops before the active one.
+    segments
+        .iter()
+        .take_while(|segment| segment.end_offset <= through)
+        .map(|segment| segment.end_offset)
+        .last()
 }
 
 /// `end_offset` of the `count`-th oldest sealed (non-active) segment of

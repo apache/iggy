@@ -213,7 +213,8 @@ public actor IggyConsumer: AsyncSequence {
     /// task is cancelled, or a read error ends the reading with that error.
     /// A message that does not decode ends it, and so does
     /// ``IggyErrorCode/historyUnavailable`` for a position read in a history
-    /// that is gone. Both stop their partition until a
+    /// that is gone and ``IggyErrorCode/tieredReadFailed`` for tiered data
+    /// that the object store refuses for good. Each stops its partition until a
     /// ``seek(partitionID:to:)``, and a seek to ``ReadError/skip`` steps over
     /// the message. So does ``IggyErrorCode/partitionLaneBlocked`` under
     /// ``CommitPolicy/onRead``: a lost committing read of another caller

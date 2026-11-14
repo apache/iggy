@@ -95,14 +95,14 @@ components:
     paths:
       - "core/binary_protocol/**"
 
-  # Miri (UB detector) on unsafe-heavy crates that don't pull tokio/compio.
-  # Scoped to `iggy_binary_protocol` (heavy unsafe in `consensus/iobuf.rs`:
-  # ref-counted CoW buffer, manual atomics, pointer arithmetic) plus the
-  # `consensus` crate (zero unsafe but exercises binary_protocol's unsafe
-  # via integration). Other crates (journal, metadata, partitions, common)
-  # instantiate compio, which uses io_uring syscalls Miri cannot emulate.
-  # See the `# Alignment` doc on the `ConsensusHeader` trait for the
-  # alignment contract that motivates this check.
+  # Miri (UB detector) runs the tests of `iggy_binary_protocol` and
+  # `consensus`, and the tests of the unsafe `server_common` files:
+  # `iobuf.rs` (ref-counted CoW buffer, manual atomics, pointer
+  # arithmetic), `consensus_message.rs` and `buffer.rs`. Other crates
+  # (journal, metadata, partitions, common) instantiate compio, which uses
+  # io_uring syscalls Miri cannot emulate. See the `# Alignment` doc on the
+  # `ConsensusHeader` trait for the alignment contract that motivates this
+  # check.
   rust-miri:
     depends_on:
       - "rust-workspace"
@@ -110,6 +110,9 @@ components:
     paths:
       - "core/binary_protocol/**"
       - "core/consensus/**"
+      - "core/server_common/src/iobuf.rs"
+      - "core/server_common/src/consensus_message.rs"
+      - "core/server_common/src/buffer.rs"
       - ".config/nextest.toml"
     tasks:
       - "miri"
@@ -586,6 +589,9 @@ components:
   helm:
     paths:
       - "helm/**"
+      # The smoke builds the gateway image.
+      - "gateways/kafka/Dockerfile"
+      - "gateways/kafka/Dockerfile.dockerignore"
       - "scripts/ci/setup-helm-smoke-cluster.sh"
       - "scripts/ci/test-helm.sh"
     tasks: ["validate", "smoke"]

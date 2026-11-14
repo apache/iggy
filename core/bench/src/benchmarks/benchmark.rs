@@ -120,10 +120,7 @@ pub trait Benchmarkable: Send {
                 .create_stream(&stream_name, &StreamCreateOptions::default())
                 .await?;
             let topic_name = "topic-1".to_string();
-            let max_topic_size = self
-                .args()
-                .max_topic_size()
-                .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
+            let max_topic_size = self.args().new_topic_max_size();
             let message_expiry = self.args().message_expiry();
             let durability = self.args().durability();
             let messages_required_to_save =
@@ -193,8 +190,7 @@ pub trait Benchmarkable: Send {
         let rate_limit = self
             .args()
             .rate_limit()
-            .map(|rl| format!(" global rate limit: {rl}/s"))
-            .unwrap_or_default();
+            .map_or_default(|rl| format!(" global rate limit: {rl}/s"));
 
         format!("{message_size}{messages_per_batch}{data}{rate_limit}")
     }

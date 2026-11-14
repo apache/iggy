@@ -57,6 +57,7 @@ const NOT_PRIMARY = 89;
 const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
 const CONSUMER_OFFSET_NOT_FOUND = 3021;
 const INVALID_OFFSET = 4100;
+const TIERED_READ_FAILED = 96;
 const CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 /** An offset reply holds the partition, its current offset and the stored offset. */
@@ -1397,17 +1398,34 @@ describe('partition reader', () => {
       }
     });
 
-  it('moves an on read offset back to the last batch taken when it closes', async () => {
-    const topic = new FakeTopic(2n);
-    const reader = await open(topic, [0, 1], { commit: CommitPolicy.OnRead });
-    const taken = await reader.next();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    await reader.close();
-
-    assert.equal(topic.stored.get(taken.partitionId), 1n);
-    assert.equal(topic.stored.has(taken.partitionId === 0 ? 1 : 0), false);
-  });
+  for (const [name, start, firstOffset, partitions] of [
+    ['next', PollingStrategy.Next, 0n, [0, 1]],
+    ['next', PollingStrategy.Next, 0n, [1, 3]],
+    ['offset 0', PollingStrategy.Offset(0n), 0n, [0, 1]],
+    ['offset 4', PollingStrategy.Offset(4n), 4n, [0, 1]]
+  ] as const) {
+    it(`rewinds unread on read batches on close from ${name}, partitions ${partitions}`, async () => {
+      const topic = new FakeTopic(firstOffset + 2n);
+      const reader = await open(topic, [...partitions], { commit: CommitPolicy.OnRead }, start);
+      let taken: number;
+      try {
+        taken = (await reader.next()).partitionId;
+        await waitFor(() => partitions.every((partition) => topic.stored.get(partition) === firstOffset + 1n),
+          'both partitions were not committed by their reads');
+      } finally {
+        await reader.close();
+      }
+      assert.equal(topic.stored.get(taken), firstOffset + 1n);
+      const unread = partitions.find((partition) => partition !== taken)!;
+      assert.equal(topic.stored.get(unread), firstOffset === 0n ? undefined : firstOffset - 1n);
+      const resumed = await open(topic, [unread], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [firstOffset, firstOffset + 1n]);
+      } finally {
+        await resumed.close();
+      }
+    });
+  }
 
   it('stores the offset before an on read seek to an offset, so a restart resumes at the sought offset', async () => {
     const topic = new FakeTopic(10n);
@@ -2952,6 +2970,12 @@ describe('partition reader', () => {
       assert.deepEqual(topic.fetches[0], [1, 3]);
       assert.deepEqual([topic.stored.get(taken.partitionId), topic.stored.get(undelivered), topic.offsetDeletes],
         [start + 1n, start === 0n ? undefined : start - 1n, start === 0n ? [undelivered] : []]);
+      const resumed = await open(topic, [undelivered], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [start, start + 1n]);
+      } finally {
+        await resumed.close();
+      }
     });
   }
 
@@ -3900,6 +3924,32 @@ describe('partition reader', () => {
 
     assert.ok(error instanceof ReadError);
     assert.equal(error.partitionId, 1);
+    assert.ok(others.every(({ partitionId }) => partitionId === 3));
+    assert.equal(resumed.messages[0].headers.offset, 0n);
+  });
+
+  it('sends a read once that fails with a tiered read failure, and stops its partition until a seek', async () => {
+    const topic = new FakeTopic(1_000n);
+    topic.refused.set(1, TIERED_READ_FAILED);
+    const reader = await open(topic, [1, 3]);
+    const readsOf = (partition: number) => topic.reads.filter((read) => read.partition === partition).length;
+
+    let stopped: unknown;
+    while (!stopped) stopped = await reader.next().then(() => undefined, (failure: unknown) => failure);
+    const others = [await reader.next(), await reader.next()];
+    // Several retry intervals, in which a refusal that retries reads again.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const refusedReads = readsOf(1);
+    topic.refused.delete(1);
+    await reader.seek(1, PollingStrategy.Offset(0n));
+    let resumed = await reader.next();
+    while (resumed.partitionId !== 1) resumed = await reader.next();
+    await reader.close();
+
+    assert.ok(stopped instanceof ReadError);
+    assert.deepEqual([stopped.partitionId, (stopped.error as { errorCode: number }).errorCode,
+      stopped.stopsPartition, stopped.resumable], [1, TIERED_READ_FAILED, true, true]);
+    assert.equal(refusedReads, 1, 'the refused read went out again');
     assert.ok(others.every(({ partitionId }) => partitionId === 3));
     assert.equal(resumed.messages[0].headers.offset, 0n);
   });

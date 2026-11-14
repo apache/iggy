@@ -1,0 +1,93 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Miri nightly
+
+# Runs the Miri tests that the default-miri filter in .config/nextest.toml
+# leaves out of the pre-merge job as too slow. A failed run opens an issue,
+# or comments on the issue that an earlier failed run opened.
+
+on:
+  schedule:
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  miri:
+    name: miri-nightly
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Run Rust check
+        uses: ./.github/actions/rust/pre-merge
+        with:
+          task: miri-nightly
+
+  # A separate job, so the job that builds and runs code holds no write token.
+  report:
+    name: Report failure
+    needs: miri
+    # A job timeout ends `miri` as cancelled, which `failure()` does not match.
+    if: ${{ !cancelled() && needs.miri.result != 'success' }}
+    # Two reports at once would both find no open issue and open one each.
+    concurrency: miri-nightly-report
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const title = 'Miri nightly run failed';
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              creator: 'github-actions[bot]',
+              per_page: 100,
+            });
+            const existing = openIssues.find(issue => issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: `The run failed again: ${runUrl}`,
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              labels: ['bug'],
+              body: [
+                `The Miri nightly run failed: ${runUrl}`,
+                '',
+                'The job runs the tests that the `default-miri` filter in `.config/nextest.toml` leaves out of the pre-merge Miri job.',
+              ].join('\n'),
+            });

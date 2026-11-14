@@ -65,6 +65,7 @@ filter = '''
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
+    + binary_id(iggy-gateway-kafka::readiness_real_server_tests)
     + binary_id(iggy-gateway-kafka::sasl_real_server_tests)
 '''
 test-group = "kafka_bridge"
@@ -129,8 +130,10 @@ slow-timeout = { period = "60s", terminate-after = 60 }
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.default-miri]
-# Keep consensus logic scenarios and large options boundaries in native CI.
-# Miri retains protocol validation and message ownership checks.
+# The pre-merge Miri job retains protocol validation and message ownership
+# checks. Consensus logic scenarios, large options boundaries and the random
+# replication flow are too slow for it. The Miri nightly workflow runs every
+# test that this filter leaves out.
 default-filter = '''
 not (
     (package(=consensus) & (
@@ -147,6 +150,7 @@ not (
         | test(/^impls::timestamp_clamp_tests::/)
         | test(/^impls::view_source_tests::/)
         | test(/^impls::vsr_consensus_tests::/)
+        | test(=replication::tests::given_random_losses_failures_and_busy_answers_when_the_flow_runs_should_keep_its_invariants_and_deliver_every_op)
     ))
     | (package(=iggy_binary_protocol) & (
         test(=primitives::options::tests::entry_count_over_limit_is_rejected)
@@ -154,8 +158,9 @@ not (
     ))
 )
 '''
-# Keep Miri bounded by the CI job timeout instead of the native-test limit.
-slow-timeout = { period = "60s" }
+# The pre-merge job timeout bounds a test before this one hour cap does. The
+# nightly job has a longer timeout, so there a test over the cap fails the run.
+slow-timeout = { period = "60s", terminate-after = 60 }
 
 [profile.ci]
 retries = 3

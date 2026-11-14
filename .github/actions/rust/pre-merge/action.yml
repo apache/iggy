@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri, miri-nightly)"
     required: true
   component:
     description: "Component name (for context)"
@@ -30,6 +30,13 @@ inputs:
     description: "Test selection: affected or workspace"
     required: false
     default: affected
+  stack-base:
+    description: >-
+      Base branch commit under a pull request stack. The merge ref of an upper
+      layer has the layer below as its first parent, so the top pull request
+      compares against this commit to cover every layer. Empty outside a stack.
+    required: false
+    default: ""
   partition:
     description: "One-based nextest partition index for the test task"
     required: false
@@ -48,7 +55,7 @@ runs:
       uses: ./.github/actions/utils/setup-rust
       with:
         # Test and Miri jobs execute nextest.
-        install-nextest: ${{ inputs.task == 'miri' || inputs.task == 'test' || startsWith(inputs.task, 'test-') }}
+        install-nextest: ${{ startsWith(inputs.task, 'miri') || inputs.task == 'test' || startsWith(inputs.task, 'test-') }}
         coverage: ${{ inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' }}
         # These tasks do not compile workspace crates and need no native
         # libraries. All compiling tasks keep the existing dependency setup.
@@ -63,11 +70,12 @@ runs:
         # artifacts rebuild regardless since the rustc hash differs.
         shared-key: ${{ inputs.task == 'miri' && 'miri' || inputs.task == 'runtime' && 'runtime' || 'dev' }}
         # Shards download the build artifact. Metadata-only tasks need no target cache.
-        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test') && 'false' || 'true' }}
+        # The nightly Miri job runs once a day and builds from scratch.
+        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test' || inputs.task == 'miri-nightly') && 'false' || 'true' }}
         save-cache: ${{ inputs.save-cache }}
         # Artifact builders do not pull test containers. Test shards have ~78 GB
         # free when tests start and use ~15 GB, so the cleanup costs minutes.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || inputs.task == 'miri' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || startsWith(inputs.task, 'miri') || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -101,12 +109,16 @@ runs:
 
     # Planning is an optimization. A planner or selector failure restores the
     # full-workspace build and test path below. The Action installs the one
-    # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
+    # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1). On the top
+    # pull request of a stack, `since` is the stack base, so the plan covers
+    # every layer. An empty `since` takes the comparison base from the event.
     - name: Plan affected Rust work
       id: rail
       if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
       continue-on-error: true
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
+      with:
+        since: ${{ inputs.stack-base }}
 
     # Individual lint tasks for parallel execution
     - name: Cargo check
@@ -187,6 +199,7 @@ runs:
         PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         PLAN_STATUS: ${{ steps.rail.outcome }}
         TEST_SELECTION: ${{ inputs.test-scope }}
+        STACK_BASE: ${{ inputs.stack-base }}
         ARTIFACT_TASK: ${{ inputs.task }}
       run: |
         set -euo pipefail
@@ -312,6 +325,8 @@ runs:
           # no merge base (so it failed on every full-workspace lane). Read the parent from
           # the raw object and fetch that one commit before diffing. A HEAD with one parent
           # (workflow_dispatch on a branch tip) has no PR base, so it takes the fail-safe.
+          # The top pull request of a stack diffs against the stack base instead: its
+          # first parent is the merge commit of the layer below.
           #
           # `2>&1` into a variable, not `2>/dev/null` piped straight to grep: the old form
           # silenced *any* git failure into empty output, which `grep -q` then reads
@@ -321,8 +336,8 @@ runs:
           # KAFKA_FIXTURES_REQUIRED never set - every fixture-backed test quietly passed by
           # skipping all its assertions instead of running them (0.005s for a test meant to
           # decode 9 real fixtures).
-          BASE_SHA=""
-          if [[ "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]]; then
+          BASE_SHA="$STACK_BASE"
+          if [[ -z "$BASE_SHA" && "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]]; then
             BASE_SHA=$(git cat-file -p HEAD | awk '/^parent /{print $2; exit}')
           fi
           if [[ -n "$BASE_SHA" ]] \
@@ -453,9 +468,19 @@ runs:
       shell: bash
 
     # Compare the shared HEAD runtime with a separately built baseline server.
+    # The script takes the first parent of the merge ref as the baseline. For
+    # the top pull request of a stack that is the layer below, so the stack
+    # base replaces it and a format break in any layer fails the check.
     - name: Storage format backwards compatibility
       if: inputs.task == 'test-storage-compat'
-      run: ./scripts/ci/storage-compat.sh --runtime-artifacts "$RUNNER_TEMP/rust-runtime"
+      env:
+        STACK_BASE: ${{ inputs.stack-base }}
+      run: |
+        compat_args=(--runtime-artifacts "$RUNNER_TEMP/rust-runtime")
+        if [[ -n "$STACK_BASE" ]]; then
+          compat_args+=(--baseline-ref "$STACK_BASE")
+        fi
+        ./scripts/ci/storage-compat.sh "${compat_args[@]}"
       shell: bash
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /
@@ -464,23 +489,41 @@ runs:
     # model and accepts the legitimate `NonNull::add` arithmetic in
     # `iobuf.rs` that stacked-borrows would reject. Strict-provenance
     # rejects int-to-pointer round trips, which we don't use.
+    # The miri task runs the tests that the default-miri filter in
+    # .config/nextest.toml selects. The miri-nightly task runs the tests that
+    # the filter leaves out as too slow for a pull request.
     - name: Run miri
-      if: inputs.task == 'miri'
+      if: startsWith(inputs.task, 'miri')
       env:
-        MIRI_TOOLCHAIN: nightly-2026-10-23
+        MIRI_TASK: ${{ inputs.task }}
+        MIRI_TOOLCHAIN: nightly-2026-11-12
         MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-strict-provenance"
       run: |
         rustup toolchain install "$MIRI_TOOLCHAIN" --component miri --profile minimal --no-self-update
         TIMEFORMAT='Miri sysroot setup: %3R seconds'
         time cargo +"$MIRI_TOOLCHAIN" miri setup
         miri_args=(--locked -p iggy_binary_protocol -p consensus)
+        nextest_args=("${miri_args[@]}")
+        if [[ "$MIRI_TASK" == "miri-nightly" ]]; then
+          nextest_args+=(--ignore-default-filter -E 'not default()')
+        else
+          # Only the tests of the unsafe server_common files. Some other
+          # tests start compio or use serial_test, which Miri cannot run.
+          nextest_args+=(-p server_common -E '
+            not package(=server_common)
+            | test(/^(iobuf|consensus_message)::tests::/)
+            | test(/^buffer::miri_tests::/)')
+        fi
         TIMEFORMAT='Miri test compilation: %3R seconds'
-        time cargo +"$MIRI_TOOLCHAIN" miri nextest run --no-run "${miri_args[@]}"
+        time cargo +"$MIRI_TOOLCHAIN" miri nextest run --no-run "${nextest_args[@]}"
         TIMEFORMAT='Miri tests: %3R seconds'
-        time cargo +"$MIRI_TOOLCHAIN" miri nextest run "${miri_args[@]}"
-        # Nextest does not run doctests.
-        TIMEFORMAT='Miri doctests: %3R seconds'
-        time cargo +"$MIRI_TOOLCHAIN" miri test --doc "${miri_args[@]}"
+        time cargo +"$MIRI_TOOLCHAIN" miri nextest run "${nextest_args[@]}"
+        # Nextest does not run doctests. The filter does not select them either,
+        # so the nightly task would only repeat what the pre-merge task ran.
+        if [[ "$MIRI_TASK" == "miri" ]]; then
+          TIMEFORMAT='Miri doctests: %3R seconds'
+          time cargo +"$MIRI_TOOLCHAIN" miri test --doc "${miri_args[@]}"
+        fi
       shell: bash
 
     # aarch64 builds (run on ARM64 runners)

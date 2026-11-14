@@ -21,7 +21,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -58,6 +58,8 @@ pub struct AppliedFrontier {
     read_budget: Duration,
     partition_freshness: Option<PartitionFreshness>,
     recovering_shards: AtomicUsize,
+    tiered_storage_ready: AtomicBool,
+    store_identity_verified: AtomicBool,
 }
 
 /// A shard's recovery state, shared with the node's primary placement probes.
@@ -146,6 +148,8 @@ impl AppliedFrontier {
             read_budget,
             partition_freshness: None,
             recovering_shards: AtomicUsize::new(0),
+            tiered_storage_ready: AtomicBool::new(false),
+            store_identity_verified: AtomicBool::new(false),
         }
     }
 
@@ -160,6 +164,41 @@ impl AppliedFrontier {
     #[must_use]
     pub fn has_partition_recovery(&self) -> bool {
         self.recovering_shards.load(Ordering::Acquire) != 0
+    }
+
+    /// Record whether the partitions of this node can read their remote
+    /// segments back. False until set. No boot path hands a partition those
+    /// reads yet (`IggyPartition::set_remote_segments`), so no boot path sets
+    /// this.
+    pub fn set_tiered_storage_ready(&self, ready: bool) {
+        self.tiered_storage_ready.store(ready, Ordering::Release);
+    }
+
+    /// Whether this node can tier topics: [`Self::set_tiered_storage_ready`]
+    /// last recorded true and the node passes the store identity check.
+    /// Shard 0 reports it to the metadata primary, which admits a tiered
+    /// topic only once every member reports true, and each shard stages
+    /// evictions only while it holds.
+    #[must_use]
+    pub fn tiered_storage_ready(&self) -> bool {
+        self.tiered_storage_ready.load(Ordering::Acquire) && self.store_identity_verified()
+    }
+
+    /// Record whether this node passes the store identity check: it read back
+    /// its cluster's store identity object since it booted, and no check
+    /// since found that object missing or changed. False until the server's
+    /// identity check sets it. Each shard runs its uploads and object deletes
+    /// only while it holds.
+    pub fn set_store_identity_verified(&self, verified: bool) {
+        self.store_identity_verified
+            .store(verified, Ordering::Release);
+    }
+
+    /// Whether this node passes the store identity check, as
+    /// [`Self::set_store_identity_verified`] last recorded it.
+    #[must_use]
+    pub fn store_identity_verified(&self) -> bool {
+        self.store_identity_verified.load(Ordering::Acquire)
     }
 
     /// Arm admission for a multi-node process. `epoch` must use the bus clock;
@@ -391,6 +430,21 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn given_each_tiering_flag_when_reading_readiness_should_need_both() {
+        let frontier = AppliedFrontier::default();
+        for (ready, verified) in [(false, false), (true, false), (false, true), (true, true)] {
+            frontier.set_tiered_storage_ready(ready);
+            frontier.set_store_identity_verified(verified);
+
+            assert_eq!(
+                frontier.tiered_storage_ready(),
+                ready && verified,
+                "ready {ready}, verified {verified}"
+            );
+        }
+    }
 
     #[test]
     fn given_recovering_shards_when_one_finishes_should_wait_for_the_last_registration() {

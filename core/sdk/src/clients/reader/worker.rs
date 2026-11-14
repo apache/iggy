@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
@@ -258,6 +258,9 @@ pub(super) struct Worker {
     assignment: Option<AssignmentVersion>,
     /// The latest error of each partition, and of the whole reader, that waits for a slot.
     pending_errors: BTreeMap<Option<u32>, Refusal>,
+    /// The lost ranges that wait for a slot. Only the report of a range names the offsets that
+    /// the reader did not deliver, so a later error of its partition does not replace it.
+    pending_losses: VecDeque<Refusal>,
     epoch: u64,
     cursor: Option<u32>,
     /// The group that the next group fetch starts the walk from, so every group gets a turn
@@ -326,6 +329,7 @@ impl Worker {
             partitions: Vec::new(),
             assignment: None,
             pending_errors: BTreeMap::new(),
+            pending_losses: VecDeque::new(),
             cursor: None,
             group_cursor: 0,
             groups: Vec::new(),
@@ -593,6 +597,8 @@ impl Worker {
             self.backlogged.remove(&partition);
             self.stopped.remove(&partition);
             self.pending_errors.remove(&Some(partition));
+            self.pending_losses
+                .retain(|refusal| refusal.error.partition_id != Some(partition));
             self.shared.progress.forget_undecoded(partition);
         }
         // A later seek replaces what a lost write of an older generation left.
@@ -849,24 +855,31 @@ impl Worker {
     }
 
     /// The error waits for a slot. It goes out at the next turn, after the batches of the same
-    /// reply, so a `seek` after it does not drop them.
+    /// reply, so a `seek` after it does not drop them. A lost range waits apart from the latest
+    /// error of its partition.
     fn report(&mut self, error: ReadError) {
         let generation = error
             .partition_id
             .map(|partition| self.generation(partition));
-        self.pending_errors
-            .insert(error.partition_id, Refusal { error, generation });
+        let refusal = Refusal { error, generation };
+        if refusal.error.lost.is_some() {
+            self.pending_losses.push_back(refusal);
+        } else {
+            self.pending_errors
+                .insert(refusal.error.partition_id, refusal);
+        }
     }
 
-    /// An error also needs a slot.
+    /// An error also needs a slot. The lost ranges go first, so the error that stopped a
+    /// partition follows the range that its catch-up did not read again.
     fn flush_errors(&mut self) {
-        while !self.pending_errors.is_empty() {
-            let Some(capacity) = self.reserve() else {
-                return;
-            };
-            let Some((_, refusal)) = self.pending_errors.pop_first() else {
-                return;
-            };
+        while !(self.pending_losses.is_empty() && self.pending_errors.is_empty())
+            && let Some(capacity) = self.reserve()
+            && let Some(refusal) = self
+                .pending_losses
+                .pop_front()
+                .or_else(|| self.pending_errors.pop_first().map(|(_, refusal)| refusal))
+        {
             self.deliver(Reply {
                 epoch: self.epoch,
                 assignment: self.assignment,
@@ -2330,7 +2343,7 @@ impl Worker {
                 epoch: self.epoch,
                 assignment: self.assignment,
                 result: Err(Refusal {
-                    error: lost_range(partition, operation, lost, context),
+                    error: lost_range(partition, operation, lost),
                     generation: Some(completed.generation),
                 }),
                 capacity: completed.capacity,
@@ -2489,11 +2502,13 @@ impl Worker {
             .map_or(until, |first| first.header.offset.saturating_sub(1))
     }
 
-    /// Ends the catch-up of `partition` and reports the range that it did not read again.
-    /// Returns whether it reported one.
-    fn interrupt_catch_up(&mut self, partition: u32) -> bool {
+    /// Ends the catch-up of `partition`: reports the range that it did not read again, then
+    /// hands over the rest of the retained batch. A caller that stops the partition reports its
+    /// own error after this. The application then takes the batch before it seeks, so the seek
+    /// that resumes the partition drops nothing.
+    fn interrupt_catch_up(&mut self, partition: u32) {
         let Some(until) = self.catch_up.remove(&partition) else {
-            return false;
+            return;
         };
         let position = self.position(partition);
         if let Some(active) = self.active.remove(&partition) {
@@ -2502,18 +2517,12 @@ impl Worker {
         let lost_end = self.lost_end(partition, until);
         let retained = self.retained_batches.remove(&partition);
         let operation = self.lost_operations.remove(&partition).unwrap_or_default();
-        let lost = position.value <= lost_end;
-        if lost {
+        if position.value <= lost_end {
             error!(
                 "Partition: {partition} lost offsets from: {} to: {lost_end} during read recovery",
                 position.value
             );
-            let error = lost_range(
-                partition,
-                operation,
-                position.value..=lost_end,
-                position.context().unwrap_or_default(),
-            );
+            let error = lost_range(partition, operation, position.value..=lost_end);
             if let Some(retained) = &retained {
                 self.deliver(Reply {
                     epoch: self.epoch,
@@ -2543,7 +2552,6 @@ impl Worker {
                 });
             }
         }
-        lost
     }
 
     /// Abandons the operations of lost committing reads, so their progress blocks go. The next
@@ -2658,7 +2666,7 @@ impl Worker {
             }
             IggyError::HistoryUnavailable => {
                 for &partition in partitions {
-                    let reported = self.interrupt_catch_up(partition);
+                    self.interrupt_catch_up(partition);
                     self.shared.progress.forget_undecoded(partition);
                     // A position without a history reads the history of the cached route, which
                     // the driver drops after this refusal, so only a lost history stops.
@@ -2678,9 +2686,14 @@ impl Worker {
                     self.retry_at.remove(&partition);
                     self.stopped.insert(partition);
                     self.shared.progress.lose_history(partition);
-                    if !reported && !self.report_pending_loss(partition) {
+                    if !self.report_pending_loss(partition) {
                         self.report(ReadError::new(Some(partition), error.clone()));
                     }
+                }
+            }
+            error if permanent_refusal(&error) => {
+                for &partition in partitions {
+                    self.stop_refused(partition, &error);
                 }
             }
             error if lasting_refusal(&error) => self.count_lasting(partitions, &error),
@@ -2705,15 +2718,11 @@ impl Worker {
             *refusals += 1;
             let refusals = *refusals;
             if refusals >= MAX_LASTING_REFUSALS {
-                self.lasting_refusals.remove(&partition);
                 if lasting_refusal(error) {
-                    self.retry_at.remove(&partition);
-                    self.stopped.insert(partition);
-                    if !self.interrupt_catch_up(partition) && !self.report_pending_loss(partition) {
-                        self.report(ReadError::new(Some(partition), error.clone()));
-                    }
+                    self.stop_refused(partition, error);
                     continue;
                 }
+                self.lasting_refusals.remove(&partition);
                 self.report(ReadError::new(Some(partition), error.clone()));
             }
             let delay = backoff(self.config.retry_interval, refusals);
@@ -2721,6 +2730,19 @@ impl Worker {
                 "Partition: {partition} was refused: {error}. It is read again in {delay:?}, refusal {refusals} of {MAX_LASTING_REFUSALS}."
             );
             self.retry_at.insert(partition, Instant::now() + delay);
+        }
+    }
+
+    /// Stops `partition` until a seek. A catch-up in progress reports its range and hands over
+    /// its retained batch first. The stop then reports `error`, or the lost read that a seek to
+    /// `Next` would skip.
+    fn stop_refused(&mut self, partition: u32, error: &IggyError) {
+        self.lasting_refusals.remove(&partition);
+        self.retry_at.remove(&partition);
+        self.stopped.insert(partition);
+        self.interrupt_catch_up(partition);
+        if !self.report_pending_loss(partition) {
+            self.report(ReadError::new(Some(partition), error.clone()));
         }
     }
 
@@ -2819,23 +2841,15 @@ fn continuation_at(partition: u32, offset: u64, context: PartitionContext) -> Po
 }
 
 /// The report of `lost`, messages of `partition` that the lost read `operation` committed and
-/// that the reader could not read again. Its skip goes on after them in `context`.
-fn lost_range(
-    partition: u32,
-    operation: u64,
-    lost: RangeInclusive<u64>,
-    context: PartitionContext,
-) -> ReadError {
+/// that the reader could not read again. It names no skip, because it stops nothing: a seek
+/// would drop the batch that follows it.
+fn lost_range(partition: u32, operation: u64, lost: RangeInclusive<u64>) -> ReadError {
     ReadError {
-        partition_id: Some(partition),
-        error: IggyError::FetchProgressUncertain(operation),
-        skip: lost
-            .end()
-            .checked_add(1)
-            .map(|next| continuation_at(partition, next, context)),
-        offset: None,
-        record: None,
         lost: Some(lost),
+        ..ReadError::new(
+            Some(partition),
+            IggyError::FetchProgressUncertain(operation),
+        )
     }
 }
 
@@ -2929,6 +2943,11 @@ pub(crate) fn lasting_refusal(error: &IggyError) -> bool {
             | IggyError::TopicIdNotFound(..)
             | IggyError::TopicNameNotFound(..)
     )
+}
+
+/// A refusal that no retry changes, so its partition stops at the first one.
+pub(crate) fn permanent_refusal(error: &IggyError) -> bool {
+    matches!(error, IggyError::TieredReadFailed)
 }
 
 /// A refusal that settles by itself: a partition that is not routable yet, a primary that is
@@ -3403,7 +3422,7 @@ mod tests {
             let error = next_error(&mut receiver);
             assert_eq!(error.error, IggyError::FetchProgressUncertain(OPERATION));
             assert_eq!(error.partition_id, Some(0));
-            assert_eq!(error.skip, Some(at(0, 7)));
+            assert_eq!(error.skip, None, "the report needs no seek");
             assert_eq!(error.lost, Some(5..=6));
             assert_eq!(offsets(&next_batches(&mut receiver)[0]), [7, 8]);
             assert!(worker.catch_up.is_empty());
@@ -3668,7 +3687,7 @@ mod tests {
             (
                 Some(0),
                 IggyError::FetchProgressUncertain(OPERATION),
-                Some(continuation_at(0, 7, CONTEXT)),
+                None,
                 Some(5..=6)
             )
         );
@@ -3775,7 +3794,7 @@ mod tests {
                 (
                     Some(0),
                     IggyError::FetchProgressUncertain(OPERATION),
-                    Some(continuation_at(0, lost.end() + 1, CONTEXT)),
+                    None,
                     Some(lost)
                 ),
                 "{case}"
@@ -3814,6 +3833,52 @@ mod tests {
         assert!(worker.retained_batches.is_empty());
         assert!(worker.catch_up.is_empty());
         assert_eq!(worker.capacity.available_permits(), worker.config.slots);
+    }
+
+    /// A catch-up that an empty reply started retains no batch, so its range waits for a slot.
+    #[tokio::test]
+    async fn given_a_lost_range_that_waits_for_a_slot_when_seeking_should_discard_it() {
+        let (mut worker, mut receiver) = worker_of(committing(standalone([0])));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+        worker.positions.insert(0, next_in(0, 5, CONTEXT));
+        worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+        for sent in [next_in(0, 5, CONTEXT), continuation_at(0, 5, CONTEXT)] {
+            worker.complete(polled(
+                &worker,
+                FetchKind::Alone,
+                sent,
+                0,
+                Ok(batch_in(0, [], 8, CONTEXT)),
+            ));
+        }
+        assert_eq!(worker.pending_losses.len(), 1, "the range waits for a slot");
+
+        worker.shared.progress.seek(0, PollingStrategy::offset(20));
+        worker.apply_seeks();
+        worker.flush_errors();
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn given_a_catch_up_without_a_batch_when_its_partition_leaves_should_still_report_the_range()
+     {
+        let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+        worker.positions.insert(0, next_in(0, 5, CONTEXT));
+        worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            next_in(0, 5, CONTEXT),
+            0,
+            Ok(batch_in(0, [], 8, CONTEXT)),
+        ));
+
+        assert!(worker.apply(grouped(&worker, SESSION, VERSION + 1, Vec::new())));
+        worker.flush_errors();
+
+        assert_eq!(next_error(&mut receiver).lost, Some(5..=8));
     }
 
     #[tokio::test]
@@ -5840,39 +5905,112 @@ mod tests {
         );
     }
 
-    /// A seek resumes a stopped partition and drops its catch-up, so a lasting stop during a
-    /// catch-up reports the range that the lost read stored, as the other stops do.
-    #[tokio::test]
-    async fn given_a_catch_up_when_lasting_refusals_stop_its_partition_should_report_the_lost_range()
+    #[tokio::test(start_paused = true)]
+    async fn given_a_tiered_read_failure_when_a_poll_returns_it_should_stop_the_partition_without_a_retry()
      {
-        let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
-        assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
-        worker.positions.insert(0, next_at(0, 5));
-        worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+        let (mut worker, mut receiver) = worker_of(standalone([0]));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+
         worker.complete(polled(
             &worker,
             FetchKind::Alone,
-            next_at(0, 5),
+            PollingStrategy::next(),
             0,
-            Ok(batch(0, [7, 8], 8)),
+            Err(IggyError::TieredReadFailed),
         ));
+
         assert!(
-            worker.catch_up.contains_key(&0),
-            "the skipped offsets are read again"
+            !worker.retry_at.contains_key(&0),
+            "no retry is scheduled for a failure that a retry does not change"
         );
-
-        for _ in 0..MAX_LASTING_REFUSALS {
-            worker.refuse(&[0], IggyError::Unauthorized);
-        }
-
-        assert!(worker.stopped.contains(&0));
+        assert!(
+            worker.stopped.contains(&0),
+            "the partition stops until a seek"
+        );
         worker.flush_errors();
         let error = next_error(&mut receiver);
-        assert_eq!(error.error, IggyError::FetchProgressUncertain(OPERATION));
-        assert_eq!(error.skip, Some(at(0, 7)));
-        assert_eq!(error.lost, Some(5..=6));
-        assert_eq!(offsets(&next_batches(&mut receiver)[0]), [7, 8]);
-        assert!(worker.catch_up.is_empty());
+        assert_eq!(error, ReadError::new(Some(0), IggyError::TieredReadFailed));
+        assert!(error.is_lasting_refusal());
+    }
+
+    /// A stopped partition reads again only after a seek, and a seek drops what is queued. So a
+    /// stop during a catch-up reports the range that the catch-up did not read again, hands over
+    /// the retained batch, and reports its own error last: the application takes the batch
+    /// before it seeks. Without a retained batch, the range still comes before that error.
+    #[tokio::test]
+    async fn given_a_catch_up_when_its_partition_stops_should_report_the_range_then_the_batch_then_the_stop()
+     {
+        let cases = [
+            (IggyError::Unauthorized, true),
+            (IggyError::Unauthorized, false),
+            (IggyError::HistoryUnavailable, true),
+            (IggyError::HistoryUnavailable, false),
+            (IggyError::TieredReadFailed, true),
+            (IggyError::TieredReadFailed, false),
+        ];
+        for (stop, retained) in cases {
+            let case = format!("stop: {stop}, retained batch: {retained}");
+            let (mut worker, mut receiver) = worker_of(committing(builder_for(group())));
+            assert!(worker.apply(grouped(&worker, SESSION, VERSION, vec![vec![0]])));
+            worker.positions.insert(0, next_in(0, 5, CONTEXT));
+            worker.refuse(&[0], IggyError::FetchProgressUncertain(OPERATION));
+            let skipping = if retained { vec![7, 8] } else { Vec::new() };
+            worker.complete(polled(
+                &worker,
+                FetchKind::Alone,
+                next_in(0, 5, CONTEXT),
+                0,
+                Ok(batch_in(0, skipping, 8, CONTEXT)),
+            ));
+            assert_eq!(worker.catching_up(0), Some(8), "{case}");
+
+            let refusals = if lasting_refusal(&stop) {
+                MAX_LASTING_REFUSALS
+            } else {
+                1
+            };
+            for _ in 0..refusals {
+                worker.refuse(&[0], stop.clone());
+            }
+
+            assert!(worker.stopped.contains(&0), "{case}");
+            assert!(
+                worker.catch_up.is_empty() && worker.retained_batches.is_empty(),
+                "{case}: the stop ends the catch-up"
+            );
+            if !retained {
+                assert!(
+                    receiver.is_empty(),
+                    "{case}: a range without a batch waits for a slot"
+                );
+                worker.flush_errors();
+            }
+            let lost = next_error(&mut receiver);
+            assert_eq!(
+                (lost.partition_id, lost.error, lost.skip, lost.lost),
+                (
+                    Some(0),
+                    IggyError::FetchProgressUncertain(OPERATION),
+                    None,
+                    Some(if retained { 5..=6 } else { 5..=8 })
+                ),
+                "{case}"
+            );
+            if retained {
+                assert_eq!(offsets(&next_batches(&mut receiver)[0]), [7, 8], "{case}");
+                assert!(
+                    receiver.is_empty(),
+                    "{case}: the stop waits for the next turn"
+                );
+                worker.flush_errors();
+            }
+            assert_eq!(
+                next_error(&mut receiver),
+                ReadError::new(Some(0), stop),
+                "{case}: the error that stopped the partition comes last"
+            );
+            assert!(receiver.is_empty(), "{case}");
+        }
     }
 
     /// A lost committing read is pending until the next read shows what it stored. A stop before

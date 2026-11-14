@@ -29,7 +29,9 @@ use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::{
     IggyMessage, Partitioning, StreamClient, StreamCreateOptions, TopicClient, TopicCreateOptions,
 };
-use integration::harness::{TestHarnessBuilder, TestServerConfig, wait_for_topic_messages_count};
+use integration::harness::{
+    TestHarnessBuilder, TestServerConfig, cargo_bin_path, wait_for_topic_messages_count,
+};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
@@ -495,8 +497,7 @@ pub async fn should_show_persisted_durability_created_through_cli() {
     let socket_address = harness.server().tcp_addr().unwrap();
     clear_session_entry(socket_address);
     let cli = || {
-        #[allow(deprecated)]
-        let mut command = Command::cargo_bin("iggy").unwrap();
+        let mut command = Command::new(cargo_bin_path("iggy").unwrap());
         command.env("IGGY_TOKEN", "").env("COLUMNS", "200").args([
             "--tcp-server-address",
             &address,

@@ -71,6 +71,7 @@ class GlobalPermissions;
 class Permissions;
 class StreamPermissions;
 class TopicPermissions;
+class PersonalAccessTokenInfo;
 class UserInfo;
 class UserInfoDetails;
 class ConsumerGroup;
@@ -1332,6 +1333,40 @@ class UserInfoDetails final {
     std::string username_;
     std::optional<::iggy::Permissions> permissions_;
     ResourceOptions options_;
+};
+
+/**
+ * @brief Snapshot of one personal access token's metadata.
+ *
+ * GetPersonalAccessTokens() returns one value for each token owned by the
+ * caller. The secret token string is never included. Expiry() is expressed
+ * in microseconds since the Unix epoch and is empty when the token never
+ * expires.
+ */
+class PersonalAccessTokenInfo final {
+  public:
+    /**
+     * @brief Returns the token name.
+     * @return The name the token was created with.
+     */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the expiry timestamp.
+     * @return Timestamp in microseconds since the Unix epoch, or empty when the token never expires.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> Expiry() const noexcept { return expires_at_; }
+
+  private:
+    PersonalAccessTokenInfo(std::string name, std::optional<std::uint64_t> expires_at)
+        : name_(std::move(name)), expires_at_(expires_at) {}
+
+    static PersonalAccessTokenInfo FromFfi(ffi::PersonalAccessTokenInfo token);
+
+    friend class IggyBlockingClient;
+
+    std::string name_;
+    std::optional<std::uint64_t> expires_at_;
 };
 
 /**
@@ -3005,8 +3040,10 @@ constexpr std::string_view to_string(const StreamOptionKey key) {
 /**
  * @brief Option keys of the topic scope, in catalog order.
  *
- * Name, MessageExpiry, and MaxTopicSize are updatable, and MessageExpiry and
- * MaxTopicSize are also resettable. Every other key is create-only.
+ * Name, MessageExpiry, MaxTopicSize, LocalRetentionAge, and
+ * LocalRetentionSize are updatable, and all of them but Name are also
+ * resettable. An update can turn TieredStorage on, never off. Every other key
+ * is create-only.
  */
 enum class TopicOptionKey : std::uint8_t {
     Name,
@@ -3021,6 +3058,10 @@ enum class TopicOptionKey : std::uint8_t {
     SizeOfMessagesRequiredToSave,
     PreallocateSegments,
     ReplicationFactor,
+    SegmentMaxAge,
+    TieredStorage,
+    LocalRetentionAge,
+    LocalRetentionSize,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3049,6 +3090,14 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "preallocate_segments";
         case TopicOptionKey::ReplicationFactor:
             return "replication_factor";
+        case TopicOptionKey::SegmentMaxAge:
+            return "segment_max_age";
+        case TopicOptionKey::TieredStorage:
+            return "tiered_storage";
+        case TopicOptionKey::LocalRetentionAge:
+            return "local_retention_age";
+        case TopicOptionKey::LocalRetentionSize:
+            return "local_retention_size";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3329,6 +3378,108 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns the age at which a partition's active segment rolls.
+     * @return Configured age, or `std::nullopt` to roll segments by size alone.
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &SegmentMaxAge() const noexcept { return segment_max_age_; }
+
+    /**
+     * @brief Sets the age at which a partition's active segment rolls.
+     *
+     * A batch stamped this long after the active segment's first batch starts
+     * the next segment. A fully idle partition keeps its segment open.
+     * @param segment_max_age Age to roll at, at least 10 minutes, or
+     *        Expiry::NeverExpire() to roll by size alone.
+     *        Expiry::ServerDefault() clears an explicitly configured age.
+     * @return Reference to this options object.
+     * @note The server refuses a duration together with
+     *       SetPreallocateSegments(true).
+     */
+    TopicCreateOptions &SetSegmentMaxAge(::iggy::Expiry segment_max_age) {
+        if (segment_max_age.Kind() == "server_default") {
+            segment_max_age_.reset();
+        } else {
+            segment_max_age_ = std::move(segment_max_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns whether sealed segments move to the object store.
+     * @return Configured setting, or `std::nullopt` to use the server default
+     *         (`false`).
+     */
+    [[nodiscard]] std::optional<bool> TieredStorage() const noexcept { return tiered_storage_; }
+
+    /**
+     * @brief Sets whether sealed segments move to the object store.
+     * @param tiered_storage `true` to tier the topic; `false` otherwise.
+     * @return Reference to this options object.
+     * @note The server refuses `true` with FeatureUnavailable until it tiers
+     *       topics.
+     */
+    TopicCreateOptions &SetTieredStorage(bool tiered_storage) noexcept {
+        tiered_storage_ = tiered_storage;
+        return *this;
+    }
+
+    /**
+     * @brief Returns how long a tiered topic keeps an uploaded segment on
+     *        local disk.
+     * @return Configured age, or `std::nullopt` to use the server default
+     *         (one day).
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &LocalRetentionAge() const noexcept {
+        return local_retention_age_;
+    }
+
+    /**
+     * @brief Sets how long a tiered topic keeps an uploaded segment on local
+     *        disk.
+     * @param local_retention_age Age to keep an uploaded segment on local
+     *        disk. Expiry::ServerDefault() clears an explicitly configured
+     *        age.
+     * @return Reference to this options object.
+     * @note The server refuses an age above a finite message expiry.
+     */
+    TopicCreateOptions &SetLocalRetentionAge(::iggy::Expiry local_retention_age) {
+        if (local_retention_age.Kind() == "server_default") {
+            local_retention_age_.reset();
+        } else {
+            local_retention_age_ = std::move(local_retention_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @return Configured size limit, or `std::nullopt` to use the server
+     *         default (unlimited).
+     */
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &LocalRetentionSize() const noexcept {
+        return local_retention_size_;
+    }
+
+    /**
+     * @brief Sets the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @param local_retention_size Topic-wide size of uploaded segments to
+     *        keep on local disk. MaxTopicSize::ServerDefault() clears an
+     *        explicitly configured limit.
+     * @return Reference to this options object.
+     * @note The server refuses a size above a finite maximum topic size.
+     */
+    TopicCreateOptions &SetLocalRetentionSize(::iggy::MaxTopicSize local_retention_size) {
+        if (local_retention_size.Value() == "server_default") {
+            local_retention_size_.reset();
+        } else {
+            local_retention_size_ = std::move(local_retention_size);
+        }
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3380,6 +3531,10 @@ class TopicCreateOptions final {
     std::optional<std::uint64_t> size_of_messages_required_to_save_;
     std::optional<bool> preallocate_segments_;
     std::optional<std::uint32_t> replication_factor_;
+    std::optional<::iggy::Expiry> segment_max_age_;
+    std::optional<bool> tiered_storage_;
+    std::optional<::iggy::Expiry> local_retention_age_;
+    std::optional<::iggy::MaxTopicSize> local_retention_size_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;
@@ -3466,6 +3621,83 @@ class TopicUpdateOptions final {
     }
 
     /**
+     * @brief Returns whether sealed segments move to the object store.
+     * @return `true` when this update turns tiered storage on, or
+     *         `std::nullopt` when it leaves the setting unchanged.
+     */
+    [[nodiscard]] std::optional<bool> TieredStorage() const noexcept { return tiered_storage_; }
+
+    /**
+     * @brief Turns tiered storage on.
+     * @param tiered_storage `true` to move sealed segments to the object
+     *        store.
+     * @return Reference to this options object.
+     * @note The server refuses `false`: an update never turns tiered storage
+     *       off. It refuses `true` with FeatureUnavailable until it tiers
+     *       topics.
+     */
+    TopicUpdateOptions &SetTieredStorage(bool tiered_storage) noexcept {
+        tiered_storage_ = tiered_storage;
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested local retention age update.
+     * @return Age to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &LocalRetentionAge() const noexcept {
+        return local_retention_age_;
+    }
+
+    /**
+     * @brief Sets how long a tiered topic keeps an uploaded segment on local
+     *        disk.
+     * @param local_retention_age Age to keep an uploaded segment on local
+     *        disk. Expiry::ServerDefault() leaves the current age unchanged.
+     *        Use Reset(TopicOptionKey::LocalRetentionAge) to return to the
+     *        default.
+     * @return Reference to this options object.
+     * @note The server refuses an age above a finite message expiry.
+     */
+    TopicUpdateOptions &SetLocalRetentionAge(::iggy::Expiry local_retention_age) {
+        if (local_retention_age.Kind() == "server_default") {
+            local_retention_age_.reset();
+        } else {
+            local_retention_age_ = std::move(local_retention_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested local retention size update.
+     * @return Size limit to apply, or `std::nullopt` when this update leaves
+     *         it unchanged.
+     */
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &LocalRetentionSize() const noexcept {
+        return local_retention_size_;
+    }
+
+    /**
+     * @brief Sets the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @param local_retention_size Size of uploaded segments to keep on local
+     *        disk. MaxTopicSize::ServerDefault() leaves the current limit
+     *        unchanged. Use Reset(TopicOptionKey::LocalRetentionSize) to
+     *        return to the default.
+     * @return Reference to this options object.
+     * @note The server refuses a size above a finite maximum topic size.
+     */
+    TopicUpdateOptions &SetLocalRetentionSize(::iggy::MaxTopicSize local_retention_size) {
+        if (local_retention_size.Value() == "server_default") {
+            local_retention_size_.reset();
+        } else {
+            local_retention_size_ = std::move(local_retention_size);
+        }
+        return *this;
+    }
+
+    /**
      * @brief Returns additional mutable topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3511,9 +3743,10 @@ class TopicUpdateOptions final {
 
     /**
      * @brief Resets a setting to its server default.
-     * @param key Setting to reset. Only MessageExpiry and MaxTopicSize are
-     *        resettable. UpdateTopic() refuses any other key before sending
-     *        with the error the server would return.
+     * @param key Setting to reset. Only MessageExpiry, MaxTopicSize,
+     *        LocalRetentionAge, and LocalRetentionSize are resettable.
+     *        UpdateTopic() refuses any other key before sending with the
+     *        error the server would return.
      * @return Reference to this options object.
      */
     TopicUpdateOptions &Reset(TopicOptionKey key) {
@@ -3544,6 +3777,9 @@ class TopicUpdateOptions final {
     std::optional<std::string> name_;
     std::optional<::iggy::Expiry> message_expiry_;
     std::optional<::iggy::MaxTopicSize> max_topic_size_;
+    std::optional<bool> tiered_storage_;
+    std::optional<::iggy::Expiry> local_retention_age_;
+    std::optional<::iggy::MaxTopicSize> local_retention_size_;
     std::map<std::string, std::string> raw_;
     std::set<TopicOptionKey> reset_;
     std::set<std::string> raw_reset_;
@@ -6045,15 +6281,28 @@ class ReadException final : public IggyException {
 
     /**
      * @return For a message that does not decode, the continuation after it,
-     *         to pass to PartitionReader::Seek(). For a lost range, the
-     *         continuation after the last offset of Lost(). Otherwise `nullptr`.
+     *         to pass to PartitionReader::Seek(). Otherwise `nullptr`.
      */
     [[nodiscard]] const ::iggy::Continuation *Skip() const noexcept { return skip_.get(); }
+
+    /**
+     * @return True when the reader stopped the partition after six refusals
+     *         in a row that a retry does not change, such as `unauthorized`.
+     *         Only a Seek() of the partition reads it again. While a lost
+     *         read is still pending, such a stop arrives as
+     *         `fetch_progress_uncertain` (14010) with an empty Lost(), and
+     *         this flag is then false.
+     */
+    [[nodiscard]] bool IsLastingRefusal() const noexcept { return lasting_refusal_; }
 
     /**
      * @return For messages that a lost read committed and that the reader
      *         could not read again, their first and last offset, with the
      *         error `fetch_progress_uncertain`. Otherwise `std::nullopt`.
+     *         This error stops nothing and needs no Seek(). A batch that the
+     *         reader holds after the range comes next, and a Seek() before
+     *         the application takes it drops it. If the reader stopped the
+     *         partition, the error that stopped it comes after that batch.
      */
     [[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>> Lost() const noexcept { return lost_; }
 
@@ -6062,10 +6311,13 @@ class ReadException final : public IggyException {
 
     friend class PartitionReader;
     friend class IggyConsumer;
+    // The unit tests have no server to fail a read, so they build one through this class.
+    friend class ReadExceptionTestPeer;
 
     std::optional<std::uint32_t> partition_id_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const ::iggy::Continuation> skip_;
+    bool lasting_refusal_;
     std::optional<std::pair<std::uint64_t, std::uint64_t>> lost_;
 };
 
@@ -6413,6 +6665,7 @@ class IggyConsumer final {
  *
  * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
  * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - DeletePersonalAccessToken().
  * - EncryptionKeyFingerprint() and invalid keys passed to CreateStream().
  * - CreateStream(), UpdateStream(), and DeleteStream().
  * - CreateTopic(), UpdateTopic(), and DeleteTopic().
@@ -6685,6 +6938,31 @@ class IggyBlockingClient final {
      *         request fails.
      */
     std::vector<UserInfo> GetUsers();
+
+    /**
+     * @brief Lists the personal access tokens owned by the authenticated caller.
+     *
+     * The result carries token names and expiry only. The server shows a
+     * secret token string only when the token is created.
+     *
+     * @return One entry per token, empty when the caller has none.
+     * @throws IggyException if the client is unavailable or unauthenticated, or
+     *         the request fails.
+     */
+    std::vector<PersonalAccessTokenInfo> GetPersonalAccessTokens();
+
+    /**
+     * @brief Deletes one of the caller's personal access tokens.
+     *
+     * A failed or unknown transport outcome can leave the deletion committed;
+     * list the tokens before retrying.
+     *
+     * @param name Name of the token to delete.
+     * @throws IggyException if @p name is empty or exceeds 255 bytes; the
+     *         client is unavailable or unauthenticated; the token does not
+     *         exist; or the request fails.
+     */
+    void DeletePersonalAccessToken(std::string name);
 
     /**
      * @brief Creates a user account.

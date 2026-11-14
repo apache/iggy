@@ -364,6 +364,17 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        // When the armed tick is due, on the timer's own clock. How far past it
+        // the tick arm runs is the time the thread spent on other work, such as
+        // a long frame or a tier job that did not yield.
+        let tick_interval_micros =
+            u64::try_from(CONSENSUS_TICK_INTERVAL.as_micros()).unwrap_or(u64::MAX);
+        let tick_due_from_now = || {
+            self.bus
+                .monotonic_micros()
+                .saturating_add(tick_interval_micros)
+        };
+        let mut tick_due = tick_due_from_now();
         // Keep the receive registered: recreating it repeats Crossfire's initial
         // backoff on every pump turn while the shutdown channel is empty.
         let mut stop_signal = std::pin::pin!(stop.recv().fuse());
@@ -402,6 +413,9 @@ where
             futures::select_biased! {
                 _ = stop_signal.as_mut() => break,
                 () = consensus_tick.as_mut() => {
+                    self.metrics.record_pump_tick_lateness(std::time::Duration::from_micros(
+                        self.bus.monotonic_micros().saturating_sub(tick_due),
+                    ));
                     // Sharing the pump task keeps `tick_partitions` borrows
                     // safe, but a tick can wait for a main frame's processing
                     // (replication, journal fsync or rotation, and reply), plus
@@ -438,6 +452,7 @@ where
                     self.tick_deferred_polls();
                     self.sweep_readiness_watches();
                     consensus_tick.set(rearm_tick());
+                    tick_due = tick_due_from_now();
                     self.process_loopback(&mut loopback_buf).await;
                 }
                 () = deferred_deadline.as_mut() => {
@@ -1169,6 +1184,63 @@ where
                         self.request_clean_partition(namespace, now, message_expiry, max_bytes);
                     }
                 }
+            }
+            LifecycleFrame::EvictPartition {
+                namespace,
+                now,
+                envelope,
+            } => {
+                // The envelope stays on the partition, so a floor advance that
+                // applies before the next tick evicts against it too.
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    partition.set_local_envelope(Some(envelope));
+                    partition.stage_eviction(now);
+                }
+            }
+            LifecycleFrame::RetainPartition {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+                committed_up_to,
+            } => {
+                self.on_retain_partition(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                    committed_up_to,
+                );
+            }
+            LifecycleFrame::UploadSegments {
+                namespace,
+                created_revision,
+                resend_advance,
+                committed_up_to,
+            } => {
+                self.on_upload_segments(
+                    namespace,
+                    created_revision,
+                    resend_advance,
+                    committed_up_to,
+                )
+                .await;
+            }
+            LifecycleFrame::SegmentUploadFinished(finished) => {
+                self.on_segment_upload_finished(*finished).await;
+            }
+            LifecycleFrame::DeleteObjects {
+                namespace,
+                created_revision,
+                now,
+                committed_up_to,
+            } => {
+                self.on_delete_objects(namespace, created_revision, now, committed_up_to);
+            }
+            LifecycleFrame::ObjectDeleteFinished(finished) => {
+                self.on_object_delete_finished(*finished);
             }
             LifecycleFrame::TruncatePartition {
                 namespace,

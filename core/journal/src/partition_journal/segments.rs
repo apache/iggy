@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use iggy_binary_protocol::batch::BatchHeader;
@@ -33,6 +34,14 @@ use crate::durable_storage::{DurableFile, DurableStorage, OpenMode};
 pub(super) const SEGMENT_STATE_FLAG: usize = 99;
 pub(super) const SEGMENT_STATE_OFFSET: usize = 128;
 pub(super) const SEGMENT_STATE_BYTES: usize = 10 * size_of::<u64>();
+/// The age roll's state: the bound and each cursor's first batch timestamp.
+pub(super) const SEGMENT_AGE_BYTES: usize = 3 * size_of::<u64>();
+/// Values of [`SEGMENT_STATE_FLAG`]. A layout that rolls by age writes its own
+/// value, which builds without the age roll refuse, so they cannot open such a
+/// WAL and roll its segments at different batches.
+pub(super) const SEGMENTS_ABSENT: u8 = 0;
+pub(super) const SEGMENTS_BY_SIZE: u8 = 1;
+pub(super) const SEGMENTS_BY_SIZE_AND_AGE: u8 = 2;
 
 const SEGMENT_RECOVERY_EXTENSION: &str = "log.tmp";
 
@@ -42,6 +51,9 @@ pub struct SegmentPosition {
     pub start_offset: u64,
     pub length: u64,
     pub next_offset: u64,
+    /// Base timestamp of the segment's first batch. Kept only by a layout that
+    /// rolls by age, zero otherwise, and meaningless while `length` is zero.
+    pub first_timestamp: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +67,9 @@ pub(super) struct SegmentCursor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SegmentState {
     pub max_size: u64,
+    /// Microseconds a batch's base timestamp may run past the active segment's
+    /// first one before that batch starts the next segment.
+    pub max_age: Option<u64>,
     pub next_generation: u64,
     pub tail: SegmentCursor,
     pub checkpoint: SegmentCursor,
@@ -71,24 +86,34 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// Enable segment body ownership after recovering the legacy committed view.
     /// The initial boundary must describe durable materialized messages only.
     ///
+    /// `max_age` adds the age roll, and then `initial.first_timestamp` must be
+    /// the first batch timestamp of a non-empty initial segment.
+    ///
     /// # Errors
-    /// Returns an error for inconsistent boundaries, a `max_size` differing from an
-    /// already enabled layout, or a failed storage barrier.
+    /// Returns an error for inconsistent boundaries, a `max_size` or `max_age`
+    /// differing from an already enabled layout, or a failed storage barrier.
     pub async fn enable_segment_storage(
         &mut self,
         initial: SegmentPosition,
         max_size: u64,
+        max_age: Option<u64>,
     ) -> io::Result<()> {
         self.ensure_healthy()?;
         if let Some(segments) = self.state.segment_storage {
             if segments.max_size != max_size {
                 return Err(invalid("segment size differs from the durable WAL layout"));
             }
+            if segments.max_age != max_age {
+                return Err(invalid(
+                    "segment age bound differs from the durable WAL layout",
+                ));
+            }
             return Ok(());
         }
-        if !valid_segment_size(max_size) || !initial.valid() {
+        if !valid_segment_size(max_size) || !valid_segment_age(max_age) || !initial.valid() {
             return Err(invalid("invalid initial segment boundary"));
         }
+        let initial = initial.aged_by(max_age);
         let generation = self
             .entries
             .values()
@@ -103,6 +128,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         };
         let segments = SegmentState {
             max_size,
+            max_age,
             next_generation: generation
                 .checked_add(1)
                 .ok_or_else(|| invalid("segment generation exhausted"))?,
@@ -177,6 +203,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             start_offset: next_offset,
             length: 0,
             next_offset,
+            first_timestamp: 0,
         })?;
         let state = JournalState {
             segment_storage: Some(segments),
@@ -230,11 +257,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         prepare: Option<Frozen<4096>>,
         initial: SegmentPosition,
         max_size: u64,
+        max_age: Option<u64>,
     ) -> io::Result<()> {
         self.ensure_healthy()?;
-        if !initial.valid() || !valid_segment_size(max_size) {
+        if !initial.valid() || !valid_segment_size(max_size) || !valid_segment_age(max_age) {
             return Err(invalid("invalid installed segment boundary"));
         }
+        let initial = initial.aged_by(max_age);
         if let Some(prepare) = &prepare {
             let header = self.validate_checkpoint_prepare(prepare)?;
             if header.op != op || Some(header.checksum) != checksum {
@@ -251,6 +280,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         };
         let mut segments = SegmentState {
             max_size,
+            max_age,
             next_generation: generation
                 .checked_add(1)
                 .ok_or_else(|| invalid("segment generation exhausted"))?,
@@ -331,6 +361,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         start_offset: batch.base_offset,
                         length: batch.batch_length,
                         next_offset: batch_next_offset(prepare.as_slice())?,
+                        first_timestamp: 0,
                     })?;
                     let reference = SegmentReference {
                         generation: retained.generation,
@@ -560,6 +591,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                             start_offset: reference.start_offset,
                             length: reference.position + reference.length,
                             next_offset,
+                            first_timestamp: entry.segment_first_timestamp,
                         },
                     })
             })
@@ -660,12 +692,34 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         Ok(())
     }
 
-    pub(super) async fn truncate_segment_tail(&mut self) -> io::Result<()> {
+    /// Roll the physical tail back to the published cursor and unlink the
+    /// public names of the `dropped_segments` the truncated suffix rolled into.
+    pub(super) async fn truncate_segment_tail(
+        &mut self,
+        dropped_segments: &BTreeSet<u64>,
+    ) -> io::Result<()> {
         let Some(segments) = self.state.segment_storage else {
             return Ok(());
         };
         self.poisoned = true;
         let cursor = segments.tail;
+        // A partition may already have rotated into the segment at `next_offset`,
+        // and the next batch rolls there again, replacing the name. A name above
+        // it holds only the dropped suffix. Left in place, a replacement that
+        // rolls elsewhere would cover it, and recovery refuses that overlap.
+        // Recovery unlinks every name above the tail, so a crash that loses
+        // these unlinks is harmless only until a replacement moves the tail
+        // past them. The frontier publishing that replacement must sync the
+        // directory first.
+        let parent = self.segment_directory()?.to_path_buf();
+        for start_offset in dropped_segments.range((
+            Bound::Excluded(cursor.position.next_offset),
+            Bound::Unbounded,
+        )) {
+            self.segment_links_dirty = true;
+            self.remove_segment_name(&parent.join(format!("{start_offset:020}.log")))
+                .await?;
+        }
         let key = (cursor.generation, cursor.position.start_offset);
         if !self.segment_files.contains_key(&key) {
             let path = cursor.path(&self.directory);
@@ -688,8 +742,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 Err(error) => return Err(error),
             }
         }
-        // Live partitions own the public log/index names and may still hold their
-        // descriptors. Namespace reconciliation belongs to startup recovery.
         let segment = self
             .segment_files
             .get_mut(&key)
@@ -795,22 +847,105 @@ impl SegmentPosition {
         self.next_offset >= self.start_offset
             && ((self.length == 0) == (self.next_offset == self.start_offset))
     }
+
+    /// Keep the first timestamp only for a layout that rolls by age, so a
+    /// size-only layout holds the same state before and after a reopen.
+    const fn aged_by(self, max_age: Option<u64>) -> Self {
+        Self {
+            first_timestamp: match max_age {
+                Some(_) => self.first_timestamp,
+                None => 0,
+            },
+            ..self
+        }
+    }
 }
 
 impl SegmentCursor {
     fn path(self, directory: &Path) -> PathBuf {
         segment_path(directory, self.generation, self.position.start_offset)
     }
+
+    const fn key(self) -> (u64, u64) {
+        (self.generation, self.position.start_offset)
+    }
 }
 
 impl SegmentState {
     pub(super) fn valid(self) -> bool {
         valid_segment_size(self.max_size)
+            && valid_segment_age(self.max_age)
             && self.tail.generation < self.next_generation
             && self.checkpoint.generation < self.next_generation
             && self.tail.position.valid()
             && self.checkpoint.position.valid()
             && self.tail.position.next_offset >= self.checkpoint.position.next_offset
+    }
+
+    /// Whether `batch` starts a new segment instead of extending the tail. A
+    /// full tail rolls, and so does one whose first batch is stamped `max_age`
+    /// or more before this one. The stamps come from the primary and every
+    /// replica stores them unchanged, so every replica rolls at the same batch.
+    /// A stamp below the first one, which a restarted primary with a clock
+    /// behind its last stamp can assign, counts as no age at all.
+    fn rolls_before(&self, batch: &BatchHeader) -> bool {
+        let tail = self.tail.position;
+        tail.length >= self.max_size
+            || (tail.length > 0
+                && self.max_age.is_some_and(|max_age| {
+                    batch.base_timestamp.saturating_sub(tail.first_timestamp) >= max_age
+                }))
+    }
+
+    /// The first batch timestamp of the segment a recovered body lives in: its
+    /// own batch's when it opens the segment, else that of the previous body
+    /// recovered into the same segment, else the tail's or the checkpoint's,
+    /// which cover the one segment that can open before the oldest record.
+    ///
+    /// The checkpoint's own prepare is the exception. A reanchor or a transfer
+    /// that installs no body for it moves both cursors off its segment, and no
+    /// rewind lands on the checkpoint, so its stamp is never read and is zero.
+    ///
+    /// # Errors
+    /// Returns an error for a body above the checkpoint in a segment whose
+    /// first batch is unknown.
+    pub(super) fn recovered_first_timestamp(
+        &self,
+        reference: SegmentReference,
+        prepare: &[u8],
+        checkpoint_prepare: bool,
+        previous: &mut Option<((u64, u64), u64)>,
+    ) -> io::Result<u64> {
+        if self.max_age.is_none() {
+            return Ok(0);
+        }
+        let key = (reference.generation, reference.start_offset);
+        let first = if reference.position == 0 {
+            decode_batch(prepare)?.base_timestamp
+        } else if let Some((_, first)) = previous.filter(|(segment, _)| *segment == key) {
+            first
+        } else if let Some(first) = self.cursor_first_timestamp(reference) {
+            first
+        } else if checkpoint_prepare {
+            return Ok(0);
+        } else {
+            return Err(invalid("recovered segment body has no known first batch"));
+        };
+        *previous = Some((key, first));
+        Ok(first)
+    }
+
+    /// The first batch timestamp of the segment `reference` points into, when
+    /// that segment is the tail's or the checkpoint's.
+    pub(super) fn cursor_first_timestamp(&self, reference: SegmentReference) -> Option<u64> {
+        let key = (reference.generation, reference.start_offset);
+        if key == self.tail.key() {
+            Some(self.tail.position.first_timestamp)
+        } else if key == self.checkpoint.key() {
+            Some(self.checkpoint.position.first_timestamp)
+        } else {
+            None
+        }
     }
 
     pub(super) fn reserve(
@@ -827,12 +962,16 @@ impl SegmentState {
                 "message offsets do not extend the physical segment tail",
             ));
         }
-        if self.tail.position.length >= self.max_size {
+        if self.rolls_before(&batch) {
             self.tail = self.allocate(SegmentPosition {
                 start_offset: batch.base_offset,
                 length: 0,
                 next_offset: batch.base_offset,
+                first_timestamp: 0,
             })?;
+        }
+        if self.tail.position.length == 0 && self.max_age.is_some() {
+            self.tail.position.first_timestamp = batch.base_timestamp;
         }
         let reference = SegmentReference {
             generation: self.tail.generation,
@@ -891,7 +1030,26 @@ impl SegmentState {
         }
     }
 
-    pub(super) fn decode(bytes: &[u8]) -> io::Result<Self> {
+    /// Encode the age roll's state, which only a layout with `max_age` keeps.
+    pub(super) fn encode_age(self, bytes: &mut [u8]) {
+        let values = [
+            self.max_age.unwrap_or(0),
+            self.tail.position.first_timestamp,
+            self.checkpoint.position.first_timestamp,
+        ];
+        for (field, value) in bytes
+            .as_chunks_mut::<{ size_of::<u64>() }>()
+            .0
+            .iter_mut()
+            .zip(values)
+        {
+            *field = value.to_le_bytes();
+        }
+    }
+
+    /// Decode a layout, with `age` holding the age roll's state when the
+    /// layout rolls by age.
+    pub(super) fn decode(bytes: &[u8], age: Option<&[u8]>) -> io::Result<Self> {
         let mut values = [0; SEGMENT_STATE_BYTES / size_of::<u64>()];
         for (value, field) in values
             .iter_mut()
@@ -911,8 +1069,20 @@ impl SegmentState {
             checkpoint_length,
             checkpoint_next,
         ] = values;
+        let (max_age, tail_first, checkpoint_first) = age.map_or((None, 0, 0), |bytes| {
+            let mut values = [0; SEGMENT_AGE_BYTES / size_of::<u64>()];
+            for (value, field) in values
+                .iter_mut()
+                .zip(bytes.as_chunks::<{ size_of::<u64>() }>().0)
+            {
+                *value = u64::from_le_bytes(*field);
+            }
+            let [max_age, tail_first, checkpoint_first] = values;
+            (Some(max_age), tail_first, checkpoint_first)
+        });
         let state = Self {
             max_size,
+            max_age,
             next_generation,
             tail: SegmentCursor {
                 generation: tail_generation,
@@ -920,6 +1090,7 @@ impl SegmentState {
                     start_offset: tail_start,
                     length: tail_length,
                     next_offset: tail_next,
+                    first_timestamp: tail_first,
                 },
             },
             checkpoint: SegmentCursor {
@@ -928,6 +1099,7 @@ impl SegmentState {
                     start_offset: checkpoint_start,
                     length: checkpoint_length,
                     next_offset: checkpoint_next,
+                    first_timestamp: checkpoint_first,
                 },
             },
         };
@@ -936,6 +1108,12 @@ impl SegmentState {
         }
         Ok(state)
     }
+}
+
+/// Admission keeps the topic option at ten minutes or more. The journal only
+/// refuses a bound that would roll every batch into a segment of its own.
+const fn valid_segment_age(max_age: Option<u64>) -> bool {
+    !matches!(max_age, Some(0))
 }
 
 fn valid_segment_size(max_size: u64) -> bool {
@@ -1023,8 +1201,10 @@ mod tests {
                     start_offset: 0,
                     length: BODY_BYTES,
                     next_offset: 1,
+                    first_timestamp: 0,
                 },
                 MAX_SIZE,
+                None,
             )
             .await
             .unwrap();
@@ -1040,7 +1220,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut journal = open_journal(&directory).await;
         journal
-            .enable_segment_storage(SegmentPosition::default(), MAX_SIZE)
+            .enable_segment_storage(SegmentPosition::default(), MAX_SIZE, None)
             .await
             .unwrap();
         (directory, journal)

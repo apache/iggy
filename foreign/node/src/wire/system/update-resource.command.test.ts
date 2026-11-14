@@ -250,6 +250,8 @@ describe('given shared vectors when encoding should match server contract', () =
       ['stream', ['critical_keys'], 4105],
       ['topic', ['segment_size', 'name'], 4103],
       ['topic', ['name'], 4104],
+      ['topic', ['tiered_storage'], 4103],
+      ['topic', ['tiered_storage', 'name'], 4103],
       ['user', ['username'], 4104],
       ['topic', ['name', 'encryption_key'], 4041]
     ];
@@ -259,6 +261,25 @@ describe('given shared vectors when encoding should match server contract', () =
         isClientError(code, UPDATE_RESOURCE_CODE),
         `${scope} reset ${reset.join(',')}`
       );
+  });
+
+  it('turns an enable-only key on and refuses turning it off', () => {
+    const body = UPDATE_TOPIC.serialize({
+      streamId: 1, topicId: 2, tieredStorage: true, localRetentionAge: 21_600_000_000n,
+      localRetentionSize: 10_737_418_240n
+    });
+    assert.deepEqual(deserializeOptions(body, 1 + 2 * serializeIdentifier(1).length + 1), {
+      local_retention_age: 21_600_000_000n,
+      local_retention_size: 10_737_418_240n,
+      tiered_storage: true
+    });
+    assert.throws(
+      () => UPDATE_TOPIC.serialize({ streamId: 1, topicId: 2, tieredStorage: false }),
+      isClientError(4103, UPDATE_RESOURCE_CODE)
+    );
+    assert.doesNotThrow(() => UPDATE_TOPIC.serialize({
+      streamId: 1, topicId: 2, reset: ['local_retention_age', 'local_retention_size']
+    }));
   });
 
   it('lets a typed field win over a raw entry of the same key', () => {
@@ -343,7 +364,11 @@ describe('given shared vectors when encoding should match server contract', () =
         messages_required_to_save: () => topicBlock({ messagesRequiredToSave: 1 }),
         size_of_messages_required_to_save: () => topicBlock({ sizeOfMessagesRequiredToSave: 1n }),
         preallocate_segments: () => topicBlock({ preallocateSegments: true }),
-        replication_factor: () => topicBlock({ replicationFactor: 1 })
+        replication_factor: () => topicBlock({ replicationFactor: 1 }),
+        segment_max_age: () => topicBlock({ segmentMaxAge: 1n }),
+        tiered_storage: () => topicBlock({ tieredStorage: false }),
+        local_retention_age: () => topicBlock({ localRetentionAge: 1n }),
+        local_retention_size: () => topicBlock({ localRetentionSize: 1n })
       },
       user: {}
     };
@@ -360,7 +385,13 @@ describe('given shared vectors when encoding should match server contract', () =
         message_expiry: () =>
           updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, messageExpiry: 1n }), 2),
         max_topic_size: () =>
-          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, maxTopicSize: 1n }), 2)
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, maxTopicSize: 1n }), 2),
+        tiered_storage: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, tieredStorage: true }), 2),
+        local_retention_age: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, localRetentionAge: 1n }), 2),
+        local_retention_size: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, localRetentionSize: 1n }), 2)
       },
       user: {
         username: () => updateBlock(UPDATE_USER.serialize({ userId: 1, username: 'alice2' }), 1),
@@ -391,7 +422,7 @@ describe('given shared vectors when encoding should match server contract', () =
     for (const scope of ['stream', 'topic', 'user'] as const) {
       const createKeys = rows(scope, (row) => row.storage === 'map' &&
         ['public', 'secret'].includes(row.visibility) &&
-        ['create_only', 'updatable'].includes(row.mutability));
+        ['create_only', 'updatable', 'enable_only'].includes(row.mutability));
       assert.deepEqual(Object.keys(typedCreate[scope]).sort(), createKeys, `${scope} create`);
       for (const [key, block] of Object.entries(typedCreate[scope])) {
         const options = block();
@@ -399,7 +430,7 @@ describe('given shared vectors when encoding should match server contract', () =
         assert.notDeepEqual(options[key], baseCreate[scope][key], `${scope} create ${key}`);
       }
 
-      const updateKeys = rows(scope, (row) => row.mutability === 'updatable');
+      const updateKeys = rows(scope, (row) => ['updatable', 'enable_only'].includes(row.mutability));
       assert.deepEqual(Object.keys(typedUpdate[scope]).sort(), updateKeys, `${scope} update`);
       for (const [key, block] of Object.entries(typedUpdate[scope]))
         assert.deepEqual(Object.keys(block()), [key], `${scope} update ${key}`);
@@ -492,6 +523,10 @@ describe('given shared vectors when encoding should match server contract', () =
         message_expiry: topic.messageExpiry.toString(),
         max_topic_size: topic.maxTopicSize.toString()
       }, expected, name);
+      assert.equal(topic.segmentMaxAge.toString(), expected.options.segment_max_age.value, name);
+      assert.equal(String(topic.tieredStorage), expected.options.tiered_storage.value, name);
+      assert.equal(topic.localRetentionAge.toString(), expected.options.local_retention_age.value, name);
+      assert.equal(topic.localRetentionSize.toString(), expected.options.local_retention_size.value, name);
     }
   });
 
@@ -539,6 +574,7 @@ describe('given shared vectors when encoding should match server contract', () =
       );
       assert.equal(descriptor.flags, row.flags, row.key);
       assert.equal(descriptor.internal, row.visibility === 'internal', row.key);
+      assert.equal(descriptor.enableOnly ?? false, row.mutability === 'enable_only', row.key);
     }
     const described = (scope: Scope) => fixture.catalog
       .filter((row) => row.described && row.scopes.includes(scope)).map((row) => row.key);

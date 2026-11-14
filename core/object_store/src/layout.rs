@@ -20,6 +20,7 @@ use crate::store::{MAX_KEY_LEN, MAX_KEY_SEGMENTS, validate_key};
 
 const META: &str = "meta";
 const MANIFEST: &str = "manifest.bin";
+const IDENTITY: &str = "identity";
 /// Decimal digits of `u64::MAX`: the most that an id takes, and the width of
 /// a zero-padded offset.
 const U64_DIGITS: usize = 20;
@@ -86,13 +87,14 @@ pub struct SegmentKey {
 /// {root}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.log
 /// {root}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.index
 /// {root}/meta/{stream_id}/{topic_id}/{partition_id}/{created_revision}/manifest.bin
+/// {root}/meta/identity
 /// ```
 ///
 /// The zero-padded offset matches the segment's file name on disk, so a
 /// listing returns the segments of an incarnation in offset order. Ids are
 /// decimal and never `meta`, so no segment key falls under `{root}/meta/`.
 /// The cluster's identity is not part of any key: the store identity object
-/// claims the root for one cluster.
+/// under [`Self::identity_key`] claims the root for one cluster.
 ///
 /// Roots never nest in the keys of another root, so two clusters can share a
 /// bucket under roots such as `iggy` and `iggy/b`. A listing under a root
@@ -172,6 +174,14 @@ impl KeyLayout {
             prefix.partition_id,
             prefix.created_revision
         )
+    }
+
+    /// The key of the store identity object, which names the cluster that
+    /// owns the root. No other root can continue with `meta`, and no id is
+    /// `identity`, so no other key of any root is this key.
+    #[must_use]
+    pub fn identity_key(&self) -> String {
+        format!("{}/{META}/{IDENTITY}", self.root)
     }
 
     /// The segment object that a listed key names, or `None` when this layout
@@ -274,6 +284,21 @@ mod tests {
         assert_eq!(
             layout().manifest_key(&PREFIX),
             "tenant/iggy/meta/1/22/0/4096/manifest.bin"
+        );
+        assert_eq!(layout().identity_key(), "tenant/iggy/meta/identity");
+    }
+
+    #[test]
+    fn given_identity_key_when_parsing_as_segment_should_return_none() {
+        let layout = layout();
+        let key = layout.identity_key();
+
+        assert!(validate_key(&key).is_ok(), "{key}");
+        assert_eq!(layout.parse_segment_key(&key), None);
+        assert_ne!(
+            KeyLayout::new("tenant/iggy/b").unwrap().identity_key(),
+            key,
+            "a longer root has an identity key of its own"
         );
     }
 

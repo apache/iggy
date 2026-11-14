@@ -69,7 +69,9 @@ type ReadError struct {
 	Skip *iggcon.PollingStrategy
 	// Lost is, for a known lost range, the offsets that a read whose reply was
 	// lost stored and that the reader does not deliver. Err then wraps
-	// errors.FetchProgressUncertain.
+	// errors.FetchProgressUncertain. This report stops nothing and needs no
+	// Seek. A batch that the reader holds after the range follows it, and then,
+	// if the partition stopped, the error that stopped it.
 	Lost *OffsetRange
 }
 
@@ -1755,7 +1757,10 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 	case transient(err):
 		p.retryAt = now.Add(r.config.retryInterval)
 		return
-	case errors.Is(err, ierror.ErrHistoryUnavailable) && !p.fromRead:
+	// The read of a gap names the history of the batch that showed the gap. So
+	// with an open gap the server lost that history, and the same read would be
+	// refused again without end.
+	case errors.Is(err, ierror.ErrHistoryUnavailable) && !p.fromRead && p.gapFrom == nil:
 		r.config.logger.Warn("A partition has a new history, the reader reads it again", "partition", p.id)
 		r.regroup = true
 		p.retryAt = now.Add(r.config.retryInterval)
@@ -1763,7 +1768,13 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 	}
 	p.lastingRefusals++
 	if errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrInvalidSizeBytes) ||
-		p.lastingRefusals >= lastingRefusalsBeforeStop {
+		errors.Is(err, ierror.ErrTieredReadFailed) || p.lastingRefusals >= lastingRefusalsBeforeStop {
+		if p.gapFrom != nil {
+			// Only a seek resumes the partition, and it drops the gap. So the gap
+			// ends here as at a leave: what was not read again is reported as
+			// lost, and the batch read after it is queued before the refusal.
+			r.acceptGapLocked(p, &iggcon.PolledMessage{}, p.gapEnd)
+		}
 		p.stopped = &ReadError{PartitionID: &p.id, Err: err}
 		r.queue = append(r.queue, entry{partition: int64(p.id), generation: p.generation, err: p.stopped})
 		return

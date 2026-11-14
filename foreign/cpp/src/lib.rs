@@ -394,9 +394,8 @@ mod ffi {
         /// For a message that does not decode: one continuation after it. The
         /// reader reads the message again until a `seek` of its partition to
         /// this continuation passes it. The messages before it arrive in a
-        /// batch first. For a lost range: one continuation after its last
-        /// offset. Empty for every other error: cxx has no `Option`, and a
-        /// `Box` is never empty.
+        /// batch first. Empty for every other error: cxx has no `Option`, and
+        /// a `Box` is never empty.
         // A `rust::Vec` holds an opaque Rust type only behind a `Box`.
         #[allow(clippy::vec_box)]
         skip: Vec<Box<Continuation>>,
@@ -406,6 +405,9 @@ mod ffi {
         /// The first and last offset of those messages.
         lost_first: u64,
         lost_last: u64,
+        /// True when the reader stopped the partition after refusals in a row
+        /// that a retry does not change. Only a `seek` reads it again.
+        lasting_refusal: bool,
     }
 
     /// Commit confirmation for one partition written by `send_messages`.
@@ -643,6 +645,12 @@ mod ffi {
         derived_options: Vec<HeaderEntry>,
     }
 
+    struct PersonalAccessTokenInfo {
+        name: String,
+        has_expiry: bool,
+        expiry: u64,
+    }
+
     struct LoginInfo {
         user_id: u32,
         has_access_token: bool,
@@ -704,6 +712,16 @@ mod ffi {
         preallocate_segments: bool,
         has_replication_factor: bool,
         replication_factor: u32,
+        has_segment_max_age: bool,
+        segment_max_age_kind: String,
+        segment_max_age_value: u64,
+        has_tiered_storage: bool,
+        tiered_storage: bool,
+        has_local_retention_age: bool,
+        local_retention_age_kind: String,
+        local_retention_age_value: u64,
+        has_local_retention_size: bool,
+        local_retention_size: String,
         has_partition_resize_policy: bool,
         partition_resize_policy: String,
         raw_options: Vec<HeaderEntry>,
@@ -720,6 +738,13 @@ mod ffi {
         message_expiry_value: u64,
         has_max_topic_size: bool,
         max_topic_size: String,
+        has_tiered_storage: bool,
+        tiered_storage: bool,
+        has_local_retention_age: bool,
+        local_retention_age_kind: String,
+        local_retention_age_value: u64,
+        has_local_retention_size: bool,
+        local_retention_size: String,
         reset: Vec<String>,
         raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,
@@ -1407,14 +1432,18 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
-        // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
+        fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
         fn create_personal_access_token(
             self: &Client,
             name: String,
             expiry_kind: String,
             expiry_value: u64,
         ) -> Result<String>;
-        // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
+        fn delete_personal_access_token(
+            self: &Client,
+            name: &str,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
         unsafe fn delete_client(client: *mut Client);

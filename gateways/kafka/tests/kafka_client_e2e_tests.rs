@@ -38,18 +38,20 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
+use std::mem::offset_of;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use iggy::prelude::IggyTimestamp;
+use iggy_binary_protocol::consensus::{HEADER_SIZE, Operation, RequestHeader};
 use secrecy::SecretString;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -114,6 +116,19 @@ const LOST_REPLY_TOPIC: &str = "lost-replies";
 const LOST_REPLY_RECORDS: u32 = 600;
 /// Produce responses the relay drops. Each drop closes that connection, as a lost reply does.
 const LOST_REPLIES: usize = 3;
+
+/// The topic that a default Java producer writes through a gateway on its defaults, and the
+/// records it sends there, as the values `0` to `DEFAULTS_RECORDS - 1`.
+const DEFAULTS_TOPIC: &str = "defaults";
+const DEFAULTS_RECORDS: u32 = 300;
+/// The producer's request timeout there, below Kafka's 30 s, so a stall past it fits one client
+/// run. Produce carries it, so it is also the deadline at which the gateway answers 7.
+const STALL_REQUEST_TIMEOUT_MS: u64 = 3_000;
+/// Sends that reach Iggy before the stall, so the producer has its 5 requests in flight by then.
+const SENDS_BEFORE_STALL: usize = 10;
+/// How long a connection that the gateway closed stays open after a kept send goes out on it, so
+/// that Iggy can still write that send.
+const LATE_SEND_GRACE: Duration = Duration::from_secs(10);
 
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
@@ -204,14 +219,16 @@ fn image_present(image: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Locates the already-built `iggy-server` alongside this test binary. Does not build it.
+/// Locates the already-built `iggy-server` in a parent directory of this test binary. Does not
+/// build it. Cargo puts final binaries in `target/<profile>/` and test binaries below it, at a
+/// depth that changes between cargo versions, so every parent is checked.
 fn iggy_server_binary() -> Option<PathBuf> {
-    let mut dir = std::env::current_exe().ok()?;
-    // .../target/<profile>/deps/<test binary> -> .../target/<profile>
-    dir.pop();
-    dir.pop();
-    let candidate = dir.join(format!("iggy-server{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+    let binary = format!("iggy-server{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .ok()?
+        .ancestors()
+        .map(|dir| dir.join(&binary))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Outcome of waiting for the spawned server to come up.
@@ -3286,6 +3303,316 @@ async fn given_lost_produce_responses_when_an_idempotent_producer_retries_should
         "{stored} of {LOST_REPLY_RECORDS} records stored"
     );
     gateway.stop().await;
+}
+
+/// A gateway started with only the Iggy address and password keeps the order of a default Java
+/// producer while its sends to Iggy stall past the Produce deadline. The gateway answers 7 for the
+/// stalled batch and for the batches behind it, so the producer sends its requests in flight again
+/// while the first send still runs. That send lands late. The defaults turn on the bridge and
+/// idempotent producers, so each batch lands once, in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn given_only_the_iggy_address_and_password_when_sends_to_iggy_stall_should_keep_a_default_java_producer_in_order()
+ {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(DEFAULTS_TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let hold = Duration::from_millis(2 * STALL_REQUEST_TIMEOUT_MS);
+    let relay = SendStallRelay::start(&server.address, SENDS_BEFORE_STALL, hold).await;
+    let gateway_addr: SocketAddr = format!("127.0.0.1:{}", free_port())
+        .parse()
+        .expect("a socket address");
+    let _gateway = GatewayProcess::start(
+        &[
+            ("IGGY_KAFKA_IGGY_ADDR", &relay.address),
+            ("IGGY_KAFKA_IGGY_PASSWORD", ROOT_PASSWORD),
+            ("IGGY_KAFKA_BIND_ADDR", &gateway_addr.to_string()),
+        ],
+        gateway_addr,
+    )
+    .await;
+
+    // The tool sets `retries=0`, which also turns the default idempotence off. The file puts
+    // back the Java default, so the producer runs on Kafka's defaults but for the timeouts.
+    let config = tempfile::tempdir().expect("create config dir");
+    let properties = config.path().join("producer.properties");
+    std::fs::write(
+        &properties,
+        format!(
+            "retries=2147483647\nrequest.timeout.ms={STALL_REQUEST_TIMEOUT_MS}\n\
+             delivery.timeout.ms=60000\n"
+        ),
+    )
+    .expect("write the producer config");
+    let properties = properties.to_str().expect("a UTF-8 path");
+    let records = DEFAULTS_RECORDS.to_string();
+    let bootstrap = gateway_addr.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-verifiable-producer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            DEFAULTS_TOPIC,
+            "--max-messages",
+            &records,
+            "--throughput",
+            "100",
+            "--producer.config",
+            "/tmp/producer.properties",
+        ],
+        &[(properties, "/tmp/producer.properties")],
+    )
+    .expect_ran("the producer runs");
+    let acked = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["name"] == "tool_data")
+        .and_then(|event| event["acked"].as_u64());
+    assert_eq!(
+        acked,
+        Some(u64::from(DEFAULTS_RECORDS)),
+        "every record must be acknowledged: {output}"
+    );
+    assert!(
+        relay.held() > 0,
+        "the relay must hold a send past the Produce deadline: {output}"
+    );
+
+    let read = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &bootstrap,
+            "-C",
+            "-t",
+            DEFAULTS_TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "%s\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat reads the topic");
+    let values: Vec<u32> = read.lines().filter_map(|line| line.parse().ok()).collect();
+    let sent: Vec<u32> = (0..DEFAULTS_RECORDS).collect();
+    assert_eq!(values, sent, "each record once, in the order sent: {read}");
+}
+
+/// The gateway binary, started with exactly the given variables, and killed on drop.
+struct GatewayProcess {
+    child: Child,
+}
+
+impl GatewayProcess {
+    /// Starts the binary with `env` and nothing else, then waits until `addr` accepts.
+    async fn start(env: &[(&str, &str)], addr: SocketAddr) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_iggy-gateway-kafka"));
+        command.env_clear();
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command.envs(env.iter().copied()).stdout(Stdio::null());
+        let mut child = command.spawn().expect("spawn iggy-gateway-kafka");
+        let deadline = Instant::now() + SERVER_READY_TIMEOUT;
+        while TcpStream::connect(addr).await.is_err() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("the gateway exited with {status} before it listened");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the gateway did not listen on {addr} within {SERVER_READY_TIMEOUT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Self { child }
+    }
+}
+
+impl Drop for GatewayProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A relay between a gateway and Iggy that stalls the gateway's sends. The first send after
+/// `before` others starts a stall of `hold`. Until it ends, the relay keeps each `SendMessages`
+/// frame, and every later frame of a connection that it keeps one of. Then it sends the kept
+/// frames on, in order, also on a connection that the gateway closed. So a send that the gateway
+/// gave up on still lands, late.
+struct SendStallRelay {
+    address: String,
+    stall: Arc<SendStall>,
+}
+
+impl SendStallRelay {
+    async fn start(server: &str, before: usize, hold: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let address = listener.local_addr().expect("relay address").to_string();
+        let stall = Arc::new(SendStall {
+            before,
+            hold,
+            sends: AtomicUsize::new(0),
+            ends: OnceLock::new(),
+            held: AtomicUsize::new(0),
+        });
+        let shared = Arc::clone(&stall);
+        let upstream = server.to_string();
+        tokio::spawn(async move {
+            while let Ok((gateway, _)) = listener.accept().await {
+                let Ok(iggy) = TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                tokio::spawn(relay_iggy_connection(gateway, iggy, Arc::clone(&shared)));
+            }
+        });
+        Self { address, stall }
+    }
+
+    /// The sends that the stall kept.
+    fn held(&self) -> usize {
+        self.stall.held.load(Ordering::SeqCst)
+    }
+}
+
+/// The one stall of a [`SendStallRelay`], shared by its connections.
+struct SendStall {
+    before: usize,
+    hold: Duration,
+    sends: AtomicUsize,
+    ends: OnceLock<Instant>,
+    held: AtomicUsize,
+}
+
+impl SendStall {
+    /// Whether to keep `frame`: a send after the first `before`, while the stall runs. The first
+    /// such send starts it.
+    fn keeps(&self, frame: &[u8]) -> bool {
+        if !is_send(frame) || self.sends.fetch_add(1, Ordering::SeqCst) < self.before {
+            return false;
+        }
+        Instant::now() < *self.ends.get_or_init(|| Instant::now() + self.hold)
+    }
+
+    /// The end of the stall, once a send started it.
+    fn ends(&self) -> Option<tokio::time::Instant> {
+        self.ends.get().copied().map(tokio::time::Instant::from_std)
+    }
+}
+
+/// Whether an Iggy request frame sends messages.
+fn is_send(frame: &[u8]) -> bool {
+    frame.get(offset_of!(RequestHeader, operation)) == Some(&(Operation::SendMessages as u8))
+}
+
+/// Relays one Iggy connection of the gateway. A kept send that goes out after the gateway closed
+/// the connection gets [`LATE_SEND_GRACE`] before the relay closes its side to Iggy.
+async fn relay_iggy_connection(gateway: TcpStream, iggy: TcpStream, stall: Arc<SendStall>) {
+    let (requests, replies) = gateway.into_split();
+    let (answers, writes) = iggy.into_split();
+    let (frames, incoming) = tokio::sync::mpsc::channel(64);
+    let reader = tokio::spawn(read_iggy_frames(requests, frames));
+    let answering = tokio::spawn(pass_iggy_answers(answers, replies));
+    let (writes, late) = pass_iggy_requests(incoming, writes, &stall).await;
+    if late {
+        let _ = tokio::time::timeout(LATE_SEND_GRACE, answering).await;
+    }
+    reader.abort();
+    drop(writes);
+}
+
+/// Passes request frames on until the gateway closes its side and nothing is kept. Returns the
+/// side to Iggy, and whether a kept frame went out after the gateway closed.
+async fn pass_iggy_requests(
+    mut incoming: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut writes: OwnedWriteHalf,
+    stall: &SendStall,
+) -> (OwnedWriteHalf, bool) {
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut open = true;
+    loop {
+        let Some(ends) = stall.ends().filter(|_| !kept.is_empty()) else {
+            let Some(frame) = incoming.recv().await else {
+                return (writes, false);
+            };
+            if stall.keeps(&frame) {
+                stall.held.fetch_add(1, Ordering::SeqCst);
+                kept.push(frame);
+            } else if writes.write_all(&frame).await.is_err() {
+                return (writes, false);
+            }
+            continue;
+        };
+        tokio::select! {
+            frame = incoming.recv(), if open => match frame {
+                Some(frame) => {
+                    if is_send(&frame) {
+                        stall.held.fetch_add(1, Ordering::SeqCst);
+                    }
+                    kept.push(frame);
+                }
+                None => open = false,
+            },
+            () = tokio::time::sleep_until(ends) => {
+                for frame in std::mem::take(&mut kept) {
+                    if writes.write_all(&frame).await.is_err() {
+                        return (writes, false);
+                    }
+                }
+                if !open {
+                    return (writes, true);
+                }
+            }
+        }
+    }
+}
+
+/// Reads whole Iggy request frames into `frames` until a side closes.
+async fn read_iggy_frames(mut requests: OwnedReadHalf, frames: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    let size_at = offset_of!(RequestHeader, size);
+    loop {
+        let mut frame = vec![0; HEADER_SIZE];
+        if requests.read_exact(&mut frame).await.is_err() {
+            return;
+        }
+        let size = u32::from_le_bytes(frame[size_at..size_at + 4].try_into().expect("4 bytes"));
+        frame.resize(usize::try_from(size).expect("a frame size"), 0);
+        if requests
+            .read_exact(&mut frame[HEADER_SIZE..])
+            .await
+            .is_err()
+            || frames.send(frame).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Copies Iggy's answers back until Iggy closes, and drops them once the gateway closed its side.
+async fn pass_iggy_answers(mut answers: OwnedReadHalf, mut replies: OwnedWriteHalf) {
+    let mut chunk = vec![0; 64 * 1024];
+    let mut open = true;
+    loop {
+        let read = match answers.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        if open && replies.write_all(&chunk[..read]).await.is_err() {
+            open = false;
+        }
+    }
 }
 
 /// A bridged gateway that advertises `relay` in place of its own address, so a client that learns

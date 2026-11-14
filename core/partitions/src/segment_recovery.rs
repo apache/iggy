@@ -29,7 +29,11 @@
 //! same crate and reading the same 24-byte format it emits.
 
 use crate::iggy_index::IGGY_INDEX_SIZE;
+use crate::segment::SegmentLocation;
 use crate::segment_anchor::ANCHOR_EXTENSION;
+use crate::segment_chain::{
+    Chain, ChainError, ChainRecord, ObjectPrefix, SegmentRecord, read_chain, truncate_chain,
+};
 use crate::state_transfer::{STAGING_SUFFIX, segment_dir_entries};
 use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
 use compio::buf::{IntoInner, IoBuf};
@@ -41,6 +45,7 @@ use server_common::fs_utils::truncate_file;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::{DISK_USAGE, SegmentStorage, yield_to_reactor};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
@@ -126,7 +131,8 @@ const PROBE_VERIFY_BUDGET_BYTES_PER_RESIDUE_BYTE: u64 = 4;
 /// header is verdict-identical to reading the claimed bytes and failing the
 /// verify, minus a claimed-size allocation and read that a single
 /// bit-flipped length field could otherwise drive up to a whole segment.
-const MAX_RECOVERABLE_BATCH_BYTES: u64 = MAX_MESSAGE_SIZE_UPPER_BYTES + COMMAND_HEADER_SIZE as u64;
+pub const MAX_RECOVERABLE_BATCH_BYTES: u64 =
+    MAX_MESSAGE_SIZE_UPPER_BYTES + COMMAND_HEADER_SIZE as u64;
 
 /// Attempts at finding a free `<partition dir>.fenced.<n>` name, mirroring
 /// the partition-level quarantine's bound.
@@ -277,6 +283,35 @@ pub enum PartitionRecoveryRefusal {
         on_disk_bytes: u64,
         expected_bytes: u64,
     },
+    /// The chain's header, or a record other than the last, does not decode.
+    /// Read as absent, a remote record would silently drop its segment.
+    ChainUnreadable {
+        /// `None` for the header.
+        record: Option<usize>,
+    },
+    /// The chain names another partition or incarnation.
+    ForeignChain { recorded: ObjectPrefix },
+    /// A chain record belongs to another incarnation than the chain itself.
+    ForeignChainRecord {
+        start_offset: u64,
+        incarnation: u64,
+        created_revision: u64,
+    },
+    /// A segment whose `.log` left the disk is not part of the chain's front:
+    /// a local segment precedes it, or none follows it.
+    TieredOutsidePrefix {
+        tiered_start: u64,
+        local_start: Option<u64>,
+    },
+    /// A segment whose `.log` left the disk reaches the WAL checkpoint-cursor
+    /// segment, which boot reads.
+    TieredAtCheckpoint {
+        tiered_start: u64,
+        checkpoint_start: u64,
+    },
+    /// The chain starts above the trim point: a front this replica's own
+    /// retention never removed is gone.
+    FrontAboveTrimPoint { first_start: u64, trim_point: u64 },
 }
 
 impl std::fmt::Display for PartitionRecoveryRefusal {
@@ -406,6 +441,60 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "segment {start_offset} file length {on_disk_bytes} diverged from \
                  its required recovered size {expected_bytes}"
             ),
+            Self::ChainUnreadable { record: None } => {
+                f.write_str("the segment chain's header does not decode")
+            }
+            Self::ChainUnreadable {
+                record: Some(record),
+            } => write!(
+                f,
+                "segment chain record {record} does not decode and is not the last"
+            ),
+            Self::ForeignChain { recorded } => write!(
+                f,
+                "the segment chain names another partition or incarnation: {recorded:?}"
+            ),
+            Self::ForeignChainRecord {
+                start_offset,
+                incarnation,
+                created_revision,
+            } => write!(
+                f,
+                "the segment chain's record of segment {start_offset} belongs to \
+                 incarnation {incarnation}, not {created_revision}"
+            ),
+            Self::TieredOutsidePrefix {
+                tiered_start,
+                local_start: Some(local_start),
+            } => write!(
+                f,
+                "remote segment {tiered_start} lies past local segment {local_start}, \
+                 but remote segments must be the front of the chain"
+            ),
+            Self::TieredOutsidePrefix {
+                tiered_start,
+                local_start: None,
+            } => write!(
+                f,
+                "remote segment {tiered_start} has no local segment after it, so the \
+                 chain lost its active segment"
+            ),
+            Self::TieredAtCheckpoint {
+                tiered_start,
+                checkpoint_start,
+            } => write!(
+                f,
+                "remote segment {tiered_start} reaches the WAL checkpoint segment \
+                 {checkpoint_start}, whose log boot reads"
+            ),
+            Self::FrontAboveTrimPoint {
+                first_start,
+                trim_point,
+            } => write!(
+                f,
+                "the chain starts at {first_start}, above trim point {trim_point}, so \
+                 a front this replica never removed is gone"
+            ),
         }
     }
 }
@@ -452,6 +541,18 @@ pub enum PartitionRecoveryError {
         path: String,
         source: std::io::Error,
     },
+    /// A recovered consumer offset past the partition's offset space could not
+    /// be rewritten or removed in its file, or the change could not be synced.
+    /// Boot fails on it: a file left at the old value brings that value back
+    /// on the next boot.
+    ConsumerOffsetClamp {
+        consumer_kind: &'static str,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        path: String,
+        source: Box<IggyError>,
+    },
     /// Transient I/O with no structural verdict attached. Boot fails on it
     /// rather than fencing, so a retried boot can still serve the partition.
     /// The reconciler logs it and retries the partition with backoff.
@@ -496,6 +597,18 @@ impl std::fmt::Display for PartitionRecoveryError {
                 "failed to create offsets directory {path} for stream {stream_id}, \
                  topic {topic_id}, partition {partition_id}: {source}"
             ),
+            Self::ConsumerOffsetClamp {
+                consumer_kind,
+                stream_id,
+                topic_id,
+                partition_id,
+                path,
+                source,
+            } => write!(
+                f,
+                "failed to clamp the persisted {consumer_kind} offset at {path} for stream \
+                 {stream_id}, topic {topic_id}, partition {partition_id}: {source}"
+            ),
             Self::Iggy(source) => write!(f, "{source}"),
         }
     }
@@ -504,8 +617,10 @@ impl std::fmt::Display for PartitionRecoveryError {
 impl std::error::Error for PartitionRecoveryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            // Both put the cause in the Display text, the only part boot logs.
-            Self::Refused { .. } | Self::CreateOffsetsDirectory { .. } => None,
+            // These put the cause in the Display text, the only part boot logs.
+            Self::Refused { .. }
+            | Self::CreateOffsetsDirectory { .. }
+            | Self::ConsumerOffsetClamp { .. } => None,
             Self::ConsumerOffsetsLoad { source, .. } => Some(source.as_ref()),
             Self::Iggy(source) => std::error::Error::source(source),
         }
@@ -526,7 +641,18 @@ pub struct RecoveredSegment {
     pub storage: SegmentStorage,
 }
 
+/// Every segment boot recovered for one partition, and the chain beside them.
+pub struct RecoveredLog {
+    pub segments: Vec<RecoveredSegment>,
+    /// The partition's `remote.chain`, `None` when it keeps none.
+    pub chain: Option<Chain>,
+}
+
 /// Loads every persisted segment for a partition, sorted by start offset.
+///
+/// A segment whose `.log` left the disk comes back from the partition's
+/// `remote.chain` as `Remote`, bounded by its record, and must be part of the
+/// chain's front. The chain is returned beside the segments.
 ///
 /// Segment offsets and timestamps are recovered from the 24-byte sparse index
 /// (see module docs); segment byte size comes from walking the `.log` batch
@@ -566,7 +692,7 @@ pub async fn load_persisted_segments(
     segment_size: IggyByteSize,
     durable_segments: bool,
     stats: &PartitionStats,
-) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
+) -> Result<RecoveredLog, PartitionRecoveryError> {
     load_persisted_segments_with_checkpoint(
         config,
         namespace,
@@ -600,7 +726,7 @@ pub async fn load_persisted_segments_with_checkpoint(
     durable_segments: bool,
     stats: &PartitionStats,
     checkpoint: Option<journal::partition_journal::SegmentPosition>,
-) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
+) -> Result<RecoveredLog, PartitionRecoveryError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
@@ -611,13 +737,19 @@ pub async fn load_persisted_segments_with_checkpoint(
         topic_id,
         partition_id,
     };
+    // Read before the sweep, which must keep the `.index` and `.anchor` of
+    // every segment whose `.log` left the disk.
+    let mut chain = read_partition_chain(identity).await?;
+    let remote = chain.as_ref().map_or_default(remote_segments);
     // ONE directory walk feeds both: the sweep only ever unlinks `.staging` and
     // orphan `.index` files, never a `.log`, so the log stems it already
     // collects ARE the post-sweep start-offset set. Note the error policy is
     // the collect side's (NotFound => empty, anything else => refuse boot); the
     // sweep's silent return would swallow an EACCES that must not be ignored.
-    let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path).await?;
+    let mut start_offsets =
+        sweep_scratch_files_and_collect_offsets(&partition_path, &remote).await?;
     start_offsets.sort_unstable();
+    let tiered = tiered_prefix(identity, &remote, &start_offsets, checkpoint)?;
     if let Some(checkpoint) = checkpoint {
         start_offsets.retain(|offset| {
             *offset < checkpoint.next_offset || *offset == checkpoint.start_offset
@@ -633,7 +765,10 @@ pub async fn load_persisted_segments_with_checkpoint(
     // accepted, so a refusal raised by a later segment (or by the chain
     // guard) leaves the earlier segments' files byte-identical for the
     // caller's quarantine to keep.
-    let mut planned = Vec::with_capacity(start_offsets.len());
+    let mut planned = Vec::with_capacity(tiered.len() + start_offsets.len());
+    for record in &tiered {
+        planned.push(PlannedSegment::tiered(config, namespace, record, max_size));
+    }
     for start_offset in start_offsets {
         let messages_path =
             config.get_messages_path(stream_id, topic_id, partition_id, start_offset);
@@ -755,15 +890,53 @@ pub async fn load_persisted_segments_with_checkpoint(
         last.segment.sealed = false;
     }
 
+    // Local on purpose: metadata at boot can trail the last truncation this
+    // replica enforced, so comparing with it would refuse healthy replicas.
+    if let (Some(trim_point), Some(first)) =
+        (chain.as_ref().and_then(Chain::trim_point), planned.first())
+        && first.segment.start_offset > trim_point.saturating_add(1)
+    {
+        return Err(
+            identity.refusal(PartitionRecoveryRefusal::FrontAboveTrimPoint {
+                first_start: first.segment.start_offset,
+                trim_point,
+            }),
+        );
+    }
+
     // Pass B: the chain guard reads the planned bounds and, for a gap, the
     // anchor beside it, so it can refuse BEFORE anything is truncated.
     ensure_contiguous_chain(identity, &planned).await?;
 
     // Pass C: the chain is accepted; make disk match the bounds and open
     // storage over them.
+    if let Some(chain) = chain.as_mut().filter(|chain| chain.torn_tail) {
+        truncate_chain(identity.partition_path, chain.valid_len)
+            .await
+            .map_err(|source| {
+                error!(
+                    partition_path = identity.partition_path,
+                    error = %source,
+                    "failed to truncate the segment chain's torn tail during recovery"
+                );
+                PartitionRecoveryError::from(IggyError::CannotWriteToFile)
+            })?;
+        chain.torn_tail = false;
+    }
     let mut recovered = Vec::with_capacity(planned.len());
     for plan in planned {
         let messages_size = plan.segment.size.as_bytes_u64();
+        if plan.segment.location == SegmentLocation::Remote {
+            let index_path = index_kept(&plan.index_path)
+                .await?
+                .then_some(plan.index_path.as_str());
+            count_recovered_segment(stats, &plan.segment);
+            recovered.push(RecoveredSegment {
+                segment: plan.segment,
+                storage: SegmentStorage::without_messages(index_path),
+            });
+            continue;
+        }
         if plan.recovered_empty {
             // The pair holds bytes that prove nothing, yet they are the only
             // copy of whatever the crash tore: move them aside and seed fresh
@@ -854,31 +1027,145 @@ pub async fn load_persisted_segments_with_checkpoint(
             storage.seal();
         }
 
-        stats.increment_segments_count(1);
-        stats.increment_size_bytes(messages_size);
-        if messages_size > 0 {
-            // The count is the offset span this segment now advertises, which
-            // is what a consumer can ask for. A byte-0 walk proves every
-            // offset in a non-fsynced or rebuilt span. An fsynced anchored
-            // walk proves the final chunk and inherits the earlier prefix from
-            // completed serialized log fdatasyncs. Counting the whole span
-            // therefore does not widen the recovery claim. Saturating: an end
-            // offset at u64::MAX must not wrap the counter.
-            stats.increment_messages_count(
-                plan.segment
-                    .end_offset
-                    .saturating_sub(plan.segment.start_offset)
-                    .saturating_add(1),
-            );
-        }
-
+        count_recovered_segment(stats, &plan.segment);
         recovered.push(RecoveredSegment {
             segment: plan.segment,
             storage,
         });
     }
 
-    Ok(recovered)
+    Ok(RecoveredLog {
+        segments: recovered,
+        chain,
+    })
+}
+
+/// Fold one accepted segment into the partition's stats.
+fn count_recovered_segment(stats: &PartitionStats, segment: &Segment) {
+    let size = segment.size.as_bytes_u64();
+    stats.increment_segments_count(1);
+    stats.increment_size_bytes(size);
+    if size > 0 {
+        // The count is the offset span this segment now advertises, which
+        // is what a consumer can ask for. A byte-0 walk proves every
+        // offset in a non-fsynced or rebuilt span. An fsynced anchored
+        // walk proves the final chunk and inherits the earlier prefix from
+        // completed serialized log fdatasyncs. Counting the whole span
+        // therefore does not widen the recovery claim. Saturating: an end
+        // offset at u64::MAX must not wrap the counter.
+        stats.increment_messages_count(
+            segment
+                .end_offset
+                .saturating_sub(segment.start_offset)
+                .saturating_add(1),
+        );
+    }
+}
+
+/// Read the partition's chain, refusing one that does not decode or whose
+/// records belong to another incarnation.
+async fn read_partition_chain(
+    identity: PartitionIdentity<'_>,
+) -> Result<Option<Chain>, PartitionRecoveryError> {
+    let chain = match read_chain(identity.partition_path).await {
+        Ok(chain) => chain,
+        Err(ChainError::Header) => {
+            return Err(
+                identity.refusal(PartitionRecoveryRefusal::ChainUnreadable { record: None })
+            );
+        }
+        Err(ChainError::Record { index }) => {
+            return Err(identity.refusal(PartitionRecoveryRefusal::ChainUnreadable {
+                record: Some(index),
+            }));
+        }
+        Err(error) => {
+            error!(
+                partition_path = identity.partition_path,
+                %error,
+                "failed to read the segment chain during recovery"
+            );
+            return Err(IggyError::CannotReadFile.into());
+        }
+    };
+    if let Some(chain) = &chain {
+        let created_revision = chain.prefix.created_revision;
+        if let Some(segment) = chain
+            .records
+            .iter()
+            .filter_map(ChainRecord::segment)
+            .find(|segment| segment.incarnation != created_revision)
+        {
+            return Err(
+                identity.refusal(PartitionRecoveryRefusal::ForeignChainRecord {
+                    start_offset: segment.start_offset,
+                    incarnation: segment.incarnation,
+                    created_revision,
+                }),
+            );
+        }
+    }
+    Ok(chain)
+}
+
+/// The segments whose latest live record is remote, by start offset.
+fn remote_segments(chain: &Chain) -> BTreeMap<u64, SegmentRecord> {
+    chain
+        .remote_segments()
+        .into_iter()
+        .map(|segment| (segment.start_offset, segment))
+        .collect()
+}
+
+/// The remote segments whose `.log` is gone, which must be the front of the
+/// chain and end below the WAL checkpoint-cursor segment. A remote segment
+/// whose `.log` is still here is local: a crash cut its eviction short.
+fn tiered_prefix(
+    identity: PartitionIdentity<'_>,
+    remote: &BTreeMap<u64, SegmentRecord>,
+    local_starts: &[u64],
+    checkpoint: Option<journal::partition_journal::SegmentPosition>,
+) -> Result<Vec<SegmentRecord>, PartitionRecoveryError> {
+    let tiered: Vec<SegmentRecord> = remote
+        .values()
+        .filter(|segment| local_starts.binary_search(&segment.start_offset).is_err())
+        .copied()
+        .collect();
+    let Some(last) = tiered.last() else {
+        return Ok(tiered);
+    };
+    let local_start = local_starts.first().copied();
+    if local_start.is_none_or(|local_start| local_start < last.start_offset) {
+        return Err(
+            identity.refusal(PartitionRecoveryRefusal::TieredOutsidePrefix {
+                tiered_start: last.start_offset,
+                local_start,
+            }),
+        );
+    }
+    if let Some(checkpoint) = checkpoint
+        && last.end_offset >= checkpoint.start_offset
+    {
+        return Err(
+            identity.refusal(PartitionRecoveryRefusal::TieredAtCheckpoint {
+                tiered_start: last.start_offset,
+                checkpoint_start: checkpoint.start_offset,
+            }),
+        );
+    }
+    Ok(tiered)
+}
+
+/// Whether a tiered segment kept its `.index`.
+async fn index_kept(index_path: &str) -> Result<bool, PartitionRecoveryError> {
+    match fs::metadata(index_path).await {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => {
+            error!(path = index_path, error = %source, "failed to stat a tiered segment's index during recovery");
+            Err(IggyError::CannotReadFileMetadata.into())
+        }
+    }
 }
 
 /// Identity of the partition being recovered, threaded through the walk for
@@ -915,6 +1202,40 @@ struct PlannedSegment {
     /// The pair holds bytes but nothing in them decodes; pass C fences the
     /// files aside and reseeds empty ones instead of truncating.
     recovered_empty: bool,
+}
+
+impl PlannedSegment {
+    /// A segment whose `.log` left the disk, bounded by its chain record.
+    fn tiered(
+        config: &PartitionsConfig,
+        namespace: IggyNamespace,
+        record: &SegmentRecord,
+        max_size: IggyByteSize,
+    ) -> Self {
+        let (stream_id, topic_id, partition_id) = (
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        Self {
+            segment: record.remote_segment(max_size),
+            messages_path: config.get_messages_path(
+                stream_id,
+                topic_id,
+                partition_id,
+                record.start_offset,
+            ),
+            index_path: config.get_index_path(
+                stream_id,
+                topic_id,
+                partition_id,
+                record.start_offset,
+            ),
+            index_size: 0,
+            rebuilt_index_staging: None,
+            recovered_empty: false,
+        }
+    }
 }
 
 /// Work bounds shared by every damage probe in one partition load.
@@ -1125,7 +1446,8 @@ async fn ensure_contiguous_chain(
 }
 
 /// Unlink the partition directory's scratch leftovers: every `*.staging` spill
-/// file, and every `.index` with no `.log` beside it.
+/// file, and every `.index` with no `.log` beside it unless `remote` records
+/// the segment.
 ///
 /// Boot is the one sweep that always runs. The install-time and reuse-time
 /// staging sweeps only fire on the NEXT transfer attempt, so a transfer
@@ -1148,6 +1470,7 @@ async fn ensure_contiguous_chain(
 /// missing directory means a never-persisted partition.
 async fn sweep_scratch_files_and_collect_offsets(
     partition_path: &str,
+    remote: &BTreeMap<u64, SegmentRecord>,
 ) -> Result<Vec<u64>, PartitionRecoveryError> {
     // The recovery opens are read-only, but a failed one fails the partition
     // load, which stops the server at boot, so they count like write opens.
@@ -1195,11 +1518,17 @@ async fn sweep_scratch_files_and_collect_offsets(
             _ => {}
         }
     }
+    // A remote segment keeps its `.index` and `.anchor` without a `.log`.
     swept.extend(orphan_candidates.into_iter().filter(|path| {
         !path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| log_stems.contains(stem))
+            .is_some_and(|stem| {
+                log_stems.contains(stem)
+                    || stem
+                        .parse::<u64>()
+                        .is_ok_and(|start_offset| remote.contains_key(&start_offset))
+            })
     }));
     for path in swept {
         if let Err(error) = fs::remove_file(&path).await {

@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::FILE_SYNC_CONCURRENCY;
+use crate::FreeSpaceReserve;
 use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
 use futures::future::Either;
 use futures::{FutureExt, TryStreamExt};
@@ -250,6 +251,47 @@ impl FileSyncBarrier {
     }
 }
 
+/// Bytes this WAL accepted and has not finished writing. The node's free-space
+/// reserve counts them as pending, because the write sites charge the disk
+/// usage estimate only when a write starts.
+#[derive(Default)]
+struct PendingBytes {
+    bytes: Cell<u64>,
+    reserve: RefCell<Option<Arc<FreeSpaceReserve>>>,
+}
+
+impl PendingBytes {
+    const fn get(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    fn set(&self, bytes: u64) {
+        let previous = self.bytes.replace(bytes);
+        if let Some(reserve) = self.reserve.borrow().as_ref() {
+            if bytes > previous {
+                reserve.add_pending(bytes - previous);
+            } else if bytes < previous {
+                reserve.release_pending(previous - bytes);
+            }
+        }
+    }
+
+    fn report_to(&self, reserve: Option<Arc<FreeSpaceReserve>>) {
+        if let Some(reserve) = &reserve {
+            reserve.add_pending(self.bytes.get());
+        }
+        if let Some(previous) = self.reserve.replace(reserve) {
+            previous.release_pending(self.bytes.get());
+        }
+    }
+}
+
+impl Drop for PendingBytes {
+    fn drop(&mut self) {
+        self.report_to(None);
+    }
+}
+
 pub struct PartitionPersistence<S: DurableStorage = crate::WalStorage> {
     group: u64,
     incarnation: u64,
@@ -286,8 +328,8 @@ pub struct PartitionPersistence<S: DurableStorage = crate::WalStorage> {
     disk_bytes: Cell<u64>,
     retained_bytes: Cell<u64>,
     segment_checkpoint: Cell<Option<SegmentPosition>>,
-    queued_bytes: Cell<u64>,
-    in_flight_bytes: Cell<u64>,
+    queued_bytes: PendingBytes,
+    in_flight_bytes: PendingBytes,
     waiters: RefCell<Vec<std::task::Waker>>,
     running: Cell<bool>,
     writer_active: Cell<bool>,
@@ -551,6 +593,7 @@ enum Mutation<S: DurableStorage> {
         epoch: u64,
         initial: SegmentPosition,
         max_size: u64,
+        max_age: Option<u64>,
     },
     ReanchorSegments {
         epoch: u64,
@@ -605,7 +648,7 @@ enum Mutation<S: DurableStorage> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     },
 }
 
@@ -760,8 +803,8 @@ impl<S: DurableStorage + Clone> PartitionPersistence<S> {
             queue: RefCell::new(VecDeque::new()),
             offset_files: RetainedOffsetFiles::default(),
             accepted: RefCell::new(accepted),
-            queued_bytes: Cell::new(0),
-            in_flight_bytes: Cell::new(0),
+            queued_bytes: PendingBytes::default(),
+            in_flight_bytes: PendingBytes::default(),
             waiters: RefCell::new(Vec::new()),
             running: Cell::new(false),
             writer_active: Cell::new(false),
@@ -890,11 +933,17 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             });
     }
 
-    pub fn enable_segment_storage(&self, initial: SegmentPosition, max_size: u64) {
+    pub fn enable_segment_storage(
+        &self,
+        initial: SegmentPosition,
+        max_size: u64,
+        max_age: Option<u64>,
+    ) {
         self.queue.borrow_mut().push_back(Mutation::EnableSegments {
             epoch: self.epoch.get(),
             initial,
             max_size,
+            max_age,
         });
     }
 
@@ -948,6 +997,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub fn is_durable_through(&self, op: u64) -> bool {
         self.is_written_through(op) && op <= self.durable_head.get()
+    }
+
+    /// Reports the queued and in-flight bytes of this WAL to `reserve` as
+    /// pending, whatever the role of the replica: a backup writes what it
+    /// journals to the same disk.
+    pub fn report_pending_bytes_to(&self, reserve: Option<&Arc<FreeSpaceReserve>>) {
+        self.queued_bytes.report_to(reserve.cloned());
+        self.in_flight_bytes.report_to(reserve.cloned());
     }
 
     pub fn has_capacity(&self, frame_bytes: usize) -> bool {
@@ -1245,7 +1302,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     ) {
         self.offset_files.clear();
         self.certified_log_view.set(None);
@@ -1622,8 +1679,15 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     ) -> io::Result<()> {
         match mutation {
             Mutation::EnableSegments {
-                initial, max_size, ..
-            } => logs.data.enable_segment_storage(initial, max_size).await,
+                initial,
+                max_size,
+                max_age,
+                ..
+            } => {
+                logs.data
+                    .enable_segment_storage(initial, max_size, max_age)
+                    .await
+            }
             Mutation::ReanchorSegments { next_offset, .. } => {
                 logs.data.reanchor_segment_storage(next_offset).await
             }
@@ -1775,7 +1839,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     ) -> io::Result<()> {
         let (data_prepare, command_prepare) = match prepare {
             Some(prepare)
@@ -1785,9 +1849,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             }
             prepare => (prepare, None),
         };
-        if let Some((position, max_size)) = segments {
+        if let Some((position, max_size, max_age)) = segments {
             logs.data
-                .reset_with_segment_checkpoint(op, checksum, data_prepare, position, max_size)
+                .reset_with_segment_checkpoint(
+                    op,
+                    checksum,
+                    data_prepare,
+                    position,
+                    max_size,
+                    max_age,
+                )
                 .await?;
         } else if let Some(prepare) = data_prepare {
             logs.data.reset_with_prepare(prepare).await?;

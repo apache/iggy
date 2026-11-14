@@ -219,7 +219,7 @@ Three variables set what a new topic gets for each key its request leaves out. T
 | `IGGY_KAFKA_TOPIC_DURABILITY` | None | `replicated`. `persisted` applies to the messages and to the consumer offsets of the topic |
 
 Kafka keeps records for 7 days by default. The gateway keeps them forever unless an operator sets
-`IGGY_KAFKA_TOPIC_RETENTION_MS`.
+`IGGY_KAFKA_TOPIC_RETENTION_MS`. While the variable is unset, the gateway warns at startup.
 
 Iggy stores a default like any value that a client sends. So a describe reports a stored
 `retention.ms` or `retention.bytes` equal to the default as `STATIC_BROKER_CONFIG` (4), as Kafka

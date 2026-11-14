@@ -40,7 +40,7 @@ See [metadata freshness and counters](../../core/server/README.md#metadata-fresh
 
 ## Resource options
 
-Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog.
+Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog. A topic update can change `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize`, reset each of them, and turn `TieredStorage` on, never off.
 
 ```cpp
 const std::string key_base64 = LoadStreamKey();
@@ -100,6 +100,7 @@ errors from these methods:
 
 - `Login`, `Logout`, `ResolveOperation`, and `AbandonOperation`.
 - `CreateUser`, `UpdateUser`, and `DeleteUser`.
+- `DeletePersonalAccessToken`.
 - `CreateStream`, `UpdateStream`, and `DeleteStream`.
 - `CreateTopic`, `UpdateTopic`, and `DeleteTopic`.
 - `CreatePartitions`, `DeletePartitions`, and `DeleteSegments`.
@@ -147,7 +148,12 @@ reader.Close();
 - `Commit` stores a checkpoint that the reader delivered, and under `CommitPolicy::Auto` `Mark` counts one for the policy to store.
 - `Seek` moves a partition to a `PollingStrategy`, or to a `Continuation` of that partition.
 - C++ cannot cancel `Commit` and `Seek`, so each one ends at a deadline 10 s after its start. The `Commit` and `Seek` of an `IggyConsumer` do the same.
-- A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it. A lost read can commit messages that the reader cannot read again. Then the reader throws `fetch_progress_uncertain` once. `Lost()` holds the first and last offset of those messages, and `Skip()` the continuation after them.
+- A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it.
+- A lost read can commit messages that the reader cannot read again. Then the reader throws `fetch_progress_uncertain` once. `Lost()` holds the first and last offset of those messages. This error stops nothing and needs no `Seek`. A `Seek` after it drops the batch that follows the range. If the reader stopped the partition, the error that stopped it comes after that batch.
+  Earlier versions gave this error a `Skip()` after the range. Code that handles `fetch_progress_uncertain` with `AbandonOperation` and a `Seek` must now check `Lost()` first and do neither for this error.
+- Under every commit policy, two errors stop a partition until a `Seek`. The first is `history_unavailable` (87) for a position whose history is gone. The second is the sixth refusal in a row that a retry does not change, such as `unauthorized` (41), and `IsLastingRefusal()` is then true. While a lost read is still pending, such a stop throws `fetch_progress_uncertain` (14010) with an empty `Lost()` in place of its own error.
+- Under `CommitPolicy::OnRead`, the reader also stops a partition that the client holds blocked. Its error is `partition_lane_blocked` (14009) for a block that another call on the client left. Over HTTP it is `fetch_progress_uncertain` (14010) for a lost read of the reader itself. Call `AbandonOperation` with the `OperationId()` of the error, and then call `Seek`. A `Seek` of a partition that is still blocked fails with `partition_lane_blocked`.
+- Under `CommitPolicy::OnRead`, a read from the stored offset whose reply does not decode also stops its partition until a `Seek`. Its error has no `Skip()`, because the reader does not know where that reply started.
 - `Close` stops the reader, and a second `Close` does nothing. Destroying a reader without `Close` moves no offset back and does not leave the group.
 
 A consumer group reader joins its group in `Reader` and leaves it in `Close`. A group create or join with an unknown outcome throws its error, and the next `Reader` or `GroupConsumer` joins again. A join that landed keeps its member in the group until the session ends.

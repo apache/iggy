@@ -136,15 +136,16 @@ impl ReadException {
     }
 
     /// For a message that does not decode: the continuation after it. The reader reads the
-    /// message again until a seek of its partition to this continuation skips it. For a lost
-    /// range: the continuation after the last offset of `lost`. Null for every other error.
+    /// message again until a seek of its partition to this continuation skips it. Null for
+    /// every other error.
     #[php(getter)]
     pub fn skip(&self) -> Option<PollingStrategy> {
         self.skip.clone()
     }
 
     /// Whether the reader stopped the partition after six refusals in a row that a retry does
-    /// not change, such as Unauthorized (41). A seek of the partition reads it again.
+    /// not change, such as Unauthorized (41), or after one TieredReadFailed (96). A seek of the
+    /// partition reads it again.
     #[php(getter, change_case = "snake_case")]
     pub fn is_lasting_refusal(&self) -> bool {
         self.lasting_refusal
@@ -152,7 +153,10 @@ impl ReadException {
 
     /// For messages that a lost read committed and that the reader could not read again: their
     /// first and last offset, as [first, last]. The code is then FetchProgressUncertain
-    /// (14010). Null for every other error.
+    /// (14010). Null for every other error. This error stops nothing and needs no seek. A
+    /// batch that the reader holds after the range comes next, and a seek before the
+    /// application takes it drops it. If the reader stopped the partition, the error that
+    /// stopped it comes after that batch.
     #[php(getter)]
     pub fn lost(&self) -> Option<Vec<u64>> {
         self.lost.map(|(first, last)| vec![first, last])
@@ -415,6 +419,24 @@ mod tests {
     }
 
     #[test]
+    fn given_tiered_read_failure_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::TieredReadFailed;
+        assert_eq!(error.as_code(), 96);
+        assert_eq!(error.as_string(), "tiered_read_failed");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+
+        let read = ReadError::new(Some(1), error);
+        assert_eq!(read.error.as_code(), 96);
+        assert!(
+            read.is_lasting_refusal(),
+            "the first tiered read failure stops its partition"
+        );
+    }
+
+    #[test]
     fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
         const PARTITION_ID: u32 = 7;
         const OPERATION_ID: u64 = 42;
@@ -424,15 +446,17 @@ mod tests {
             Some(PARTITION_ID),
             IggyError::FetchProgressUncertain(OPERATION_ID),
         );
-        error.skip = Some(RustPollingStrategy::offset(LAST + 1));
         error.lost = Some(FIRST..=LAST);
 
         let exception = ReadException::from(&error);
 
         assert_eq!(exception.partition_id(), Some(PARTITION_ID));
-        assert!(exception.skip().is_some());
+        assert!(exception.skip().is_none());
         assert_eq!(exception.lost(), Some(vec![FIRST, LAST]));
-        let other = ReadException::from(&ReadError::new(None, IggyError::Disconnected));
+        let mut undecoded = ReadError::new(Some(PARTITION_ID), IggyError::CannotReadMessage);
+        undecoded.skip = Some(RustPollingStrategy::offset(LAST + 1));
+        let other = ReadException::from(&undecoded);
+        assert!(other.skip().is_some());
         assert_eq!(other.lost(), None, "only a lost range carries offsets");
     }
 }

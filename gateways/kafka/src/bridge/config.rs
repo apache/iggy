@@ -175,8 +175,9 @@ pub struct IggyBridgeConfig {
     pub tls: IggyTls,
     pub produce_sessions: ProduceSessionLimits,
     /// Pass the producer of an idempotent Kafka batch to Iggy, so the partition writes the batch
-    /// once. Off by default, because released consumers cannot read such batches. When off, a
-    /// retry of an idempotent producer can write its records twice.
+    /// once. On by default. Iggy clients from before the 0.10.0 release cannot poll such batches.
+    /// When off, a retry of an idempotent producer can write its records twice, or after later
+    /// ones.
     pub idempotent_producers: bool,
     /// The nodes of the last roster the bridge read, which each new client dials after `address`.
     /// No variable sets it: the bridge fills it, and every clone of this config shares it.
@@ -257,7 +258,8 @@ impl IggyBridgeConfig {
             BridgeError::InvalidConfig(
                 "IGGY_KAFKA_IGGY_PASSWORD must be set: the iggy-server root password is the \
                  operator's own unless started with --with-default-root-credentials, so there is \
-                 no safe default to fall back to"
+                 no safe default to fall back to. To run without Iggy, in stub mode, set \
+                 IGGY_KAFKA_BRIDGE_ENABLED=false"
                     .to_string(),
             )
         })?;
@@ -329,7 +331,7 @@ impl IggyBridgeConfig {
         let idempotent_producers = match std::env::var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS") {
             Ok(raw) => parse_bool("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", &raw)
                 .map_err(BridgeError::InvalidConfig)?,
-            Err(_) => false,
+            Err(_) => true,
         };
         let topic_defaults = TopicDefaults::from_env().map_err(BridgeError::InvalidConfig)?;
 
@@ -574,9 +576,9 @@ mod tests {
         }
         let unset = IggyBridgeConfig::from_env();
         unsafe {
-            std::env::set_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "true");
+            std::env::set_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "false");
         }
-        let on = IggyBridgeConfig::from_env();
+        let off = IggyBridgeConfig::from_env();
         unsafe {
             std::env::set_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS", "yes");
         }
@@ -586,8 +588,8 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_IDEMPOTENT_PRODUCERS");
         }
 
-        assert!(!unset.unwrap().idempotent_producers, "off by default");
-        assert!(on.unwrap().idempotent_producers);
+        assert!(unset.unwrap().idempotent_producers, "on by default");
+        assert!(!off.unwrap().idempotent_producers);
         assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
     }
 

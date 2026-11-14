@@ -66,7 +66,8 @@ use iggy_common::{
     MetadataPartitionsItem, MetadataSession, MetadataSessionClosed, MetadataStreamChange,
     MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTopicChange,
     MetadataTopicDeleted, MetadataTopicItem, MetadataUserChange, MetadataUserIdentity,
-    MetadataUserPermissionsUpdated, Permissions as RustPermissions, Stats as RustStats,
+    MetadataUserPermissionsUpdated, Permissions as RustPermissions,
+    PersonalAccessTokenInfo as RustPersonalAccessTokenInfo, Stats as RustStats,
     StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
     TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
     UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
@@ -204,6 +205,17 @@ impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
             permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
             options: resource_options_to_ffi(&user.options, true),
             derived_options: resource_options_to_ffi(&user.options, false),
+        }
+    }
+}
+
+impl From<RustPersonalAccessTokenInfo> for ffi::PersonalAccessTokenInfo {
+    fn from(token: RustPersonalAccessTokenInfo) -> Self {
+        let has_expiry = token.expiry_at.is_some();
+        ffi::PersonalAccessTokenInfo {
+            name: token.name,
+            has_expiry,
+            expiry: token.expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
         }
     }
 }
@@ -605,16 +617,18 @@ impl ffi::StreamCreateOptions {
 }
 
 pub(crate) fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
+    parse_expiry("message expiry", kind, value)
+}
+
+fn parse_expiry(option: &str, kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
     match kind {
         "server_default" | "default" => Ok(RustIggyExpiry::ServerDefault),
         "never_expire" => Ok(RustIggyExpiry::NeverExpire),
-        "duration" if value == 0 => {
-            Err("message expiry duration must be greater than zero".to_string())
-        }
+        "duration" if value == 0 => Err(format!("{option} duration must be greater than zero")),
         "duration" => Ok(RustIggyExpiry::ExpireDuration(
             iggy::prelude::IggyDuration::from(value),
         )),
-        _ => Err(format!("invalid message expiry kind '{kind}'")),
+        _ => Err(format!("invalid {option} kind '{kind}'")),
     }
 }
 
@@ -633,8 +647,12 @@ fn parse_user_status(
 }
 
 fn parse_max_topic_size(value: &str) -> Result<RustMaxTopicSize, String> {
+    parse_topic_size("max topic size", value)
+}
+
+fn parse_topic_size(option: &str, value: &str) -> Result<RustMaxTopicSize, String> {
     RustMaxTopicSize::from_str(value)
-        .map_err(|error| format!("invalid max topic size '{value}': {error}"))
+        .map_err(|error| format!("invalid {option} '{value}': {error}"))
 }
 
 impl From<RustOptionSpec> for ffi::OptionSpec {
@@ -672,6 +690,32 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
         };
         let max_topic_size = if options.has_max_topic_size {
             Some(parse_max_topic_size(&options.max_topic_size)?)
+        } else {
+            None
+        };
+        let segment_max_age = if options.has_segment_max_age {
+            Some(parse_expiry(
+                "segment max age",
+                &options.segment_max_age_kind,
+                options.segment_max_age_value,
+            )?)
+        } else {
+            None
+        };
+        let local_retention_age = if options.has_local_retention_age {
+            Some(parse_expiry(
+                "local retention age",
+                &options.local_retention_age_kind,
+                options.local_retention_age_value,
+            )?)
+        } else {
+            None
+        };
+        let local_retention_size = if options.has_local_retention_size {
+            Some(parse_topic_size(
+                "local retention size",
+                &options.local_retention_size,
+            )?)
         } else {
             None
         };
@@ -751,6 +795,10 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             } else {
                 None
             },
+            segment_max_age,
+            tiered_storage: options.has_tiered_storage.then_some(options.tiered_storage),
+            local_retention_age,
+            local_retention_size,
             raw,
         })
     }
@@ -773,10 +821,30 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
         } else {
             None
         };
+        let local_retention_age = if options.has_local_retention_age {
+            Some(parse_expiry(
+                "local retention age",
+                &options.local_retention_age_kind,
+                options.local_retention_age_value,
+            )?)
+        } else {
+            None
+        };
+        let local_retention_size = if options.has_local_retention_size {
+            Some(parse_topic_size(
+                "local retention size",
+                &options.local_retention_size,
+            )?)
+        } else {
+            None
+        };
         Ok(RustTopicUpdateOptions {
             name: options.has_name.then_some(options.name),
             message_expiry,
             max_topic_size,
+            tiered_storage: options.has_tiered_storage.then_some(options.tiered_storage),
+            local_retention_age,
+            local_retention_size,
             reset: ffi_reset_keys(options.reset)?,
             raw_reset: options.raw_reset.into_iter().collect(),
             raw: ffi_options_to_raw(options.raw_options)?,
@@ -1976,6 +2044,13 @@ mod tests {
             message_expiry_value: 5,
             has_max_topic_size: false,
             max_topic_size: "unlimited".to_owned(),
+            has_tiered_storage: false,
+            tiered_storage: true,
+            has_local_retention_age: false,
+            local_retention_age_kind: "duration".to_owned(),
+            local_retention_age_value: 5,
+            has_local_retention_size: false,
+            local_retention_size: "unlimited".to_owned(),
             reset: vec!["max_topic_size".to_owned()],
             raw_reset: Vec::new(),
             raw_options: Vec::new(),
@@ -2055,6 +2130,13 @@ mod tests {
             message_expiry_value: 0,
             has_max_topic_size: false,
             max_topic_size: String::new(),
+            has_tiered_storage: false,
+            tiered_storage: false,
+            has_local_retention_age: false,
+            local_retention_age_kind: String::new(),
+            local_retention_age_value: 0,
+            has_local_retention_size: false,
+            local_retention_size: String::new(),
             reset: vec!["max_topic_size".to_owned()],
             raw_reset: vec!["future_key".to_owned()],
             raw_options: Vec::new(),
@@ -2067,6 +2149,47 @@ mod tests {
                 raw_reset: BTreeSet::from(["future_key".to_owned()]),
                 ..RustTopicUpdateOptions::default()
             }
+        );
+    }
+
+    #[test]
+    fn given_tiering_fields_when_converting_topic_update_should_carry_them() {
+        let update = |age_kind: &str, size: &str| ffi::TopicUpdateOptions {
+            has_name: false,
+            name: String::new(),
+            has_message_expiry: false,
+            message_expiry_kind: String::new(),
+            message_expiry_value: 0,
+            has_max_topic_size: false,
+            max_topic_size: String::new(),
+            has_tiered_storage: true,
+            tiered_storage: true,
+            has_local_retention_age: true,
+            local_retention_age_kind: age_kind.to_owned(),
+            local_retention_age_value: 1_800_000_000,
+            has_local_retention_size: true,
+            local_retention_size: size.to_owned(),
+            reset: Vec::new(),
+            raw_reset: Vec::new(),
+            raw_options: Vec::new(),
+        };
+
+        assert_eq!(
+            RustTopicUpdateOptions::try_from(update("duration", "unlimited")),
+            Ok(RustTopicUpdateOptions {
+                tiered_storage: Some(true),
+                local_retention_age: Some(RustIggyExpiry::from(1_800_000_000u64)),
+                local_retention_size: Some(RustMaxTopicSize::Unlimited),
+                ..RustTopicUpdateOptions::default()
+            })
+        );
+        assert_eq!(
+            RustTopicUpdateOptions::try_from(update("sometimes", "unlimited")),
+            Err("invalid local retention age kind 'sometimes'".to_owned())
+        );
+        assert!(
+            RustTopicUpdateOptions::try_from(update("duration", "plenty"))
+                .is_err_and(|error| error.starts_with("invalid local retention size 'plenty'"))
         );
     }
 
@@ -2455,5 +2578,23 @@ mod tests {
             MetadataChangesQuery::try_from(query(ffi::MetadataChangeStart::After, Vec::new())),
             Err(IggyError::InvalidCommand)
         );
+    }
+
+    #[test]
+    fn given_token_with_and_without_expiry_when_converting_should_preserve_presence() {
+        let expiring = ffi::PersonalAccessTokenInfo::from(RustPersonalAccessTokenInfo {
+            name: "ci-bot".to_owned(),
+            expiry_at: Some(IggyTimestamp::from(1_700_000_000_000_000)),
+        });
+        assert_eq!(expiring.name, "ci-bot");
+        assert!(expiring.has_expiry);
+        assert_eq!(expiring.expiry, 1_700_000_000_000_000);
+
+        let permanent = ffi::PersonalAccessTokenInfo::from(RustPersonalAccessTokenInfo {
+            name: "laptop".to_owned(),
+            expiry_at: None,
+        });
+        assert!(!permanent.has_expiry);
+        assert_eq!(permanent.expiry, 0);
     }
 }

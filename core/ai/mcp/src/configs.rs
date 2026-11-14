@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::error::McpRuntimeError;
 use ::configs::{FileConfigProvider, TypedEnvProvider};
-use axum::http::Method;
+use axum::http::{HeaderName, HeaderValue, Method};
 use configs_derive::ConfigEnv;
 use figment::{
     Metadata, Profile, Provider,
@@ -29,6 +30,8 @@ use std::fmt::{Display as FmtDisplay, Formatter};
 use std::str::FromStr;
 use strum::Display;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+const ANY_ORIGIN: &str = "*";
 
 #[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
 #[config_env(prefix = "IGGY_MCP_", name = "iggy-mcp-server-config")]
@@ -67,12 +70,18 @@ pub struct PermissionsConfig {
     pub read: bool,
     pub update: bool,
     pub delete: bool,
+    #[serde(default)]
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
+#[serde(default)]
 pub struct HttpConfig {
     pub address: String,
     pub path: String,
+    #[config_env(secret)]
+    pub auth_token: String,
+    pub allowed_hosts: Vec<String>,
     pub cors: HttpCorsConfig,
     pub tls: HttpTlsConfig,
 }
@@ -235,8 +244,14 @@ impl Default for IggyConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            address: "localhost:8082".to_owned(),
+            address: "127.0.0.1:8082".to_owned(),
             path: "/mcp".to_owned(),
+            auth_token: String::new(),
+            allowed_hosts: vec![
+                "localhost".to_owned(),
+                "127.0.0.1".to_owned(),
+                "::1".to_owned(),
+            ],
             cors: HttpCorsConfig::default(),
             tls: HttpTlsConfig::default(),
         }
@@ -250,56 +265,81 @@ impl Default for PermissionsConfig {
             read: true,
             update: true,
             delete: true,
+            admin: false,
         }
     }
 }
 
-pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
-    let allowed_origins = match &config.allowed_origins {
-        origins if origins.is_empty() => AllowOrigin::default(),
-        origins if origins.first().unwrap() == "*" => AllowOrigin::any(),
-        origins => AllowOrigin::list(origins.iter().map(|s| s.parse().unwrap())),
+impl HttpCorsConfig {
+    pub fn allows_any_origin(&self) -> bool {
+        self.allowed_origins
+            .iter()
+            .any(|origin| origin == ANY_ORIGIN)
+    }
+}
+
+pub fn configure_cors(config: &HttpCorsConfig) -> Result<CorsLayer, McpRuntimeError> {
+    let allowed_origins = if config.allows_any_origin() {
+        if config.allowed_origins.len() > 1 {
+            return Err(McpRuntimeError::InvalidCorsConfiguration(format!(
+                "the {ANY_ORIGIN} origin cannot be listed with other origins"
+            )));
+        }
+        if config.allow_credentials {
+            return Err(McpRuntimeError::InvalidCorsConfiguration(format!(
+                "allow_credentials cannot be combined with the {ANY_ORIGIN} origin"
+            )));
+        }
+        AllowOrigin::any()
+    } else if config.allowed_origins.is_empty() {
+        AllowOrigin::default()
+    } else {
+        AllowOrigin::list(parsed_values::<HeaderValue>(
+            &config.allowed_origins,
+            "origin",
+        )?)
     };
-
-    let allowed_headers = config
-        .allowed_headers
-        .iter()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap())
-        .collect::<Vec<_>>();
-
-    let exposed_headers = config
-        .exposed_headers
-        .iter()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap())
-        .collect::<Vec<_>>();
-
+    let allowed_headers = parsed_values::<HeaderName>(&config.allowed_headers, "header")?;
+    let exposed_headers = parsed_values::<HeaderName>(&config.exposed_headers, "header")?;
     let allowed_methods = config
         .allowed_methods
         .iter()
-        .filter(|s| !s.is_empty())
-        .map(|s| match s.to_uppercase().as_str() {
-            "GET" => Method::GET,
-            "POST" => Method::POST,
-            "PUT" => Method::PUT,
-            "DELETE" => Method::DELETE,
-            "HEAD" => Method::HEAD,
-            "OPTIONS" => Method::OPTIONS,
-            "CONNECT" => Method::CONNECT,
-            "PATCH" => Method::PATCH,
-            "TRACE" => Method::TRACE,
-            _ => panic!("Invalid HTTP method: {s}"),
+        .filter(|method| !method.is_empty())
+        .map(|method| match method.to_uppercase().as_str() {
+            "GET" => Ok(Method::GET),
+            "POST" => Ok(Method::POST),
+            "PUT" => Ok(Method::PUT),
+            "DELETE" => Ok(Method::DELETE),
+            "HEAD" => Ok(Method::HEAD),
+            "OPTIONS" => Ok(Method::OPTIONS),
+            "CONNECT" => Ok(Method::CONNECT),
+            "PATCH" => Ok(Method::PATCH),
+            "TRACE" => Ok(Method::TRACE),
+            _ => Err(McpRuntimeError::InvalidCorsConfiguration(format!(
+                "invalid HTTP method {method}"
+            ))),
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    CorsLayer::new()
+    Ok(CorsLayer::new()
         .allow_methods(allowed_methods)
         .allow_origin(allowed_origins)
         .allow_headers(allowed_headers)
         .expose_headers(exposed_headers)
         .allow_credentials(config.allow_credentials)
-        .allow_private_network(config.allow_private_network)
+        .allow_private_network(config.allow_private_network))
+}
+
+fn parsed_values<T: FromStr>(values: &[String], kind: &str) -> Result<Vec<T>, McpRuntimeError> {
+    values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse().map_err(|_| {
+                McpRuntimeError::InvalidCorsConfiguration(format!("invalid {kind} {value:?}"))
+            })
+        })
+        .collect()
 }
 
 impl std::fmt::Display for IggyConfig {
@@ -335,8 +375,8 @@ impl std::fmt::Display for PermissionsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ create: {}, read: {}, update: {}, delete: {} }}",
-            self.create, self.read, self.update, self.delete
+            "{{ create: {}, read: {}, update: {}, delete: {}, admin: {} }}",
+            self.create, self.read, self.update, self.delete, self.admin
         )
     }
 }
@@ -355,8 +395,17 @@ impl std::fmt::Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ address: {}, path: {}, cors: {}, tls: {} }}",
-            self.address, self.path, self.cors, self.tls
+            "{{ address: {}, path: {}, auth_token: {}, allowed_hosts: {:?}, cors: {}, tls: {} }}",
+            self.address,
+            self.path,
+            if self.auth_token.is_empty() {
+                ""
+            } else {
+                "****"
+            },
+            self.allowed_hosts,
+            self.cors,
+            self.tls
         )
     }
 }
@@ -419,5 +468,41 @@ impl Provider for McpServerEnvProvider {
 
     fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
         self.provider.data()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::catch_unwind;
+
+    #[test]
+    fn given_invalid_cors_values_when_configuring_should_refuse_them() {
+        let configs = [
+            HttpCorsConfig {
+                allowed_methods: vec!["FETCH".to_owned()],
+                ..HttpCorsConfig::default()
+            },
+            HttpCorsConfig {
+                allowed_origins: vec!["http://console.example\n".to_owned()],
+                ..HttpCorsConfig::default()
+            },
+            HttpCorsConfig {
+                allowed_headers: vec!["not a header".to_owned()],
+                ..HttpCorsConfig::default()
+            },
+            HttpCorsConfig {
+                allowed_origins: vec!["http://console.example".to_owned(), "*".to_owned()],
+                ..HttpCorsConfig::default()
+            },
+        ];
+
+        for config in configs {
+            let result = catch_unwind(|| configure_cors(&config));
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "{config} must be refused with an error, not accepted or a panic"
+            );
+        }
     }
 }

@@ -29,11 +29,30 @@ repository = "https://github.com/apache/iggy"
 publish = false
 
 [dependencies]
+arc-swap = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
+compio = { workspace = true }
 crc32c = { workspace = true }
+cyper = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+http = { workspace = true }
+md5 = { workspace = true }
+percent-encoding = { workspace = true }
+quick-xml = { workspace = true }
+rand = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+send_wrapper = { workspace = true, features = ["futures"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"

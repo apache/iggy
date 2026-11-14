@@ -93,14 +93,18 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
     public let raw: [UInt8]?
     /// Whether the partition reads nothing until a
     /// ``PartitionReader/seek(partitionID:to:)``: a message that does not
-    /// decode, or a position whose history is gone. A partition that a lost
+    /// decode, a position whose history is gone, or tiered data that the
+    /// object store refuses for good. A partition that a lost
     /// committing read of another caller blocks (``IggyErrorCode/partitionLaneBlocked``
     /// under ``CommitPolicy/onRead``) reads again by itself once
     /// ``IggyClient/abandonOperation(_:)`` took that operation.
     public let stopsPartition: Bool
     /// For ``IggyErrorCode/fetchProgressUncertain``: the first and the last
     /// offset of a range that a lost read stored and the reader never
-    /// delivered, or that the history no longer holds.
+    /// delivered, or that the history no longer holds. This report stops
+    /// nothing and needs no ``PartitionReader/seek(partitionID:to:)``. A
+    /// batch that the reader holds after the range follows it, and then, if
+    /// the partition stopped, an error whose ``stopsPartition`` is true.
     public let lost: ClosedRange<UInt64>?
 
     init(
@@ -176,8 +180,9 @@ public struct ReadError: Error, Sendable, CustomStringConvertible {
 ///   ``PollOptions/maxWait``, a partition that a read found empty waits it
 ///   too.
 ///   ``IggyErrorCode/historyUnavailable`` for a position read in a history
-///   that is gone, and a message that does not decode, stop the partition
-///   until a seek.
+///   that is gone, ``IggyErrorCode/tieredReadFailed`` and a message that does
+///   not decode stop the partition until a seek, and the read is not sent
+///   again.
 public actor PartitionReader: AsyncSequence {
     public typealias Element = PolledMessages
 
@@ -1174,10 +1179,12 @@ public actor PartitionReader: AsyncSequence {
             }
             if configuration.options.commitsOnRead {
                 let now = ContinuousClock.now
-                // A sync beside the reads can take a partition away meanwhile.
+                resumeUnblocked()
+                // A sync beside the reads can take a partition away meanwhile. A stopped partition reads nothing
+                // until a seek, and a lookup of it would send the refused read again on each pass.
                 for partition in assigned.sorted()
                 where assigned.contains(partition) && activeReads[partition] == nil && (pausedUntil[partition] ?? now) <= now
-                    && awaitingLookup[partition] == nil
+                    && awaitingLookup[partition] == nil && !stopped.contains(partition)
                 {
                     // The close waits for this call, so a lookup after the close start only delays it.
                     guard !isClosed else {
@@ -1589,14 +1596,20 @@ public actor PartitionReader: AsyncSequence {
         }
         let now = ContinuousClock.now
         pausedUntil = pausedUntil.filter { $0.value > now }
-        for (partition, operation) in blockedBy where !client.core.pollRouter.retainsFetch(operation) {
-            blockedBy[partition] = nil
-            stopped.remove(partition)
-        }
+        resumeUnblocked()
         if !configuration.options.commitsOnRead || onDemand {
             fetchAhead()
         }
         pollSingles()
+    }
+
+    /// Resumes the partitions that a lost committing read blocked once that
+    /// read was abandoned.
+    private func resumeUnblocked() {
+        for (partition, operation) in blockedBy where !client.core.pollRouter.retainsFetch(operation) {
+            blockedBy[partition] = nil
+            stopped.remove(partition)
+        }
     }
 
     /// With `onRead` a read goes out only for a reader that waits with
@@ -2298,8 +2311,9 @@ public actor PartitionReader: AsyncSequence {
     }
 
     /// The partition moved to another member before its gap was read again,
-    /// or the history no longer holds the rest of the gap: those messages are
-    /// lost to this reader, the batches after them are not.
+    /// the history no longer holds the rest of the gap, or the server lost
+    /// that history: those messages are lost to this reader, the batches
+    /// after them are not.
     /// The error comes first, as the lost offsets precede those batches.
     private func giveUp(_ gap: Gap, of partition: UInt32) {
         reportLost(gap.next..<gap.end, of: partition)
@@ -2321,10 +2335,12 @@ public actor PartitionReader: AsyncSequence {
     /// for the retry interval: a moved primary groups again and waits for a
     /// good lookup instead, a refused owner syncs the assignment and waits
     /// for a good lookup too, a position without a history reads again, a
-    /// lost membership joins again. What the reader cannot repair is queued
-    /// for ``next()``, and so is each ``notOwnedRefusalsPerReport``th
-    /// refusal of an owner in a row. The wait after a refusal of an owner
-    /// doubles with each refusal in a row, as `backoff` in the Rust SDK.
+    /// lost membership joins again. Tiered data that the object store refuses
+    /// for good stops its partitions without a wait. What the reader cannot
+    /// repair is queued for ``next()``, and so is each
+    /// ``notOwnedRefusalsPerReport``th refusal of an owner in a row. The wait
+    /// after a refusal of an owner doubles with each refusal in a row, as
+    /// `backoff` in the Rust SDK.
     private func failed(_ partitions: [UInt32], with error: IggyError) {
         let until = ContinuousClock.now + configuration.retryInterval
         var stops = false
@@ -2353,15 +2369,22 @@ public actor PartitionReader: AsyncSequence {
             return
         case .historyUnavailable:
             for partition in partitions {
-                if positions[partition]?.context != nil {
-                    stopped.insert(partition)
-                    report(ReadError(partitionID: partition, error: error, stopsPartition: true))
+                // A gap is read in the history of its context. The server lost that history, so the gap is lost and the partition stops.
+                if gaps[partition] != nil || positions[partition]?.context != nil {
+                    stop(partition, with: error)
                 } else {
                     forget(partition)
                     pausedUntil[partition] = until
                 }
             }
             client.core.pollRouter.dropRoutes(partitions.map { PollRouter.RouteKey(stream: streamID, topic: topicID, partitionID: $0) })
+            return
+        case .tieredReadFailed:
+            // The object store refused the read for good, so the same read
+            // gets the same answer: the partition stops at the first one.
+            for partition in partitions {
+                stop(partition, with: error)
+            }
             return
         case .consumerGroupMemberNotFound:
             joinedGroup = false
@@ -2390,6 +2413,19 @@ public actor PartitionReader: AsyncSequence {
         }
         logger.error("Failed to read messages", metadata: metadata.merging(["partitions": "\(partitions)", "error": "\(error)"]) { $1 })
         report(ReadError(partitionID: partitions.count == 1 ? partitions.first : nil, error: error, stopsPartition: stops))
+    }
+
+    /// Stops `partition` until a seek and queues `error` for ``next()``. A
+    /// seek drops the gap of the partition and the replies held behind it,
+    /// and a seek to `next` then reads after both. So the stop gives the gap
+    /// up first: its range is reported as lost and those replies are queued
+    /// before `error`.
+    private func stop(_ partition: UInt32, with error: IggyError) {
+        if let gap = gaps.removeValue(forKey: partition) {
+            giveUp(gap, of: partition)
+        }
+        stopped.insert(partition)
+        report(ReadError(partitionID: partition, error: error, stopsPartition: true))
     }
 
     /// Groups the partitions again, and `partitions` read again once a lookup

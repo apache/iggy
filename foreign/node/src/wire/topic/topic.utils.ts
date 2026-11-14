@@ -21,8 +21,15 @@ import type { ValueOf } from '../../type.utils.js';
 import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
 import { deserializeError } from '../error.utils.js';
 
-/** Default of `message_expiry` and `max_topic_size`: never expire, no cap. */
+/**
+ * Default of `message_expiry`, `max_topic_size`, `segment_max_age` and
+ * `local_retention_size`: never expire, no cap, never roll by age, no local
+ * cap.
+ */
 const UNLIMITED = 0xffff_ffff_ffff_ffffn;
+
+/** Default of `local_retention_age`: one day in microseconds. */
+const DEFAULT_LOCAL_RETENTION_AGE = 86_400_000_000n;
 
 /** Partition id, counters and context, before the two node lists. */
 const PARTITION_COUNTERS_SIZE = 40 + PARTITION_CONTEXT_SIZE;
@@ -48,6 +55,14 @@ export type BaseTopic = {
   messageExpiry: bigint,
   /** Maximum topic size in bytes, read from the options (u64 max = unlimited) */
   maxTopicSize: bigint,
+  /** Segment roll age in microseconds, read from the options (u64 max = never) */
+  segmentMaxAge: bigint,
+  /** Whether sealed segments move to the object store, read from the options */
+  tieredStorage: boolean,
+  /** Local retention of uploaded segments in microseconds, read from the options (u64 max = never) */
+  localRetentionAge: bigint,
+  /** Local cap on uploaded segments in bytes, read from the options (u64 max = unlimited) */
+  localRetentionSize: bigint,
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
@@ -170,14 +185,18 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
   pos += derived.bytesRead;
 
   const setting = (key: string) => explicit.options[key] ?? derived.options[key];
-  const limit = (key: string) => {
+  const limit = (key: string, fallback = UNLIMITED) => {
     const value = setting(key);
-    return typeof value === 'bigint' ? value : UNLIMITED;
+    return typeof value === 'bigint' ? value : fallback;
   };
   const compressionAlgorithm = setting('compression_algorithm') === 'gzip'
     ? CompressionAlgorithm.Gzip : CompressionAlgorithm.None;
   const messageExpiry = limit('message_expiry');
   const maxTopicSize = limit('max_topic_size');
+  const segmentMaxAge = limit('segment_max_age');
+  const tieredStorage = setting('tiered_storage') === true;
+  const localRetentionAge = limit('local_retention_age', DEFAULT_LOCAL_RETENTION_AGE);
+  const localRetentionSize = limit('local_retention_size');
 
   return {
     bytesRead: pos - start,
@@ -189,6 +208,10 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       compressionAlgorithm,
       maxTopicSize,
       messageExpiry,
+      segmentMaxAge,
+      tieredStorage,
+      localRetentionAge,
+      localRetentionSize,
       messagesCount,
       sizeBytes,
       options: explicit.options,

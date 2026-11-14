@@ -253,8 +253,7 @@ fn planned_entries(
                 kek_fingerprints: stream_wrap_set(&stream.options)
                     .ok()
                     .flatten()
-                    .map(|set| set.kek_fingerprints().join(","))
-                    .unwrap_or_default(),
+                    .map_or_default(|set| set.kek_fingerprints().join(",")),
                 error,
             }),
         }

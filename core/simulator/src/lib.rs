@@ -117,6 +117,12 @@ pub struct SimReplica {
     /// [`Simulator::replica_restart`], consumed by `materialise_partition`. Belongs
     /// to the incarnation of the group's `partition_superblocks` entry.
     partition_logs: RefCell<HashMap<IggyNamespace, RetainedPartitionState>>,
+    /// The retained logs that a power loss still has to cut to their WAL. See
+    /// [`Simulator::replica_restart_losing_unsynced_messages`].
+    /// `materialise_partition` cuts a log of a `replicated` partition when it
+    /// takes it. A log that waits for its metadata keeps its entry through a
+    /// later restart.
+    unsynced_partition_logs: RefCell<BTreeSet<IggyNamespace>>,
     /// Fixture groups the last restart could not re-materialise, its replay having
     /// stopped short of their incarnation. Reconcile materialises each once the
     /// metadata catches up.
@@ -580,6 +586,7 @@ impl Simulator {
                 partition_superblocks: RefCell::new(HashMap::new()),
                 partition_storage: SimStorage::default(),
                 partition_logs: RefCell::new(HashMap::new()),
+                unsynced_partition_logs: RefCell::new(BTreeSet::new()),
                 deferred_partitions: RefCell::new(BTreeSet::new()),
                 data_dir: replica_data_dir,
                 system_path,
@@ -1501,8 +1508,30 @@ impl Simulator {
     ///
     /// # Panics
     /// As [`Self::replica_restart`].
-    #[allow(clippy::too_many_lines)]
     pub fn replica_restart_losing_partitions(&mut self, replica_index: u8, lost: &[IggyNamespace]) {
+        self.restart_replica(replica_index, lost, false);
+    }
+
+    /// Restart a crashed replica whose `replicated` partitions come back with
+    /// only what their WAL had synced, as a server that lost power does: its
+    /// boot discards the segment bytes that the durable WAL does not cover.
+    /// [`Self::replica_restart`] keeps every applied message, which such a
+    /// topic does not promise. A `persisted` partition keeps its log.
+    ///
+    /// # Panics
+    /// As [`Self::replica_restart`], and if a WAL kept only a part of the
+    /// applied prefix, which the harness cannot cut a retained log to.
+    pub fn replica_restart_losing_unsynced_messages(&mut self, replica_index: u8) {
+        self.restart_replica(replica_index, &[], true);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn restart_replica(
+        &mut self,
+        replica_index: u8,
+        lost: &[IggyNamespace],
+        unsynced_messages_lost: bool,
+    ) {
         assert!(
             self.crashed.contains(&replica_index),
             "cannot restart replica {replica_index}: not crashed"
@@ -1530,10 +1559,16 @@ impl Simulator {
         // retained for a group its replay had not reached yet is still owed too.
         let mut partition_logs =
             std::mem::take(&mut *self.replicas[idx].partition_logs.borrow_mut());
+        let mut unsynced_partition_logs =
+            std::mem::take(&mut *self.replicas[idx].unsynced_partition_logs.borrow_mut());
         partition_logs.extend(self.retain_partition_logs(idx, &partition_superblocks));
         for namespace in lost {
             partition_logs.remove(namespace);
         }
+        if unsynced_messages_lost {
+            unsynced_partition_logs.extend(partition_logs.keys().copied());
+        }
+        unsynced_partition_logs.retain(|namespace| partition_logs.contains_key(namespace));
         let seeded_namespaces = self.replicas[idx].seeded_namespaces.borrow().clone();
         let seed_namespaces: Vec<_> = seeded_namespaces
             .iter()
@@ -1644,6 +1679,7 @@ impl Simulator {
             partition_superblocks: RefCell::new(partition_superblocks),
             partition_storage,
             partition_logs: RefCell::new(partition_logs),
+            unsynced_partition_logs: RefCell::new(unsynced_partition_logs),
             deferred_partitions: RefCell::new(BTreeSet::new()),
             data_dir: replica_data_dir,
             system_path,
@@ -1852,6 +1888,20 @@ impl Simulator {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
         let partition = shard.plane.partitions().get_by_ns(&namespace)?;
         Some(partition.log.journal().inner.repair_headers_in(ops))
+    }
+
+    /// The header of the prepare a replica journals at `op`, body included, or
+    /// `None` when it journals no such prepare or does not host the namespace.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn partition_journaled_header(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        op: u64,
+    ) -> Option<PrepareHeader> {
+        self.partition_journaled_headers(replica_idx, namespace, op..=op)?
+            .remove(&op)
     }
 
     /// Consensus view for a replica's partition-plane group, or `None` if that
@@ -2139,6 +2189,10 @@ fn materialise_partition(
     // a second materialisation with no restart between would otherwise resurrect a
     // log the live partition has moved past.
     let mut retained = replica.partition_logs.borrow_mut().remove(&namespace);
+    let unsynced_lost = replica
+        .unsynced_partition_logs
+        .borrow_mut()
+        .remove(&namespace);
     let owner_shard = &replica.shards[usize::from(owner)];
     // The live group holds this incarnation's WAL lease; a second open is refused.
     if !owner_shard.plane.partitions().contains(&namespace) {
@@ -2148,6 +2202,19 @@ fn materialise_partition(
             epoch,
             retained.as_mut(),
         );
+        if unsynced_lost
+            && let Some(retained) = retained.as_mut()
+            && !owner_shard
+                .topic_runtime_options(namespace)
+                .durability
+                .is_persisted()
+        {
+            partition_wal::lose_unsynced(
+                retained,
+                &persistence,
+                owner_shard.plane.partitions().config().segment_size,
+            );
+        }
         owner_shard.init_partition(
             namespace,
             Some(superblock),
@@ -2974,6 +3041,62 @@ mod tests {
             Some(0),
             "the delete must finish without a metadata view change"
         );
+    }
+
+    /// The primary of a tiered partition decides its retention, and it can sit
+    /// on a metadata backup, which cannot propose the truncation itself.
+    #[test]
+    fn given_retention_decision_on_metadata_backup_when_relayed_should_commit_the_truncation_on_every_replica()
+     {
+        const PROGRESS_STEPS: usize = 4_000;
+        /// The cleaner hands the decision over on every timed pass until the
+        /// watermark covers it.
+        const DECISION_PERIOD_STEPS: usize = 100;
+        const DECIDED: u64 = 9;
+        let (mut sim, _client) = cluster(0x5245_5445);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.init_partition(namespace);
+        let primary = sim.metadata_primary_index().unwrap();
+        let view = sim.metadata_view();
+        let backup = usize::from((primary + 1) % sim.replica_count);
+        let committed = |sim: &Simulator, replica: usize| {
+            sim.replicas[replica].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .with_committed_partition(namespace, |partition| {
+                    (partition.created_revision, partition.deleted_up_to_offset)
+                })
+                .expect("the partition is committed")
+        };
+        let (created_revision, untrimmed) = committed(&sim, backup);
+        assert_eq!(untrimmed, 0);
+
+        assert!(
+            (0..PROGRESS_STEPS).any(|step| {
+                if step % DECISION_PERIOD_STEPS == 0 {
+                    sim.replicas[backup].shards[0].forward_metadata_submit(
+                        shard::MetadataSubmit::RetentionTruncate {
+                            namespace,
+                            created_revision,
+                            up_to_offset: DECIDED,
+                        },
+                    );
+                }
+                sim.step();
+                (0..usize::from(sim.replica_count))
+                    .all(|replica| committed(&sim, replica).1 == DECIDED)
+            }),
+            "the decision of a metadata backup must commit on every replica"
+        );
+        assert!(sim.network.delivered_any(Command::ForwardCompletion));
+        assert_eq!(
+            sim.metadata_primary_index(),
+            Some(primary),
+            "the backup must not become the primary to commit its decision"
+        );
+        assert_eq!(sim.metadata_view(), view);
     }
 
     /// Fences `namespace` on replica 0, the metadata primary, as boot recovery
@@ -12444,6 +12567,532 @@ mod view_change_data_loss_tests {
     }
 }
 
+#[cfg(test)]
+mod unservable_op_view_change_tests {
+    //! A `replicated` group must start a view once every replica has reported
+    //! and none of them can serve an op above the commit point.
+    //!
+    //! `replicated` acknowledges a prepare before its write is stable, so a
+    //! replica that restarts may lack ops it prepared, and its log is untrusted
+    //! until a view vouches for it. With fewer trusted logs than a view-change
+    //! quorum the merge takes every replica. An op that one of them names by its
+    //! header alone, and none holds, then has no source left: either the view
+    //! starts without it or the group never serves again.
+
+    use super::partition_repair_driver_tests::{cluster, is_request_prepares_for, prepare_for};
+    use super::*;
+    use bytes::Bytes;
+    use consensus::{Sequencer, Status};
+    use packet::Packet;
+
+    const SEED: u64 = 0x5EED_D15C;
+    /// Leads the first view, then stays down until the primary of the next view
+    /// has died, so its log never leaves the first view.
+    const STALE: u8 = 0;
+    /// Leads the next view, prepares the op no backup receives, and loses it
+    /// with the unsynced tail of its WAL.
+    const OLD_PRIMARY: u8 = 1;
+    /// Learns the op from the `StartView` of that view and never gets its body.
+    const HEADER_HOLDER: u8 = 2;
+    const REPLICAS: [u8; 3] = [STALE, OLD_PRIMARY, HEADER_HOLDER];
+    /// Covers a heartbeat timeout, a full view probe and several view-change
+    /// rounds.
+    const SETTLE_STEPS: usize = 4_000;
+    const PAYLOAD: &[u8] = b"sent-after-the-view-change";
+
+    /// The replica that starts the view once every replica has reported.
+    #[derive(Clone, Copy, Debug)]
+    enum Starter {
+        /// Leads the view right after the lost one. It holds the header, so it
+        /// must drop its own copy of the op.
+        HeaderHolder,
+        /// Leads the view after that one. The header holder is then a backup
+        /// that must adopt a log shorter than its own.
+        Stale,
+    }
+
+    #[test]
+    fn given_an_uncommitted_op_no_replica_can_serve_when_every_replica_reports_should_start_a_view_and_commit_new_sends()
+     {
+        for starter in [Starter::HeaderHolder, Starter::Stale] {
+            start_a_view_without_the_unservable_op(starter);
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn start_a_view_without_the_unservable_op(starter: Starter) {
+        let namespace = namespace();
+        let (mut sim, client) = cluster(SEED);
+        sim.register_client_with_primary(&client);
+        sim.set_partition_durability(namespace, iggy_common::Durability::Replicated);
+        sim.seed_stream_topic_partition(namespace);
+        for replica in &sim.replicas {
+            materialise_partition(replica, namespace, sim.consumer_offsets_max);
+        }
+        step_until(&mut sim, "the fresh group never elected replica 0", |sim| {
+            group(sim, STALE)
+                .is_some_and(|group| group.status == Status::Normal && group.is_primary)
+        });
+        let first_view = group(&sim, STALE).unwrap().view;
+        sim.discover_partition_contexts(&client);
+        let mut committed_op = 0;
+        for payload in [&b"first"[..], b"second"] {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                STALE,
+                client.send_messages(namespace, &[Bytes::from_static(payload)]),
+            );
+            assert_eq!(reply.header().status, 0);
+            committed_op = reply.header().commit;
+        }
+        step_until(&mut sim, "a replica never applied both sends", |sim| {
+            every_group(sim, |group| group.commit_min == committed_op)
+        });
+
+        // The stale replica misses the next view.
+        sim.replica_crash(STALE);
+        step_until(
+            &mut sim,
+            "the survivors never started the next view",
+            |sim| {
+                settled_above(sim, OLD_PRIMARY, first_view, true)
+                    && settled_above(sim, HEADER_HOLDER, first_view, false)
+                    && admits_requests(sim, OLD_PRIMARY)
+            },
+        );
+        let lost_view = group(&sim, OLD_PRIMARY).unwrap().view;
+
+        // The primary prepares an op that no backup receives or can repair.
+        set_link_drops(&mut sim, OLD_PRIMARY, HEADER_HOLDER, Some(is_group_prepare));
+        set_link_drops(
+            &mut sim,
+            HEADER_HOLDER,
+            OLD_PRIMARY,
+            Some(is_group_repair_request),
+        );
+        let unservable_op = committed_op + 1;
+        sim.discover_partition_contexts(&client);
+        sim.submit_request(
+            client.client_id(),
+            OLD_PRIMARY,
+            client
+                .send_messages(namespace, &[Bytes::from_static(b"never-acknowledged")])
+                .into_generic(),
+        );
+        let lost = (0..SETTLE_STEPS)
+            .find_map(|_| {
+                let replies = sim.step();
+                assert!(
+                    replies.is_empty(),
+                    "a send no backup received was answered: {:?}",
+                    replies[0].header()
+                );
+                sim.partition_journaled_header(usize::from(OLD_PRIMARY), namespace, unservable_op)
+            })
+            .expect("the primary must journal the send");
+
+        // The backup restarts and adopts the primary's `StartView`, which names
+        // the op. It holds the header from then on, and never the body.
+        sim.replica_crash(HEADER_HOLDER);
+        sim.replica_restart(HEADER_HOLDER);
+        step_until(
+            &mut sim,
+            "the backup never adopted the primary's view",
+            |sim| {
+                group(sim, HEADER_HOLDER).is_some_and(|group| {
+                    group.status == Status::Normal
+                        && group.view == lost_view
+                        && group.head == unservable_op
+                })
+            },
+        );
+        assert!(
+            sim.partition_journaled_header(usize::from(HEADER_HOLDER), namespace, unservable_op)
+                .is_none(),
+            "the backup must hold op {unservable_op} as a header only"
+        );
+        assert!(
+            group(&sim, OLD_PRIMARY).is_some_and(|group| {
+                group.status == Status::Normal
+                    && group.is_primary
+                    && group.commit_min == committed_op
+            }),
+            "the op must stay uncommitted on its primary: {:?}",
+            groups(&sim)
+        );
+
+        // The primary dies with the only body. It and the stale replica restart
+        // on logs that stop below the op. The links carry prepares and repair
+        // requests again, and no replica holds the op to answer with.
+        sim.replica_crash(OLD_PRIMARY);
+        sim.replica_restart(OLD_PRIMARY);
+        sim.replica_restart(STALE);
+        set_link_drops(&mut sim, OLD_PRIMARY, HEADER_HOLDER, None);
+        set_link_drops(&mut sim, HEADER_HOLDER, OLD_PRIMARY, None);
+        let primary = match starter {
+            Starter::HeaderHolder => HEADER_HOLDER,
+            Starter::Stale => {
+                // The header holder is the candidate of the next view. It
+                // cannot start that view without the votes of the others, and
+                // the stale replica is the candidate of the view after it.
+                for voter in [STALE, OLD_PRIMARY] {
+                    set_link_drops(
+                        &mut sim,
+                        voter,
+                        HEADER_HOLDER,
+                        Some(is_group_do_view_change),
+                    );
+                }
+                STALE
+            }
+        };
+        step_until(
+            &mut sim,
+            "a restarted replica never rebuilt the group",
+            |sim| every_group(sim, |_| true),
+        );
+        for replica in [STALE, OLD_PRIMARY] {
+            assert_eq!(
+                group(&sim, replica).map(|group| (group.status, group.head)),
+                Some((Status::Recovering, committed_op)),
+                "replica {replica} must restart on a log that stops below op {unservable_op}"
+            );
+        }
+
+        // Nobody answers the view probes of the restarted replicas, so both
+        // vote on logs no view vouches for. One trusted log is short of a
+        // view-change quorum, and the merge takes every replica.
+        let mut voted_untrusted = [false; 3];
+        let view_started = (0..SETTLE_STEPS).any(|_| {
+            sim.step();
+            for (voted, group) in voted_untrusted.iter_mut().zip(groups(&sim)) {
+                *voted |= group.is_some_and(|group| group.untrusted_log);
+            }
+            every_group(&sim, |group| {
+                group.status == Status::Normal
+                    && group.view > lost_view
+                    && group.view == group.log_view
+                    && !group.untrusted_log
+            })
+        });
+        assert!(
+            view_started,
+            "{starter:?}: every replica reported and the group never started a view: {:?}",
+            groups(&sim)
+        );
+        assert_eq!(
+            voted_untrusted,
+            [true, true, false],
+            "{starter:?}: only the restarted replicas {STALE} and {OLD_PRIMARY} may vote untrusted"
+        );
+        for (replica, group) in REPLICAS.into_iter().zip(groups(&sim)) {
+            assert_eq!(
+                group.map(|group| (group.head, group.is_primary)),
+                Some((committed_op, replica == primary)),
+                "{starter:?}: replica {replica} must start the view without op \
+                 {unservable_op}, led by replica {primary}"
+            );
+        }
+        for voter in [STALE, OLD_PRIMARY] {
+            set_link_drops(&mut sim, voter, HEADER_HOLDER, None);
+        }
+        step_until(&mut sim, "the new primary never admitted requests", |sim| {
+            admits_requests(sim, primary)
+        });
+
+        sim.discover_partition_contexts(&client);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            primary,
+            client.send_messages(namespace, &[Bytes::from_static(PAYLOAD)]),
+        );
+        assert_eq!(reply.header().status, 0);
+        assert_eq!(
+            reply.header().commit,
+            unservable_op,
+            "{starter:?}: the new send must take the number of the op the view discarded"
+        );
+        step_until(&mut sim, "a replica never applied the new send", |sim| {
+            every_group(sim, |group| group.commit_min == unservable_op)
+        });
+
+        let checksums = |replica: u8| {
+            sim.partition_journaled_headers(usize::from(replica), namespace, 1..=unservable_op)
+                .expect("every replica hosts the group")
+                .into_iter()
+                .map(|(op, header)| (op, header.checksum))
+                .collect::<Vec<_>>()
+        };
+        let expected = checksums(primary);
+        assert!(
+            expected.iter().map(|(op, _)| *op).eq(1..=unservable_op),
+            "{starter:?}: the primary must journal every committed op, got {expected:?}"
+        );
+        assert_ne!(
+            expected.last().map(|(_, checksum)| *checksum),
+            Some(lost.checksum),
+            "{starter:?}: the lost prepare must not come back"
+        );
+        for replica in REPLICAS {
+            assert_eq!(
+                checksums(replica),
+                expected,
+                "{starter:?}: replica {replica} journals a different log than the primary"
+            );
+            assert_eq!(
+                sim.offsets(usize::from(replica), namespace),
+                sim.offsets(usize::from(primary), namespace),
+                "{starter:?}: replica {replica} holds different offsets than the primary"
+            );
+            assert!(
+                tests::retained_prepare(&sim, usize::from(replica), namespace, unservable_op)
+                    .body()
+                    .windows(PAYLOAD.len())
+                    .any(|bytes| bytes == PAYLOAD),
+                "{starter:?}: replica {replica} lost the payload of the new send"
+            );
+        }
+    }
+
+    /// A backup can learn that an op committed before its prepare arrives, and
+    /// its vote names a commit only up to its head. When the replicas that held
+    /// the op lose it, a view starts without the op. That backup must not lead
+    /// the view: its commit point names an op that no replica can supply, and a
+    /// primary takes no request while it has committed ops left to apply.
+    #[test]
+    fn given_a_backup_that_knows_a_lost_commit_when_the_group_restarts_should_commit_a_new_send() {
+        const PRIMARY: u8 = 0;
+        /// Gets the commit number and never the prepare. Candidate of the view
+        /// after the one that `PRIMARY` leads.
+        const KNOWER: u8 = 1;
+        const ACKER: u8 = 2;
+        let namespace = namespace();
+        let (mut sim, client) = cluster(SEED);
+        sim.register_client_with_primary(&client);
+        sim.set_partition_durability(namespace, iggy_common::Durability::Replicated);
+        sim.seed_stream_topic_partition(namespace);
+        for replica in &sim.replicas {
+            materialise_partition(replica, namespace, sim.consumer_offsets_max);
+        }
+        step_until(&mut sim, "the fresh group never elected replica 0", |sim| {
+            group(sim, PRIMARY)
+                .is_some_and(|group| group.status == Status::Normal && group.is_primary)
+        });
+        let first_view = group(&sim, PRIMARY).unwrap().view;
+
+        // The prepare reaches the acker only. The commit heartbeat reaches both.
+        for holder in [PRIMARY, ACKER] {
+            set_link_drops(&mut sim, holder, KNOWER, Some(is_group_prepare));
+            set_link_drops(&mut sim, KNOWER, holder, Some(is_group_repair_request));
+        }
+        let reply = send(&mut sim, &client, PRIMARY, b"lost");
+        assert_eq!(reply.header().status, 0);
+        let lost_op = reply.header().commit;
+        let held_before = lost_op - 1;
+        step_until(&mut sim, "the backup never learned of the commit", |sim| {
+            group(sim, KNOWER).is_some_and(|group| group.commit_max == lost_op)
+        });
+        assert_eq!(
+            group(&sim, KNOWER).map(|group| group.head),
+            Some(held_before),
+            "the backup must know the commit of op {lost_op} without the prepare"
+        );
+
+        // Both holders lose power before their WALs sync the op.
+        for holder in [PRIMARY, ACKER] {
+            sim.replica_crash(holder);
+        }
+        for holder in [PRIMARY, ACKER] {
+            sim.replica_restart_losing_unsynced_messages(holder);
+            set_link_drops(&mut sim, holder, KNOWER, None);
+            set_link_drops(&mut sim, KNOWER, holder, None);
+        }
+        step_until(
+            &mut sim,
+            "a restarted replica never rebuilt the group",
+            |sim| every_group(sim, |_| true),
+        );
+        for holder in [PRIMARY, ACKER] {
+            assert_eq!(
+                group(&sim, holder).map(|group| group.head),
+                Some(held_before),
+                "replica {holder} must restart without op {lost_op}"
+            );
+        }
+
+        let leader = (0..SETTLE_STEPS)
+            .find_map(|_| {
+                sim.step();
+                REPLICAS.into_iter().find(|&replica| {
+                    settled_above(&sim, replica, first_view, true)
+                        && admits_requests(&sim, replica)
+                        && REPLICAS
+                            .into_iter()
+                            .any(|backup| settled_above(&sim, backup, first_view, false))
+                })
+            })
+            .unwrap_or_else(|| panic!("no view started without op {lost_op}: {:?}", groups(&sim)));
+
+        let reply = send(&mut sim, &client, leader, PAYLOAD);
+        assert_eq!(
+            reply.header().status,
+            0,
+            "replica {leader} leads the view and refused a send: {:?}",
+            groups(&sim)
+        );
+        assert_eq!(
+            reply.header().commit,
+            lost_op,
+            "the send must take the number of the op the group lost"
+        );
+        step_until(&mut sim, "a replica never applied the send", |sim| {
+            every_group(sim, |group| {
+                group.status == Status::Normal && group.commit_min == lost_op
+            })
+        });
+        let journaled = |replica: u8| {
+            sim.partition_journaled_header(usize::from(replica), namespace, lost_op)
+                .map(|header| header.checksum)
+        };
+        assert!(journaled(leader).is_some());
+        for replica in REPLICAS {
+            assert_eq!(
+                journaled(replica),
+                journaled(leader),
+                "replica {replica} journals another prepare at op {lost_op} than the primary"
+            );
+        }
+    }
+
+    /// Send `payload` to `replica` and step until its reply arrives. A commit can
+    /// wait for a resend of the prepare, which takes more steps than
+    /// `tests::submit_and_wait_for_reply` allows.
+    fn send(
+        sim: &mut Simulator,
+        client: &SimClient,
+        replica: u8,
+        payload: &'static [u8],
+    ) -> Message<ReplyHeader> {
+        sim.discover_partition_contexts(client);
+        let send = client.send_messages(namespace(), &[Bytes::from_static(payload)]);
+        let request = send.header().request;
+        sim.submit_request(client.client_id(), replica, send.into_generic());
+        (0..SETTLE_STEPS)
+            .find_map(|_| {
+                sim.step()
+                    .into_iter()
+                    .find(|reply| reply.header().request == request)
+            })
+            .unwrap_or_else(|| panic!("replica {replica} never answered a send: {:?}", groups(sim)))
+    }
+
+    fn namespace() -> IggyNamespace {
+        IggyNamespace::new(1, 1, 0)
+    }
+
+    /// What a failure has to show about one replica's group.
+    #[derive(Debug)]
+    struct Group {
+        status: Status,
+        view: u32,
+        log_view: u32,
+        is_primary: bool,
+        head: u64,
+        commit_min: u64,
+        commit_max: u64,
+        untrusted_log: bool,
+    }
+
+    /// `None` until a restarted replica has rebuilt the group.
+    fn group(sim: &Simulator, replica: u8) -> Option<Group> {
+        let shard = sim.replicas[usize::from(replica)].partition_shard(namespace());
+        let partition = shard.plane.partitions().get_by_ns(&namespace())?;
+        let consensus = partition.consensus();
+        Some(Group {
+            status: consensus.status(),
+            view: consensus.view(),
+            log_view: consensus.log_view(),
+            is_primary: consensus.is_primary(),
+            head: consensus.sequencer().current_sequence(),
+            commit_min: consensus.commit_min(),
+            commit_max: consensus.commit_max(),
+            untrusted_log: consensus.has_untrusted_log(),
+        })
+    }
+
+    fn groups(sim: &Simulator) -> Vec<Option<Group>> {
+        REPLICAS
+            .iter()
+            .map(|&replica| group(sim, replica))
+            .collect()
+    }
+
+    fn every_group(sim: &Simulator, holds: impl Fn(&Group) -> bool) -> bool {
+        groups(sim)
+            .iter()
+            .all(|group| group.as_ref().is_some_and(&holds))
+    }
+
+    /// Whether `replica` is in normal status in a view above `old_view`, as its
+    /// primary or as a backup.
+    fn settled_above(sim: &Simulator, replica: u8, old_view: u32, is_primary: bool) -> bool {
+        group(sim, replica).is_some_and(|group| {
+            group.status == Status::Normal
+                && group.view > old_view
+                && group.is_primary == is_primary
+        })
+    }
+
+    /// Whether `replica` takes partition requests, which needs recent evidence
+    /// of a metadata quorum.
+    fn admits_requests(sim: &Simulator, replica: u8) -> bool {
+        let replica = usize::from(replica);
+        sim.replicas[replica].shards[0]
+            .plane
+            .metadata()
+            .applied_frontier()
+            .partition_requests_allowed(sim.outboxes[replica].monotonic_now())
+    }
+
+    fn step_until(sim: &mut Simulator, what: &str, reached: impl Fn(&Simulator) -> bool) {
+        assert!(
+            (0..SETTLE_STEPS).any(|_| {
+                sim.step();
+                reached(sim)
+            }),
+            "{what}: {:?}",
+            groups(sim)
+        );
+    }
+
+    /// Drop the packets `drops` accepts on the link from `from` to `to`.
+    pub fn set_link_drops(
+        sim: &mut Simulator,
+        from: u8,
+        to: u8,
+        drops: Option<fn(&Packet) -> bool>,
+    ) {
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) = drops;
+    }
+
+    fn is_group_prepare(packet: &Packet) -> bool {
+        prepare_for(packet, namespace().inner()).is_some()
+    }
+
+    fn is_group_repair_request(packet: &Packet) -> bool {
+        is_request_prepares_for(packet, namespace().inner())
+    }
+
+    fn is_group_do_view_change(packet: &Packet) -> bool {
+        packet.message.header().command == Command::DoViewChange
+            && view_scoped_partition_frame(&packet.message)
+                .is_some_and(|(group, _, _)| group == namespace())
+    }
+}
+
 /// Whether a setup-handshake reply is a result-framed transport rejection rather
 /// than an answer. `build_result_rejection_reply` carries the reason in the result
 /// section under the request's own operation with `status` left at 0, so nothing in
@@ -13034,6 +13683,92 @@ mod partition_repair_driver_tests {
         assert_eq!(
             group_state(&sim, LAGGING, namespace),
             (Status::Normal, 0, OPS as u64, OPS as u64)
+        );
+    }
+
+    #[test]
+    fn given_a_restarted_partition_wal_when_adopting_the_same_view_should_fence_recovered_history()
+    {
+        let (mut sim, client) = cluster(178);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            CLIENT_ID,
+            0,
+            client.send_messages(namespace, &[Bytes::from_static(b"before restart")]),
+        );
+        assert_eq!(reply.header().status, 0);
+        let recovered_op = reply.header().op;
+        assert!(
+            (0..DRAIN_STEPS).any(|_| {
+                sim.step();
+                group_state(&sim, LAGGING, namespace).2 == recovered_op
+            }),
+            "replica {LAGGING} must apply op {recovered_op} before restarting"
+        );
+        sim.replica_crash(LAGGING);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            CLIENT_ID,
+            0,
+            client.send_messages(namespace, &[Bytes::from_static(b"during restart")]),
+        );
+        assert_eq!(reply.header().status, 0);
+        let head = reply.header().op;
+        assert!(
+            head > recovered_op,
+            "the primary must advance beyond {recovered_op}, got {head}"
+        );
+        sim.replica_restart(LAGGING);
+        let shard = sim.replicas[usize::from(LAGGING)].partition_shard(namespace);
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        let view = partition.consensus().log_view();
+        assert_eq!(view, group_state(&sim, 0, namespace).1);
+        assert_eq!(partition.consensus().status(), Status::Recovering);
+        assert_eq!(partition.consensus().commit_min(), recovered_op);
+        assert!(
+            !partition.view_fenced(),
+            "the fence must be installed by view adoption"
+        );
+        let start_view = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.cluster = partition.consensus().cluster();
+                header.replica = 0;
+                header.view = view;
+                header.group = namespace.inner();
+                header.partition_incarnation = partition.created_revision();
+                header.op = head;
+                header.commit = head;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                header.checksum_body = u128::from(iggy_common::calculate_checksum(&[]));
+                header.seal();
+            });
+        futures::executor::block_on(shard.on_message(MessageBag::StartView(start_view)));
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert_eq!(partition.consensus().status(), Status::Normal);
+        assert_eq!(partition.consensus().view(), view);
+        assert_eq!(partition.consensus().log_view(), view);
+        assert!(
+            partition.view_fenced(),
+            "recovered op {recovered_op} must fence the adopted head {head} in the unchanged view {view}"
+        );
+        assert_eq!(partition.consensus().commit_min(), recovered_op);
+
+        assert!(
+            (0..DRAIN_STEPS).any(|_| {
+                sim.step();
+                let partition = sim.replicas[usize::from(LAGGING)]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .unwrap();
+                partition.consensus().commit_min() == head && !partition.view_fenced()
+            }),
+            "replica {LAGGING} must prove the fenced history and commit through op {head}"
         );
     }
 
@@ -17277,10 +18012,9 @@ mod review_4092_dst_tests {
                     .items
                     .get(namespace.stream_id())
                     .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                    .map(|topic| {
+                    .map_or_default(|topic| {
                         iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
                     })
-                    .unwrap_or_default()
             });
 
         assert!(
@@ -17846,6 +18580,239 @@ mod metadata_walk_stuck_detector_tests {
 }
 
 #[cfg(test)]
+mod empty_view_log_tests {
+    //! A view change can decide an empty log while one replica still holds an
+    //! op 1 that reached nobody. That replica drops the op, and its log is then
+    //! as empty as its peer's: the next op 1 chains onto nothing, whether the
+    //! replica starts the new view or adopts it.
+    //!
+    //! Two replicas, so every vote and every ack needs both of them. A replica
+    //! that still chained onto the dropped op could neither vote nor append,
+    //! and the pair would stop for good.
+
+    use super::partition_repair_driver_tests::sized_cluster;
+    use super::unservable_op_view_change_tests::set_link_drops;
+    use super::*;
+    use bytes::Bytes;
+
+    const SEED: u64 = 0x0E10;
+    const REPLICAS: u8 = 2;
+    const SHARDS_PER_REPLICA: u16 = 1;
+    /// Leads view 0 and journals the op that never reaches its peer.
+    const OLD_PRIMARY: u8 = 0;
+    const PEER: u8 = 1;
+
+    /// Steps for the pair to settle its next view: the primary loses its
+    /// heartbeat quorum, its view probe goes unanswered, and a view whose
+    /// candidate misses a vote lasts one status timeout. Each timer can start
+    /// out of phase, hence the factor.
+    const ELECTION_STEPS: u64 = 4
+        * (consensus::TimeoutManager::NORMAL_HEARTBEAT_TICKS
+            + consensus::TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS
+                * consensus::PROBE_ATTEMPTS_MAX as u64
+            + consensus::TimeoutManager::VIEW_CHANGE_STATUS_TICKS);
+
+    #[test]
+    fn given_an_empty_view_adopted_over_a_first_op_that_reached_no_backup_when_the_pair_changes_view_again_should_commit_the_next_send()
+     {
+        let (mut sim, client, namespace, stranded) = stranded_first_op(primary_stream);
+
+        // The peer hears no heartbeat and the primary hears no reply, so the
+        // pair elects the peer, whose log is empty.
+        let adopted = (0..ELECTION_STEPS).any(|_| {
+            sim.step();
+            leads_a_later_view(&sim, PEER, namespace)
+                && normal_view(&sim, OLD_PRIMARY, namespace) == normal_view(&sim, PEER, namespace)
+                && sim
+                    .partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
+                    .is_none()
+        });
+        assert!(
+            adopted,
+            "the old primary never adopted an empty view of its peer: {:?}",
+            states(&sim, namespace)
+        );
+        set_link_drops(&mut sim, OLD_PRIMARY, PEER, None);
+        let adopted_view = normal_view(&sim, PEER, namespace);
+
+        // A send now would hide a wrong chain head on the old primary, because
+        // the prepare replaces it. A view change does not: drop the new
+        // primary's stream first, so the pair needs the vote of the old primary
+        // while its log is still empty.
+        set_link_drops(&mut sim, PEER, OLD_PRIMARY, Some(primary_stream));
+        let voted = (0..ELECTION_STEPS).any(|_| {
+            sim.step();
+            normal_view(&sim, OLD_PRIMARY, namespace) > adopted_view
+        });
+        set_link_drops(&mut sim, PEER, OLD_PRIMARY, None);
+        assert!(
+            voted,
+            "the pair never changed view again, so the old primary cast no vote: {:?}",
+            states(&sim, namespace)
+        );
+
+        assert_next_send_commits(&mut sim, &client, namespace, OLD_PRIMARY, &stranded);
+    }
+
+    #[test]
+    fn given_a_first_op_that_reached_no_backup_when_its_replica_starts_an_empty_view_should_commit_the_next_send()
+     {
+        let (mut sim, client, namespace, stranded) = stranded_first_op(primary_stream_and_votes);
+
+        // The peer cannot start view 1 without the vote of the old primary, so
+        // the pair moves on to a view that the old primary leads. The vote of
+        // the peer proves the op uncommitted, and the merge drops it.
+        let started = (0..ELECTION_STEPS).any(|_| {
+            sim.step();
+            leads_a_later_view(&sim, OLD_PRIMARY, namespace)
+                && sim
+                    .partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
+                    .is_none()
+        });
+        assert!(
+            started,
+            "the old primary never started a view with an empty log: {:?}",
+            states(&sim, namespace)
+        );
+        set_link_drops(&mut sim, OLD_PRIMARY, PEER, None);
+
+        assert_next_send_commits(&mut sim, &client, namespace, OLD_PRIMARY, &stranded);
+    }
+
+    /// A two-replica partition whose primary journals op 1 alone, because
+    /// `withheld` drops what it sends its peer. Returns the header of that op.
+    fn stranded_first_op(
+        withheld: fn(&packet::Packet) -> bool,
+    ) -> (Simulator, SimClient, IggyNamespace, PrepareHeader) {
+        let (mut sim, client) = sized_cluster(SEED, REPLICAS, SHARDS_PER_REPLICA);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        assert!(
+            sim.partition_consensus_state(usize::from(OLD_PRIMARY), namespace)
+                .is_some_and(|state| {
+                    state.is_primary && state.view == 0 && matches!(state.status, Status::Normal)
+                }),
+            "replica {OLD_PRIMARY} leads view 0 of a new partition"
+        );
+        set_link_drops(&mut sim, OLD_PRIMARY, PEER, Some(withheld));
+        sim.submit_request(
+            client.client_id(),
+            OLD_PRIMARY,
+            client
+                .send_messages(namespace, &[Bytes::from_static(b"stranded")])
+                .into_generic(),
+        );
+        let stranded = (0..SETUP_TOTAL_STEPS)
+            .find_map(|_| {
+                sim.step();
+                sim.partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
+            })
+            .expect("the primary journals the send as op 1");
+        assert!(
+            sim.partition_journaled_header(usize::from(PEER), namespace, 1)
+                .is_none(),
+            "the op reached the backup"
+        );
+        (sim, client, namespace, stranded)
+    }
+
+    /// The next send commits as op 1 on both replicas, in place of `stranded`.
+    /// The client offers it to `target` first and then retries as clients do.
+    fn assert_next_send_commits(
+        sim: &mut Simulator,
+        client: &SimClient,
+        namespace: IggyNamespace,
+        target: u8,
+        stranded: &PrepareHeader,
+    ) {
+        let request = client
+            .send_messages(namespace, &[Bytes::from_static(b"next")])
+            .into_generic();
+        let reply = sim.try_await_setup_reply(
+            client,
+            target,
+            &request,
+            iggy_binary_protocol::Operation::SendMessages,
+        );
+        assert_eq!(
+            reply.map(|reply| reply.header().status),
+            Some(0),
+            "no send committed after the view that emptied the log: {:?}",
+            states(sim, namespace)
+        );
+        let applied = (0..SETUP_TOTAL_STEPS).any(|_| {
+            sim.step();
+            states(sim, namespace)
+                .into_iter()
+                .all(|state| state.is_some_and(|state| state.commit_min >= 1))
+        });
+        assert!(
+            applied,
+            "a replica never applied the committed send: {:?}",
+            states(sim, namespace)
+        );
+        let first_op = sim
+            .partition_journaled_header(usize::from(OLD_PRIMARY), namespace, 1)
+            .map(|header| header.checksum);
+        assert_eq!(
+            first_op,
+            sim.partition_journaled_header(usize::from(PEER), namespace, 1)
+                .map(|header| header.checksum),
+            "the replicas hold different entries at op 1"
+        );
+        assert!(
+            first_op.is_some_and(|checksum| checksum != stranded.checksum),
+            "op 1 is still the entry that reached no backup"
+        );
+    }
+
+    /// A partition prepare or commit heartbeat: all that a primary sends its
+    /// backup in normal operation.
+    fn primary_stream(packet: &packet::Packet) -> bool {
+        matches!(
+            packet.message.header().command,
+            Command::Prepare | Command::Commit
+        ) && view_scoped_partition_frame(&packet.message).is_some()
+    }
+
+    /// [`primary_stream`] and every partition `DoViewChange`, so the receiver
+    /// cannot start a view either.
+    fn primary_stream_and_votes(packet: &packet::Packet) -> bool {
+        primary_stream(packet)
+            || (packet.message.header().command == Command::DoViewChange
+                && packet
+                    .message
+                    .try_as_typed::<DoViewChangeHeader>()
+                    .is_ok_and(|vote| vote.header().group != METADATA_GROUP))
+    }
+
+    /// Whether `replica` is the normal primary of a view after view 0.
+    fn leads_a_later_view(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> bool {
+        sim.partition_consensus_state(usize::from(replica), namespace)
+            .is_some_and(|state| {
+                state.is_primary && state.view > 0 && matches!(state.status, Status::Normal)
+            })
+    }
+
+    /// The view `replica` is in, if it is in normal status.
+    fn normal_view(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> Option<u32> {
+        sim.partition_consensus_state(usize::from(replica), namespace)
+            .filter(|state| matches!(state.status, Status::Normal))
+            .map(|state| state.view)
+    }
+
+    /// The consensus state of both replicas, for a failure message.
+    fn states(
+        sim: &Simulator,
+        namespace: IggyNamespace,
+    ) -> [Option<PartitionConsensusState>; REPLICAS as usize] {
+        [OLD_PRIMARY, PEER]
+            .map(|replica| sim.partition_consensus_state(usize::from(replica), namespace))
+    }
+}
+
+#[cfg(test)]
 mod primary_transfer_crash_tests {
     //! Crash each replica at each handoff message of a planned primary transfer.
     //!
@@ -18259,5 +19226,194 @@ mod primary_transfer_crash_tests {
     fn given_a_transfer_to_a_returned_replica_when_each_replica_crashes_at_each_handoff_should_converge_and_spread()
      {
         sweep(Sweep::Return);
+    }
+}
+
+#[cfg(test)]
+mod unsynced_power_loss_tests {
+    //! Every member of a `replicated` pair loses power before its WAL syncs, so
+    //! no member keeps the committed messages. The superblock of the member
+    //! that started a view change in between still names their offsets.
+
+    use super::partition_repair_driver_tests::sized_cluster;
+    use super::*;
+    use bytes::Bytes;
+
+    const SEED: u64 = 0x5EED_024C;
+    const REPLICAS: u8 = 2;
+    /// Sends committed before the power loss. One message each, so this is
+    /// also the frontier that their offsets end at.
+    const LOST_SENDS: u64 = 2;
+    /// Budget of each wait: the view probe of a lone primary, a view change or
+    /// a commit.
+    const PROGRESS_STEPS: usize = 4_000;
+
+    /// The primary of `namespace` once both replicas run one view.
+    fn settled_primary(sim: &Simulator, namespace: IggyNamespace) -> Option<u8> {
+        let states = (0..REPLICAS)
+            .map(|replica| sim.partition_consensus_state(usize::from(replica), namespace))
+            .collect::<Option<Vec<_>>>()?;
+        let settled = states
+            .iter()
+            .all(|state| state.status == Status::Normal && state.view == states[0].view);
+        (0..REPLICAS).find(|replica| settled && states[usize::from(*replica)].is_primary)
+    }
+
+    /// The `offset_frontier` in the durable record of a replica's group.
+    fn recorded_frontier(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> Option<u64> {
+        let stores = sim.replicas[usize::from(replica)]
+            .partition_superblocks
+            .borrow();
+        let (_, superblock) = stores.get(&namespace)?;
+        let record = superblock.read_latest_sync()?;
+        VsrState::try_from(record.as_slice())
+            .ok()
+            .map(|state| state.offset_frontier)
+    }
+
+    /// The reply to a send on the settled pair, retrying a transient refusal
+    /// as a client does. `None` once `steps` run out.
+    fn commit_send(
+        sim: &mut Simulator,
+        client: &SimClient,
+        namespace: IggyNamespace,
+        steps: usize,
+    ) -> Option<Message<ReplyHeader>> {
+        let mut steps = 0..steps;
+        loop {
+            let primary = steps.by_ref().find_map(|_| {
+                sim.step();
+                settled_primary(sim, namespace)
+            })?;
+            sim.discover_partition_contexts(client);
+            let request = client.send_messages(
+                namespace,
+                &[Bytes::from_static(b"after"), Bytes::from_static(b"restart")],
+            );
+            let request_id = request.header().request;
+            sim.submit_request(client.client_id(), primary, request.into_generic());
+            let reply = steps.by_ref().find_map(|_| {
+                sim.step()
+                    .into_iter()
+                    .find(|reply| reply.header().request == request_id)
+            })?;
+            if reply.header().status != IggyError::TransientNotAccepted.as_code() {
+                return Some(reply);
+            }
+        }
+    }
+
+    fn describe(sim: &Simulator, namespace: IggyNamespace) -> String {
+        format!(
+            "states={:?}, offsets={:?}, recorded frontiers={:?}",
+            (0..REPLICAS)
+                .map(|replica| sim.partition_consensus_state(usize::from(replica), namespace))
+                .collect::<Vec<_>>(),
+            (0..REPLICAS)
+                .map(|replica| sim.offsets(usize::from(replica), namespace))
+                .collect::<Vec<_>>(),
+            (0..REPLICAS)
+                .map(|replica| recorded_frontier(sim, replica, namespace))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    #[test]
+    fn given_a_replicated_pair_that_lost_power_unsynced_when_one_superblock_names_the_lost_offsets_should_commit_a_new_send()
+     {
+        let (mut sim, client) = sized_cluster(SEED, REPLICAS, 1);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.set_partition_durability(namespace, Durability::Replicated);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+
+        let survivor = (0..PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                settled_primary(&sim, namespace)
+            })
+            .expect("the fresh pair elects a primary");
+        let first_down = 1 - survivor;
+        let mut lost_op = 0;
+        for _ in 0..LOST_SENDS {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                survivor,
+                client.send_messages(namespace, &[Bytes::from_static(b"lost")]),
+            );
+            assert_eq!(reply.header().status, 0);
+            lost_op = reply.header().commit;
+        }
+
+        sim.replica_crash(first_down);
+        // The primary loses its heartbeat quorum, finds no primary to follow and
+        // starts a view change alone. The superblock write of the new view
+        // records the committed offsets.
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                recorded_frontier(&sim, survivor, namespace) == Some(LOST_SENDS)
+            }),
+            "the survivor never recorded the committed offsets: {}",
+            describe(&sim, namespace)
+        );
+        sim.replica_crash(survivor);
+
+        sim.replica_restart_losing_unsynced_messages(first_down);
+        sim.replica_restart_losing_unsynced_messages(survivor);
+        for replica in [first_down, survivor] {
+            assert!(
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .is_some_and(|state| state.commit_min == 0)
+                    && sim
+                        .partition_journaled_headers(usize::from(replica), namespace, 1..=lost_op)
+                        .is_some_and(|headers| headers.is_empty()),
+                "replica {replica} kept sends that its WAL had not synced: {}",
+                describe(&sim, namespace)
+            );
+        }
+        assert_eq!(
+            recorded_frontier(&sim, survivor, namespace),
+            Some(LOST_SENDS)
+        );
+        assert_eq!(
+            recorded_frontier(&sim, first_down, namespace).unwrap_or(0),
+            0
+        );
+
+        let reply =
+            commit_send(&mut sim, &client, namespace, PROGRESS_STEPS).unwrap_or_else(|| {
+                panic!(
+                    "the pair never committed a send after the restart: {}",
+                    describe(&sim, namespace)
+                )
+            });
+        assert_eq!(reply.header().status, 0);
+
+        let committed_op = reply.header().commit;
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                (0..REPLICAS).all(|replica| {
+                    sim.partition_consensus_state(usize::from(replica), namespace)
+                        .is_some_and(|state| state.commit_min >= committed_op)
+                })
+            }),
+            "a member never committed the send: {}",
+            describe(&sim, namespace)
+        );
+        assert_eq!(
+            sim.offsets(usize::from(first_down), namespace),
+            sim.offsets(usize::from(survivor), namespace),
+            "the members hold the send at different offsets"
+        );
+        assert_eq!(
+            tests::retained_prepare(&sim, usize::from(first_down), namespace, committed_op)
+                .as_slice(),
+            tests::retained_prepare(&sim, usize::from(survivor), namespace, committed_op)
+                .as_slice(),
+            "the members journaled different bytes for the send"
+        );
     }
 }

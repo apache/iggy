@@ -622,7 +622,12 @@ where
             if let Err(error) = partition.accept_io(token.identity, result) {
                 tracing::error!(namespace_raw = token.identity.namespace.inner(), %error, "partition I/O acceptance failed");
             }
-            if token.identity.continuation == partitions::PartitionIoContinuation::Retention {
+            self.stage_wanted_upload(token.identity.namespace, partition);
+            if matches!(
+                token.identity.continuation,
+                partitions::PartitionIoContinuation::Retention
+                    | partitions::PartitionIoContinuation::Eviction
+            ) {
                 self.drop_partition_transfer_state(token.identity.namespace, partition);
             }
             partition.retains_io_reservation(token.identity)
@@ -661,6 +666,7 @@ where
             return;
         };
         let step = partition.resume_io(partitions.config()).await;
+        self.stage_wanted_upload(namespace, partition);
         if let Some(token) = self.partition_io.retained(namespace, incarnation)
             && !partition.retains_io_reservation(token.identity)
         {
@@ -748,6 +754,7 @@ where
                         if matches!(
                             plan.continuation,
                             partitions::PartitionIoContinuation::Retention
+                                | partitions::PartitionIoContinuation::Eviction
                                 | partitions::PartitionIoContinuation::Install
                         ) {
                             self.drop_partition_transfer_state(namespace, partition);
@@ -1353,6 +1360,7 @@ mod tests {
                     entry,
                     log_path: log_path.to_str().unwrap().to_owned(),
                 }],
+                chain: None,
                 offsets: (
                     StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
                     Rc::new(Vec::new()),
@@ -1440,6 +1448,7 @@ mod tests {
                     entry: StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, bytes),
                     log_path: log_path.to_str().unwrap().to_owned(),
                 }],
+                chain: None,
                 offsets: (
                     StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
                     Rc::new(Vec::new()),
@@ -1500,7 +1509,7 @@ mod tests {
         let targets = record_transfer_targets(&bus);
         let namespace = IggyNamespace::new(0, 0, 0);
         let directory = tempfile::tempdir().unwrap();
-        let (owner, _sender) = serving_shard(&bus, &[namespace], directory.path()).await;
+        let (owner, _sender) = Box::pin(serving_shard(&bus, &[namespace], directory.path())).await;
         owner
             .on_message(request_state_transfer(
                 namespace,
@@ -1545,7 +1554,7 @@ mod tests {
         let targets = record_transfer_targets(&bus);
         let namespaces = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)];
         let directory = tempfile::tempdir().unwrap();
-        let (owner, _sender) = serving_shard(&bus, &namespaces, directory.path()).await;
+        let (owner, _sender) = Box::pin(serving_shard(&bus, &namespaces, directory.path())).await;
         for namespace in namespaces {
             owner
                 .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
@@ -1587,7 +1596,7 @@ mod tests {
         let targets = record_transfer_targets(&bus);
         let namespace = IggyNamespace::new(0, 0, 0);
         let directory = tempfile::tempdir().unwrap();
-        let (owner, _sender) = serving_shard(&bus, &[namespace], directory.path()).await;
+        let (owner, _sender) = Box::pin(serving_shard(&bus, &[namespace], directory.path())).await;
         owner
             .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
             .await;
@@ -1636,7 +1645,8 @@ mod tests {
             let targets = record_transfer_targets(&bus);
             let namespace = IggyNamespace::new(0, 0, 0);
             let directory = tempfile::tempdir().unwrap();
-            let (owner, _sender) = serving_shard(&bus, &[namespace], directory.path()).await;
+            let (owner, _sender) =
+                Box::pin(serving_shard(&bus, &[namespace], directory.path())).await;
             owner
                 .on_message(request_state_transfer(namespace, NONCE, SERVED_INCARNATION))
                 .await;
@@ -5848,6 +5858,7 @@ mod tests {
         let offer = partitions::state_transfer::PartitionStateTransferOffer {
             commit_op: 0,
             segments: Vec::new(),
+            chain: None,
             offsets: (
                 StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
                 Rc::new(Vec::new()),
@@ -11397,4 +11408,8 @@ mod tests {
             std::future::ready(Ok(SuperblockContents::Empty))
         }
     }
+
+    mod object_deletes;
+    mod segment_uploads;
+    mod tier_service_uploads;
 }

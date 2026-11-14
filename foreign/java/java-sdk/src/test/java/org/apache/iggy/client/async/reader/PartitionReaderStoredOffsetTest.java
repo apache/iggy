@@ -88,6 +88,8 @@ class PartitionReaderStoredOffsetTest {
     // The read of the gap that loseTheSecondRead() leaves once a later read serves offset 5: from 2, without a store.
     private static final PollingStrategy GAP_FROM_TWO =
             new PollingStrategy(PollingKind.Offset, BigInteger.TWO, Optional.of(FakeTransport.CONTEXT));
+    // A refusal that a retry does not change stops its partition once it came this often in a row.
+    private static final int REFUSALS_BEFORE_THE_STOP = 6;
 
     /** Under OnRead a start applies only to a partition without a stored offset. One with it resumes after it. */
     @ParameterizedTest
@@ -892,6 +894,98 @@ class PartitionReaderStoredOffsetTest {
             assertThat(offsets(second.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
                     .containsExactly(2L, 3L, 4L);
             assertThat(offsets(next(reader))).containsExactly(5L, 6L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Only a seek resumes a stopped partition, and it drops the gap. So a partition that stops during the read of a gap
+     * first reports the offsets that it did not read again and hands over the batch after them, and reports the
+     * refusal that stopped it last.
+     */
+    @ParameterizedTest
+    @MethodSource("refusalsThatStopAGap")
+    void shouldReportAGapAndHandOverItsBatchBeforeTheRefusalThatStopsThePartitionUnderOnRead(
+            IggyErrorCode refusal, int refusals) throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = PartitionReader.builder(transport)
+                .partitions(List.of(1L))
+                .options(ON_READ)
+                .retryInterval(PartitionReaderPacingTest.SHORT_RETRY)
+                .build()
+                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        try {
+            CompletableFuture<PolledMessages> second = loseTheSecondRead(transport, reader);
+            transport.nextRead().answer(section(1, 5, 6));
+            for (int refused = 1; refused <= refusals; refused++) {
+                Read gap = transport.nextRead();
+                assertThat(gap.targets()).isEqualTo(Map.of(1L, GAP_FROM_TWO));
+                gap.reply().completeExceptionally(serverError(refusal));
+            }
+
+            assertThatThrownBy(() -> second.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .hasCauseInstanceOf(ReadException.class)
+                    .satisfies(error -> assertThat(((ReadException) error.getCause()).lost())
+                            .contains(new ReadException.OffsetRange(BigInteger.TWO, BigInteger.valueOf(4))));
+            assertThat(offsets(next(reader))).containsExactly(5L, 6L);
+            assertThatThrownBy(() -> next(reader))
+                    .hasCauseInstanceOf(ReadException.class)
+                    .satisfies(error -> assertThat(((ReadException) error.getCause()).errorCode())
+                            .hasValue(refusal.getCode()));
+            CompletableFuture<PolledMessages> afterSeek = reader.next();
+            assertThat(transport.readsNothingFor(QUIET))
+                    .as("the stopped partition reads nothing")
+                    .isTrue();
+
+            reader.seek(1L, PollingStrategy.next()).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            transport.nextRead().answer(section(1, 7));
+            assertThat(offsets(afterSeek.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(7L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
+
+    static List<Arguments> refusalsThatStopAGap() {
+        // The read of a gap names a history, so a history that is gone stops the partition at once.
+        return List.of(
+                Arguments.of(IggyErrorCode.UNAUTHORIZED, REFUSALS_BEFORE_THE_STOP),
+                Arguments.of(IggyErrorCode.HISTORY_UNAVAILABLE, 1));
+    }
+
+    /**
+     * An empty read can show what a lost read stored, so no batch follows the gap. A partition that stops during the
+     * read of that gap reports its offsets, and the error that stopped it follows them at once.
+     */
+    @Test
+    void shouldReportAGapWithoutABatchBeforeTheGoneHistoryThatStopsThePartitionUnderOnRead() throws Exception {
+        FakeTransport transport = new FakeTransport(false);
+        PartitionReader reader = standalone(transport, ON_READ, 1L);
+        try {
+            CompletableFuture<PolledMessages> second = loseTheSecondRead(transport, reader);
+            transport.nextRead().answer(FakeTransport.empty(1, 5));
+            Read gap = transport.nextRead();
+            assertThat(gap.targets()).isEqualTo(Map.of(1L, GAP_FROM_TWO));
+            gap.answer(FakeTransport.refused(1, IggyErrorCode.HISTORY_UNAVAILABLE.getCode()));
+
+            assertThatThrownBy(() -> second.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                    .hasCauseInstanceOf(ReadException.class)
+                    .satisfies(error -> assertThat(((ReadException) error.getCause()).lost())
+                            .contains(new ReadException.OffsetRange(BigInteger.TWO, BigInteger.valueOf(4))));
+            assertThatThrownBy(() -> next(reader))
+                    .hasCauseInstanceOf(ReadException.class)
+                    .satisfies(error -> assertThat(((ReadException) error.getCause()).errorCode())
+                            .hasValue(IggyErrorCode.HISTORY_UNAVAILABLE.getCode()));
+            CompletableFuture<PolledMessages> afterSeek = reader.next();
+            assertThat(transport.readsNothingFor(QUIET))
+                    .as("the stopped partition reads nothing")
+                    .isTrue();
+
+            reader.seek(1L, PollingStrategy.next()).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            transport.nextRead().answer(section(1, 5));
+            assertThat(offsets(afterSeek.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)))
+                    .containsExactly(5L);
         } finally {
             reader.closeAsync().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         }
