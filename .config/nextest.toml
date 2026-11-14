@@ -27,6 +27,12 @@ nextest-version = { required = "0.9.127" }
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
+# This disk usage test compares the server's estimate with statvfs of the
+# volume every test writes to, so no other test may run beside it.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/server::disk_usage::given_a_file_written_outside_iggy/)'
+threads-required = "num-cpus"
+
 # Each test in these binaries spawns its own real iggy-server subprocess (isolated data dir, port
 # from PortGuard's own flock, so no two ever share a port). #[serial] on them is a dead letter
 # under nextest - nextest runs every test as its own process, and #[serial]'s mutex only excludes
@@ -59,6 +65,7 @@ filter = '''
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
+    + binary_id(iggy-gateway-kafka::readiness_real_server_tests)
     + binary_id(iggy-gateway-kafka::sasl_real_server_tests)
 '''
 test-group = "kafka_bridge"
@@ -80,7 +87,10 @@ test-group = "kafka_client_e2e"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::coordinator_cluster_tests)'
+filter = '''
+    binary_id(iggy-gateway-kafka::coordinator_cluster_tests)
+    + binary_id(iggy-gateway-kafka::replication_factor_cluster_tests)
+'''
 test-group = "kafka_cluster"
 
 # The failover tests also run three gateway processes and Kafka clients in Docker for minutes, and
@@ -120,8 +130,10 @@ slow-timeout = { period = "60s", terminate-after = 60 }
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.default-miri]
-# Keep consensus logic scenarios and large options boundaries in native CI.
-# Miri retains protocol validation and message ownership checks.
+# The pre-merge Miri job retains protocol validation and message ownership
+# checks. Consensus logic scenarios, large options boundaries and the random
+# replication flow are too slow for it. The Miri nightly workflow runs every
+# test that this filter leaves out.
 default-filter = '''
 not (
     (package(=consensus) & (
@@ -138,6 +150,7 @@ not (
         | test(/^impls::timestamp_clamp_tests::/)
         | test(/^impls::view_source_tests::/)
         | test(/^impls::vsr_consensus_tests::/)
+        | test(=replication::tests::given_random_losses_failures_and_busy_answers_when_the_flow_runs_should_keep_its_invariants_and_deliver_every_op)
     ))
     | (package(=iggy_binary_protocol) & (
         test(=primitives::options::tests::entry_count_over_limit_is_rejected)
@@ -145,8 +158,9 @@ not (
     ))
 )
 '''
-# Keep Miri bounded by the CI job timeout instead of the native-test limit.
-slow-timeout = { period = "60s" }
+# The pre-merge job timeout bounds a test before this one hour cap does. The
+# nightly job has a longer timeout, so there a test over the cap fails the run.
+slow-timeout = { period = "60s", terminate-after = 60 }
 
 [profile.ci]
 retries = 3

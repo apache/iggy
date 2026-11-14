@@ -487,6 +487,10 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.TopicOptionSizeOfMessagesRequiredToSave),
 			string(iggcon.TopicOptionPreallocateSegments),
 			string(iggcon.TopicOptionReplicationFactor),
+			string(iggcon.TopicOptionSegmentMaxAge),
+			string(iggcon.TopicOptionTieredStorage),
+			string(iggcon.TopicOptionLocalRetentionAge),
+			string(iggcon.TopicOptionLocalRetentionSize),
 		},
 		"user": {
 			string(iggcon.UserOptionUsername),
@@ -535,7 +539,7 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 
 // checkTypedSurface proves the typed API follows each catalog row: a create
 // field for every client-settable map key, an update field for every
-// updatable key, a reset constant for every resettable key and an accessor
+// updatable or enable-only key, a reset constant for every resettable key and an accessor
 // for every read-only key. A row whose mutability changes fails here until
 // the typed API follows it.
 func checkTypedSurface(t *testing.T, catalog []catalogRow) {
@@ -563,6 +567,10 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"size_of_messages_required_to_save": {create: "SizeOfMessagesRequiredToSave"},
 			"preallocate_segments":              {create: "PreallocateSegments"},
 			"replication_factor":                {create: "ReplicationFactor"},
+			"segment_max_age":                   {create: "SegmentMaxAge"},
+			"tiered_storage":                    {create: "TieredStorage", update: "TieredStorage"},
+			"local_retention_age":               {create: "LocalRetentionAge", update: "LocalRetentionAge", reset: string(iggcon.TopicOptionLocalRetentionAge)},
+			"local_retention_size":              {create: "LocalRetentionSize", update: "LocalRetentionSize", reset: string(iggcon.TopicOptionLocalRetentionSize)},
 		},
 		"user": {
 			"username": {update: "Username"},
@@ -596,7 +604,8 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 				_, found := createTypes[scope].FieldByName(expected.create)
 				assert.True(t, found, "%s create field %s", name, expected.create)
 			}
-			assert.Equal(t, row.Mutability == "updatable", expected.update != "", "%s update field", name)
+			updatable := row.Mutability == "updatable" || row.Mutability == "enable_only"
+			assert.Equal(t, updatable, expected.update != "", "%s update field", name)
 			if expected.update != "" {
 				_, found := updateTypes[scope].FieldByName(expected.update)
 				assert.True(t, found, "%s update field %s", name, expected.update)
@@ -721,6 +730,18 @@ func checkTopicResponse(t *testing.T, constants fixtureConstants, vector topicRe
 	assert.Equal(t, uint8(compression[expected.CompressionAlgorithm]), topic.CompressionAlgorithm)
 	assert.Equal(t, parseUint64(t, expected.MessageExpiry), uint64(topic.MessageExpiry))
 	assert.Equal(t, parseUint64(t, expected.MaxTopicSize), topic.MaxTopicSize)
+	if segmentMaxAge, ok := expected.Options[string(iggcon.TopicOptionSegmentMaxAge)]; ok {
+		assert.Equal(t, parseUint64(t, segmentMaxAge.Value), uint64(topic.SegmentMaxAge))
+	}
+	if tieredStorage, ok := expected.Options[string(iggcon.TopicOptionTieredStorage)]; ok {
+		assert.Equal(t, tieredStorage.Value, strconv.FormatBool(topic.TieredStorage))
+	}
+	if localRetentionAge, ok := expected.Options[string(iggcon.TopicOptionLocalRetentionAge)]; ok {
+		assert.Equal(t, parseUint64(t, localRetentionAge.Value), uint64(topic.LocalRetentionAge))
+	}
+	if localRetentionSize, ok := expected.Options[string(iggcon.TopicOptionLocalRetentionSize)]; ok {
+		assert.Equal(t, parseUint64(t, localRetentionSize.Value), topic.LocalRetentionSize)
+	}
 }
 
 func checkUserResponse(t *testing.T, constants fixtureConstants, vector userResponseVector) {

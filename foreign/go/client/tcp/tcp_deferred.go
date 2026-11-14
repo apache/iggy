@@ -273,7 +273,8 @@ func fetchRefusedBeforeAdmission(err error, section bool) bool {
 	}
 	switch coded.Code() {
 	case ierror.TransientNotAcceptedCode, ierror.InvalidSizeBytesCode, ierror.HistoryUnavailableCode, ierror.NotPrimaryCode,
-		ierror.PartitionNotFoundCode, ierror.TooManyConsumerOffsetsCode, ierror.ConsumerGroupPartitionNotOwnedCode:
+		ierror.PartitionNotFoundCode, ierror.TooManyConsumerOffsetsCode, ierror.ConsumerGroupPartitionNotOwnedCode,
+		ierror.TieredReadFailedCode:
 		return true
 	case ierror.FeatureUnavailableCode, ierror.InvalidIdentifierCode, ierror.DeferredPollCapacityExceededCode,
 		ierror.StreamIdNotFoundCode, ierror.StreamNameNotFoundCode, ierror.TopicIdNotFoundCode, ierror.TopicNameNotFoundCode,
@@ -306,6 +307,9 @@ func (c *IggyTcpClient) fenceTargets(ctx context.Context, fetch *fetchRequest) e
 	fetch.body = append([]byte(nil), fetch.body...)
 	for lookup, offset := range unfenced {
 		if routes[lookup].context.Incarnation == 0 {
+			// A route without a history is not ready yet. The next call looks
+			// it up again.
+			c.polls.invalidate(routes[lookup], false)
 			return ierror.ErrTransientNotAccepted
 		}
 		incarnation := fetch.body[offset+fetchTargetIncarnationAt:]

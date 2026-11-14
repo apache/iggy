@@ -23,7 +23,6 @@ import org.apache.iggy.connector.pinot.config.IggyStreamConfig;
 import org.apache.iggy.connector.pinot.metadata.IggyStreamMetadataProvider;
 import org.apache.pinot.spi.stream.PartitionGroupConsumer;
 import org.apache.pinot.spi.stream.PartitionGroupConsumptionStatus;
-import org.apache.pinot.spi.stream.PartitionLevelConsumer;
 import org.apache.pinot.spi.stream.StreamConfig;
 import org.apache.pinot.spi.stream.StreamConsumerFactory;
 import org.apache.pinot.spi.stream.StreamMetadataProvider;
@@ -62,30 +61,15 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
      * Pinot calls this method for each partition that needs to be consumed.
      *
      * @param clientId unique identifier for this consumer instance
-     * @param partitionGroupConsumptionStatus consumption status containing partition group ID and offset info
+     * @param partitionGroupConsumptionStatus consumption status containing the stream partition ID and offset info
      * @return a new partition consumer instance
      */
     @Override
     public PartitionGroupConsumer createPartitionGroupConsumer(
             String clientId, PartitionGroupConsumptionStatus partitionGroupConsumptionStatus) {
         IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
-        int partitionGroupId = partitionGroupConsumptionStatus.getPartitionGroupId();
-        return new IggyPartitionGroupConsumer(clientId, iggyConfig, partitionGroupId);
-    }
-
-    /**
-     * Creates a partition-level consumer (newer Pinot API).
-     * Wraps the partition group consumer for compatibility.
-     *
-     * @param clientId unique identifier for this consumer instance
-     * @param partition partition identifier
-     * @return a new partition consumer instance
-     */
-    @Override
-    public PartitionLevelConsumer createPartitionLevelConsumer(String clientId, int partition) {
-        IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
-        IggyPartitionGroupConsumer groupConsumer = new IggyPartitionGroupConsumer(clientId, iggyConfig, partition);
-        return new IggyPartitionLevelConsumer(groupConsumer);
+        int streamPartitionId = partitionGroupConsumptionStatus.getStreamPartitionGroupId();
+        return new IggyPartitionGroupConsumer(clientId, iggyConfig, streamPartitionId);
     }
 
     /**

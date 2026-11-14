@@ -17,6 +17,11 @@
 
 //! Per-shard periodic segment cleaner.
 //!
+//! A tiered topic is the exception to what follows: its retention covers the
+//! segments in the object store too, so only the partition primary decides,
+//! and the decision is committed as a `TruncatePartition` that every replica
+//! enforces.
+//!
 //! Local and unreplicated: every replica (primary and backup) trims its own
 //! expired or over-budget sealed segments. Divergence in physical log start is
 //! invisible to clients because reads are served by the partition primary. The
@@ -30,6 +35,7 @@ use crate::shell::ServerShard;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::{IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::LocalEnvelope;
 use shard::Receiver;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -75,14 +81,20 @@ pub async fn run_segment_cleaner(shard: Rc<ServerShard>, stop: Receiver<()>, int
 /// across passes, so the disclosure lands once per topic instead of once per
 /// interval tick. Slab ids are reused after a delete, so the creation revision
 /// is part of the key: a topic recreated into the same slots discloses again.
-fn stage_owned_partitions(
+pub fn stage_owned_partitions(
     shard: &Rc<ServerShard>,
     reported_floors: &mut HashSet<(usize, usize, u64)>,
 ) {
     let now = IggyTimestamp::now();
     let namespaces: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
     let streams = shard.plane.metadata().mux_stm.streams();
+    let tiered_storage_ready = shard
+        .plane
+        .metadata()
+        .applied_frontier()
+        .tiered_storage_ready();
     let max_message_size = u64::try_from(shard.bus_max_message_size()).unwrap_or(u64::MAX);
+    let mut tiered = Vec::new();
     for namespace in namespaces {
         let Some((message_expiry, max_topic_size, partition_count, segment_size)) =
             streams.topic_retention_config(namespace.stream_id(), namespace.topic_id())
@@ -109,6 +121,48 @@ fn stage_owned_partitions(
             segment_size.saturating_add(max_message_size),
         );
 
+        if let Some((age, size)) =
+            streams.topic_local_retention(namespace.stream_id(), namespace.topic_id())
+        {
+            // An evicted segment is read back from the store, so a node
+            // evicts only while it can tier topics: it passes the store
+            // identity check and its partitions read remote segments.
+            if tiered_storage_ready {
+                shard.request_evict_partition(
+                    namespace,
+                    now,
+                    local_envelope(age, size, partition_count),
+                );
+            }
+            // One lookup, so both passes name the incarnation the watermark
+            // was read for.
+            let Some((created_revision, committed_up_to)) = streams
+                .with_committed_partition(namespace, |partition| {
+                    (partition.created_revision, partition.deleted_up_to_offset)
+                })
+            else {
+                continue;
+            };
+            // Staged after the loop, where the shard orders them.
+            tiered.push((namespace, created_revision, committed_up_to));
+            // Staged whatever the topic's policy is: a truncation a client
+            // asked for leaves objects behind as well.
+            shard.request_delete_objects(namespace, created_revision, now, committed_up_to);
+            // Retention of a tiered topic covers its remote segments too, so
+            // no replica expires its own: the partition primary decides, and
+            // the decision reaches every replica as a committed truncation.
+            if has_expiry || budget.is_some() {
+                shard.request_retain_partition(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    budget.map(|budget| budget.max_bytes),
+                    committed_up_to,
+                );
+            }
+            continue;
+        }
         if !has_expiry && budget.is_none() {
             continue;
         }
@@ -140,6 +194,23 @@ fn stage_owned_partitions(
             budget.map(|budget| budget.max_bytes),
         );
     }
+    // The timed pass is what retries an upload the store refused and an
+    // advance that did not commit. It is also the only upload pass that
+    // knows the committed truncation watermark.
+    shard.request_upload_passes(&tiered, now);
+}
+
+/// What one partition of a tiered topic keeps on local disk. The topic's
+/// `local_retention_size` is shared evenly between its partitions, as
+/// `max_topic_size` is.
+fn local_envelope(age: IggyExpiry, size: MaxTopicSize, partition_count: usize) -> LocalEnvelope {
+    let size = match size {
+        MaxTopicSize::Custom(size) => {
+            Some(size.as_bytes_u64() / u64::try_from(partition_count.max(1)).unwrap_or(u64::MAX))
+        }
+        MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
+    };
+    LocalEnvelope { age, size }
 }
 
 /// A topic's enforced per-partition budget, next to the share it was derived
@@ -203,6 +274,38 @@ fn per_partition_size_budget(
 #[cfg(test)]
 mod tests {
     use super::{PartitionSizeBudget, per_partition_size_budget};
+
+    #[test]
+    fn given_local_retention_when_resolving_an_envelope_should_share_the_size_between_partitions() {
+        let age = iggy_common::IggyExpiry::NeverExpire;
+        let size =
+            |bytes: u64| iggy_common::MaxTopicSize::Custom(iggy_common::IggyByteSize::from(bytes));
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, size(900), 3),
+            partitions::LocalEnvelope {
+                age,
+                size: Some(300)
+            }
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, size(900), 0).size,
+            Some(900)
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, iggy_common::MaxTopicSize::Unlimited, 3)
+                .size,
+            None
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(
+                age,
+                iggy_common::MaxTopicSize::ServerDefault,
+                3
+            )
+            .size,
+            None
+        );
+    }
     use iggy_common::MaxTopicSize;
 
     /// A ceiling low enough that the share is what the assertion is about.

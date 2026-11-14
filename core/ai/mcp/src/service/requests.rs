@@ -85,7 +85,9 @@ pub struct CreateTopic {
     #[schemars(description = "name (required, must be unique)")]
     pub name: String,
 
-    #[schemars(description = "partitions count (required, must be greater than 0)")]
+    #[schemars(
+        description = "partitions count (required, zero creates a topic with no partitions. Add partitions before sending messages)"
+    )]
     pub partitions_count: u32,
 
     #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
@@ -197,13 +199,22 @@ pub struct PollMessages {
     #[schemars(description = "partition identifier (optional, number)")]
     pub partition_id: Option<u32>,
 
-    #[schemars(description = "strategy (optional, string)")]
+    #[schemars(
+        description = "polling strategy (optional, one of 'offset', 'first', 'last', 'next', \
+                       'timestamp'; defaults to 'offset'; 'next' resumes from the stored consumer \
+                       offset and always auto-commits; unknown values fall back to 'offset')"
+    )]
     pub strategy: Option<String>,
 
-    #[schemars(description = "offset to start from (optional)")]
+    #[schemars(
+        description = "offset to start from (optional, used with strategy 'offset', defaults to 0)"
+    )]
     pub offset: Option<u64>,
 
-    #[schemars(description = "timestamp to start from (optional, microseconds from Unix Epoch)")]
+    #[schemars(
+        description = "timestamp to start from (optional, microseconds from Unix Epoch, used with \
+                       strategy 'timestamp', defaults to now)"
+    )]
     pub timestamp: Option<u64>,
 
     #[schemars(
@@ -223,13 +234,20 @@ pub struct SendMessages {
     #[schemars(description = "topic identifier (name or number)")]
     pub topic_id: String,
 
-    #[schemars(description = "partition identifier (optional, number)")]
+    #[schemars(
+        description = "partition identifier (optional, number, used with partitioning 'partition', \
+                       defaults to 0)"
+    )]
     pub partition_id: Option<u32>,
 
-    #[schemars(description = "partitioning (optional, string)")]
+    #[schemars(
+        description = "partitioning (optional, one of 'balanced', 'key', 'partition'; defaults to \
+                       'balanced'; 'key' requires messages_key, 'partition' uses partition_id; \
+                       unknown values fall back to 'balanced')"
+    )]
     pub partitioning: Option<String>,
 
-    #[schemars(description = "messages key (optional, string)")]
+    #[schemars(description = "messages key (optional, string, required with partitioning 'key')")]
     pub messages_key: Option<String>,
 
     #[schemars(description = "messages collection")]
@@ -241,7 +259,9 @@ pub struct Message {
     #[schemars(description = "message identifier (optional, number)")]
     pub id: Option<u128>,
 
-    #[schemars(description = "message payload as a UTF-8 string")]
+    #[schemars(
+        description = "message payload as a UTF-8 string, which poll_messages returns base64 encoded"
+    )]
     pub payload: String,
 }
 
@@ -373,10 +393,10 @@ pub struct CreateUser {
     #[schemars(description = "password")]
     pub password: String,
 
-    #[schemars(description = "active (optional)")]
+    #[schemars(description = "whether the user can sign in (optional, defaults to true)")]
     pub active: Option<bool>,
 
-    #[schemars(description = "permissions (optional)")]
+    #[schemars(description = "permissions (optional, a flag left out is false)")]
     pub permissions: Option<Permissions>,
 }
 
@@ -410,7 +430,9 @@ pub struct UpdatePermissions {
     #[schemars(description = "user identifier (name or number)")]
     pub user_id: String,
 
-    #[schemars(description = "permissions (optional)")]
+    #[schemars(
+        description = "the complete new permissions, which replace the current ones. A flag left out is false, and leaving permissions out removes all of them (optional)"
+    )]
     pub permissions: Option<Permissions>,
 }
 
@@ -443,55 +465,55 @@ pub struct Permissions {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GlobalPermissions {
-    #[schemars(description = "manage servers (optional)")]
+    #[schemars(description = "manage servers (optional, defaults to false)")]
     pub manage_servers: Option<bool>,
 
-    #[schemars(description = "read servers (optional)")]
+    #[schemars(description = "read servers (optional, defaults to false)")]
     pub read_servers: Option<bool>,
 
-    #[schemars(description = "manage users (optional)")]
+    #[schemars(description = "manage users (optional, defaults to false)")]
     pub manage_users: Option<bool>,
 
-    #[schemars(description = "read users (optional)")]
+    #[schemars(description = "read users (optional, defaults to false)")]
     pub read_users: Option<bool>,
 
-    #[schemars(description = "manage streams (optional)")]
+    #[schemars(description = "manage streams (optional, defaults to false)")]
     pub manage_streams: Option<bool>,
 
-    #[schemars(description = "read streams (optional)")]
+    #[schemars(description = "read streams (optional, defaults to false)")]
     pub read_streams: Option<bool>,
 
-    #[schemars(description = "manage topics (optional)")]
+    #[schemars(description = "manage topics (optional, defaults to false)")]
     pub manage_topics: Option<bool>,
 
-    #[schemars(description = "read topics (optional)")]
+    #[schemars(description = "read topics (optional, defaults to false)")]
     pub read_topics: Option<bool>,
 
-    #[schemars(description = "poll messages (optional)")]
+    #[schemars(description = "poll messages (optional, defaults to false)")]
     pub poll_messages: Option<bool>,
 
-    #[schemars(description = "send messages (optional)")]
+    #[schemars(description = "send messages (optional, defaults to false)")]
     pub send_messages: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct StreamPermissions {
-    #[schemars(description = "manage stream (optional)")]
+    #[schemars(description = "manage stream (optional, defaults to false)")]
     pub manage_stream: Option<bool>,
 
-    #[schemars(description = "read stream (optional)")]
+    #[schemars(description = "read stream (optional, defaults to false)")]
     pub read_stream: Option<bool>,
 
-    #[schemars(description = "manage topics (optional)")]
+    #[schemars(description = "manage topics (optional, defaults to false)")]
     pub manage_topics: Option<bool>,
 
-    #[schemars(description = "read topics (optional)")]
+    #[schemars(description = "read topics (optional, defaults to false)")]
     pub read_topics: Option<bool>,
 
-    #[schemars(description = "poll messages (optional)")]
+    #[schemars(description = "poll messages (optional, defaults to false)")]
     pub poll_messages: Option<bool>,
 
-    #[schemars(description = "send messages (optional)")]
+    #[schemars(description = "send messages (optional, defaults to false)")]
     pub send_messages: Option<bool>,
 
     #[schemars(description = "topics permissions (optional)")]
@@ -500,16 +522,16 @@ pub struct StreamPermissions {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TopicPermissions {
-    #[schemars(description = "manage topic (optional)")]
+    #[schemars(description = "manage topic (optional, defaults to false)")]
     pub manage_topic: Option<bool>,
 
-    #[schemars(description = "read topic (optional)")]
+    #[schemars(description = "read topic (optional, defaults to false)")]
     pub read_topic: Option<bool>,
 
-    #[schemars(description = "poll messages (optional)")]
+    #[schemars(description = "poll messages (optional, defaults to false)")]
     pub poll_messages: Option<bool>,
 
-    #[schemars(description = "send messages (optional)")]
+    #[schemars(description = "send messages (optional, defaults to false)")]
     pub send_messages: Option<bool>,
 }
 

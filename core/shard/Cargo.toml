@@ -41,6 +41,7 @@ futures = { workspace = true }
 hash32 = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+iggy_object_store = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
 metadata = { workspace = true }
@@ -52,6 +53,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 metadata = { workspace = true, features = ["simulator"] }
 tempfile = { workspace = true }
 

@@ -1733,6 +1733,9 @@ class IggyClient:
         reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
         raw_reset: builtins.list[builtins.str] | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1753,19 +1756,34 @@ class IggyClient:
                 nothing either, reset `OptionKey.MaxTopicSize` to return to the
                 default.
             reset: Keys to return to their defaults as `list[OptionKey] | None`:
-                `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+                `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+                `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so an updatable server key can be set from this build.
                 A create-only key is refused by name.
             raw_reset: Additional reset names as `list[str] | None`, sent
                 verbatim so a key newer than this build can be reset. The
                 server decides them.
+            tiered_storage: `True` turns tiered storage on, unchanged when
+                `None`. The server refuses `False`, an update never turns it
+                off, and refuses `True` with `FeatureUnavailable` until it
+                tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, unchanged when
+                `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+                reset `OptionKey.LocalRetentionAge` to return to the default.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+                nothing either, reset `OptionKey.LocalRetentionSize` to return
+                to the default.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `local_retention_age` or `local_retention_size` is out of range.
             OptionError: A `RuntimeError` carrying the error `code` and
                 `kind` when the client or the server refuses an option.
             RuntimeError: Before anything is sent, if the update changes
@@ -2206,15 +2224,17 @@ class IggyClient:
         by default. A continuation is refused, because it belongs to one partition. `options`
         sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
         reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
-        default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
-        bound the requests in flight and the queued batches.
+        default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+        and queued batches. Each effective budget holds at least 32 reads at the configured
+        count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+        queued batches; network requests have a separate per-consumer limit of 32.
 
         Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
         `Consumer.Single` without partitions or a continuation as `start`,
         `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
-        error of the group join. A join with an unknown outcome raises `PendingOperationError`:
-        the client keeps it, so a new `reader()` raises `lane_blocked` until
-        `resolve_operation()` or `abandon_operation()` settles it.
+        error of the group join. A join with an unknown outcome raises `PendingOperationError`
+        after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+        that landed keeps its member in the group until the session ends.
         """
     def consumer_group(
         self,
@@ -2230,6 +2250,7 @@ class IggyClient:
         polling_retry_interval: datetime.timedelta | None = None,
         init_retries: builtins.int | None = None,
         init_retry_interval: datetime.timedelta | None = None,
+        offset_drain_timeout: datetime.timedelta | None = None,
         allow_replay: builtins.bool = False,
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
@@ -2243,11 +2264,17 @@ class IggyClient:
         the default, stores none, so commit checkpoints after processing, or each restart reads
         the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
         each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
-        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
-        the poll count by default) bound the requests in flight and the queued batches.
+        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+        budgets for reads in flight and queued batches. Each effective budget holds at least
+        32 reads at the configured poll count and byte limit, even if a smaller budget is
+        requested. Larger budgets allow more queued batches; network requests have a separate
+        per-consumer limit of 32.
+        `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
+        stores before closing the reader. It defaults to five seconds; zero skips that wait.
         Call `shutdown()` before dropping the consumer.
         Returns the consumer or raises `IggyError` on failure. Raises `ValueError` if
-        `polling_retry_interval` or `init_retry_interval` is negative or zero.
+        `polling_retry_interval` or `init_retry_interval` is negative or zero, or if
+        `offset_drain_timeout` is negative.
 
         Consumer groups are not available over HTTP: this call raises `FeatureUnavailable`.
         Use `Consumer.Single(...)` with `poll_messages(...)` or `reader(...)` there.
@@ -2404,7 +2431,9 @@ class IggyConsumer:
         r"""
         Sets the next read position of a partition and drops the rest of its batch that the
         consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
-        stores the offset before it, so a restart resumes at the new position. Every other seek
+        stores the offset before it, so a restart resumes at the new position. A seek to offset 0
+        or `PollingStrategy.First()` deletes the stored offset. A seek to a timestamp stores the
+        offset before the first message at the timestamp, if there is one. Every other seek
         stores nothing. It resumes a stopped partition.
         `start` is a new strategy or a continuation of the same partition, such as
         `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
@@ -2412,9 +2441,9 @@ class IggyConsumer:
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
         read and for a continuation of another partition, `PendingOperationError` under
         `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
-        (abandon its operation first), the errors of the offset store with `OnRead`, and
-        `RuntimeError` while `consume_messages()` runs, also from its callback: seek after the
-        run ends.
+        (abandon its operation first), the errors of the read, lookup, store or delete with
+        `OnRead`, and `RuntimeError` while `consume_messages()` runs, also from its callback:
+        seek after the run ends.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -3749,6 +3778,24 @@ class OptionKey:
     Fingerprints of the server keys wrapping the stream's key, computed by
     the server.
     """
+    SegmentMaxAge: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment age roll, fixed at creation.
+    """
+    TieredStorage: typing.ClassVar[OptionKey]
+    r"""
+    Topic tiered storage. An update only turns it on.
+    """
+    LocalRetentionAge: typing.ClassVar[OptionKey]
+    r"""
+    Time a tiered topic keeps an uploaded segment on local disk,
+    resettable to one day.
+    """
+    LocalRetentionSize: typing.ClassVar[OptionKey]
+    r"""
+    Cap on the uploaded segments a tiered topic keeps on local disk,
+    resettable to unlimited.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -3918,12 +3965,15 @@ class PartitionReader:
       while `next()` waits and then fills its budget (one fetch per primary that may wait for
       messages, the partitions with messages left behind spread over the other slots), a `seek()`
       to an offset stores the offset before it, and `close()` moves the offset back to the last
-      delivered message.
+      delivered message. A crash, or a reader dropped without `close()`, loses the batches that
+      the server stored before the application took them, up to the effective budget, which
+      holds at least 32 batches.
     - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
       (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
       partition until `IggyClient.abandon_operation()` and `seek()`.
-    - The calls on one reader run one at a time, so a call waits for a pending `next()`.
-      `next()` is cancel safe: cancel it before `close()`.
+    - The calls on one reader run one at a time, so each call waits for the pending ones, and
+      `close()` waits for all of them. `next()` is cancel safe. Cancel a pending `next()` or
+      `commit()` before `close()`.
     - Dropping the reader stops its tasks without waiting, and it moves no offset back.
     - `async for` reads its batches until `close()`, and `async with` closes it on exit.
     """
@@ -3939,6 +3989,13 @@ class PartitionReader:
         Stores the offset of a checkpoint that this reader delivered, which covers every earlier
         message of its partition. A checkpoint of an older generation of its partition, or at or
         below the last commit of its generation, stores nothing.
+
+        When the offset store gets `ConsumerGroupPartitionNotOwned` (5009) for a partition that
+        the reader still has, `commit()` reads the owner of the partition again. The server can
+        refuse that read for a short time, and `commit()` repeats it after each such refusal, with
+        no time limit. To bound `commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends
+        nothing more, but a write that it already sent can still take effect. `close()` waits for
+        a pending `commit()`, so cancel it before `close()`.
 
         Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
         checkpoint that this reader did not deliver, the errors of the offset store, and
@@ -3965,14 +4022,18 @@ class PartitionReader:
 
         With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
         it, under the history of a continuation or else of the last delivered message, so a
-        restart resumes at the new position. A failed store fails the seek and nothing moves.
-        Every other seek stores nothing. The new position waits for the end of the committing
-        read in flight, whose reply the new generation drops.
+        restart resumes at the new position. A seek to offset 0 or `PollingStrategy.First()`
+        deletes the stored offset under the same history when the server holds one, because the
+        commit of a read never moves the offset back. A seek to a timestamp first reads one
+        message at the timestamp without a commit, and then acts as a seek to the offset of that
+        message. Without such a message it stores nothing. A failed read, lookup, store or delete
+        fails the seek and nothing moves. Every other seek stores nothing. The new position waits
+        for the end of the committing read in flight, whose reply the new generation drops.
 
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
         and for a continuation of another partition, `PendingOperationError` with `OnRead` while
         a read of the partition has an unknown outcome (abandon its operation first), the errors
-        of the offset store with `OnRead`, and `RuntimeError` after `close()`.
+        of the read, lookup, store or delete with `OnRead`, and `RuntimeError` after `close()`.
         """
     def partitions(self) -> collections.abc.Awaitable[list[builtins.int]]:
         r"""
@@ -4065,7 +4126,10 @@ class Partitioning:
 @typing.final
 class PendingOperationError(IggyError):
     r"""
-    An operation whose retained identity is needed to recover or release its lane.
+    An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+    names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+    The client retains no operation for kind `not_retained`, and none for a group join that
+    `reader()` abandoned.
     """
     @property
     def operation_id(self) -> builtins.int: ...
@@ -4480,7 +4544,18 @@ class ReadError(IggyError):
     def is_lasting_refusal(self) -> builtins.bool:
         r"""
         Whether the reader stopped the partition after six refusals in a row that a retry does
-        not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+        not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+        of the partition reads it again.
+        """
+    @property
+    def lost(self) -> tuple[builtins.int, builtins.int] | None:
+        r"""
+        For messages that a lost read committed and that the reader could not read again: their
+        first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+        (14010). `None` for every other error. This error stops nothing and needs no `seek()`.
+        A batch that the reader holds after the range comes next, and a `seek()` before the
+        application takes it drops it. If the reader stopped the partition, the error that
+        stopped it comes after that batch.
         """
     @property
     def error(self) -> IggyError:
@@ -4493,7 +4568,7 @@ class ReadError(IggyError):
         r"""
         For a message that does not decode: the continuation after it. The messages before it
         arrive in a batch before this error, and the reader reads the message again until
-        `seek()` to this continuation skips it.
+        `seek()` to this continuation skips it. `None` for every other error.
         """
     @property
     def record(self) -> bytes | None: ...
@@ -5442,14 +5517,19 @@ class TopicOptions:
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
         replication_factor: builtins.int | None = None,
+        segment_max_age: IggyExpiry | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
         Constructs topic create options.
 
         Every setting left as `None` resolves against the server default at
-        admission. Only `message_expiry`, `max_topic_size` and the name can
-        change after creation, through `update_topic`.
+        admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
+        `local_retention_age`, `local_retention_size` and the name can change
+        after creation, through `update_topic`.
 
         Args:
             partitions_count: Number of partitions as `int`, at most 1000.
@@ -5479,12 +5559,31 @@ class TopicOptions:
                 accepting writes while either node is down. The server rejects
                 an out-of-range value with an `OptionError` of kind
                 `invalid_replication_factor`.
+            segment_max_age: Age past a segment's first batch at which a batch
+                starts the next segment, as `IggyExpiry | None`, at least 10
+                minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+                which rolls segments by size alone. The server refuses a
+                duration together with `preallocate_segments=True`.
+            tiered_storage: Move sealed segments to the object store as
+                `bool | None`. `None` leaves it off. The server refuses `True`
+                with `FeatureUnavailable` until it tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, one day when
+                `None`. `IggyExpiry.ServerDefault()` is the same as `None`.
+                The server refuses an age above a finite `message_expiry`.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
+                same as `None`. The server refuses a size above a finite
+                `max_topic_size`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `segment_max_age`, `local_retention_age` or
+                `local_retention_size` is out of range.
             RuntimeError: If `compression_algorithm` names no known algorithm.
             TypeError: If a durability is not a `Durability`.
         """

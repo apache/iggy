@@ -38,7 +38,7 @@ use server_common::send_messages::{ChecksumMode, convert_request_message, encryp
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
@@ -117,7 +117,9 @@ where
     keyring: RefCell<StreamKeyring>,
     /// Reconciler fences must not borrow a partition held by the pump across await.
     teardown: RefCell<AHashMap<IggyNamespace, crate::PartitionTeardown>>,
-    consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
+    /// Namespaces whose consumer group offsets need a sweep, shared with every
+    /// partition here. Same single-threaded borrow rules as `tombstoned`.
+    consumer_group_offsets_dirty: Rc<RefCell<BTreeSet<IggyNamespace>>>,
     fence_published: Rc<Cell<bool>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
@@ -164,7 +166,7 @@ where
             tombstoned: RefCell::new(AHashMap::new()),
             keyring,
             teardown: RefCell::new(AHashMap::new()),
-            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            consumer_group_offsets_dirty: Rc::default(),
             fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
@@ -187,7 +189,7 @@ where
             tombstoned: RefCell::new(AHashMap::new()),
             keyring,
             teardown: RefCell::new(AHashMap::new()),
-            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            consumer_group_offsets_dirty: Rc::default(),
             fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
@@ -415,9 +417,7 @@ where
         }
         self.install_loopback_notifier(namespace, &partition);
         partition.publish_current_offset();
-        partition.set_consumer_group_offsets_reconcile_epoch(Rc::clone(
-            &self.consumer_group_offsets_reconcile_epoch,
-        ));
+        partition.set_consumer_group_offsets_dirty(Rc::clone(&self.consumer_group_offsets_dirty));
         partition.set_fence_published_flag(Rc::clone(&self.fence_published));
         self.teardown
             .borrow_mut()
@@ -430,16 +430,19 @@ where
         local_idx
     }
 
-    pub fn consumer_group_offsets_reconcile_epoch(&self) -> u64 {
-        self.consumer_group_offsets_reconcile_epoch.get()
+    /// Takes the namespaces whose consumer group offsets need a sweep. A
+    /// partition records itself when it is inserted, installs a group owner,
+    /// creates or deletes a group-keyed offset, and at the first operation
+    /// that sees a new view.
+    #[must_use]
+    pub fn take_consumer_group_offsets_dirty(&self) -> BTreeSet<IggyNamespace> {
+        self.consumer_group_offsets_dirty.take()
     }
 
-    pub fn note_consumer_group_offsets_reconcile_needed(&self) {
-        self.consumer_group_offsets_reconcile_epoch.set(
-            self.consumer_group_offsets_reconcile_epoch
-                .get()
-                .wrapping_add(1),
-        );
+    pub fn mark_consumer_group_offsets_dirty(&self, namespace: IggyNamespace) {
+        self.consumer_group_offsets_dirty
+            .borrow_mut()
+            .insert(namespace);
     }
 
     /// Whether a partition here published a fence since the last call.
@@ -678,13 +681,26 @@ where
         consumer: PollingConsumer,
         args: &PollingArgs,
     ) -> Option<PollPlan> {
+        self.build_poll_snapshot_within(namespace, consumer, args, usize::MAX)
+    }
+
+    /// [`Self::build_poll_snapshot`] for a poll whose reply holds at most
+    /// `byte_budget` bytes of messages, so the snapshot stops at the segment
+    /// that covers them instead of at the partition's tail.
+    pub fn build_poll_snapshot_within(
+        &self,
+        namespace: &IggyNamespace,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+        byte_budget: usize,
+    ) -> Option<PollPlan> {
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
         // inside), so no sibling task can realloc the partitions vec under it.
         // Read the knob first: the `&mut` borrow below covers `self.config` too.
         let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
-        Some(partition.build_poll_plan(consumer, args, validate_checksum))
+        Some(partition.build_poll_plan_within(consumer, args, validate_checksum, byte_budget))
     }
 
     /// Validate and accept a poll synchronously on the owning pump.
@@ -702,7 +718,9 @@ where
     /// # Errors
     /// Rejects stale history, unavailable partition or admission state, invalid
     /// consumer identifiers, and exhausted consumer, queue, or journal capacity.
-    /// Rejection does not accept progress from this read.
+    /// A read of the served history that the object store failed for good is
+    /// rejected with that failure. Rejection does not accept progress from
+    /// this read.
     pub fn complete_poll(
         &self,
         namespace: &IggyNamespace,

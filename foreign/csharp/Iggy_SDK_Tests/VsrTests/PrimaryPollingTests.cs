@@ -1146,6 +1146,25 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
+    public async Task given_a_failed_tiered_read_when_polling_should_report_it_without_sending_again()
+    {
+        using var cluster = new PollCluster();
+        var polls = new ConcurrentQueue<MockRequest>();
+        cluster.OnPrimaryPoll = request =>
+        {
+            polls.Enqueue(request);
+            return Reply(request.Operation, [], VsrError.TIERED_READ_FAILED);
+        };
+        using var client = await cluster.ConnectAsync();
+
+        var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.PollMessagesAsync(Stream,
+            Topic, 0, Consumer.New(3), PollingStrategy.Next(), 10, false, TestContext.Current.CancellationToken));
+
+        Assert.Equal((VsrError.TIERED_READ_FAILED, true), (refusal.StatusCode, refusal.FromServer));
+        Assert.Single(polls);
+    }
+
+    [Fact]
     public async Task given_a_history_refusal_when_storing_an_offset_should_report_it_and_route_the_next_write_again()
     {
         using var cluster = new PollCluster { RouteContext = new PartitionContext(17, 0, 52) };

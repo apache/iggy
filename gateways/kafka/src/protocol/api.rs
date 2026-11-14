@@ -35,6 +35,7 @@ use crate::cluster_id::ClusterId;
 use crate::coordinator::{Coordination, Placement};
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember, MAX_CLIENT_ID_BYTES};
+use crate::observability::{Pool, PoolCensus};
 use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
@@ -84,6 +85,9 @@ pub enum HandleOutcome {
     RespondThenClose(Bytes),
     /// No parseable response exists for this request; close the TCP connection.
     Close,
+    /// Produce with `acks=0` whose records Iggy did not take in time. Write nothing and close,
+    /// as Kafka does, so the client refreshes its metadata.
+    UnacknowledgedProduceFailed,
 }
 
 impl HandleOutcome {
@@ -99,6 +103,7 @@ impl HandleOutcome {
             Self::Respond(body) | Self::RespondThenClose(body) => body,
             Self::NoResponse => panic!("{msg}: got NoResponse"),
             Self::Close => panic!("{msg}: got Close"),
+            Self::UnacknowledgedProduceFailed => panic!("{msg}: got UnacknowledgedProduceFailed"),
         }
     }
 
@@ -131,6 +136,10 @@ impl Default for BrokerAdvertise {
 /// The node id of a gateway that `IGGY_KAFKA_NODE_ID` does not set.
 pub const DEFAULT_NODE_ID: u16 = 1;
 
+/// The first stand-in node id in a replica list: 65536, one past the largest node id a gateway can
+/// take, since `IGGY_KAFKA_NODE_ID` is a `u16`.
+pub const FIRST_STAND_IN_REPLICA: i32 = 1 << 16;
+
 /// The gateways that one listener lists in Metadata. A gateway alone lists itself, as node 1.
 #[derive(Debug, Clone)]
 pub struct Brokers {
@@ -161,6 +170,28 @@ impl Brokers {
         listed.push((self.node_id, own));
         listed.sort_by_key(|(node, _)| *node);
         listed
+    }
+
+    /// `count` node ids for the replicas of a partition, and never fewer than one: this gateway
+    /// first, then the next gateways in node id order, wrapping round. A factor above the number
+    /// of gateways is filled with stand-in ids from [`FIRST_STAND_IN_REPLICA`], which no gateway
+    /// can take. A client reads a stand-in as a replica on a broker that is not up, and reads the
+    /// factor from the length of the list.
+    #[must_use]
+    pub fn replicas(&self, count: u32) -> Vec<i32> {
+        let wanted = usize::try_from(count).unwrap_or(usize::MAX).max(1);
+        let mut ids: Vec<i32> = self.peers.iter().map(|(node, _)| *node).collect();
+        ids.push(self.node_id);
+        ids.sort_unstable();
+        let own = ids
+            .iter()
+            .position(|node| *node == self.node_id)
+            .unwrap_or(0);
+        ids.rotate_left(own);
+        ids.truncate(wanted);
+        let stand_ins = (FIRST_STAND_IN_REPLICA..).take(wanted.saturating_sub(ids.len()));
+        ids.extend(stand_ins);
+        ids
     }
 
     /// The gateway that coordinates every consumer group: the lowest node id. Every gateway names
@@ -292,6 +323,11 @@ pub struct GatewayState {
     /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
     /// proof that no record matches. Only the first of a spell warns.
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, what the Iggy polls of Fetch and `ListOffsets` showed: how
+    /// long the next poll may take, and whether the partition stalled. Shared, so the consumers
+    /// of a partition whose node stopped do not each spend a read slot waiting for it. In an
+    /// `Arc`, since a re-check reports after its request ended.
+    pub(crate) poll_records: Arc<Mutex<fetch::PollRecords>>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
     /// Held by `CreatePartitions` from reading a topic's partition count until its write is
@@ -324,7 +360,32 @@ const PRODUCE_LARGE: usize = 4;
 /// large slots: large requests can hold a cap each, and the small ones still have one.
 const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
 
+/// The bytes of [`GatewayState::produce_memory`]: [`PRODUCE_CAPS`] frames, at most what a
+/// semaphore counts.
+const fn produce_memory_capacity(max_frame_size: usize) -> usize {
+    let capacity = PRODUCE_CAPS.saturating_mul(max_frame_size);
+    if capacity < Semaphore::MAX_PERMITS {
+        capacity
+    } else {
+        Semaphore::MAX_PERMITS
+    }
+}
+
 impl GatewayState {
+    /// The large Produce slots in use, and the bytes of decoded Produce partitions held now with
+    /// the most the gateway holds, for the metrics.
+    #[must_use]
+    pub fn produce_use(&self) -> (PoolCensus, (usize, usize)) {
+        let large = PoolCensus {
+            pool: Pool::ProduceLarge,
+            used: PRODUCE_LARGE.saturating_sub(self.produce_large.available_permits()),
+            capacity: PRODUCE_LARGE,
+        };
+        let capacity = produce_memory_capacity(self.max_frame_size);
+        let used = capacity.saturating_sub(self.produce_memory.available_permits());
+        (large, (used, capacity))
+    }
+
     /// Whether this gateway gave out `producer_id` lately, so Produce may key an Iggy session on
     /// it. With a bridge the ids come from Iggy. Without one, from the local allocator.
     #[must_use]
@@ -346,15 +407,12 @@ impl GatewayState {
             bridge,
             max_frame_size,
             producer_ids: ProducerIdAllocator::new(instance_id),
-            produce_memory: Arc::new(Semaphore::new(
-                PRODUCE_CAPS
-                    .saturating_mul(max_frame_size)
-                    .min(Semaphore::MAX_PERMITS),
-            )),
+            produce_memory: Arc::new(Semaphore::new(produce_memory_capacity(max_frame_size))),
             produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
             groups,
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
+            poll_records: Arc::default(),
             probe_board: ProbeBoard::default(),
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
@@ -666,19 +724,15 @@ pub fn supported_max_version(api_key: i16) -> Option<i16> {
 /// open, the answer a real broker gives on a PLAINTEXT listener. Keeping them out of the firewall
 /// table means dispatch never serves them on its own.
 ///
-/// `SaslHandshake` is pinned to v1 on both ends. v0 selects the headerless token framing (KIP-152)
-/// that the frame reader cannot parse, so advertising it would invite exactly the shape this
-/// gateway refuses.
+/// `SaslHandshake` v0 selects a bare token with no request header after it (KIP-152), and v1 a
+/// token in a `SaslAuthenticate` request. The connection loop serves both.
 static SASL_ADVERTISED_RANGES: &[ApiVersionRange] = &[
     ApiVersionRange {
-        // Advertised from v0 even though only v1 is accepted, the same split
-        // [`advertised_min_version`] already applies to Produce. librdkafka gates its whole
-        // SASL-handshake feature on `SaslHandshake` v0 appearing in the advertisement
-        // (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so advertising v1
-        // alone makes it report "SASL Handshake not supported by broker" and give up before it
-        // ever sends one. It then picks v1 anyway, because `SaslAuthenticate` being advertised is
-        // what selects the KIP-152 framing. A client that really only knows v0 still gets
-        // `UNSUPPORTED_VERSION` and a closed connection from the state machine.
+        // librdkafka gates its whole SASL-handshake feature on `SaslHandshake` v0 appearing in the
+        // advertisement (`RD_KAFKA_FEATURE_SASL_HANDSHAKE` depends on key 17 at version 0), so
+        // advertising v1 alone makes it report "SASL Handshake not supported by broker" and give
+        // up before it ever sends one. It then picks v1, because `SaslAuthenticate` being
+        // advertised is what selects the KIP-152 framing.
         api_key: API_KEY_SASL_HANDSHAKE,
         min_version: 0,
         max_version: 1,
@@ -920,6 +974,18 @@ mod tests {
     use iggy_kafka_wire::bounds_guard::guarded_range;
 
     use super::*;
+
+    #[tokio::test]
+    async fn given_held_produce_slots_and_memory_should_count_them() {
+        let state = GatewayState::stub(1_024);
+        let _large = state.produce_large.acquire().await.unwrap();
+        let _memory = state.produce_memory.acquire_many(300).await.unwrap();
+
+        let (large, (used, capacity)) = state.produce_use();
+        assert_eq!(large.pool, Pool::ProduceLarge);
+        assert_eq!((large.used, large.capacity), (1, PRODUCE_LARGE));
+        assert_eq!((used, capacity), (300, produce_memory_capacity(1_024)));
+    }
 
     /// A version this gateway advertises but the guard does not walk would reach the decoder
     /// unchecked, so the two tables must never drift apart.

@@ -26,12 +26,12 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3::{PyErrArguments, PyRef};
-use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ use crate::consumer::{
     ConsumerGroupDetails as PyConsumerGroupDetails, ConsumerOffsetInfo, IggyConsumer,
 };
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
-use crate::event_loop::on_event_loop;
+use crate::event_loop::{attach_unless_exiting, future_into_py, on_event_loop};
 use crate::identifier::PyIdentifier;
 use crate::metadata_changes::{
     MetadataChangeGroup, MetadataChangeStart, MetadataChanges, validated_query,
@@ -94,7 +94,10 @@ impl From<&IggyError> for PyIggyError {
     }
 }
 
-/// An operation whose retained identity is needed to recover or release its lane.
+/// An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+/// names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+/// The client retains no operation for kind `not_retained`, and none for a group join that
+/// `reader()` abandoned.
 #[gen_stub_pyclass]
 #[pyclass(frozen, extends=PyIggyError)]
 pub struct PendingOperationError {
@@ -128,9 +131,18 @@ pub struct ReadError {
     offset: Option<u64>,
     record: Option<Bytes>,
     /// Whether the reader stopped the partition after six refusals in a row that a retry does
-    /// not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+    /// not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+    /// of the partition reads it again.
     #[pyo3(get)]
     is_lasting_refusal: bool,
+    /// For messages that a lost read committed and that the reader could not read again: their
+    /// first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+    /// (14010). `None` for every other error. This error stops nothing and needs no `seek()`.
+    /// A batch that the reader holds after the range comes next, and a `seek()` before the
+    /// application takes it drops it. If the reader stopped the partition, the error that
+    /// stopped it comes after that batch.
+    #[pyo3(get)]
+    lost: Option<(u64, u64)>,
 }
 
 #[gen_stub_pymethods]
@@ -146,7 +158,7 @@ impl ReadError {
 
     /// For a message that does not decode: the continuation after it. The messages before it
     /// arrive in a batch before this error, and the reader reads the message again until
-    /// `seek()` to this continuation skips it.
+    /// `seek()` to this continuation skips it. `None` for every other error.
     #[gen_stub(override_return_type(type_repr = "PollingStrategy | None"))]
     #[getter]
     fn skip(&self) -> Option<PollingStrategy> {
@@ -204,6 +216,7 @@ impl PyErrArguments for ReadErrorArguments {
             offset: error.offset,
             record: error.record,
             is_lasting_refusal,
+            lost: error.lost.map(RangeInclusive::into_inner),
         };
         exception_value(
             py,
@@ -1259,26 +1272,41 @@ impl IggyClient {
     ///         nothing either, reset `OptionKey.MaxTopicSize` to return to the
     ///         default.
     ///     reset: Keys to return to their defaults as `list[OptionKey] | None`:
-    ///         `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+    ///         `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+    ///         `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
     ///     options: Additional option keys as `dict[str, str] | None`, sent
     ///         verbatim so an updatable server key can be set from this build.
     ///         A create-only key is refused by name.
     ///     raw_reset: Additional reset names as `list[str] | None`, sent
     ///         verbatim so a key newer than this build can be reset. The
     ///         server decides them.
+    ///     tiered_storage: `True` turns tiered storage on, unchanged when
+    ///         `None`. The server refuses `False`, an update never turns it
+    ///         off, and refuses `True` with `FeatureUnavailable` until it
+    ///         tiers topics.
+    ///     local_retention_age: How long a tiered topic keeps an uploaded
+    ///         segment on local disk as `IggyExpiry | None`, unchanged when
+    ///         `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+    ///         reset `OptionKey.LocalRetentionAge` to return to the default.
+    ///     local_retention_size: Topic-wide cap on the uploaded segments a
+    ///         tiered topic keeps on local disk as `MaxTopicSize | None`,
+    ///         unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+    ///         nothing either, reset `OptionKey.LocalRetentionSize` to return
+    ///         to the default.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     ValueError: If `message_expiry`, `max_topic_size`,
+    ///         `local_retention_age` or `local_retention_size` is out of range.
     ///     OptionError: A `RuntimeError` carrying the error `code` and
     ///         `kind` when the client or the server refuses an option.
     ///     RuntimeError: Before anything is sent, if the update changes
     ///         nothing, names a key both set and reset, the name does not fit,
     ///         or a reset key cannot be reset. Otherwise if the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None)
+        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -1301,11 +1329,25 @@ impl IggyClient {
         options: Option<BTreeMap<String, String>>,
         #[gen_stub(override_type(type_repr = "builtins.list[builtins.str] | None"))]
         raw_reset: Option<Vec<String>>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tiered_storage: Option<bool>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] local_retention_age: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let update_options = TopicUpdateOptions {
             name,
             message_expiry: message_expiry.map(RustIggyExpiry::try_from).transpose()?,
             max_topic_size: max_topic_size.map(RustMaxTopicSize::try_from).transpose()?,
+            tiered_storage,
+            local_retention_age: local_retention_age
+                .map(RustIggyExpiry::try_from)
+                .transpose()?,
+            local_retention_size: local_retention_size
+                .map(RustMaxTopicSize::try_from)
+                .transpose()?,
             reset: reset_keys(reset),
             raw_reset: raw_reset.into_iter().flatten().collect(),
             raw: options.unwrap_or_default(),
@@ -1486,8 +1528,7 @@ impl IggyClient {
             inner
                 .delete_segments(&stream_id, &topic_id, partition_id, segments_count)
                 .await
-                .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| py.None()))
+                .map_err(to_runtime_error)
         })
     }
 
@@ -2069,15 +2110,17 @@ impl IggyClient {
     /// by default. A continuation is refused, because it belongs to one partition. `options`
     /// sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
     /// reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
-    /// default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
-    /// bound the requests in flight and the queued batches.
+    /// default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+    /// and queued batches. Each effective budget holds at least 32 reads at the configured
+    /// count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+    /// queued batches; network requests have a separate per-consumer limit of 32.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
     /// `Consumer.Single` without partitions or a continuation as `start`,
     /// `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
-    /// error of the group join. A join with an unknown outcome raises `PendingOperationError`:
-    /// the client keeps it, so a new `reader()` raises `lane_blocked` until
-    /// `resolve_operation()` or `abandon_operation()` settles it.
+    /// error of the group join. A join with an unknown outcome raises `PendingOperationError`
+    /// after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+    /// that landed keeps its member in the group until the session ends.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         stream,
@@ -2146,11 +2189,17 @@ impl IggyClient {
     /// the default, stores none, so commit checkpoints after processing, or each restart reads
     /// the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
     /// each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
-    /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
-    /// the poll count by default) bound the requests in flight and the queued batches.
+    /// `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+    /// budgets for reads in flight and queued batches. Each effective budget holds at least
+    /// 32 reads at the configured poll count and byte limit, even if a smaller budget is
+    /// requested. Larger budgets allow more queued batches; network requests have a separate
+    /// per-consumer limit of 32.
+    /// `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
+    /// stores before closing the reader. It defaults to five seconds; zero skips that wait.
     /// Call `shutdown()` before dropping the consumer.
     /// Returns the consumer or raises `IggyError` on failure. Raises `ValueError` if
-    /// `polling_retry_interval` or `init_retry_interval` is negative or zero.
+    /// `polling_retry_interval` or `init_retry_interval` is negative or zero, or if
+    /// `offset_drain_timeout` is negative.
     ///
     /// Consumer groups are not available over HTTP: this call raises `FeatureUnavailable`.
     /// Use `Consumer.Single(...)` with `poll_messages(...)` or `reader(...)` there.
@@ -2168,6 +2217,7 @@ impl IggyClient {
         polling_retry_interval=None,
         init_retries=None,
         init_retry_interval=None,
+        offset_drain_timeout=None,
         allow_replay=false,
     ))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IggyConsumer]", imports=("collections.abc")))]
@@ -2193,6 +2243,8 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         init_retry_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        offset_drain_timeout: Option<Py<PyDelta>>,
         allow_replay: bool,
     ) -> PyResult<Bound<'a, PyAny>> {
         let mut builder = self
@@ -2205,6 +2257,10 @@ impl IggyClient {
         } else {
             builder.do_not_create_consumer_group_if_not_exists()
         };
+        if let Some(offset_drain_timeout) = offset_drain_timeout {
+            builder =
+                builder.offset_drain_timeout(py_delta_to_iggy_duration(&offset_drain_timeout)?);
+        }
         let settings = ConsumerSettings {
             polling_strategy: polling_strategy.map(|strategy| strategy.inner),
             poll_options,
@@ -2312,7 +2368,7 @@ impl IggyClient {
                 .send_binary_request(code, Bytes::from(payload))
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+            attach_unless_exiting(|py| Ok(PyBytes::new(py, &response).unbind()))
         })
     }
 
@@ -2350,7 +2406,7 @@ impl IggyClient {
                 .send_binary_request_to_replica(code, Bytes::from(payload), replica_id)
                 .await
                 .map_err(to_runtime_error)?;
-            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
+            attach_unless_exiting(|py| Ok(PyBytes::new(py, &response).unbind()))
         })
     }
 }
@@ -2564,13 +2620,11 @@ mod tests {
         Python::attach(|py| {
             for offset in [None, Some(10)] {
                 for record in [None, Some(Bytes::from_static(&[0, 255, 17, 128]))] {
-                    let error = to_read_error(RustReadError {
-                        partition_id: Some(7),
-                        error: IggyError::CannotReadMessage,
-                        skip: Some(RustPollingStrategy::offset(11)),
-                        offset,
-                        record: record.clone(),
-                    });
+                    let mut read_error = RustReadError::new(Some(7), IggyError::CannotReadMessage);
+                    read_error.skip = Some(RustPollingStrategy::offset(11));
+                    read_error.offset = offset;
+                    read_error.record = record.clone();
+                    let error = to_read_error(read_error);
                     let value = error.value(py);
                     assert_eq!(
                         value
@@ -2604,13 +2658,8 @@ mod tests {
         Python::attach(|py| {
             let cause = IggyError::FetchProgressUncertain(OPERATION_ID);
             let code = cause.as_code();
-            let read_error = RustReadError {
-                partition_id: Some(PARTITION_ID),
-                error: cause,
-                skip: Some(RustPollingStrategy::offset(SKIP_OFFSET)),
-                offset: None,
-                record: None,
-            };
+            let mut read_error = RustReadError::new(Some(PARTITION_ID), cause);
+            read_error.skip = Some(RustPollingStrategy::offset(SKIP_OFFSET));
             let message = read_error.to_string();
 
             let error = to_read_error(read_error);
@@ -2663,13 +2712,7 @@ mod tests {
                 (None, IggyError::Unauthorized, false),
                 (Some(1), IggyError::HistoryUnavailable, false),
             ] {
-                let error = to_read_error(RustReadError {
-                    partition_id,
-                    error,
-                    skip: None,
-                    offset: None,
-                    record: None,
-                });
+                let error = to_read_error(RustReadError::new(partition_id, error));
 
                 let value = error.value(py);
                 assert_eq!(
@@ -2686,23 +2729,95 @@ mod tests {
     }
 
     #[test]
+    fn given_tiered_read_failure_when_mapping_should_keep_its_code_and_flag_the_stop() {
+        const TIERED_READ_FAILED_CODE: u32 = 96;
+        const PARTITION_ID: u32 = 1;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::TieredReadFailed);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            assert_eq!(
+                raised
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+
+            let read = to_read_error(RustReadError::new(
+                Some(PARTITION_ID),
+                IggyError::TieredReadFailed,
+            ));
+
+            assert!(read.is_instance_of::<ReadError>(py));
+            let value = read.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+            assert!(
+                value
+                    .getattr("is_lasting_refusal")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                "the first tiered read failure stops its partition"
+            );
+            let cause = value.getattr("error").unwrap();
+            assert_eq!(
+                cause.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+        });
+    }
+
+    #[test]
     fn given_read_error_of_the_whole_reader_when_mapping_should_have_no_partition_or_skip() {
         Python::initialize();
         Python::attach(|py| {
-            let error = to_read_error(RustReadError {
-                partition_id: None,
-                error: IggyError::Disconnected,
-                skip: None,
-                offset: None,
-                record: None,
-            });
+            let error = to_read_error(RustReadError::new(None, IggyError::Disconnected));
 
             let value = error.value(py);
             assert!(value.getattr("partition_id").unwrap().is_none());
             assert!(value.getattr("skip").unwrap().is_none());
+            assert!(value.getattr("lost").unwrap().is_none());
             let cause = value.getattr("error").unwrap();
             assert!(cause.is_instance_of::<PyIggyError>());
             assert!(!cause.is_instance_of::<PendingOperationError>());
+        });
+    }
+
+    #[test]
+    fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
+        const PARTITION_ID: u32 = 7;
+        const OPERATION_ID: u64 = 42;
+        const FIRST: u64 = 4;
+        const LAST: u64 = 9;
+        Python::initialize();
+        Python::attach(|py| {
+            let mut read_error = RustReadError::new(
+                Some(PARTITION_ID),
+                IggyError::FetchProgressUncertain(OPERATION_ID),
+            );
+            read_error.lost = Some(FIRST..=LAST);
+
+            let error = to_read_error(read_error);
+
+            let value = error.value(py);
+            assert!(value.getattr("skip").unwrap().is_none());
+            assert_eq!(
+                value
+                    .getattr("lost")
+                    .unwrap()
+                    .extract::<Option<(u64, u64)>>()
+                    .unwrap(),
+                Some((FIRST, LAST))
+            );
+            assert!(value.setattr("lost", py.None()).is_err());
         });
     }
 
@@ -2718,13 +2833,7 @@ mod tests {
                 let errors = (
                     to_runtime_error(IggyError::FetchProgressUncertain(OPERATION_ID)),
                     to_runtime_error(IggyError::InvalidOptionValue("count".to_owned())),
-                    to_read_error(RustReadError {
-                        partition_id: None,
-                        error: IggyError::Disconnected,
-                        skip: None,
-                        offset: None,
-                        record: None,
-                    }),
+                    to_read_error(RustReadError::new(None, IggyError::Disconnected)),
                 );
                 let _ = built.send(errors);
             });

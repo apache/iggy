@@ -76,6 +76,38 @@ public sealed class TopicResponse
     public ulong MaxTopicSize => OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.MaxTopicSize);
 
     /// <summary>
+    ///     How long after the active segment's first batch a batch starts the next segment, read from the topic's
+    ///     options. <see cref="TimeSpan.MaxValue" /> never rolls by age.
+    /// </summary>
+    [JsonIgnore]
+    public TimeSpan SegmentMaxAge =>
+        DurationHelpers.FromDuration(OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.SegmentMaxAge));
+
+    /// <summary>
+    ///     Whether sealed segments move to the object store, read from the topic's options. False when the server
+    ///     reports no such option.
+    /// </summary>
+    [JsonIgnore]
+    public bool TieredStorage =>
+        OptionValues.Find(Options, DerivedOptions, TopicOptionKey.TieredStorage) is { Kind: HeaderKind.Bool } value
+        && value.ToBool();
+
+    /// <summary>
+    ///     How long a tiered topic keeps an uploaded segment on local disk, read from the topic's options.
+    ///     <see cref="TimeSpan.MaxValue" /> never removes it.
+    /// </summary>
+    [JsonIgnore]
+    public TimeSpan LocalRetentionAge =>
+        DurationHelpers.FromDuration(OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.LocalRetentionAge));
+
+    /// <summary>
+    ///     Topic-wide cap in bytes on the uploaded segments a tiered topic keeps on local disk, read from the
+    ///     topic's options. <see cref="ulong.MaxValue" /> is unlimited.
+    /// </summary>
+    [JsonIgnore]
+    public ulong LocalRetentionSize => OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.LocalRetentionSize);
+
+    /// <summary>
     ///     Number of messages in the topic.
     /// </summary>
     public required ulong MessagesCount { get; init; }

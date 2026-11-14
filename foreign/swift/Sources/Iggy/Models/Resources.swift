@@ -56,7 +56,7 @@ public enum IggyExpiry: Sendable, Hashable {
             // Anything under a microsecond would travel as 0 (server default)
             // and anything past the u64 range would wrap; both are refused.
             guard duration >= .microseconds(1), let microseconds = duration.wholeMicroseconds, microseconds < UInt64.max else {
-                throw IggyError(.invalidOptionValue, context: "message expiry must be between 1 microsecond and 2^64 - 2 microseconds, got \(duration)")
+                throw IggyError(.invalidOptionValue, context: "an expiry must be between 1 microsecond and 2^64 - 2 microseconds, got \(duration)")
             }
             return microseconds
         case .never:

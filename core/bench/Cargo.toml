@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-bench"
-version = "0.6.1-edge.6"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/apache/iggy"
@@ -57,6 +57,11 @@ tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The actor tests need paused time, and `full` leaves out `test-util`.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints.clippy]
 enum_glob_use = "deny"

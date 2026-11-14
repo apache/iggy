@@ -88,6 +88,7 @@ use user_headers::{HeaderKey, HeaderValue, UserHeaders};
 /// Python client for Apache Iggy, the persistent message streaming platform.
 #[pymodule]
 fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    event_loop::register_exit_gate(m)?;
     durability::Durability::register(py, m)?;
     m.add_class::<SendMessage>()?;
     m.add_class::<SendMessagesResponse>()?;

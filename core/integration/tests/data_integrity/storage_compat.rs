@@ -1010,7 +1010,7 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
 /// The absolute requirement is not cosmetic for the binary. `ServerHandle::start`
 /// only spawns the configured path directly when it has more than one component
 /// or already exists; a bare name that does not exist falls through to
-/// `Command::cargo_bin`, which resolves the binary of the crate under test. So
+/// `cargo_bin_path`, which resolves the binary of the crate under test. So
 /// a single-component value would boot the HEAD build while the test reported
 /// it as the baseline, comparing master against master and passing forever.
 /// The same silent-green family as running a stale binary.
@@ -1541,6 +1541,12 @@ async fn assert_topic_recovered(
             .preallocate_segments
             .and(recovered.preallocate_segments),
         replication_factor: seed.replication_factor.and(recovered.replication_factor),
+        segment_max_age: seed.segment_max_age.and(recovered.segment_max_age),
+        tiered_storage: seed.tiered_storage.and(recovered.tiered_storage),
+        local_retention_age: seed.local_retention_age.and(recovered.local_retention_age),
+        local_retention_size: seed
+            .local_retention_size
+            .and(recovered.local_retention_size),
         raw: BTreeMap::new(),
     };
     assert_eq!(

@@ -18,14 +18,16 @@ fetches the principal's own record, and the connection keeps the result. No seco
 stored password, one extra round trip on a path that already does one.
 
 **Global permissions only, as wildcard bindings.** Iggy's per-stream and per-topic permissions are
-not rendered, and the checks the gateway makes against a principal read the same global grants. See
+not rendered. The checks the gateway makes against a principal read the same global grants, except
+`OffsetCommit`, which also reads stream and topic grants. See
 [What is not mapped](#what-is-not-mapped).
 
 ## Why this is worth doing before the data plane exists
 
 Authorization cannot be *enforced* on the data plane yet. Produce and Fetch act as the bridge's
 Iggy user for every client, so no read or write runs as the principal. The gateway checks a
-principal only before a few admin requests, listed under [What is not mapped](#what-is-not-mapped).
+principal only before a few admin requests and each `OffsetCommit`, listed under
+[What is not mapped](#what-is-not-mapped).
 
 `DescribeAcls` is the one authorization surface that needs neither. It is a read: take the
 authenticated principal, take the permissions Iggy already holds for it, and answer in Kafka's
@@ -75,10 +77,12 @@ because group *membership* operations route through Iggy's own `get_topic` rule,
 read and manage flags and never consults polling. Deriving it from polling granted a group to
 principals Iggy denies.
 
-Offset commit and fetch are the exception: Iggy routes those through `poll_messages`, while Kafka
-gates them on this same `GROUP READ`. A principal holding polling but no read grant is therefore
-shown no group binding even though Iggy would let it commit an offset. That under-reports, which is
-the safe direction, where deriving from polling would over-report membership.
+Iggy routes offset commit and fetch through `poll_messages`, while Kafka gates them on this same
+`GROUP READ`. The gateway gates every `OffsetCommit` on it, so a principal with polling alone
+commits nothing. A read or manage grant on the topic's stream, or on the topic, also lets a
+principal commit there, since Iggy needs one of these grants to create a consumer group. Without
+them, the commit answers `GROUP_AUTHORIZATION_FAILED` (30)
+([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md#gateway-rules)). `OffsetFetch` is not gated.
 
 **`manage_servers` renders nothing of its own.** Iggy reads it in exactly one rule, as an alias for
 `read_servers`, so it gates no mutation anywhere. Rendering `CLUSTER ALTER` from it would advertise
@@ -137,7 +141,8 @@ deliberately rather than half-built.
 **Enforcement of per-stream grants.** The gateway refuses `DeleteTopics`, `AlterConfigs` and the
 auto topic creation a `Metadata` request asks for unless the principal holds `manage_topics` or
 `manage_streams` in the global projection above. A principal granted `manage_topics` on one stream
-alone is therefore refused, though Iggy would let it manage topics there. A refused auto-creation is
+alone is therefore refused, though Iggy would let it manage topics there. `OffsetCommit` reads
+stream and topic grants too. A refused auto-creation is
 answered `TOPIC_AUTHORIZATION_FAILED` (29), which Kafka clients treat as fatal (see the README's
 [Auto topic creation](../README.md#auto-topic-creation)). A request that passes still runs as the
 bridge's Iggy user, and Iggy decides it against that user's grants.

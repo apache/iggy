@@ -337,11 +337,11 @@ mod ffi {
         has_poll_options: bool,
         poll_options: PollOptions,
         /// The encoded bytes of the requests in flight and the queued
-        /// batches. Default 16 MiB.
+        /// batches. Default 16 MiB, raised to at least 32 full batches.
         has_prefetch_bytes: bool,
         prefetch_bytes: u32,
         /// The messages of the requests in flight and the queued batches.
-        /// Default: the larger of 16,000 and `count`.
+        /// Default 16,000, raised to at least 32 full batches.
         has_prefetch_messages: bool,
         prefetch_messages: u32,
     }
@@ -399,6 +399,15 @@ mod ffi {
         // A `rust::Vec` holds an opaque Rust type only behind a `Box`.
         #[allow(clippy::vec_box)]
         skip: Vec<Box<Continuation>>,
+        /// True for messages that a lost read committed and that the reader
+        /// could not read again. The error is then `fetch_progress_uncertain`.
+        has_lost: bool,
+        /// The first and last offset of those messages.
+        lost_first: u64,
+        lost_last: u64,
+        /// True when the reader stopped the partition after refusals in a row
+        /// that a retry does not change. Only a `seek` reads it again.
+        lasting_refusal: bool,
     }
 
     /// Commit confirmation for one partition written by `send_messages`.
@@ -636,6 +645,12 @@ mod ffi {
         derived_options: Vec<HeaderEntry>,
     }
 
+    struct PersonalAccessTokenInfo {
+        name: String,
+        has_expiry: bool,
+        expiry: u64,
+    }
+
     struct LoginInfo {
         user_id: u32,
         has_access_token: bool,
@@ -697,6 +712,16 @@ mod ffi {
         preallocate_segments: bool,
         has_replication_factor: bool,
         replication_factor: u32,
+        has_segment_max_age: bool,
+        segment_max_age_kind: String,
+        segment_max_age_value: u64,
+        has_tiered_storage: bool,
+        tiered_storage: bool,
+        has_local_retention_age: bool,
+        local_retention_age_kind: String,
+        local_retention_age_value: u64,
+        has_local_retention_size: bool,
+        local_retention_size: String,
         has_partition_resize_policy: bool,
         partition_resize_policy: String,
         raw_options: Vec<HeaderEntry>,
@@ -713,6 +738,13 @@ mod ffi {
         message_expiry_value: u64,
         has_max_topic_size: bool,
         max_topic_size: String,
+        has_tiered_storage: bool,
+        tiered_storage: bool,
+        has_local_retention_age: bool,
+        local_retention_age_kind: String,
+        local_retention_age_value: u64,
+        has_local_retention_size: bool,
+        local_retention_size: String,
         reset: Vec<String>,
         raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,
@@ -1208,7 +1240,10 @@ mod ffi {
         /// Stores the offset of a checkpoint that this reader delivered. A
         /// checkpoint of an older generation of its partition, or at or below
         /// the last commit, stores nothing. Refused with
-        /// `CommitPolicy::OnRead`.
+        /// `CommitPolicy::OnRead`. C++ cannot cancel the call, so it ends at a
+        /// deadline 10 s after its start: after a refusal for an earlier owner
+        /// (5009), the read of the new owner retries only until then, and the
+        /// call fails with the refusal.
         fn commit(
             self: &PartitionReader,
             checkpoint: &Checkpoint,
@@ -1227,8 +1262,12 @@ mod ffi {
         /// Sets the next read position of a partition and drops its queued
         /// batches. It resumes a stopped partition. With `CommitPolicy::OnRead`
         /// a seek to an offset above 0 first stores the offset before it, so a
-        /// restart resumes at the new position, and a failed store fails the
-        /// seek with nothing moved. Every other seek stores nothing.
+        /// restart resumes at the new position. A seek to offset 0 or `first`
+        /// deletes the stored offset, and a seek to a timestamp stores the
+        /// offset before the first message at the timestamp, if there is one.
+        /// A failed read, lookup, store or delete fails the seek with nothing
+        /// moved. Every other seek stores nothing. It ends at a deadline 10 s
+        /// after its start, as `commit` does.
         fn seek(
             self: &PartitionReader,
             partition_id: u32,
@@ -1393,14 +1432,18 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
-        // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
+        fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
         fn create_personal_access_token(
             self: &Client,
             name: String,
             expiry_kind: String,
             expiry_value: u64,
         ) -> Result<String>;
-        // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
+        fn delete_personal_access_token(
+            self: &Client,
+            name: &str,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
         unsafe fn delete_client(client: *mut Client);
@@ -1432,7 +1475,8 @@ mod ffi {
             error_info: &mut ReadErrorInfo,
         ) -> Result<Vec<ReceivedMessage>>;
         /// Stores the offset of a checkpoint that this consumer handed over.
-        /// Refused with `CommitPolicy::OnRead`.
+        /// Refused with `CommitPolicy::OnRead`. It ends at a deadline 10 s
+        /// after its start, as the `commit` of a reader does.
         fn commit(
             self: &Consumer,
             checkpoint: &Checkpoint,
@@ -1444,8 +1488,12 @@ mod ffi {
         -> Result<()>;
         /// Sets the next read position of a partition. With
         /// `CommitPolicy::OnRead` a seek to an offset above 0 first stores the
-        /// offset before it, and a failed store fails the seek with nothing
-        /// moved. Every other seek stores nothing.
+        /// offset before it, a seek to offset 0 or `first` deletes the stored
+        /// offset, and a seek to a timestamp stores the offset before the first
+        /// message at the timestamp, if there is one. A failed read, lookup,
+        /// store or delete fails the seek with nothing moved. Every other seek
+        /// stores nothing. It ends at a deadline 10 s after its start, as the
+        /// `commit` of a reader does.
         fn seek(
             self: &Consumer,
             partition_id: u32,

@@ -25,10 +25,10 @@ export const CommitErrorScope = {
 
 export type CommitErrorScope = typeof CommitErrorScope[keyof typeof CommitErrorScope];
 
-const REQUEST_PROVES_NOTHING_STORED = new Set([5, 6, 58, 80, 87, 89, 90, 1009, 1010, 2010, 2011, 3007, 3024, 4100,
+const REQUEST_PROVES_NOTHING_STORED = new Set([5, 6, 58, 80, 87, 89, 90, 96, 1009, 1010, 2010, 2011, 3007, 3024, 4100,
   5009]);
 // A section whose read may have stored never carries one of these.
-const SECTION_PROVES_NOTHING_STORED = new Set([58, 80, 87, 89, 3007, 3024, 5009]);
+const SECTION_PROVES_NOTHING_STORED = new Set([58, 80, 87, 89, 96, 3007, 3024, 5009]);
 
 /**
  * Whether `status`, reported in `scope`, proves that the server stored no

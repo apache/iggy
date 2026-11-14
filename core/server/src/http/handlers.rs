@@ -105,8 +105,8 @@ use iggy_common::{
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
     MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
     PersonalAccessTokenInfo, PollMessages, PolledMessages, PollingStrategy, RawPersonalAccessToken,
-    SendMessages, SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic,
-    TopicDetails, UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
+    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
+    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -129,7 +129,9 @@ use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
 };
-use crate::http::extractor::{Authenticated, Credential, Identity, JsonMembers, JsonUpdate};
+use crate::http::extractor::{
+    Authenticated, Credential, Identity, JsonMembers, JsonSendMessages, JsonUpdate,
+};
 use crate::http::forward::{
     FirstAttempt, PartitionEffect, PartitionHop, PartitionRequest, require_local_primary,
     serve_partition,
@@ -625,10 +627,11 @@ pub(in crate::http) async fn get_stats(
 /// `GET <http.metrics.endpoint>`: the metric set in prometheus text
 /// exposition. The `Identity` extractor rejects a missing or invalid bearer
 /// with 401, and any authenticated user may scrape the aggregate gauges.
-/// The per-topic series name every stream and topic, so they are exported only
-/// to a user the `/stats` rule ([`Permissioner::get_stats`]) admits; anyone
-/// else gets the aggregates with no per-topic series. Scrapers present a JWT
-/// or a raw PAT the same way every read route accepts them.
+/// The per-topic series name every stream and topic, and the disk series
+/// describe the host's volume, so both are exported only to a user the `/stats`
+/// rule ([`Permissioner::get_stats`]) admits; anyone else gets the aggregates
+/// alone. Scrapers present a JWT or a raw PAT the same way every read route
+/// accepts them.
 ///
 /// The entity gauges sample the same reads `/stats` serves: the metadata STM
 /// stream and user maps plus the stats-registry rollups, whose partition-plane
@@ -661,7 +664,7 @@ pub(in crate::http) async fn get_metrics(
     state
         .ensure_active_user(identity.user_id, Some(identity.user_created_at))
         .map_err(ReadError::Rejected)?;
-    let exports_topics = state
+    let exports_stats = state
         .shard
         .plane
         .metadata()
@@ -683,7 +686,7 @@ pub(in crate::http) async fn get_metrics(
             let mut partitions_count = 0u64;
             let mut segments_count = 0u64;
             let mut messages_count = 0u64;
-            let mut topic_usage = if exports_topics {
+            let mut topic_usage = if exports_stats {
                 Vec::with_capacity(
                     streams
                         .items
@@ -703,7 +706,7 @@ pub(in crate::http) async fn get_metrics(
                 for (_, topic) in &stream.topics {
                     partitions_count =
                         partitions_count.saturating_add(topic.partitions.len() as u64);
-                    if !exports_topics {
+                    if !exports_stats {
                         continue;
                     }
                     topic_usage.push(TopicUsageSample {
@@ -746,7 +749,7 @@ pub(in crate::http) async fn get_metrics(
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
     metrics.topic_usage.replace(topic_usage);
-    Ok(metrics.formatted_output())
+    Ok(metrics.formatted_output(exports_stats))
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP
@@ -1677,7 +1680,7 @@ pub(in crate::http) async fn send_messages(
     Path((stream_id, topic_id)): Path<(String, String)>,
     Query(query): Query<ProduceQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
-    Json(mut command): Json<SendMessages>,
+    JsonSendMessages(mut command): JsonSendMessages,
 ) -> Result<Response, PartitionWriteError> {
     let stream_id =
         Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
@@ -1735,8 +1738,7 @@ pub(in crate::http) async fn send_messages(
                 // An unreadable confirmation still answers 201: the batch committed,
                 // only its offsets did not survive the reply.
                 let confirmations = send_confirmations(&reply, &header)
-                    .map(SendMessagesConfirmations::from)
-                    .unwrap_or_default();
+                    .map_or_default(SendMessagesConfirmations::from);
                 Ok::<_, PartitionWriteError>(
                     (StatusCode::CREATED, durability, Json(confirmations)).into_response(),
                 )
@@ -2274,6 +2276,13 @@ pub(in crate::http) async fn delete_pat(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(in crate::http) async fn delete_pat_named_login(
+    state: State<HttpState>,
+    identity: Authenticated,
+) -> Result<StatusCode, WriteError> {
+    delete_pat(state, identity, Path("login".to_owned())).await
+}
+
 /// Mint a token only while the account verified by login or named by the
 /// refresh token still occupies its user id.
 fn issue_identity(
@@ -2361,7 +2370,7 @@ mod tests {
     use iggy_binary_protocol::responses::messages::{
         SendMessagesConfirmationResponse, SendMessagesResponse,
     };
-    use iggy_common::{OptionInputMap, OptionInputValue, OptionKey};
+    use iggy_common::{OptionInputMap, OptionInputValue, OptionKey, SendMessages};
     use serde_json::Value;
 
     use crate::http::reply::classify_partition_reply;

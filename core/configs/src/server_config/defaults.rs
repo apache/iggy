@@ -35,6 +35,7 @@ use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
 use super::server::ServerConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
+use super::tiered_storage::TieredStorageConfig;
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
 use crate::common::server::{
@@ -71,6 +72,7 @@ impl Default for ServerConfig {
             partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
             external_auth: ExternalAuthConfig::default(),
+            tiered_storage: TieredStorageConfig::default(),
         }
     }
 }
@@ -185,6 +187,19 @@ impl Default for MetadataConfig {
             partitions_max: metadata.partitions_max as u32,
             change_log_resource_capacity: metadata.change_log_resource_capacity as usize,
             change_log_activity_capacity: metadata.change_log_activity_capacity as usize,
+        }
+    }
+}
+
+impl Default for NodeConfig {
+    fn default() -> NodeConfig {
+        NodeConfig {
+            advertised_address: None,
+            free_space_reserve: SERVER_CONFIG
+                .node
+                .free_space_reserve
+                .parse()
+                .expect("static_toml node.free_space_reserve must parse as IggyByteSize"),
         }
     }
 }

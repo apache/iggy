@@ -38,26 +38,28 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
+use std::mem::offset_of;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use iggy::prelude::IggyTimestamp;
+use iggy_binary_protocol::consensus::{HEADER_SIZE, Operation, RequestHeader};
 use secrecy::SecretString;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, KnownNodes,
-    ProduceSessionLimits, TopicMapping,
+    DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
+    KnownNodes, ProduceSessionLimits, TopicDefaults, TopicMapping,
 };
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol, parse_brokers};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
@@ -82,7 +84,12 @@ use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use server::{spawn_gateway as spawn_listeners, spawn_test_server_with_authenticator};
 
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
-const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
+/// The newest Kafka release: the Java tools of every test that names no other image.
+const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
+/// The oldest Kafka 4 release, for the one test that runs both ends of the Kafka 4 range.
+const KAFKA_4_0_IMAGE: &str = "apache/kafka:4.0.2";
+/// The newest Kafka 3 release, for the one test of a Kafka 3 client.
+const KAFKA_3_9_IMAGE: &str = "apache/kafka:3.9.2";
 const ROOT_USER: &str = "iggy";
 const ROOT_PASSWORD: &str = "iggy";
 /// Password for every non-root principal these tests create.
@@ -109,6 +116,19 @@ const LOST_REPLY_TOPIC: &str = "lost-replies";
 const LOST_REPLY_RECORDS: u32 = 600;
 /// Produce responses the relay drops. Each drop closes that connection, as a lost reply does.
 const LOST_REPLIES: usize = 3;
+
+/// The topic that a default Java producer writes through a gateway on its defaults, and the
+/// records it sends there, as the values `0` to `DEFAULTS_RECORDS - 1`.
+const DEFAULTS_TOPIC: &str = "defaults";
+const DEFAULTS_RECORDS: u32 = 300;
+/// The producer's request timeout there, below Kafka's 30 s, so a stall past it fits one client
+/// run. Produce carries it, so it is also the deadline at which the gateway answers 7.
+const STALL_REQUEST_TIMEOUT_MS: u64 = 3_000;
+/// Sends that reach Iggy before the stall, so the producer has its 5 requests in flight by then.
+const SENDS_BEFORE_STALL: usize = 10;
+/// How long a connection that the gateway closed stays open after a kept send goes out on it, so
+/// that Iggy can still write that send.
+const LATE_SEND_GRACE: Duration = Duration::from_secs(10);
 
 /// Budget for `iggy-server` to start listening. Generous: it is a cold process start, and a debug
 /// build on a loaded machine is not quick.
@@ -199,14 +219,16 @@ fn image_present(image: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Locates the already-built `iggy-server` alongside this test binary. Does not build it.
+/// Locates the already-built `iggy-server` in a parent directory of this test binary. Does not
+/// build it. Cargo puts final binaries in `target/<profile>/` and test binaries below it, at a
+/// depth that changes between cargo versions, so every parent is checked.
 fn iggy_server_binary() -> Option<PathBuf> {
-    let mut dir = std::env::current_exe().ok()?;
-    // .../target/<profile>/deps/<test binary> -> .../target/<profile>
-    dir.pop();
-    dir.pop();
-    let candidate = dir.join(format!("iggy-server{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+    let binary = format!("iggy-server{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .ok()?
+        .ancestors()
+        .map(|dir| dir.join(&binary))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Outcome of waiting for the spawned server to come up.
@@ -432,10 +454,12 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
         idempotent_producers: true,
         nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     };
     IggyBridge::connect(config)
         .await
@@ -1037,6 +1061,107 @@ async fn given_the_java_client_should_authenticate_and_list_the_sasl_apis() {
     );
 }
 
+/// Java clients 4.0 to 4.3 open `ApiVersions` at v4, and 4.4 clients at v5 (KIP-1242). Each finds
+/// its version in the advertisement, so neither asks again at v3 (KIP-511). The oldest Kafka 4
+/// client then produces and reads back in a group, as the newest one does in the other tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_4_0_and_4_4_clients_should_use_their_own_api_versions_and_serve_records() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    if image_missing(KAFKA_4_0_IMAGE) {
+        return;
+    }
+    let bootstrap = gateway.to_string();
+    for (image, usable) in [(KAFKA_4_0_IMAGE, 4), (KAFKA_IMAGE, 5)] {
+        assert_usable_api_versions(image, &bootstrap, usable);
+    }
+    produce_and_read_back_in_a_group(KAFKA_4_0_IMAGE, &bootstrap, "kafka-4-0");
+}
+
+/// Java clients 3.0 to 3.8 open `ApiVersions` at v3, and 3.9 clients at v4, as 4.0 to 4.3 do. The
+/// newest Kafka 3 client finds v4 in the advertisement, then produces and reads back in a group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_kafka_3_9_client_should_use_api_versions_v4_and_serve_records() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    if image_missing(KAFKA_3_9_IMAGE) {
+        return;
+    }
+    let bootstrap = gateway.to_string();
+    assert_usable_api_versions(KAFKA_3_9_IMAGE, &bootstrap, 4);
+    produce_and_read_back_in_a_group(KAFKA_3_9_IMAGE, &bootstrap, "kafka-3-9");
+}
+
+/// Whether to skip because `image` is not pulled. [`ready_server`] checks the images that every
+/// test needs, and this one the image of a single test.
+fn image_missing(image: &str) -> bool {
+    !image_present(image)
+        && skip(&format!(
+            "client image {image} is not pulled; run `docker pull {image}`"
+        ))
+}
+
+/// The Java client of `image` lists the gateway's `ApiVersions` range and uses v`usable` of it.
+fn assert_usable_api_versions(image: &str, bootstrap: &str, usable: i16) {
+    let versions = run_client(
+        image,
+        &[
+            "/opt/kafka/bin/kafka-broker-api-versions.sh",
+            "--bootstrap-server",
+            bootstrap,
+        ],
+        &[],
+    )
+    .expect_ran("java client api-versions");
+    assert!(
+        versions.contains(&format!("ApiVersions(18): 0 to 5 [usable: {usable}]")),
+        "{image} must use ApiVersions v{usable}, got: {versions}"
+    );
+}
+
+/// Writes two records to `TOPIC` with the console producer of `image`, and reads them back with
+/// its console consumer in `group`.
+fn produce_and_read_back_in_a_group(image: &str, bootstrap: &str, group: &str) {
+    let produce = format!(
+        "printf 'k1:alpha\\nk2:beta\\n' | /opt/kafka/bin/kafka-console-producer.sh \
+         --bootstrap-server {bootstrap} --topic {TOPIC} --property parse.key=true \
+         --property key.separator=: --producer-property max.block.ms=20000"
+    );
+    let produced =
+        run_client(image, &["sh", "-c", &produce], &[]).expect_ran("java console producer");
+    assert!(
+        !produced.contains("ERROR"),
+        "the producer of {image} must send, got: {produced}"
+    );
+    let consumed = run_client(
+        image,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            bootstrap,
+            "--topic",
+            TOPIC,
+            "--group",
+            group,
+            "--from-beginning",
+            "--max-messages",
+            "2",
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer in a group");
+    assert!(
+        consumed.contains("k1\talpha") && consumed.contains("k2\tbeta"),
+        "the consumer of {image} must read both records, got: {consumed}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_distinct_principals_when_listing_acls_should_describe_each_differently() {
     // The spec's category T procedure. Root alone proves nothing about the mapping, because it
@@ -1315,9 +1440,289 @@ async fn given_kafka_configs_sh_when_adding_then_deleting_retention_should_round
     )
     .expect_ran("kafka-configs.sh --describe after --delete-config");
     assert!(
-        described_after.contains("retention.ms=-1 sensitive=false"),
-        "a deleted retention.ms reads as never expire, got: {described_after}"
+        described_after.contains(&format!("Dynamic configs for topic {TOPIC} are:")),
+        "kafka-configs.sh must describe the topic, got: {described_after}"
     );
+    assert!(
+        !described_after.contains("retention.ms="),
+        "a deleted retention.ms is back at its default, which is not a dynamic config, got: \
+         {described_after}"
+    );
+}
+
+/// `kafka-topics.sh --create --config` sends the configs on `CreateTopics`. Iggy stores
+/// `retention.ms`, `retention.bytes` and `segment.bytes`, the gateway accepts the other keys at
+/// the values it reports, and `retention.bytes` stays per partition when the topic grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_with_configs_should_store_them_per_partition() {
+    const CONFIGURED: &str = "configured-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            CONFIGURED,
+            "--partitions",
+            "2",
+            "--config",
+            "retention.ms=60000",
+            "--config",
+            "retention.bytes=134217728",
+            "--config",
+            "segment.bytes=67108864",
+            "--config",
+            "cleanup.policy=delete",
+            "--config",
+            "min.insync.replicas=1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config");
+    assert!(
+        created.contains(&format!("Created topic {CONFIGURED}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+
+    let describe_topic = || {
+        kafka_configs(
+            gateway,
+            &[
+                "--describe",
+                "--entity-type",
+                "topics",
+                "--entity-name",
+                CONFIGURED,
+            ],
+        )
+        .expect_ran("kafka-configs.sh --describe")
+    };
+    let described = describe_topic();
+    for stored in [
+        "retention.ms=60000 sensitive=false",
+        "retention.bytes=134217728 sensitive=false",
+        "segment.bytes=67108864 sensitive=false",
+    ] {
+        assert!(
+            described.contains(stored),
+            "the describe must show {stored}, got: {described}"
+        );
+    }
+    assert!(
+        !described.contains("min.insync.replicas="),
+        "a key at its default is not a dynamic config, got: {described}"
+    );
+
+    let grown = kafka_topics(
+        gateway,
+        &["--alter", "--topic", CONFIGURED, "--partitions", "4"],
+    )
+    .expect_ran("kafka-topics.sh --alter --partitions");
+    assert!(
+        !grown.to_lowercase().contains("error"),
+        "the topic must grow, got: {grown}"
+    );
+    let described_after = describe_topic();
+    assert!(
+        described_after.contains("retention.bytes=134217728 sensitive=false"),
+        "each new partition keeps the same retention.bytes, got: {described_after}"
+    );
+
+    let under_min_isr = kafka_topics(gateway, &["--describe", "--under-min-isr-partitions"])
+        .expect_ran("kafka-topics.sh --describe --under-min-isr-partitions");
+    assert!(
+        !under_min_isr.contains("Exception"),
+        "the tool reads min.insync.replicas of every topic, got: {under_min_isr}"
+    );
+}
+
+/// Kafka accepts a `retention.bytes` below one segment, and so does the gateway. Iggy keeps the
+/// newest sealed segment of each partition and refuses a topic cap below one segment, so the
+/// topic of one partition reports one segment of 1 GiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_with_a_retention_below_one_segment_should_keep_one() {
+    const SMALL: &str = "small-retention-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            SMALL,
+            "--config",
+            "retention.bytes=1048576",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config retention.bytes=1048576");
+    assert!(
+        created.contains(&format!("Created topic {SMALL}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            SMALL,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe");
+    assert!(
+        described.contains("retention.bytes=1073741824 sensitive=false"),
+        "Iggy keeps one segment of the partition, got: {described}"
+    );
+}
+
+/// `kafka-topics.sh --create --config cleanup.policy=compact`, as Kafka Connect and Schema
+/// Registry create their topics. Iggy does not compact, so the topic keeps every record, and the
+/// gateway does not report the policy. Keys that change nothing a client sees are accepted, while
+/// a replication factor above the one Iggy node and `LogAppendTime` are refused with the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_a_compacted_topic_should_keep_every_record() {
+    const COMPACTED: &str = "compacted-topic";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            COMPACTED,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+            "--config",
+            "cleanup.policy=compact",
+            "--config",
+            "retention.ms=60000",
+            "--config",
+            "min.insync.replicas=1",
+            "--config",
+            "compression.type=lz4",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create --config cleanup.policy=compact");
+    assert!(
+        created.contains(&format!("Created topic {COMPACTED}.")),
+        "kafka-topics.sh must create the topic, got: {created}"
+    );
+
+    let described = kafka_topics(gateway, &["--describe", "--topic", COMPACTED])
+        .expect_ran("kafka-topics.sh --describe");
+    assert!(
+        described.contains("ReplicationFactor: 1"),
+        "the describe must show the stored factor, got: {described}"
+    );
+    let configs = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            COMPACTED,
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe");
+    assert!(
+        configs.contains("retention.ms=-1 sensitive=false"),
+        "a compacted topic never expires, got: {configs}"
+    );
+    assert!(
+        !configs.contains("cleanup.policy") && !configs.contains("min.insync.replicas"),
+        "the policy is not stored, and min.insync.replicas reports the majority as a default, \
+         got: {configs}"
+    );
+
+    let refused_factor = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-factor",
+            "--replication-factor",
+            "2",
+        ],
+    )
+    .text();
+    assert!(
+        refused_factor.contains("only 1 Iggy node(s) are in the cluster"),
+        "a factor above the node count must be refused with its reason, got: {refused_factor}"
+    );
+    let refused_timestamps = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-timestamps",
+            "--config",
+            "message.timestamp.type=LogAppendTime",
+        ],
+    )
+    .text();
+    assert!(
+        refused_timestamps.contains("accepts only CreateTime"),
+        "LogAppendTime must be refused with its reason, got: {refused_timestamps}"
+    );
+    let refused_min_isr = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            "refused-min-isr",
+            "--config",
+            "min.insync.replicas=2",
+        ],
+    )
+    .text();
+    assert!(
+        refused_min_isr.contains("accepts at most 1"),
+        "Iggy commits on a majority of one node, got: {refused_min_isr}"
+    );
+}
+
+/// `kafka-configs.sh --describe --entity-type brokers` reads a BROKER resource, as the Strimzi
+/// Topic Operator does at startup for `auto.create.topics.enable` and `min.insync.replicas`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_configs_sh_when_describing_the_broker_should_report_the_gateway_settings() {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let described = kafka_configs(
+        gateway,
+        &[
+            "--describe",
+            "--entity-type",
+            "brokers",
+            "--entity-name",
+            "1",
+            "--all",
+        ],
+    )
+    .expect_ran("kafka-configs.sh --describe --entity-type brokers --all");
+    for setting in [
+        "auto.create.topics.enable=false",
+        "min.insync.replicas=1",
+        "log.retention.ms=-1",
+        "num.partitions=1",
+        "default.replication.factor=1",
+    ] {
+        assert!(
+            described.contains(setting),
+            "the broker describe must show {setting}, got: {described}"
+        );
+    }
 }
 
 /// #3546's own acceptance criterion: `kafka-topics.sh` must work against the gateway for create
@@ -2326,10 +2731,12 @@ async fn tls_stack() -> Option<TlsStack> {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        fetch_slots: DEFAULT_FETCH_SLOTS,
         produce_sessions: ProduceSessionLimits::default(),
         tls: IggyTls::default(),
         idempotent_producers: true,
         nodes: KnownNodes::default(),
+        topic_defaults: TopicDefaults::default(),
     })
     .await
     .expect("the bridge connects to a ready server");
@@ -2896,6 +3303,316 @@ async fn given_lost_produce_responses_when_an_idempotent_producer_retries_should
         "{stored} of {LOST_REPLY_RECORDS} records stored"
     );
     gateway.stop().await;
+}
+
+/// A gateway started with only the Iggy address and password keeps the order of a default Java
+/// producer while its sends to Iggy stall past the Produce deadline. The gateway answers 7 for the
+/// stalled batch and for the batches behind it, so the producer sends its requests in flight again
+/// while the first send still runs. That send lands late. The defaults turn on the bridge and
+/// idempotent producers, so each batch lands once, in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn given_only_the_iggy_address_and_password_when_sends_to_iggy_stall_should_keep_a_default_java_producer_in_order()
+ {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    root_bridge(&server)
+        .await
+        .ensure_stream_and_topic(DEFAULTS_TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let hold = Duration::from_millis(2 * STALL_REQUEST_TIMEOUT_MS);
+    let relay = SendStallRelay::start(&server.address, SENDS_BEFORE_STALL, hold).await;
+    let gateway_addr: SocketAddr = format!("127.0.0.1:{}", free_port())
+        .parse()
+        .expect("a socket address");
+    let _gateway = GatewayProcess::start(
+        &[
+            ("IGGY_KAFKA_IGGY_ADDR", &relay.address),
+            ("IGGY_KAFKA_IGGY_PASSWORD", ROOT_PASSWORD),
+            ("IGGY_KAFKA_BIND_ADDR", &gateway_addr.to_string()),
+        ],
+        gateway_addr,
+    )
+    .await;
+
+    // The tool sets `retries=0`, which also turns the default idempotence off. The file puts
+    // back the Java default, so the producer runs on Kafka's defaults but for the timeouts.
+    let config = tempfile::tempdir().expect("create config dir");
+    let properties = config.path().join("producer.properties");
+    std::fs::write(
+        &properties,
+        format!(
+            "retries=2147483647\nrequest.timeout.ms={STALL_REQUEST_TIMEOUT_MS}\n\
+             delivery.timeout.ms=60000\n"
+        ),
+    )
+    .expect("write the producer config");
+    let properties = properties.to_str().expect("a UTF-8 path");
+    let records = DEFAULTS_RECORDS.to_string();
+    let bootstrap = gateway_addr.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-verifiable-producer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            DEFAULTS_TOPIC,
+            "--max-messages",
+            &records,
+            "--throughput",
+            "100",
+            "--producer.config",
+            "/tmp/producer.properties",
+        ],
+        &[(properties, "/tmp/producer.properties")],
+    )
+    .expect_ran("the producer runs");
+    let acked = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["name"] == "tool_data")
+        .and_then(|event| event["acked"].as_u64());
+    assert_eq!(
+        acked,
+        Some(u64::from(DEFAULTS_RECORDS)),
+        "every record must be acknowledged: {output}"
+    );
+    assert!(
+        relay.held() > 0,
+        "the relay must hold a send past the Produce deadline: {output}"
+    );
+
+    let read = run_client(
+        KCAT_IMAGE,
+        &[
+            "-b",
+            &bootstrap,
+            "-C",
+            "-t",
+            DEFAULTS_TOPIC,
+            "-p",
+            "0",
+            "-o",
+            "beginning",
+            "-e",
+            "-f",
+            "%s\n",
+        ],
+        &[],
+    )
+    .expect_ran("kcat reads the topic");
+    let values: Vec<u32> = read.lines().filter_map(|line| line.parse().ok()).collect();
+    let sent: Vec<u32> = (0..DEFAULTS_RECORDS).collect();
+    assert_eq!(values, sent, "each record once, in the order sent: {read}");
+}
+
+/// The gateway binary, started with exactly the given variables, and killed on drop.
+struct GatewayProcess {
+    child: Child,
+}
+
+impl GatewayProcess {
+    /// Starts the binary with `env` and nothing else, then waits until `addr` accepts.
+    async fn start(env: &[(&str, &str)], addr: SocketAddr) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_iggy-gateway-kafka"));
+        command.env_clear();
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command.envs(env.iter().copied()).stdout(Stdio::null());
+        let mut child = command.spawn().expect("spawn iggy-gateway-kafka");
+        let deadline = Instant::now() + SERVER_READY_TIMEOUT;
+        while TcpStream::connect(addr).await.is_err() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("the gateway exited with {status} before it listened");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the gateway did not listen on {addr} within {SERVER_READY_TIMEOUT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Self { child }
+    }
+}
+
+impl Drop for GatewayProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A relay between a gateway and Iggy that stalls the gateway's sends. The first send after
+/// `before` others starts a stall of `hold`. Until it ends, the relay keeps each `SendMessages`
+/// frame, and every later frame of a connection that it keeps one of. Then it sends the kept
+/// frames on, in order, also on a connection that the gateway closed. So a send that the gateway
+/// gave up on still lands, late.
+struct SendStallRelay {
+    address: String,
+    stall: Arc<SendStall>,
+}
+
+impl SendStallRelay {
+    async fn start(server: &str, before: usize, hold: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay");
+        let address = listener.local_addr().expect("relay address").to_string();
+        let stall = Arc::new(SendStall {
+            before,
+            hold,
+            sends: AtomicUsize::new(0),
+            ends: OnceLock::new(),
+            held: AtomicUsize::new(0),
+        });
+        let shared = Arc::clone(&stall);
+        let upstream = server.to_string();
+        tokio::spawn(async move {
+            while let Ok((gateway, _)) = listener.accept().await {
+                let Ok(iggy) = TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                tokio::spawn(relay_iggy_connection(gateway, iggy, Arc::clone(&shared)));
+            }
+        });
+        Self { address, stall }
+    }
+
+    /// The sends that the stall kept.
+    fn held(&self) -> usize {
+        self.stall.held.load(Ordering::SeqCst)
+    }
+}
+
+/// The one stall of a [`SendStallRelay`], shared by its connections.
+struct SendStall {
+    before: usize,
+    hold: Duration,
+    sends: AtomicUsize,
+    ends: OnceLock<Instant>,
+    held: AtomicUsize,
+}
+
+impl SendStall {
+    /// Whether to keep `frame`: a send after the first `before`, while the stall runs. The first
+    /// such send starts it.
+    fn keeps(&self, frame: &[u8]) -> bool {
+        if !is_send(frame) || self.sends.fetch_add(1, Ordering::SeqCst) < self.before {
+            return false;
+        }
+        Instant::now() < *self.ends.get_or_init(|| Instant::now() + self.hold)
+    }
+
+    /// The end of the stall, once a send started it.
+    fn ends(&self) -> Option<tokio::time::Instant> {
+        self.ends.get().copied().map(tokio::time::Instant::from_std)
+    }
+}
+
+/// Whether an Iggy request frame sends messages.
+fn is_send(frame: &[u8]) -> bool {
+    frame.get(offset_of!(RequestHeader, operation)) == Some(&(Operation::SendMessages as u8))
+}
+
+/// Relays one Iggy connection of the gateway. A kept send that goes out after the gateway closed
+/// the connection gets [`LATE_SEND_GRACE`] before the relay closes its side to Iggy.
+async fn relay_iggy_connection(gateway: TcpStream, iggy: TcpStream, stall: Arc<SendStall>) {
+    let (requests, replies) = gateway.into_split();
+    let (answers, writes) = iggy.into_split();
+    let (frames, incoming) = tokio::sync::mpsc::channel(64);
+    let reader = tokio::spawn(read_iggy_frames(requests, frames));
+    let answering = tokio::spawn(pass_iggy_answers(answers, replies));
+    let (writes, late) = pass_iggy_requests(incoming, writes, &stall).await;
+    if late {
+        let _ = tokio::time::timeout(LATE_SEND_GRACE, answering).await;
+    }
+    reader.abort();
+    drop(writes);
+}
+
+/// Passes request frames on until the gateway closes its side and nothing is kept. Returns the
+/// side to Iggy, and whether a kept frame went out after the gateway closed.
+async fn pass_iggy_requests(
+    mut incoming: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut writes: OwnedWriteHalf,
+    stall: &SendStall,
+) -> (OwnedWriteHalf, bool) {
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut open = true;
+    loop {
+        let Some(ends) = stall.ends().filter(|_| !kept.is_empty()) else {
+            let Some(frame) = incoming.recv().await else {
+                return (writes, false);
+            };
+            if stall.keeps(&frame) {
+                stall.held.fetch_add(1, Ordering::SeqCst);
+                kept.push(frame);
+            } else if writes.write_all(&frame).await.is_err() {
+                return (writes, false);
+            }
+            continue;
+        };
+        tokio::select! {
+            frame = incoming.recv(), if open => match frame {
+                Some(frame) => {
+                    if is_send(&frame) {
+                        stall.held.fetch_add(1, Ordering::SeqCst);
+                    }
+                    kept.push(frame);
+                }
+                None => open = false,
+            },
+            () = tokio::time::sleep_until(ends) => {
+                for frame in std::mem::take(&mut kept) {
+                    if writes.write_all(&frame).await.is_err() {
+                        return (writes, false);
+                    }
+                }
+                if !open {
+                    return (writes, true);
+                }
+            }
+        }
+    }
+}
+
+/// Reads whole Iggy request frames into `frames` until a side closes.
+async fn read_iggy_frames(mut requests: OwnedReadHalf, frames: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    let size_at = offset_of!(RequestHeader, size);
+    loop {
+        let mut frame = vec![0; HEADER_SIZE];
+        if requests.read_exact(&mut frame).await.is_err() {
+            return;
+        }
+        let size = u32::from_le_bytes(frame[size_at..size_at + 4].try_into().expect("4 bytes"));
+        frame.resize(usize::try_from(size).expect("a frame size"), 0);
+        if requests
+            .read_exact(&mut frame[HEADER_SIZE..])
+            .await
+            .is_err()
+            || frames.send(frame).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Copies Iggy's answers back until Iggy closes, and drops them once the gateway closed its side.
+async fn pass_iggy_answers(mut answers: OwnedReadHalf, mut replies: OwnedWriteHalf) {
+    let mut chunk = vec![0; 64 * 1024];
+    let mut open = true;
+    loop {
+        let read = match answers.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        if open && replies.write_all(&chunk[..read]).await.is_err() {
+            open = false;
+        }
+    }
 }
 
 /// A bridged gateway that advertises `relay` in place of its own address, so a client that learns

@@ -246,20 +246,18 @@ use std::io::Read;
 use std::ops::RangeInclusive;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::path::PathBuf;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use assert_cmd::cargo::CommandCargoExt;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use iggy::prelude::*;
 use integration::harness::handle::common::SIGTERM_TIMEOUT;
 use integration::harness::{
     GroupPoller, ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness,
-    TestServerConfig, disk, resolve_config_paths,
+    TestServerConfig, cargo_bin_path, disk, log_capture, resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -386,7 +384,7 @@ type SharedLog = Arc<Mutex<ObservedLog>>;
 #[parallel]
 #[ignore = "runs for minutes against a multi-node cluster; run with --run-ignored only"]
 async fn given_cluster_when_scenario_faults_hit_should_keep_acked_messages() {
-    crate::use_saved_logs_on_failure();
+    log_capture::use_saved_logs_on_failure();
     let config = ChaosConfig::from_env();
     let mut harness = build_cluster(&config);
     let mut report =
@@ -4208,7 +4206,7 @@ fn record_summary(
 }
 
 fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
-    let mut system = System::new();
+    let mut system = System::new().expect("sysinfo supports this platform");
     system.refresh_all();
     let recorded_unix_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -4251,8 +4249,8 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
             "cleaner_interval": CLEANER_INTERVAL,
         },
         "host": {
-            "os": System::name(), "os_version": System::os_version(),
-            "kernel": System::kernel_version(), "arch": std::env::consts::ARCH,
+            "os": System::name().ok(), "os_version": System::os_version().ok(),
+            "kernel": System::kernel_version().ok(), "arch": std::env::consts::ARCH,
             "cpu": system.cpus().first().map(|cpu| cpu.brand()),
             "logical_cpus": system.cpus().len(),
             "available_parallelism": std::thread::available_parallelism().ok().map(|count| count.get()),
@@ -4264,8 +4262,7 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
 }
 
 fn server_binary_metadata() -> serde_json::Value {
-    let command = Command::cargo_bin("iggy-server").expect("locate the prebuilt server");
-    let path = PathBuf::from(command.get_program());
+    let path = cargo_bin_path("iggy-server").expect("locate the prebuilt server");
     let fingerprint = || -> std::io::Result<String> {
         let mut file = File::open(&path)?;
         let mut digest = Context::new(&SHA256);

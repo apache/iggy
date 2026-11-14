@@ -16,6 +16,7 @@
 // under the License.
 
 use assert_cmd::Command;
+use integration::harness::cargo_bin_path;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -32,7 +33,7 @@ where
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
-    let mut cmd = Command::cargo_bin(binary).expect("binary should be built");
+    let mut cmd = Command::new(cargo_bin_path(binary).expect("binary should be built"));
     cmd.current_dir(directory)
         .arg("--list-config-env-vars")
         .envs(env)
@@ -71,12 +72,6 @@ fn config_env_listing_exits_before_startup_for_each_binary() {
             "IGGY_CONFIG_PATH",
             "IGGY_ENV_PATH",
             "IGGY_HTTP_ADDRESS",
-        ),
-        (
-            "iggy-connectors",
-            "IGGY_CONNECTORS_CONFIG_PATH",
-            "IGGY_CONNECTORS_ENV_PATH",
-            "IGGY_CONNECTORS_HTTP_ADDRESS",
         ),
         (
             "iggy-mcp",
@@ -145,57 +140,8 @@ fn config_env_listing_includes_vector_index_templates() {
 }
 
 #[test]
-fn config_env_listing_includes_connector_templates() {
-    let names = list_config_env_vars("iggy-connectors");
-    let names: HashSet<_> = names.iter().map(String::as_str).collect();
-
-    assert!(
-        names.contains("IGGY_CONNECTORS_SINK_<KEY>_PLUGIN_CONFIG_<FIELD>"),
-        "connectors should list SINK plugin config templates"
-    );
-    assert!(
-        names.contains("IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_<FIELD>"),
-        "connectors should list SOURCE plugin config templates"
-    );
-    assert!(
-        names.contains("IGGY_CONNECTORS_SINK_<KEY>_PLUGIN_CONFIG_FORMAT"),
-        "connectors should list the typed SINK plugin config format"
-    );
-    assert!(
-        names.contains("IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_FORMAT"),
-        "connectors should list the typed SOURCE plugin config format"
-    );
-
-    assert!(
-        names.contains("IGGY_CONNECTORS_SINK_<KEY>_ENABLED"),
-        "connectors should list SINK_<KEY>_ENABLED"
-    );
-    assert!(
-        names.contains("IGGY_CONNECTORS_SOURCE_<KEY>_ENABLED"),
-        "connectors should list SOURCE_<KEY>_ENABLED"
-    );
-    for excluded in [
-        "IGGY_CONNECTORS_SINK_<KEY>_KEY",
-        "IGGY_CONNECTORS_SINK_<KEY>_VERSION",
-        "IGGY_CONNECTORS_SOURCE_<KEY>_KEY",
-        "IGGY_CONNECTORS_SOURCE_<KEY>_VERSION",
-    ] {
-        assert!(!names.contains(excluded), "connectors listed {excluded}");
-    }
-
-    assert_eq!(
-        names
-            .iter()
-            .filter(|name| **name == "IGGY_CONNECTORS_CONNECTORS_CONFIG_TYPE")
-            .count(),
-        1,
-        "enum variants should produce one deduplicated tag name"
-    );
-}
-
-#[test]
 fn mcp_rejects_unknown_arguments() {
-    let mut command = Command::cargo_bin("iggy-mcp").expect("binary should be built");
+    let mut command = Command::new(cargo_bin_path("iggy-mcp").expect("binary should be built"));
     let output = command
         .arg("--unknown")
         .timeout(LIST_ENV_VARS_TIMEOUT)
@@ -222,6 +168,7 @@ fn config_env_listing_excludes_other_processes_variables() {
         "IGGY_PASSWORD",
         "IGGY_TEST_CLEANUP_DISABLED",
         "IGGY_TEST_CLUSTER_NODES",
+        "IGGY_TEST_LOGS_DIR",
         "IGGY_TEST_VERBOSE",
         "IGGY_USERNAME",
     ] {
@@ -236,18 +183,12 @@ fn config_env_listing_excludes_other_processes_variables() {
         "server listed a sibling binary's variables"
     );
 
-    for (binary, prefix) in [
-        ("iggy-connectors", "IGGY_CONNECTORS_"),
-        ("iggy-mcp", "IGGY_MCP_"),
-    ] {
-        let names = list_config_env_vars(binary);
-        assert!(
-            names
-                .iter()
-                .all(|name| name == "IGGY_DISPLAY_CONFIG" || name.starts_with(prefix)),
-            "{binary} listed a variable outside {prefix}"
-        );
-    }
+    let mcp = list_config_env_vars("iggy-mcp");
+    assert!(
+        mcp.iter()
+            .all(|name| name == "IGGY_DISPLAY_CONFIG" || name.starts_with("IGGY_MCP_")),
+        "iggy-mcp listed a variable outside IGGY_MCP_"
+    );
 }
 
 #[test]
@@ -256,10 +197,6 @@ fn config_env_listing_includes_each_process_runtime_variables() {
         (
             "iggy-server",
             &["IGGY_ROOT_PASSWORD", "IGGY_SHARD_RUNTIME_CAPACITY"][..],
-        ),
-        (
-            "iggy-connectors",
-            &["IGGY_CONNECTORS_CONFIG_PATH", "IGGY_CONNECTORS_ENV_PATH"][..],
         ),
         (
             "iggy-mcp",

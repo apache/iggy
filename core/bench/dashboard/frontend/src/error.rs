@@ -17,7 +17,7 @@
 
 use thiserror::Error;
 
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum IggyBenchDashboardError {
     #[error("Network error: {0}")]
     Network(String),

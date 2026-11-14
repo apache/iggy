@@ -156,9 +156,10 @@ public actor IggyConsumer: AsyncSequence {
     /// Stops reading, counts the last message under
     /// ``CommitAfter/processing``, and closes the reader, which stores the
     /// counted positions, moves an `onRead` offset back to the last message
-    /// handed over, and leaves the group, within
-    /// ``ConsumerConfiguration/offsetDrainTimeout``. Every caller waits for
-    /// the same shutdown. Failures are logged.
+    /// handed over, and leaves the group. At
+    /// ``ConsumerConfiguration/offsetDrainTimeout``, it cancels the close and
+    /// waits for its end, as ``PartitionReader/close()`` describes. Every
+    /// caller waits for the same shutdown. Failures are logged.
     public func shutdown() async {
         if let shutdownTask {
             await shutdownTask.value
@@ -212,13 +213,16 @@ public actor IggyConsumer: AsyncSequence {
     /// task is cancelled, or a read error ends the reading with that error.
     /// A message that does not decode ends it, and so does
     /// ``IggyErrorCode/historyUnavailable`` for a position read in a history
-    /// that is gone. Both stop their partition until a
+    /// that is gone and ``IggyErrorCode/tieredReadFailed`` for tiered data
+    /// that the object store refuses for good. Each stops its partition until a
     /// ``seek(partitionID:to:)``, and a seek to ``ReadError/skip`` steps over
     /// the message. So does ``IggyErrorCode/partitionLaneBlocked`` under
     /// ``CommitPolicy/onRead``: a lost committing read of another caller
     /// blocks the partition until ``IggyClient/abandonOperation(_:)`` takes
     /// that operation, after which the reader reads it again by itself. A
-    /// client that is shut down or cannot come back without
+    /// lost range (``ReadError/lost``) ends it too: that error is the only
+    /// report of the loss. Its partition does not stop, so a new call reads
+    /// on. A client that is shut down or cannot come back without
     /// the caller ends it, and so does an invalid address. Other read errors
     /// are logged and reading goes on. Under ``CommitAfter/processing`` a
     /// message counts once its handler returned, and a handler that throws
@@ -236,7 +240,7 @@ public actor IggyConsumer: AsyncSequence {
                 received = next
             } catch let error as ReadError {
                 let recovers = await client.canRecover
-                if error.stopsPartition || Self.endsConsumption(error.error) || !recovers {
+                if error.stopsPartition || error.lost != nil || Self.endsConsumption(error.error) || !recovers {
                     logger.error("Reading stopped", metadata: metadata.merging(["error": "\(error)"]) { $1 })
                     throw error
                 }

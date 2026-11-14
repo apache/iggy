@@ -246,7 +246,8 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   The key, the `loginUser()` password and the `fromConnectionString()` string are marked `#[\SensitiveParameter]`, so exception traces hold a `SensitiveParameterValue` in their place. The `raw` arrays of `createStream()`, `updateStream()`, `createTopic()` and `updateTopic()` are marked as well, because an unknown key may hold a secret.
 
   Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
-- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros` and `max_topic_size`. Null arguments keep stored values. `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry and size cap are resettable, every other case is refused with the server's error.
+- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros`, `max_topic_size`, `local_retention_age_micros` and `local_retention_size`, and turns `tiered_storage` on, never off. Null arguments keep stored values.
+- `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry, size cap, local retention age and local retention size are resettable, every other case is refused with the server's error.
 - `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
 - `createTopic()` takes `replication_factor`, how many nodes store each partition: 1 to 32 and at most the cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply. The factor is create-only, and a value out of range is refused as `Invalid replication factor` (code 2018).
 - A topic read's `partitions` holds one `Iggy\Partition` per partition with `id`, `segments_count`, `current_offset`, `size_bytes`, `messages_count`, `members` (the node ids that store the partition) and `in_sync_members` (the members its primary last reported in sync and that are up, empty until it first reports).
@@ -398,7 +399,10 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
 - With `CommitPolicy::onRead()`, the server stores the offset of each reply. A lost reply, also to a `disconnect()` while the poll waits, then throws `FetchProgressUncertain` (14010), and the partition stays blocked until `abandonOperation()`. `disconnect()` closes the connection until the next `connect()`, after which `loginUser()` signs in again.
 - `consumerGroup()` builds a member of a consumer group, and creates a missing group
   by default. `reader()` builds a batch reader of chosen partitions as a standalone
-  consumer, and `groupReader()` a batch reader of an existing consumer group.
+  consumer, and `groupReader()` a batch reader of an existing consumer group. A group
+  create or join with an unknown outcome throws its error, and the next `groupReader()`
+  or `consumerGroup()` joins again. A join that landed keeps its member in the group
+  until the session ends.
 - `PartitionReader::next()` waits until a batch arrives. Give `timeout_micros` to
   limit the wait. At the timeout, `next()` returns `null`, and the script gets control
   back. A batch that arrives later stays in the reader for the next call.
@@ -409,8 +413,9 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   it on a client that sends nothing else meanwhile.
 - The default options of a reader or a consumer wait 5 seconds for up to 1000
   messages. A wait of 0 polls an idle topic in a busy loop. `prefetch_bytes`
-  (16 MiB) and `prefetch_messages` bound the requests in flight and the queued
-  batches.
+  (16 MiB) and `prefetch_messages` (16000) are the requested budgets for the
+  requests in flight and the queued batches. Each effective budget holds at
+  least 32 full batches: 32 MiB and 32000 messages with the default options.
 - With `CommitPolicy::manual()`, the consumer stores no offset. Commit checkpoints
   after processing, or each restart reads the same messages again.
 - Under `CommitPolicy::auto()`, `consumeMessages()` counts a message after its callback
@@ -424,6 +429,8 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   commit after a recreation or an owner change is refused instead of landing on the newer
   partition. `storeOffset()` commits under the context of the latest message consumed
   from that partition. `PolledMessages::checkpoint()` covers the whole batch.
+- PHP cannot cancel `commit()` and `seek()` of a reader or a consumer, or `storeOffset()`
+  and `deleteOffset()` of a consumer, so each one ends at a deadline 10 s after its start.
 - `PolledMessages::continuation()` continues a poll after the batch, under the
   partition context of the batch. A read after a recreation fails with
   `HistoryUnavailable` (87). A continuation cannot move to another process: store a
@@ -436,12 +443,20 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   `getCode()` is the error code, `getPrevious()` the typed exception that a direct call
   would throw, `partition_id` the partition or `null`, and `skip` the continuation after
   a message that does not decode. The reader retries by itself. `HistoryUnavailable`
-  (87) stops the partition until `seek()`.
+  (87) stops the partition until `seek()`. A lost read can commit messages that the
+  reader cannot read again. Then the reader throws `FetchProgressUncertain` (14010)
+  once. Its `lost` holds the first and last offset of those messages as `[first, last]`.
+  This error stops nothing and needs no seek. A seek after it drops the batch that
+  follows the range. If the reader stopped the partition, the error that stopped it
+  comes after that batch. Earlier versions gave this error a `skip` after the range.
+  Code that handles `FetchProgressUncertain` with `abandonOperation()` and a `seek()`
+  must now check `lost` first and do neither for this error.
 - Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered
   message, so the next run reads the prefetched messages again. Destroying the object
-  without them skips those messages.
+  without them, or a crash, skips those messages. The loss is at most the effective
+  budget, which holds at least 32 batches.
 - A poll with a fresh strategy, or an offset write without a checkpoint, uses the
   context of its route. It can fail once with `HistoryUnavailable` (87), or
   `ConsumerGroupPartitionNotOwned` (5009) for a consumer group, after another client

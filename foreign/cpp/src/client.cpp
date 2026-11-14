@@ -85,6 +85,19 @@ void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
         ffi_options.has_max_topic_size = true;
         ffi_options.max_topic_size     = std::string(value->Value());
     }
+    if (const auto value = options.TieredStorage()) {
+        ffi_options.has_tiered_storage = true;
+        ffi_options.tiered_storage     = *value;
+    }
+    if (const auto &value = options.LocalRetentionAge()) {
+        ffi_options.has_local_retention_age   = true;
+        ffi_options.local_retention_age_kind  = std::string(value->Kind());
+        ffi_options.local_retention_age_value = value->Value();
+    }
+    if (const auto &value = options.LocalRetentionSize()) {
+        ffi_options.has_local_retention_size = true;
+        ffi_options.local_retention_size     = std::string(value->Value());
+    }
     ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
 }
 
@@ -160,6 +173,23 @@ std::vector<UserInfo> IggyBlockingClient::GetUsers() {
         }
         return users;
     });
+}
+
+std::vector<PersonalAccessTokenInfo> IggyBlockingClient::GetPersonalAccessTokens() {
+    return RethrowAsIggyException([this] {
+        std::vector<PersonalAccessTokenInfo> tokens;
+        auto ffi_tokens = Handle()->get_personal_access_tokens();
+        tokens.reserve(ffi_tokens.size());
+        for (auto &token : ffi_tokens) {
+            tokens.push_back(PersonalAccessTokenInfo::FromFfi(std::move(token)));
+        }
+        return tokens;
+    });
+}
+
+void IggyBlockingClient::DeletePersonalAccessToken(std::string name) {
+    RethrowAsIggyException(
+        [this, &name](ffi::ErrorInfo &error_info) { Handle()->delete_personal_access_token(name, error_info); });
 }
 
 UserInfoDetails IggyBlockingClient::CreateUser(std::string username,
@@ -323,6 +353,11 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
         } else {
             ffi_options.has_replication_factor = false;
             ffi_options.replication_factor     = 0;
+        }
+        if (const auto &value = options.SegmentMaxAge()) {
+            ffi_options.has_segment_max_age   = true;
+            ffi_options.segment_max_age_kind  = std::string(value->Kind());
+            ffi_options.segment_max_age_value = value->Value();
         }
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options), error_info));
     });

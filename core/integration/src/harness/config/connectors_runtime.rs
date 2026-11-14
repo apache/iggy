@@ -19,6 +19,8 @@ use bon::Builder;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Only the connector tests in apache/iggy-connectors build this
+/// configuration, through a git dependency on this crate.
 #[derive(Debug, Clone, Builder)]
 pub struct ConnectorsRuntimeConfig {
     #[builder(into)]

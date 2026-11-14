@@ -48,7 +48,7 @@ enum CommitErrorScope {
             switch code {
             case .featureUnavailable, .invalidIdentifier, .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary,
                 .deferredPollCapacityExceeded, .streamIdNotFound, .streamNameNotFound, .topicIdNotFound, .topicNameNotFound, .partitionNotFound,
-                .tooManyConsumerOffsets, .invalidOffset, .consumerGroupPartitionNotOwned:
+                .tooManyConsumerOffsets, .invalidOffset, .consumerGroupPartitionNotOwned, .tieredReadFailed:
                 true
             default:
                 false
@@ -56,7 +56,7 @@ enum CommitErrorScope {
         case .section:
             switch code {
             case .transientNotAccepted, .invalidSizeBytes, .historyUnavailable, .notPrimary, .partitionNotFound, .tooManyConsumerOffsets,
-                .consumerGroupPartitionNotOwned:
+                .consumerGroupPartitionNotOwned, .tieredReadFailed:
                 true
             default:
                 false

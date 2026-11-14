@@ -26,7 +26,7 @@ dependencies = [
     "argparse==1.4.0",
     "loguru==0.7.3",
     "pyrefly>=1.4.0",
-    "ruff>=0.17.1",
+    "ruff>=0.17.3",
 ]
 
 [tool.ruff.lint]
@@ -58,4 +58,5 @@ search-path = [
     "message-headers",
     "message-headers/plain-headers",
     "message-headers/typed-headers",
+    "multi-tenant",
 ]

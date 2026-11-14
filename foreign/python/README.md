@@ -212,7 +212,7 @@ asyncio.run(main())
 
 `create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
 
-A topic's `message_expiry` and `max_topic_size` are the only resettable keys. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
+A topic's `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` are the only resettable keys. `tiered_storage` can only be turned on by an update, never off. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
 
 The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
 
@@ -607,7 +607,9 @@ until `abandon_operation()`, as described above. `poll_messages()` refuses
 `reader()` returns a `PartitionReader`, which reads the partitions of a topic
 with prefetch and keeps the position of each one. A `Consumer.Single` reads the
 `partitions` that you pass. A `Consumer.Group` joins its group and reads the
-partitions that the server assigns to it. `next()` returns the next batch of
+partitions that the server assigns to it. A join with an unknown outcome raises
+its error, and the next `reader()` joins again. A join that landed keeps its
+member in the group until the session ends. `next()` returns the next batch of
 one partition and never an empty one, and `commit()` stores the offset of a
 checkpoint. The default options wait up to five seconds for messages. `next()`
 has no time limit. To bound it, use `asyncio.wait_for()`: a cancelled `next()`
@@ -615,6 +617,15 @@ leaves its batch in the reader. Call `close()` when you are done, or use the
 reader in `async with`, which closes it. `async for` reads batches until
 `close()`. `delete_consumer_position()` deletes the offset stored for the
 partition of a checkpoint.
+
+When the offset store of `commit()` gets `ConsumerGroupPartitionNotOwned` (5009)
+for a partition that the reader still has, `commit()` reads the owner of the
+partition again. The server can refuse that read for a short time, and
+`commit()` repeats it after each such refusal, with no time limit. To bound
+`commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends nothing more,
+but a write that it already sent can still take effect. `close()` waits for
+every pending call of the reader, so cancel a pending `commit()` before
+`close()`.
 
 ```python
 from apache_iggy import Consumer, IggyClient, PollingStrategy
@@ -642,7 +653,11 @@ async def read_batches(client: IggyClient):
 yields its messages one at a time. The `commit` of its `poll_options` says when
 offsets are stored. `CommitPolicy.Manual()`, the default, stores none: commit the
 checkpoint of a message after you process it. `CommitPolicy.OnRead()` makes the
-server store the offset of each read. `CommitPolicy.Auto(AutoCommit(...))` makes
+server store the offset of each read. A reader or a consumer with `OnRead` reads
+ahead. A crash, or an exit without `close()` or `shutdown()`, loses the batches
+that the server stored before the application took them. The loss is at most the
+effective prefetch budget, which holds at least 32 batches.
+`CommitPolicy.Auto(AutoCommit(...))` makes
 the consumer store the latest counted position at an `interval` or on a
 `CommitEvery` event, and on shutdown. A message counts after its processing with
 `CommitAfter.Processing`, when it is handed over with `CommitAfter.Delivery`, or
@@ -650,11 +665,16 @@ when you call `mark(checkpoint)` with `CommitAfter.Marked`.
 `AutoCommit.default()` stores every 10,000 messages or 5 seconds after
 processing. With `CommitAfter.Processing`, a `consume_messages()` callback that
 raises ends the run with its exception, and its message is read again by the
-next run. A reader takes the same `commit`. Call `shutdown()` before you drop the consumer, or use it in
-`async with`, which shuts it down. `shutdown()` also ends an `async for` that
-waits for a message. In a `consume_messages()` callback, `shutdown()`, iterating
-the consumer and a nested `consume_messages()` raise `RuntimeError`, because the
-run waits for the callback: set the shutdown event instead.
+next run. A reader takes the same `commit`. Call `shutdown()` before you drop the
+consumer, or use it in `async with`, which shuts it down. Shutdown waits up to
+five seconds for pending automatic offset stores by default. Pass
+`offset_drain_timeout` to `consumer_group()` to change that wait; zero skips it.
+Closing the reader and leaving the group still run after the wait expires.
+This timeout is not a deadline for the entire shutdown. `shutdown()` also ends
+an `async for` that waits for a message. In a
+`consume_messages()` callback, `shutdown()`, iterating the consumer and a nested
+`consume_messages()` raise `RuntimeError`, because the run waits for the
+callback: set the shutdown event instead.
 
 ```python
 from apache_iggy import IggyClient
@@ -677,6 +697,33 @@ itself. A partition that was deleted and created again stops with
 `HistoryUnavailable` (87) until `seek(partition_id, start)` picks a new start.
 `consume_messages()` then raises the error and stops. Call it again after the
 seek. If a message does not decode, pass `skip` to `seek()` to read past it.
+A lost read can commit messages that the reader cannot read again. Then the
+reader raises `FetchProgressUncertain` (14010) once. Its `lost` holds the first
+and last offset of those messages as `(first, last)`. This error stops nothing
+and needs no seek. A seek after it drops the batch that follows the range. If
+the reader stopped the partition, the error that stopped it comes after that
+batch. Earlier versions gave this error a `skip` after the range. Code that
+handles `FetchProgressUncertain` with an abandon and a `seek()` must now check
+`lost` first and do neither for this error.
+
+## Interpreter Exit
+
+Before the interpreter exits, shut the SDK down: await `shutdown()` on each
+consumer and producer, and `close()` on each reader.
+
+The SDK registers an `atexit` handler at its first import. From that handler
+on, the threads of the SDK hand no result to Python. A thread that enters
+Python during finalization can abort the process. After that handler:
+
+- A call in flight can stay pending and never complete.
+- A call from a thread other than the exiting main thread raises
+  `RuntimeError`. An example is a daemon thread that runs the event loop.
+- A `consume_messages()` run ends and calls its callback no more.
+
+Python runs `atexit` handlers in reverse order of registration. A handler that
+you register before the first import of `apache_iggy` runs after the handler of
+the SDK. A wait for the SDK in such a handler can hang. Before you register
+such a handler, import `apache_iggy`, or shut the SDK down before the exit.
 
 ## Examples
 
