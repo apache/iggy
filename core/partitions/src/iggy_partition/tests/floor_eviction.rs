@@ -47,14 +47,14 @@ pub(super) async fn advance_over(
 
 /// Apply `advance` as the commit path does: to the floor machine, and then to
 /// the partition's own bookkeeping.
-async fn apply(
+pub(super) async fn apply(
     partition: &mut IggyPartition<IggyMessageBus>,
     op: u64,
     advance: AdvanceTieredFloor,
 ) {
     let _ = partition.register_builtin_state_machines();
     let payload = advance.encode();
-    partition
+    let applied = partition
         .state_machines
         .apply(
             op,
@@ -64,6 +64,7 @@ async fn apply(
             },
         )
         .unwrap();
+    assert_eq!(applied, crate::state_machine::Applied::Changed);
     partition.note_tiered_advance(advance);
     Box::pin(settle_partition_io(partition, &repair_config())).await;
 }

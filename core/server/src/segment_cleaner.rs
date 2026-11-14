@@ -84,6 +84,7 @@ fn stage_owned_partitions(
     let namespaces: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
     let streams = shard.plane.metadata().mux_stm.streams();
     let max_message_size = u64::try_from(shard.bus_max_message_size()).unwrap_or(u64::MAX);
+    let mut tiered = Vec::new();
     for namespace in namespaces {
         let Some((message_expiry, max_topic_size, partition_count, segment_size)) =
             streams.topic_retention_config(namespace.stream_id(), namespace.topic_id())
@@ -118,6 +119,8 @@ fn stage_owned_partitions(
                 now,
                 local_envelope(age, size, partition_count),
             );
+            // Staged after the loop, where the shard orders them.
+            tiered.push(namespace);
         }
         if !has_expiry && budget.is_none() {
             continue;
@@ -150,6 +153,9 @@ fn stage_owned_partitions(
             budget.map(|budget| budget.max_bytes),
         );
     }
+    // The timed pass is what retries an upload the store refused and an
+    // advance that did not commit.
+    shard.request_upload_passes(&tiered, now);
 }
 
 /// What one partition of a tiered topic keeps on local disk. The topic's

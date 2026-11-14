@@ -622,6 +622,7 @@ where
             if let Err(error) = partition.accept_io(token.identity, result) {
                 tracing::error!(namespace_raw = token.identity.namespace.inner(), %error, "partition I/O acceptance failed");
             }
+            self.stage_wanted_upload(token.identity.namespace, partition);
             if matches!(
                 token.identity.continuation,
                 partitions::PartitionIoContinuation::Retention
@@ -665,6 +666,7 @@ where
             return;
         };
         let step = partition.resume_io(partitions.config()).await;
+        self.stage_wanted_upload(namespace, partition);
         if let Some(token) = self.partition_io.retained(namespace, incarnation)
             && !partition.retains_io_reservation(token.identity)
         {
@@ -11406,4 +11408,6 @@ mod tests {
             std::future::ready(Ok(SuperblockContents::Empty))
         }
     }
+
+    mod segment_uploads;
 }

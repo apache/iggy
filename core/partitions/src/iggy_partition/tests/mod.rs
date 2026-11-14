@@ -1918,6 +1918,7 @@ mod repair_floor;
 mod repair_protocol;
 mod retention;
 mod segment_chain;
+mod segment_upload;
 mod session_retirement;
 mod state_machines;
 mod state_transfer_offer;

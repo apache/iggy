@@ -47,7 +47,12 @@ pub use remote_segments::{RemoteObjects, RemoteRange, RemoteSegments};
 mod segment;
 pub mod segment_anchor;
 pub mod segment_chain;
+mod segment_upload;
 pub use segment_chain::object_prefix;
+pub use segment_upload::{
+    ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
+    UploadError, UploadOutcome, upload_segment,
+};
 mod segment_recovery;
 pub mod state_machine;
 pub mod state_transfer;

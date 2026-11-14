@@ -1182,6 +1182,15 @@ where
                     partition.stage_eviction(now);
                 }
             }
+            LifecycleFrame::UploadSegments {
+                namespace,
+                resend_advance,
+            } => {
+                self.on_upload_segments(namespace, resend_advance).await;
+            }
+            LifecycleFrame::SegmentUploadFinished(finished) => {
+                self.on_segment_upload_finished(*finished).await;
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,
