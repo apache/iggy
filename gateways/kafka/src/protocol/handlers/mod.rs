@@ -51,6 +51,7 @@ pub mod sync_group;
 pub(crate) mod topic_config;
 
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -61,7 +62,7 @@ use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
 
-use crate::auth::AuthenticatedPrincipal;
+use crate::auth::{AuthenticatedPrincipal, TopicReads};
 use crate::bridge::BridgeError;
 use crate::error::Result;
 use crate::protocol::api::{
@@ -124,9 +125,11 @@ pub async fn dispatch(
         API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
         API_KEY_METADATA => metadata::handle(state, connection, principal, api_version, body).await,
-        API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
+        API_KEY_OFFSET_COMMIT => {
+            offset_commit::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
-        API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
+        API_KEY_API_VERSIONS => api_versions::handle(state, connection, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, connection, api_version, body).await,
         API_KEY_DELETE_TOPICS => {
             delete_topics::handle(state, connection, principal, api_version, body).await
@@ -207,6 +210,40 @@ fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> b
         return false;
     }
     principal.permissions.manage_topics
+}
+
+/// The topics a principal may commit offsets to. See [`commit_access`].
+#[derive(Debug, Clone)]
+pub(crate) enum CommitAccess {
+    /// Every topic.
+    Any,
+    /// The topics that these stream and topic grants cover.
+    Scoped(Arc<TopicReads>),
+    /// No topic.
+    Never,
+}
+
+/// Where `principal` may commit offsets. `None` means no listener of this gateway names principals,
+/// and `ANONYMOUS` comes from a listener that authenticates no one. Both commit anywhere.
+///
+/// Kafka asks for `READ` on the group. Iggy creates a consumer group only for a user that may read
+/// the topic: a read or manage permission on topics or streams, globally (`read_topics`, which
+/// `DescribeAcls` shows as that `READ`), on the topic's stream, or on the topic. Every commit asks
+/// for the same, so whether it may store does not depend on whether the group exists yet. A
+/// principal whose permissions were never read commits nowhere.
+fn commit_access(principal: Option<&AuthenticatedPrincipal>) -> CommitAccess {
+    let Some(principal) = principal.filter(|principal| !principal.is_anonymous()) else {
+        return CommitAccess::Any;
+    };
+    if !principal.permissions_known {
+        CommitAccess::Never
+    } else if principal.permissions.read_topics {
+        CommitAccess::Any
+    } else if principal.topic_reads.is_empty() {
+        CommitAccess::Never
+    } else {
+        CommitAccess::Scoped(Arc::clone(&principal.topic_reads))
+    }
 }
 
 /// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.

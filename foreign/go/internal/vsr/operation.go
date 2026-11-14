@@ -70,6 +70,7 @@ const (
 	OperationInstallConsumerGroupOwner  Operation = 167
 	OperationTransitionPartitionHistory Operation = 168
 	OperationRetireConsumerGroupOwners  Operation = 169
+	OperationStateMachineCommand        Operation = 170
 )
 
 // Band boundaries. The internal band is never client-sent.
@@ -121,6 +122,7 @@ var allOperations = []Operation{
 	OperationInstallConsumerGroupOwner,
 	OperationTransitionPartitionHistory,
 	OperationRetireConsumerGroupOwners,
+	OperationStateMachineCommand,
 }
 
 var knownOperations = newOperationSet(allOperations)
@@ -197,7 +199,7 @@ func IsKnownOperation(operation Operation) bool {
 // IsInternal reports whether the operation belongs to the replica-internal
 // band, which a client never sends.
 func IsInternal(operation Operation) bool {
-	return operation == OperationRetireSession || operation == OperationInstallConsumerGroupOwner || operation == OperationTransitionPartitionHistory || operation == OperationRetireConsumerGroupOwners || operation >= internalBandStart && operation < metadataBandStart
+	return operation == OperationRetireSession || operation == OperationInstallConsumerGroupOwner || operation == OperationTransitionPartitionHistory || operation == OperationRetireConsumerGroupOwners || operation == OperationStateMachineCommand || operation >= internalBandStart && operation < metadataBandStart
 }
 
 // IsMetadata reports whether the operation replicates through the metadata

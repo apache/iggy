@@ -26,6 +26,8 @@ if [ ! -d "$RESULTS_DIR" ]; then
     echo "Set RESULTS_DIR=/path/to/performance_results or run benchmarks with \`output\` subcommand first."
     exit 1
 fi
+# The server runs from another directory, so a relative RESULTS_DIR must be resolved here.
+RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd)"
 
 # Check if trunk is installed
 if ! command -v trunk &>/dev/null; then
@@ -55,9 +57,10 @@ if [ $# -gt 0 ]; then
     fi
 fi
 
-# Start server in background
+# Start server in background. It serves frontend/dist (with /vendor) relative to its working
+# directory. exec keeps the job PID on the server process.
 echo "Starting server (results: $RESULTS_DIR)..."
-cargo run --bin iggy-bench-dashboard-server -- --results-dir "$RESULTS_DIR" &
+(cd core/bench/dashboard && exec cargo run -p iggy-bench-dashboard-server -- --results-dir "$RESULTS_DIR") &
 
 # Wait a bit for server to start
 sleep 1

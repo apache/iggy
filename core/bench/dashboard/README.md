@@ -1,47 +1,39 @@
 # Apache Iggy Benchmarks Dashboard
 
-A modern, high-performance benchmark results dashboard for Iggy, built with Rust. This application provides a responsive web interface for visualizing and analyzing benchmark results.
+A web dashboard for Apache Iggy benchmark results. It reads the reports that `iggy-bench` saves. From them it
+shows which runs are comparable, how each release did, and what changed between two runs or two versions.
 
 ## Features
 
-- 📊 Interactive performance trend visualization
-  - Support for multiple benchmark types:
-    - Send (Producer) benchmarks
-    - Poll (Consumer) benchmarks
-    - Send & Poll (Combined) benchmarks
-    - Consumer Group Poll benchmarks
-  - Separate visualization for producer and consumer metrics
-  - Comprehensive latency metrics (Average, P95, P99, P999)
-  - Trend and throughput charts across all benchmarks, hardware and versions
-- 🔍 Filter benchmarks by hardware and version
-- 📱 Responsive design that works on desktop and mobile
-- 🚀 High-performance Rust backend
-- ⚡ Fast, modern web frontend built with Yew
+- The Overview (`/`) shows the headline workloads from `dashboard.toml`: the latest release's numbers, the
+  trend across releases, and the change in newer builds.
+- Explore (`/benchmarks`) lists every run, with search and filters for machine, version, kind, topology,
+  durability and message size.
+- The run page (`/benchmarks/{uuid}`) shows one run: headline numbers against the previous version, charts
+  over the run, every percentile, history across versions, the command to reproduce it, and its files.
+- Compare (`/compare` and `/compare/releases`) puts two or three runs side by side, or two versions across
+  an official suite.
+- Methodology (`/methodology`) explains how to run `iggy-bench`, and what every number, threshold and badge
+  means.
+
+A run's charts can also be embedded in another page as an iframe or a PNG. On a phone, tables turn into
+labeled blocks.
 
 ![Dashboard](../../../assets/benchmarking_platform.png)
 
 ## Project Structure
 
-The project is organized as a Rust workspace with four main components:
+The dashboard is three crates in the Iggy workspace:
 
-- `frontend/`: Yew-based web application
-  - Modern UI with interactive charts
-  - Type-safe API integration
-  - Error handling and loading states
-
-- `server/`: Actix-web REST API server
-  - Efficient file system operations
-  - Configurable through command-line arguments
-  - Built-in security features
-
-- `shared/`: Common code between components
-  - Type definitions
-  - Serialization logic
-  - Shared constants
+- `frontend/`: the Yew web application, built with Trunk
+- `server/`: the Actix-web server. It reads the results directory, serves the JSON API, the embed pages and
+  the PNG charts, and hosts the built frontend
+- `shared/`: code that the server and the frontend both use, such as the run summary, the workload key, the
+  delta rule and the configuration types
 
 ## API Endpoints
 
-The server provides the following REST API endpoints:
+The server provides the following HTTP endpoints:
 
 ### Health Check
 
@@ -49,34 +41,15 @@ The server provides the following REST API endpoints:
   - Check server health status
   - Response: `{"status": "healthy"}`
 
-### Hardware Information
-
-- `GET /api/hardware`
-  - List all available hardware configurations
-  - Response: Array of hardware configurations
-
-### Git References
-
-- `GET /api/gitrefs/{hardware}`
-  - List git references for specific hardware
-  - Parameters:
-    - `hardware`: Hardware configuration identifier
-  - Response: Array of git reference strings
-
 ### Benchmarks
 
-- `GET /api/benchmarks/{gitref}`
-  - List all benchmarks for a specific git reference
-  - Parameters:
-    - `gitref`: Git reference identifier
-  - Response: Array of benchmark summaries
+- `GET /api/benchmarks`
+  - List all runs as summaries, newest first: identity, the hardware of the machine that ran the bench, workload key, badges, and the comparable metrics of each actor group
+  - Response: Array of run summaries
 
-- `GET /api/benchmarks/{hardware}/{gitref}`
-  - List benchmarks for specific hardware and git reference
-  - Parameters:
-    - `hardware`: Hardware configuration identifier
-    - `gitref`: Git reference identifier
-  - Response: Array of benchmark summaries
+- `GET /api/config`
+  - Get the dashboard configuration file: official suites, headline workloads, and thresholds
+  - Response: Configuration JSON
 
 ### Benchmark Reports
 
@@ -92,28 +65,55 @@ The server provides the following REST API endpoints:
     - `unique_id`: UUID of the benchmark
   - Response: Simplified benchmark report JSON
 
-### Trend Analysis
-
-- `GET /api/benchmark/trend/{hardware}/{params_identifier}`
-  - Get benchmark trend data
+- `GET /api/benchmark/series/{unique_id}?metric={metric}&scope={scope}`
+  - Get the time series of a run for charts, with at most 3000 points per series (LTTB downsampling)
+  - The server builds the series on the first request and keeps them in a bounded memory cache until the results directory reloads
   - Parameters:
-    - `hardware`: Hardware configuration identifier
-    - `params_identifier`: Benchmark parameters identifier
-  - Response: Array of benchmark data points for trend analysis
+    - `unique_id`: UUID of the benchmark
+    - `metric`: `latency` (average latency of each sampling window, in ms) or `throughput` (MB/s)
+    - `scope`: `group` (one series per actor group, with the total MB/s or the average latency of its actors) or `actors` (one series per actor)
+  - Response: the metric, its unit, and the series. Each series has a `source`, for example `{"group": "producers"}` or `{"actor": {"kind": "consumer", "id": 3}}`, and its `time_s` and `value` points
 
 ### Test Artifacts
 
-- `GET /api/benchmark/{unique_id}/artifacts`
+- `GET /api/artifacts/{uuid}`
   - Download test artifacts for a benchmark
   - Parameters:
-    - `unique_id`: UUID of the benchmark
-  - Response: ZIP archive containing test artifacts
+    - `uuid`: UUID of the benchmark
+  - Response: ZIP archive containing test artifacts, built on the first request and then served from `--cache-dir`
 
-All endpoints return JSON responses (except artifacts which returns a ZIP file) and use standard HTTP status codes:
+### Embedded Charts
+
+- `GET /embed/{uuid}?type={type}&theme={theme}&action={action}`
+  - Get a page with the interactive chart of a run, for an iframe
+  - Parameters:
+    - `uuid`: UUID of the benchmark
+    - `type`: `latency` (default), `throughput`, or `distribution`
+    - `theme`: `dark` (default) or `light`
+    - `action`: optional, `download` gives a page that saves the chart as a PNG file in the browser
+  - Response: HTML page
+
+- `GET /embed/{uuid}/chart.png?type={type}&theme={theme}&width={width}&height={height}&legend={legend}`
+  - Get the chart of a run as an image, rendered on the server
+  - Parameters:
+    - `uuid`: UUID of the benchmark
+    - `type`: `latency` (default), `throughput`, or `distribution`
+    - `theme`: `dark` (default), `light`, `dark_nobg`, or `light_nobg` (transparent background)
+    - `width`, `height`: image size in pixels, from 1 to 4096 (default 1600 x 1200)
+    - `legend`: `true` (default) or `false`
+  - Response: PNG image. At the default size it is built on the first request and then served from
+    `--cache-dir`. Other sizes are built on every request.
+
+`/health` and the `/api` endpoints return JSON, except `/api/artifacts/{uuid}`, which returns a ZIP file. The embed
+endpoints return HTML or PNG. All of them use standard HTTP status codes:
 
 - 200: Success
+- 400: Invalid parameter
 - 404: Resource not found
 - 500: Server error
+
+An unknown `/api` path returns 404 with a JSON error. Every other path serves the frontend from `frontend/dist`.
+A page path with no file there gets `index.html` with 200, so the frontend's page links work.
 
 ## Prerequisites
 
@@ -161,10 +161,13 @@ All endpoints return JSON responses (except artifacts which returns a ZIP file) 
    ./scripts/dashboard/build_release.sh
    ```
 
-2. Start the server:
+2. Start the server from `core/bench/dashboard`. The server reads `dashboard.toml` and `frontend/dist` from its
+   working directory:
 
    ```bash
-   ./target/release/iggy-bench-dashboard-server --host 127.0.0.1 --port 8061
+   cd core/bench/dashboard
+   ../../../target/release/iggy-bench-dashboard-server --host 127.0.0.1 --port 8061 \
+       --results-dir ../../../performance_results
    ```
 
 ### Development Mode
@@ -177,7 +180,7 @@ Run the development script from root of `apache/iggy` repository to start both t
 
 This will start:
 
-- Frontend development server on port 8060
+- Frontend development server on port 8060, which proxies `/api`, `/embed` and `/health` to the backend
 - Backend API server on port 8061
 
 Access the development version at <http://localhost:8060>
@@ -196,17 +199,17 @@ docker build -t iggy-bench-dashboard -f core/bench/dashboard/server/Dockerfile .
 
 ### Running the Container
 
-First, ensure your performance results directory exists and has proper permissions:
+First, check that your performance results directory exists and has proper permissions:
 
   ```bash
   mkdir -p performance_results
   chmod 755 performance_results
   ```
 
-Basic usage (recommended):
+Basic usage (recommended). The server listens on port 80 in the container:
 
   ```bash
-  docker run -p 8061:8061 \
+  docker run -p 8061:80 \
      -v "$(pwd)/performance_results:/data/performance_results" \
      --user "$(id -u):$(id -g)" \
      apache/iggy-bench-dashboard
@@ -224,6 +227,20 @@ With custom configuration:
         apache/iggy-bench-dashboard
   ```
 
+With your own dashboard configuration and a cache directory that persists between restarts:
+
+  ```bash
+  mkdir -p dashboard_cache
+  docker run -p 8061:80 \
+        -v "$(pwd)/performance_results:/data/performance_results" \
+        -v "$(pwd)/dashboard.toml:/config/dashboard.toml:ro" \
+        -v "$(pwd)/dashboard_cache:/cache" \
+        --user "$(id -u):$(id -g)" \
+        -e CONFIG=/config/dashboard.toml \
+        -e CACHE_DIR=/cache \
+        apache/iggy-bench-dashboard
+  ```
+
 Using a named volume:
 
   ```bash
@@ -231,7 +248,7 @@ Using a named volume:
   docker volume create iggy-results
 
   # Run with named volume
-  docker run -p 8061:8061 \
+  docker run -p 8061:80 \
      -v iggy-results:/data/performance_results \
      apache/iggy-bench-dashboard
   ```
@@ -242,17 +259,19 @@ Using a named volume:
 
 #### Environment Variables
 
-| Variable     | Default                   | Description                       |
-| ------------ | ------------------------- | --------------------------------- |
-| HOST         | 0.0.0.0                   | Server host address               |
-| PORT         | 8061                      | Server port                       |
-| RESULTS_DIR  | /data/performance_results | Directory for performance results |
+| Variable      | Default                     | Description                                                         |
+| ------------- | --------------------------- | ------------------------------------------------------------------- |
+| `HOST`        | `0.0.0.0`                   | Server host address                                                 |
+| `PORT`        | `80`                        | Server port                                                         |
+| `RESULTS_DIR` | `/data/performance_results` | Directory for performance results                                   |
+| `CONFIG`      | `/app/dashboard.toml`       | Dashboard configuration file. The image holds the official one      |
+| `CACHE_DIR`   | not set                     | Directory for cached PNG files and artifact zips. See `--cache-dir` |
 
 #### Volume Permissions
 
-The container is configured to run as a non-root user for security. When mounting a local directory, you should:
+The container is configured to run as a non-root user for security. When you mount a local directory:
 
-1. Use the `--user` flag with your local user ID to ensure proper file permissions
+1. Use the `--user` flag with your local user ID to get the correct file permissions
 2. Make sure your local directory has the correct permissions (755)
 3. If using a named volume, the container will handle permissions automatically
 
@@ -271,9 +290,22 @@ Options:
       --results-dir <RESULTS_DIR>    Directory containing performance results [default: ./performance_results]
       --log-level <LOG_LEVEL>        Log level (trace, debug, info, warn, error) [default: info]
       --cors-origins <CORS_ORIGINS>  Allowed CORS origins (comma-separated) [default: *]
+      --cache-dir <CACHE_DIR>        Directory for cached PNG files and artifact zips [default: /tmp/iggy-bench-dashboard]
+      --config <CONFIG>              Dashboard configuration file: official suites, headline workloads, and thresholds [default: dashboard.toml]
   -h, --help                         Print help
   -V, --version                      Print version
 ```
+
+The server only reads `--results-dir`. It writes the files it generates to `--cache-dir`: chart PNG files of
+the default size for `/embed/{uuid}/chart.png` under `embed/` and artifact zips for `/api/artifacts/{uuid}`
+under `artifacts/`. Each file is built on the first request and reused later. When a file in a run directory
+changes or is removed, the server rebuilds that run's artifact zip. To rebuild the PNG files, delete the
+directory. The default is `iggy-bench-dashboard` in the system temp directory (`$TMPDIR`, usually `/tmp`). If
+`--cache-dir` is inside `--results-dir`, the server does not start.
+
+The server reads `--config` at start. The default is `dashboard.toml` in the working directory, and this
+directory holds the file for the official AWS suites. If a run's `suite` label is in `[[suites]]`, the run is
+official. If the file is missing or invalid, the server does not start.
 
 ### Environment Variables for Development
 

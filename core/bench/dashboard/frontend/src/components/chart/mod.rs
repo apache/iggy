@@ -15,28 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod plot_trend;
-pub mod single_chart;
-pub mod tail_chart;
-pub mod trend_chart;
-
+use js_sys::{Object, Reflect};
+use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::Element;
 
-#[derive(Debug, Clone)]
-pub struct PlotConfig {
-    pub width: u32,
-    pub height: u32,
-    pub element_id: String,
-    pub is_dark: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub enum PlotType {
-    Latency,
-    Throughput,
-}
+const DATA_ZOOM_ACTION: &str = "dataZoom";
+/// The start and the end of the zoom window, in percent of the x axis.
+const WHOLE_AXIS: [(&str, f64); 2] = [("start", 0.0), ("end", 100.0)];
 
 #[wasm_bindgen]
 extern "C" {
@@ -47,14 +33,30 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn dispose(this: &EChartsInstance);
+
+    #[wasm_bindgen(method, js_name = dispatchAction)]
+    fn dispatch_action(this: &EChartsInstance, action: &JsValue);
 }
 
-pub fn dispose_chart(element_id: &str) {
-    if let Some(window) = web_sys::window()
-        && let Some(document) = window.document()
-        && let Some(element) = document.get_element_by_id(element_id)
-        && let Some(instance) = getInstanceByDom(&element)
-    {
+/// Also works on an element that has left the page, so an unmounted component frees its chart.
+pub fn dispose_chart_at(element: &Element) {
+    if let Some(instance) = getInstanceByDom(element) {
         instance.dispose();
     }
+}
+
+/// Zooms a chart with a zoom slider out to its whole x axis. A chart without one ignores it.
+pub fn reset_zoom_at(element: &Element) {
+    let Some(instance) = getInstanceByDom(element) else {
+        return;
+    };
+    let action = Object::new();
+    let fields = [("type", JsValue::from_str(DATA_ZOOM_ACTION))]
+        .into_iter()
+        .chain(WHOLE_AXIS.map(|(key, percent)| (key, JsValue::from_f64(percent))));
+    for (key, value) in fields {
+        // Setting a property of a new plain object can't fail.
+        let _ = Reflect::set(&action, &JsValue::from_str(key), &value);
+    }
+    instance.dispatch_action(&action);
 }

@@ -61,6 +61,7 @@ async fn main() -> Result<(), IggyError> {
         // - `First` - start polling from the first message in the partition. This enables messages replay in order of arrival.
         // - `Last` - read up to `count` messages ending at the committed offset.
         // - `Next` - start polling from the next message after the last polled message based on the stored consumer offset.
+        // With `CommitPolicy::OnRead`, the start applies only to a partition without a stored offset. A partition with one resumes after it.
         .polling_strategy(PollingStrategy::last())
         // Sets the polling retry interval in case of server disconnection.
         .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)

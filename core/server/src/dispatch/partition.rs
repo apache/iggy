@@ -2058,8 +2058,10 @@ mod tests {
                     .metadata()
                     .mux_stm
                     .streams()
-                    .partition_delete_watermark(0, 0, 0),
-                0
+                    .with_committed_partition(IggyNamespace::new(0, 0, 0), |partition| {
+                        partition.deleted_up_to_offset
+                    }),
+                Some(0)
             );
         }
     }

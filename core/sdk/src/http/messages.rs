@@ -288,6 +288,12 @@ mod tests {
         owner_generation: 0,
         metadata_op: 14,
     };
+    /// Names an owner and an op, but no history.
+    const NO_INCARNATION: PartitionContext = PartitionContext {
+        incarnation: 0,
+        owner_generation: 9,
+        metadata_op: 100,
+    };
     const START: u64 = 5;
     const STREAM_NAME: &str = "stream";
     const TOPIC_NAME: &str = "topic";
@@ -496,6 +502,58 @@ mod tests {
         assert_eq!(context, Some(CURRENT));
     }
 
+    /// A zero context names no history, so the poll goes without one, as on binary. HTTP has no
+    /// route to fill a missing incarnation from, so a context with an owner or an op goes as it
+    /// is, and the server refuses it: dropping it would drop the fence that the caller asked for.
+    #[tokio::test]
+    async fn given_a_continuation_without_an_incarnation_when_polling_should_send_only_a_zero_context_as_none()
+     {
+        let server = ScriptedServer::start(vec![Reply::polled(), Reply::polled()]).await;
+        let client = server.client();
+
+        for context in [PartitionContext::default(), NO_INCARNATION] {
+            let strategy =
+                PollingStrategy::continuation(PARTITION_ID, PollingKind::Offset, START, context);
+            poll(&client, &strategy, CommitPolicy::Manual)
+                .await
+                .unwrap();
+        }
+
+        let sent: Vec<_> = server
+            .requests()
+            .iter()
+            .map(|request| request.query("context"))
+            .collect();
+        assert_eq!(
+            sent,
+            [None, Some(serde_json::to_string(&NO_INCARNATION).unwrap())]
+        );
+    }
+
+    /// A store names its history as a poll does.
+    #[tokio::test]
+    async fn given_a_checkpoint_without_an_incarnation_when_storing_should_send_only_a_zero_context_as_none()
+     {
+        let server = ScriptedServer::start(vec![Reply::empty(200), Reply::empty(200)]).await;
+        let client = server.client();
+        let (stream_id, topic_id) = ids();
+
+        for context in [PartitionContext::default(), NO_INCARNATION] {
+            client
+                .store_consumer_position(
+                    &Consumer::default(),
+                    &stream_id,
+                    &topic_id,
+                    &Checkpoint::new(PARTITION_ID, START, context),
+                )
+                .await
+                .unwrap();
+        }
+
+        let sent: Vec<_> = server.requests().iter().map(Recorded::context).collect();
+        assert_eq!(sent, [None, Some(NO_INCARNATION)]);
+    }
+
     /// The server stores the offset of an `OnRead` poll before it answers, and it can still
     /// store it after the client gives up. So a poll whose answer does not prove the outcome
     /// is never sent again, and it blocks the partition. The server checks a poll again after
@@ -582,6 +640,26 @@ mod tests {
         );
         next.unwrap();
         assert_eq!(server.requests().len(), 7);
+    }
+
+    /// A read that the object store refused returns no messages, so the server stores no
+    /// offset for it. The refusal must reach the reader as it is: a block would hide a failure
+    /// that no retry changes behind an uncertain outcome that the reader retries.
+    #[tokio::test]
+    async fn given_an_on_read_poll_when_the_tiered_read_fails_should_return_it_without_a_block() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(424, &IggyError::TieredReadFailed),
+            Reply::polled(),
+        ])
+        .await;
+        let client = server.client();
+
+        let refused = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let next = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+
+        assert_eq!(refused.map(drop), Err(IggyError::TieredReadFailed));
+        next.unwrap();
+        assert_eq!(server.requests().len(), 2);
     }
 
     /// The server returns a first message above `max_bytes` alone in the reply, so it refuses a

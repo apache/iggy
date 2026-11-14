@@ -38,6 +38,13 @@ import java.util.Optional;
  * After a positive wait ends, the server still needs {@link #REPLY_MARGIN} for
  * the final read and the reply, so the budget must cover both.
  *
+ * <p>The client retries a poll that a node refused as not the primary, as not
+ * accepted or as over its poll capacity only while more than
+ * {@link #REPLY_MARGIN} of {@code requestTimeout} is left. So a poll without a
+ * wait whose {@code requestTimeout} is {@link #REPLY_MARGIN} or less gets no
+ * such retry: the first such refusal ends it, as not accepted or with the
+ * capacity refusal.
+ *
  * <p>{@code maxBytes} bounds the encoded response body, including the 40-byte
  * poll prefix and all batch framing, but excluding the 256-byte transport
  * header. It is not a payload-only limit, and not a bound on server disk work.

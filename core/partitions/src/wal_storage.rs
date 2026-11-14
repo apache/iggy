@@ -73,7 +73,7 @@ pub trait InjectedStorage {
 
 /// [`DurableFile`] as a trait object.
 pub trait InjectedFile {
-    fn preallocate<'a>(&'a self, path: &'a Path, length: u64) -> LocalBoxFuture<'a, ()>;
+    fn preallocate<'a>(&'a self, path: &'a Path, length: u64) -> LocalBoxFuture<'a, u64>;
     fn read(&self, offset: u64, length: usize) -> LocalBoxFuture<'_, io::Result<Vec<u8>>>;
     fn write(&mut self, offset: u64, bytes: Vec<u8>) -> LocalBoxFuture<'_, io::Result<()>>;
     fn write_frozen(
@@ -198,7 +198,7 @@ impl DurableStorage for WalStorage {
 }
 
 impl DurableFile for WalFile {
-    async fn preallocate(&self, path: &Path, length: u64) {
+    async fn preallocate(&self, path: &Path, length: u64) -> u64 {
         match self {
             Self::Disk(file) => DurableFile::preallocate(file, path, length).await,
             Self::Injected(file) => file.preallocate(path, length).await,
@@ -375,7 +375,7 @@ where
 }
 
 impl<F: DurableFile> InjectedFile for F {
-    fn preallocate<'a>(&'a self, path: &'a Path, length: u64) -> LocalBoxFuture<'a, ()> {
+    fn preallocate<'a>(&'a self, path: &'a Path, length: u64) -> LocalBoxFuture<'a, u64> {
         Box::pin(DurableFile::preallocate(self, path, length))
     }
 

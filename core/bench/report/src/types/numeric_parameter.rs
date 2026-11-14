@@ -21,7 +21,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 /// Represents a numeric argument that can be either a single value or a range.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BenchmarkNumericParameter {
     /// Single value
     Value(u32),

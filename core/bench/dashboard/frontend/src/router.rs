@@ -21,11 +21,53 @@ use yew_router::prelude::*;
 pub enum AppRoute {
     #[at("/")]
     Home,
+    #[at("/benchmarks")]
+    Explore,
     #[at("/benchmarks/:uuid")]
     Benchmark { uuid: String },
+    /// The runs are in the query: `?runs=a,b,c`, the baseline first.
+    #[at("/compare")]
+    Compare,
+    /// The suite and the two versions are in the query: `?suite=...&base=...&head=...`.
+    #[at("/compare/releases")]
+    CompareReleases,
+    /// The link form from before the query. It stays an alias of `?runs=left,right`, so shared
+    /// links keep working.
     #[at("/compare/:left/:right")]
-    Compare { left: String, right: String },
+    ComparePair { left: String, right: String },
+    #[at("/methodology")]
+    Methodology,
     #[not_found]
     #[at("/404")]
     NotFound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_releases_path_when_recognized_should_open_releases_compare_not_run_pair() {
+        assert_eq!(
+            AppRoute::recognize("/compare/releases"),
+            Some(AppRoute::CompareReleases)
+        );
+        assert_eq!(
+            AppRoute::recognize("/compare/releases/"),
+            Some(AppRoute::CompareReleases)
+        );
+        assert_eq!(AppRoute::CompareReleases.to_path(), "/compare/releases");
+    }
+
+    #[test]
+    fn given_old_pair_link_when_recognized_should_keep_alias() {
+        assert_eq!(
+            AppRoute::recognize("/compare/3f2a9c1b/0eb36c51"),
+            Some(AppRoute::ComparePair {
+                left: "3f2a9c1b".to_owned(),
+                right: "0eb36c51".to_owned(),
+            })
+        );
+        assert_eq!(AppRoute::recognize("/compare"), Some(AppRoute::Compare));
+    }
 }

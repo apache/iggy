@@ -28,8 +28,9 @@ namespace Apache.Iggy.Contracts;
 ///     Options a topic takes at creation, passed to <see cref="IIggyTopic.CreateTopicAsync" />.
 /// </summary>
 /// <remarks>
-///     <see cref="MessageExpiry" /> and <see cref="MaxTopicSize" /> can change later through a
-///     <see cref="TopicUpdate" />, every other setting is fixed at creation. A property left null emits no key,
+///     <see cref="MessageExpiry" />, <see cref="MaxTopicSize" />, <see cref="LocalRetentionAge" /> and
+///     <see cref="LocalRetentionSize" /> can change later through a <see cref="TopicUpdate" />, which can also turn
+///     <see cref="TieredStorage" /> on. Every other setting is fixed at creation. A property left null emits no key,
 ///     which leaves the server default in place. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates the
 ///     keys a given server accepts, with the kind, default and mutability of each.
 /// </remarks>
@@ -98,6 +99,43 @@ public sealed class TopicOptions
     ///     <c>invalid_replication_factor</c>.
     /// </remarks>
     public uint? ReplicationFactor { get; init; }
+
+    /// <summary>
+    ///     How long after the active segment's first batch a batch starts the next segment.
+    ///     <see cref="TimeSpan.MaxValue" /> never rolls by age, zero keeps the server default. Fixed at creation.
+    /// </summary>
+    /// <remarks>
+    ///     The server refuses less than ten minutes, and any age together with <see cref="PreallocateSegments" />.
+    /// </remarks>
+    public TimeSpan? SegmentMaxAge { get; init; }
+
+    /// <summary>
+    ///     Move sealed segments to the object store and keep only the local retention on disk. An update can turn
+    ///     it on and never off.
+    /// </summary>
+    /// <remarks>
+    ///     Not available yet: the server refuses <c>true</c> with <c>feature_unavailable</c>.
+    /// </remarks>
+    public bool? TieredStorage { get; init; }
+
+    /// <summary>
+    ///     How long a tiered topic keeps an uploaded segment on local disk. <see cref="TimeSpan.MaxValue" /> never
+    ///     removes it, zero keeps the server default of one day. No effect without <see cref="TieredStorage" />.
+    /// </summary>
+    /// <remarks>
+    ///     The server refuses a value above a finite <see cref="MessageExpiry" />.
+    /// </remarks>
+    public TimeSpan? LocalRetentionAge { get; init; }
+
+    /// <summary>
+    ///     Topic-wide cap in bytes on the uploaded segments a tiered topic keeps on local disk, divided among
+    ///     partitions. <see cref="ulong.MaxValue" /> is unlimited, zero keeps the server default. No effect without
+    ///     <see cref="TieredStorage" />.
+    /// </summary>
+    /// <remarks>
+    ///     The server refuses a value above a finite <see cref="MaxTopicSize" />.
+    /// </remarks>
+    public ulong? LocalRetentionSize { get; init; }
 
     /// <summary>
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
@@ -176,6 +214,27 @@ public sealed class TopicOptions
         if (ReplicationFactor is { } replicationFactor)
         {
             options[Name(TopicOptionKey.ReplicationFactor)] = HeaderValue.FromUInt32(replicationFactor);
+        }
+
+        if (SegmentMaxAge is { } segmentMaxAge && DurationHelpers.ToDuration(segmentMaxAge) is not 0 and var ageMicros)
+        {
+            options[Name(TopicOptionKey.SegmentMaxAge)] = HeaderValue.FromUInt64(ageMicros);
+        }
+
+        if (TieredStorage is { } tieredStorage)
+        {
+            options[Name(TopicOptionKey.TieredStorage)] = HeaderValue.FromBool(tieredStorage);
+        }
+
+        if (LocalRetentionAge is { } localRetentionAge
+            && DurationHelpers.ToDuration(localRetentionAge) is not 0 and var localAgeMicros)
+        {
+            options[Name(TopicOptionKey.LocalRetentionAge)] = HeaderValue.FromUInt64(localAgeMicros);
+        }
+
+        if (LocalRetentionSize is { } localRetentionSize and not 0)
+        {
+            options[Name(TopicOptionKey.LocalRetentionSize)] = HeaderValue.FromUInt64(localRetentionSize);
         }
 
         return options;

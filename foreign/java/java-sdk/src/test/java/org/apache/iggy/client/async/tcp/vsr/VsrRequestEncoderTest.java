@@ -220,26 +220,40 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldKeepFetchHeaderContextZeroAfterObservingMetadata() {
+    void shouldNameOnlyTheSessionWatermarkInTheFetchHeaderAndKeepTheTargetFences() {
         session.bind(42);
         session.observeMetadata(52);
+        ConsensusSession shared = new ConsensusSession();
+        shared.bindShared(session, session.clientIdLow(), session.clientIdHigh(), 42, session.bindSecret());
+        VsrRequestEncoder primary = new VsrRequestEncoder(shared);
         PartitionContext context =
                 new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(49));
+        ByteBuf payload = fetchPayload(4, 17, 9);
+        byte[] originalBody = new byte[payload.readableBytes()];
+        payload.getBytes(payload.readerIndex(), originalBody);
 
-        for (PartitionContext supplied : List.of(PartitionContext.EMPTY, context)) {
-            ByteBuf frame = encoder.encode(
-                    alloc, CommandCode.Messages.FETCH_MESSAGES.getValue(), Unpooled.EMPTY_BUFFER, supplied);
-            try {
-                assertThat(frame.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
-                        .isZero();
-                assertThat(frame.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
-                        .isZero();
-                assertThat(frame.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
-                        .isZero();
-                assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(42);
-            } finally {
-                frame.release();
+        try {
+            for (PartitionContext supplied : List.of(PartitionContext.EMPTY, context)) {
+                ByteBuf frame =
+                        primary.encode(alloc, CommandCode.Messages.FETCH_MESSAGES.getValue(), payload, supplied);
+                try {
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_INCARNATION_OFFSET))
+                            .isZero();
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))
+                            .isZero();
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET))
+                            .isEqualTo(52);
+                    assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET))
+                            .isEqualTo(42);
+                    byte[] encodedBody = new byte[originalBody.length];
+                    frame.getBytes(VsrHeaders.HEADER_SIZE, encodedBody);
+                    assertThat(encodedBody).isEqualTo(originalBody);
+                } finally {
+                    frame.release();
+                }
             }
+        } finally {
+            payload.release();
         }
     }
 
@@ -368,6 +382,31 @@ class VsrRequestEncoderTest {
         payload.writeByte(1);
         payload.writeByte(0);
         payload.writeIntLE(0);
+        return payload;
+    }
+
+    private static ByteBuf fetchPayload(long partitionId, long incarnation, long ownerGeneration) {
+        ByteBuf payload = Unpooled.buffer();
+        // consumer group, stream, topic
+        payload.writeByte(2);
+        writeNumericIdentifier(payload, 7);
+        writeNumericIdentifier(payload, 2);
+        writeNumericIdentifier(payload, 3);
+        // wait, request timeout, min_count, count, max_bytes, auto_commit, target count
+        payload.writeLongLE(0);
+        payload.writeLongLE(1_000_000);
+        payload.writeIntLE(1);
+        payload.writeIntLE(10);
+        payload.writeIntLE(4096);
+        payload.writeByte(0);
+        payload.writeIntLE(1);
+        // target: partition, next offset strategy, max_bytes, then the fence of the partition
+        payload.writeIntLE((int) partitionId);
+        payload.writeByte(5);
+        payload.writeLongLE(0);
+        payload.writeIntLE(4096);
+        payload.writeLongLE(incarnation);
+        payload.writeLongLE(ownerGeneration);
         return payload;
     }
 

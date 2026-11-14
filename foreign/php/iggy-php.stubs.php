@@ -175,6 +175,19 @@ namespace Iggy {
          * 2 keeps two copies but stops accepting writes while either node is down. The server
          * rejects an out-of-range value with `InvalidReplicationFactor`.
          *
+         * `segment_max_age_micros` starts a new segment once a batch arrives this long after the
+         * active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
+         * segments by size alone. The server refuses a duration together with
+         * `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+         * keep their meaning, and so do the three options below.
+         *
+         * `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
+         * server refuses true with `Feature is unavailable` until it tiers topics.
+         * `local_retention_age_micros` is how long a tiered topic keeps an uploaded segment on local
+         * disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
+         * there, unlimited when null. The server refuses an age above a finite message expiry and a
+         * size above a finite `max_topic_size`.
+         *
          * @param mixed $stream
          * @param string $name
          * @param int $partitions_count
@@ -190,9 +203,13 @@ namespace Iggy {
          * @param string|null $partition_resize_policy
          * @param mixed $replication_factor
          * @param array|null $raw
+         * @param mixed $segment_max_age_micros
+         * @param bool|null $tiered_storage
+         * @param mixed $local_retention_age_micros
+         * @param mixed $local_retention_size
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
 
         /**
          * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
@@ -411,8 +428,10 @@ namespace Iggy {
          * offset, PollingStrategy::next() when null, and a continuation is refused. `options`
          * defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
          * 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
-         * `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
-         * flight and the queued batches.
+         * `prefetch_messages`, 16000 when null, set the requested budgets for requests in flight and
+         * queued batches. Each effective budget holds at least 32 full batches so primary groups can
+         * wait independently: 32 MiB and 32000 messages with the default options. Larger budgets
+         * allow more queued batches.
          *
          * @param mixed $stream
          * @param mixed $topic
@@ -554,6 +573,12 @@ namespace Iggy {
          * decides whether each one may be set or reset. `raw` is marked
          * `#[\SensitiveParameter]`, because an unknown key may hold a secret.
          *
+         * `tiered_storage` set to true turns tiered storage on. The server refuses false, an update
+         * never turns it off, and refuses true with `Feature is unavailable` until it tiers topics.
+         * `local_retention_age_micros` and `local_retention_size` change how long and how much a
+         * tiered topic keeps on local disk after upload, with the same int or decimal string values
+         * and the same refusal of 0 as the expiry and the size cap.
+         *
          * @param mixed $stream
          * @param mixed $topic
          * @param string|null $name
@@ -562,9 +587,12 @@ namespace Iggy {
          * @param array $reset
          * @param array|null $raw
          * @param array|null $raw_reset
+         * @param bool|null $tiered_storage
+         * @param mixed $local_retention_age_micros
+         * @param mixed $local_retention_size
          * @return void
          */
-        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null): void {}
+        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
     }
 
     /**
@@ -670,6 +698,7 @@ namespace Iggy {
          * recreated partition fails with HistoryUnavailable (87), and one from a previous owner
          * fails with ConsumerGroupPartitionNotOwned (5009). A checkpoint that this consumer did not
          * deliver, and every commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+         * The call ends at a deadline 10 s after its start, as PartitionReader::commit() does.
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
@@ -718,6 +747,7 @@ namespace Iggy {
          * The delete uses the context of its route. It can fail once with HistoryUnavailable
          * (87), or ConsumerGroupPartitionNotOwned (5009), after another client deleted and
          * recreated the partition. The failed route is dropped, and the next call routes again.
+         * The call ends at a deadline 10 s after its start, as commit() does.
          *
          * @param int|null $partition_id
          * @return void
@@ -786,8 +816,11 @@ namespace Iggy {
         /**
          * Sets the next read position of a partition and drops the rest of its current batch. Under
          * CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before it, so
-         * a restart resumes at the new position, and a failed store fails the seek with its
-         * exception and moves nothing. Every other seek stores nothing.
+         * a restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+         * deletes the stored offset, and a seek to a timestamp stores the offset before the first
+         * message at the timestamp, if there is one. A failed read, lookup, store or delete fails
+         * the seek with its exception and moves nothing. Every other seek stores nothing. The call
+         * ends at a deadline 10 s after its start, as commit() does.
          *
          * It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
          * after a message that does not decode: seek to the `skip` of its ReadException. A
@@ -834,6 +867,8 @@ namespace Iggy {
          * and can fail once with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned
          * (5009), after another client deleted and recreated the partition. The failed route is
          * dropped, and the next call routes again.
+         *
+         * The call ends at a deadline 10 s after its start, as commit() does.
          *
          * @param int $offset
          * @param int|null $partition_id
@@ -2157,7 +2192,9 @@ namespace Iggy {
      * budget (one fetch per primary that may wait for messages, the partitions with messages left
      * behind spread over the other slots), a seek() to an offset stores the offset before it, and
      * close() moves the offset back to the last delivered message. Destroying the reader without
-     * close() stops it without waiting, moves no offset back and does not leave the group.
+     * close() stops it without waiting, moves no offset back and does not leave the group. Under
+     * onRead(), such a reader or a crash loses the batches that the server stored before the
+     * application took them, up to the effective budget, which holds at least 32 batches.
      */
     class PartitionReader {
         public function __construct() {}
@@ -2184,6 +2221,10 @@ namespace Iggy {
          * A checkpoint of an older generation of its partition, or at or below the last commit of
          * its generation, stores nothing. A checkpoint that this reader did not deliver, and every
          * commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+         *
+         * PHP cannot cancel the call, so it ends at a deadline 10 s after its start: after a
+         * refusal for an earlier owner (5009), the read of the new owner retries only until then,
+         * and the call throws the refusal.
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
@@ -2232,9 +2273,14 @@ namespace Iggy {
          *
          * Under CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before
          * it, under the history of a continuation or else of the last delivered message, so a
-         * restart resumes at the new position. A failed store fails the seek with its exception and
-         * nothing moves. Every other seek stores nothing. The new position waits for the end of the
-         * committing read in flight, whose reply the new generation drops.
+         * restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+         * deletes the stored offset under the same history when the server holds one, because the
+         * commit of a read never moves the offset back. A seek to a timestamp first reads one
+         * message at the timestamp without a commit, and then acts as a seek to the offset of that
+         * message. Without such a message it stores nothing. A failed read, lookup, store or delete
+         * fails the seek with its exception and nothing moves. Every other seek stores nothing. The
+         * new position waits for the end of the committing read in flight, whose reply the new
+         * generation drops. The call ends at a deadline 10 s after its start, as commit() does.
          *
          * A partition that the reader does not read, and a continuation of another partition,
          * fail with InvalidCommand (3). Under CommitPolicy::onRead(), a read with an unknown
@@ -2697,8 +2743,8 @@ namespace Iggy {
     /**
      * Topic option keys, as the cases an update's reset list takes.
      *
-     * Only `MessageExpiry` and `MaxTopicSize` are resettable in this release. The server refuses
-     * every other case with its own category.
+     * Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
+     * resettable in this release. The server refuses every other case with its own category.
      */
     enum TopicOptionKey: string {
       case Name = 'name';
@@ -2713,6 +2759,10 @@ namespace Iggy {
       case SizeOfMessagesRequiredToSave = 'size_of_messages_required_to_save';
       case PreallocateSegments = 'preallocate_segments';
       case ReplicationFactor = 'replication_factor';
+      case SegmentMaxAge = 'segment_max_age';
+      case TieredStorage = 'tiered_storage';
+      case LocalRetentionAge = 'local_retention_age';
+      case LocalRetentionSize = 'local_retention_size';
     }
 }
 
@@ -2758,11 +2808,24 @@ namespace Iggy\Exception {
     class ReadException extends \Iggy\Exception\IggyException {
         /**
          * Whether the reader stopped the partition after six refusals in a row that a retry does
-         * not change, such as Unauthorized (41). A seek of the partition reads it again.
+         * not change, such as Unauthorized (41), or after one TieredReadFailed (96). A seek of the
+         * partition reads it again.
          *
          * @var bool
          */
         public readonly bool $is_lasting_refusal;
+
+        /**
+         * For messages that a lost read committed and that the reader could not read again: their
+         * first and last offset, as [first, last]. The code is then FetchProgressUncertain
+         * (14010). Null for every other error. This error stops nothing and needs no seek. A
+         * batch that the reader holds after the range comes next, and a seek before the
+         * application takes it drops it. If the reader stopped the partition, the error that
+         * stopped it comes after that batch.
+         *
+         * @var array|null
+         */
+        public readonly ?array $lost;
 
         /**
          * The partition of the error, or null for an error of the whole reader.
@@ -2773,7 +2836,8 @@ namespace Iggy\Exception {
 
         /**
          * For a message that does not decode: the continuation after it. The reader reads the
-         * message again until a seek of its partition to this continuation skips it.
+         * message again until a seek of its partition to this continuation skips it. Null for
+         * every other error.
          *
          * @var \Iggy\PollingStrategy|null
          */

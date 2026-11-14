@@ -318,7 +318,8 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::CompleteLifecycle
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
-        | Operation::RetireConsumerGroupOwners => return None,
+        | Operation::RetireConsumerGroupOwners
+        | Operation::StateMachineCommand => return None,
     };
     Some(&COMMAND_TABLE[idx])
 }

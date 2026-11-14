@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod app_content;
 pub mod chart;
-pub mod embed_modal;
+pub mod clipboard;
+pub mod command_block;
+pub mod embed_code;
 pub mod footer;
+pub mod headline;
 pub mod layout;
-pub mod loader;
-pub mod selectors;
+pub mod page;
+pub mod run_labels;
+pub mod section_nav;
+pub mod select_field;
+pub mod share_button;
 pub mod theme;
-pub mod tooltips;

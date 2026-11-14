@@ -89,8 +89,8 @@ pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
 #[doc(hidden)]
 pub use traits::binary_transport::{
-    BINARY_OPERATION_TIMEOUT, BinaryOperationLineage, binary_operation_deadline,
-    binary_operation_lineage, with_binary_deadline, with_binary_lineage,
+    BINARY_OPERATION_TIMEOUT, BinaryOperationLineage, binary_deadline_in_force,
+    binary_operation_deadline, binary_operation_lineage, with_binary_deadline, with_binary_lineage,
 };
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed, decode_session_binding};
 pub use traits::client::Client;

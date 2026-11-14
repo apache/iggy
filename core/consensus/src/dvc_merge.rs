@@ -24,6 +24,11 @@
 //! it that a replication quorum provably never formed. Absent that the op is
 //! kept, and if no replica offers its body the view does not start. Stalling is
 //! visible and recoverable; losing the op is neither.
+//!
+//! One discard needs no such proof. When too few senders trust their logs and
+//! every replica reports that it cannot serve an op above the commit point,
+//! stalling recovers nothing, so the view starts without the op. See
+//! [`MergeQuorums::unservable_discards`].
 
 #[cfg(test)]
 use crate::view_change_quorum::DvcSuffix;
@@ -65,6 +70,31 @@ pub struct MergeQuorums {
     /// one, and fewer than a replication quorum of them leave every committed op
     /// in some other sender's log.
     pub empty_votes_max: usize,
+    /// Whether an op above the commit point is discarded, with every op above
+    /// it, once every replica has reported and each one shows that it cannot
+    /// serve the op. Off, such an op stalls the view for good.
+    ///
+    /// Not a proof that the op never committed. Sound only in the merge that
+    /// takes every replica because fewer senders than a view-change quorum
+    /// trust their logs. From three replicas up, at least a replication quorum
+    /// of senders may then have lost writes they acknowledged, a loss that
+    /// `replicated` durability already allows, and with every replica reported
+    /// no later message can supply the body. In a smaller group one nack is a
+    /// nack quorum, so no op reaches this rule.
+    ///
+    /// The commit point is the one the senders report, and a sender reports
+    /// its own only up to its head (`VsrConsensus::dvc_commit`). A backup that
+    /// learned of a commit from a heartbeat before the prepare arrived cannot
+    /// name it, so the rule can discard an op that such a backup knows as
+    /// committed.
+    ///
+    /// An empty vote counts as a replica that cannot serve the op. Its sender
+    /// holds no certified log and waits for a state transfer. Only the primary
+    /// of a started view serves one, so waiting for that log would stall this
+    /// view too, unless the primary of an earlier view still serves it. When
+    /// such an install ends, the sender votes with its log and `dvc_record`
+    /// replaces the empty vote, but a merge that already decided stays.
+    pub unservable_discards: bool,
 }
 
 /// What the collected DVCs say about starting the view.
@@ -79,8 +109,10 @@ pub enum MergeOutcome {
         undecided_op: u64,
     },
     /// Every replica reported and an op is still neither provably dead nor
-    /// recoverable. No further message changes that: data loss already happened,
-    /// and truncating here would turn it from detected into silent.
+    /// recoverable. Data loss already happened, and truncating here would turn it
+    /// from detected into silent. Only a real vote that replaces an empty one
+    /// (see [`dvc_record`]) gives a later merge more to decide on. Not returned
+    /// for an op that [`MergeQuorums::unservable_discards`] discards.
     Deadlocked {
         /// The op that cannot be decided.
         undecided_op: u64,
@@ -173,6 +205,9 @@ struct OpVerdict<'a> {
     /// Senders holding the canonical header AND able to serve its body.
     copies: usize,
     nacks: usize,
+    /// Senders whose log reaches this op and whose suffix neither describes nor
+    /// nacks it. Such a sender may still hold the body.
+    abstentions: usize,
     /// Canonical senders disagree about this op, so no header here is trustworthy.
     conflict: bool,
 }
@@ -234,6 +269,7 @@ fn tally_op<'a>(
     } = canonical_header_at(canonical_senders, op);
     let mut copies = 0;
     let mut nacks = 0;
+    let mut abstentions = 0;
 
     for dvc in dvc_iter(quorum) {
         // The sender's log stops below this op, so it never prepared it.
@@ -258,6 +294,7 @@ fn tally_op<'a>(
             // non-empty suffix not covering `op` puts `op` below the sender's window
             // floor, at or below its own commit point, so nacking it is backwards.
             // Only the defensive `DVC_HEADERS_MAX` clamp reaches that.
+            abstentions += 1;
             continue;
         };
 
@@ -302,6 +339,9 @@ fn tally_op<'a>(
                     _ => {}
                 }
             }
+        } else {
+            // A blank without its nack bit: the sender cannot describe the op.
+            abstentions += 1;
         }
     }
 
@@ -309,6 +349,7 @@ fn tally_op<'a>(
         canonical,
         copies,
         nacks,
+        abstentions,
         conflict,
     }
 }
@@ -467,8 +508,15 @@ fn committed_elsewhere(
 /// untrusted, the second rule gets its turn rather than waiting on DVCs that
 /// will never come.
 ///
-/// `quorums.view_change` is the plain quorum and `quorums.absence_nacks` is
-/// ignored: both follow from which rule applies.
+/// When the second rule runs because fewer than `view_change` senders are
+/// trusted, it also discards an op above the commit point that no sender can
+/// serve, where it would otherwise stall the view: see
+/// [`MergeQuorums::unservable_discards`]. Not when it runs after a trusted
+/// quorum left an op undecided.
+///
+/// `quorums.view_change` is the plain quorum, and `quorums.absence_nacks` and
+/// `quorums.unservable_discards` are ignored: all three follow from which rule
+/// applies.
 #[must_use]
 pub fn merge_view_change(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> MergeOutcome {
     let received = dvc_count(quorum);
@@ -476,6 +524,7 @@ pub fn merge_view_change(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> Merg
     if trusted >= quorums.view_change {
         let trusted_quorums = MergeQuorums {
             absence_nacks: true,
+            unservable_discards: false,
             ..quorums
         };
         let outcome = if trusted == received {
@@ -515,6 +564,7 @@ pub fn merge_view_change(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> Merg
         MergeQuorums {
             view_change: quorums.replica_count,
             absence_nacks: false,
+            unservable_discards: trusted < quorums.view_change,
             ..quorums
         },
     )
@@ -618,20 +668,34 @@ pub fn merge_dvc_quorum(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> Merge
         if verdict.canonical.is_none() || verdict.copies == 0 {
             // Neither provably dead nor recoverable. An outstanding replica may
             // hold the body or supply the deciding nack.
-            return if received < quorums.replica_count {
-                MergeOutcome::AwaitingRepair { undecided_op: op }
-            } else {
+            if received < quorums.replica_count {
+                return MergeOutcome::AwaitingRepair { undecided_op: op };
+            }
+            // Not a proof, see `MergeQuorums::unservable_discards`: every sender
+            // took a position on this op and none can serve it.
+            if quorums.unservable_discards && op > commit_max && verdict.abstentions == 0 {
                 tracing::error!(
                     op,
-                    canonical = verdict.canonical.is_some(),
-                    copies = verdict.copies,
+                    discarded_through = op_head_max,
+                    commit_max,
                     nacks = verdict.nacks,
                     nack_quorum = quorums.nack_prepare,
-                    "every replica reported and op {op} is neither recoverable nor provably \
-                     uncommitted; the view cannot start"
+                    "every replica reported and none can serve op {op}; discarding it and every \
+                     op above it"
                 );
-                MergeOutcome::Deadlocked { undecided_op: op }
-            };
+                op_head = op - 1;
+                break;
+            }
+            tracing::error!(
+                op,
+                canonical = verdict.canonical.is_some(),
+                copies = verdict.copies,
+                nacks = verdict.nacks,
+                nack_quorum = quorums.nack_prepare,
+                "every replica reported and op {op} is neither recoverable nor provably \
+                 uncommitted; the view cannot start"
+            );
+            return MergeOutcome::Deadlocked { undecided_op: op };
         }
 
         op += 1;
@@ -689,6 +753,7 @@ mod tests {
             prepare_queue_ceiling: 32,
             absence_nacks: true,
             empty_votes_max: 3,
+            unservable_discards: false,
         }
     }
 
@@ -952,6 +1017,7 @@ mod tests {
             prepare_queue_ceiling: 32,
             absence_nacks: true,
             empty_votes_max: 7,
+            unservable_discards: false,
         };
         let mut quorum = dvc_quorum_array_empty();
         let mut abstaining = suffix_headers(4, 5, 7);
@@ -1292,6 +1358,7 @@ mod tests {
             prepare_queue_ceiling: 32,
             absence_nacks: true,
             empty_votes_max: 1,
+            unservable_discards: false,
         };
         let mut quorum = dvc_quorum_array_empty();
         dvc_record(
@@ -1519,5 +1586,284 @@ mod tests {
             panic!("every replica reported");
         };
         assert_eq!(merged.op_head, 3);
+    }
+
+    /// Five replicas: replication 3, view-change 3, nack 3.
+    fn quorums_r5() -> MergeQuorums {
+        MergeQuorums {
+            view_change: 3,
+            nack_prepare: 3,
+            replica_count: 5,
+            prepare_queue_ceiling: 32,
+            absence_nacks: true,
+            empty_votes_max: 5,
+            unservable_discards: false,
+        }
+    }
+
+    /// Keeps a rejected discard rule out of the merge: "a sender whose `log_view`
+    /// is below the header's `view` never acknowledged the op". A resend stamps
+    /// the frame with the view of its sender, so a stored header carries the view
+    /// of the transmission that delivered it, not the view that created the
+    /// prepare. The rule would discard the committed op below.
+    #[test]
+    fn given_an_inherited_prepare_restamped_by_a_later_view_when_its_first_ackers_lost_it_should_keep_the_op()
+     {
+        // Replica 0 prepared op 3 in view 0, replicas 1 and 2 acknowledged it, and
+        // it committed. View 3 inherited the op and resent it, and replica 4 keeps
+        // that copy. Replicas 0, 1 and 2 never entered view 3 and restarted
+        // without the op.
+        let committed = suffix_headers(2, 2, 0);
+        let restamped = PrepareHeader {
+            view: 3,
+            ..prepare(3, 0)
+        };
+        let mut quorum = dvc_quorum_array_empty();
+        for replica in 0..3 {
+            dvc_record(
+                &mut quorum,
+                untrusted(dvc(replica, 0, 2, 2, suffix_all_present(committed.clone()))),
+            );
+        }
+        dvc_record(
+            &mut quorum,
+            untrusted(dvc(3, 3, 2, 2, suffix_all_present(committed.clone()))),
+        );
+        dvc_record(
+            &mut quorum,
+            dvc(
+                4,
+                3,
+                3,
+                2,
+                suffix_all_present(vec![restamped, committed[0]]),
+            ),
+        );
+
+        let MergeOutcome::Ready(merged) = merge_view_change(&quorum, quorums_r5()) else {
+            panic!("replica 4 serves op 3, so the view can start");
+        };
+        assert_eq!(
+            merged.op_head, 3,
+            "a committed op that replica 4 still holds was discarded"
+        );
+    }
+
+    fn quorum_of(votes: impl IntoIterator<Item = StoredDvc>) -> DvcQuorumArray {
+        let mut quorum = dvc_quorum_array_empty();
+        for vote in votes {
+            dvc_record(&mut quorum, vote);
+        }
+        quorum
+    }
+
+    /// Op 3 as view 2 prepared it, on top of op 2 of view 0.
+    fn op_three_of_view_two() -> PrepareHeader {
+        PrepareHeader {
+            parent: prepare(2, 0).checksum,
+            ..prepare(3, 2)
+        }
+    }
+
+    /// The primary of view 2 prepared op 3, restarted and lost it. Replica 1
+    /// holds the header alone, from the `StartView` of that view. Replica 0
+    /// never entered view 2. Both restarted logs are untrusted and stop at op 2,
+    /// so no sender can serve op 3.
+    fn votes_without_a_body_for_op_three() -> [StoredDvc; 3] {
+        let committed = suffix_headers(1, 2, 0);
+        [
+            untrusted(dvc(0, 0, 2, 1, suffix_all_present(committed.clone()))),
+            dvc(
+                1,
+                2,
+                3,
+                2,
+                DvcSuffix::new(vec![op_three_of_view_two(), committed[0]], 0, 0b10),
+            ),
+            untrusted(dvc(2, 2, 2, 1, suffix_all_present(committed))),
+        ]
+    }
+
+    #[test]
+    fn given_too_few_trusted_senders_when_every_replica_reports_it_cannot_serve_an_op_should_discard_the_op()
+     {
+        let quorum = quorum_of(votes_without_a_body_for_op_three());
+
+        match merge_view_change(&quorum, quorums_r3()) {
+            MergeOutcome::Ready(merged) => {
+                assert_eq!(merged.op_head, 2, "op 3 has no body on any replica");
+                assert_eq!(merged.commit_max, 2);
+                assert_eq!(merged.headers, vec![prepare(2, 0)]);
+            }
+            outcome => panic!("no later message can supply op 3, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn given_too_few_trusted_senders_when_the_only_sender_above_an_op_nacks_it_should_discard_it_and_the_ops_above()
+     {
+        // Replica 1 holds op 4 and proves it never prepared op 3. Op 4 cannot
+        // stay without the op it chains to.
+        let committed = suffix_headers(1, 2, 0);
+        let gapped = DvcSuffix::new(
+            vec![prepare(4, 2), dvc_blank(3), committed[0]],
+            0b010,
+            0b101,
+        );
+        let quorum = quorum_of([
+            untrusted(dvc(0, 0, 2, 1, suffix_all_present(committed.clone()))),
+            dvc(1, 2, 4, 2, gapped),
+            untrusted(dvc(2, 2, 2, 1, suffix_all_present(committed))),
+        ]);
+
+        match merge_view_change(&quorum, quorums_r3()) {
+            MergeOutcome::Ready(merged) => assert_eq!(merged.op_head, 2),
+            outcome => panic!("no later message can supply op 3, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn given_too_few_trusted_senders_when_one_replica_votes_without_a_log_should_discard_the_op_no_sender_can_serve()
+     {
+        // Replica 0 came back without a certified log and waits for a state
+        // transfer. Its empty vote reports nothing, and it will report nothing
+        // more until a view starts.
+        let [_, second, third] = votes_without_a_body_for_op_three();
+        let quorum = quorum_of([empty_vote(0), second, third]);
+
+        match merge_view_change(&quorum, quorums_r3()) {
+            MergeOutcome::Ready(merged) => assert_eq!(merged.op_head, 2),
+            outcome => panic!("no later message can supply op 3, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn given_op_one_that_no_sender_can_serve_when_nothing_is_committed_should_start_on_an_empty_log()
+     {
+        // Replica 1 holds the header of op 1 alone. Both restarted logs are empty.
+        let quorum = quorum_of([
+            untrusted(dvc(0, 1, 0, 0, DvcSuffix::empty())),
+            dvc(1, 1, 1, 0, DvcSuffix::new(vec![prepare(1, 1)], 0, 0)),
+            untrusted(dvc(2, 1, 0, 0, DvcSuffix::empty())),
+        ]);
+
+        assert_eq!(
+            merge_view_change(&quorum, quorums_r3()),
+            MergeOutcome::Ready(MergedLog {
+                op_head: 0,
+                commit_max: 0,
+                headers: Vec::new(),
+                committed_elsewhere: Vec::new(),
+            }),
+            "no later message can supply op 1"
+        );
+    }
+
+    #[test]
+    fn given_an_op_no_sender_can_serve_when_a_replica_has_not_reported_should_wait_for_it() {
+        // Replica 2 has not reported, and it may hold the body of op 3.
+        let [first, second, _] = votes_without_a_body_for_op_three();
+        let quorum = quorum_of([first, second]);
+
+        assert_eq!(
+            merge_view_change(&quorum, quorums_r3()),
+            MergeOutcome::AwaitingQuorum
+        );
+        let discarding = MergeQuorums {
+            absence_nacks: false,
+            unservable_discards: true,
+            ..quorums_r3()
+        };
+        assert_eq!(
+            merge_dvc_quorum(&quorum, discarding),
+            MergeOutcome::AwaitingRepair { undecided_op: 3 }
+        );
+    }
+
+    #[test]
+    fn given_an_op_one_untrusted_sender_can_serve_when_every_replica_reported_should_keep_the_op() {
+        let [first, second, _] = votes_without_a_body_for_op_three();
+        let mut held = suffix_headers(1, 2, 0);
+        held.insert(0, op_three_of_view_two());
+        let quorum = quorum_of([
+            first,
+            second,
+            untrusted(dvc(2, 2, 3, 1, suffix_all_present(held))),
+        ]);
+
+        let MergeOutcome::Ready(merged) = merge_view_change(&quorum, quorums_r3()) else {
+            panic!("replica 2 serves op 3, so the view can start");
+        };
+        assert_eq!(
+            merged.op_head, 3,
+            "an op one sender can serve was discarded"
+        );
+    }
+
+    #[test]
+    fn given_an_op_no_sender_can_serve_when_it_is_at_the_commit_point_should_stay_deadlocked() {
+        // Replica 1 knows op 3 committed and holds only its header.
+        let [first, _, third] = votes_without_a_body_for_op_three();
+        let header_only = DvcSuffix::new(vec![op_three_of_view_two()], 0, 0);
+        let quorum = quorum_of([first, dvc(1, 2, 3, 3, header_only), third]);
+
+        assert_eq!(
+            merge_view_change(&quorum, quorums_r3()),
+            MergeOutcome::Deadlocked { undecided_op: 3 }
+        );
+    }
+
+    #[test]
+    fn given_an_op_no_sender_offers_when_a_sender_at_or_above_it_abstains_should_stay_deadlocked() {
+        // Replica 2 reaches op 3 and says nothing about it: once with no suffix,
+        // once with a blank that carries no nack. It may hold the body.
+        let committed = suffix_headers(1, 2, 0);
+        let blank = DvcSuffix::new(vec![dvc_blank(3), committed[0], committed[1]], 0, 0b110);
+        for silent in [DvcSuffix::empty(), blank] {
+            let [first, second, _] = votes_without_a_body_for_op_three();
+            let quorum = quorum_of([first, second, untrusted(dvc(2, 2, 3, 1, silent))]);
+
+            assert_eq!(
+                merge_view_change(&quorum, quorums_r3()),
+                MergeOutcome::Deadlocked { undecided_op: 3 }
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_trusted_quorum_when_its_merge_is_undecided_should_not_discard_an_op_no_sender_can_serve()
+     {
+        // Replicas 0 and 1 are a trusted quorum whose logs stop at op 2. Neither
+        // sent a suffix, so their merge cannot anchor on op 2. The untrusted
+        // replica 2 describes op 2 and holds op 3 as a header only.
+        let quorum = quorum_of([
+            dvc(0, 1, 2, 2, DvcSuffix::empty()),
+            dvc(1, 1, 2, 2, DvcSuffix::empty()),
+            untrusted(dvc(
+                2,
+                2,
+                3,
+                2,
+                DvcSuffix::new(vec![op_three_of_view_two(), prepare(2, 0)], 0, 0b10),
+            )),
+        ]);
+        let discarding = MergeQuorums {
+            view_change: 3,
+            absence_nacks: false,
+            unservable_discards: true,
+            ..quorums_r3()
+        };
+        assert!(
+            matches!(
+                merge_dvc_quorum(&quorum, discarding),
+                MergeOutcome::Ready(MergedLog { op_head: 2, .. })
+            ),
+            "the discard must decide differently for this case to pin anything"
+        );
+
+        assert_eq!(
+            merge_view_change(&quorum, quorums_r3()),
+            MergeOutcome::Deadlocked { undecided_op: 3 }
+        );
     }
 }

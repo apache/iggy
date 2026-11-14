@@ -52,6 +52,10 @@ pub mod artifact_kind {
     /// Partition plane: the encoded consumer + consumer-group offset table;
     /// `frontier` = the offer's `commit_op`.
     pub const CONSUMER_OFFSETS: u8 = 3;
+    /// Partition plane: a tiered partition's `remote.chain`, reduced to its
+    /// trim point and the latest record of every segment; `frontier` = the
+    /// offer's `commit_op`.
+    pub const SEGMENT_CHAIN: u8 = 4;
 }
 
 /// One artifact a serving peer offers: what it is, where its receiver-side
