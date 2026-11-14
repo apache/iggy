@@ -21,6 +21,7 @@
 
 use arc_swap::ArcSwap;
 use nix::sys::resource::{Resource, getrlimit};
+use partitions::{FreeSpaceChange, FreeSpaceReserve};
 use server_common::DISK_USAGE;
 use std::io;
 use std::path::PathBuf;
@@ -29,6 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System as SysinfoSystem;
 use system_stats::{SystemProbe, count_open_files, count_open_files_without_scan};
+use tracing::{error, info};
 
 /// The last completed process-wide sample. CPU deltas cover the sampler interval.
 /// Slow probes leave the previous sample available without delaying shard readers.
@@ -87,6 +89,8 @@ static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
 /// bootstrap.
 static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+static FREE_SPACE_RESERVE: OnceLock<Arc<FreeSpaceReserve>> = OnceLock::new();
+
 static PUBLISHED_STATS: LazyLock<ArcSwap<SystemStats>> =
     LazyLock::new(|| ArcSwap::from_pointee(SystemStats::default()));
 
@@ -102,6 +106,19 @@ pub fn init_stats_data_path(path: PathBuf) {
 /// Samples refresh every second. The descriptor-scan fallback refreshes every
 /// ten seconds or printer interval.
 /// Sampling time extends these intervals; readers always get the last completed sample.
+/// Call before [`start_system_stats_sampler`], whose first sample decides
+/// whether the node boots short. A reserve of 0 installs nothing.
+pub fn init_free_space_reserve(reserve_bytes: u64) {
+    if reserve_bytes > 0 {
+        let _ = FREE_SPACE_RESERVE.set(Arc::new(FreeSpaceReserve::new(reserve_bytes, &DISK_USAGE)));
+    }
+}
+
+/// The reserve every partition of this node checks, or `None` when disabled.
+pub fn free_space_reserve() -> Option<Arc<FreeSpaceReserve>> {
+    FREE_SPACE_RESERVE.get().cloned()
+}
+
 pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Result<()> {
     let scan_interval = if sysinfo_print_interval.is_zero() {
         OPEN_FILES_SCAN_INTERVAL
@@ -145,9 +162,17 @@ impl SystemStats {
             DISK_USAGE.rebase(|| {
                 let stats = fs2::statvfs(path).ok()?;
                 let used_bytes = stats.total_space().saturating_sub(stats.free_space());
-                Some((stats, used_bytes))
+                Some(((stats, used_bytes), used_bytes))
             })
         });
+        // A failed sample keeps the last one: neither refusing messages nor
+        // accepting them again on a disk that could not be measured.
+        if let (Some(reserve), Some((stats, used_bytes))) =
+            (FREE_SPACE_RESERVE.get(), disk.as_ref())
+        {
+            observe_free_space(reserve, stats.available_space(), *used_bytes);
+        }
+        let disk = disk.map(|(stats, _)| stats);
         Self {
             process_id: probe.process_id,
             cpu_usage: probe.cpu_usage,
@@ -174,6 +199,22 @@ impl SystemStats {
             free_disk_space: disk.as_ref().map_or(0, fs2::FsStats::available_space),
             total_disk_space: disk.as_ref().map_or(0, fs2::FsStats::total_space),
         }
+    }
+}
+
+fn observe_free_space(reserve: &FreeSpaceReserve, free_bytes: u64, used_bytes: u64) {
+    let reserve_bytes = reserve.reserve_bytes();
+    match reserve.observe(free_bytes, used_bytes) {
+        FreeSpaceChange::FellShort => error!(
+            free_bytes,
+            reserve_bytes,
+            "data disk is below its free-space reserve; refusing new messages until space returns"
+        ),
+        FreeSpaceChange::Recovered => info!(
+            free_bytes,
+            reserve_bytes, "data disk is back above its free-space reserve; accepting new messages"
+        ),
+        FreeSpaceChange::Unchanged => {}
     }
 }
 
