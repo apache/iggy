@@ -858,9 +858,10 @@ mod tests {
     use crate::shards_table::{PapayaShardsTable, ShardsTable};
     use crate::test_support::{advance_and_tick, connect_replica_on};
     use crate::{
-        IggyShard, LifecycleFrame, PARTITION_REPAIRS_INFLIGHT_MAX, PartitionConsensusConfig,
-        REPAIR_GAP_DEBOUNCE_TICKS_MIN, Receiver, ReconcileOp, ReplicaTopology, ShardFrame,
-        ShardIdentity, TaggedSender, channel, shard_channel,
+        IggyShard, LifecycleFrame, PARTITION_REPAIRS_INFLIGHT_MAX,
+        PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX, PARTITION_VIEW_CHANGES_INFLIGHT_MAX,
+        PartitionConsensusConfig, REPAIR_GAP_DEBOUNCE_TICKS_MIN, Receiver, ReconcileOp,
+        ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
     };
 
     const SEGMENT_BYTES: u64 = 1024 * 1024;
@@ -5346,6 +5347,117 @@ mod tests {
                 assert_eq!(peer, expected, "sweep {sweep}, group {index}");
             }
         }
+    }
+
+    /// Every backup stops hearing its primary on the same tick, as after the
+    /// death of a node. The sweep casts the votes a few per tick and reports the
+    /// rest as held.
+    #[compio::test]
+    async fn given_more_timed_out_backups_than_the_tick_limit_when_sweeping_should_cast_a_few_votes_per_sweep()
+     {
+        const ROUNDS: usize = 3;
+        const GROUPS: usize = ROUNDS * PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX;
+        // Past the sweeps that cast the votes, so no backup starts a second
+        // round of them.
+        const HEARTBEAT_TICKS: u64 = 2 * ROUNDS as u64;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespaces: Vec<_> = (0..GROUPS)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        for &namespace in &namespaces {
+            partitions.insert(namespace, quiet_backup(&bus, namespace, HEARTBEAT_TICKS));
+        }
+
+        let mut voters = 0;
+        let mut rounds = Vec::new();
+        for _ in 0..HEARTBEAT_TICKS + ROUNDS as u64 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            let voted = namespaces
+                .iter()
+                .filter(|namespace| {
+                    let consensus = partitions.get_by_ns(namespace).unwrap().consensus();
+                    consensus.votes_to_leave_view()
+                })
+                .count();
+            if voted > voters {
+                let (_, held) = owner.metrics().partition_view_changes_value();
+                rounds.push((voted - voters, held));
+                voters = voted;
+            }
+        }
+
+        let cast = PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX;
+        let expected: Vec<_> = (1..=ROUNDS)
+            .map(|round| (cast, i64::try_from(GROUPS - round * cast).unwrap()))
+            .collect();
+        assert_eq!(
+            rounds, expected,
+            "(votes cast, votes held) of each sweep that cast a vote"
+        );
+    }
+
+    /// A view change counts against the limit however it started. At the limit
+    /// no backup casts its heartbeat vote, and the first sweep below the limit
+    /// casts it.
+    #[compio::test]
+    async fn given_view_changes_at_the_inflight_limit_when_a_backup_times_out_should_hold_its_vote_until_one_ends()
+     {
+        const HEARTBEAT_TICKS: u64 = 2;
+        const HELD_SWEEPS: u64 = 3 * HEARTBEAT_TICKS;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespaces: Vec<_> = (0..=PARTITION_VIEW_CHANGES_INFLIGHT_MAX)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        let (&waiting, changing) = namespaces.split_last().unwrap();
+        for &namespace in changing {
+            let partition = quiet_backup(&bus, namespace, HEARTBEAT_TICKS);
+            let MessageBag::StartViewChange(vote) = view_control_message(
+                namespace,
+                Command::StartViewChange,
+                REPAIR_VIEW + 1,
+                REPAIR_PRIMARY,
+            ) else {
+                unreachable!()
+            };
+            let _ = partition
+                .consensus()
+                .handle_start_view_change(PlaneKind::Partitions, vote.header());
+            assert_eq!(
+                partition.consensus().status(),
+                consensus::Status::ViewChange
+            );
+            partitions.insert(namespace, partition);
+        }
+        partitions.insert(waiting, quiet_backup(&bus, waiting, HEARTBEAT_TICKS));
+        let waiting_votes = || {
+            let consensus = partitions.get_by_ns(&waiting).unwrap().consensus();
+            consensus.votes_to_leave_view()
+        };
+
+        for sweep in 1..=HELD_SWEEPS {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            assert!(!waiting_votes(), "sweep {sweep}");
+        }
+        let limit = i64::try_from(PARTITION_VIEW_CHANGES_INFLIGHT_MAX).unwrap();
+        assert_eq!(
+            owner.metrics().partition_view_changes_value(),
+            (limit, 1),
+            "(partitions in view change, votes held) at the limit"
+        );
+
+        partitions.remove(&changing[0]).unwrap();
+        assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+
+        assert!(waiting_votes());
+        assert_eq!(
+            owner.metrics().partition_view_changes_value(),
+            (limit - 1, 0),
+            "(partitions in view change, votes held) below the limit"
+        );
     }
 
     /// A transfer abandoned at the session ceiling schedules a re-arm and opens
@@ -10952,6 +11064,32 @@ mod tests {
         )
         .expect("valid shard wiring");
         (owner, sender)
+    }
+
+    /// A backup of a 3-replica group in [`REPAIR_VIEW`] that never hears its
+    /// primary, so its heartbeat timer fires after `heartbeat_ticks`.
+    fn quiet_backup(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        heartbeat_ticks: u64,
+    ) -> IggyPartition<Rc<IggyMessageBus>, HeldSuperblock> {
+        let mut consensus = VsrConsensus::new(
+            1,
+            REPAIR_BACKUP,
+            3,
+            namespace.inner(),
+            Rc::clone(bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(REPAIR_VIEW);
+        consensus.set_log_view(REPAIR_VIEW);
+        consensus.set_normal_heartbeat_ticks(heartbeat_ticks);
+        consensus.init();
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(SEGMENT_BYTES),
+        )
     }
 
     /// A backup in [`REPAIR_VIEW`] whose repair session for

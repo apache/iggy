@@ -158,14 +158,31 @@ readiness probes identify responsive replicas, new primaries are assigned only
 to those replicas. Before readiness is known, all configured replicas remain
 eligible. After the responsive replica set
 has been stable for five seconds, the metadata primary balances existing primary
-counts one partition at a time. It confirms the source's committed frontier and
-the target's applied history, then grants the move to the source primary. The
+counts, with up to 512 moves in flight. For each move it confirms the source's
+committed frontier and the target's applied history, then grants the move to
+the source primary. The
 source finishes its accepted writes before it requests a persisted consensus
 view change.
 Recovering partitions are skipped without delaying transfers of other partitions.
 Every replica still stores every partition.
 Balancing primary counts does not balance bytes, throughput or CPU load. A hot
 partition still has one ordering primary.
+
+On the first stop signal, a node of a cluster hands off the partitions it leads
+before it shuts down. Without the handoff, each of them waits for a heartbeat
+timeout before it elects a new primary. Each shard spreads them over the members
+that are in sync and reachable, and the node takes no primaries while it leaves.
+The shutdown waits for every shard to finish, at most
+`sharding.shutdown_primary_handoff_timeout` (15 s by default). `"0 s"` skips
+the handoff, and so do `"disabled"`, `"none"` and `"unlimited"`, which also read
+as zero. A second stop signal ends the handoff. The metadata group has no
+handoff and still waits for the timeout.
+
+When a node fails, each partition it led elects a new primary after a heartbeat
+timeout. Each shard starts at most 4 of these elections per 10 ms tick, and none
+while 128 of its partitions are in a view change. `/metrics` reports
+`partitions_in_view_change`, the partitions of a shard in a view change, and
+`partition_view_change_votes_held`, the elections it holds back.
 
 A create whose namespace is invalid can receive 58 (`TransientNotAccepted`) while
 any metadata write is pending, even an unrelated one. Under steady unrelated

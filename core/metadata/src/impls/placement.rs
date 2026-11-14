@@ -190,6 +190,7 @@ impl PlacementState {
         replicas: u8,
         eligible: &[bool],
         after: Option<IggyNamespace>,
+        inflight: &BTreeMap<IggyNamespace, PartitionPrimaryTransfer>,
     ) -> Option<PartitionPrimaryTransfer> {
         let replica_count = usize::from(replicas);
         let available = eligible.iter().filter(|&&available| available).count();
@@ -198,6 +199,11 @@ impl PlacementState {
         }
         streams.read(|inner| {
             self.retire_removed(inner);
+            // The memo holds the pick with no move in flight. A round of
+            // picks changes `inflight` with each one, so none of them repeats.
+            if !inflight.is_empty() {
+                return self.pick(inner, replicas, eligible, after, inflight);
+            }
             let inputs = ScanInputs {
                 revision: inner.revision,
                 observed_generation: self.observed_generation,
@@ -210,7 +216,7 @@ impl PlacementState {
             {
                 return *plan;
             }
-            let plan = self.pick(inner, replicas, eligible, after);
+            let plan = self.pick(inner, replicas, eligible, after, inflight);
             self.last_scan = Some((inputs, plan));
             plan
         })
@@ -394,15 +400,45 @@ impl PlacementState {
     /// Those rules read only the class of a partition, so each class is judged
     /// once, and only the classes of the best gap and source are walked. A
     /// topic with a pending lifecycle intent takes no part in the rebalance.
+    ///
+    /// A move in `inflight` counts as done: its source leads one partition
+    /// fewer and its target one more, and its partition does not move again.
+    /// So the picks of one round are the picks that follow each other when
+    /// each move ends before the next pick.
     fn pick(
         &mut self,
         inner: &StreamsInner,
         nodes: u8,
         eligible: &[bool],
         after: Option<IggyNamespace>,
+        inflight: &BTreeMap<IggyNamespace, PartitionPrimaryTransfer>,
     ) -> Option<PartitionPrimaryTransfer> {
         let hidden = hidden_topics(inner);
-        let counts = self.visible_counts(inner, nodes, &hidden);
+        let mut counts = self.visible_counts(inner, nodes, &hidden);
+        for moving in inflight.values() {
+            let namespace = moving.namespace;
+            if hidden.contains(&(namespace.stream_id(), namespace.topic_id())) {
+                continue;
+            }
+            // A plan whose view ended moved already, or never will.
+            let Some((source, _)) = self
+                .observations
+                .get(&namespace)
+                .filter(|observed| {
+                    observed.report.created_revision == moving.created_revision
+                        && observed.report.view == moving.view
+                })
+                .and_then(|observed| observed.class(nodes))
+            else {
+                continue;
+            };
+            if let Some(count) = counts.get_mut(usize::from(source)) {
+                *count = count.saturating_sub(1);
+            }
+            if let Some(count) = counts.get_mut(usize::from(moving.target)) {
+                *count += 1;
+            }
+        }
         if self
             .classes
             .as_ref()
@@ -435,7 +471,9 @@ impl PlacementState {
             .collect();
         moves.sort_unstable_by_key(|(rank, ..)| *rank);
         let movable = |namespace: IggyNamespace, target: u8| {
-            if hidden.contains(&(namespace.stream_id(), namespace.topic_id())) {
+            if hidden.contains(&(namespace.stream_id(), namespace.topic_id()))
+                || inflight.contains_key(&namespace)
+            {
                 return None;
             }
             let report = self.matching_view(namespace, committed_partition(inner, namespace)?)?;
@@ -708,6 +746,9 @@ mod tests {
     const VIEW_JUMP: usize = 8;
     /// One pick in this many runs without a cursor.
     const NO_CURSOR_ODDS: usize = 4;
+    /// Picks of one round that the full walk judges.
+    const ROUND_PICKS: usize = 6;
+    const NO_MOVES: BTreeMap<IggyNamespace, PartitionPrimaryTransfer> = BTreeMap::new();
     /// A stream, a topic, or twice as often some partitions.
     const DELETE_KINDS: usize = 4;
 
@@ -889,7 +930,7 @@ mod tests {
     #[test]
     fn given_unchanged_inputs_when_selecting_again_should_reuse_the_last_scan() {
         let (streams, mut placement) = observed_topics(&[0, 0, 0]);
-        let first = placement.primary_rebalance_candidate(&streams, 3, &[true; 3], None);
+        let first = placement.primary_rebalance_candidate(&streams, 3, &[true; 3], None, &NO_MOVES);
         assert!(first.is_some());
         // A tree at the same revision cannot differ from the scanned one, so a
         // changed tree that kept its revision exposes a skipped scan.
@@ -908,12 +949,12 @@ mod tests {
         let same_revision = Streams::from(inner);
 
         assert_eq!(
-            placement.primary_rebalance_candidate(&same_revision, 3, &[true; 3], None),
+            placement.primary_rebalance_candidate(&same_revision, 3, &[true; 3], None, &NO_MOVES),
             first
         );
         assert!(
             PlacementState::default()
-                .primary_rebalance_candidate(&same_revision, 3, &[true; 3], None)
+                .primary_rebalance_candidate(&same_revision, 3, &[true; 3], None, &NO_MOVES)
                 .is_none()
         );
     }
@@ -923,7 +964,7 @@ mod tests {
         let (streams, mut placement) = observed_topics(&[0, 0, 1, 2]);
         assert!(
             placement
-                .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
+                .primary_rebalance_candidate(&streams, 3, &[true; 3], None, &NO_MOVES)
                 .is_none()
         );
         let mut inner = streams.read(Clone::clone);
@@ -945,7 +986,7 @@ mod tests {
         let deleting = Streams::from(inner);
 
         let transfer = placement
-            .primary_rebalance_candidate(&deleting, 3, &[true; 3], None)
+            .primary_rebalance_candidate(&deleting, 3, &[true; 3], None, &NO_MOVES)
             .unwrap();
 
         assert_eq!(transfer.target, 1);
@@ -977,7 +1018,7 @@ mod tests {
             let mut moves = 0;
             let mut after = None;
             while let Some(transfer) =
-                placement.primary_rebalance_candidate(&streams, 5, &eligible, after)
+                placement.primary_rebalance_candidate(&streams, 5, &eligible, after, &NO_MOVES)
             {
                 assert!(moves < 100, "each completed transfer must reduce imbalance");
                 assert!(eligible[usize::from(transfer.target)]);
@@ -1010,13 +1051,118 @@ mod tests {
         );
     }
 
+    /// One round plans its moves before any of them ends. It must plan the
+    /// moves that single picks make when each move ends before the next pick.
+    #[test]
+    fn given_moves_in_flight_when_picking_a_round_should_plan_the_moves_of_single_picks() {
+        const NODES: u8 = 5;
+        const ELIGIBLE: [bool; 5] = [true; 5];
+        let views = (0..100).map(|topic| topic % 5).collect::<Vec<_>>();
+        let unbalanced = || {
+            let (streams, mut placement) = observed_topics(&views);
+            for topic in (0..100).step_by(5) {
+                let namespace = IggyNamespace::new(0, topic, 0);
+                placement.observe(
+                    &streams,
+                    &[PartitionPlacementView {
+                        namespace,
+                        created_revision: streams
+                            .created_revision_for_namespace(namespace)
+                            .unwrap(),
+                        view: 1,
+                    }],
+                );
+            }
+            (streams, placement)
+        };
+        let done = |transfer: PartitionPrimaryTransfer| PartitionPlacementView {
+            namespace: transfer.namespace,
+            created_revision: transfer.created_revision,
+            view: transfer.view
+                + (u32::from(transfer.target) + u32::from(NODES)
+                    - transfer.view % u32::from(NODES))
+                    % u32::from(NODES),
+        };
+
+        let (streams, mut placement) = unbalanced();
+        let mut single = Vec::new();
+        while let Some(transfer) = placement.primary_rebalance_candidate(
+            &streams,
+            NODES,
+            &ELIGIBLE,
+            single
+                .last()
+                .map(|last: &PartitionPrimaryTransfer| last.namespace),
+            &NO_MOVES,
+        ) {
+            assert!(
+                single.len() < views.len(),
+                "each move must reduce the imbalance"
+            );
+            placement.observe(&streams, &[done(transfer)]);
+            single.push(transfer);
+        }
+
+        let (streams, mut placement) = unbalanced();
+        let mut round = Vec::new();
+        let mut inflight = BTreeMap::new();
+        while let Some(transfer) = placement.primary_rebalance_candidate(
+            &streams,
+            NODES,
+            &ELIGIBLE,
+            round
+                .last()
+                .map(|last: &PartitionPrimaryTransfer| last.namespace),
+            &inflight,
+        ) {
+            assert!(
+                round.len() < views.len(),
+                "each move must reduce the imbalance"
+            );
+            inflight.insert(transfer.namespace, transfer);
+            round.push(transfer);
+        }
+
+        assert_eq!(single.len(), 20);
+        assert_eq!(round, single);
+        let views_done: Vec<_> = round.iter().copied().map(done).collect();
+        placement.observe(&streams, &views_done);
+        assert_eq!(
+            placement.committed_counts(&streams, NODES).primaries,
+            [20; 5]
+        );
+        assert_eq!(
+            placement.primary_rebalance_candidate(&streams, NODES, &ELIGIBLE, None, &NO_MOVES),
+            None
+        );
+        // A plan whose view ended counts for nothing. Here node 2 took the
+        // first moved partition from node 0, so it leads two more than node 0.
+        let ended = done(round[0]);
+        placement.observe(
+            &streams,
+            &[PartitionPlacementView {
+                view: ended.view + 2,
+                ..ended
+            }],
+        );
+        assert_eq!(
+            placement.committed_counts(&streams, NODES).primaries,
+            [19, 20, 21, 20, 20]
+        );
+        let after_the_round = placement
+            .primary_rebalance_candidate(&streams, NODES, &ELIGIBLE, None, &inflight)
+            .expect("node 2 owes node 0 a move");
+        assert_eq!(after_the_round.target, 0);
+        assert!(!inflight.contains_key(&after_the_round.namespace));
+    }
+
     #[test]
     fn given_balanced_or_almost_balanced_primaries_when_selecting_should_not_transfer() {
         for views in [&[][..], &[0, 1, 2], &[0, 1, 2, 0]] {
             let (streams, mut placement) = observed_topics(views);
             assert!(
                 placement
-                    .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
+                    .primary_rebalance_candidate(&streams, 3, &[true; 3], None, &NO_MOVES)
                     .is_none()
             );
         }
@@ -1033,18 +1179,18 @@ mod tests {
         ] {
             assert!(
                 placement
-                    .primary_rebalance_candidate(&streams, 5, eligible, None)
+                    .primary_rebalance_candidate(&streams, 5, eligible, None, &NO_MOVES)
                     .is_none()
             );
         }
         assert!(
             placement
-                .primary_rebalance_candidate(&streams, 0, &[], None)
+                .primary_rebalance_candidate(&streams, 0, &[], None, &NO_MOVES)
                 .is_none()
         );
         assert!(
             placement
-                .primary_rebalance_candidate(&streams, 1, &[true], None)
+                .primary_rebalance_candidate(&streams, 1, &[true], None, &NO_MOVES)
                 .is_none()
         );
     }
@@ -1059,6 +1205,7 @@ mod tests {
                     5,
                     &[true; 5],
                     after.map(|topic| IggyNamespace::new(0, topic, 0)),
+                    &NO_MOVES,
                 )
                 .unwrap();
             assert_eq!(transfer.namespace, IggyNamespace::new(0, expected_topic, 0));
@@ -1081,7 +1228,7 @@ mod tests {
         ] {
             placement.observe(&streams, &[stale]);
             let transfer = placement
-                .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
+                .primary_rebalance_candidate(&streams, 3, &[true; 3], None, &NO_MOVES)
                 .unwrap();
             assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
             assert_eq!(transfer.target, 0);
@@ -1094,7 +1241,7 @@ mod tests {
         placement.observe(&streams, &[report]);
         assert!(
             placement
-                .primary_rebalance_candidate(&streams, 3, &[true; 3], None)
+                .primary_rebalance_candidate(&streams, 3, &[true; 3], None, &NO_MOVES)
                 .is_some()
         );
     }
@@ -1117,7 +1264,7 @@ mod tests {
         );
         let deleting_topic = Streams::from(inner);
         let transfer = placement
-            .primary_rebalance_candidate(&deleting_topic, 3, &[true; 3], None)
+            .primary_rebalance_candidate(&deleting_topic, 3, &[true; 3], None, &NO_MOVES)
             .unwrap();
         assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
         assert!(
@@ -1141,7 +1288,7 @@ mod tests {
         let deleting_stream = Streams::from(inner);
         assert!(
             placement
-                .primary_rebalance_candidate(&deleting_stream, 3, &[true; 3], None)
+                .primary_rebalance_candidate(&deleting_stream, 3, &[true; 3], None, &NO_MOVES)
                 .is_none()
         );
         assert!(
@@ -1186,7 +1333,7 @@ mod tests {
             }],
         );
         let transfer = placement
-            .primary_rebalance_candidate(&recreated, 3, &[true; 3], None)
+            .primary_rebalance_candidate(&recreated, 3, &[true; 3], None, &NO_MOVES)
             .unwrap();
         assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
         assert!(
@@ -1203,7 +1350,7 @@ mod tests {
             }],
         );
         let transfer = placement
-            .primary_rebalance_candidate(&recreated, 3, &[true; 3], None)
+            .primary_rebalance_candidate(&recreated, 3, &[true; 3], None, &NO_MOVES)
             .unwrap();
         assert_eq!(transfer.namespace, namespace);
         assert_eq!(transfer.created_revision, new_revision);
@@ -1218,7 +1365,7 @@ mod tests {
     fn given_an_unavailable_primary_when_other_partitions_are_imbalanced_should_move_a_ready_one() {
         let (streams, mut placement) = observed_topics(&[0, 1, 1, 1]);
         let transfer = placement
-            .primary_rebalance_candidate(&streams, 3, &[false, true, true], None)
+            .primary_rebalance_candidate(&streams, 3, &[false, true, true], None, &NO_MOVES)
             .unwrap();
         assert_eq!(transfer.namespace, IggyNamespace::new(0, 1, 0));
         assert_eq!(transfer.target, 2);
@@ -1335,7 +1482,7 @@ mod tests {
         );
 
         let transfer = placement
-            .primary_rebalance_candidate(&streams, NODES, &[true; 5], None)
+            .primary_rebalance_candidate(&streams, NODES, &[true; 5], None, &NO_MOVES)
             .unwrap();
         assert_eq!(
             transfer.target, 1,
@@ -1346,7 +1493,7 @@ mod tests {
         group_down[1] = false;
         group_down[2] = false;
         assert_eq!(
-            placement.primary_rebalance_candidate(&streams, NODES, &group_down, None),
+            placement.primary_rebalance_candidate(&streams, NODES, &group_down, None, &NO_MOVES),
             None,
             "one of three members cannot elect"
         );
@@ -1391,7 +1538,7 @@ mod tests {
         );
 
         let transfer = placement
-            .primary_rebalance_candidate(&streams, NODES, &[true; 5], None)
+            .primary_rebalance_candidate(&streams, NODES, &[true; 5], None, &NO_MOVES)
             .expect("node 1 can hand a partition to node 3");
         assert_eq!(transfer.target, 3);
         assert_eq!(
@@ -1529,12 +1676,24 @@ mod tests {
         context: &str,
     ) {
         let nodes = u8::try_from(eligible.len()).unwrap();
-        let picked = placement.primary_rebalance_candidate(streams, nodes, eligible, after);
-        let scanned = streams.read(|inner| placement.scan(inner, nodes, eligible, after));
-        assert_eq!(
-            picked, scanned,
-            "{context}: eligible {eligible:?}, after {after:?}"
-        );
+        // A round: each pick joins the moves in flight and moves the cursor.
+        let mut inflight = BTreeMap::new();
+        let mut after = after;
+        for _ in 0..ROUND_PICKS {
+            let picked =
+                placement.primary_rebalance_candidate(streams, nodes, eligible, after, &inflight);
+            let scanned =
+                streams.read(|inner| placement.scan(inner, nodes, eligible, after, &inflight));
+            assert_eq!(
+                picked, scanned,
+                "{context}: eligible {eligible:?}, after {after:?}, in flight {inflight:?}"
+            );
+            let Some(picked) = picked else {
+                break;
+            };
+            inflight.insert(picked.namespace, picked);
+            after = Some(picked.namespace);
+        }
         if let Some((replicas, classes)) = &placement.classes {
             assert_eq!(
                 classes,
@@ -1560,14 +1719,25 @@ mod tests {
             nodes: u8,
             eligible: &[bool],
             after: Option<IggyNamespace>,
+            inflight: &BTreeMap<IggyNamespace, PartitionPrimaryTransfer>,
         ) -> Option<PartitionPrimaryTransfer> {
             let ready = |node: u8| eligible.get(usize::from(node)).copied().unwrap_or(false);
             let mut counts = vec![0_u64; usize::from(nodes)];
-            self.for_each_partition(inner, |_, partition, report| {
+            self.for_each_partition(inner, |namespace, partition, report| {
                 let view = report.map_or(partition.created_view, |report| report.view);
-                if let Some(count) = partition
-                    .primary_node(view, nodes)
-                    .and_then(|primary| counts.get_mut(usize::from(primary)))
+                // A move in flight leads from its target already.
+                let moving = inflight.get(&namespace).filter(|moving| {
+                    report.is_some_and(|report| {
+                        (report.created_revision, report.view)
+                            == (moving.created_revision, moving.view)
+                    })
+                });
+                let primary = moving.map_or_else(
+                    || partition.primary_node(view, nodes),
+                    |moving| Some(moving.target),
+                );
+                if let Some(count) =
+                    primary.and_then(|primary| counts.get_mut(usize::from(primary)))
                 {
                     *count += 1;
                 }
@@ -1578,6 +1748,9 @@ mod tests {
                 let Some(report) = report else {
                     return;
                 };
+                if inflight.contains_key(&namespace) {
+                    return;
+                }
                 let Some(source) = partition
                     .primary_node(report.view, nodes)
                     .filter(|source| ready(*source))

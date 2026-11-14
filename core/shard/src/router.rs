@@ -516,6 +516,7 @@ where
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
+                    self.tick_primary_handoff();
                     if let Some(fault) = self.tick_partitions(&mut namespace_scratch).await {
                         fatal = Some(fault);
                         break;
