@@ -340,17 +340,19 @@ impl ReplicaLinks {
     ///
     /// Before the pings, while reconnection is on and the session is bound,
     /// or a link reset it and still owes the sign-in, it runs
-    /// [`Self::connect`] when a slot used up its retries or the client is
-    /// disconnected. That restarts every slot without a link with a fresh
-    /// budget, or sweeps to sign in again, which nothing else does, because
-    /// a request never dials. An explicit disconnect or a logout ends the
-    /// session and owes nothing, so a keepalive never undoes it.
+    /// [`Self::connect`] when a slot used up its retries, the client is
+    /// disconnected, or the caller of the last sweep dropped it halfway. That
+    /// restarts every slot without a link with a fresh budget, or sweeps to
+    /// sign in again, which nothing else does, because a request never dials.
+    /// An explicit disconnect or a logout ends the session and owes nothing,
+    /// so a keepalive never undoes it.
     pub(crate) async fn keepalive(&self) -> Result<bool, IggyError> {
         let stopped = {
             let epoch = self.shared.session.epoch();
             let table = self.shared.table();
             self.shared.keepalive_restarts(epoch)
                 && (table.state == ClientState::Disconnected
+                    || self.shared.coordinator.is_abandoned()
                     || table.slots.values().any(|slot| slot.task.is_none()))
         };
         if stopped && let Err(error) = self.connect().await {
@@ -2515,5 +2517,28 @@ mod tests {
         assert_eq!(links.state(), ClientState::Connected);
         assert!(links.link(Target::MetadataPrimary).is_ok());
         assert!(cluster.dials_to(&endpoint(1)).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_sweep_owner_cancelled_in_its_pause_when_keepalive_ticks_should_restart_the_links()
+     {
+        let cluster = FakeCluster::new(1);
+        let links = connected(&cluster, 1).await;
+        links.disconnect();
+        cluster.down.lock().unwrap().insert(endpoint(0));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), links.connect())
+                .await
+                .is_err()
+        );
+        cluster.down.lock().unwrap().clear();
+
+        for _ in 0..4 {
+            sleep(Duration::from_secs(10)).await;
+            links.keepalive().await.unwrap();
+        }
+
+        assert_eq!(links.state(), ClientState::Authenticated);
     }
 }

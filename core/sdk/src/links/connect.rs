@@ -214,6 +214,12 @@ impl ConnectCoordinator {
         }
     }
 
+    /// Whether the last owner was dropped before its operation completed.
+    /// The next owner sees it and starts again from a clean state.
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
+    }
+
     pub(crate) async fn wait_until_inactive(&self) {
         loop {
             let changed = self.changed.notified();
