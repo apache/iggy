@@ -73,12 +73,14 @@ pub struct MaterializationIoJob {
     pub(crate) written: u64,
     pub(crate) completes: bool,
     pub(crate) checksum: Option<Box<StateArtifactHasher>>,
+    pub(crate) digest: Option<Box<crate::segment_chain::SegmentDigest>>,
 }
 
 pub struct MaterializationIoResult {
     pub(crate) target: MaterializationTarget,
     pub(crate) outcome: Result<(u64, u64), IggyError>,
     pub(crate) checksum: Option<Box<StateArtifactHasher>>,
+    pub(crate) digest: Option<Box<crate::segment_chain::SegmentDigest>>,
 }
 
 pub enum PartitionIoJob<SB = PingPongSuperblock> {
@@ -395,6 +397,8 @@ pub struct RotationTarget {
     pub(crate) messages_position: Option<u64>,
     pub(crate) index_writer: Option<Rc<IggyIndexWriter>>,
     pub(crate) index_position: Option<u64>,
+    /// The sealed segment's chain record that the rotation job appends.
+    pub(crate) chain_record: Option<crate::segment_chain::ChainRecord>,
 }
 
 pub struct MaterializationTarget {
@@ -418,6 +422,7 @@ pub struct SegmentIoJob {
     pub(crate) preallocate: bool,
     pub(crate) segment_bodies: bool,
     pub(crate) old_index: Option<Rc<IggyIndexWriter>>,
+    pub(crate) chain_append: Option<crate::segment_chain::ChainAppend>,
 }
 
 pub struct InstalledSegment {
@@ -565,6 +570,7 @@ impl MaterializationIoJob {
             written,
             completes,
             mut checksum,
+            mut digest,
             ..
         } = self;
         for batch in &mut batches {
@@ -573,12 +579,17 @@ impl MaterializationIoJob {
                     target,
                     outcome: Err(IggyError::CannotWriteToFile),
                     checksum: None,
+                    digest: None,
                 };
             }
             *batch = batch.slice(size_of::<PrepareHeader>()..);
         }
         if let Some(hasher) = checksum.as_mut() {
             crate::state_transfer::hash_yielding(hasher, batches.iter().map(Frozen::as_slice))
+                .await;
+        }
+        if let Some(digest) = digest.as_mut() {
+            crate::state_transfer::hash_yielding(digest, batches.iter().map(Frozen::as_slice))
                 .await;
         }
         let outcome = if let Some(saved) = bodies_written {
@@ -595,6 +606,7 @@ impl MaterializationIoJob {
                     target,
                     outcome: Err(IggyError::CannotWriteToFile),
                     checksum: None,
+                    digest: None,
                 };
             };
             // Both halves must settle, including when either one fails.
@@ -633,6 +645,7 @@ impl MaterializationIoJob {
             target,
             outcome,
             checksum,
+            digest,
         }
     }
 }
@@ -1265,6 +1278,12 @@ impl TransferFileJob {
 impl SegmentIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(self) -> Result<InstalledSegment, IggyError> {
+        if let Some(append) = &self.chain_append {
+            append.execute().await.map_err(|error| {
+                warn!(path = append.path, %error, "cannot append the sealed segment's chain record");
+                IggyError::CannotWriteToFile
+            })?;
+        }
         if let Some(writer) = &self.old_index {
             writer.fsync().await?;
         }
@@ -1683,6 +1702,7 @@ mod tests {
                 preallocate: false,
                 segment_bodies: false,
                 old_index: None,
+                chain_append: None,
             },
         }
         .execute()
