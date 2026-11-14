@@ -31,8 +31,9 @@ import {
 
 
 /**
- * Settings a topic takes at create. Only the message expiry and the size cap
- * can change later, through `updateTopic`.
+ * Settings a topic takes at create. Only the message expiry, the size cap,
+ * the local retention and turning tiered storage on can change later, through
+ * `updateTopic`.
  */
 export type TopicOptions = {
   /** Compression algorithm label (None or Gzip), stored and reported only */
@@ -72,6 +73,35 @@ export type TopicOptions = {
    * invalid replication factor.
    */
   replicationFactor?: number,
+  /**
+   * Rolls the active segment once a batch is stamped this long after the
+   * segment's first batch, in microseconds (u64 max = never). `0n` is not
+   * "never": it omits the key so the server resolves its own default, reported
+   * back as a derived option on `getTopic`. The server refuses values under 10
+   * minutes, and the key alongside `preallocateSegments: true`.
+   */
+  segmentMaxAge?: bigint,
+  /**
+   * Moves sealed segments to the object store and keeps only the local
+   * retention on disk. The server does not offer tiering yet and refuses
+   * `true` with error 5, feature unavailable.
+   */
+  tieredStorage?: boolean,
+  /**
+   * How long a tiered topic keeps an uploaded segment on local disk, in
+   * microseconds (u64 max = never). `0n` is not "never": it omits the key so
+   * the server resolves its own default, reported back as a derived option on
+   * `getTopic`. The server refuses a value above a finite `messageExpiry`.
+   */
+  localRetentionAge?: bigint,
+  /**
+   * Cap in bytes on the uploaded segments a tiered topic keeps on local disk,
+   * split across all partitions (u64 max = unlimited). `0n` is not
+   * "unlimited": it omits the key so the server resolves its own default,
+   * reported back as a derived option on `getTopic`. The server refuses a
+   * value above a finite `maxTopicSize`.
+   */
+  localRetentionSize?: bigint,
   /**
    * Option keys with no field of their own, for a key the server catalog gained
    * after this build shipped. A field above wins on collision, since the block
@@ -117,6 +147,10 @@ export const CREATE_TOPIC = {
     sizeOfMessagesRequiredToSave,
     preallocateSegments,
     replicationFactor,
+    segmentMaxAge = 0n,
+    tieredStorage,
+    localRetentionAge = 0n,
+    localRetentionSize = 0n,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -131,9 +165,9 @@ export const CREATE_TOPIC = {
 
     // partitions_count rides the command's own fixed field, never the
     // options block: the server rejects it as an unsupported option key.
-    // Server-default sentinels (expiry 0, size 0, compression none) and
-    // unset optionals are omitted so the server resolves them from its own
-    // config and reports them back as derived options.
+    // Server-default sentinels (expiry, segment age and local retention 0,
+    // size 0, compression none) and unset optionals are omitted so the server resolves them from
+    // its own config and reports them back as derived options.
     // Caller keys first so a typed field below overwrites one of them.
     const options: OptionEntry[] = [...extraOptions];
     if (compressionAlgorithm !== CompressionAlgorithm.None)
@@ -192,6 +226,22 @@ export const CREATE_TOPIC = {
       options.push({
         key: 'replication_factor',
         value: HeaderValue.Uint32(replicationFactor)
+      });
+    if (segmentMaxAge !== 0n)
+      options.push({
+        key: 'segment_max_age', value: HeaderValue.Uint64(segmentMaxAge)
+      });
+    if (tieredStorage !== undefined)
+      options.push({
+        key: 'tiered_storage', value: HeaderValue.Bool(tieredStorage)
+      });
+    if (localRetentionAge !== 0n)
+      options.push({
+        key: 'local_retention_age', value: HeaderValue.Uint64(localRetentionAge)
+      });
+    if (localRetentionSize !== 0n)
+      options.push({
+        key: 'local_retention_size', value: HeaderValue.Uint64(localRetentionSize)
       });
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);

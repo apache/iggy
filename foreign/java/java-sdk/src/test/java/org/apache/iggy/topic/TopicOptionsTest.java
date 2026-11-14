@@ -55,6 +55,10 @@ class TopicOptionsTest {
                 .sizeOfMessagesRequiredToSave(BigInteger.valueOf(1_048_576))
                 .preallocateSegments(true)
                 .replicationFactor(3)
+                .segmentMaxAge(BigInteger.valueOf(3_600_000_000L))
+                .tieredStorage(false)
+                .localRetentionAge(BigInteger.valueOf(21_600_000_000L))
+                .localRetentionSize(BigInteger.valueOf(10_737_418_240L))
                 .build()
                 .entries();
 
@@ -66,13 +70,25 @@ class TopicOptionsTest {
                         "messages_required_to_save",
                         "size_of_messages_required_to_save",
                         "preallocate_segments",
-                        "replication_factor");
+                        "replication_factor",
+                        "segment_max_age",
+                        "tiered_storage",
+                        "local_retention_age",
+                        "local_retention_size");
         assertThat(options.get("segment_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(options.get("size_of_messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("preallocate_segments").kind()).isEqualTo(HeaderKind.Bool);
         assertThat(options.get("replication_factor").kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(options.get("replication_factor").value()).containsExactly(3, 0, 0, 0);
+        assertThat(options.get("segment_max_age").kind()).isEqualTo(HeaderKind.Uint64);
+        assertThat(options.get("segment_max_age").asUint64()).isEqualTo(BigInteger.valueOf(3_600_000_000L));
+        assertThat(options.get("tiered_storage").kind()).isEqualTo(HeaderKind.Bool);
+        assertThat(options.get("tiered_storage").asBool()).isFalse();
+        assertThat(options.get("local_retention_age").kind()).isEqualTo(HeaderKind.Uint64);
+        assertThat(options.get("local_retention_age").asUint64()).isEqualTo(BigInteger.valueOf(21_600_000_000L));
+        assertThat(options.get("local_retention_size").kind()).isEqualTo(HeaderKind.Uint64);
+        assertThat(options.get("local_retention_size").asUint64()).isEqualTo(BigInteger.valueOf(10_737_418_240L));
         // Little-endian, so the low byte of 128 MiB leads and the high bytes are zero.
         assertThat(options.get("segment_size").value()).containsExactly(0, 0, 0, 8, 0, 0, 0, 0);
     }

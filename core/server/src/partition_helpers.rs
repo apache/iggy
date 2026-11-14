@@ -49,7 +49,7 @@ use metadata::stm::stream::Partition;
 use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{
     IggyPartition, IggyPartitions, PartitionPersistence, PartitionRecoveryError,
-    PartitionRecoveryRefusal, PartitionsConfig, RecoveredSegment, clamp_consumer_offsets,
+    PartitionRecoveryRefusal, PartitionsConfig, RecoveredLog, clamp_consumer_offsets,
     create_partition_file_hierarchy, ensure_initial_segment, hydrate_partition_log,
     load_persisted_segments, load_persisted_segments_with_checkpoint, recover_consumer_offsets,
 };
@@ -753,7 +753,18 @@ async fn load_partition(
     };
     let segment_checkpoint = recovered_persistence.0.segment_checkpoint();
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
     partition.set_runtime_options(runtime_options);
+    // The chain file comes with the partition of a tiered topic, and a chain
+    // that a crash left short of a record is completed here.
+    if runtime_options.tiered_storage {
+        partition.enable_tiering(partitions::object_prefix(
+            namespace,
+            partition_metadata.created_revision,
+        ));
+    }
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Recovered partitions honor the same config-surfaced ring ceilings as the
     // fresh-create path (build_partition_fresh). Retention is already off for
@@ -767,11 +778,12 @@ async fn load_partition(
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
     partition.set_created_revision(partition_metadata.created_revision);
+    partition.set_free_space_reserve(crate::sysinfo_probe::free_space_reserve());
     partition
         .restore_retry_checkpoint(recovered_persistence.0.checkpoint_op())
         .await
         .map_err(wal_error)?;
-    let recovered_segments = recover_partition_segments(
+    let recovered = recover_partition_segments(
         partitions_config,
         namespace,
         runtime_options,
@@ -785,7 +797,7 @@ async fn load_partition(
         stream_id,
         topic_id,
         partition_id,
-        recovered_segments,
+        recovered,
     )
     .await?;
 
@@ -909,7 +921,7 @@ async fn recover_partition_segments(
     runtime_options: TopicRuntimeOptions,
     stats: &PartitionStats,
     checkpoint: Option<SegmentPosition>,
-) -> Result<Vec<RecoveredSegment>, PartitionRecoveryError> {
+) -> Result<RecoveredLog, PartitionRecoveryError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
@@ -1136,9 +1148,17 @@ pub async fn build_partition_fresh(
 
     let mut partition = IggyPartition::new(stats, consensus);
     partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
+    partition
         .consensus()
         .set_recovery_election_allowed(first_initialization && !lost_with_storage);
     partition.set_runtime_options(runtime_options);
+    // The chain file comes with the partition of a tiered topic, and a chain
+    // that a crash left short of a record is completed here.
+    if runtime_options.tiered_storage {
+        partition.enable_tiering(partitions::object_prefix(namespace, created_revision));
+    }
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
     // IggyPartition::new has already disabled retention for single-replica
@@ -1153,6 +1173,7 @@ pub async fn build_partition_fresh(
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir);
     partition.set_created_revision(created_revision);
+    partition.set_free_space_reserve(crate::sysinfo_probe::free_space_reserve());
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);

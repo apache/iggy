@@ -247,6 +247,7 @@ impl TestHarnessBuilder {
             primary_client_config: self.primary_client_config,
             jwks_config: self.jwks_config,
             jwks_server: None,
+            floci_bucket: None,
             started: false,
             peer_relays,
         })

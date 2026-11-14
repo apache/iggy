@@ -19,6 +19,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using Apache.Iggy.Errors;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
@@ -432,6 +433,15 @@ public sealed class VsrProtocolDriftTests
 
         Assert.Empty(mismatches);
         Assert.True(matched > 10, $"Only {matched} error codes were matched by name; the Rust naming drifted.");
+    }
+
+    [Fact]
+    public void given_code_58_when_naming_it_should_match_the_rust_transient_not_accepted()
+    {
+        var error = ErrorFactory.TransientNotAccepted;
+
+        Assert.Equal((VsrError.TRANSIENT_NOT_ACCEPTED, "transient_not_accepted"), (error.Id, error.Code));
+        Assert.Matches(@"\bTransientNotAccepted = 58,", ReadRustSource(ErrorPath));
     }
 
     private static VsrOperation? ResolveOperation(string codeName, int code)

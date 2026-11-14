@@ -62,4 +62,24 @@ public record Topic(
     public Optional<BigInteger> maxTopicSize() {
         return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.MAX_TOPIC_SIZE);
     }
+
+    /** Segment age roll in microseconds, {@code 2^64 - 1} meaning never. */
+    public Optional<BigInteger> segmentMaxAge() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.SEGMENT_MAX_AGE);
+    }
+
+    /** Whether sealed segments move to the object store. */
+    public Optional<Boolean> tieredStorage() {
+        return TopicSettings.bool(options, derivedOptions, TopicOptionKey.TIERED_STORAGE);
+    }
+
+    /** How long an uploaded segment stays on local disk in microseconds, {@code 2^64 - 1} meaning never removed. */
+    public Optional<BigInteger> localRetentionAge() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.LOCAL_RETENTION_AGE);
+    }
+
+    /** Cap in bytes on the uploaded segments kept on local disk, {@code 2^64 - 1} meaning unlimited. */
+    public Optional<BigInteger> localRetentionSize() {
+        return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.LOCAL_RETENTION_SIZE);
+    }
 }

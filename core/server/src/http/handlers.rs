@@ -1738,8 +1738,7 @@ pub(in crate::http) async fn send_messages(
                 // An unreadable confirmation still answers 201: the batch committed,
                 // only its offsets did not survive the reply.
                 let confirmations = send_confirmations(&reply, &header)
-                    .map(SendMessagesConfirmations::from)
-                    .unwrap_or_default();
+                    .map_or_default(SendMessagesConfirmations::from);
                 Ok::<_, PartitionWriteError>(
                     (StatusCode::CREATED, durability, Json(confirmations)).into_response(),
                 )

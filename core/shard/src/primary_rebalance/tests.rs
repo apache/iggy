@@ -872,6 +872,7 @@ fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_re
             nonce: Some(NONCE),
             sent_at: Some(Instant::now()),
             ready_at: Some(previous),
+            tiered_storage_ready_at: Some(previous),
             live_at: Some(previous),
             answered_at: None,
             heard: false,
@@ -888,9 +889,15 @@ fn given_health_challenge_when_reply_is_overdue_or_replayed_should_not_extend_re
             "unsent" => state.peers[usize::from(TARGET)].sent_at = None,
             _ => unreachable!(),
         }
+        invalid.tiered_storage_ready = 1;
         state.observe_peer(&invalid, Instant::now());
         assert_eq!(
             state.peers[usize::from(TARGET)].ready_at,
+            Some(previous),
+            "{changed}"
+        );
+        assert_eq!(
+            state.peers[usize::from(TARGET)].tiered_storage_ready_at,
             Some(previous),
             "{changed}"
         );
@@ -1700,4 +1707,218 @@ async fn given_a_report_no_primary_refreshes_when_the_coordinator_scans_should_c
         streams.partition_status(namespace).unwrap().in_sync_nodes,
         0
     );
+}
+
+/// Answers the newest probe sent to `peer`, reporting `tiered_storage_ready`.
+#[allow(clippy::future_not_send)]
+async fn answer_newest_probe(shard: &TestShard, peer: u8, tiered_storage_ready: u8) {
+    let (_, mut reply) = *shard
+        .bus
+        .sent
+        .borrow()
+        .iter()
+        .rfind(|(replica, probe)| {
+            *replica == peer && probe.kind == PrimaryRebalanceKind::MetadataProbe
+        })
+        .expect("the peer was probed");
+    reply.replica = peer;
+    reply.kind = PrimaryRebalanceKind::MetadataReply;
+    reply.commit = 0;
+    reply.quorum_age_ns = PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE;
+    reply.ready = 1;
+    reply.tiered_storage_ready = tiered_storage_ready;
+    shard.on_primary_rebalance(reply, Vec::new()).await;
+}
+
+/// Moves the clock one probe interval on, probes, and has both peers answer.
+#[allow(clippy::future_not_send)]
+async fn probe_round(shard: &TestShard, tiered_storage_ready: [u8; 2]) -> bool {
+    let at = shard.bus.monotonic_now() + PROBE_INTERVAL;
+    shard.bus.now.set(Some(at));
+    shard.tick_primary_rebalance().await;
+    for (peer, ready) in [1, 2].into_iter().zip(tiered_storage_ready) {
+        answer_newest_probe(shard, peer, ready).await;
+    }
+    shard.tick_primary_rebalance().await;
+    shard.plane.metadata().tiered_storage_cluster_ready()
+}
+
+#[compio::test]
+async fn given_peer_tiered_storage_reports_when_the_coordinator_ticks_should_admit_only_while_every_member_is_ready()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
+    let metadata = shard.plane.metadata();
+    let frontier = metadata.applied_frontier();
+    frontier.set_store_identity_verified(true);
+    frontier.set_tiered_storage_ready(true);
+
+    shard.tick_primary_rebalance().await;
+    assert!(
+        !metadata.tiered_storage_cluster_ready(),
+        "no peer was heard in this view"
+    );
+    answer_newest_probe(&shard, 1, 1).await;
+    shard.tick_primary_rebalance().await;
+    assert!(
+        !metadata.tiered_storage_cluster_ready(),
+        "one peer is still unheard"
+    );
+
+    assert!(!probe_round(&shard, [1, 0]).await, "a peer reports 0");
+    assert!(probe_round(&shard, [1, 1]).await, "every member is ready");
+
+    frontier.set_tiered_storage_ready(false);
+    shard.tick_primary_rebalance().await;
+    assert!(
+        !metadata.tiered_storage_cluster_ready(),
+        "this node is not ready itself"
+    );
+    frontier.set_tiered_storage_ready(true);
+    shard.tick_primary_rebalance().await;
+    assert!(metadata.tiered_storage_cluster_ready());
+
+    let_one_peer_age_out(&shard).await;
+}
+
+/// From a ready cluster: one peer stops answering, and its report ages out.
+#[allow(clippy::future_not_send)]
+async fn let_one_peer_age_out(shard: &TestShard) {
+    let metadata = shard.plane.metadata();
+    let reported = shard.bus.monotonic_now();
+    for elapsed in [PROBE_INTERVAL, PROBE_INTERVAL * 2, PROBE_TIMEOUT] {
+        shard.bus.now.set(Some(reported + elapsed));
+        shard.tick_primary_rebalance().await;
+        answer_newest_probe(shard, 1, 1).await;
+        shard.tick_primary_rebalance().await;
+        assert!(
+            metadata.tiered_storage_cluster_ready(),
+            "a report stays fresh for the probe timeout, at {elapsed:?}"
+        );
+    }
+    shard
+        .bus
+        .now
+        .set(Some(reported + PROBE_TIMEOUT + Duration::from_nanos(1)));
+    shard.tick_primary_rebalance().await;
+    assert!(
+        !metadata.tiered_storage_cluster_ready(),
+        "the silent peer's report aged out"
+    );
+}
+
+#[compio::test]
+async fn given_a_ready_cluster_when_a_peer_reports_not_ready_should_refuse_before_the_next_tick() {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
+    let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
+    metadata.applied_frontier().set_tiered_storage_ready(true);
+    shard.tick_primary_rebalance().await;
+    assert!(probe_round(&shard, [1, 1]).await);
+
+    shard
+        .bus
+        .now
+        .set(Some(shard.bus.monotonic_now() + PROBE_INTERVAL));
+    shard.tick_primary_rebalance().await;
+    assert!(metadata.tiered_storage_cluster_ready());
+    answer_newest_probe(&shard, 2, 0).await;
+    assert!(!metadata.tiered_storage_cluster_ready());
+}
+
+#[compio::test]
+async fn given_a_ready_cluster_when_the_metadata_view_is_contested_should_refuse_until_peers_are_heard_again()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
+    let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
+    metadata.applied_frontier().set_tiered_storage_ready(true);
+    shard.tick_primary_rebalance().await;
+    assert!(probe_round(&shard, [1, 1]).await);
+
+    shard.fence_rebalance_authority(&suspect_primary(METADATA_GROUP, 1));
+    assert!(
+        !metadata.tiered_storage_cluster_ready(),
+        "the fence drops the verdict with the authority"
+    );
+    shard.tick_primary_rebalance().await;
+    assert!(
+        !metadata.tiered_storage_cluster_ready(),
+        "reports from before the fence do not carry over"
+    );
+    assert!(
+        shard
+            .primary_rebalance
+            .borrow()
+            .peers
+            .iter()
+            .all(|peer| peer.tiered_storage_ready_at.is_none())
+    );
+    assert!(probe_round(&shard, [1, 1]).await);
+}
+
+#[compio::test]
+async fn given_a_backup_when_the_coordinator_ticks_should_hold_no_tiered_storage_verdict() {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, REPLICAS, 0);
+    let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
+    metadata.applied_frontier().set_tiered_storage_ready(true);
+    metadata.observe_tiered_storage_readiness(true);
+    shard.tick_primary_rebalance().await;
+    assert!(!metadata.tiered_storage_cluster_ready());
+}
+
+#[compio::test]
+async fn given_a_single_node_when_the_coordinator_ticks_should_follow_its_own_tiered_storage_flag()
+{
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, 1, 0);
+    let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
+    shard.tick_primary_rebalance().await;
+    assert!(!metadata.tiered_storage_cluster_ready());
+    for ready in [true, false, true] {
+        metadata.applied_frontier().set_tiered_storage_ready(ready);
+        shard.tick_primary_rebalance().await;
+        assert_eq!(metadata.tiered_storage_cluster_ready(), ready);
+    }
+}
+
+#[compio::test]
+async fn given_a_metadata_probe_when_a_node_answers_should_report_its_tiered_storage_flag() {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, REPLICAS, 0);
+    let metadata = shard.plane.metadata();
+    let consensus = metadata.consensus.as_ref().unwrap();
+    // A node that fails the store identity check reports 0 however its
+    // partitions read.
+    for (nonce, ready, verified) in [
+        (NONCE, false, true),
+        (NONCE + 1, true, true),
+        (NONCE + 2, true, false),
+        (NONCE + 3, false, true),
+    ] {
+        metadata.applied_frontier().set_tiered_storage_ready(ready);
+        metadata
+            .applied_frontier()
+            .set_store_identity_verified(verified);
+        let mut probe = probe_header(consensus, nonce);
+        probe.replica = 0;
+        shard.on_primary_rebalance(probe, Vec::new()).await;
+        let (target, reply) = *shard
+            .bus
+            .sent
+            .borrow()
+            .last()
+            .expect("the probe is answered");
+        assert_eq!(target, 0);
+        assert_eq!(reply.kind, PrimaryRebalanceKind::MetadataReply);
+        assert_eq!(reply.nonce, nonce);
+        assert_eq!(reply.tiered_storage_ready, u8::from(ready && verified));
+    }
 }

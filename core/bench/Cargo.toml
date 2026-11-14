@@ -59,6 +59,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # The actor tests need paused time, and `full` leaves out `test-util`.
 tokio = { workspace = true, features = ["test-util"] }
 

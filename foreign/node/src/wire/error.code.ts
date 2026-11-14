@@ -91,6 +91,7 @@ export const translateErrorCode = (code: number): string => {
     case '88': return "A committed lifecycle operation prevents this mutation. Retry as a new request.";
     case '89': return "The replica is not the partition primary.";
     case '90': return "Deferred poll capacity exceeded; retry after backoff on the same replica";
+    case '96': return "Tiered data cannot be read from the object store; a retry does not help";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";

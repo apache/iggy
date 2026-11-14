@@ -84,6 +84,20 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 			wantValue: []byte{0},
 		},
 		{
+			name:      "tiered storage on",
+			entry:     TieredStorageOption(true),
+			wantKey:   "tiered_storage",
+			wantKind:  Bool,
+			wantValue: []byte{1},
+		},
+		{
+			name:      "tiered storage off",
+			entry:     TieredStorageOption(false),
+			wantKey:   "tiered_storage",
+			wantKind:  Bool,
+			wantValue: []byte{0},
+		},
+		{
 			name:      "replication factor",
 			entry:     ReplicationFactorOption(3),
 			wantKey:   "replication_factor",
@@ -122,6 +136,7 @@ func TestTopicOptions_ConstructorEntriesSurviveTheHeaderCodec(t *testing.T) {
 		SizeOfMessagesRequiredToSaveOption(4096),
 		PreallocateSegmentsOption(false),
 		ReplicationFactorOption(3),
+		TieredStorageOption(false),
 	}
 
 	decoded, err := DeserializeHeaders(GetHeadersBytes(entries))

@@ -3175,6 +3175,11 @@ pub const LIFECYCLE_COMPLETION_SIZE: usize = 2 * size_of::<u32>() + size_of::<u6
 /// The partition replicas prove a completion, and the primary may hold none of
 /// them, so a backup that holds one relays its evidence. No result frame comes
 /// back: the backup sees the commit through replication.
+///
+/// A `TruncatePartition` rides the same frame for the same reason: the primary
+/// of a tiered partition decides its retention, and it can sit on a metadata
+/// backup. A build that predates it refuses the operation in `validate`, so
+/// the frame is dropped there and the sender decides again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct ForwardCompletionHeader {
@@ -3210,6 +3215,13 @@ impl ForwardCompletionHeader {
         + size_of::<u32>()
         + InstallConsumerGroupOwnerRequest::ENCODED_SIZE
         + size_of::<u64>();
+
+    /// The relay names the stream and topic by number, then carries the
+    /// partition id, the offset and the incarnation the offset was read from.
+    /// The incarnation is not optional here: a truncation without it would
+    /// apply to whatever partition holds the slot at commit.
+    const RETENTION_TRUNCATION_BODY_SIZE: usize =
+        2 * WireIdentifier::NUMERIC_ENCODED_SIZE + size_of::<u32>() + 2 * size_of::<u64>();
 }
 
 impl ConsensusHeader for ForwardCompletionHeader {
@@ -3254,9 +3266,12 @@ impl ConsensusHeader for ForwardCompletionHeader {
                             .contains(&(completions / LIFECYCLE_COMPLETION_SIZE))
                 }),
             Operation::CompleteConsumerGroupRevocation => body_size == Self::REVOCATION_BODY_SIZE,
+            Operation::TruncatePartition => body_size == Self::RETENTION_TRUNCATION_BODY_SIZE,
             _ => {
                 return Err(ConsensusError::InvalidField(
-                    "forward completion operation must be a partition completion".to_string(),
+                    "forward completion operation must be a partition completion or a \
+                     retention truncation"
+                        .to_string(),
                 ));
             }
         };
@@ -3265,9 +3280,9 @@ impl ConsensusHeader for ForwardCompletionHeader {
                 "forward completion body must have the size of its operation".to_string(),
             ));
         }
-        if self.operation == Operation::CompleteConsumerGroupRevocation && self.reporter != 0 {
+        if self.operation != Operation::CompleteLifecycle && self.reporter != 0 {
             return Err(ConsensusError::InvalidField(
-                "a forward revocation names no reporter".to_string(),
+                "only a forward lifecycle batch names a reporter".to_string(),
             ));
         }
         if self.release != 0 {
@@ -4362,12 +4377,17 @@ mod tests {
         assert_eq!(ForwardLogoutOutcome::OperationMismatch as u8, 6);
     }
 
-    /// A revocation, or else a lifecycle batch of one completion.
+    /// A revocation, a retention truncation, or else a lifecycle batch of one
+    /// completion.
     fn forward_completion(operation: Operation) -> ForwardCompletionHeader {
-        let (body_size, reporter) = if operation == Operation::CompleteConsumerGroupRevocation {
-            (ForwardCompletionHeader::REVOCATION_BODY_SIZE, 0)
-        } else {
-            (LIFECYCLE_BATCH_HEADER_SIZE + LIFECYCLE_COMPLETION_SIZE, 5)
+        let (body_size, reporter) = match operation {
+            Operation::CompleteConsumerGroupRevocation => {
+                (ForwardCompletionHeader::REVOCATION_BODY_SIZE, 0)
+            }
+            Operation::TruncatePartition => {
+                (ForwardCompletionHeader::RETENTION_TRUNCATION_BODY_SIZE, 0)
+            }
+            _ => (LIFECYCLE_BATCH_HEADER_SIZE + LIFECYCLE_COMPLETION_SIZE, 5),
         };
         let mut header = ForwardCompletionHeader {
             checksum: 0,
@@ -4392,6 +4412,7 @@ mod tests {
         for operation in [
             Operation::CompleteLifecycle,
             Operation::CompleteConsumerGroupRevocation,
+            Operation::TruncatePartition,
         ] {
             let header = forward_completion(operation);
             let mut bytes = aligned_zeroed(HEADER_SIZE);
@@ -4419,7 +4440,7 @@ mod tests {
         for operation in [
             Operation::Reserved,
             Operation::RemoveConsumerGroupMember,
-            Operation::TruncatePartition,
+            Operation::DeleteSegments,
             Operation::DeleteTopic,
             Operation::InstallConsumerGroupOwner,
         ] {
@@ -4501,6 +4522,39 @@ mod tests {
         assert!(
             matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
             "the frame prefix reserved bytes must be zero"
+        );
+    }
+    #[test]
+    fn given_forward_retention_truncation_when_malformed_should_fail_validation() {
+        let truncation_body = ForwardCompletionHeader::RETENTION_TRUNCATION_BODY_SIZE;
+        assert_eq!(truncation_body, 32, "the relayed truncation body is pinned");
+        for (body_size, fits) in [
+            (truncation_body, true),
+            // The body of a truncation that names no incarnation.
+            (truncation_body - size_of::<u64>(), false),
+            (truncation_body - 1, false),
+            (truncation_body + 1, false),
+            (0, false),
+        ] {
+            let mut header = forward_completion(Operation::TruncatePartition);
+            header.size = u32::try_from(HEADER_SIZE + body_size).expect("the frame size fits u32");
+            assert_eq!(
+                header.validate().is_ok(),
+                fits,
+                "a truncation with a body of {body_size} bytes"
+            );
+        }
+        let mut header = forward_completion(Operation::TruncatePartition);
+        header.reporter = 5;
+        assert!(
+            matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+            "a forward truncation names no reporter"
+        );
+        header = forward_completion(Operation::TruncatePartition);
+        header.reserved[0] = 1;
+        assert!(
+            matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
+            "a forward truncation carries nothing in the reserved bytes"
         );
     }
 }

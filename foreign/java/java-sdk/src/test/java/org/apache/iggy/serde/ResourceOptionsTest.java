@@ -204,10 +204,38 @@ class ResourceOptionsTest {
                         .reset(TopicOptionKey.SEGMENT_SIZE)
                         .build(),
                 IggyErrorCode.OPTION_NOT_UPDATABLE);
+        assertRefusal(() -> TopicUpdate.builder().tieredStorage(false).build(), IggyErrorCode.OPTION_NOT_UPDATABLE);
+        assertRefusal(
+                () -> TopicUpdate.builder().reset(TopicOptionKey.TIERED_STORAGE).build(),
+                IggyErrorCode.OPTION_NOT_UPDATABLE);
         assertRefusal(() -> StreamOptions.builder().encryptionKey(new byte[31]), IggyErrorCode.INVALID_ENCRYPTION_KEY);
         assertRefusal(() -> StreamOptions.builder().encryptionKeyBase64("AAAA"), IggyErrorCode.INVALID_ENCRYPTION_KEY);
         assertThat(StreamUpdate.builder().name(" ").build().entries().get(StreamOptionKey.NAME.value()))
                 .isEqualTo(new HeaderValue(HeaderKind.String, new byte[] {' '}));
+    }
+
+    @Test
+    void givenTieredStorageKeysWhenBuildingUpdateShouldSendThemInTheirCatalogKinds() {
+        TopicUpdate update = TopicUpdate.builder()
+                .tieredStorage(true)
+                .localRetentionAge(BigInteger.valueOf(21_600_000_000L))
+                .localRetentionSize(BigInteger.ZERO)
+                .reset(TopicOptionKey.LOCAL_RETENTION_SIZE)
+                .build();
+
+        assertThat(update.entries().keySet()).containsExactlyInAnyOrder("tiered_storage", "local_retention_age");
+        assertThat(update.entries().get("tiered_storage")).isEqualTo(HeaderValue.fromBool(true));
+        assertThat(update.entries().get("local_retention_age"))
+                .isEqualTo(HeaderValue.fromUint64(BigInteger.valueOf(21_600_000_000L)));
+        assertThat(update.resetKeys()).containsExactly("local_retention_size");
+        // A raw key hands the decision to the server, so turning the option off is sent as written.
+        assertThat(TopicUpdate.builder()
+                        .tieredStorage(false)
+                        .raw("future_key", HeaderValue.fromBool(true))
+                        .build()
+                        .entries()
+                        .get("tiered_storage"))
+                .isEqualTo(HeaderValue.fromBool(false));
     }
 
     @Test
@@ -368,6 +396,31 @@ class ResourceOptionsTest {
             assertThat(topic.maxTopicSize())
                     .as(name)
                     .contains(new BigInteger(expected.get("max_topic_size").asString()));
+            assertThat(topic.segmentMaxAge())
+                    .as(name)
+                    .contains(new BigInteger(expected.get("options")
+                            .get("segment_max_age")
+                            .get("value")
+                            .asString()));
+            assertThat(topic.tieredStorage())
+                    .as(name)
+                    .contains(expected.get("options")
+                            .get("tiered_storage")
+                            .get("value")
+                            .asString()
+                            .equals("true"));
+            assertThat(topic.localRetentionAge())
+                    .as(name)
+                    .contains(new BigInteger(expected.get("options")
+                            .get("local_retention_age")
+                            .get("value")
+                            .asString()));
+            assertThat(topic.localRetentionSize())
+                    .as(name)
+                    .contains(new BigInteger(expected.get("options")
+                            .get("local_retention_size")
+                            .get("value")
+                            .asString()));
         }
         for (JsonNode vector : section("user_responses")) {
             JsonNode expected = vector.get("expected");
@@ -450,7 +503,7 @@ class ResourceOptionsTest {
                 if (mapKey && !"read_only".equals(mutability)) {
                     assertTypedMember(create.get(scope), key, scope + " create " + key);
                 }
-                if ("updatable".equals(mutability)) {
+                if ("updatable".equals(mutability) || "enable_only".equals(mutability)) {
                     assertTypedMember(update.get(scope), key, scope + " update " + key);
                 }
                 if ("read_only".equals(mutability)) {

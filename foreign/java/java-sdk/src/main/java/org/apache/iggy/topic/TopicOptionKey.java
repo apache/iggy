@@ -21,14 +21,17 @@ package org.apache.iggy.topic;
 
 import org.apache.iggy.system.OptionKey;
 
+import static org.apache.iggy.system.OptionSpec.FLAG_CRITICAL;
 import static org.apache.iggy.system.OptionSpec.FLAG_RESETTABLE;
 import static org.apache.iggy.system.OptionSpec.FLAG_UPDATABLE;
 
 /**
  * The option keys of a topic, in catalog order.
  *
- * <p>An update may set {@code name}, {@code message_expiry} and {@code max_topic_size}, and reset the
- * last two to their defaults. Every other key is fixed at create.
+ * <p>An update may set {@code name}, {@code message_expiry}, {@code max_topic_size},
+ * {@code local_retention_age} and {@code local_retention_size}, and reset the last four to their
+ * defaults. It may also turn {@code tiered_storage} on, never off and never back to its default. Every
+ * other key is fixed at create.
  */
 public enum TopicOptionKey implements OptionKey {
     NAME("name", FLAG_UPDATABLE),
@@ -42,7 +45,11 @@ public enum TopicOptionKey implements OptionKey {
     MESSAGES_REQUIRED_TO_SAVE("messages_required_to_save", 0),
     SIZE_OF_MESSAGES_REQUIRED_TO_SAVE("size_of_messages_required_to_save", 0),
     PREALLOCATE_SEGMENTS("preallocate_segments", 0),
-    REPLICATION_FACTOR("replication_factor", 0);
+    REPLICATION_FACTOR("replication_factor", 0),
+    SEGMENT_MAX_AGE("segment_max_age", FLAG_CRITICAL),
+    TIERED_STORAGE("tiered_storage", FLAG_UPDATABLE | FLAG_CRITICAL),
+    LOCAL_RETENTION_AGE("local_retention_age", FLAG_UPDATABLE | FLAG_RESETTABLE),
+    LOCAL_RETENTION_SIZE("local_retention_size", FLAG_UPDATABLE | FLAG_RESETTABLE);
 
     private final String value;
     private final int flags;
@@ -60,5 +67,10 @@ public enum TopicOptionKey implements OptionKey {
     @Override
     public int flags() {
         return flags;
+    }
+
+    @Override
+    public boolean enableOnly() {
+        return this == TIERED_STORAGE;
     }
 }

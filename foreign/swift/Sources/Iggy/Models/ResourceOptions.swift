@@ -91,6 +91,13 @@ public struct OptionFlags: OptionSet, Sendable, Hashable {
 /// gives it. Cases are declared in catalog order.
 protocol CatalogOptionKey: RawRepresentable, CaseIterable, Hashable where RawValue == String {
     var flags: OptionFlags { get }
+    /// An update may turn the key on and nothing else. The flags report such
+    /// a key as updatable and not resettable, which does not tell it apart.
+    var isEnableOnly: Bool { get }
+}
+
+extension CatalogOptionKey {
+    var isEnableOnly: Bool { false }
 }
 
 /// An update's options: the keys to set and the keys to return to their
@@ -134,6 +141,9 @@ struct OptionsPatch {
                 throw IggyError(.readOnlyOption, context: key.rawValue)
             }
             if let key = allKeys.first(where: { !$0.flags.contains(.updatable) }) {
+                throw IggyError(.optionNotUpdatable, context: key.rawValue)
+            }
+            if let key = resetKeys.first(where: \.isEnableOnly) {
                 throw IggyError(.optionNotUpdatable, context: key.rawValue)
             }
             if let key = resetKeys.first(where: { !$0.flags.contains(.resettable) }) {

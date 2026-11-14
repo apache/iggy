@@ -1701,6 +1701,9 @@ class IggyClient:
         reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
         raw_reset: builtins.list[builtins.str] | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1721,19 +1724,34 @@ class IggyClient:
                 nothing either, reset `OptionKey.MaxTopicSize` to return to the
                 default.
             reset: Keys to return to their defaults as `list[OptionKey] | None`:
-                `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+                `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+                `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so an updatable server key can be set from this build.
                 A create-only key is refused by name.
             raw_reset: Additional reset names as `list[str] | None`, sent
                 verbatim so a key newer than this build can be reset. The
                 server decides them.
+            tiered_storage: `True` turns tiered storage on, unchanged when
+                `None`. The server refuses `False`, an update never turns it
+                off, and refuses `True` with `FeatureUnavailable` until it
+                tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, unchanged when
+                `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+                reset `OptionKey.LocalRetentionAge` to return to the default.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+                nothing either, reset `OptionKey.LocalRetentionSize` to return
+                to the default.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `local_retention_age` or `local_retention_size` is out of range.
             OptionError: A `RuntimeError` carrying the error `code` and
                 `kind` when the client or the server refuses an option.
             RuntimeError: Before anything is sent, if the update changes
@@ -3728,6 +3746,24 @@ class OptionKey:
     Fingerprints of the server keys wrapping the stream's key, computed by
     the server.
     """
+    SegmentMaxAge: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment age roll, fixed at creation.
+    """
+    TieredStorage: typing.ClassVar[OptionKey]
+    r"""
+    Topic tiered storage. An update only turns it on.
+    """
+    LocalRetentionAge: typing.ClassVar[OptionKey]
+    r"""
+    Time a tiered topic keeps an uploaded segment on local disk,
+    resettable to one day.
+    """
+    LocalRetentionSize: typing.ClassVar[OptionKey]
+    r"""
+    Cap on the uploaded segments a tiered topic keeps on local disk,
+    resettable to unlimited.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -4476,7 +4512,8 @@ class ReadError(IggyError):
     def is_lasting_refusal(self) -> builtins.bool:
         r"""
         Whether the reader stopped the partition after six refusals in a row that a retry does
-        not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+        not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+        of the partition reads it again.
         """
     @property
     def lost(self) -> tuple[builtins.int, builtins.int] | None:
@@ -5386,14 +5423,19 @@ class TopicOptions:
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
         replication_factor: builtins.int | None = None,
+        segment_max_age: IggyExpiry | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
         Constructs topic create options.
 
         Every setting left as `None` resolves against the server default at
-        admission. Only `message_expiry`, `max_topic_size` and the name can
-        change after creation, through `update_topic`.
+        admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
+        `local_retention_age`, `local_retention_size` and the name can change
+        after creation, through `update_topic`.
 
         Args:
             partitions_count: Number of partitions as `int`, at most 1000.
@@ -5423,12 +5465,31 @@ class TopicOptions:
                 accepting writes while either node is down. The server rejects
                 an out-of-range value with an `OptionError` of kind
                 `invalid_replication_factor`.
+            segment_max_age: Age past a segment's first batch at which a batch
+                starts the next segment, as `IggyExpiry | None`, at least 10
+                minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+                which rolls segments by size alone. The server refuses a
+                duration together with `preallocate_segments=True`.
+            tiered_storage: Move sealed segments to the object store as
+                `bool | None`. `None` leaves it off. The server refuses `True`
+                with `FeatureUnavailable` until it tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, one day when
+                `None`. `IggyExpiry.ServerDefault()` is the same as `None`.
+                The server refuses an age above a finite `message_expiry`.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
+                same as `None`. The server refuses a size above a finite
+                `max_topic_size`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `segment_max_age`, `local_retention_age` or
+                `local_retention_size` is out of range.
             RuntimeError: If `compression_algorithm` names no known algorithm.
             TypeError: If a durability is not a `Durability`.
         """

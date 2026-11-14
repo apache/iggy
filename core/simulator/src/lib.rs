@@ -3043,6 +3043,62 @@ mod tests {
         );
     }
 
+    /// The primary of a tiered partition decides its retention, and it can sit
+    /// on a metadata backup, which cannot propose the truncation itself.
+    #[test]
+    fn given_retention_decision_on_metadata_backup_when_relayed_should_commit_the_truncation_on_every_replica()
+     {
+        const PROGRESS_STEPS: usize = 4_000;
+        /// The cleaner hands the decision over on every timed pass until the
+        /// watermark covers it.
+        const DECISION_PERIOD_STEPS: usize = 100;
+        const DECIDED: u64 = 9;
+        let (mut sim, _client) = cluster(0x5245_5445);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.init_partition(namespace);
+        let primary = sim.metadata_primary_index().unwrap();
+        let view = sim.metadata_view();
+        let backup = usize::from((primary + 1) % sim.replica_count);
+        let committed = |sim: &Simulator, replica: usize| {
+            sim.replicas[replica].shards[0]
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .with_committed_partition(namespace, |partition| {
+                    (partition.created_revision, partition.deleted_up_to_offset)
+                })
+                .expect("the partition is committed")
+        };
+        let (created_revision, untrimmed) = committed(&sim, backup);
+        assert_eq!(untrimmed, 0);
+
+        assert!(
+            (0..PROGRESS_STEPS).any(|step| {
+                if step % DECISION_PERIOD_STEPS == 0 {
+                    sim.replicas[backup].shards[0].forward_metadata_submit(
+                        shard::MetadataSubmit::RetentionTruncate {
+                            namespace,
+                            created_revision,
+                            up_to_offset: DECIDED,
+                        },
+                    );
+                }
+                sim.step();
+                (0..usize::from(sim.replica_count))
+                    .all(|replica| committed(&sim, replica).1 == DECIDED)
+            }),
+            "the decision of a metadata backup must commit on every replica"
+        );
+        assert!(sim.network.delivered_any(Command::ForwardCompletion));
+        assert_eq!(
+            sim.metadata_primary_index(),
+            Some(primary),
+            "the backup must not become the primary to commit its decision"
+        );
+        assert_eq!(sim.metadata_view(), view);
+    }
+
     /// Fences `namespace` on replica 0, the metadata primary, as boot recovery
     /// does with unreadable files, and waits until a replica that serves the
     /// partition leads it.
@@ -17956,10 +18012,9 @@ mod review_4092_dst_tests {
                     .items
                     .get(namespace.stream_id())
                     .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                    .map(|topic| {
+                    .map_or_default(|topic| {
                         iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
                     })
-                    .unwrap_or_default()
             });
 
         assert!(

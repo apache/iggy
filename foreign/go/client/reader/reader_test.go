@@ -1150,6 +1150,22 @@ func TestPartitionReader_StopsAPartitionWhoseHistoryIsGoneUntilASeek(t *testing.
 	assert.Equal(t, uint64(0), client.nextRead(t).targets[0].Strategy.Value)
 }
 
+func TestPartitionReader_StopsAPartitionAtTheFirstTieredReadFailureUntilASeek(t *testing.T) {
+	client := newFakeClient()
+	reader := standalone(t, client, waitOneSecond, 1)
+	client.nextRead(t).answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrTieredReadFailed})
+
+	_, err := reader.Next(context.Background())
+	var readError *ReadError
+	require.ErrorAs(t, err, &readError)
+	require.ErrorIs(t, err, ierror.ErrTieredReadFailed)
+	assert.Equal(t, uint32(1), *readError.PartitionID)
+	assert.True(t, client.readsNothingFor(300*time.Millisecond), "a refusal that no retry changes is not read again")
+
+	require.NoError(t, reader.Seek(context.Background(), 1, iggcon.FirstPollingStrategy()))
+	assert.Equal(t, uint64(0), client.nextRead(t).targets[0].Strategy.Value)
+}
+
 // A fully zero context names no history, so a partition at a start or a seek
 // with one reads again after a new history, as without a context.
 func TestPartitionReader_ReadsAgainAfterANewHistoryAtAStartOrSeekWithAZeroContext(t *testing.T) {
@@ -1654,6 +1670,36 @@ func TestPartitionReader_SendsAgainAnEmptyReadOfWhatALostReplyStored(t *testing.
 	result := <-polled
 	require.NoError(t, result.err)
 	assert.Equal(t, []uint64{2, 3, 4}, offsets(result.polled))
+}
+
+// A stop during the read again of what a lost reply stored leaves the
+// partition to a seek, which drops the range and the batch read after it, and
+// a seek to Next reads after both. So the stop reports the range as lost and
+// hands over that batch before its own error.
+func TestPartitionReader_ReportsTheLostRangeAndHandsOverTheHeldBatchBeforeAStopUnderOnRead(t *testing.T) {
+	client := newFakeClient()
+	reader := standalone(t, client, withCommit(waitOneSecond, iggcon.OnReadCommit()), 1)
+	polled := nextInBackground(reader)
+	client.nextRead(t).answer(section(1, 0, 1))
+	require.NoError(t, (<-polled).err)
+	polled = nextInBackground(reader)
+	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	client.nextRead(t).answer(section(1, 5, 6))
+	again := client.nextRead(t)
+	require.False(t, again.commit)
+	require.Equal(t, uint64(2), again.targets[0].Strategy.Value)
+
+	again.answer(iggcon.FetchMessagesSection{PartitionId: 1, Err: ierror.ErrTieredReadFailed})
+
+	err := (<-polled).err
+	require.ErrorIs(t, err, ierror.FetchProgressUncertain{})
+	var lost *ReadError
+	require.ErrorAs(t, err, &lost)
+	assert.Equal(t, &OffsetRange{First: 2, Last: 4}, lost.Lost)
+	assert.Equal(t, []uint64{5, 6}, offsets(next(t, reader)))
+	_, err = reader.Next(context.Background())
+	require.ErrorIs(t, err, ierror.ErrTieredReadFailed)
+	assert.True(t, client.readsNothingFor(300*time.Millisecond), "the stopped partition reads nothing until a seek")
 }
 
 // A read again of what a lost reply stored that the server serves from after
@@ -4071,6 +4117,7 @@ func TestPartitionReader_MovesTheOffsetBackOverAReadLostAcrossANewSessionUnderTh
 	require.NoError(t, (<-polled).err)
 	nextInBackground(reader)
 	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	require.Eventually(t, func() bool { return len(client.recordedAbandons()) == 1 }, testTimeout, 5*time.Millisecond)
 	losesItsSession(t, client, reader, 1)
 
 	require.NoError(t, reader.Close(context.Background()))
@@ -4166,6 +4213,9 @@ func losesAReadAfterADelivery(t *testing.T) (*fakeClient, *PartitionReader) {
 	require.NoError(t, (<-polled).err)
 	nextInBackground(reader)
 	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	// Close cancels a read in flight, and the fake can then drop a reply that
+	// it did not take yet. The abandon shows that the reader took the lost read.
+	require.Eventually(t, func() bool { return len(client.recordedAbandons()) == 1 }, testTimeout, 5*time.Millisecond)
 	return client, reader
 }
 
@@ -4183,6 +4233,7 @@ func TestPartitionReader_EndsTheRetryOfARewindRefusedAsNotOwnedWhenTheContextOfC
 	next(t, reader)
 	nextInBackground(reader)
 	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	require.Eventually(t, func() bool { return len(client.recordedAbandons()) == 1 }, testTimeout, 5*time.Millisecond)
 	client.mu.Lock()
 	client.owners = map[uint32]uint64{1: returnedOwner, 2: returnedOwner}
 	client.installOp, client.watermark = ownerOp, ownerOp

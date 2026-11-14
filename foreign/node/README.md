@@ -286,7 +286,9 @@ try {
   names the partition of an error, or none for an error of the whole reader,
   and the reader retries by itself. Error 87 stops a partition until `seek`
   when its position is tied to the history of an earlier read, and so do error
-  80 and a refusal other than 5009 that six retries did not change. A context
+  80, error 96 (the object store refuses a read of tiered data for good, so
+  the reader never sends it again) and a refusal other than 5009 that six
+  retries did not change. A context
   that is all zero ties a position to no history. The error of each stop sets
   `stopsPartition`, and that of an 87 or a refusal stop also sets `resumable`:
   a `seek` to Next reads the partition again after its stored offset. When
@@ -709,7 +711,7 @@ console.log(stream.encryptionKeyFingerprint === key.fingerprint()); // true
 
 `stream.update`, `topic.update` and `user.update` change only the keys they name and leave every other setting as it is, so an update without `name` keeps the name. `reset` returns a key to the server default. Use the `StreamOptionKey`, `TopicOptionKey` and `UserOptionKey` constants to name keys.
 
-Only the topic keys `message_expiry` and `max_topic_size` can be reset. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
+Only the topic keys `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. The topic key `tiered_storage` is enable-only: an update can set it to `true`, and setting it to `false` or resetting it is refused with 4103. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
 
 The SDK checks the typed fields and `reset` before sending, in the server's order and with its error codes (4041 for an unknown key, 4105 for a read-only key, 4103 for a create-only key, 4104 for a key without a default, then the name, username or status error). For a key this build has no field or constant for, pass `options` entries and `rawReset` names. The SDK sends those as they are and the server decides, so a refusal comes back from the server.
 

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::actor_kind::ActorKind;
 use derive_more::derive::Display;
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +43,17 @@ impl GroupMetricsKind {
             GroupMetricsKind::Consumers => "Consumer",
             GroupMetricsKind::ProducersAndConsumers => "Actor",
             GroupMetricsKind::ProducingConsumers => "Producing Consumer",
+        }
+    }
+}
+
+/// The group that holds an actor of this kind.
+impl From<ActorKind> for GroupMetricsKind {
+    fn from(kind: ActorKind) -> Self {
+        match kind {
+            ActorKind::Producer => Self::Producers,
+            ActorKind::Consumer => Self::Consumers,
+            ActorKind::ProducingConsumer => Self::ProducingConsumers,
         }
     }
 }

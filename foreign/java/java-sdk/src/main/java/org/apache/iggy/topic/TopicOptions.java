@@ -31,9 +31,10 @@ import java.util.Set;
 /**
  * The options a topic is created with, one typed setter per catalog key.
  *
- * <p>Every key here is fixed at create except {@code message_expiry} and {@code max_topic_size}, which a
- * {@link TopicUpdate} may change later. A key left unset is resolved by the server and reported in the
- * topic's derived options. {@code describeOptions} enumerates what a given server accepts.
+ * <p>Every key here is fixed at create except {@code message_expiry}, {@code max_topic_size},
+ * {@code local_retention_age} and {@code local_retention_size}, which a {@link TopicUpdate} may change
+ * later, and {@code tiered_storage}, which it may turn on. A key left unset is resolved by the server and
+ * reported in the topic's derived options. {@code describeOptions} enumerates what a given server accepts.
  *
  * <pre>{@code
  * var options = TopicOptions.builder()
@@ -176,6 +177,48 @@ public final class TopicOptions {
          */
         public Builder replicationFactor(long replicas) {
             return set(TopicOptionKey.REPLICATION_FACTOR, HeaderValue.fromUint32(replicas));
+        }
+
+        /**
+         * Segment age roll in microseconds, {@code 2^64 - 1} meaning never: a batch stamped this long after the
+         * active segment's first batch starts the next segment. Zero leaves the key to the server default.
+         *
+         * <p>The server refuses less than ten minutes, and any age together with {@code preallocate_segments}.
+         */
+        public Builder segmentMaxAge(BigInteger micros) {
+            return setUnlessZero(TopicOptionKey.SEGMENT_MAX_AGE, micros);
+        }
+
+        /**
+         * Move sealed segments to the object store and keep only the local retention on disk. An update can
+         * turn it on later and never off, because the removed local segments cannot come back.
+         *
+         * <p>Not available yet: the server refuses {@code true} with {@code FEATURE_UNAVAILABLE}.
+         */
+        public Builder tieredStorage(boolean enabled) {
+            return set(TopicOptionKey.TIERED_STORAGE, HeaderValue.fromBool(enabled));
+        }
+
+        /**
+         * How long a tiered topic keeps an uploaded segment on local disk in microseconds, {@code 2^64 - 1}
+         * meaning never removed. Zero leaves the key to the server default.
+         *
+         * <p>The server refuses a value above a finite {@code message_expiry}. No effect without
+         * {@code tiered_storage}.
+         */
+        public Builder localRetentionAge(BigInteger micros) {
+            return setUnlessZero(TopicOptionKey.LOCAL_RETENTION_AGE, micros);
+        }
+
+        /**
+         * Topic-wide cap in bytes on the uploaded segments a tiered topic keeps on local disk, {@code 2^64 - 1}
+         * meaning unlimited. Zero leaves the key to the server default.
+         *
+         * <p>The server refuses a value above a finite {@code max_topic_size}. No effect without
+         * {@code tiered_storage}.
+         */
+        public Builder localRetentionSize(BigInteger bytes) {
+            return setUnlessZero(TopicOptionKey.LOCAL_RETENTION_SIZE, bytes);
         }
 
         /** An option this build has no setter for. A typed setter wins on collision. */
