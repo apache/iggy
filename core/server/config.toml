@@ -1360,6 +1360,58 @@ handshake_grace = "10 s"
 # requests in flight.
 #max_concurrent_callouts = 64
 
+# Tiered storage: an object store for the sealed segments of tiered topics.
+# Without this section, the backend is "none" and no topic can turn tiered.
+# Even with a backend, no topic can turn tiered yet: that waits for a boot
+# check that this cluster owns the prefix, which this version does not do.
+#[tiered_storage]
+# "none", "fs" (a directory) or "s3" (S3 and stores with its API). The s3
+# backend is not implemented yet, so the server refuses to start with it.
+#backend = "none"
+# The key prefix of this cluster's objects. Two clusters can share a bucket
+# under different prefixes, but never under the same one.
+#prefix = "iggy"
+# The fs backend: the directory that holds the objects.
+#path = "/var/lib/iggy-tiered"
+# The s3 backend: the bucket, the region and, for a store other than AWS,
+# its URL.
+#bucket = "iggy-segments"
+#region = "eu-central-1"
+#endpoint = "http://minio:9000"
+# Static s3 credentials. Set them in the environment, with
+# IGGY_TIERED_STORAGE_ACCESS_KEY_ID and IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY,
+# rather than in this file. The printed configuration never shows them.
+#access_key_id = ""
+#secret_access_key = ""
+# The tuning values below are provisional.
+# The longest wait for one attempt at a store call other than a put, from
+# 1 s to 1 h.
+#request_timeout = "30 s"
+# If the store takes no piece of a put's body for this long, or gives no
+# answer for this long after the last piece, the put fails. A put has no
+# total deadline. From 1 s to 1 h.
+#progress_timeout = "30 s"
+# The most attempts at a store call other than a put that keeps failing for
+# a transient reason, the first one included, and the backoff between them,
+# each wait from 1 ms to 1 h.
+#max_attempts = 3
+#retry_delay = "200 ms"
+#max_retry_delay = "5 s"
+# Per shard: how many jobs of each class run at once, and the bytes that
+# fetches and uploads hold. A segment larger than 'upload_bytes' uploads
+# alone. Only segment uploads go through these caps so far, so only 'uploads'
+# and 'upload_bytes' take effect. The other caps take effect once cold reads
+# and deletes go through the tier service.
+#[tiered_storage.jobs]
+#demand_fetches = 16
+#demand_fetch_bytes = "64 MiB"
+#uploads = 2
+#upload_bytes = "2 GiB"
+#speculative_fetches = 4
+#speculative_fetch_bytes = "32 MiB"
+#deletes = 2
+#housekeeping = 1
+
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]
 # A literal IP or a DNS hostname, without a port. Named to match its roster

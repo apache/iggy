@@ -50,6 +50,10 @@ use list::{ListCache, Walk};
 /// forgets them all and syncs each one again.
 const MAX_DURABLE_DIRECTORIES: usize = 65_536;
 
+/// A put syncs its scratch file each time it wrote this many body bytes
+/// since the last sync.
+const SYNC_INTERVAL: u64 = 8 * 1024 * 1024;
+
 // A scratch name adds two dots and the 32 hex digits of an etag to the last
 // segment of a key, and a file name holds 255 bytes.
 const _: () = assert!(MAX_KEY_SEGMENT_LEN + 34 <= 255);
@@ -596,6 +600,11 @@ impl Leftovers {
 
 /// Writes the body after the header's room, then the header, and syncs the
 /// file.
+///
+/// The body is synced every [`SYNC_INTERVAL`] bytes as it arrives, so the
+/// last sync flushes little more than that. A caller that times each piece,
+/// as the tier service does, then sees the pace of the disk, and a large
+/// body never ends in one long sync after its last piece.
 async fn write_object(
     key: &str,
     file: &File,
@@ -607,6 +616,7 @@ async fn write_object(
     let mut writer = file;
     let mut position = header.len();
     let mut checksum = 0;
+    let mut unsynced = 0;
     let mut pieces = body.into_pieces();
     while let Some(piece) = pieces.next().await {
         let piece = piece.map_err(ObjectStoreError::Body)?;
@@ -618,6 +628,13 @@ async fn write_object(
             .0
             .map_err(|error| io_error(key, "writing", &error))?;
         position += len;
+        unsynced += len;
+        if unsynced >= SYNC_INTERVAL {
+            file.sync_data()
+                .await
+                .map_err(|error| io_error(key, "syncing", &error))?;
+            unsynced = 0;
+        }
     }
     if expected_crc32c.is_some_and(|expected| expected != checksum) {
         return Err(ObjectStoreError::ChecksumMismatch {

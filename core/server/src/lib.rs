@@ -78,6 +78,7 @@ pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;
 pub(crate) mod sysinfo_printer;
+pub(crate) mod tiered_storage;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;

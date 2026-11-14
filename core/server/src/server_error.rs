@@ -436,6 +436,22 @@ pub enum ServerError {
     ListConfigEnvVars(#[source] std::io::Error),
     #[error("failed to build the external auth HTTP client: {reason}")]
     ExternalAuthClient { reason: String },
+    #[error("tiered storage cannot start: {reason}")]
+    TieredStorage { reason: String },
+    #[error("tiered storage cannot start: tiered_storage.path {path:?} cannot be read")]
+    TieredStoragePath {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "tiered storage cannot start: tiered_storage.prefix {prefix:?} is not a usable key prefix"
+    )]
+    TieredStoragePrefix {
+        prefix: String,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

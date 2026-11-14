@@ -151,6 +151,30 @@ fn given_object_when_reading_its_file_should_find_header_then_body_on_block_boun
 }
 
 #[test]
+fn given_body_longer_than_the_sync_interval_when_putting_should_store_every_piece() {
+    let (_directory, store) = store();
+    let piece_len = usize::try_from(SYNC_INTERVAL / 3 + 1).unwrap();
+    let pieces: Vec<Bytes> = (0..7_u8)
+        .map(|fill| Bytes::from(vec![fill; piece_len]))
+        .collect();
+    let whole = pieces.concat();
+    let body = PutBody::from_stream(whole.len() as u64, stream::iter(pieces.into_iter().map(Ok)));
+
+    shard_runtime().block_on(async {
+        store
+            .put("a/large", body, &PutOptions::default())
+            .await
+            .unwrap();
+
+        let meta = store.head("a/large").await.unwrap();
+        assert_eq!(meta.size, whole.len() as u64);
+        assert_eq!(meta.crc32c, Some(crc32c::crc32c(&whole)));
+        let read = store.get_range("a/large", 0..meta.size).await.unwrap();
+        assert_eq!(read.bytes, whole);
+    });
+}
+
+#[test]
 fn given_failed_puts_when_reading_directory_should_find_no_scratch_files() {
     let (directory, store) = store();
 

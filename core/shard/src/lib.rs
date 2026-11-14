@@ -31,6 +31,7 @@ mod served_reads;
 pub mod shards_table;
 #[cfg(test)]
 mod test_support;
+pub mod tier_service;
 mod upload_pacing;
 
 pub use config::CoordinatorConfig;

@@ -396,6 +396,9 @@ pub struct ShardMetrics {
     client_requests: ClientRequestMetrics,
     fetches: FetchMetrics,
     readiness_push_to_fire: Histogram,
+    /// How late each consensus tick of the message pump ran after its timer
+    /// was due: the time the shard's thread spent on other work first.
+    pump_tick_lateness: Histogram,
 }
 
 impl ShardMetrics {
@@ -494,6 +497,7 @@ impl ShardMetrics {
             client_requests: ClientRequestMetrics::new(),
             fetches: FetchMetrics::new(),
             readiness_push_to_fire: latency_histogram(),
+            pump_tick_lateness: latency_histogram(),
         }
     }
 
@@ -510,6 +514,10 @@ impl ShardMetrics {
 
     pub(crate) fn record_readiness_push_to_fire(&self, elapsed: Duration) {
         self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
+    }
+
+    pub(crate) fn record_pump_tick_lateness(&self, lateness: Duration) {
+        self.pump_tick_lateness.observe(lateness.as_secs_f64());
     }
 
     pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
@@ -1433,6 +1441,11 @@ impl ShardMetrics {
             "time from applying the pushed partition state that made a parked readiness wait \
              ready to the end of that wait",
             self.readiness_push_to_fire.clone(),
+        );
+        registry.register(
+            "pump_tick_lateness_seconds",
+            "how late each consensus tick of the message pump ran after its timer was due",
+            self.pump_tick_lateness.clone(),
         );
     }
 
