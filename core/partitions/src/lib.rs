@@ -42,6 +42,8 @@ pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
 pub use repair_memory::RepairMemoryBudget;
+mod remote_segments;
+pub use remote_segments::{RemoteObjects, RemoteRange, RemoteSegments};
 mod segment;
 pub mod segment_anchor;
 pub mod segment_chain;
