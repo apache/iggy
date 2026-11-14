@@ -21,7 +21,7 @@
 mod chart;
 mod matrix;
 pub mod releases;
-mod runs;
+pub mod runs;
 mod settings;
 
 pub use self::runs::{CompareLink, RunList, oldest_first};
@@ -43,6 +43,8 @@ use self::matrix::{
 use self::runs::{RUNS_PARAM, RunEntry, opens_elsewhere, with_baseline, without};
 use self::settings::{SettingRow, setting_rows};
 use crate::api::fetch_benchmark_by_uuid;
+use crate::components::chart::series_color;
+use crate::components::framework::{Framework, framework_line};
 use crate::components::headline::{compact_judged_chip, judged_chip};
 use crate::components::page::{
     Crumb, breadcrumbs, data_status, loadable, page_head, page_shell, section_head,
@@ -66,8 +68,9 @@ const CHANGE_NOTE: &str = "A green or red change passes the delta rule. A gray c
                            within run-to-run noise, a run has a badge, or the parameters differ. \
                            Point at a change to see why, and the two values that it compares.";
 /// The baseline takes the accent, like the page's own run on the run page. Blue and violet stay
-/// distinct from it and from the colors of a better or worse change.
-const RUN_COLORS: [&str; MAX_COMPARED_RUNS] = [CURRENT_COLOR, "#147ce5", "#8b5cf6"];
+/// distinct from it and from the colors of a better or worse change. The OMB compare page uses
+/// them too, so a run's color means the same on both pages.
+pub const RUN_COLORS: [&str; MAX_COMPARED_RUNS] = [CURRENT_COLOR, "#147ce5", "#8b5cf6"];
 const LATENCY: NavSection = NavSection {
     id: "latency",
     label: "Latency",
@@ -88,7 +91,7 @@ static THROUGHPUT_SECTIONS: [NavSection; 2] = [THROUGHPUT, CONFIGURATION];
 pub struct ComparePageProps {
     /// The runs of an old link, `/compare/:left/:right`, instead of the query.
     #[prop_or_default]
-    pub alias: Option<RunList>,
+    pub alias: Option<RunList<Uuid>>,
 }
 
 #[function_component(ComparePage)]
@@ -167,7 +170,7 @@ impl Lookup {
     fn new(
         summaries: &Loadable<Vec<BenchmarkSummary>>,
         config: &Loadable<DashboardConfig>,
-        list: &RunList,
+        list: &RunList<Uuid>,
     ) -> Self {
         let (Loadable::Ready(summaries), Loadable::Ready(config)) = (summaries, config) else {
             return Self::Pending;
@@ -250,7 +253,12 @@ fn pending_view(data: &DashboardData) -> Html {
 
 fn head(lead: &str) -> Html {
     page_head(
-        breadcrumbs(&[Crumb::new("Explore", AppRoute::Explore)], CRUMB),
+        html! {
+            <>
+                { breadcrumbs(&[Crumb::new("Explore", AppRoute::Explore)], CRUMB) }
+                { framework_line(Framework::IggyBench) }
+            </>
+        },
         None,
         PAGE_TITLE,
         lead,
@@ -357,7 +365,7 @@ fn compare_view(
                     "One line per run for its main group, plotted against the time since the run \
                      started. The card next to the chart gives each run's rates and their change.",
                 ) }
-                <div class="compare-throughput">
+                <div class="chart-with-card">
                     <article class="card run-chart-card">
                         <h3>{"Throughput"}</h3>
                         <OverlayChart runs={throughput_runs} metric={SeriesMetric::Throughput} />
@@ -419,9 +427,9 @@ fn summary_line(
         _ => NO_VALUE.to_owned(),
     };
     html! {
-        <li class="compare-summary-run" style={run_color(color)}>
+        <li class="compare-summary-run" style={series_color(color)}>
             <span class="compare-summary-name">
-                <span class="compare-swatch" aria-hidden="true"></span>
+                <span class="series-swatch" aria-hidden="true"></span>
                 { run_name(run) }
             </span>
             { for changes.iter().map(|(label, change)| html! {
@@ -486,9 +494,9 @@ fn run_card(
         .timestamp_us
         .and_then(DayLabel::from_unix_micros);
     html! {
-        <article class="card compare-run" style={run_color(color)}>
+        <article class="card compare-run" style={series_color(color)}>
             <div class="compare-run-top">
-                <span class="compare-swatch" aria-hidden="true"></span>
+                <span class="series-swatch" aria-hidden="true"></span>
                 { version_tag_view(&version_tag(run), run.release) }
                 if let Some(level) = level {
                     <span class={classes!("compare-level", level_look(level))}>
@@ -508,7 +516,7 @@ fn run_card(
             <p class="compare-run-conditions">{ conditions(run) }</p>
             <div class="compare-run-actions">
                 <Link<AppRoute>
-                    to={AppRoute::Benchmark { uuid: run.uuid.to_string() }}
+                    to={AppRoute::Run { uuid: run.uuid.to_string() }}
                     classes={classes!("run-action")}
                 >
                     {"Open run"}
@@ -526,10 +534,6 @@ fn run_card(
             </div>
         </article>
     }
-}
-
-fn run_color(color: &str) -> String {
-    format!("--run-color: {color}")
 }
 
 fn ask_view(view: &CompareView) -> Html {
@@ -582,8 +586,8 @@ fn run_heads(view: &CompareView, first: &'static str) -> Html {
         <tr>
             <th scope="col">{ first }</th>
             { for view.runs.iter().zip(RUN_COLORS).enumerate().map(|(position, (run, color))| html! {
-                <th scope="col" class="run-table-number compare-run-head" style={run_color(color)}>
-                    <span class="compare-swatch" aria-hidden="true"></span>
+                <th scope="col" class="run-table-number compare-run-head" style={series_color(color)}>
+                    <span class="series-swatch" aria-hidden="true"></span>
                     { run_name(run) }
                     if position == 0 {
                         <small>{ BASELINE }</small>
@@ -617,7 +621,7 @@ fn columns(view: &CompareView) -> Vec<Column> {
             };
             Column {
                 run: run.into(),
-                style: run_color(color).into(),
+                style: series_color(color).into(),
             }
         })
         .collect()
@@ -731,34 +735,34 @@ fn throughput_card(view: &CompareView) -> Html {
                 .filter(|_| fastest > 0.0)
                 .map_or(0.0, |rate| rate / fastest * 100.0);
             html! {
-                <li class="compare-throughput-run" style={run_color(color)}>
-                    <span class="compare-throughput-name">
-                        <span class="compare-swatch" aria-hidden="true"></span>
-                        <span class="compare-throughput-run-name">{ run_name(run) }</span>
+                <li class="rates-row" style={series_color(color)}>
+                    <span class="rates-name">
+                        <span class="series-swatch" aria-hidden="true"></span>
+                        <span class="rates-label">{ run_name(run) }</span>
                     </span>
-                    <span class="compare-throughput-change">
+                    <span class="rates-change">
                         if position == 0 {
-                            <span class="compare-throughput-baseline">{ BASELINE }</span>
+                            <span class="rates-baseline">{ BASELINE }</span>
                         } else if let Some(change) = &rate_cell.change {
                             { compact_judged_chip(change.text.clone(), change.values.clone(), change.judgment) }
                         }
                     </span>
-                    <strong class="compare-throughput-rate" title={throughput.hint}>
+                    <strong class="rates-value" title={throughput.hint}>
                         { cell_text(rate_cell) }
                     </strong>
-                    <span class="compare-throughput-messages" title={messages.hint}>
+                    <span class="rates-messages" title={messages.hint}>
                         { cell_text(messages_cell) }
                     </span>
-                    <span class="compare-throughput-bar" aria-hidden="true">
+                    <span class="rates-bar" aria-hidden="true">
                         <span style={format!("width: {share:.1}%")}></span>
                     </span>
                 </li>
             }
         });
     html! {
-        <article class="card compare-throughput-card">
+        <article class="card rates-card">
             <h3>{"Against the baseline"}</h3>
-            <ul class="compare-throughput-runs">{ for runs }</ul>
+            <ul class="rates-list">{ for runs }</ul>
         </article>
     }
 }
