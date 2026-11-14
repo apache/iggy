@@ -4071,6 +4071,7 @@ func TestPartitionReader_MovesTheOffsetBackOverAReadLostAcrossANewSessionUnderTh
 	require.NoError(t, (<-polled).err)
 	nextInBackground(reader)
 	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	require.Eventually(t, func() bool { return len(client.recordedAbandons()) == 1 }, testTimeout, 5*time.Millisecond)
 	losesItsSession(t, client, reader, 1)
 
 	require.NoError(t, reader.Close(context.Background()))
@@ -4166,6 +4167,9 @@ func losesAReadAfterADelivery(t *testing.T) (*fakeClient, *PartitionReader) {
 	require.NoError(t, (<-polled).err)
 	nextInBackground(reader)
 	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	// Close cancels a read in flight, and the fake can then drop a reply that
+	// it did not take yet. The abandon shows that the reader took the lost read.
+	require.Eventually(t, func() bool { return len(client.recordedAbandons()) == 1 }, testTimeout, 5*time.Millisecond)
 	return client, reader
 }
 
@@ -4183,6 +4187,7 @@ func TestPartitionReader_EndsTheRetryOfARewindRefusedAsNotOwnedWhenTheContextOfC
 	next(t, reader)
 	nextInBackground(reader)
 	client.nextRead(t).reply <- fakeReply{err: ierror.FetchProgressUncertain{OperationID: 42}}
+	require.Eventually(t, func() bool { return len(client.recordedAbandons()) == 1 }, testTimeout, 5*time.Millisecond)
 	client.mu.Lock()
 	client.owners = map[uint32]uint64{1: returnedOwner, 2: returnedOwner}
 	client.installOp, client.watermark = ownerOp, ownerOp

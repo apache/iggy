@@ -15,8 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod config;
+pub mod delta;
+pub mod identity;
+pub mod metrics;
+pub mod series;
 pub mod subtext;
-pub mod title;
+pub mod summary;
+#[cfg(test)]
+mod test_fixtures;
 
 use bench_report::{
     cluster::BenchmarkClusterInfo, group_metrics_summary::BenchmarkGroupMetricsSummary,
