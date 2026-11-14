@@ -273,6 +273,18 @@ pub enum MetadataSubmit {
         reply: Sender<Result<u64, IggyError>>,
     },
     ForwardedSegmentDelete(Message<SegmentDeleteHeader>),
+    /// The primary of a tiered partition decided that retention removes its
+    /// segments up to `up_to_offset`. Shard 0 commits that as a
+    /// `TruncatePartition` when this node leads the metadata group, and
+    /// relays it to the node that does otherwise. No reply: the next timed
+    /// pass decides again.
+    RetentionTruncate {
+        namespace: IggyNamespace,
+        /// The incarnation the offset was read from. Slab ids are reused
+        /// after a delete, so the namespace alone can name a later partition.
+        created_revision: u64,
+        up_to_offset: u64,
+    },
     /// Replica-link liveness report routed to shard 0; no proposal or reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
     BindSession {
@@ -1140,6 +1152,24 @@ pub enum LifecycleFrame {
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
     },
+    /// Per-shard pass over a partition of a tiered topic: the primary works
+    /// out what the topic's retention removes, over local and remote segments
+    /// alike, and hands the offset to shard 0 to commit as a
+    /// `TruncatePartition`. Nothing is deleted here, and a backup does
+    /// nothing. The timer task resolves the same inputs as for
+    /// `CleanPartition`, plus the watermark already committed, so a decision
+    /// that commits nothing new is dropped on the pump.
+    RetainPartition {
+        namespace: IggyNamespace,
+        /// The incarnation the policy was read for. Slab ids are reused after
+        /// a delete, so by the time the pump takes the frame the namespace
+        /// can name a recreated partition with another policy.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    },
     /// Reconciler-staged enforcement of a committed `TruncatePartition`
     /// watermark: delete sealed segments up to `up_to_offset` on the pump,
     /// serialized with reads. Each replica applies the committed offset
@@ -1165,10 +1195,19 @@ pub enum LifecycleFrame {
     /// nothing on a shard without an uploader.
     UploadSegments {
         namespace: IggyNamespace,
+        /// The incarnation the pass was staged for. Slab ids are reused after
+        /// a delete, so by the time the pump takes the frame the namespace
+        /// can name a recreated partition that `committed_up_to` says
+        /// nothing about.
+        created_revision: u64,
         /// Whether the pass also sends the floor advance that a stored
         /// segment still owes. The pass that follows a finished upload leaves
         /// it out, since that advance was sent a moment ago.
         resend_advance: bool,
+        /// The truncation watermark metadata holds, on the pass the timer
+        /// task stages. Any other pass has no metadata to read it from, and
+        /// leaves the partition with the last one a timed pass brought.
+        committed_up_to: Option<u64>,
     },
     /// The result of an upload that an [`Self::UploadSegments`] pass started,
     /// sent by the task that ran it.
@@ -3478,6 +3517,69 @@ where
                 namespace_raw = namespace.inner(),
                 "segment cleaner pass refused by own inbox: {error:?}"
             );
+        }
+    }
+
+    /// Stage a retention pass for `namespace`, a partition of a tiered topic,
+    /// on this shard's pump. `created_revision` is the incarnation the policy
+    /// belongs to, and `committed_up_to` the truncation watermark metadata
+    /// already holds for it. A refused frame is picked up by the cleaner's
+    /// next tick.
+    pub fn request_retain_partition(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::RetainPartition {
+            namespace,
+            created_revision,
+            now,
+            message_expiry,
+            max_bytes,
+            committed_up_to,
+        }));
+    }
+
+    /// Run a retention pass over `namespace` on the pump: when its partition
+    /// is the incarnation `created_revision` and a tiered primary whose
+    /// retention removes segments past `committed_up_to`, hand the offset to
+    /// shard 0 to commit.
+    pub(crate) fn on_retain_partition(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    ) {
+        // The policy and the watermark belong to `created_revision`. Judged
+        // against any other incarnation they would truncate a topic that
+        // never had this policy.
+        let decision = self
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .filter(|partition| partition.created_revision() == created_revision)
+            .and_then(|partition| partition.total_retention_end(now, message_expiry, max_bytes));
+        // The same decision comes back on every tick until the replicas
+        // enforce it, and committing it again would only wake every
+        // reconciler.
+        if let Some(up_to_offset) = decision
+            && up_to_offset > committed_up_to
+        {
+            self.forward_metadata_submit(MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset,
+            });
         }
     }
 

@@ -3702,6 +3702,61 @@ where
         }
     }
 
+    /// Submit a replicated `TruncatePartition` originated by the server (the
+    /// retention of a tiered topic, decided by the partition primary), not by
+    /// a client `DeleteSegments`.
+    ///
+    /// Same in-process path as the PAT cleaner's delete: the reserved
+    /// internal client `0`, no request preflight, no receipt. The watermark
+    /// only rises, so a re-proposal on the next tick is harmless. `Ok(true)`
+    /// when the truncation committed and applied, `Ok(false)` when it
+    /// committed as a rejection.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
+    /// `PipelineFull` under pipeline pressure, `Canceled` if the prepare is
+    /// dropped before commit.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_truncate_partition_in_process(
+        &self,
+        request: &TruncatePartitionRequest,
+    ) -> Result<bool, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::TruncatePartition,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(iggy_binary_protocol::result_code(reply.body()) == Some(0)),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
+        }
+    }
+
     /// Submit a replicated client request from in-process and await the
     /// committed reply.
     ///

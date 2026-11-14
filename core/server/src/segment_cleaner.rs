@@ -17,6 +17,11 @@
 
 //! Per-shard periodic segment cleaner.
 //!
+//! A tiered topic is the exception to what follows: its retention covers the
+//! segments in the object store too, so only the partition primary decides,
+//! and the decision is committed as a `TruncatePartition` that every replica
+//! enforces.
+//!
 //! Local and unreplicated: every replica (primary and backup) trims its own
 //! expired or over-budget sealed segments. Divergence in physical log start is
 //! invisible to clients because reads are served by the partition primary. The
@@ -76,7 +81,7 @@ pub async fn run_segment_cleaner(shard: Rc<ServerShard>, stop: Receiver<()>, int
 /// across passes, so the disclosure lands once per topic instead of once per
 /// interval tick. Slab ids are reused after a delete, so the creation revision
 /// is part of the key: a topic recreated into the same slots discloses again.
-fn stage_owned_partitions(
+pub fn stage_owned_partitions(
     shard: &Rc<ServerShard>,
     reported_floors: &mut HashSet<(usize, usize, u64)>,
 ) {
@@ -119,8 +124,31 @@ fn stage_owned_partitions(
                 now,
                 local_envelope(age, size, partition_count),
             );
+            // One lookup, so both passes name the incarnation the watermark
+            // was read for.
+            let Some((created_revision, committed_up_to)) = streams
+                .with_committed_partition(namespace, |partition| {
+                    (partition.created_revision, partition.deleted_up_to_offset)
+                })
+            else {
+                continue;
+            };
             // Staged after the loop, where the shard orders them.
-            tiered.push(namespace);
+            tiered.push((namespace, created_revision, committed_up_to));
+            // Retention of a tiered topic covers its remote segments too, so
+            // no replica expires its own: the partition primary decides, and
+            // the decision reaches every replica as a committed truncation.
+            if has_expiry || budget.is_some() {
+                shard.request_retain_partition(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    budget.map(|budget| budget.max_bytes),
+                    committed_up_to,
+                );
+            }
+            continue;
         }
         if !has_expiry && budget.is_none() {
             continue;
@@ -154,7 +182,8 @@ fn stage_owned_partitions(
         );
     }
     // The timed pass is what retries an upload the store refused and an
-    // advance that did not commit.
+    // advance that did not commit. It is also the only upload pass that
+    // knows the committed truncation watermark.
     shard.request_upload_passes(&tiered, now);
 }
 
