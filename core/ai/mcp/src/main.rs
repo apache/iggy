@@ -103,7 +103,7 @@ async fn run() -> Result<(), McpRuntimeError> {
     let config: McpServerConfig = McpServerConfig::config_provider(config_path)
         .load_config()
         .await
-        .expect("Failed to load configuration");
+        .map_err(McpRuntimeError::Configuration)?;
 
     let telemetry = log::init_logging(&config.telemetry, config.transport, VERSION);
     let result = run_service(config).await;
@@ -135,6 +135,7 @@ async fn run_service(config: McpServerConfig) -> Result<(), McpRuntimeError> {
         read: config.permissions.read,
         update: config.permissions.update,
         delete: config.permissions.delete,
+        admin: config.permissions.admin,
     };
 
     #[cfg(feature = "systemd")]
@@ -219,6 +220,7 @@ pub struct Permissions {
     read: bool,
     update: bool,
     delete: bool,
+    admin: bool,
 }
 
 impl Permissions {
@@ -272,6 +274,17 @@ impl Permissions {
         } else {
             Err(ErrorData::invalid_request(
                 "Insufficient 'delete' permissions",
+                None,
+            ))
+        }
+    }
+
+    pub fn ensure_admin(&self) -> Result<(), ErrorData> {
+        if self.admin {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                "Insufficient 'admin' permissions",
                 None,
             ))
         }
