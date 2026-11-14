@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod test_json_output;
 mod test_topic_create_command;
 mod test_topic_delete_command;
 mod test_topic_get_command;

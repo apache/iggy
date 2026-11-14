@@ -128,8 +128,11 @@ fn get_command(
                 args.stream_id.clone(),
                 StreamUpdateOptions::from(&args),
             )),
-            StreamAction::Get(args) => Box::new(GetStreamCmd::new(args.stream_id.clone())),
-            StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.list_mode.into())),
+            StreamAction::Get(args) => Box::new(GetStreamCmd::new(
+                args.stream_id.clone(),
+                args.output.into(),
+            )),
+            StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.output().into())),
         },
         Command::Topic(command) => match command {
             TopicAction::Create(args) => Box::new(CreateTopicCmd::new(
@@ -155,10 +158,11 @@ fn get_command(
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
+                args.output.into(),
             )),
             TopicAction::List(args) => Box::new(GetTopicsCmd::new(
                 args.stream_id.clone(),
-                args.list_mode.into(),
+                args.output().into(),
             )),
         },
         Command::Partition(command) => match command {

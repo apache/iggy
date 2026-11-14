@@ -193,6 +193,11 @@ Options:
           [default: table]
           [possible values: table, list]
 
+  -o, --output <OUTPUT>
+          Output format (table, list or json), replaces --list-mode
+{CLAP_INDENT}
+          [possible values: table, list, json]
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -219,6 +224,7 @@ Arguments:
 
 Options:
   -l, --list-mode <LIST_MODE>  List mode (table or list) [default: table] [possible values: table, list]
+  -o, --output <OUTPUT>        Output format (table, list or json), replaces --list-mode [possible values: table, list, json]
   -h, --help                   Print help (see more with '--help')
 "#,
             ),

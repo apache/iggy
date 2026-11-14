@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
-use anyhow::Context;
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
@@ -24,13 +24,19 @@ use iggy_common::Identifier;
 use iggy_common::StreamEncryptionSource;
 use tracing::{Level, event};
 
+pub enum GetStreamOutput {
+    Table,
+    Json,
+}
+
 pub struct GetStreamCmd {
     stream_id: Identifier,
+    output: GetStreamOutput,
 }
 
 impl GetStreamCmd {
-    pub fn new(stream_id: Identifier) -> Self {
-        Self { stream_id }
+    pub fn new(stream_id: Identifier, output: GetStreamOutput) -> Self {
+        Self { stream_id, output }
     }
 }
 
@@ -40,18 +46,28 @@ impl CliCommand for GetStreamCmd {
         format!("get stream with ID: {}", self.stream_id)
     }
 
+    fn stdout_is_data(&self) -> bool {
+        matches!(self.output, GetStreamOutput::Json)
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let stream = client
             .get_stream(&self.stream_id)
             .await
             .with_context(|| format!("Problem getting stream with ID: {}", self.stream_id))?;
 
-        if stream.is_none() {
+        let Some(stream) = stream else {
+            if self.stdout_is_data() {
+                bail!("Stream with ID: {} was not found", self.stream_id);
+            }
             event!(target: PRINT_TARGET, Level::INFO, "Stream with ID: {} was not found", self.stream_id);
             return Ok(());
+        };
+
+        if self.stdout_is_data() {
+            return print_json(&stream);
         }
 
-        let stream = stream.unwrap();
         let mut table = Table::new();
 
         table.set_header(vec!["Property", "Value"]);
