@@ -457,6 +457,13 @@ store for the sealed segments of tiered topics. The server still refuses to turn
 `tiered_storage` on for a topic. No partition can read its segments back from
 the store yet.
 
+The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
+in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. It
+signs each request with the static keys `access_key_id` and
+`secret_access_key`, which it needs. With an empty `endpoint`, it uses AWS in
+`region`. `url_style` picks whether the bucket goes in the URL path or in the
+host name.
+
 At boot the server reads the store identity object `<prefix>/meta/identity`
 once. Only a missing bucket or rejected credentials stop the boot. If the store
 does not answer within `request_timeout`, or 5 seconds at most, the server
@@ -504,6 +511,10 @@ not work, because `fs` keeps a header before the body of each object file. A
 node that finds a wrong file still boots, but it runs no uploads or object
 deletes until the right file is back.
 
+With the `s3` backend, the object is the key `<prefix>/meta/identity` in the
+bucket. If it is lost or damaged, write the two lines back under that key with
+any S3 client. Each node logs the `cluster_uid` to write.
+
 A node logs that the object names another cluster when:
 
 - Another cluster uses the same prefix. Give this cluster another `prefix`.
@@ -511,7 +522,8 @@ A node logs that the object names another cluster when:
   objects under the prefix belong to its earlier lifetime. Give the cluster
   another `prefix`, or delete every object under the prefix, and replica 0
   claims it again.
-- The object holds bytes that no cluster wrote. Put the copy back.
+- The object holds bytes that no cluster wrote. Put the `fs` copy back, or
+  write the two lines again on `s3`.
 
 Give every node the same store and the same prefix. The check cannot tell every
 pair of stores apart. For example, replica 0 reaches an empty store, and the

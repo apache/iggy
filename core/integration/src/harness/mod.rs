@@ -46,6 +46,7 @@ pub mod disk;
 mod error;
 pub mod ext_auth_server;
 mod fixture;
+pub mod floci;
 pub mod handle;
 mod helpers;
 pub mod log_capture;

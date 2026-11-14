@@ -221,6 +221,11 @@ impl ServerHandle {
         self.config.removed_envs.push(key.into());
     }
 
+    /// The value that the server config gives the environment variable `key`.
+    pub fn env(&self, key: &str) -> Option<&str> {
+        self.config.extra_envs.get(key).map(String::as_str)
+    }
+
     pub fn collect_logs(&self) -> (String, String) {
         super::common::collect_logs(&self.stdout_path, &self.stderr_path)
     }

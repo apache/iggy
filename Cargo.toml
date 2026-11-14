@@ -157,6 +157,7 @@ harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"
 hex = "0.4.3"
 hostname = "0.4.2"
+http = "1.5.0"
 human-repr = "1.1.0"
 humantime = "2.4.0"
 hwlocality = "1.0.0-alpha.13"
@@ -184,6 +185,7 @@ left-right = "=0.11.8"
 libc = "0.2.191"
 lz4 = "1.28.1"
 lz4_flex = "0.14.0"
+md5 = "0.8.1"
 message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"
@@ -219,6 +221,7 @@ pin-project-lite = "0.2.17"
 predicates = "3.1.4"
 proc-macro2 = "1"
 prometheus-client = "0.25.2"
+quick-xml = { version = "0.42.0", features = ["overlapped-lists", "serialize"] }
 quinn = "0.11.12"
 quote = "1"
 rand = "0.10.3"
@@ -262,6 +265,7 @@ system_stats = { path = "core/system_stats" }
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.4.1"
+testcontainers = { version = "0.27.3", features = ["http_wait_plain", "reusable-containers"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = "0.26.6"

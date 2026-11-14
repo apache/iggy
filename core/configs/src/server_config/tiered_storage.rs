@@ -68,6 +68,30 @@ impl Display for TieredStorageBackend {
     }
 }
 
+/// Where the bucket goes in the request URLs of the `s3` backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3UrlStyle {
+    /// The host names the bucket on AWS, where `endpoint` is empty, and the
+    /// path names it on any other endpoint.
+    #[default]
+    Auto,
+    /// `{endpoint}/{bucket}/{key}`, which most stores with the S3 API take.
+    Path,
+    /// `{bucket}.{endpoint host}/{key}`, which AWS expects.
+    VirtualHosted,
+}
+
+impl Display for S3UrlStyle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Path => "path",
+            Self::VirtualHosted => "virtual_hosted",
+        })
+    }
+}
+
 #[serde_as]
 #[derive(Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +118,10 @@ pub struct TieredStorageConfig {
     /// The region of the `s3` backend.
     #[serde(default)]
     pub region: String,
+    /// Where the bucket goes in the request URLs of the `s3` backend.
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub url_style: S3UrlStyle,
     /// The access key ID of static `s3` credentials.
     // skip_serializing keeps credentials out of the runtime
     // `current_config.toml`, as for the cluster secrets.
@@ -182,6 +210,7 @@ impl Default for TieredStorageConfig {
             bucket: String::new(),
             endpoint: String::new(),
             region: String::new(),
+            url_style: S3UrlStyle::default(),
             access_key_id: String::new(),
             secret_access_key: String::new(),
             jobs: TierJobsConfig::default(),
@@ -233,14 +262,15 @@ impl Display for TieredStorageConfig {
         write!(
             f,
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
-             credentials: {}, jobs: {}, request_timeout: {}, progress_timeout: {}, \
-             max_attempts: {}, retry_delay: {}, max_retry_delay: {} }}",
+             url_style: {}, credentials: {}, jobs: {}, request_timeout: {}, \
+             progress_timeout: {}, max_attempts: {}, retry_delay: {}, max_retry_delay: {} }}",
             self.backend,
             self.prefix,
             self.path,
             self.bucket,
             self.endpoint,
             self.region,
+            self.url_style,
             self.credentials(),
             self.jobs,
             self.request_timeout,
