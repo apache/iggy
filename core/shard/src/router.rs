@@ -1170,6 +1170,18 @@ where
                     }
                 }
             }
+            LifecycleFrame::EvictPartition {
+                namespace,
+                now,
+                envelope,
+            } => {
+                // The envelope stays on the partition, so a floor advance that
+                // applies before the next tick evicts against it too.
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    partition.set_local_envelope(Some(envelope));
+                    partition.stage_eviction(now);
+                }
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,

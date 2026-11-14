@@ -17,8 +17,9 @@
 
 use super::{
     Chain, ChainError, ChainRecord, EvictionFailure, EvictionJob, HEADER_SIZE, HashSource,
-    ObjectPrefix, RECORD_SIZE, SegmentDigest, SegmentHashes, SegmentRecord, append_record,
-    chain_path, create_chain, decode_chain, encode_header, hash_segment_file, read_chain,
+    LiveChain, ObjectPrefix, RECORD_SIZE, SegmentChain, SegmentDigest, SegmentHashes,
+    SegmentRecord, append_record, chain_path, create_chain, decode_chain, encode_header,
+    hash_segment_file, read_chain,
 };
 use crate::state_transfer::ChunkHasher;
 
@@ -218,6 +219,64 @@ async fn given_a_segment_file_when_hashed_from_disk_should_match_its_bytes() {
             .await
             .is_err()
     );
+}
+
+#[test]
+fn given_a_floor_advance_when_encoded_should_decode_to_the_same_record() {
+    let advance = ChainRecord::Advanced(crate::tiered_floor::AdvanceTieredFloor {
+        start: 10,
+        up_to: 19,
+        hash: [5; 32],
+    });
+    let mut bytes = encode_header(&PREFIX).to_vec();
+    bytes.extend_from_slice(&advance.encode());
+    assert_eq!(decode_chain(&bytes).unwrap().records, [advance]);
+
+    // A byte this build never writes in an advance refuses the record.
+    let stray = HEADER_SIZE + 40;
+    bytes[stray] = 1;
+    assert_eq!(decode_chain(&bytes).unwrap().records, Vec::new());
+}
+
+#[test]
+fn given_advances_waiting_for_segments_when_one_seals_should_settle_only_those_it_holds() {
+    let advanced = |up_to| {
+        ChainRecord::Advanced(crate::tiered_floor::AdvanceTieredFloor {
+            start: up_to,
+            up_to,
+            hash: [7; 32],
+        })
+    };
+    let waiting = |chain: &SegmentChain| chain.advances.keys().copied().collect::<Vec<_>>();
+    let empty = Chain {
+        prefix: PREFIX,
+        records: Vec::new(),
+        valid_len: HEADER_SIZE as u64,
+        torn_tail: false,
+    };
+    let mut chain = SegmentChain::load(String::new(), LiveChain::new(&empty), None);
+    // The first ends its segment, the second ends inside the next one, and
+    // the third is two segments ahead.
+    for up_to in [9, 14, 29] {
+        assert_eq!(chain.note_appended(&advanced(up_to)), Vec::<u64>::new());
+    }
+
+    let first = ChainRecord::Sealed(segment(0, HashSource::CommitPath));
+    assert_eq!(chain.note_appended(&first), Vec::<u64>::new());
+    assert!(chain.evictable(0, 9));
+    assert_eq!(waiting(&chain), [14, 29]);
+
+    let second = ChainRecord::Sealed(segment(10, HashSource::CommitPath));
+    assert_eq!(chain.note_appended(&second), [14]);
+    assert!(!chain.evictable(10, 19));
+    assert_eq!(waiting(&chain), [29]);
+
+    assert_eq!(
+        chain.note_appended(&ChainRecord::TrimPoint(29)),
+        Vec::<u64>::new()
+    );
+    assert_eq!(waiting(&chain), Vec::<u64>::new());
+    assert_eq!(chain.diverged().iter().copied().collect::<Vec<_>>(), [14]);
 }
 
 #[test]

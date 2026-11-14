@@ -182,6 +182,12 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// The floor advances this replica applied that its chain does not record
+    /// yet, oldest first. Recorded ones leave from the front.
+    pub(crate) pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
+    /// How much of the partition stays on local disk, as the segment cleaner
+    /// last resolved it from the topic. `None` until it has.
+    local_envelope: Option<LocalEnvelope>,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -995,6 +1001,8 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            pending_advances: VecDeque::new(),
+            local_envelope: None,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -2056,6 +2064,7 @@ where
         (self.fatal.is_none()
             && self.maintenance.checkpoint.is_none()
             && !self.checkpoint_waits_for_commit()
+            && !self.checkpoint_waits_for_advances()
             && persistence.needs_checkpoint()
             && through_op > persistence.checkpoint_op()
             && through_op <= persistence.head())
@@ -12913,7 +12922,7 @@ where
         self.log.reset_read_state(sealed_index);
         self.stamp_sealed_segment(target.segment_start);
         if let Some(chain) = self.segment_chain.as_mut() {
-            chain.sealed(target.chain_record.as_ref(), start_offset);
+            let diverged = chain.sealed(target.chain_record.as_ref(), start_offset);
             // A segment whose bytes did not all pass through the digest seals
             // without a record, so it gets one hashed from disk.
             if target.chain_record.is_none()
@@ -12921,6 +12930,7 @@ where
             {
                 self.request_tiering(prefix);
             }
+            self.chain_settled(&diverged);
         }
         debug!(
             namespace_raw = self.namespace().inner(),
@@ -13249,23 +13259,125 @@ where
         let Some(pending) = &self.maintenance.tiering else {
             return false;
         };
+        let (failures, retry_after_micros) = (pending.failures, pending.retry_after_micros);
+        // Before any job is chosen: the lane records only the front advance.
+        self.drop_recorded_advances();
         // The next start asks again, and the shutdown flush does not wait for
-        // the rest of the history to be hashed.
-        if self.maintenance.shutdown.is_some() {
+        // the rest of the history to be hashed. The applied advances are still
+        // recorded, each with one short append that goes before any hash: a
+        // checkpoint during the shutdown would otherwise outrun them.
+        if self.maintenance.shutdown.is_some()
+            && (failures > 0 || self.segment_chain.is_none() || self.pending_advances.is_empty())
+        {
             self.maintenance.tiering = None;
             return false;
         }
-        if self.consensus.clock_realtime_micros() < pending.retry_after_micros {
+        if self.consensus.clock_realtime_micros() < retry_after_micros {
             return false;
         }
         let Some(read_len) = self.next_tiering_read_len() else {
             self.maintenance.tiering = None;
+            // No chain can be opened here, so nothing ever records these.
+            self.pending_advances.clear();
             return false;
         };
         if let Some(pending) = &mut self.maintenance.tiering {
             pending.read_len = read_len;
         }
         true
+    }
+
+    /// Drop the leading advances that the chain holds or a segment settled,
+    /// so that choosing the next job looks at one advance however many wait.
+    fn drop_recorded_advances(&mut self) {
+        let Some(chain) = self.segment_chain.as_ref() else {
+            return;
+        };
+        while self
+            .pending_advances
+            .front()
+            .is_some_and(|advance| !chain.lacks_advance(advance))
+        {
+            self.pending_advances.pop_front();
+        }
+    }
+
+    /// A checkpoint keeps the floor and lets the WAL drop the advances that
+    /// moved it. One taken before the chain holds them would leave a restarted
+    /// replica unable to evict their segments, or any segment after them. It
+    /// waits only while the I/O lane is about to record them.
+    ///
+    /// A failed append is retried after a delay that keeps growing, and only
+    /// checkpoints bound the WAL, so a checkpoint does not wait for a retry.
+    /// Nor does it wait where the lane never reaches the tiering step.
+    fn checkpoint_waits_for_advances(&self) -> bool {
+        self.has_io_dispatcher()
+            && !self.materialization_missing
+            && self
+                .maintenance
+                .tiering
+                .as_ref()
+                .is_some_and(|pending| pending.failures == 0)
+            && !self.pending_advances.is_empty()
+    }
+
+    /// Take a floor advance this replica applied. The store holds the
+    /// segment, so this replica may evict its own copy, but only once it has
+    /// recorded the advance and its own sealed record carries the same hash.
+    pub(crate) fn note_tiered_advance(&mut self, advance: crate::tiered_floor::AdvanceTieredFloor) {
+        self.pending_advances.push_back(advance);
+        if let Some(prefix) = self.object_prefix() {
+            self.request_tiering(prefix);
+        }
+        self.notify_io();
+    }
+
+    /// Act on what the chain learned from a new record: report the advances
+    /// that this replica's segments contradict, and stage the eviction of the
+    /// segments an advance confirmed.
+    fn chain_settled(&mut self, diverged: &[u64]) {
+        for up_to in diverged {
+            error!(
+                namespace_raw = self.namespace().inner(),
+                up_to,
+                "a tiered floor advance does not match this replica's segment, which stays on disk"
+            );
+        }
+        self.stage_eviction(IggyTimestamp::now());
+    }
+
+    /// The last offsets of the floor advances that this replica's own
+    /// segments contradict. Any entry means the replica and the store
+    /// disagree about committed bytes.
+    #[must_use]
+    pub fn tiered_divergences(&self) -> Vec<u64> {
+        self.segment_chain
+            .as_ref()
+            .map_or_default(|chain| chain.diverged().iter().copied().collect())
+    }
+
+    /// Keep what the topic says stays on local disk, for the evictions that a
+    /// floor advance stages between two passes of the segment cleaner.
+    pub const fn set_local_envelope(&mut self, envelope: Option<LocalEnvelope>) {
+        self.local_envelope = envelope;
+    }
+
+    /// Hand the I/O lane the segments that may leave the disk now: sealed,
+    /// below the tiered floor, confirmed by an advance and outside the local
+    /// envelope.
+    pub fn stage_eviction(&mut self, now: IggyTimestamp) {
+        let (Some(envelope), Some(floor)) = (self.local_envelope, self.tiered_floor()) else {
+            return;
+        };
+        let Some(through) = self.eviction_end(now, floor, envelope) else {
+            return;
+        };
+        self.maintenance.eviction = Some(
+            self.maintenance
+                .eviction
+                .map_or(through, |previous| previous.max(through)),
+        );
+        self.notify_io();
     }
 
     /// Whether the tiering job that is ready lets other work go first. It
@@ -13289,6 +13401,13 @@ where
         let segments = self.log.segments();
         if let Some(removed) = segments.first()?.start_offset.checked_sub(1)
             && chain.trim(removed).is_some()
+        {
+            return Some(0);
+        }
+        if self
+            .pending_advances
+            .front()
+            .is_some_and(|advance| chain.lacks_advance(advance))
         {
             return Some(0);
         }
@@ -13333,7 +13452,16 @@ where
         if let Some(removed) = segments.first()?.start_offset.checked_sub(1)
             && let Some(append) = chain.trim(removed)
         {
-            return Some(crate::segment_chain::TieringJob::Trim(append));
+            return Some(crate::segment_chain::TieringJob::Append(append));
+        }
+        // Advances apply in offset order, and the recorded ones were dropped
+        // from the front.
+        if let Some(append) = self
+            .pending_advances
+            .front()
+            .and_then(|advance| chain.record_advance(advance))
+        {
+            return Some(crate::segment_chain::TieringJob::Append(append));
         }
         let digest = pending.digest.clone()?;
         let index = segments
@@ -13358,9 +13486,11 @@ where
             }
             crate::segment_chain::TieringResult::Opened(Err(error)) => Some(error),
             crate::segment_chain::TieringResult::Appended(Ok(record)) => {
-                if let Some(chain) = self.segment_chain.as_mut() {
-                    chain.note_appended(&record);
-                }
+                let diverged = self
+                    .segment_chain
+                    .as_mut()
+                    .map(|chain| chain.note_appended(&record));
+                self.chain_settled(&diverged.unwrap_or_default());
                 None
             }
             crate::segment_chain::TieringResult::Appended(Err(error)) => Some(error.into()),

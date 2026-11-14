@@ -1146,6 +1146,16 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         up_to_offset: u64,
     },
+    /// Per-shard pass over a partition of a tiered topic: evict the sealed
+    /// segments below the tiered floor that left `envelope`. The timer task
+    /// resolves the envelope from the topic and stamps `now`. Local and
+    /// unreplicated, like `CleanPartition`: each replica reclaims its own
+    /// disk.
+    EvictPartition {
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        envelope: partitions::LocalEnvelope,
+    },
 }
 
 /// Reconciler-staged partition mutation.
@@ -3416,6 +3426,24 @@ where
     /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
     /// pump: delete sealed segments up to `up_to_offset`. The reconciler calls
     /// this after observing a committed delete watermark for an owned partition.
+    /// Stage an eviction pass for `namespace` on this shard's pump. A refused
+    /// frame is picked up by the cleaner's next tick.
+    pub fn request_evict_partition(
+        &self,
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        envelope: partitions::LocalEnvelope,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::EvictPartition {
+            namespace,
+            now,
+            envelope,
+        }));
+    }
+
     pub fn request_truncate_partition(&self, namespace: IggyNamespace, up_to_offset: u64) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
