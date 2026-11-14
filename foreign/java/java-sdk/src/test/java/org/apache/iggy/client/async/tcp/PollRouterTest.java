@@ -905,6 +905,30 @@ class PollRouterTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReturnATieredReadFailureWithoutSendingThePollAgain(boolean deferred) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        try {
+            ByteBuf first = routedPoll(router, pollPayload(), deferred).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            first.release();
+            int code = IggyErrorCode.TIERED_READ_FAILED.getCode();
+            primary.replies.add(CompletableFuture.failedFuture(IggyServerException.fromTcpResponse(code, new byte[0])));
+            timers.delaysMillis.clear();
+            assertServerError(routedPoll(router, pollPayload(), deferred), code);
+            assertThat(primary.sentContexts).hasSize(2);
+            assertThat(timers.delaysMillis).allMatch(delay -> delay > 1000L);
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     /**
      * A dead primary answers nothing, so only its lost link can move the partition. The next attempt reads the route
      * again on the replica after the dead one, which a view change makes the next primary.

@@ -642,6 +642,26 @@ mod tests {
         assert_eq!(server.requests().len(), 7);
     }
 
+    /// A read that the object store refused returns no messages, so the server stores no
+    /// offset for it. The refusal must reach the reader as it is: a block would hide a failure
+    /// that no retry changes behind an uncertain outcome that the reader retries.
+    #[tokio::test]
+    async fn given_an_on_read_poll_when_the_tiered_read_fails_should_return_it_without_a_block() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(424, &IggyError::TieredReadFailed),
+            Reply::polled(),
+        ])
+        .await;
+        let client = server.client();
+
+        let refused = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let next = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+
+        assert_eq!(refused.map(drop), Err(IggyError::TieredReadFailed));
+        next.unwrap();
+        assert_eq!(server.requests().len(), 2);
+    }
+
     /// The server returns a first message above `max_bytes` alone in the reply, so it refuses a
     /// poll with `InvalidSizeBytes` only for a byte limit it cannot serve, before it stores
     /// anything. The refusal comes back from one read and the partition polls on.

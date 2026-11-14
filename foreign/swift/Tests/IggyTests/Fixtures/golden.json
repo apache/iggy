@@ -722,6 +722,7 @@
     "93": "producer_epoch_fenced",
     "94": "producer_unknown",
     "95": "producer_partition_required",
+    "96": "tiered_read_failed",
     "100": "client_not_found",
     "101": "invalid_client_id",
     "206": "connection_closed",

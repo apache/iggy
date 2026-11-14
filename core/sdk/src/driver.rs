@@ -3542,6 +3542,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_tiered_read_failure_when_polling_should_return_it_without_a_resend() {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            POLL_MESSAGES_CODE,
+            repeat_n(Answer::Refuse(IggyError::TieredReadFailed), ENDLESS),
+        );
+
+        let polled = f
+            .driver
+            .poll(&f.poll(false, WirePollingStrategy::next()), None)
+            .await;
+
+        assert_eq!(polled, Err(IggyError::TieredReadFailed));
+        assert_eq!(f.cluster.count(POLL_MESSAGES_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_retained_send_when_progress_poll_enters_should_keep_progress_independent() {
         let fixture = Fixture::new().await;
         let op = fixture.uncertain_send().await;
@@ -4952,6 +4970,7 @@ mod tests {
         for status in [
             IggyError::TooManyConsumerOffsets.as_code(),
             IggyError::PartitionNotFound(0, Identifier::default(), Identifier::default()).as_code(),
+            IggyError::TieredReadFailed.as_code(),
         ] {
             let f = Fixture::new().await;
             f.cluster.script(
@@ -6305,15 +6324,16 @@ mod tests {
         }
     }
 
-    /// The server refuses a first message larger than `max_bytes`, and a read that needs a new
-    /// offset key above the limit, before it stores the offset, so each refusal proves the
-    /// outcome of a committing poll.
+    /// The server refuses a first message larger than `max_bytes`, a read that needs a new
+    /// offset key above the limit, and a read of tiered data that the object store refused,
+    /// before it stores the offset, so each refusal proves the outcome of a committing poll.
     #[tokio::test(start_paused = true)]
     async fn given_a_refusal_before_the_store_when_a_committing_poll_is_refused_should_return_it_and_leave_its_partition_open()
      {
         for refusal in [
             IggyError::InvalidSizeBytes,
             IggyError::TooManyConsumerOffsets,
+            IggyError::TieredReadFailed,
         ] {
             let f = Fixture::new().await;
             f.cluster.script(
