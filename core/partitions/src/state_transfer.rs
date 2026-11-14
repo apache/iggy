@@ -5090,7 +5090,7 @@ const INDEX_STRIDE_BYTES: usize = 64 * 1024;
 /// chunk) the yields would add over half the pass again; 4 MiB keeps the
 /// un-yielded stretch a bounded ~80 us CPU pass at ~15% overhead, and
 /// matches the recovery walk's `SCAN_WINDOW_CAPACITY`.
-const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
+pub(crate) const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 
 /// Bytes one offer-build round may read and hash before it refuses and resumes
 /// on the next request.

@@ -993,6 +993,7 @@ async fn reconcile_target(
             counters.rows_rewritten += 1;
             return Convergence::Pending;
         }
+        enable_committed_tiering(ctx, ns, epoch);
         return trim_to_watermark(ctx, ns, target.delete_watermark, counters);
     }
 
@@ -1997,6 +1998,27 @@ fn shards_table_has_epoch(ctx: &ReconcilerCtx, ns: IggyNamespace, epoch: u64) ->
     ctx.shard.shards_table().epoch_for(ns) == Some(epoch)
 }
 
+/// Start the chain file of a live owned partition whose topic turned tiered
+/// storage on. The partition's I/O lane does the work, and a partition that
+/// keeps a chain already is left alone, so every pass can ask.
+fn enable_committed_tiering(ctx: &ReconcilerCtx, ns: IggyNamespace, created_revision: u64) {
+    let tiered = ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        inner
+            .items
+            .get(ns.stream_id())
+            .and_then(|stream| stream.topics.get(ns.topic_id()))
+            .is_some_and(|topic| topic.resolved.tiered_storage)
+    });
+    if !tiered {
+        return;
+    }
+    if let Some(partition) = ctx.shard.plane.partitions().get_mut_by_ns(&ns)
+        && !partition.is_tiered()
+    {
+        partition.enable_tiering(partitions::object_prefix(ns, created_revision));
+    }
+}
+
 /// Enforce the committed `TruncatePartition` watermark of a live owned
 /// partition. A watermark whose enforcement is still incomplete (first local
 /// segment starts below it) is pending work: the pump may be blocked by a
@@ -2435,6 +2457,7 @@ mod tests {
     };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
+        UpdateTopicResolvedRequest,
     };
     use iggy_binary_protocol::{
         AckLevel, Command, ConsensusHeader, Operation, PrepareHeader, RepairRangeReplyHeader,
@@ -3227,6 +3250,104 @@ mod tests {
             partitions.len(),
             3,
             "second pass over an unchanged target must be a no-op"
+        );
+    }
+
+    /// The enable is a topic update, which no partition takes part in, so the
+    /// reconciler is what tells each replica's partitions to start their
+    /// chain files.
+    #[compio::test]
+    async fn given_a_live_partition_when_its_topic_enables_tiered_storage_should_ask_it_to_start_its_chain()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let partitions = shard.plane.partitions();
+        let pending = || partitions.with_partition(&ns, IggyPartition::pending_tiering);
+        assert_eq!(pending(), Some(None), "the topic is not tiered yet");
+
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(
+                &ResourceOptions::from([(
+                    HeaderKey::from(OptionKey::TieredStorage),
+                    OptionValue::explicit(HeaderValue::from(true)),
+                )]),
+                OptionsProvenance::All,
+            )
+            .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &enable))
+            .expect("UpdateTopic apply succeeds");
+        reconcile_pass(&ctx).await;
+
+        let created_revision = partitions
+            .with_partition(&ns, IggyPartition::created_revision)
+            .expect("the partition is live");
+        assert_eq!(
+            pending(),
+            Some(Some(partitions::object_prefix(ns, created_revision)))
+        );
+    }
+
+    /// A partition built on a topic that is tiered already starts its chain
+    /// file with its directory, without waiting for a later pass.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_its_partition_is_built_should_ask_it_to_start_its_chain() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        let request = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic-a").expect("test topic name fits WireName"),
+                options: resource_options_to_wire(
+                    &ResourceOptions::from([(
+                        HeaderKey::from(OptionKey::TieredStorage),
+                        OptionValue::explicit(HeaderValue::from(true)),
+                    )]),
+                    OptionsProvenance::All,
+                )
+                .expect("options fit the wire"),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![assignment(0, 1)],
+        };
+        mux.update(build_prepare(
+            2,
+            Operation::CreateTopicWithAssignments,
+            &request,
+        ))
+        .expect("CreateTopicWithAssignments apply succeeds");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_pass(&ctx).await;
+
+        let partitions = shard.plane.partitions();
+        let created_revision = partitions
+            .with_partition(&ns, IggyPartition::created_revision)
+            .expect("the partition is built");
+        assert_eq!(
+            partitions.with_partition(&ns, IggyPartition::pending_tiering),
+            Some(Some(partitions::object_prefix(ns, created_revision)))
         );
     }
 

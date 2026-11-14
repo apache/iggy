@@ -21,7 +21,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -58,6 +58,7 @@ pub struct AppliedFrontier {
     read_budget: Duration,
     partition_freshness: Option<PartitionFreshness>,
     recovering_shards: AtomicUsize,
+    tiered_storage_ready: AtomicBool,
 }
 
 /// A shard's recovery state, shared with the node's primary placement probes.
@@ -146,6 +147,7 @@ impl AppliedFrontier {
             read_budget,
             partition_freshness: None,
             recovering_shards: AtomicUsize::new(0),
+            tiered_storage_ready: AtomicBool::new(false),
         }
     }
 
@@ -160,6 +162,20 @@ impl AppliedFrontier {
     #[must_use]
     pub fn has_partition_recovery(&self) -> bool {
         self.recovering_shards.load(Ordering::Acquire) != 0
+    }
+
+    /// Record whether this node can tier topics. False until set, and no boot
+    /// path sets it. Shard 0 reports it to the metadata primary, which admits a
+    /// tiered topic only once every member reports true.
+    pub fn set_tiered_storage_ready(&self, ready: bool) {
+        self.tiered_storage_ready.store(ready, Ordering::Release);
+    }
+
+    /// Whether this node can tier topics, as [`Self::set_tiered_storage_ready`]
+    /// last recorded it.
+    #[must_use]
+    pub fn tiered_storage_ready(&self) -> bool {
+        self.tiered_storage_ready.load(Ordering::Acquire)
     }
 
     /// Arm admission for a multi-node process. `epoch` must use the bus clock;
