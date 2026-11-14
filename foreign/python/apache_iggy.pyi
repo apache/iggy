@@ -1325,6 +1325,32 @@ class IggyClient:
         Raises:
             RuntimeError: If the request fails.
         """
+    def create_personal_access_token(
+        self, name: builtins.str, expiry: IggyExpiry
+    ) -> collections.abc.Awaitable[str]:
+        r"""
+        Creates a personal access token for the authenticated user.
+
+        The token is returned once, so store it when the call completes.
+        `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a
+        token that never expires.
+
+        Returns:
+            An awaitable that resolves to the raw token as `str`.
+
+        Raises:
+            ValueError: If the expiry is invalid.
+            PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
+                The token may exist with its value lost. A retry with the same name
+                fails with code 51. Delete the token by name, then create it again.
+                Until `delete_personal_access_token` is added, delete the token
+                through the HTTP API or another SDK.
+            RuntimeError: If the server refuses the request.
+                On TCP, QUIC, and WebSocket, an empty name or a name over 255 bytes
+                raises code 4 before anything is sent. On TCP, a name from 1 to
+                255 bytes is accepted. On HTTP, a name outside 3 to 30 bytes is
+                refused with code 300.
+        """
     def get_user(
         self, user_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[UserInfoDetails | None]:
