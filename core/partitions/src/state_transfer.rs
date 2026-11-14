@@ -2607,6 +2607,15 @@ where
         }
     }
 
+    /// Whether a served repair tail holds a lease that
+    /// [`Self::expire_transfer_tails`] must end on a later tick.
+    pub(crate) fn holds_transfer_tail_lease(&self) -> bool {
+        self.served_repair_tails
+            .borrow()
+            .values()
+            .any(|tail| tail.lease.is_some())
+    }
+
     pub fn expire_transfer_tails(&self, tick: u64, idle_ticks_max: u64) {
         for tail in self.served_repair_tails.borrow_mut().values_mut() {
             if tick.saturating_sub(tail.last_active_tick) >= idle_ticks_max {

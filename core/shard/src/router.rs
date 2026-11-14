@@ -905,12 +905,7 @@ where
     /// the pump-exit edges where a stop signal wins before that tick, or a
     /// queued frame fails while the pump is draining during shutdown.
     fn first_partition_commit_fault(&self) -> Option<FatalCommit> {
-        let partitions = self.plane.partitions();
-        partitions.namespaces().find_map(|namespace| {
-            partitions
-                .get_io_owner(namespace)
-                .and_then(|partition| partition.fatal().cloned())
-        })
+        self.plane.partitions().first_commit_fault()
     }
 
     /// `first_partition_commit_fault` for the simulator's lost-wakeup

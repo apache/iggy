@@ -361,6 +361,8 @@ pub struct ShardMetrics {
     partition_repair_ring_entries_dropped: Counter,
     partition_wal_checkpoints: Counter,
     partition_wal_errors: Counter,
+    partition_tick_visits: Counter,
+    partition_missed_wakeups: Counter,
     frame_drops: FrameDropMetrics,
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
@@ -476,6 +478,8 @@ impl ShardMetrics {
             partition_repair_ring_entries_dropped: Counter::default(),
             partition_wal_checkpoints: Counter::default(),
             partition_wal_errors: Counter::default(),
+            partition_tick_visits: Counter::default(),
+            partition_missed_wakeups: Counter::default(),
             frame_drops: FrameDropMetrics {
                 total: frame_drops_total,
                 cached_counters,
@@ -577,11 +581,10 @@ impl ShardMetrics {
         self.object_store_unreachable.get() != 0
     }
 
+    /// The WAL work of the partitions that a sweep visited. The bytes on disk
+    /// and the retained bytes are levels of sleeping partitions too, so
+    /// [`Self::set_partition_levels`] publishes them.
     pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
-        self.partition_wal_disk_bytes
-            .set(i64::try_from(metrics.disk_bytes).unwrap_or(i64::MAX));
-        self.partition_wal_retained_bytes
-            .set(i64::try_from(metrics.retained_bytes).unwrap_or(i64::MAX));
         self.partition_wal_queued_bytes
             .set(i64::try_from(metrics.queued_bytes).unwrap_or(i64::MAX));
         self.partition_wal_in_flight_bytes
@@ -770,6 +773,18 @@ impl ShardMetrics {
             "partition WAL writer failures",
             self.partition_wal_errors.clone(),
         );
+        registry.register(
+            "partition_tick_visits",
+            "partitions the consensus tick visited; a quiet partition is visited once per \
+             timeout, so a rate near partitions times ticks means that few of them sleep",
+            self.partition_tick_visits.clone(),
+        );
+        registry.register(
+            "partition_missed_wakeups",
+            "sleeping partitions the consensus tick found with work and woke; non-zero means \
+             that a change reached a partition with no wake-up",
+            self.partition_missed_wakeups.clone(),
+        );
     }
 
     pub(crate) fn set_partition_io_limits(&self, capacity: usize, bytes_max: usize) {
@@ -807,16 +822,38 @@ impl ShardMetrics {
             .set(i64::try_from(quarantined).unwrap_or(i64::MAX));
     }
 
-    /// Republished by every partition sweep: what the repair rings on this
-    /// shard actually hold, which the configured per-partition ceilings do not
-    /// say. The ceilings multiply by the partition count on every replica, so
-    /// this is the only place an operator can see the real cost of raising
-    /// them.
-    pub fn set_repair_ring(&self, entries: usize, bytes: u64) {
+    /// Republished by every partition sweep, summed over every partition of
+    /// the shard: the WAL bytes, and what the repair rings actually hold,
+    /// which the configured per-partition ceilings do not say. The ceilings
+    /// multiply by the partition count on every replica, so this is the only
+    /// place an operator can see the real cost of raising them.
+    pub fn set_partition_levels(&self, levels: &partitions::GaugeShare) {
+        self.partition_wal_disk_bytes
+            .set(i64::try_from(levels.wal_disk_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_retained_bytes
+            .set(i64::try_from(levels.wal_retained_bytes).unwrap_or(i64::MAX));
         self.partition_repair_ring_entries
-            .set(i64::try_from(entries).unwrap_or(i64::MAX));
+            .set(i64::try_from(levels.repair_ring_entries).unwrap_or(i64::MAX));
         self.partition_repair_ring_bytes
-            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+            .set(i64::try_from(levels.repair_ring_bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Partitions that one sweep visited.
+    pub fn record_partition_tick_visits(&self, visits: usize) {
+        self.partition_tick_visits
+            .inc_by(u64::try_from(visits).unwrap_or(u64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_tick_visits_value(&self) -> u64 {
+        self.partition_tick_visits.get()
+    }
+
+    /// A sleeping partition that the sweep found with work.
+    pub fn record_partition_missed_wakeup(&self) {
+        self.partition_missed_wakeups.inc();
     }
 
     /// Where the shed left this shard's repair ring budget, and what it took.
@@ -1068,6 +1105,13 @@ impl ShardMetrics {
     pub fn set_partitions_owing_retirement(&self, owing: usize) {
         self.partitions_owing_retirement
             .set(i64::try_from(owing).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(test)]
+    #[must_use]
+    pub fn partitions_owing_retirement_value(&self) -> i64 {
+        self.partitions_owing_retirement.get()
     }
 
     /// Republished by every timed upload pass: the age of the oldest sealed
@@ -1900,9 +1944,9 @@ mod tests {
     #[test]
     fn persistence_scrape_distinguishes_retained_budget_from_wal_file_bytes() {
         let metrics = ShardMetrics::for_shard();
-        metrics.record_persistence(&partitions::PersistenceMetrics {
-            disk_bytes: 4096,
-            retained_bytes: 65536,
+        metrics.set_partition_levels(&partitions::GaugeShare {
+            wal_disk_bytes: 4096,
+            wal_retained_bytes: 65536,
             ..Default::default()
         });
         let mut registry = Registry::default();

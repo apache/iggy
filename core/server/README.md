@@ -191,6 +191,14 @@ that lost their quorum do not stop the elections of other partitions.
 view change, and `partition_view_change_votes_held`, the elections it holds
 back.
 
+The 10 ms tick of a shard visits only the partitions with work. A partition
+with nothing to commit, replicate, persist or repair sleeps until its next
+timeout, and a frame for it or a finished I/O step makes it due on the next
+tick. `/metrics` reports `partition_tick_visits`, the visits of a shard, and
+`partition_missed_wakeups`, the sleeping partitions that a check found with
+work and woke. That check tests a few sleeping partitions per tick. Its
+counter stays at 0 on a correct server, so report a value above 0 as a bug.
+
 A create whose namespace is invalid can receive 58 (`TransientNotAccepted`) while
 any metadata write is pending, even an unrelated one. Under steady unrelated
 traffic its retries can reach the deadline with 58 instead of the namespace

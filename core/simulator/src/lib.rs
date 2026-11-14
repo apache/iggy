@@ -270,6 +270,8 @@ pub struct Simulator {
     /// routing. Set at construction by [`Simulator::with_shards_shell`].
     shell: bool,
     seed_root: bool,
+    /// Set by [`Self::visit_every_partition`].
+    every_partition_due: bool,
     /// Repair ring budget of every shard, `None` for no budget. A restart
     /// gives the rebuilt shards the same one.
     repair_ring_bytes_max: Option<usize>,
@@ -627,6 +629,7 @@ impl Simulator {
             seed,
             shell,
             seed_root,
+            every_partition_due: false,
             repair_ring_bytes_max,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
             _system_directory: system_directory,
@@ -978,6 +981,22 @@ impl Simulator {
             .collect()
     }
 
+    /// Make every shard tick visit every partition, as a tick did before
+    /// quiet partitions slept. A run with it must replay the run without it:
+    /// a difference means that a tick skipped a partition with work.
+    pub const fn visit_every_partition(&mut self) {
+        self.every_partition_due = true;
+    }
+
+    fn wake_partitions_if_every_one_is_due(&self) {
+        if !self.every_partition_due {
+            return;
+        }
+        for shard in self.replicas.iter().flat_map(|replica| &replica.shards) {
+            shard.plane.partitions().wake_all();
+        }
+    }
+
     /// [`Self::step`], with the replica that sent each reply.
     ///
     /// # Panics
@@ -991,6 +1010,7 @@ impl Simulator {
         // Phase 0: Fire the pumps' consensus-tick timers (view change,
         // retransmits) and run them to quiescence. Crashed replicas have no
         // live pump tasks, so they are skipped implicitly.
+        self.wake_partitions_if_every_one_is_due();
         self.executor.advance_time(CONSENSUS_TICK_INTERVAL);
         self.run_pumps();
 
@@ -1323,7 +1343,7 @@ impl Simulator {
                 let incarnation = streams.created_revision_for_namespace(namespace);
                 let partitions = replica.partition_shard(namespace).plane.partitions();
                 match partitions
-                    .get_by_ns(&namespace)
+                    .peek_by_ns(&namespace)
                     .map(IggyPartition::created_revision)
                 {
                     // A recreated topic reuses the deleted one's ids. The production
@@ -1755,6 +1775,7 @@ impl Simulator {
     /// # Panics
     /// If a pump livelocks (poll budget exhausted).
     pub fn tick(&mut self) {
+        self.wake_partitions_if_every_one_is_due();
         self.executor.advance_time(CONSENSUS_TICK_INTERVAL);
         self.run_pumps();
     }
@@ -1816,7 +1837,7 @@ impl Simulator {
         namespace: IggyNamespace,
     ) -> Option<PartitionOffsets> {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
-        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let partition = shard.plane.partitions().peek_by_ns(&namespace)?;
         Some(partition.offsets())
     }
 
@@ -1832,7 +1853,7 @@ impl Simulator {
             .partition_shard(namespace)
             .plane
             .partitions()
-            .get_by_ns(&namespace)
+            .peek_by_ns(&namespace)
             .map(IggyPartition::created_revision)
     }
 
@@ -1849,7 +1870,7 @@ impl Simulator {
             .partition_shard(namespace)
             .plane
             .partitions()
-            .get_by_ns(&namespace)?
+            .peek_by_ns(&namespace)?
             .consumer_group_owner(group_id)
     }
 
@@ -1900,7 +1921,7 @@ impl Simulator {
         ops: std::ops::RangeInclusive<u64>,
     ) -> Option<BTreeMap<u64, PrepareHeader>> {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
-        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let partition = shard.plane.partitions().peek_by_ns(&namespace)?;
         Some(partition.log.journal().inner.repair_headers_in(ops))
     }
 
@@ -1940,7 +1961,7 @@ impl Simulator {
         namespace: IggyNamespace,
     ) -> Option<u64> {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
-        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let partition = shard.plane.partitions().peek_by_ns(&namespace)?;
         Some(u64::from(partition.consensus().view()))
     }
 
@@ -1955,7 +1976,7 @@ impl Simulator {
         namespace: IggyNamespace,
     ) -> Option<PartitionConsensusState> {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
-        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let partition = shard.plane.partitions().peek_by_ns(&namespace)?;
         let consensus = partition.consensus();
         Some(PartitionConsensusState {
             status: consensus.status(),
@@ -1995,18 +2016,8 @@ impl Simulator {
         let partitions: u64 = self.replicas[replica_idx]
             .shards
             .iter()
-            .map(|shard| {
-                let partitions = shard.plane.partitions();
-                partitions
-                    .namespaces()
-                    .filter_map(|namespace| {
-                        partitions
-                            .local_idx(namespace)
-                            .and_then(|local| partitions.get(local))
-                    })
-                    .map(|partition| partition.consensus().applied_log_contradictions())
-                    .sum::<u64>()
-            })
+            .flat_map(|shard| shard.plane.partitions().peek_all())
+            .map(|partition| partition.consensus().applied_log_contradictions())
             .sum();
         metadata + partitions
     }
@@ -2034,7 +2045,7 @@ impl Simulator {
         namespace: IggyNamespace,
     ) -> Option<CommitPrefixHole> {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
-        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let partition = shard.plane.partitions().peek_by_ns(&namespace)?;
         let consensus = partition.consensus();
         CommitPrefixHole::read(
             consensus.pipeline_head_header(),
@@ -2120,7 +2131,7 @@ impl Simulator {
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace)?;
+                    .peek_by_ns(&namespace)?;
                 let consensus = partition.consensus();
                 Some(consensus.primary_index(consensus.view()))
             })
@@ -8253,6 +8264,23 @@ mod tests {
     /// `shards_per_replica` shards. Shared by the single-shard locked
     /// baseline and the multi-shard replay tests.
     fn workload_hash(seed: u64, shards_per_replica: u16) -> (u64, u64) {
+        workload_hash_visiting(seed, shards_per_replica, false)
+    }
+
+    /// [`workload_hash`], with ticks that visit every partition when
+    /// `every_partition` is set.
+    fn workload_hash_visiting(
+        seed: u64,
+        shards_per_replica: u16,
+        every_partition: bool,
+    ) -> (u64, u64) {
+        let (sim, replies) = workload_run(seed, shards_per_replica, every_partition);
+        (replies, sim.schedule_hash())
+    }
+
+    /// The simulator after a full workload run on two partitions, with the
+    /// hash of the reply trace.
+    fn workload_run(seed: u64, shards_per_replica: u16, every_partition: bool) -> (Simulator, u64) {
         use crate::workload::{
             Workload,
             actions::Action,
@@ -8275,6 +8303,9 @@ mod tests {
             std::iter::once(client_id),
             network_opts,
         );
+        if every_partition {
+            sim.visit_every_partition();
+        }
         let client = SimClient::new(client_id);
 
         let ns_a = IggyNamespace::new(1, 1, 0);
@@ -8324,7 +8355,16 @@ mod tests {
         // Catches PRNG-trace shifts from `sample` returning `None`.
         // Stays 0 on the current seed mix; non-zero drifts the baseline.
         wl.samples_none().hash(&mut hasher);
-        (hasher.finish(), sim.schedule_hash())
+        (sim, hasher.finish())
+    }
+
+    /// Partitions that every shard tick of `sim` visited, since its start.
+    fn partition_tick_visits(sim: &Simulator) -> u64 {
+        sim.replicas
+            .iter()
+            .flat_map(|replica| &replica.shards)
+            .map(|shard| shard.metrics().partition_tick_visits_value())
+            .sum()
     }
 
     /// No shard of any replica dropped an inter-shard frame. Runs without injected
@@ -10036,6 +10076,235 @@ mod tests {
         );
     }
 
+    /// A sleeping partition has nothing to do: ticks that visit every
+    /// partition give the replies and the executor schedule of ticks that
+    /// skip the sleeping ones.
+    #[test]
+    fn given_ticks_that_visit_every_partition_when_replayed_should_match_ticks_that_skip_sleepers()
+    {
+        for (seed, shards_per_replica) in [(0xDEAD_BEEF, 1), (0xD0D0_0001, 4)] {
+            assert_eq!(
+                workload_hash_visiting(seed, shards_per_replica, true),
+                workload_hash(seed, shards_per_replica),
+                "seed {seed:#x} on {shards_per_replica} shards per replica"
+            );
+        }
+    }
+
+    /// Partitions that took traffic hold a WAL, a repair ring and consumer
+    /// offsets. With no client left they sleep between their timeouts all
+    /// the same, so the two-mode tests compare runs that do skip partitions.
+    #[test]
+    fn given_partitions_that_took_traffic_when_the_clients_stop_should_sleep_between_timeouts() {
+        assert_idle_partitions_sleep(|_| {});
+    }
+
+    /// The invariants of a fault run read every partition after each tick,
+    /// so a read that woke them would keep every partition of the run awake.
+    #[test]
+    fn given_an_oracle_that_reads_every_partition_after_each_tick_when_the_clients_stop_should_sleep_between_timeouts()
+     {
+        assert_idle_partitions_sleep(|sim| {
+            let contradictions: u64 = (0..usize::from(sim.replica_count))
+                .map(|replica| sim.applied_log_contradictions(replica))
+                .sum();
+            assert_eq!(contradictions, 0, "a run with no faults refused a log");
+        });
+    }
+
+    /// Runs a workload on two partitions, lets them turn idle and requires
+    /// few partition visits in the idle ticks after, with `observe` called
+    /// after each of them.
+    fn assert_idle_partitions_sleep(observe: impl Fn(&Simulator)) {
+        const WINDOW_TICKS: u64 = 1_000;
+        const PARTITION_REPLICAS: u64 = 2 * 3;
+
+        let (mut sim, _) = workload_run(0xD0D0_0001, 2, false);
+        // Long enough for the last requests to commit and the groups to turn
+        // idle.
+        for _ in 0..2 * consensus::HeartbeatSchedule::default().busy_timeout_ticks {
+            sim.step();
+        }
+        let before = partition_tick_visits(&sim);
+        for _ in 0..WINDOW_TICKS {
+            sim.step();
+            observe(&sim);
+        }
+        let visits = partition_tick_visits(&sim) - before;
+        assert!(visits > 0, "no heartbeat ran in {WINDOW_TICKS} ticks");
+        assert!(
+            visits <= PARTITION_REPLICAS * WINDOW_TICKS / 10,
+            "{visits} visits of {PARTITION_REPLICAS} idle partitions in {WINDOW_TICKS} ticks: \
+             some state keeps them awake"
+        );
+    }
+
+    /// `(view, primary, commit, normal status)` of a partition group on one
+    /// replica.
+    type GroupState = Option<(u32, bool, u64, bool)>;
+
+    /// The state of each group of `namespaces` on each of `replicas`, group
+    /// by group.
+    fn group_states(
+        sim: &Simulator,
+        replicas: std::ops::Range<u8>,
+        namespaces: &[IggyNamespace],
+    ) -> Vec<GroupState> {
+        namespaces
+            .iter()
+            .flat_map(|namespace| replicas.clone().map(move |replica| (replica, *namespace)))
+            .map(|(replica, namespace)| {
+                sim.partition_consensus_state(usize::from(replica), namespace)
+                    .map(|state| {
+                        (
+                            state.view,
+                            state.is_primary,
+                            state.commit_min,
+                            state.status == consensus::Status::Normal,
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// The executor schedule, the state of each group on the survivors and
+    /// the partition visits, for an idle cluster that loses replica 0. No
+    /// client sends anything, so the heartbeats, the timeout of the backups
+    /// and the view changes behind it are all timer work.
+    fn idle_failover_run(seed: u64, every_partition: bool) -> (u64, Vec<GroupState>, u64) {
+        const GROUPS: usize = 6;
+        const SHARDS_PER_REPLICA: u16 = 2;
+        let replica_count: u8 = 3;
+        let mut sim = Simulator::with_shards(
+            usize::from(replica_count),
+            SHARDS_PER_REPLICA,
+            std::iter::once(1),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        if every_partition {
+            sim.visit_every_partition();
+        }
+        let namespaces: Vec<_> = (0..GROUPS).map(|id| IggyNamespace::new(1, 1, id)).collect();
+        for namespace in &namespaces {
+            sim.init_partition(*namespace);
+        }
+        let schedule = consensus::HeartbeatSchedule::default();
+        // Long enough for the groups to turn idle.
+        for _ in 0..2 * schedule.busy_timeout_ticks {
+            sim.step();
+        }
+        sim.replica_crash(0);
+        // Past the wait of the backups of an idle group and their view change.
+        for _ in 0..2 * schedule.idle_timeout_ticks {
+            sim.step();
+        }
+        let states = group_states(&sim, 1..replica_count, &namespaces);
+        (sim.schedule_hash(), states, partition_tick_visits(&sim))
+    }
+
+    /// [`idle_failover_run`] for groups that took traffic, and with replica 0
+    /// back at the end: it restarts with the log of one partition wiped. Its
+    /// other partition catches up from its own log, the wiped one by a state
+    /// transfer, both on groups that no client writes to.
+    fn idle_recovery_run(seed: u64, every_partition: bool) -> (u64, Vec<GroupState>, u64) {
+        const REPLICAS: u8 = 3;
+        let namespaces = [IggyNamespace::new(1, 1, 0), IggyNamespace::new(1, 1, 1)];
+        let (mut sim, _) = workload_run(seed, 2, every_partition);
+        let schedule = consensus::HeartbeatSchedule::default();
+        for _ in 0..2 * schedule.busy_timeout_ticks {
+            sim.step();
+        }
+        sim.replica_crash(0);
+        for _ in 0..2 * schedule.idle_timeout_ticks {
+            sim.step();
+        }
+        sim.replica_restart_losing_partitions(0, &namespaces[1..]);
+        for _ in 0..4 * schedule.idle_timeout_ticks {
+            sim.step();
+        }
+        let states = group_states(&sim, 0..REPLICAS, &namespaces);
+        (sim.schedule_hash(), states, partition_tick_visits(&sim))
+    }
+
+    /// The restarted replica needs a repair, a state transfer and the views
+    /// that it missed, and only timers and the frames behind them drive an
+    /// idle group there.
+    #[test]
+    fn given_idle_groups_that_recover_a_replica_when_ticks_visit_every_partition_should_match_ticks_that_skip_sleepers()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let (schedule, states, visits) = idle_recovery_run(0xD0D0_0001, false);
+        for group in states.chunks(3) {
+            let commits: Vec<_> = group
+                .iter()
+                .map(|state| state.map(|(_, _, commit, normal)| (commit, normal)))
+                .collect();
+            assert!(
+                commits.iter().all(|state| *state == commits[1])
+                    && commits[1].is_some_and(|(commit, normal)| normal && commit > 0),
+                "replica 0 did not catch up with a group that took traffic: {group:?}"
+            );
+        }
+        let (schedule_visiting, states_visiting, visits_visiting) =
+            idle_recovery_run(0xD0D0_0001, true);
+        assert_eq!(
+            (schedule, states),
+            (schedule_visiting, states_visiting),
+            "ticks that visit every partition changed the run, so a tick skipped a \
+             partition with work"
+        );
+        assert!(
+            visits <= visits_visiting / 10,
+            "{visits} visits against {visits_visiting} with every partition due: the run \
+             skipped too few partitions to compare"
+        );
+    }
+
+    /// Only timers drive an idle cluster, so this run fails when a sleeping
+    /// partition misses one of its timeouts.
+    #[test]
+    fn given_an_idle_cluster_that_loses_a_replica_when_ticks_visit_every_partition_should_match_ticks_that_skip_sleepers()
+     {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let (schedule, states, visits) = idle_failover_run(0x1D1E_0001, false);
+        assert!(
+            states.iter().flatten().any(|(view, ..)| *view > 0),
+            "no group left view 0, so no timeout of a backup ran: {states:?}"
+        );
+        assert!(
+            states.iter().flatten().all(|(.., normal)| *normal),
+            "a group did not finish its view change: {states:?}"
+        );
+        let (schedule_visiting, states_visiting, visits_visiting) =
+            idle_failover_run(0x1D1E_0001, true);
+        assert_eq!(
+            (schedule, states),
+            (schedule_visiting, states_visiting),
+            "ticks that visit every partition changed the run, so a tick skipped a \
+             partition with work"
+        );
+        assert!(
+            visits <= visits_visiting / 10,
+            "{visits} visits against {visits_visiting} with every partition due: the run \
+             skipped too few partitions to compare"
+        );
+    }
+
     /// A full fault run replays byte-identically from its seed.
     ///
     /// The other determinism tests drive the workload inline, so nothing covered
@@ -10044,6 +10313,7 @@ mod tests {
     /// alongside the traces because a trace can match while the faults behind it
     /// differ.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fault_runs_replay_from_their_seed() {
         use crate::workload::{
             FaultInjector, Workload,
@@ -10052,8 +10322,18 @@ mod tests {
             run_with_faults,
         };
 
-        // `(replies, schedule_hash, crashes, restarts)` for one run.
-        fn fault_run(seed: u64) -> (u64, u64, u64, u64) {
+        fn replica_visits(replica: &SimReplica) -> u64 {
+            replica
+                .shards
+                .iter()
+                .map(|shard| shard.metrics().partition_tick_visits_value())
+                .sum()
+        }
+
+        // `(replies, schedule_hash, crashes, restarts)` for one run, with ticks
+        // that visit every partition when `every_partition` is set, and the
+        // partition visits of its ticks after the first.
+        fn fault_run(seed: u64, every_partition: bool) -> ((u64, u64, u64, u64), u64) {
             let replica_count: u8 = 3;
             let client_id: u128 = 1;
             let mut sim = Simulator::new(
@@ -10067,6 +10347,9 @@ mod tests {
                     ..packet::PacketSimulatorOptions::default()
                 },
             );
+            if every_partition {
+                sim.visit_every_partition();
+            }
             let client = SimClient::new(client_id);
             let ns = server_common::sharding::IggyNamespace::new(1, 1, 0);
             sim.init_partition(ns);
@@ -10085,20 +10368,51 @@ mod tests {
             let mut injector = FaultInjector::new(seed, replica_count);
             let clients = [client];
             let mut invariants = crate::workload::invariants::Invariants::new();
-            let replies = run_with_faults(
-                &mut sim,
-                &mut workload,
-                &clients,
-                3_000,
-                u64::MAX,
-                &mut injector,
-                &mut invariants,
-            );
+            let mut replies = 0;
+            let mut visits = 0;
+            // One tick per call, so the visits of each tick are read before a
+            // restart drops the shards of its replica and their counters.
+            for tick in 0..3_000 {
+                let before: Vec<_> = sim
+                    .replicas
+                    .iter()
+                    .map(|replica| (replica.metadata_incarnation, replica_visits(replica)))
+                    .collect();
+                replies += run_with_faults(
+                    &mut sim,
+                    &mut workload,
+                    &clients,
+                    1,
+                    u64::MAX,
+                    &mut injector,
+                    &mut invariants,
+                );
+                // The invariants read every partition after a tick, so a read
+                // that woke them shows from the second tick on.
+                if tick > 0 {
+                    visits += sim
+                        .replicas
+                        .iter()
+                        .zip(before)
+                        .map(|(replica, (incarnation, earlier))| {
+                            let counted = if replica.metadata_incarnation == incarnation {
+                                earlier
+                            } else {
+                                0
+                            };
+                            replica_visits(replica) - counted
+                        })
+                        .sum::<u64>();
+                }
+            }
             (
-                replies,
-                sim.schedule_hash(),
-                injector.crashes(),
-                injector.restarts(),
+                (
+                    replies,
+                    sim.schedule_hash(),
+                    injector.crashes(),
+                    injector.restarts(),
+                ),
+                visits,
             )
         }
 
@@ -10108,8 +10422,26 @@ mod tests {
             bucket_capacity: 1,
         });
 
-        let first = fault_run(0xFA17_0001);
-        assert_eq!(first, fault_run(0xFA17_0001), "a fault run did not replay");
+        let (first, visits) = fault_run(0xFA17_0001, false);
+        assert_eq!(
+            (first, visits),
+            fault_run(0xFA17_0001, false),
+            "a fault run did not replay"
+        );
+        // Crashes, restarts and view changes included: a sleeping partition
+        // has nothing to do, so visiting it changes neither the replies nor
+        // the executor schedule.
+        let (visiting, visits_visiting) = fault_run(0xFA17_0001, true);
+        assert_eq!(
+            first, visiting,
+            "ticks that visit every partition changed the run, so a tick skipped a \
+             partition with work"
+        );
+        assert!(
+            visits < visits_visiting,
+            "{visits} visits against {visits_visiting} with every partition due: no \
+             partition slept, so the two runs compare nothing"
+        );
         assert!(first.0 > 0, "the run produced no replies");
         assert!(
             first.2 > 0 && first.3 > 0,
@@ -10120,7 +10452,7 @@ mod tests {
         );
         assert_ne!(
             first,
-            fault_run(0xFA17_0002),
+            fault_run(0xFA17_0002, false).0,
             "two seeds produced the same trace, so the seed is not reaching the \
              injector"
         );

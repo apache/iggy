@@ -2399,13 +2399,13 @@ fn completed_prefix_validation_remains_available_during_a_pending_append() {
                     .is_ok(),
                 durable
             );
-            let metrics = persistence.take_metrics();
-            assert_eq!(metrics.disk_bytes, 2 * PARTITION_WAL_BLOCK_SIZE as u64);
+            let (disk_bytes, retained_bytes) = persistence.disk_and_retained_bytes();
+            assert_eq!(disk_bytes, 2 * PARTITION_WAL_BLOCK_SIZE as u64);
             assert_eq!(
-                metrics.retained_bytes,
+                retained_bytes,
                 2 * journal::partition_journal::record_length(first.len()).unwrap() as u64
             );
-            assert!(metrics.retained_bytes > metrics.disk_bytes);
+            assert!(retained_bytes > disk_bytes);
             assert_eq!(
                 persistence
                     .validate_segment_prefix(second_prefix, 0, OWNED_BATCH_BYTES as u64, durable)

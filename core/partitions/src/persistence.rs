@@ -197,8 +197,6 @@ pub struct PersistenceCompletion {
 
 #[derive(Default)]
 pub struct PersistenceMetrics {
-    pub disk_bytes: u64,
-    pub retained_bytes: u64,
     pub queued_bytes: u64,
     pub in_flight_bytes: u64,
     pub checkpoints_pending: u64,
@@ -1356,10 +1354,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 && self.queued_bytes.get() + self.in_flight_bytes.get() < RUN_AHEAD_BYTES_MAX)
     }
 
+    /// Bytes of the WAL on disk and bytes that it retains. Unlike the levels
+    /// of [`Self::take_metrics`], both stay above zero while the writer is
+    /// idle.
+    #[must_use]
+    pub const fn disk_and_retained_bytes(&self) -> (u64, u64) {
+        (self.disk_bytes.get(), self.retained_bytes.get())
+    }
+
     pub fn take_metrics(&self) -> PersistenceMetrics {
         PersistenceMetrics {
-            disk_bytes: self.disk_bytes.get(),
-            retained_bytes: self.retained_bytes.get(),
             queued_bytes: self.queued_bytes.get(),
             in_flight_bytes: self.in_flight_bytes.get(),
             checkpoints_pending: u64::from(self.checkpoint_pending()),

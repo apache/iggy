@@ -87,7 +87,7 @@ pub use iggy_partition::{
     BatchRetirement, IggyPartition, LocalEnvelope, RetirementDebtStatus, SegmentEviction,
     SegmentRemoval,
 };
-pub use iggy_partitions::{IggyPartitions, SentReport};
+pub use iggy_partitions::{GaugeShare, IggyPartitions, SentReport, Sleeper};
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,

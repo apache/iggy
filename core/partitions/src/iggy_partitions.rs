@@ -95,6 +95,18 @@ where
     slots: UnsafeCell<Vec<Option<Slot<B, SB>>>>,
     /// Vacant slots, reused last freed first.
     free_slots: RefCell<Vec<LocalIdx>>,
+    /// The tick of `tick_clock` at which the shard tick next visits each
+    /// slot, by `LocalIdx`: [`WAKE_NOW`] for a slot that the next tick
+    /// visits, [`WAKE_NEVER`] for a vacant one. Dense and apart from the
+    /// slots, because every tick scans it whole.
+    ///
+    /// A slot sleeps only after [`Self::settle`], which the shard calls with
+    /// a tick for a partition with nothing to do before it. Every accessor
+    /// that hands out a partition wakes its slot, so no path that reaches a
+    /// partition through this table can leave it asleep with new work.
+    wake_at: RefCell<Vec<Cell<u64>>>,
+    /// Sum of the [`GaugeShare`] of every slot.
+    gauge_sums: Cell<GaugeShare>,
     /// Slot of each namespace. Never iterated, so its per-process hash order
     /// cannot reach the simulator schedule: every walk follows the slots.
     namespace_to_local: RefCell<AHashMap<IggyNamespace, LocalIdx>>,
@@ -151,6 +163,54 @@ where
     namespace: IggyNamespace,
     partition: Box<UnsafeCell<IggyPartition<B, SB>>>,
     sent_report: Cell<SentReport>,
+    gauge_share: Cell<GaugeShare>,
+}
+
+/// A sleeping partition, as the check for missed wake-ups reads it.
+pub struct Sleeper<'a, B, SB>
+where
+    B: MessageBus,
+{
+    pub namespace: IggyNamespace,
+    pub partition: &'a IggyPartition<B, SB>,
+    pub sent_report: SentReport,
+    /// The tick at which the shard tick next visits it.
+    pub wake_at: u64,
+    /// Whether its recorded [`GaugeShare`] equals its levels now.
+    pub gauge_share_current: bool,
+}
+
+/// A slot that the next shard tick visits.
+const WAKE_NOW: u64 = 0;
+/// A vacant slot. No tick reaches it.
+const WAKE_NEVER: u64 = u64::MAX;
+
+/// What one partition last added to the shard gauges that count sleeping
+/// partitions too.
+///
+/// The shard tick visits only the partitions with work, so it cannot sum
+/// these levels over all of them: each visit replaces the share of its
+/// partition, and [`IggyPartitions::gauge_sums`] is the total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GaugeShare {
+    pub wal_disk_bytes: u64,
+    pub wal_retained_bytes: u64,
+    pub repair_ring_entries: usize,
+    pub repair_ring_bytes: u64,
+}
+
+impl GaugeShare {
+    const fn replaced(self, old: Self, new: Self) -> Self {
+        Self {
+            wal_disk_bytes: self.wal_disk_bytes - old.wal_disk_bytes + new.wal_disk_bytes,
+            wal_retained_bytes: self.wal_retained_bytes - old.wal_retained_bytes
+                + new.wal_retained_bytes,
+            repair_ring_entries: self.repair_ring_entries - old.repair_ring_entries
+                + new.repair_ring_entries,
+            repair_ring_bytes: self.repair_ring_bytes - old.repair_ring_bytes
+                + new.repair_ring_bytes,
+        }
+    }
 }
 
 /// What the shard last sent shard 0 about one partition, so it reports again
@@ -225,6 +285,8 @@ where
             config,
             slots: UnsafeCell::new(Vec::with_capacity(capacity)),
             free_slots: RefCell::new(Vec::new()),
+            wake_at: RefCell::new(Vec::with_capacity(capacity)),
+            gauge_sums: Cell::default(),
             namespace_to_local: RefCell::new(AHashMap::with_capacity(capacity)),
             tombstoned: RefCell::new(AHashMap::new()),
             keyring,
@@ -300,7 +362,7 @@ where
             while let Some(excess) = budget.excess_over_low_watermark()
                 && let Some(ticket) = budget.oldest_grown()
             {
-                let visit = self.ring_owner(ticket).map(|partition| {
+                let visit = self.shed_ring_owner(ticket).map(|partition| {
                     partition
                         .log
                         .journal()
@@ -317,7 +379,7 @@ where
             while let Some(excess) = budget.excess()
                 && let Some(ticket) = budget.oldest_released()
             {
-                let visit = self.ring_owner(ticket).map(|partition| {
+                let visit = self.shed_ring_owner(ticket).map(|partition| {
                     partition
                         .log
                         .journal()
@@ -341,10 +403,23 @@ where
 
     /// The partition whose ring `ticket` charges, fenced for delete or not:
     /// its ring holds memory until the partition leaves. `None` once the
-    /// partition left the shard or took a new charge.
+    /// partition left the shard or took a new charge. Does not wake it: the
+    /// shed asks for the owner of every ticket on every tick.
     fn ring_owner(&self, ticket: RingTicket) -> Option<&IggyPartition<B, SB>> {
-        self.get(self.local_idx(&ticket.namespace)?)
+        let local_idx = self.local_idx(&ticket.namespace)?;
+        self.slots()
+            .get(*local_idx)?
+            .as_ref()
+            .map(Slot::partition)
             .filter(|partition| partition.log.journal().inner.charged_by(ticket))
+    }
+
+    /// [`Self::ring_owner`] for a shed that takes memory from the ring, which
+    /// changes the gauge share of the partition.
+    fn shed_ring_owner(&self, ticket: RingTicket) -> Option<&IggyPartition<B, SB>> {
+        let owner = self.ring_owner(ticket)?;
+        self.wake_namespace(ticket.namespace);
+        Some(owner)
     }
 
     fn report_ring_floor(&self, budget: &crate::RepairRingBudget) {
@@ -429,6 +504,7 @@ where
     pub fn capture_teardown(&self, namespace: &IggyNamespace) -> Option<crate::PartitionTeardown> {
         let teardown = self.teardown.borrow().get(namespace)?.clone();
         teardown.delete();
+        self.wake_namespace(*namespace);
         Some(teardown)
     }
 
@@ -491,6 +567,7 @@ where
     }
 
     /// Every partition on this shard, in slot order, tombstoned ones too.
+    /// Does not wake them.
     fn partitions(&self) -> impl Iterator<Item = &IggyPartition<B, SB>> {
         self.slots().iter().flatten().map(Slot::partition)
     }
@@ -508,15 +585,23 @@ where
         self.namespace_to_local.borrow().is_empty()
     }
 
-    /// Get partition by local index.
+    /// Get partition by local index. Wakes it: the caller can change it
+    /// through its cells.
     pub fn get(&self, local_idx: LocalIdx) -> Option<&IggyPartition<B, SB>> {
-        self.slots().get(*local_idx)?.as_ref().map(Slot::partition)
+        let partition = self
+            .slots()
+            .get(*local_idx)?
+            .as_ref()
+            .map(Slot::partition)?;
+        self.wake(local_idx);
+        Some(partition)
     }
 
-    /// Get mutable partition by local index.
+    /// Get mutable partition by local index. Wakes it.
     #[allow(clippy::mut_from_ref)]
     fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition<B, SB>> {
         let slot = self.slots().get(*local_idx)?.as_ref()?;
+        self.wake(local_idx);
         // SAFETY: the slot array is only read, so a walk over it stays valid.
         // The `&mut` covers this one partition, through its own `UnsafeCell`,
         // and is sound on the pump task only (the sole mutator).
@@ -587,15 +672,18 @@ where
             namespace,
             partition: Box::new(UnsafeCell::new(partition)),
             sent_report: Cell::default(),
+            gauge_share: Cell::default(),
         });
         // SAFETY: see the `slots` field doc: pump-only, outside any walk, so
         // no other borrow of the array is live. Caller responsibility.
         let slots = unsafe { &mut *self.slots.get() };
         let local_idx = if let Some(local_idx) = self.free_slots.borrow_mut().pop() {
             slots[*local_idx] = slot;
+            self.wake(local_idx);
             local_idx
         } else {
             slots.push(slot);
+            self.wake_at.borrow_mut().push(Cell::new(WAKE_NOW));
             LocalIdx::new(slots.len() - 1)
         };
         self.namespace_to_local
@@ -736,6 +824,12 @@ where
             .get_mut(*local_idx)
             .and_then(Option::take)
             .expect("IggyPartitions invariant: a namespace maps to no live slot");
+        self.wake_at.borrow()[*local_idx].set(WAKE_NEVER);
+        self.gauge_sums.set(
+            self.gauge_sums
+                .get()
+                .replaced(slot.gauge_share.get(), GaugeShare::default()),
+        );
         self.free_slots.borrow_mut().push(local_idx);
         let partition = UnsafeCell::into_inner(*slot.partition);
         self.teardown.borrow_mut().remove(namespace);
@@ -763,25 +857,129 @@ where
         self.slots().iter().flatten().map(|slot| &slot.namespace)
     }
 
-    /// Every partition with what its shard last reported of it, in slot
-    /// order. Tombstoned ones too, so the shard can retract their reports.
-    pub fn sent_reports(
-        &self,
-    ) -> impl Iterator<Item = (&IggyNamespace, &IggyPartition<B, SB>, &Cell<SentReport>)> {
-        self.slots()
-            .iter()
-            .flatten()
-            .map(|slot| (&slot.namespace, slot.partition(), &slot.sent_report))
-    }
-
     /// The partition of `namespace`, tombstoned or not, with what its shard
-    /// last reported of it.
+    /// last reported of it. Wakes it.
     pub fn sent_report(
         &self,
         namespace: &IggyNamespace,
     ) -> Option<(&IggyPartition<B, SB>, &Cell<SentReport>)> {
-        let slot = self.slots().get(*self.local_idx(namespace)?)?.as_ref()?;
+        let local_idx = self.local_idx(namespace)?;
+        let slot = self.slots().get(*local_idx)?.as_ref()?;
+        self.wake(local_idx);
         Some((slot.partition(), &slot.sent_report))
+    }
+
+    /// The commit fault of the first fenced partition in slot order,
+    /// tombstoned ones too. Wakes none: it reads the fault and hands out no
+    /// partition.
+    pub fn first_commit_fault(&self) -> Option<crate::types::FatalCommit> {
+        self.partitions()
+            .find_map(|partition| partition.fatal().cloned())
+    }
+
+    /// Makes the next shard tick visit the partition in `local_idx`.
+    fn wake(&self, local_idx: LocalIdx) {
+        self.wake_at.borrow()[*local_idx].set(WAKE_NOW);
+    }
+
+    fn wake_namespace(&self, namespace: IggyNamespace) {
+        if let Some(local_idx) = self.local_idx(&namespace) {
+            self.wake(local_idx);
+        }
+    }
+
+    /// Appends the namespaces that the shard tick at `now` visits, in slot
+    /// order, tombstoned ones too: every slot that is awake or whose wake
+    /// tick came.
+    pub fn due_namespaces(&self, now: u64, due: &mut Vec<IggyNamespace>) {
+        let wake_at = self.wake_at.borrow();
+        let slots = self.slots();
+        for (index, wake_at) in wake_at.iter().enumerate() {
+            if wake_at.get() <= now
+                && let Some(slot) = &slots[index]
+            {
+                due.push(slot.namespace);
+            }
+        }
+    }
+
+    /// The last step of a shard tick for a partition that the tick visited.
+    /// `quiet_until` is the tick before which no tick has work for it, when
+    /// it has such a tick: the partition then sleeps until that tick or
+    /// until an accessor hands it out. Any other partition stays awake.
+    ///
+    /// The gauge share is read here, in the step that decides the sleep, so
+    /// a sleeping partition always holds its current share.
+    pub fn settle(&self, namespace: &IggyNamespace, quiet_until: Option<u64>) {
+        let Some(local_idx) = self.local_idx(namespace) else {
+            return;
+        };
+        let Some(slot) = self.slots().get(*local_idx).and_then(Option::as_ref) else {
+            return;
+        };
+        let share = slot.partition().gauge_share();
+        let old = slot.gauge_share.replace(share);
+        self.gauge_sums
+            .set(self.gauge_sums.get().replaced(old, share));
+        self.wake_at.borrow()[*local_idx].set(quiet_until.unwrap_or(WAKE_NOW));
+    }
+
+    /// Slots so far, vacant ones too.
+    pub fn slot_count(&self) -> usize {
+        self.slots().len()
+    }
+
+    /// The partition in slot `index`, when it sleeps past `now`. Does NOT
+    /// wake it: this is the read of the check that a sleeping partition has
+    /// no work.
+    pub fn sleeper(&self, index: usize, now: u64) -> Option<Sleeper<'_, B, SB>> {
+        let wake_at = self.wake_at.borrow().get(index)?.get();
+        let slot = self.slots().get(index)?.as_ref()?;
+        (wake_at > now).then(|| Sleeper {
+            namespace: slot.namespace,
+            partition: slot.partition(),
+            sent_report: slot.sent_report.get(),
+            wake_at,
+            gauge_share_current: slot.gauge_share.get() == slot.partition().gauge_share(),
+        })
+    }
+
+    /// The partition of `namespace` for a read that changes nothing, such as
+    /// the oracle of a simulation. Unlike [`Self::get_by_ns`] it does NOT
+    /// wake the partition, so an observer cannot hide a missed wake-up.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn peek_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B, SB>> {
+        if self.is_tombstoned(namespace) {
+            return None;
+        }
+        self.slots()
+            .get(*self.local_idx(namespace)?)?
+            .as_ref()
+            .map(Slot::partition)
+    }
+
+    /// Every partition here, tombstoned ones too, for a read that changes
+    /// nothing. Like [`Self::peek_by_ns`] it does NOT wake them.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn peek_all(&self) -> impl Iterator<Item = &IggyPartition<B, SB>> {
+        self.partitions()
+    }
+
+    /// Makes the next shard tick visit every partition, as a tick did before
+    /// partitions slept. A run that calls it before each tick must behave as
+    /// a run that never does.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn wake_all(&self) {
+        for (wake_at, slot) in self.wake_at.borrow().iter().zip(self.slots()) {
+            if slot.is_some() {
+                wake_at.set(WAKE_NOW);
+            }
+        }
+    }
+
+    /// The gauge levels of every partition here, sleeping ones too.
+    pub const fn gauge_sums(&self) -> GaugeShare {
+        self.gauge_sums.get()
     }
 
     pub fn is_tombstoned(&self, namespace: &IggyNamespace) -> bool {
@@ -810,6 +1008,7 @@ where
             .borrow_mut()
             .entry(namespace)
             .or_insert(None);
+        self.wake_namespace(namespace);
     }
 
     /// A permanent recovery failure, unlike a temporary teardown tombstone.
@@ -818,6 +1017,7 @@ where
         self.tombstoned
             .borrow_mut()
             .insert(namespace, Some(created_revision));
+        self.wake_namespace(namespace);
     }
 
     #[must_use]
@@ -829,6 +1029,7 @@ where
     /// `ReconcileOp::ConfirmRemove` after the partition is dropped.
     pub fn untombstone(&self, namespace: &IggyNamespace) {
         self.tombstoned.borrow_mut().remove(namespace);
+        self.wake_namespace(*namespace);
     }
 
     /// Snapshot read resources under a synchronous borrow on the owning pump.
@@ -2046,5 +2247,174 @@ mod tests {
                 .map(IggyPartition::incarnation),
             Some(incarnation)
         );
+    }
+
+    /// The partition ids that a shard tick at `now` visits.
+    fn due(partitions: &IggyPartitions<IggyMessageBus>, now: u64) -> Vec<usize> {
+        let mut due = Vec::new();
+        partitions.due_namespaces(now, &mut due);
+        due.iter().map(IggyNamespace::partition_id).collect()
+    }
+
+    #[test]
+    fn given_a_settled_partition_when_ticks_pass_should_be_due_from_its_wake_tick_on() {
+        let [quiet, busy] = [0, 1].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with(&[quiet, busy]);
+        assert_eq!(due(&partitions, 1), [0, 1], "a new partition is due");
+
+        partitions.settle(&quiet, Some(10));
+        partitions.settle(&busy, None);
+        assert_eq!(due(&partitions, 9), [1]);
+        assert_eq!(due(&partitions, 10), [0, 1]);
+        assert_eq!(due(&partitions, 11), [0, 1], "due until the next settle");
+    }
+
+    /// No path that reaches a partition through the table leaves it asleep.
+    #[test]
+    fn given_a_sleeping_partition_when_the_table_hands_it_out_should_be_due_again() {
+        type Access = fn(&IggyPartitions<IggyMessageBus>, IggyNamespace);
+        let accesses: [(&str, Access); 9] = [
+            ("get_by_ns", |partitions, namespace| {
+                partitions.get_by_ns(&namespace).unwrap();
+            }),
+            ("get_mut_by_ns", |partitions, namespace| {
+                partitions.get_mut_by_ns(&namespace).unwrap();
+            }),
+            ("with_partition", |partitions, namespace| {
+                partitions.with_partition(&namespace, |_| ()).unwrap();
+            }),
+            ("get_io_owner", |partitions, namespace| {
+                partitions.get_io_owner(&namespace).unwrap();
+            }),
+            ("sent_report", |partitions, namespace| {
+                partitions.sent_report(&namespace).unwrap();
+            }),
+            ("capture_teardown", |partitions, namespace| {
+                partitions.capture_teardown(&namespace).unwrap();
+            }),
+            ("tombstone", |partitions, namespace| {
+                partitions.tombstone(namespace);
+            }),
+            ("fence", |partitions, namespace| {
+                partitions.fence(namespace, 1);
+            }),
+            ("untombstone", |partitions, namespace| {
+                partitions.untombstone(&namespace);
+            }),
+        ];
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for (name, access) in accesses {
+            let partitions = shard_with(&[namespace]);
+            partitions.settle(&namespace, Some(u64::MAX));
+            assert!(due(&partitions, 1).is_empty(), "{name}: asleep");
+            assert!(partitions.sleeper(0, 1).is_some(), "{name}: a sleeper");
+
+            access(&partitions, namespace);
+            assert_eq!(due(&partitions, 1), [0], "{name}");
+            assert!(partitions.sleeper(0, 1).is_none(), "{name}: awake");
+        }
+    }
+
+    #[test]
+    fn given_a_sleeping_partition_when_removed_should_leave_its_slot_awake_for_the_next_one() {
+        let [removed, newcomer] = [0, 1].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with(&[removed]);
+        partitions.settle(&removed, Some(u64::MAX));
+
+        drop(partitions.remove(&removed));
+        assert!(due(&partitions, 1).is_empty(), "a vacant slot is never due");
+        assert!(
+            partitions.sleeper(0, 1).is_none(),
+            "a vacant slot is no sleeper"
+        );
+
+        partitions.insert(newcomer, build_replicated_partition(newcomer));
+        assert_eq!(due(&partitions, 1), [1]);
+    }
+
+    #[test]
+    fn given_sleeping_partitions_when_waking_all_should_make_each_one_due() {
+        let namespaces = [0, 1, 2].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with(&namespaces);
+        drop(partitions.remove(&namespaces[1]));
+        partitions.settle(&namespaces[0], Some(u64::MAX));
+        partitions.settle(&namespaces[2], Some(50));
+
+        partitions.wake_all();
+        assert_eq!(due(&partitions, 1), [0, 2]);
+    }
+
+    /// The shed looks at every ring on every tick, so it wakes only the
+    /// partitions it takes memory from.
+    #[compio::test]
+    async fn given_sleeping_ring_owners_when_shedding_should_wake_only_the_shed_ones() {
+        let [shed, kept] = [0, 1].map(|id| IggyNamespace::new(1, 1, id));
+        let body = ring_body_bytes().await;
+        // The low watermark is one release into the first ring.
+        let budget = budget_releasing_down_to(2 * body, 4 * HEADER + 4 * body);
+        let partitions = shard_with_ring_budget(budget, &[shed, kept]);
+        grow_ring(&partitions, shed, RING_OPS).await;
+        grow_ring(&partitions, kept, RING_OPS).await;
+        partitions.settle(&shed, Some(u64::MAX));
+        partitions.settle(&kept, Some(u64::MAX));
+
+        assert!(partitions.shed_repair_rings().unwrap().bodies_released > 0);
+        assert_eq!(due(&partitions, 1), [0]);
+        // The layout read hands the partition out, so it comes after.
+        assert_eq!(ring_layout(&partitions, kept, RING_OPS), "BBBB");
+
+        partitions.settle(&shed, Some(u64::MAX));
+        partitions.settle(&kept, Some(u64::MAX));
+        assert_eq!(partitions.shed_repair_rings().unwrap().bodies_released, 0);
+        assert!(
+            due(&partitions, 1).is_empty(),
+            "nothing shed, nothing woken"
+        );
+    }
+
+    /// The sums count a sleeping partition at the levels of its last settle,
+    /// and a removed one not at all.
+    #[compio::test]
+    async fn given_settled_partitions_when_reading_the_gauge_sums_should_count_each_last_share() {
+        let [first, second] = [0, 1].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with_ring_budget(usize::MAX, &[first, second]);
+        grow_ring(&partitions, first, RING_OPS).await;
+        grow_ring(&partitions, second, 1..=1).await;
+        assert_eq!(partitions.gauge_sums(), GaugeShare::default());
+
+        partitions.settle(&first, Some(u64::MAX));
+        let first_share = partitions.gauge_sums();
+        assert_eq!(first_share.repair_ring_entries, RING_OPS.count());
+        assert!(first_share.repair_ring_bytes > 0);
+        assert!(partitions.sleeper(0, 1).unwrap().gauge_share_current);
+
+        partitions.settle(&second, None);
+        assert_eq!(
+            partitions.gauge_sums().repair_ring_entries,
+            RING_OPS.count() + 1
+        );
+
+        // The ring grows with no settle: the sums keep the old share, and the
+        // check for missed wake-ups sees the difference.
+        partitions.settle(&second, Some(u64::MAX));
+        let journal = &partitions.slots()[1].as_ref().unwrap().partition().log;
+        journal
+            .journal()
+            .inner
+            .append(build_send_messages_entry(second, 2, 1))
+            .await
+            .unwrap();
+        journal.journal().inner.evict_prefix_located(1, |op| {
+            Some(BodyPosition {
+                segment_start: 0,
+                position: op,
+            })
+        });
+        assert!(!partitions.sleeper(1, 1).unwrap().gauge_share_current);
+
+        drop(partitions.remove(&second));
+        assert_eq!(partitions.gauge_sums(), first_share);
+        drop(partitions.remove(&first));
+        assert_eq!(partitions.gauge_sums(), GaugeShare::default());
     }
 }
