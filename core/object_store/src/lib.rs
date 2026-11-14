@@ -25,13 +25,16 @@
 //! root for one cluster. [`TierExecutor`] is how uploads, cold reads and
 //! deletes hand work to the tier service of a shard.
 //!
-//! [`FsStore`] keeps objects as files in a directory. [`MemoryStore`] and
+//! [`FsStore`] keeps objects as files in a directory, and [`s3::S3Store`]
+//! keeps them in an S3 bucket. [`Backend`] is the one of them that a
+//! configuration names. [`MemoryStore`] and
 //! [`InlineTierExecutor`] stand in for a provider and for the tier service in
 //! tests, and [`contract`] holds the cases that providers pass.
 
 // Every future here runs on the shard that owns it and never crosses threads.
 #![allow(clippy::future_not_send)]
 
+mod backend;
 pub mod contract;
 mod error;
 mod fs;
@@ -39,16 +42,20 @@ mod identity;
 mod inline;
 mod layout;
 mod memory;
+mod resolver;
+pub mod s3;
 mod segment_metadata;
 mod store;
 mod tier;
 
+pub use backend::Backend;
 pub use error::{ErrorClass, ObjectStoreError};
 pub use fs::FsStore;
 pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
 pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, ObjectPrefix, SegmentKey, SegmentObject};
 pub use memory::MemoryStore;
+pub use resolver::ShardResolver;
 pub use segment_metadata::{SEGMENT_HASH_LEN, SegmentMetadata, SegmentMetadataError};
 pub use store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, MAX_KEY_LEN,

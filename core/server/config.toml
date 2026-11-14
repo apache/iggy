@@ -1365,8 +1365,8 @@ handshake_grace = "10 s"
 # Even with a backend, no topic can turn tiered yet: that waits for reads of
 # evicted segments from the store, which this version does not do.
 #[tiered_storage]
-# "none", "fs" (a directory) or "s3" (S3 and stores with its API). The s3
-# backend is not implemented yet, so the server refuses to start with it.
+# "none", "fs" (a directory) or "s3" (S3 and stores with its API, such as
+# Ceph RGW and R2).
 #backend = "none"
 # The key prefix of this cluster's objects. Two clusters can share a bucket
 # under different prefixes, but never under the same one. The cluster claims
@@ -1385,13 +1385,18 @@ handshake_grace = "10 s"
 # The fs backend: the directory that holds the objects.
 #path = "/var/lib/iggy-tiered"
 # The s3 backend: the bucket, the region and, for a store other than AWS,
-# its URL.
+# its URL without a path.
 #bucket = "iggy-segments"
 #region = "eu-central-1"
-#endpoint = "http://minio:9000"
-# Static s3 credentials. Set them in the environment, with
-# IGGY_TIERED_STORAGE_ACCESS_KEY_ID and IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY,
-# rather than in this file. The printed configuration never shows them.
+#endpoint = "https://storage.example.com"
+# Where the bucket goes in a request URL: "path" (endpoint/bucket/key),
+# "virtual_hosted" (bucket.endpoint/key) or "auto", which picks
+# "virtual_hosted" for AWS and "path" for any other endpoint.
+#url_style = "auto"
+# Static s3 credentials, which the s3 backend needs. Set them in the
+# environment, with IGGY_TIERED_STORAGE_ACCESS_KEY_ID and
+# IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY, rather than in this file. The
+# printed configuration never shows them.
 #access_key_id = ""
 #secret_access_key = ""
 # The tuning values below are provisional.
