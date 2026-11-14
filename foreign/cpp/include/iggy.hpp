@@ -6758,7 +6758,8 @@ class IggyBlockingClient final {
      * - `tls=<bool>`
      * - `tls_domain=<string>`
      * - `tls_ca_file=<path>`
-     * - `reconnection_retries=<uint32|unlimited>`
+     * - `tls_validate_certificate=<bool>` (default `true`)
+     * - `reconnection_max_retries=<uint32|unlimited>` (`reconnection_retries` is deprecated)
      * - `reconnection_interval=<duration>`
      * - `reestablish_after=<duration>`
      * - `heartbeat_interval=<duration>`
@@ -6776,11 +6777,11 @@ class IggyBlockingClient final {
      * - `receive_window=<uint64>`
      * - `keep_alive_interval=<uint64>`
      * - `max_idle_timeout=<uint64>`
-     * - `validate_certificate=<bool>`
+     * - `tls_validate_certificate=<bool>` (default `false`, `validate_certificate` is deprecated)
      * - `heartbeat_interval=<duration>`
      * - `reconnection_max_retries=<uint32|unlimited>`
      * - `reconnection_interval=<duration>`
-     * - `reconnection_reestablish_after=<duration>`
+     * - `reestablish_after=<duration>` (`reconnection_reestablish_after` is deprecated)
      * - `max_pending_operations=<positive integer>`
      * - `max_pending_operation_bytes=<positive integer>`
      *
@@ -6792,7 +6793,7 @@ class IggyBlockingClient final {
      * WebSocket accepts these query parameters:
      *
      * - `heartbeat_interval=<duration>`
-     * - `reconnection_retries=<uint32|unlimited>`
+     * - `reconnection_max_retries=<uint32|unlimited>` (`reconnection_retries` is deprecated)
      * - `reconnection_interval=<duration>`
      * - `reestablish_after=<duration>`
      * - `read_buffer_size=<unsigned integer>`
@@ -6804,12 +6805,16 @@ class IggyBlockingClient final {
      * - `tls=<bool>`
      * - `tls_domain=<string>`
      * - `tls_ca_file=<path>`
-     * - `tls_validate_certificate=<bool>`
+     * - `tls_validate_certificate=<bool>` (default `false`)
      * - `max_pending_operations=<positive integer>`
      * - `max_pending_operation_bytes=<positive integer>`
      *
      * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
      * Boolean values are `true` or `false`.
+     * The `tls` and `tls_validate_certificate` options reject all other values.
+     * Disabling certificate validation leaves the connection vulnerable to server impersonation.
+     * For retry, cooldown and certificate validation options, the last occurrence
+     * of a key or alias wins. Malformed values fail in any position.
      *
      * Credentials embedded in the connection string configure automatic login
      * for Connect() and later reconnections. This method parses configuration
