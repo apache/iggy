@@ -3040,8 +3040,10 @@ constexpr std::string_view to_string(const StreamOptionKey key) {
 /**
  * @brief Option keys of the topic scope, in catalog order.
  *
- * Name, MessageExpiry, and MaxTopicSize are updatable, and MessageExpiry and
- * MaxTopicSize are also resettable. Every other key is create-only.
+ * Name, MessageExpiry, MaxTopicSize, LocalRetentionAge, and
+ * LocalRetentionSize are updatable, and all of them but Name are also
+ * resettable. An update can turn TieredStorage on, never off. Every other key
+ * is create-only.
  */
 enum class TopicOptionKey : std::uint8_t {
     Name,
@@ -3057,6 +3059,9 @@ enum class TopicOptionKey : std::uint8_t {
     PreallocateSegments,
     ReplicationFactor,
     SegmentMaxAge,
+    TieredStorage,
+    LocalRetentionAge,
+    LocalRetentionSize,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3087,6 +3092,12 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "replication_factor";
         case TopicOptionKey::SegmentMaxAge:
             return "segment_max_age";
+        case TopicOptionKey::TieredStorage:
+            return "tiered_storage";
+        case TopicOptionKey::LocalRetentionAge:
+            return "local_retention_age";
+        case TopicOptionKey::LocalRetentionSize:
+            return "local_retention_size";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3394,6 +3405,81 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns whether sealed segments move to the object store.
+     * @return Configured setting, or `std::nullopt` to use the server default
+     *         (`false`).
+     */
+    [[nodiscard]] std::optional<bool> TieredStorage() const noexcept { return tiered_storage_; }
+
+    /**
+     * @brief Sets whether sealed segments move to the object store.
+     * @param tiered_storage `true` to tier the topic; `false` otherwise.
+     * @return Reference to this options object.
+     * @note The server refuses `true` with FeatureUnavailable until it tiers
+     *       topics.
+     */
+    TopicCreateOptions &SetTieredStorage(bool tiered_storage) noexcept {
+        tiered_storage_ = tiered_storage;
+        return *this;
+    }
+
+    /**
+     * @brief Returns how long a tiered topic keeps an uploaded segment on
+     *        local disk.
+     * @return Configured age, or `std::nullopt` to use the server default
+     *         (one day).
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &LocalRetentionAge() const noexcept {
+        return local_retention_age_;
+    }
+
+    /**
+     * @brief Sets how long a tiered topic keeps an uploaded segment on local
+     *        disk.
+     * @param local_retention_age Age to keep an uploaded segment on local
+     *        disk. Expiry::ServerDefault() clears an explicitly configured
+     *        age.
+     * @return Reference to this options object.
+     * @note The server refuses an age above a finite message expiry.
+     */
+    TopicCreateOptions &SetLocalRetentionAge(::iggy::Expiry local_retention_age) {
+        if (local_retention_age.Kind() == "server_default") {
+            local_retention_age_.reset();
+        } else {
+            local_retention_age_ = std::move(local_retention_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @return Configured size limit, or `std::nullopt` to use the server
+     *         default (unlimited).
+     */
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &LocalRetentionSize() const noexcept {
+        return local_retention_size_;
+    }
+
+    /**
+     * @brief Sets the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @param local_retention_size Topic-wide size of uploaded segments to
+     *        keep on local disk. MaxTopicSize::ServerDefault() clears an
+     *        explicitly configured limit.
+     * @return Reference to this options object.
+     * @note The server refuses a size above a finite maximum topic size.
+     */
+    TopicCreateOptions &SetLocalRetentionSize(::iggy::MaxTopicSize local_retention_size) {
+        if (local_retention_size.Value() == "server_default") {
+            local_retention_size_.reset();
+        } else {
+            local_retention_size_ = std::move(local_retention_size);
+        }
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3446,6 +3532,9 @@ class TopicCreateOptions final {
     std::optional<bool> preallocate_segments_;
     std::optional<std::uint32_t> replication_factor_;
     std::optional<::iggy::Expiry> segment_max_age_;
+    std::optional<bool> tiered_storage_;
+    std::optional<::iggy::Expiry> local_retention_age_;
+    std::optional<::iggy::MaxTopicSize> local_retention_size_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;
@@ -3532,6 +3621,83 @@ class TopicUpdateOptions final {
     }
 
     /**
+     * @brief Returns whether sealed segments move to the object store.
+     * @return `true` when this update turns tiered storage on, or
+     *         `std::nullopt` when it leaves the setting unchanged.
+     */
+    [[nodiscard]] std::optional<bool> TieredStorage() const noexcept { return tiered_storage_; }
+
+    /**
+     * @brief Turns tiered storage on.
+     * @param tiered_storage `true` to move sealed segments to the object
+     *        store.
+     * @return Reference to this options object.
+     * @note The server refuses `false`: an update never turns tiered storage
+     *       off. It refuses `true` with FeatureUnavailable until it tiers
+     *       topics.
+     */
+    TopicUpdateOptions &SetTieredStorage(bool tiered_storage) noexcept {
+        tiered_storage_ = tiered_storage;
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested local retention age update.
+     * @return Age to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &LocalRetentionAge() const noexcept {
+        return local_retention_age_;
+    }
+
+    /**
+     * @brief Sets how long a tiered topic keeps an uploaded segment on local
+     *        disk.
+     * @param local_retention_age Age to keep an uploaded segment on local
+     *        disk. Expiry::ServerDefault() leaves the current age unchanged.
+     *        Use Reset(TopicOptionKey::LocalRetentionAge) to return to the
+     *        default.
+     * @return Reference to this options object.
+     * @note The server refuses an age above a finite message expiry.
+     */
+    TopicUpdateOptions &SetLocalRetentionAge(::iggy::Expiry local_retention_age) {
+        if (local_retention_age.Kind() == "server_default") {
+            local_retention_age_.reset();
+        } else {
+            local_retention_age_ = std::move(local_retention_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested local retention size update.
+     * @return Size limit to apply, or `std::nullopt` when this update leaves
+     *         it unchanged.
+     */
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &LocalRetentionSize() const noexcept {
+        return local_retention_size_;
+    }
+
+    /**
+     * @brief Sets the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @param local_retention_size Size of uploaded segments to keep on local
+     *        disk. MaxTopicSize::ServerDefault() leaves the current limit
+     *        unchanged. Use Reset(TopicOptionKey::LocalRetentionSize) to
+     *        return to the default.
+     * @return Reference to this options object.
+     * @note The server refuses a size above a finite maximum topic size.
+     */
+    TopicUpdateOptions &SetLocalRetentionSize(::iggy::MaxTopicSize local_retention_size) {
+        if (local_retention_size.Value() == "server_default") {
+            local_retention_size_.reset();
+        } else {
+            local_retention_size_ = std::move(local_retention_size);
+        }
+        return *this;
+    }
+
+    /**
      * @brief Returns additional mutable topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3577,9 +3743,10 @@ class TopicUpdateOptions final {
 
     /**
      * @brief Resets a setting to its server default.
-     * @param key Setting to reset. Only MessageExpiry and MaxTopicSize are
-     *        resettable. UpdateTopic() refuses any other key before sending
-     *        with the error the server would return.
+     * @param key Setting to reset. Only MessageExpiry, MaxTopicSize,
+     *        LocalRetentionAge, and LocalRetentionSize are resettable.
+     *        UpdateTopic() refuses any other key before sending with the
+     *        error the server would return.
      * @return Reference to this options object.
      */
     TopicUpdateOptions &Reset(TopicOptionKey key) {
@@ -3610,6 +3777,9 @@ class TopicUpdateOptions final {
     std::optional<std::string> name_;
     std::optional<::iggy::Expiry> message_expiry_;
     std::optional<::iggy::MaxTopicSize> max_topic_size_;
+    std::optional<bool> tiered_storage_;
+    std::optional<::iggy::Expiry> local_retention_age_;
+    std::optional<::iggy::MaxTopicSize> local_retention_size_;
     std::map<std::string, std::string> raw_;
     std::set<TopicOptionKey> reset_;
     std::set<std::string> raw_reset_;

@@ -525,6 +525,9 @@ func TestDeserializeToTopic_ResolvesMissingSettingsToTheCatalogDefaults(t *testi
 	assert.Equal(t, iggcon.IggyExpiryNeverExpire, topic.MessageExpiry)
 	assert.Equal(t, uint64(math.MaxUint64), topic.MaxTopicSize)
 	assert.Equal(t, iggcon.IggyExpiryNeverExpire, topic.SegmentMaxAge)
+	assert.False(t, topic.TieredStorage)
+	assert.Equal(t, iggcon.Duration(86_400_000_000), topic.LocalRetentionAge)
+	assert.Equal(t, uint64(math.MaxUint64), topic.LocalRetentionSize)
 	assert.Equal(t, uint8(iggcon.CompressionAlgorithmNone), topic.CompressionAlgorithm)
 }
 

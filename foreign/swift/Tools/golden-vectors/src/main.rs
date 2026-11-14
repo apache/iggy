@@ -1861,6 +1861,11 @@ fn main() {
         segment_max_age: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
             3_600,
         ))),
+        tiered_storage: Some(false),
+        local_retention_age: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+            1_800,
+        ))),
+        local_retention_size: Some(MaxTopicSize::Custom(IggyByteSize::from(536_870_912))),
         raw: BTreeMap::new(),
     };
     add(
@@ -1871,6 +1876,11 @@ fn main() {
     let update_options = TopicUpdateOptions {
         message_expiry: Some(IggyExpiry::NeverExpire),
         max_topic_size: Some(MaxTopicSize::Unlimited),
+        tiered_storage: Some(true),
+        local_retention_age: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+            1_800,
+        ))),
+        local_retention_size: Some(MaxTopicSize::Custom(IggyByteSize::from(536_870_912))),
         ..Default::default()
     };
     add(
