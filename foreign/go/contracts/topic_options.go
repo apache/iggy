@@ -40,6 +40,7 @@ const (
 	TopicOptionSizeOfMessagesRequiredToSave TopicOptionKey = "size_of_messages_required_to_save"
 	TopicOptionPreallocateSegments          TopicOptionKey = "preallocate_segments"
 	TopicOptionReplicationFactor            TopicOptionKey = "replication_factor"
+	TopicOptionSegmentMaxAge                TopicOptionKey = "segment_max_age"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -75,6 +76,11 @@ type TopicOptions struct {
 	PreallocateSegments *bool
 	// ReplicationFactor, see ReplicationFactorOption.
 	ReplicationFactor *uint32
+	// SegmentMaxAge in microseconds rolls the active segment once a batch is
+	// stamped this long after the segment's first batch, IggyExpiryNeverExpire
+	// for never. IggyExpiryServerDefault leaves it derived. The server refuses
+	// values under 10 minutes, and the key alongside PreallocateSegments true.
+	SegmentMaxAge *Duration
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }

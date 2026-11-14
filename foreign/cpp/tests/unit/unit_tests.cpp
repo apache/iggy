@@ -133,6 +133,7 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.SizeOfMessagesRequiredToSave().has_value());
     EXPECT_FALSE(options.PreallocateSegments().has_value());
     EXPECT_FALSE(options.ReplicationFactor().has_value());
+    EXPECT_FALSE(options.SegmentMaxAge().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
 }
 
@@ -243,13 +244,21 @@ TEST(TopicCreateOptionsTest, CompressionAlgorithmAndExpiryAndMaxTopicSize) {
 
 TEST(TopicCreateOptionsTest, ServerDefaultSentinelsClearValues) {
     iggy::TopicCreateOptions options;
-    options.SetMessageExpiry(iggy::Expiry::Duration(15)).SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    options.SetMessageExpiry(iggy::Expiry::Duration(15))
+        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024))
+        .SetSegmentMaxAge(iggy::Expiry::Duration(600000000));
     ASSERT_TRUE(options.MessageExpiry().has_value());
     ASSERT_TRUE(options.MaxTopicSize().has_value());
+    ASSERT_TRUE(options.SegmentMaxAge().has_value());
+    EXPECT_EQ(options.SegmentMaxAge()->Kind(), "duration");
+    EXPECT_EQ(options.SegmentMaxAge()->Value(), 600000000u);
 
-    options.SetMessageExpiry(iggy::Expiry::ServerDefault()).SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault());
+    options.SetMessageExpiry(iggy::Expiry::ServerDefault())
+        .SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault())
+        .SetSegmentMaxAge(iggy::Expiry::ServerDefault());
     EXPECT_FALSE(options.MessageExpiry().has_value());
     EXPECT_FALSE(options.MaxTopicSize().has_value());
+    EXPECT_FALSE(options.SegmentMaxAge().has_value());
 }
 
 TEST(TopicCreateOptionsTest, RawMapStoresForwardCompatibleKeys) {
@@ -351,6 +360,7 @@ TEST(OptionKeyTest, ReturnsCatalogNames) {
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKey), "encryption_key");
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKekFingerprint), "encryption_kek_fingerprint");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SizeOfMessagesRequiredToSave), "size_of_messages_required_to_save");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SegmentMaxAge), "segment_max_age");
     EXPECT_EQ(iggy::to_string(iggy::UserOptionKey::Status), "status");
     EXPECT_EQ(iggy::to_string(iggy::OptionsScope::User), "user");
     EXPECT_EQ(iggy::to_string(iggy::StreamEncryptionSource::Server), "server");

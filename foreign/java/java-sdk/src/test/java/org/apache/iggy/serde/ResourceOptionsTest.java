@@ -368,6 +368,12 @@ class ResourceOptionsTest {
             assertThat(topic.maxTopicSize())
                     .as(name)
                     .contains(new BigInteger(expected.get("max_topic_size").asString()));
+            assertThat(topic.segmentMaxAge())
+                    .as(name)
+                    .contains(new BigInteger(expected.get("options")
+                            .get("segment_max_age")
+                            .get("value")
+                            .asString()));
         }
         for (JsonNode vector : section("user_responses")) {
             JsonNode expected = vector.get("expected");

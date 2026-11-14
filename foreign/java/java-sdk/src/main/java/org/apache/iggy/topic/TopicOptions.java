@@ -178,6 +178,16 @@ public final class TopicOptions {
             return set(TopicOptionKey.REPLICATION_FACTOR, HeaderValue.fromUint32(replicas));
         }
 
+        /**
+         * Segment age roll in microseconds, {@code 2^64 - 1} meaning never: a batch stamped this long after the
+         * active segment's first batch starts the next segment. Zero leaves the key to the server default.
+         *
+         * <p>The server refuses less than ten minutes, and any age together with {@code preallocate_segments}.
+         */
+        public Builder segmentMaxAge(BigInteger micros) {
+            return setUnlessZero(TopicOptionKey.SEGMENT_MAX_AGE, micros);
+        }
+
         /** An option this build has no setter for. A typed setter wins on collision. */
         public Builder raw(String key, HeaderValue value) {
             raw.put(key, value);

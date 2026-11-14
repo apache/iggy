@@ -81,7 +81,7 @@ use iggy_common::{
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
     TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, stream_wrap_set,
-    topic_option_keys, validate_topic_segment_size,
+    topic_option_keys, validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
@@ -5061,13 +5061,27 @@ where
                 // concrete values and every replica commits the same state
                 // whatever its build. Resolved defaults ride a separate derived
                 // block, preserving per-key provenance for `GetTopic`.
-                let admitted = admit(
+                let mut admitted = admit(
                     OptionsScope::Topic,
                     OptionOperation::Create,
                     &request.options,
                     &[],
                     &OptionAdmissionContext::default(),
                 )?;
+                // A node that does not understand a critical key must refuse
+                // the topic rather than serve it without that key's effect.
+                let critical: Vec<OptionKey> = admitted
+                    .explicit
+                    .keys()
+                    .filter_map(|key| OptionKey::try_from(key).ok())
+                    .filter(|key| key.descriptor().critical)
+                    .collect();
+                if !critical.is_empty() {
+                    admitted.explicit.insert(
+                        HeaderKey::from(OptionKey::CriticalKeys),
+                        OptionValue::explicit(critical_keys_marker(&critical)?),
+                    );
+                }
                 // Re-encode the admitted block rather than forwarding the
                 // client's bytes. Admission drops a zero sentinel, so the
                 // resolved value goes in the derived block, but apply merges
@@ -5104,6 +5118,7 @@ where
                         topic_option_keys::MAX_TOPIC_SIZE.to_string(),
                     ));
                 }
+                validate_segment_max_age(resolved.runtime)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
                 let mut counts = self.placement_counts()?;
                 let partitions = self
@@ -7177,11 +7192,29 @@ mod tests {
         name: &str,
         partitions_count: u32,
     ) -> Message<RoutedRequestHeader> {
+        create_topic_request_with_options(
+            client,
+            wire_user_id,
+            stream_id,
+            name,
+            partitions_count,
+            WireOptions::empty(),
+        )
+    }
+
+    fn create_topic_request_with_options(
+        client: u128,
+        wire_user_id: u32,
+        stream_id: WireIdentifier,
+        name: &str,
+        partitions_count: u32,
+        options: WireOptions,
+    ) -> Message<RoutedRequestHeader> {
         let body = CreateTopicRequest {
             stream_id,
             partitions_count,
             name: WireName::new(name).unwrap(),
-            options: WireOptions::empty(),
+            options,
         }
         .to_bytes();
         let header_size = size_of::<RoutedRequestHeader>();
@@ -7852,6 +7885,115 @@ mod tests {
             persisted.partitions.len(),
             1,
             "absent partitions_count defaults to one partition"
+        );
+    }
+
+    fn prepare_topic_with(
+        options: &iggy_common::TopicCreateOptions,
+    ) -> Result<PersistedCreateTopicRequest, IggyError> {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        let plane = metadata_plane();
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .expect("register commits");
+        let prepare = plane.prepare_request(create_topic_request_with_options(
+            CLIENT,
+            ACTING_USER,
+            WireIdentifier::numeric(0),
+            "t",
+            1,
+            options.to_wire().expect("options encode"),
+        ))?;
+        let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
+        Ok(PersistedCreateTopicRequest::decode_from(body)
+            .expect("create topic with assignments prepare must decode"))
+    }
+
+    const HOUR_MICROS: u64 = 3_600_000_000;
+
+    #[test]
+    fn given_an_explicit_critical_key_when_preparing_create_topic_should_record_the_marker() {
+        let persisted = prepare_topic_with(&iggy_common::TopicCreateOptions {
+            segment_max_age: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+            ..Default::default()
+        })
+        .expect("an hour-long age roll is admitted");
+
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        assert_eq!(
+            explicit[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"segment_max_age"
+        );
+        let stored = TopicResolvedOptions::from(&explicit);
+        assert_eq!(
+            stored.runtime.effective_segment_max_age(),
+            Some(HOUR_MICROS)
+        );
+
+        let unmarked = prepare_topic_with(&iggy_common::TopicCreateOptions::default())
+            .expect("a keyless topic is admitted");
+        assert!(
+            !resource_options_from_wire(&unmarked.request.options, true)
+                .expect("explicit block decodes")
+                .contains_key(&HeaderKey::from(OptionKey::CriticalKeys)),
+            "a topic setting no critical key carries no marker"
+        );
+    }
+
+    #[test]
+    fn given_an_age_roll_with_preallocated_segments_when_preparing_should_refuse_it() {
+        let refused = prepare_topic_with(&iggy_common::TopicCreateOptions {
+            segment_max_age: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+            preallocate_segments: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            refused.err(),
+            Some(IggyError::InvalidOptionValue("segment_max_age".to_owned()))
+        );
+
+        assert!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                segment_max_age: Some(iggy_common::IggyExpiry::NeverExpire),
+                preallocate_segments: Some(true),
+                ..Default::default()
+            })
+            .is_ok(),
+            "preallocation with segments rolled by size alone stays admitted"
+        );
+    }
+
+    #[test]
+    fn given_an_age_roll_below_ten_minutes_when_preparing_should_refuse_it() {
+        let nine_minutes = iggy_common::MIN_SEGMENT_MAX_AGE - 60_000_000;
+        assert_eq!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                segment_max_age: Some(iggy_common::IggyExpiry::from(nine_minutes)),
+                ..Default::default()
+            })
+            .err(),
+            Some(IggyError::InvalidOptionValue("segment_max_age".to_owned()))
+        );
+        assert!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                segment_max_age: Some(iggy_common::IggyExpiry::from(
+                    iggy_common::MIN_SEGMENT_MAX_AGE
+                )),
+                ..Default::default()
+            })
+            .is_ok()
         );
     }
 

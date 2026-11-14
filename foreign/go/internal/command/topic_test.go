@@ -323,6 +323,48 @@ func TestCreateTopic_ReplicationFactorFieldRidesTheBlockAsUint32(t *testing.T) {
 	}
 }
 
+func TestCreateTopic_SegmentMaxAgeFieldRidesTheBlockAsUint64(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	segmentOptions := func(age iggcon.Duration) []iggcon.HeaderEntry {
+		t.Helper()
+		command := CreateTopic{
+			StreamId: streamId,
+			Name:     "topic",
+			Options:  iggcon.TopicOptions{SegmentMaxAge: &age},
+		}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		options, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		var entries []iggcon.HeaderEntry
+		for _, entry := range options {
+			if string(entry.Key.Value) == string(iggcon.TopicOptionSegmentMaxAge) {
+				entries = append(entries, entry)
+			}
+		}
+		return entries
+	}
+
+	entries := segmentOptions(iggcon.Duration(3_600_000_000))
+	if len(entries) != 1 {
+		t.Fatalf("segment_max_age entries = %v, want exactly one", entries)
+	}
+	if entries[0].Value.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(entries[0].Value.Value) != 3_600_000_000 {
+		t.Errorf("segment_max_age = %+v, want Uint64 3600000000", entries[0].Value)
+	}
+	if entries := segmentOptions(iggcon.IggyExpiryServerDefault); len(entries) != 0 {
+		t.Errorf("the server-default sentinel must leave segment_max_age derived, got %v", entries)
+	}
+}
+
 func TestCreateTopic_NonStringOptionKeyIsRejected(t *testing.T) {
 	streamId, err := iggcon.NewIdentifier(uint32(1))
 	if err != nil {

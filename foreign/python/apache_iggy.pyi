@@ -3728,6 +3728,10 @@ class OptionKey:
     Fingerprints of the server keys wrapping the stream's key, computed by
     the server.
     """
+    SegmentMaxAge: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment age roll, fixed at creation.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -5386,6 +5390,7 @@ class TopicOptions:
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
         replication_factor: builtins.int | None = None,
+        segment_max_age: IggyExpiry | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
@@ -5423,12 +5428,18 @@ class TopicOptions:
                 accepting writes while either node is down. The server rejects
                 an out-of-range value with an `OptionError` of kind
                 `invalid_replication_factor`.
+            segment_max_age: Age past a segment's first batch at which a batch
+                starts the next segment, as `IggyExpiry | None`, at least 10
+                minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+                which rolls segments by size alone. The server refuses a
+                duration together with `preallocate_segments=True`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size` or
+                `segment_max_age` is out of range.
             RuntimeError: If `compression_algorithm` names no known algorithm.
             TypeError: If a durability is not a `Durability`.
         """

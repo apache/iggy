@@ -100,6 +100,15 @@ public sealed class TopicOptions
     public uint? ReplicationFactor { get; init; }
 
     /// <summary>
+    ///     How long after the active segment's first batch a batch starts the next segment.
+    ///     <see cref="TimeSpan.MaxValue" /> never rolls by age, zero keeps the server default. Fixed at creation.
+    /// </summary>
+    /// <remarks>
+    ///     The server refuses less than ten minutes, and any age together with <see cref="PreallocateSegments" />.
+    /// </remarks>
+    public TimeSpan? SegmentMaxAge { get; init; }
+
+    /// <summary>
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
     ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
     ///     durability is kept unless the matching property asks for persisted durability.
@@ -176,6 +185,11 @@ public sealed class TopicOptions
         if (ReplicationFactor is { } replicationFactor)
         {
             options[Name(TopicOptionKey.ReplicationFactor)] = HeaderValue.FromUInt32(replicationFactor);
+        }
+
+        if (SegmentMaxAge is { } segmentMaxAge && DurationHelpers.ToDuration(segmentMaxAge) is not 0 and var ageMicros)
+        {
+            options[Name(TopicOptionKey.SegmentMaxAge)] = HeaderValue.FromUInt64(ageMicros);
         }
 
         return options;

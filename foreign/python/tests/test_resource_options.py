@@ -258,7 +258,7 @@ class TestTopicOptions:
     """Typed topic create options and generic topic updates."""
 
     @pytest.mark.asyncio
-    async def test_given_keyword_topic_options_when_creating_should_preserve_all_eleven_settings(  # noqa: E501
+    async def test_given_keyword_topic_options_when_creating_should_preserve_all_twelve_settings(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Every known create setting has a typed field and reads back explicit."""
@@ -282,6 +282,8 @@ class TestTopicOptions:
                 size_of_messages_required_to_save=4096,
                 preallocate_segments=True,
                 replication_factor=1,
+                # A finite age is refused together with preallocate_segments.
+                segment_max_age=IggyExpiry.NeverExpire(),
             ),
         )
 
@@ -300,6 +302,7 @@ class TestTopicOptions:
             "size_of_messages_required_to_save": 4096,
             "preallocate_segments": True,
             "replication_factor": 1,
+            "segment_max_age": U64_MAX,
         }
         assert topic.derived_options.to_scalar_dict() == {}
         assert topic.compression_algorithm == "gzip"

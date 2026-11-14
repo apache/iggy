@@ -310,6 +310,12 @@ impl IggyClient {
     /// every node unless an operator set a number. A write commits on a quorum of these nodes, so
     /// 2 keeps two copies but stops accepting writes while either node is down. The server
     /// rejects an out-of-range value with `InvalidReplicationFactor`.
+    ///
+    /// `segment_max_age_micros` starts a new segment once a batch arrives this long after the
+    /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
+    /// segments by size alone. The server refuses a duration together with
+    /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+    /// keep their meaning.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -328,6 +334,7 @@ impl IggyClient {
         partition_resize_policy: Option<String>,
         replication_factor: Option<&Zval>,
         raw: Option<BTreeMap<String, String>>,
+        segment_max_age_micros: Option<&Zval>,
     ) -> PhpResult {
         let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
@@ -340,6 +347,8 @@ impl IggyClient {
         )?;
         let replication_factor =
             optional_unsigned::<u32>(replication_factor, "replication_factor")?;
+        let segment_max_age_micros =
+            optional_u64(segment_max_age_micros, "segment_max_age_micros")?;
         let compression_algorithm = match compression_algorithm {
             Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
             None => CompressionAlgorithm::default(),
@@ -353,6 +362,8 @@ impl IggyClient {
             })?;
         let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+        let segment_max_age =
+            segment_max_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
 
@@ -373,6 +384,8 @@ impl IggyClient {
                 .map(IggyByteSize::from),
             preallocate_segments,
             replication_factor,
+            segment_max_age: (segment_max_age != IggyExpiry::ServerDefault)
+                .then_some(segment_max_age),
             raw: raw.unwrap_or_default(),
         };
 

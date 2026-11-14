@@ -617,16 +617,18 @@ impl ffi::StreamCreateOptions {
 }
 
 pub(crate) fn parse_message_expiry(kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
+    parse_expiry("message expiry", kind, value)
+}
+
+fn parse_expiry(option: &str, kind: &str, value: u64) -> Result<RustIggyExpiry, String> {
     match kind {
         "server_default" | "default" => Ok(RustIggyExpiry::ServerDefault),
         "never_expire" => Ok(RustIggyExpiry::NeverExpire),
-        "duration" if value == 0 => {
-            Err("message expiry duration must be greater than zero".to_string())
-        }
+        "duration" if value == 0 => Err(format!("{option} duration must be greater than zero")),
         "duration" => Ok(RustIggyExpiry::ExpireDuration(
             iggy::prelude::IggyDuration::from(value),
         )),
-        _ => Err(format!("invalid message expiry kind '{kind}'")),
+        _ => Err(format!("invalid {option} kind '{kind}'")),
     }
 }
 
@@ -684,6 +686,15 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
         };
         let max_topic_size = if options.has_max_topic_size {
             Some(parse_max_topic_size(&options.max_topic_size)?)
+        } else {
+            None
+        };
+        let segment_max_age = if options.has_segment_max_age {
+            Some(parse_expiry(
+                "segment max age",
+                &options.segment_max_age_kind,
+                options.segment_max_age_value,
+            )?)
         } else {
             None
         };
@@ -763,6 +774,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             } else {
                 None
             },
+            segment_max_age,
             raw,
         })
     }

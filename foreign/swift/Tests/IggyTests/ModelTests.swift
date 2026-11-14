@@ -518,6 +518,11 @@ struct TopicOptionsTests {
         #expect(try TopicCreateOptions(messageExpiry: .after(.microseconds(1))).toResourceOptions()[key] == .explicit(.uint64(1)))
         #expect(try TopicCreateOptions(messageExpiry: .never).toResourceOptions()[key] == .explicit(.uint64(UInt64.max)))
         #expect(try TopicCreateOptions(messageExpiry: .serverDefault).toResourceOptions()[key] == nil)
+        let ageKey = TopicOptionKey.segmentMaxAge.rawValue
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(segmentMaxAge: .after(.zero)).encode() }
+        #expect(try TopicCreateOptions(segmentMaxAge: .after(.seconds(3_600))).toResourceOptions()[ageKey] == .explicit(.uint64(3_600_000_000)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .never).toResourceOptions()[ageKey] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .serverDefault).toResourceOptions()[ageKey] == nil)
         // On an update the server default changes nothing. A reset restores the default.
         #expect(
             try TopicUpdateOptions(name: "renamed", messageExpiry: .serverDefault, maxTopicSize: .serverDefault).toResourceOptions().keys.sorted() == ["name"])

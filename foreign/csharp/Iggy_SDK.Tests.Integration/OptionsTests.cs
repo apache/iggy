@@ -53,7 +53,8 @@ public class OptionsTests
         "messages_required_to_save",
         "size_of_messages_required_to_save",
         "preallocate_segments",
-        "replication_factor"
+        "replication_factor",
+        "segment_max_age"
     ];
 
     private static readonly string[] NeverReturnedKeys = ["encryption_key", "encryption_key_wrapped", "critical_keys"];
@@ -183,7 +184,8 @@ public class OptionsTests
             MessagesRequiredToSave = 1,
             SizeOfMessagesRequiredToSave = 1,
             PreallocateSegments = true,
-            ReplicationFactor = 1
+            ReplicationFactor = 1,
+            SegmentMaxAge = TimeSpan.FromHours(1)
         }.ToDictionary().Keys;
 
         typedKeys.ShouldAllBe(key => catalogKeys.Contains(key));

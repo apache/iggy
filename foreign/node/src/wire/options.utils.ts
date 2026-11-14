@@ -68,7 +68,8 @@ export const TopicOptionKey = {
   MessagesRequiredToSave: 'messages_required_to_save',
   SizeOfMessagesRequiredToSave: 'size_of_messages_required_to_save',
   PreallocateSegments: 'preallocate_segments',
-  ReplicationFactor: 'replication_factor'
+  ReplicationFactor: 'replication_factor',
+  SegmentMaxAge: 'segment_max_age'
 } as const;
 
 export type TopicOptionKey = typeof TopicOptionKey[keyof typeof TopicOptionKey];
@@ -114,6 +115,7 @@ export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
   ['encryption_key_source', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['encryption_key_fingerprint', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['encryption_kek_fingerprint', { scopes: [Stream], flags: ReadOnly, internal: false }],
+  ['segment_max_age', { scopes: [Topic], flags: Critical, internal: false }],
   ['critical_keys', { scopes: [Stream, Topic, User], flags: 0, internal: true }]
 ]);
 
