@@ -62,6 +62,8 @@ pub enum ServerError {
         #[source]
         source: Box<iggy_common::IggyError>,
     },
+    #[error("cannot register the partition state machines")]
+    PartitionStateMachines(#[source] partitions::state_machine::RegistrationError),
     #[error("failed to load server config")]
     Config(#[source] configs::ConfigurationError),
     #[error("failed to allocate shards from sharding.cpu_allocation")]

@@ -5385,6 +5385,10 @@ where
     // The feature forwards to `partitions/simulator` instead.
     /// The WAL runs on the simulator's filesystem model. The retained log and
     /// receipts stand in for segment and receipt files, which it does not model.
+    ///
+    /// # Panics
+    /// When the built-in state machines fail to register on the partition it
+    /// just built, which only a duplicate registration could cause.
     #[cfg(feature = "simulator")]
     pub fn init_partition(
         &self,
@@ -5456,6 +5460,9 @@ where
             consensus,
             partitions.config().segment_size,
         );
+        partition
+            .register_builtin_state_machines()
+            .expect("a fresh partition registers its built-in state machines");
         partition.set_created_revision(epoch);
         partition.set_runtime_options(self.topic_runtime_options(namespace));
         partition.set_consumer_offsets_max(consumer_offsets_max);
