@@ -44,6 +44,7 @@ pub use persistence::{
 pub use repair_memory::RepairMemoryBudget;
 mod segment;
 pub mod segment_anchor;
+pub mod segment_chain;
 mod segment_recovery;
 pub mod state_machine;
 pub mod state_transfer;
@@ -112,7 +113,7 @@ pub use partition_storage::{
     recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
 };
 pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
-pub use segment::Segment;
+pub use segment::{Segment, SegmentLocation};
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,
     load_persisted_segments_with_checkpoint,

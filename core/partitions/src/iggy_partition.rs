@@ -176,6 +176,8 @@ where
     pub(crate) history_transition: Option<InstalledPartitionHistory>,
     /// The partition's state machines, applied at commit in op order.
     pub(crate) state_machines: StateMachines,
+    /// The chain of a tiered partition, `None` until it opens one.
+    pub(crate) segment_chain: Option<crate::segment_chain::SegmentChain>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -747,6 +749,7 @@ struct PendingMaterialization {
     phase: MaterializationPhase,
     save: Option<PendingMaterializationSave>,
     checksum: Option<Box<consensus::StateArtifactHasher>>,
+    digest: Option<Box<crate::segment_chain::SegmentDigest>>,
 }
 
 #[derive(Clone, Copy)]
@@ -944,6 +947,7 @@ where
             pending_history_transition: Cell::new(None),
             history_transition: None,
             state_machines: StateMachines::default(),
+            segment_chain: None,
             stats,
             widest_batch_bytes: Cell::new(0),
             committed_bytes: 0,
@@ -10589,6 +10593,7 @@ where
             phase: MaterializationPhase::Inspect,
             save: None,
             checksum: None,
+            digest: None,
         });
         Ok(true)
     }
@@ -12523,7 +12528,9 @@ where
                 .as_mut()
                 .and_then(|pending| pending.checksum.take())
         };
-        let frozen_batches = if bodies_written.is_some() && checksum.is_none() {
+        let digest =
+            self.take_materialization_digest(target.segment_start, target.segment_size, written);
+        let frozen_batches = if bodies_written.is_some() && checksum.is_none() && digest.is_none() {
             Vec::new()
         } else {
             frozen_batches
@@ -12542,8 +12549,28 @@ where
             written,
             completes,
             checksum,
+            digest,
         };
         Ok(Some(job))
+    }
+
+    /// The digest a save `written` bytes into its chunk feeds: the chain's for
+    /// the first piece, the one the previous piece handed back after it.
+    fn take_materialization_digest(
+        &mut self,
+        segment_start: u64,
+        segment_size: u64,
+        written: u64,
+    ) -> Option<Box<crate::segment_chain::SegmentDigest>> {
+        if written == 0 {
+            self.segment_chain
+                .as_mut()
+                .and_then(|chain| chain.take_digest(segment_start, segment_size))
+        } else {
+            self.materialization
+                .as_mut()
+                .and_then(|pending| pending.digest.take())
+        }
     }
 
     fn accept_materialization(
@@ -12609,15 +12636,21 @@ where
         if saved == 0 {
             if let Some(pending) = self.materialization.as_mut() {
                 pending.checksum = result.checksum;
+                pending.digest = result.digest;
             }
-        } else if let Some(hasher) = result.checksum {
-            self.segment_checksum_cache.borrow_mut().insert(
-                target.segment_start,
-                crate::state_transfer::SegmentChecksumMemo::Hashing {
-                    hashed_len: size,
-                    hasher,
-                },
-            );
+        } else {
+            if let Some(hasher) = result.checksum {
+                self.segment_checksum_cache.borrow_mut().insert(
+                    target.segment_start,
+                    crate::state_transfer::SegmentChecksumMemo::Hashing {
+                        hashed_len: size,
+                        hasher,
+                    },
+                );
+            }
+            if let Some(chain) = self.segment_chain.as_mut() {
+                chain.restore_digest(result.digest);
+            }
         }
         Ok(())
     }
@@ -12689,7 +12722,12 @@ where
             .last()
             .and_then(Option::as_ref)
             .cloned();
+        let chain_append = self
+            .segment_chain
+            .as_ref()
+            .and_then(|chain| chain.seal(segment, self.created_revision()));
         let target = crate::io::RotationTarget {
+            chain_record: chain_append.as_ref().map(|append| append.record),
             incarnation: self.incarnation,
             poll_history: self.poll_history,
             segment_start: segment.start_offset,
@@ -12704,6 +12742,7 @@ where
         if self.persistence.is_some() {
             job.old_index.clone_from(&target.index_writer);
         }
+        job.chain_append = chain_append;
         (target, job)
     }
 
@@ -12740,6 +12779,9 @@ where
         self.log.indexes_mut()[sealed_index] = None;
         self.log.reset_read_state(sealed_index);
         self.stamp_sealed_segment(target.segment_start);
+        if let Some(chain) = self.segment_chain.as_mut() {
+            chain.sealed(target.chain_record.as_ref(), start_offset);
+        }
         debug!(
             namespace_raw = self.namespace().inner(),
             sealed_end = target.segment_end,
@@ -12964,6 +13006,7 @@ where
             preallocate: self.effective_preallocate_segments(config),
             segment_bodies: self.persistence.is_some(),
             old_index: None,
+            chain_append: None,
         }
     }
 

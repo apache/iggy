@@ -7630,13 +7630,16 @@ name = "partitions"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "blake3",
  "bytemuck",
  "bytes",
  "compio",
  "consensus",
+ "crc32c",
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_object_store",
  "journal",
  "message_bus",
  "nix",
