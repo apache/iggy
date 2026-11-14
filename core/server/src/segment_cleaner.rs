@@ -27,9 +27,12 @@
 //! message-pump `CleanTopicMessages` path.
 
 use crate::shell::ServerShard;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use iggy_binary_protocol::{Command, HEADER_SIZE, Operation, RoutedRequestHeader};
 use iggy_common::{IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
+use server_common::Message;
+use server_common::sharding::IggyNamespace;
 use shard::Receiver;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -133,13 +136,60 @@ fn stage_owned_partitions(
                 "{UNENFORCEABLE_TOPIC_SIZE_WARN}"
             );
         }
-        shard.request_clean_partition(
-            namespace,
-            now,
-            message_expiry,
-            budget.map(|budget| budget.max_bytes),
-        );
+        let max_bytes = budget.map(|budget| budget.max_bytes);
+        if let Some(incarnation) =
+            should_roll_active_segment(shard, namespace, now, message_expiry, max_bytes)
+        {
+            let metadata_op = shard.plane.metadata().applied_frontier().get();
+            let request = roll_segment_request(namespace, metadata_op, incarnation, now.into());
+            let _ = shard.partition_submit(namespace, request);
+        }
+        shard.request_clean_partition(namespace, now, message_expiry, max_bytes);
     }
+}
+
+fn should_roll_active_segment(
+    shard: &Rc<ServerShard>,
+    namespace: IggyNamespace,
+    now: IggyTimestamp,
+    message_expiry: IggyExpiry,
+    max_bytes: Option<u64>,
+) -> Option<u64> {
+    shard
+        .plane
+        .partitions()
+        .with_partition(&namespace, |partition| {
+            (partition.consensus().is_primary()
+                && partition.consensus().is_normal()
+                && partition.retention_roll_needed(now, message_expiry, max_bytes))
+            .then_some(partition.created_revision())
+        })
+        .flatten()
+}
+
+fn roll_segment_request(
+    namespace: IggyNamespace,
+    metadata_op: u64,
+    incarnation: u64,
+    request_id: u64,
+) -> Message<RoutedRequestHeader> {
+    let size = HEADER_SIZE;
+    let request = Message::<RoutedRequestHeader>::new(size);
+    request.transmute_header(|_, header: &mut RoutedRequestHeader| {
+        *header = RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::RollSegment,
+            size: u32::try_from(size).expect("roll request fits u32"),
+            client: message_bus::AUTO_COMMIT_CLIENT_ID,
+            session: 1,
+            request: request_id,
+            group: namespace.inner(),
+            partition_incarnation: incarnation,
+            minimum_metadata_op: metadata_op,
+            metadata_watermark: metadata_op,
+            ..Default::default()
+        };
+    })
 }
 
 /// A topic's enforced per-partition budget, next to the share it was derived

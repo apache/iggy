@@ -126,6 +126,7 @@ where
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
                 | Operation::StateMachineCommand
+                | Operation::RollSegment
                 | Operation::CreateStream
                 | Operation::UpdateStreamResolved
                 | Operation::DeleteStream

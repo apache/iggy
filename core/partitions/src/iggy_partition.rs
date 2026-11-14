@@ -2445,7 +2445,9 @@ where
 
     const fn requires_persistence(&self, operation: Operation) -> bool {
         match operation {
-            Operation::RetireSession | Operation::StateMachineCommand => true,
+            Operation::RetireSession | Operation::StateMachineCommand | Operation::RollSegment => {
+                true
+            }
             Operation::SendMessages => self.durability().is_persisted(),
             Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.consumer_offset_durability().is_persisted()
@@ -9513,6 +9515,14 @@ where
                 self.journal_append(frozen.clone()).await?;
                 Ok(frozen)
             }
+            Operation::RollSegment => {
+                if !message.body().is_empty() {
+                    return Err(IggyError::InvalidCommand);
+                }
+                let frozen = message.into_frozen();
+                self.journal_append(frozen.clone()).await?;
+                Ok(frozen)
+            }
             Operation::RetireSession => {
                 let retirement = RetireSessionsRequest::decode_from(message.body())
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -12628,6 +12638,35 @@ where
     /// Mounted or busy partitions retain the watermark for the I/O lane and
     /// return an empty result. Only an idle partition without a dispatcher removes
     /// files inline and returns their counts.
+    /// Whether retention would become effective if the active segment were
+    /// sealed now. Empty active segments are deliberately left alone.
+    pub fn retention_roll_needed(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> bool {
+        let active = self.log.active_segment();
+        if active.size.as_bytes_u64() == 0 {
+            return false;
+        }
+        let expires = matches!(
+            message_expiry,
+            IggyExpiry::ExpireDuration(duration)
+                if active.max_timestamp != 0
+                    && active.max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
+        );
+        let over_budget = max_bytes.is_some_and(|limit| {
+            self.log
+                .segments()
+                .iter()
+                .map(|segment| segment.size.as_bytes_u64())
+                .sum::<u64>()
+                > limit
+        });
+        expires || over_budget
+    }
+
     pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
         self.maintenance.retention = Some(
             self.maintenance

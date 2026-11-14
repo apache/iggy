@@ -785,6 +785,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::StoreConsumerOffset => "store_consumer_offset",
         Operation::DeleteConsumerOffset => "delete_consumer_offset",
         Operation::StateMachineCommand => "state_machine_command",
+        Operation::RollSegment => "roll_segment",
     }
 }
 
@@ -1028,5 +1029,16 @@ impl StructuredSimEvent for ControlActionLogEvent {
             action_commit = self.commit.unwrap_or_default(),
             action_untrusted_log = self.untrusted_log.unwrap_or_default(),
         );
+    }
+}
+
+#[cfg(test)]
+mod roll_segment_tests {
+    use super::operation_as_str;
+    use iggy_binary_protocol::Operation;
+
+    #[test]
+    fn roll_segment_has_a_stable_observability_name() {
+        assert_eq!(operation_as_str(Operation::RollSegment), "roll_segment");
     }
 }

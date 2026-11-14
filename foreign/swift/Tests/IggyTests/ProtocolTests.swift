@@ -149,7 +149,7 @@ struct CommandCodeTests {
 
     @Test func serverOrderedOperationsAreInternal() {
         let serverOrderedPartitionOperations: [ConsensusOperation] = [
-            .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners, .stateMachineCommand,
+            .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners, .stateMachineCommand, .rollSegment,
         ]
         for operation in serverOrderedPartitionOperations {
             #expect(operation.isInternal)

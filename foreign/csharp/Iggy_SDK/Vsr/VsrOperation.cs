@@ -72,7 +72,8 @@ internal enum VsrOperation : byte
     InstallConsumerGroupOwner = 167,
     TransitionPartitionHistory = 168,
     RetireConsumerGroupOwners = 169,
-    StateMachineCommand = 170
+    StateMachineCommand = 170,
+    RollSegment = 171
 }
 
 internal static class VsrOperations
@@ -215,7 +216,8 @@ internal static class VsrOperations
     {
         return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
             || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners
-                or VsrOperation.StateMachineCommand;
+                or VsrOperation.StateMachineCommand
+                or VsrOperation.RollSegment;
     }
 
     /// <summary>

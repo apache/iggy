@@ -122,6 +122,10 @@ pub enum Operation {
     /// but is stored in the partition's state-machine log, never in its
     /// segments. The body names the command kind. No client wire code.
     StateMachineCommand = 170,
+    /// Server-originated: seal a non-empty active segment before retention
+    /// removes it. The primary submits this through partition consensus so
+    /// every replica rotates at the same log position.
+    RollSegment = 171,
 }
 
 impl Operation {
@@ -169,6 +173,7 @@ impl Operation {
                     | Self::TransitionPartitionHistory
                     | Self::RetireConsumerGroupOwners
                     | Self::StateMachineCommand
+                    | Self::RollSegment
             )
     }
 
@@ -304,7 +309,8 @@ impl Operation {
             | Self::InstallConsumerGroupOwner
             | Self::TransitionPartitionHistory
             | Self::RetireConsumerGroupOwners
-            | Self::StateMachineCommand => None,
+            | Self::StateMachineCommand
+            | Self::RollSegment => None,
             Self::CreateStream
             | Self::DeleteStream
             | Self::CreateTopic
@@ -439,6 +445,10 @@ mod tests {
         assert!(!Operation::TruncatePartition.is_client_allowed());
         assert!(Operation::StoreConsumerOffset.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
+        assert!(Operation::RollSegment.is_internal());
+        assert!(Operation::RollSegment.is_partition());
+        assert!(!Operation::RollSegment.is_metadata());
+        assert!(!Operation::RollSegment.is_client_allowed());
     }
 
     /// Every operation belongs to exactly one plane, or to the short list
