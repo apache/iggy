@@ -1803,6 +1803,19 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         mut synced_files: BTreeSet<PathBuf>,
     ) -> io::Result<()> {
         synced_files.extend(Self::sync_files(offset_files, barriers).await?);
+        if let (Some(commands), Some(checksum)) = (logs.commands.as_mut(), checksum)
+            && commands
+                .first_op_above(commands.checkpoint_op())
+                .is_some_and(|op| op <= through_op)
+        {
+            commands.advance_checkpoint(through_op, checksum).await?;
+        }
+        #[cfg(test)]
+        if self.stop_between_checkpoints.get() {
+            return Err(io::Error::other(
+                "stopped between the two partition log checkpoints",
+            ));
+        }
         if let Some(checksum) = checksum {
             logs.data
                 .checkpoint_files_at(through_op, checksum, &files, &directories, &synced_files)
@@ -1811,24 +1824,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             logs.data
                 .checkpoint_files(through_op, &files, &directories, &synced_files)
                 .await?;
-        }
-        #[cfg(test)]
-        if self.stop_between_checkpoints.get() {
-            return Err(io::Error::other(
-                "stopped between the two partition log checkpoints",
-            ));
-        }
-        // After the data log: until it publishes, its older checkpoint is the
-        // replay point, and the commands above that are still here. A log
-        // holding nothing above its own checkpoint through `through_op` has
-        // nothing to reclaim and keeps its older checkpoint, which recovery
-        // tolerates because it drops every command below the data log's.
-        if let (Some(commands), Some(checksum)) = (logs.commands.as_mut(), checksum)
-            && commands
-                .first_op_above(commands.checkpoint_op())
-                .is_some_and(|op| op <= through_op)
-        {
-            commands.checkpoint_at(through_op, checksum).await?;
         }
         Ok(())
     }
@@ -2844,8 +2839,8 @@ mod tests {
         drop(persistence);
 
         let (persistence, prepares) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
-        assert_eq!(persistence.checkpoint_op(), 4);
-        assert_eq!(ops(&prepares), vec![4, 5]);
+        assert_eq!(persistence.checkpoint_op(), 0);
+        assert_eq!(ops(&prepares), vec![1, 2, 3, 4, 5]);
         assert_eq!(persistence.head(), 5);
         assert_eq!(persistence.checksum(5), Some(fifth.header().checksum));
     }

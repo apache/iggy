@@ -1190,6 +1190,23 @@ async fn metadata_v9_flexible_empty_topics_returns_zero_topics() {
 }
 
 #[tokio::test]
+async fn metadata_v9_librdkafka_30_byte_all_topics_returns_response() {
+    // 8-byte body from librdkafka 2.x Metadata v9 all-topics request:
+    // 4-byte unfinalized arraycnt placeholder, then allow_auto=false, inc_cluster=false, inc_topic=false, tags=0.
+    let body_bytes = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    let body = handle_request(API_KEY_METADATA, 9, body_bytes, &default_broker())
+        .await
+        .expect_response("librdkafka 30-byte Metadata v9 request must return a response");
+
+    let mut d = Decoder::new(body);
+    d.read_i32().unwrap(); // throttle
+    let broker_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    assert_eq!(broker_count, 1);
+}
+
+#[tokio::test]
 async fn metadata_v9_flexible_echoes_each_requested_topic_name() {
     let topics = ["orders", "payments", "inventory"];
     let body = handle_request(
