@@ -131,7 +131,8 @@ const PROBE_VERIFY_BUDGET_BYTES_PER_RESIDUE_BYTE: u64 = 4;
 /// header is verdict-identical to reading the claimed bytes and failing the
 /// verify, minus a claimed-size allocation and read that a single
 /// bit-flipped length field could otherwise drive up to a whole segment.
-const MAX_RECOVERABLE_BATCH_BYTES: u64 = MAX_MESSAGE_SIZE_UPPER_BYTES + COMMAND_HEADER_SIZE as u64;
+pub const MAX_RECOVERABLE_BATCH_BYTES: u64 =
+    MAX_MESSAGE_SIZE_UPPER_BYTES + COMMAND_HEADER_SIZE as u64;
 
 /// Attempts at finding a free `<partition dir>.fenced.<n>` name, mirroring
 /// the partition-level quarantine's bound.

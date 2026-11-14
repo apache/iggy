@@ -368,6 +368,7 @@ pub struct ShardMetrics {
     partitions_under_replicated: Gauge,
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
+    partition_segment_upload_lag_seconds: Gauge,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -465,6 +466,7 @@ impl ShardMetrics {
             partitions_under_replicated: Gauge::default(),
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
+            partition_segment_upload_lag_seconds: Gauge::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -889,6 +891,21 @@ impl ShardMetrics {
             .set(i64::try_from(owing).unwrap_or(i64::MAX));
     }
 
+    /// Republished by every timed upload pass: the age of the oldest sealed
+    /// segment that waits for its upload, over the tiered partitions this
+    /// shard leads. Zero when none waits.
+    pub fn set_segment_upload_lag(&self, lag: Duration) {
+        self.partition_segment_upload_lag_seconds
+            .set(i64::try_from(lag.as_secs()).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn segment_upload_lag_seconds_value(&self) -> i64 {
+        self.partition_segment_upload_lag_seconds.get()
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1283,6 +1300,12 @@ impl ShardMetrics {
             "partitions on this shard refusing sessions until they retire sessions that \
              finalized while the partition lacked a quorum of its members",
             self.partitions_owing_retirement.clone(),
+        );
+        registry.register(
+            "partition_segment_upload_lag_seconds",
+            "age of the oldest sealed segment that waits for its upload to the object store, \
+             over the tiered partitions this shard leads",
+            self.partition_segment_upload_lag_seconds.clone(),
         );
         registry.register(
             "retirement_debts_paid",

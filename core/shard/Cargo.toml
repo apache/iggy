@@ -52,6 +52,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+iggy_object_store = { workspace = true }
 metadata = { workspace = true, features = ["simulator"] }
 tempfile = { workspace = true }
 

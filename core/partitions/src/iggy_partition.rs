@@ -109,6 +109,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, warn};
 
@@ -188,6 +189,18 @@ where
     /// How much of the partition stays on local disk, as the segment cleaner
     /// last resolved it from the topic. `None` until it has.
     local_envelope: Option<LocalEnvelope>,
+    /// The upload in flight: its attempt, and the scope whose end stops the
+    /// job.
+    segment_upload: Option<(crate::SegmentUploadAttempt, iggy_object_store::TierScope)>,
+    /// Attempts started so far, so that no two share a number.
+    segment_upload_attempts: u64,
+    /// The offset after the last segment this primary stored, when uploads
+    /// have run oldest first up to it. Only where the search for the next
+    /// upload starts: see [`Self::slot_after_uploaded`].
+    upload_cursor: Option<u64>,
+    /// Set when a sealed segment became uploadable, for the shard to turn into
+    /// an upload pass: the partition cannot send itself a frame.
+    upload_wanted: Cell<bool>,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1003,6 +1016,10 @@ where
             remote_segments: None,
             pending_advances: VecDeque::new(),
             local_envelope: None,
+            segment_upload: None,
+            segment_upload_attempts: 0,
+            upload_cursor: None,
+            upload_wanted: Cell::new(false),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -12925,10 +12942,12 @@ where
             let diverged = chain.sealed(target.chain_record.as_ref(), start_offset);
             // A segment whose bytes did not all pass through the digest seals
             // without a record, so it gets one hashed from disk.
-            if target.chain_record.is_none()
-                && let Some(prefix) = self.object_prefix()
-            {
-                self.request_tiering(prefix);
+            if target.chain_record.is_none() {
+                if let Some(prefix) = self.object_prefix() {
+                    self.request_tiering(prefix);
+                }
+            } else {
+                self.want_upload();
             }
             self.chain_settled(&diverged);
         }
@@ -13287,6 +13306,322 @@ where
         true
     }
 
+    /// The segment the primary uploads next: the oldest sealed one that is
+    /// still local and above the tiered floor.
+    ///
+    /// `None` when there is none, and also while that segment has no usable
+    /// record: its hash from disk is still being taken, or an advance
+    /// contradicted it. A younger segment never goes first, so a seal does not
+    /// overtake a backlog. The caller checks that this replica is the primary.
+    #[must_use]
+    pub fn next_segment_upload(&self) -> Option<crate::SegmentUpload> {
+        let slot = self.oldest_unuploaded_segment()?;
+        let (segment, storage) = (&self.log.segments()[slot], &self.log.storages()[slot]);
+        let record = self.undisputed_segment_record(segment.start_offset)?;
+        let (log_path, index_path) = storage.segment_and_index_paths();
+        Some(crate::SegmentUpload {
+            prefix: self.object_prefix()?,
+            record,
+            log_path: log_path?,
+            index_path: index_path?,
+        })
+    }
+
+    /// Start the next upload, when this replica is the primary and none is in
+    /// flight. The caller runs it under the returned scope and hands the
+    /// result to [`Self::finish_segment_upload`] with the returned attempt.
+    ///
+    /// A replica that is no longer the primary cancels the upload it started,
+    /// so a scan of a demoted replica is what stops its job.
+    pub fn begin_segment_upload(&mut self) -> Option<crate::StartedSegmentUpload> {
+        self.begin_segment_upload_if(|_| true)
+    }
+
+    /// [`Self::begin_segment_upload`], unless `admit` refuses the segment's
+    /// size in bytes. `admit` is asked last, and only about an upload that
+    /// would start, so what it charges is charged to a started upload. A
+    /// refusal leaves the segment for a later call.
+    pub fn begin_segment_upload_if(
+        &mut self,
+        admit: impl FnOnce(u64) -> bool,
+    ) -> Option<crate::StartedSegmentUpload> {
+        if !self.consensus.is_primary() || !self.consensus.is_normal() {
+            self.segment_upload = None;
+            self.upload_cursor = None;
+            return None;
+        }
+        if self.segment_upload.is_some() {
+            return None;
+        }
+        let upload = self.next_segment_upload()?;
+        if !admit(upload.record.size) {
+            return None;
+        }
+        let scope = iggy_object_store::TierScope::new();
+        let token = scope.token();
+        self.segment_upload_attempts += 1;
+        let attempt = crate::SegmentUploadAttempt(self.segment_upload_attempts);
+        self.segment_upload = Some((attempt, scope));
+        Some((upload, token, attempt))
+    }
+
+    /// The upload this partition waits for the result of.
+    ///
+    /// A result of any other attempt is stale: its upload was cancelled, and
+    /// the segment may be on its way again under a later attempt.
+    #[must_use]
+    pub fn segment_upload_attempt(&self) -> Option<crate::SegmentUploadAttempt> {
+        self.segment_upload
+            .as_ref()
+            .filter(|(_, scope)| !scope.is_cancelled())
+            .map(|(attempt, _)| *attempt)
+    }
+
+    /// Take the result of upload `attempt`, of the segment in `record`.
+    /// Returns the advance to commit when the segment is stored and this
+    /// replica is still the primary that started the upload.
+    ///
+    /// The result of an attempt other than the one in flight changes nothing.
+    /// A failure leaves the segment local, so a later scan offers it again. A
+    /// failure that no retry changes is reported: the segment and everything
+    /// after it stay out of the store until someone repairs it.
+    pub fn finish_segment_upload(
+        &mut self,
+        attempt: crate::SegmentUploadAttempt,
+        record: &crate::segment_chain::SegmentRecord,
+        outcome: &crate::UploadOutcome,
+    ) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        if self.segment_upload_attempt() != Some(attempt) {
+            return None;
+        }
+        self.segment_upload = None;
+        match outcome {
+            Ok(Ok(())) if self.consensus.is_primary() && self.consensus.is_normal() => {
+                Some(self.note_segment_uploaded(record))
+            }
+            Ok(Ok(())) | Err(_) => None,
+            Ok(Err(failure)) => {
+                if failure.is_transient() {
+                    warn!(
+                        namespace_raw = self.namespace().inner(),
+                        start_offset = record.start_offset,
+                        %failure,
+                        "segment upload failed and is tried again"
+                    );
+                } else {
+                    error!(
+                        namespace_raw = self.namespace().inner(),
+                        start_offset = record.start_offset,
+                        %failure,
+                        "segment upload cannot succeed, and holds back every later segment"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Stop the upload in flight, as a partition does on its way out.
+    pub fn cancel_segment_upload(&mut self) {
+        self.segment_upload = None;
+    }
+
+    /// Whether a segment became uploadable since the last call. Only a
+    /// primary asks for a pass, since only a primary uploads.
+    pub fn take_upload_wanted(&self) -> bool {
+        self.upload_wanted.take()
+    }
+
+    fn want_upload(&self) {
+        if self.consensus.is_primary() {
+            self.upload_wanted.set(true);
+        }
+    }
+
+    /// The slot of the oldest sealed segment that is still local and above
+    /// the tiered floor.
+    fn oldest_unuploaded_segment(&self) -> Option<usize> {
+        let from = self
+            .first_slot_above_floor()
+            .max(self.slot_after_uploaded());
+        self.log.segments()[from..]
+            .iter()
+            .position(|segment| {
+                segment.sealed
+                    && segment.location == SegmentLocation::Local
+                    && segment.size.as_bytes_u64() > 0
+            })
+            .map(|slot| from + slot)
+    }
+
+    /// The slot of the first segment that holds an offset above the tiered
+    /// floor, found without walking the history below it.
+    fn first_slot_above_floor(&self) -> usize {
+        let Some(floor) = self.tiered_floor() else {
+            return 0;
+        };
+        let segments = self.log.segments();
+        let after = segments.partition_point(|segment| segment.start_offset <= floor);
+        match after.checked_sub(1) {
+            Some(last) if segments[last].end_offset > floor => last,
+            _ => after,
+        }
+    }
+
+    /// The slot after the segments [`Self::upload_cursor`] covers, or `0`
+    /// when the cursor does not describe the segment list.
+    ///
+    /// The cursor is trusted only while the segment that ends right before it
+    /// is still marked as stored: a segment list rebuilt from disk marks
+    /// every segment local again, and those have to be offered again.
+    fn slot_after_uploaded(&self) -> usize {
+        let Some(cursor) = self.upload_cursor else {
+            return 0;
+        };
+        let segments = self.log.segments();
+        let slot = segments.partition_point(|segment| segment.start_offset < cursor);
+        let stands = slot.checked_sub(1).is_some_and(|last| {
+            segments[last].location != SegmentLocation::Local
+                && segments[last].end_offset.checked_add(1) == Some(cursor)
+        });
+        if stands { slot } else { 0 }
+    }
+
+    /// How far this primary's uploads are behind at `now`: the age of the
+    /// newest message in the oldest segment that waits for its upload.
+    ///
+    /// `None` on a replica that uploads nothing, and when no segment waits.
+    /// A segment sealed without a known timestamp counts as no lag, as it
+    /// counts as not expired.
+    #[must_use]
+    pub fn upload_lag(&self, now: IggyTimestamp) -> Option<Duration> {
+        if !self.is_tiered() || !self.consensus.is_primary() {
+            return None;
+        }
+        let segment = &self.log.segments()[self.oldest_unuploaded_segment()?];
+        if segment.max_timestamp == 0 {
+            return None;
+        }
+        Some(Duration::from_micros(
+            now.as_micros().saturating_sub(segment.max_timestamp),
+        ))
+    }
+
+    /// Whether this primary holds a sealed segment that the local envelope
+    /// would evict at `now`, were it uploaded: the leading local segments are
+    /// outside the envelope up to one that is above the tiered floor.
+    ///
+    /// Judged against the envelope the segment cleaner last resolved, so it
+    /// is `false` until the first eviction pass.
+    #[must_use]
+    pub fn eviction_awaits_upload(&self, now: IggyTimestamp) -> bool {
+        let Some(envelope) = self.local_envelope else {
+            return false;
+        };
+        if !self.is_tiered() || !self.consensus.is_primary() {
+            return false;
+        }
+        let Some((_, sealed)) = self.log.segments().split_last() else {
+            return false;
+        };
+        let floor = self.tiered_floor();
+        let local = || {
+            sealed
+                .iter()
+                .filter(|segment| segment.location != SegmentLocation::Remote)
+        };
+        let mut local_bytes: u64 = local().map(|segment| segment.size.as_bytes_u64()).sum();
+        for segment in local() {
+            let outside = segment.is_expired(now, envelope.age)
+                || envelope.size.is_some_and(|size| local_bytes > size);
+            if !segment.sealed || !outside {
+                return false;
+            }
+            if floor.is_none_or(|floor| segment.end_offset > floor) {
+                return true;
+            }
+            local_bytes -= segment.size.as_bytes_u64();
+        }
+        false
+    }
+
+    /// Account for a finished upload of the segment in `record`, and return
+    /// the advance that tells every replica the store holds it.
+    ///
+    /// The advance starts right after the floor. Uploads go oldest first, so
+    /// no local segment holds an offset between the floor and this segment.
+    pub fn note_segment_uploaded(
+        &mut self,
+        record: &crate::segment_chain::SegmentRecord,
+    ) -> crate::tiered_floor::AdvanceTieredFloor {
+        let oldest = self.oldest_unuploaded_segment();
+        let slot = self
+            .log
+            .segments()
+            .binary_search_by_key(&record.start_offset, |segment| segment.start_offset)
+            .ok()
+            .filter(|slot| self.log.segments()[*slot].location == SegmentLocation::Local);
+        if let Some(slot) = slot {
+            self.log.segments_mut()[slot].location = SegmentLocation::Uploaded;
+            // A segment stored out of turn leaves an older one local, which
+            // the cursor must not step over.
+            if oldest == Some(slot) {
+                self.upload_cursor = record.end_offset.checked_add(1);
+            }
+        }
+        self.floor_advance_over(record)
+    }
+
+    /// The advance of an upload that finished and whose segment the floor has
+    /// not passed: its request was refused or lost, or has not committed yet.
+    ///
+    /// Only the oldest segment above the floor can owe one, since an advance
+    /// starts right after the floor. `None` while that segment is still
+    /// local, so no advance reaches over a segment the store does not hold.
+    #[must_use]
+    pub fn pending_floor_advance(&self) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
+        let segment = self.log.segments()[self.first_slot_above_floor()..]
+            .iter()
+            .find(|segment| segment.sealed && segment.size.as_bytes_u64() > 0)?;
+        if segment.location != SegmentLocation::Uploaded {
+            return None;
+        }
+        let record = self.undisputed_segment_record(segment.start_offset)?;
+        Some(self.floor_advance_over(&record))
+    }
+
+    /// The chain's record of the sealed segment at `start_offset`, unless an
+    /// advance contradicted it.
+    fn undisputed_segment_record(
+        &self,
+        start_offset: u64,
+    ) -> Option<crate::segment_chain::SegmentRecord> {
+        let chain = self.segment_chain.as_ref()?;
+        self.sealed_segment_record(start_offset).filter(|record| {
+            // An advance that ends anywhere inside the segment and does
+            // not match it means the store holds other bytes there.
+            chain
+                .diverged()
+                .range(record.start_offset..=record.end_offset)
+                .next()
+                .is_none()
+        })
+    }
+
+    fn floor_advance_over(
+        &self,
+        record: &crate::segment_chain::SegmentRecord,
+    ) -> crate::tiered_floor::AdvanceTieredFloor {
+        let next = self
+            .tiered_floor()
+            .map_or(0, |floor| floor.saturating_add(1));
+        crate::tiered_floor::AdvanceTieredFloor {
+            start: next.min(record.start_offset),
+            up_to: record.end_offset,
+            hash: record.hash,
+        }
+    }
+
     /// Drop the leading advances that the chain holds or a segment settled,
     /// so that choosing the next job looks at one advance however many wait.
     fn drop_recorded_advances(&mut self) {
@@ -13490,6 +13825,11 @@ where
                     .segment_chain
                     .as_mut()
                     .map(|chain| chain.note_appended(&record));
+                // A segment that sealed without a record is uploadable only
+                // from here on.
+                if matches!(record, crate::segment_chain::ChainRecord::Sealed(_)) {
+                    self.want_upload();
+                }
                 self.chain_settled(&diverged.unwrap_or_default());
                 None
             }
