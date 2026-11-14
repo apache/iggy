@@ -10861,9 +10861,10 @@ where
                 // Keeps a segment payload alive past the cache borrow below.
                 let segment_payload: Rc<Vec<u8>>;
                 let (artifact_bytes, start): (&[u8], usize) = match offer.artifact_at(artifact) {
-                    Some(partitions::state_transfer::PartitionArtifactSource::Offsets(bytes)) => {
-                        (bytes, header.offset as usize)
-                    }
+                    Some(
+                        partitions::state_transfer::PartitionArtifactSource::Offsets(bytes)
+                        | partitions::state_transfer::PartitionArtifactSource::Chain(bytes),
+                    ) => (bytes, header.offset as usize),
                     Some(partitions::state_transfer::PartitionArtifactSource::Segment(source)) => {
                         if header.offset >= source.entry.len || header.len == 0 {
                             break 'attempt ChunkAttempt::Reply(None);
@@ -11898,6 +11899,9 @@ where
             consensus::artifact_kind::CONSUMER_OFFSETS => {
                 entry.len <= Self::CONSUMER_OFFSETS_ARTIFACT_LEN_MAX
             }
+            consensus::artifact_kind::SEGMENT_CHAIN => {
+                entry.len <= partitions::segment_chain::CHAIN_ARTIFACT_LEN_MAX
+            }
             _ => false,
         });
         if !kind_capped || total_len > Self::PARTITION_TRANSFER_TOTAL_LEN_MAX {
@@ -12191,6 +12195,7 @@ where
         let peer = session.peer;
         let mut offsets_bytes: Option<Vec<u8>> = None;
         let mut offsets_frontier: Option<u64> = None;
+        let mut chain_bytes: Option<Vec<u8>> = None;
         let mut damaged = false;
         let mut staged = Vec::new();
         for artifact in session.artifacts {
@@ -12212,6 +12217,15 @@ where
                     } else {
                         offsets_frontier = Some(progress.entry.frontier);
                         offsets_bytes = Some(progress.buf);
+                    }
+                }
+                consensus::artifact_kind::SEGMENT_CHAIN
+                    if consensus::verify_state_artifact(&progress.entry, &progress.buf) =>
+                {
+                    if chain_bytes.is_some() {
+                        damaged = true;
+                    } else {
+                        chain_bytes = Some(progress.buf);
                     }
                 }
                 // An unknown kind is refused, never skipped: skipping would
@@ -12251,13 +12265,25 @@ where
             .consensus()
             .set_state_transfer_stage(consensus::StateTransferStage::Installing);
         let outcome = if partition.has_io_dispatcher() {
-            match partition.queue_state_transfer_install(commit_op, staged, &offsets_bytes, peer) {
+            match partition.queue_state_transfer_install_with_chain(
+                commit_op,
+                staged,
+                &offsets_bytes,
+                chain_bytes.as_deref(),
+                peer,
+            ) {
                 Ok(()) => return,
                 Err(error) => Err(error),
             }
         } else {
             partition
-                .install_state_transfer(&config, commit_op, staged, &offsets_bytes)
+                .install_state_transfer_with_chain(
+                    &config,
+                    commit_op,
+                    staged,
+                    &offsets_bytes,
+                    chain_bytes.as_deref(),
+                )
                 .await
         };
         self.finish_partition_install(namespace, peer, outcome)
