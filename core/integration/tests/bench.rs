@@ -20,13 +20,18 @@ use std::{fs, process::Command};
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
-use integration::bench_utils::{BENCH_WAIT_TIMEOUT, run_bench_and_wait_for_finish};
+use integration::bench_utils::{BENCH_WAIT_TIMEOUT, bench_run_dirs, run_bench_and_wait_for_finish};
 use integration::harness::{TestHarness, TestServerConfig};
 use serde_json::Value;
 use serial_test::parallel;
 
 const BENCHMARK_DATA_BYTES: u64 = 5_000_000;
 const REPORT_TEST_DATA: &str = "1MiB";
+const REPORT_FILE: &str = "report.json";
+const BENCH_LOG_FILE: &str = "bench.log";
+const TEST_SUITE: &str = "integration-suite";
+const TEST_WORKLOAD: &str = "pinned-producer-1p";
+const REDACTED_PASSWORD_ARGUMENT: &str = "--password '***'";
 const TEST_SECRET: &str = "sensitive-benchmark-test-value";
 const WARMUP_MESSAGES_PER_BATCH: &str = "32";
 const WARMUP_MESSAGE_SIZE: &str = "128";
@@ -100,14 +105,12 @@ async fn given_rate_limit_when_running_end_to_end_benchmark_should_limit_aggrega
                 .timeout(BENCH_WAIT_TIMEOUT)
                 .assert()
                 .success();
-            let report_dir = fs::read_dir(output_dir.path())
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path();
+            let run_dirs = bench_run_dirs(output_dir.path());
+            let [run_dir] = run_dirs.as_slice() else {
+                panic!("expected one run directory, found {run_dirs:?}");
+            };
             let report: Value =
-                serde_json::from_str(&fs::read_to_string(report_dir.join("report.json")).unwrap())
+                serde_json::from_str(&fs::read_to_string(run_dir.join(REPORT_FILE)).unwrap())
                     .unwrap();
             let summary = &report["individual_metrics"][0]["summary"];
             assert_eq!(
@@ -279,13 +282,11 @@ async fn given_secret_environment_when_saving_benchmark_should_omit_credentials(
         ])
         .timeout(BENCH_WAIT_TIMEOUT)
         .unwrap();
-    let report_dir = fs::read_dir(output_dir.path())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let report = fs::read_to_string(report_dir.join("report.json")).unwrap();
+    let run_dirs = bench_run_dirs(output_dir.path());
+    let [run_dir] = run_dirs.as_slice() else {
+        panic!("expected one run directory, found {run_dirs:?}");
+    };
+    let report = fs::read_to_string(run_dir.join(REPORT_FILE)).unwrap();
     assert!(report.contains("IGGY_CONFIG_PATH=benchmark-config.toml"));
     assert!(report.contains("IGGY_ENV_PATH=benchmark.env"));
     assert!(report.contains("IGGY_SHARDING_CPU_ALLOCATION=4"));
@@ -299,6 +300,78 @@ async fn given_secret_environment_when_saving_benchmark_should_omit_credentials(
         assert!(
             !content.contains(TEST_SECRET),
             "{source} exposes a credential"
+        );
+    }
+}
+
+#[tokio::test]
+#[parallel]
+async fn given_same_command_when_run_twice_should_keep_both_run_directories() {
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(TestServerConfig::default())
+        .build()
+        .unwrap();
+    harness.start().await.unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    let server_address = harness.server().raw_tcp_addr().unwrap();
+
+    for _ in 0..2 {
+        #[allow(deprecated)]
+        let command = Command::cargo_bin("iggy-bench").unwrap();
+        assert_cmd::Command::from_std(command)
+            .args([
+                "--password",
+                DEFAULT_ROOT_PASSWORD,
+                "--total-data",
+                REPORT_TEST_DATA,
+                "pinned-producer",
+                "--producers",
+                "1",
+                "--streams",
+                "1",
+                "tcp",
+                "--server-address",
+                &server_address,
+                "output",
+                "--suite",
+                TEST_SUITE,
+                "--workload",
+                TEST_WORKLOAD,
+                "--output-dir",
+            ])
+            .arg(output_dir.path())
+            .timeout(BENCH_WAIT_TIMEOUT)
+            .assert()
+            .success();
+    }
+
+    let total_data_bytes = REPORT_TEST_DATA
+        .parse::<IggyByteSize>()
+        .unwrap()
+        .as_bytes_u64();
+    let run_dirs = bench_run_dirs(output_dir.path());
+    assert_eq!(run_dirs.len(), 2, "{run_dirs:?}");
+    for run_dir in &run_dirs {
+        assert!(
+            run_dir.join(BENCH_LOG_FILE).is_file(),
+            "{} has no {BENCH_LOG_FILE}",
+            run_dir.display()
+        );
+        let report: Value =
+            serde_json::from_str(&fs::read_to_string(run_dir.join(REPORT_FILE)).unwrap()).unwrap();
+        let params = &report["params"];
+        assert_eq!(params["suite"], TEST_SUITE);
+        assert_eq!(params["workload"], TEST_WORKLOAD);
+        assert_eq!(
+            params["data_volume"]["total_data_bytes"].as_u64(),
+            Some(total_data_bytes)
+        );
+        assert!(params["options"].is_object(), "{params}");
+        let command_line = params["command_line"].as_str().unwrap();
+        assert!(
+            command_line.contains(REDACTED_PASSWORD_ARGUMENT),
+            "{command_line}"
         );
     }
 }

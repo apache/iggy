@@ -133,7 +133,10 @@ pub struct ReadError {
     is_lasting_refusal: bool,
     /// For messages that a lost read committed and that the reader could not read again: their
     /// first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
-    /// (14010). `None` for every other error.
+    /// (14010). `None` for every other error. This error stops nothing and needs no `seek()`.
+    /// A batch that the reader holds after the range comes next, and a `seek()` before the
+    /// application takes it drops it. If the reader stopped the partition, the error that
+    /// stopped it comes after that batch.
     #[pyo3(get)]
     lost: Option<(u64, u64)>,
 }
@@ -151,8 +154,7 @@ impl ReadError {
 
     /// For a message that does not decode: the continuation after it. The messages before it
     /// arrive in a batch before this error, and the reader reads the message again until
-    /// `seek()` to this continuation skips it. For a lost range: the continuation after the
-    /// last offset of `lost`. `None` for every other error.
+    /// `seek()` to this continuation skips it. `None` for every other error.
     #[gen_stub(override_return_type(type_repr = "PollingStrategy | None"))]
     #[getter]
     fn skip(&self) -> Option<PollingStrategy> {
@@ -2668,12 +2670,12 @@ mod tests {
                 Some(PARTITION_ID),
                 IggyError::FetchProgressUncertain(OPERATION_ID),
             );
-            read_error.skip = Some(RustPollingStrategy::offset(LAST + 1));
             read_error.lost = Some(FIRST..=LAST);
 
             let error = to_read_error(read_error);
 
             let value = error.value(py);
+            assert!(value.getattr("skip").unwrap().is_none());
             assert_eq!(
                 value
                     .getattr("lost")

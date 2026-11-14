@@ -1279,7 +1279,8 @@ a read. The partition reads nothing until `SeekAsync`, and `IsResumable` says th
 reads it again after its stored offset. A stop while a committing read that lost its reply is still pending reports
 that read as status 14010 instead, since a seek to Next would skip what it stored.
 A lost range (`ReadException.Lost`, status 14010) also ends the loop with its `ReadException`. It stops no
-partition, so the next loop reads on after the range.
+partition, so the next loop reads on after the range. A stop during the read again of a lost range reports that
+range first. The batch that the reader holds follows, then the stop with its own status.
 `DisposeAsync` calls `ShutdownAsync()`. It waits for a handler of `ConsumeAsync` that runs, unless that handler calls
 it, counts the last message of `ReceiveAsync` under `CommitAfter.Processing`, stores or rewinds the offsets, and
 leaves the group. `ShutdownAsync(token)` closes the reader with that token. So a cancel ends the reads for the owner
@@ -1390,7 +1391,7 @@ route them through.
 ```bash
 cargo build --bin iggy-server --bin iggy
 
-docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server:test .
+docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy --build-arg LICENSE_STAGE=license-skip -t iggy-server:test .
 ```
 
 #### 2. Build the Test Project
