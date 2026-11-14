@@ -4513,6 +4513,11 @@ where
                 return Err(IggyError::TransientNotAccepted);
             }
         }
+        // Only now: the store failing a read of a history or an owner that
+        // was replaced meanwhile says nothing about the ones served now.
+        if let Some(error) = result.tiered_read_failure() {
+            return Err(error);
+        }
         let mut replication = None;
         if let Some(offset) = result
             .last_matching_offset
@@ -6141,6 +6146,7 @@ where
             index_fetches: self.index_fetches.fence(),
             segments,
             cut,
+            deadline: None,
             start_position,
             start_index_offset,
             namespace_raw: self.namespace().inner(),

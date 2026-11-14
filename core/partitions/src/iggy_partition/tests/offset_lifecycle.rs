@@ -562,6 +562,7 @@ async fn given_in_flight_sealed_poll_when_state_is_installed_should_wipe_its_rea
         object_prefix: None,
         index_fetches: IndexFetchFence::detached(),
         cut: false,
+        deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
         validate_checksum: true,

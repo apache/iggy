@@ -1483,7 +1483,7 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::too_many_lines, clippy::future_not_send)]
     async fn probe_deferred_poll(&self, id: u64, mut waiter: Waiter) {
         let refused_at = self.deferred_polls.take_read_place(id, &mut waiter);
         if waiter.reply.is_disconnected() {
@@ -1555,6 +1555,11 @@ where
             self.accept_deferred_result(id, waiter, result).await;
             return;
         }
+        let Ok(cold) = self.poll_completions.admit(plan.reads_remote()) else {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        };
+        let plan = plan.with_deadline(std::time::Instant::now() + crate::COLD_POLL_BUDGET);
         let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place, read_bytes) else {
             self.deferred_polls.queue_read(id, waiter, place);
             return;
@@ -1579,7 +1584,9 @@ where
             .waiters
             .insert(id, waiter);
         self.bus.spawn(async move {
-            completion.complete(plan.execute_with_limit(max_bytes, max_selected_bytes).await);
+            let result = plan.execute_with_limit(max_bytes, max_selected_bytes).await;
+            drop(cold);
+            completion.complete(result);
         });
     }
 
