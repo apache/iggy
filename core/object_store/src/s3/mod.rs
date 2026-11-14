@@ -18,6 +18,7 @@
 //! The S3 provider, for AWS S3 and the stores with its API, such as Ceph RGW
 //! and R2.
 
+pub mod credentials;
 mod sigv4;
 mod xml;
 
@@ -37,6 +38,7 @@ use http::{HeaderMap, Method, StatusCode};
 use send_wrapper::SendWrapper;
 use url::Url;
 
+pub use credentials::SharedCredentials;
 pub use sigv4::Credentials;
 
 use crate::error::ObjectStoreError;
@@ -75,7 +77,9 @@ pub struct S3Config {
     pub region: String,
     pub bucket: String,
     pub url_style: UrlStyle,
-    pub credentials: Credentials,
+    /// What the store signs with: fixed keys, or the credentials that a
+    /// refresher of the node keeps fresh.
+    pub credentials: SharedCredentials,
 }
 
 /// An [`ObjectStore`] in one S3 bucket, over one HTTP client.
@@ -104,7 +108,7 @@ pub struct S3Store {
     bucket_path: String,
     bucket: String,
     region: String,
-    credentials: Credentials,
+    credentials: SharedCredentials,
     /// How far the store's clock runs ahead of this node's.
     clock_offset: Cell<TimeDelta>,
 }
@@ -162,20 +166,8 @@ impl S3Store {
             ),
             UrlStyle::VirtualHosted => (format!("{}.{authority}", config.bucket), String::new()),
         };
-        let builder = cyper::Client::builder()
-            .custom_resolver(ShardResolver::default())
-            .redirect(cyper::redirect::Policy::none());
-        let builder = if scheme == "https" {
-            builder.use_rustls_default()
-        } else {
-            // Without a config, the client loads the system's certificate
-            // authorities when it is built, and fails on a host without
-            // them, although it never dials https.
-            builder.use_rustls(Arc::new(plain_http_tls_config()?))
-        };
-        let client = builder.build().map_err(transport)?;
         Ok(Self {
-            client,
+            client: http_client(scheme)?,
             origin: format!("{scheme}://{host}"),
             host,
             bucket_path,
@@ -232,6 +224,11 @@ impl S3Store {
         unsigned: &[(&str, String)],
         body: cyper::Body,
     ) -> Result<cyper::Response, ObjectStoreError> {
+        let credentials = self.credentials.current().ok_or_else(|| {
+            ObjectStoreError::Unavailable(
+                "the node has no credentials for the store yet, and fetches them".to_owned(),
+            )
+        })?;
         let now = Utc::now() + self.clock_offset.get();
         request.headers.extend([
             ("host".to_owned(), self.host.clone()),
@@ -241,7 +238,7 @@ impl S3Store {
                 request.payload_sha256.to_owned(),
             ),
         ]);
-        if let Some(token) = &self.credentials.session_token {
+        if let Some(token) = &credentials.session_token {
             request
                 .headers
                 .push(("x-amz-security-token".to_owned(), token.clone()));
@@ -255,7 +252,7 @@ impl S3Store {
                 headers: &request.headers,
                 payload_sha256: request.payload_sha256,
             },
-            &self.credentials,
+            &credentials,
             &self.region,
             now,
         );
@@ -283,7 +280,8 @@ impl S3Store {
     }
 
     /// The error of an answer that is not a success. A refusal for the skew
-    /// of the clocks corrects the clock once.
+    /// of the clocks corrects the clock once. Expired credentials that a
+    /// refresher keeps fresh are an outage that the next refresh ends.
     fn failure(
         &self,
         status: StatusCode,
@@ -291,6 +289,14 @@ impl S3Store {
         error: &xml::ErrorBody,
         subject: &Subject<'_>,
     ) -> ObjectStoreError {
+        if self.credentials.refreshes()
+            && matches!(error.code.as_str(), "ExpiredToken" | "TokenRefreshRequired")
+        {
+            return ObjectStoreError::Unavailable(format!(
+                "{}; the node refreshes its credentials",
+                detail(status, error)
+            ));
+        }
         if error.code == "RequestTimeTooSkewed"
             && let Some(store_time) = date
         {
@@ -718,6 +724,23 @@ fn header_crc32c(headers: &HeaderMap) -> Result<Option<u32>, ObjectStoreError> {
     Ok(Some(u32::from_be_bytes(bytes)))
 }
 
+/// A client for a shard: host lookups off the shard thread, no redirects,
+/// and the system's certificate authorities only for `https`.
+fn http_client(scheme: &str) -> Result<cyper::Client, ObjectStoreError> {
+    let builder = cyper::Client::builder()
+        .custom_resolver(ShardResolver::default())
+        .redirect(cyper::redirect::Policy::none());
+    let builder = if scheme == "https" {
+        builder.use_rustls_default()
+    } else {
+        // Without a config, the client loads the system's certificate
+        // authorities when it is built, and fails on a host without them,
+        // although it never dials https.
+        builder.use_rustls(Arc::new(plain_http_tls_config()?))
+    };
+    builder.build().map_err(transport)
+}
+
 /// A TLS config that trusts no authority, for a client that dials only plain
 /// http.
 fn plain_http_tls_config() -> Result<rustls::ClientConfig, ObjectStoreError> {
@@ -903,6 +926,62 @@ mod tests {
         ));
     }
 
+    /// A store whose refresher has fetched nothing yet fails each call as
+    /// transient, before any request, so the caller retries.
+    #[test]
+    fn given_no_credentials_yet_when_calling_should_fail_as_transient_before_any_request() {
+        let store = S3Store::new(S3Config {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            region: "us-east-1".to_owned(),
+            bucket: "segments".to_owned(),
+            url_style: UrlStyle::Path,
+            credentials: SharedCredentials::refreshed(),
+        })
+        .unwrap();
+
+        let result = crate::contract::shard_runtime().block_on(store.head("a/b"));
+
+        assert!(
+            matches!(&result, Err(ObjectStoreError::Unavailable(reason)) if reason.contains("no credentials")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn given_expired_credentials_when_classifying_should_wait_for_a_refresh_only_when_refreshed() {
+        let store = |credentials: SharedCredentials| {
+            S3Store::new(S3Config {
+                endpoint: "http://127.0.0.1:1".to_owned(),
+                region: "us-east-1".to_owned(),
+                bucket: "segments".to_owned(),
+                url_style: UrlStyle::Path,
+                credentials,
+            })
+            .unwrap()
+        };
+        let expired = error_body("ExpiredToken");
+        let status = StatusCode::BAD_REQUEST;
+        let subject = Subject::Object("a/b");
+
+        let refreshed =
+            store(SharedCredentials::refreshed()).failure(status, None, &expired, &subject);
+        let fixed = store(
+            Credentials {
+                access_key_id: "id".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                session_token: Some("token".to_owned()),
+            }
+            .into(),
+        )
+        .failure(status, None, &expired, &subject);
+
+        assert!(
+            matches!(refreshed, ObjectStoreError::Unavailable(_)),
+            "{refreshed:?}"
+        );
+        assert!(matches!(fixed, ObjectStoreError::Auth(_)), "{fixed:?}");
+    }
+
     #[test]
     fn given_endpoints_when_building_should_refuse_what_cannot_address_a_bucket() {
         let config = |endpoint: &str| S3Config {
@@ -914,7 +993,8 @@ mod tests {
                 access_key_id: "id".to_owned(),
                 secret_access_key: "secret".to_owned(),
                 session_token: None,
-            },
+            }
+            .into(),
         };
 
         for endpoint in [

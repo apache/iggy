@@ -94,7 +94,8 @@ impl FlociBucket {
                 access_key_id: ACCESS_KEY_ID.to_owned(),
                 secret_access_key: SECRET_ACCESS_KEY.to_owned(),
                 session_token: None,
-            },
+            }
+            .into(),
         }
     }
 }

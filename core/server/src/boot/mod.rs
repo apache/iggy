@@ -63,6 +63,7 @@ use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::Operation;
+use iggy_object_store::s3::SharedCredentials;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
@@ -298,7 +299,9 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     crate::external_auth::preflight(&config.external_auth)?;
     crate::tiered_storage::preflight(&config.tiered_storage)?;
-    let object_store_answered = crate::tiered_storage::probe(&config.tiered_storage)?;
+    let tiered_credentials = crate::s3_credentials::credentials(&config.tiered_storage)?;
+    let object_store_answered =
+        crate::tiered_storage::probe(&config.tiered_storage, tiered_credentials.as_ref())?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -450,6 +453,7 @@ pub fn bootstrap(
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
+        let tiered_credentials_for_shard = tiered_credentials.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -472,6 +476,7 @@ pub fn bootstrap(
                     shard_metrics_for_shard,
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
+                    tiered_credentials_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -547,6 +552,7 @@ async fn shard_main(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
+    tiered_credentials: Option<SharedCredentials>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -1014,6 +1020,7 @@ async fn shard_main(
         &bus,
         &shard,
         topology.self_replica_id,
+        tiered_credentials.as_ref(),
     );
 
     // Segment cleaner: runs on every shard (each replica trims its own log,

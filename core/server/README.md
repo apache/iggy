@@ -458,11 +458,30 @@ store for the sealed segments of tiered topics. The server still refuses to turn
 the store yet.
 
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
-in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. It
-signs each request with the static keys `access_key_id` and
-`secret_access_key`, which it needs. With an empty `endpoint`, it uses AWS in
-`region`. `url_style` picks whether the bucket goes in the URL path or in the
-host name.
+in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
+an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the
+bucket goes in the URL path or in the host name.
+
+The `s3` backend signs each request with the first credentials that the node
+has, in the order of the AWS SDKs:
+
+1. The static keys `access_key_id` and `secret_access_key`.
+2. Web identity: the token in `AWS_WEB_IDENTITY_TOKEN_FILE`, which STS
+   exchanges for credentials of `AWS_ROLE_ARN`. EKS sets both variables for a
+   pod with a service account role. `AWS_ROLE_SESSION_NAME` and
+   `AWS_ENDPOINT_URL_STS` change the session name and the STS URL.
+3. The role of the EC2 instance, from its instance metadata service.
+   `AWS_EC2_METADATA_DISABLED=true` turns this source off, and
+   `AWS_EC2_METADATA_SERVICE_ENDPOINT` moves the service.
+
+The node fetches temporary credentials once and shares them with every shard.
+It fetches new ones 5 minutes before the old ones expire. If a fetch fails,
+the node keeps the credentials that it has and tries again. The first retry
+comes after 1 second, and the wait doubles up to 1 minute. If the source
+refuses the first fetch,
+for example because the role does not trust the token, the server does not
+start. If the source does not answer at boot, the server starts without
+credentials and keeps trying. No log line shows a key or a token.
 
 At boot the server reads the store identity object `<prefix>/meta/identity`
 once. Only a missing bucket or rejected credentials stop the boot. If the store
