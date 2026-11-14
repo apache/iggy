@@ -35,6 +35,7 @@ use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
 use super::server::ServerConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
+use super::tiered_storage::TieredStorageConfig;
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
 use crate::common::server::{
@@ -71,6 +72,7 @@ impl Default for ServerConfig {
             partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
             external_auth: ExternalAuthConfig::default(),
+            tiered_storage: TieredStorageConfig::default(),
         }
     }
 }

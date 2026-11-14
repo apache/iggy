@@ -297,6 +297,7 @@ pub fn bootstrap(
     let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
     crate::external_auth::preflight(&config.external_auth)?;
+    crate::tiered_storage::preflight(&config.tiered_storage)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -998,6 +999,10 @@ async fn shard_main(
         }
         _ => None,
     };
+
+    // Before the segment cleaner, whose timed passes start the uploads of
+    // tiered partitions.
+    crate::tiered_storage::start(&config.tiered_storage, &bus, &shard);
 
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
