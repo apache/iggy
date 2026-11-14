@@ -3927,27 +3927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "error_set"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ce8f47d095467cd3c796a35d95a0363877f59a91cc2df0c47770cb87dbb6a3c"
-dependencies = [
- "error_set_impl",
-]
-
-[[package]]
-name = "error_set_impl"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7521f538d4b71021e32ee4e6c4ed2426fd04c49e0a0d34ea3c65dcb4ca5f7930"
-dependencies = [
- "proc-macro2",
- "quote",
- "regex",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "euclid"
 version = "0.22.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8915,12 +8894,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ringbuffer"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57b0b88a509053cbfd535726dcaaceee631313cef981266119527a1d110f6d2b"
-
-[[package]]
 name = "rmcp"
 version = "3.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9643,12 +9616,10 @@ version = "0.10.0"
 dependencies = [
  "ahash",
  "arc-swap",
- "argon2",
  "assert_cmd",
  "async-channel",
  "async_zip",
  "axum",
- "axum-server",
  "blake3",
  "bytemuck",
  "bytes",
@@ -9665,14 +9636,10 @@ dependencies = [
  "cyper-core",
  "dashmap",
  "dotenvy",
- "err_trail",
- "error_set",
  "figlet-rs",
  "fs2",
  "futures",
- "hash32",
  "hex",
- "human-repr",
  "hwlocality",
  "hyper",
  "hyper-util",
@@ -9681,30 +9648,19 @@ dependencies = [
  "iggy_common",
  "journal",
  "jsonwebtoken",
- "left-right",
  "message_bus",
  "metadata",
  "mimalloc",
  "mime_guess",
  "nix",
- "opentelemetry",
- "opentelemetry-appender-tracing",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
- "papaya",
  "partitions",
  "proc-macro2",
  "prometheus-client",
  "quote",
  "rand 0.10.3",
  "ring",
- "ringbuffer",
- "rmp-serde",
- "rolling-file",
  "rust-embed",
  "rustls",
- "rustls-pemfile",
  "sd-notify",
  "secrecy",
  "send_wrapper",
@@ -9712,7 +9668,6 @@ dependencies = [
  "serde_json",
  "server_common",
  "shard",
- "socket2",
  "strum 0.28.0",
  "syn 3.0.9",
  "sysinfo 0.40.1",
@@ -9723,9 +9678,6 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tower-http 0.7.1",
  "tracing",
- "tracing-appender",
- "tracing-opentelemetry",
- "ulid",
  "uuid",
  "vergen-git2",
 ]

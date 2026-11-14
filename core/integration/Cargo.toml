@@ -27,10 +27,11 @@ ignored = ["cfg_aliases"]
 
 [features]
 default = ["login-session"]
-login-session = ["dep:zbus-secret-service-keyring-store"]
+# Gates only the keyring backend of the CLI login tests. Its store is a
+# dev-dependency, and a dev-dependency cannot be optional.
+login-session = []
 
 [dependencies]
-assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 configs = { workspace = true }
@@ -65,13 +66,11 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-zbus-secret-service-keyring-store = { workspace = true, optional = true }
-
 [build-dependencies]
 cfg_aliases = { workspace = true }
 
 [dev-dependencies]
+assert_cmd = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytemuck = { workspace = true }
@@ -97,6 +96,9 @@ tempfile = { workspace = true }
 test-case = { workspace = true }
 twox-hash = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dev-dependencies]
+zbus-secret-service-keyring-store = { workspace = true }
 
 [lints]
 workspace = true

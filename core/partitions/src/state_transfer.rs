@@ -687,8 +687,7 @@ impl ConsumerOffsetsWire {
         let retirement_bytes = self
             .owner_retirement
             .as_ref()
-            .map(WireEncode::to_bytes)
-            .unwrap_or_default();
+            .map_or_default(WireEncode::to_bytes);
         out.extend_from_slice(
             &u32::try_from(retirement_bytes.len())
                 .expect("bounded owner retirement")

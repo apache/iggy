@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{fs, process::Command};
+use std::fs;
 
-use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use integration::bench_utils::{BENCH_WAIT_TIMEOUT, bench_run_dirs, run_bench_and_wait_for_finish};
-use integration::harness::{TestHarness, TestServerConfig};
+use integration::harness::{TestHarness, TestServerConfig, cargo_bin_path};
 use serde_json::Value;
 use serial_test::parallel;
 
@@ -54,9 +53,7 @@ async fn given_rate_limit_when_running_end_to_end_benchmark_should_limit_aggrega
             harness.start().await.unwrap();
             let output_dir = tempfile::tempdir().unwrap();
             let server_address = harness.server().raw_tcp_addr().unwrap();
-            #[allow(deprecated)]
-            let command = Command::cargo_bin("iggy-bench").unwrap();
-            let mut command = assert_cmd::Command::from_std(command);
+            let mut command = assert_cmd::Command::new(cargo_bin_path("iggy-bench").unwrap());
             command.args([
                 "--total-data",
                 &format!("{RATE_TEST_BYTES}B"),
@@ -141,9 +138,7 @@ async fn given_populated_topic_when_warming_consumer_group_should_replay_without
             .unwrap();
         harness.start().await.unwrap();
         let server_address = harness.server().raw_tcp_addr().unwrap();
-        #[allow(deprecated)]
-        let command = Command::cargo_bin("iggy-bench").unwrap();
-        assert_cmd::Command::from_std(command)
+        assert_cmd::Command::new(cargo_bin_path("iggy-bench").unwrap())
             .args([
                 "--total-data",
                 REPORT_TEST_DATA,
@@ -180,9 +175,7 @@ async fn given_populated_topic_when_warming_consumer_group_should_replay_without
             .await
             .unwrap();
 
-        #[allow(deprecated)]
-        let command = Command::cargo_bin("iggy-bench").unwrap();
-        let mut command = assert_cmd::Command::from_std(command);
+        let mut command = assert_cmd::Command::new(cargo_bin_path("iggy-bench").unwrap());
         command.args([
             "--total-data",
             REPORT_TEST_DATA,
@@ -250,9 +243,7 @@ async fn given_secret_environment_when_saving_benchmark_should_omit_credentials(
     harness.start().await.unwrap();
     let output_dir = tempfile::tempdir().unwrap();
     let server_address = harness.server().raw_tcp_addr().unwrap();
-    #[allow(deprecated)]
-    let command = Command::cargo_bin("iggy-bench").unwrap();
-    let output = assert_cmd::Command::from_std(command)
+    let output = assert_cmd::Command::new(cargo_bin_path("iggy-bench").unwrap())
         .args([
             "--total-data",
             REPORT_TEST_DATA,
@@ -317,9 +308,7 @@ async fn given_same_command_when_run_twice_should_keep_both_run_directories() {
     let server_address = harness.server().raw_tcp_addr().unwrap();
 
     for _ in 0..2 {
-        #[allow(deprecated)]
-        let command = Command::cargo_bin("iggy-bench").unwrap();
-        assert_cmd::Command::from_std(command)
+        assert_cmd::Command::new(cargo_bin_path("iggy-bench").unwrap())
             .args([
                 "--password",
                 DEFAULT_ROOT_PASSWORD,

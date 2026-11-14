@@ -64,7 +64,7 @@ pub use context::{TestContext, get_test_directory};
 pub use error::TestBinaryError;
 pub use handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
-    StopOutcome,
+    StopOutcome, common::cargo_bin_path,
 };
 pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
 pub use port_reserver::SinglePortReserver;
