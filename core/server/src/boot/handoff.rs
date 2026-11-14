@@ -18,7 +18,7 @@
 //! Cross-shard boot handoff: the metadata bundle broadcast and the
 //! listener barrier.
 
-use crate::boot::credentials::RootCredentials;
+use crate::boot::credentials::{RootCredentials, RootPasswordReset};
 use crate::server_error::ServerError;
 use crate::shell::ServerMetadataBundle;
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
@@ -52,6 +52,8 @@ pub(in crate::boot) enum MetadataHandoff {
         bundle_tx: crossfire::MAsyncTx<crossfire::mpmc::Array<ServerMetadataBundle>>,
         /// Only shard 0 can propose root creation.
         root_credentials: Option<RootCredentials>,
+        /// Only shard 0 applies `--reset-root-password` input.
+        root_password_reset: Option<RootPasswordReset>,
     },
     Waiter {
         bundle_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<ServerMetadataBundle>>,

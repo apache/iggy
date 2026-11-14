@@ -407,6 +407,23 @@ pub enum ServerError {
         min: usize,
         max: usize,
     },
+    #[error(
+        "--reset-root-password cannot be combined with --fresh; --fresh deletes the data \
+         directory before boot, including the root user to reset"
+    )]
+    ResetRootPasswordFresh,
+    #[error("--reset-root-password requires a non-empty {field}; the prompt got an empty value")]
+    RootResetInputEmpty { field: &'static str },
+    #[error("failed to read the {field} for --reset-root-password")]
+    RootResetInputRead {
+        field: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("supplied username does not match the stored root username")]
+    RootResetUsernameMismatch,
+    #[error("Root password reset was rejected with status {status}")]
+    RootPasswordResetRejected { status: u32 },
     #[error("--fresh could not remove the system path at {path}")]
     FreshWipeFailed {
         path: PathBuf,

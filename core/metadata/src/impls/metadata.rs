@@ -66,7 +66,9 @@ use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopi
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::UpdateTopicResolvedRequest;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
-use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdateUserResolvedRequest};
+use iggy_binary_protocol::requests::users::{
+    ChangePasswordRequest, CreateUserRequest, UpdateUserResolvedRequest,
+};
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
     Command, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
@@ -3579,6 +3581,59 @@ where
             .await
             .map(|reply| reply.header().status)
             .map_err(|Canceled| MetadataSubmitError::Canceled)
+    }
+
+    /// Replicate a root password reset with a precomputed Argon2 hash.
+    /// Builds the prepare directly with reserved client and acting user `0`,
+    /// so the client-edge `current_password` verification in
+    /// `maybe_rewrite_user_password_request` never runs and apply in
+    /// `core/metadata/src/stm/user.rs` stays unchanged. The request must
+    /// carry a non-empty hashed `new_password`: empty is apply's rejection
+    /// sentinel.
+    ///
+    /// Returns the request status (0 = committed) with the prepare's op number.
+    ///
+    /// # Errors
+    /// Returns a submission error if this replica cannot commit the reset.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_root_password_reset_in_process(
+        &self,
+        request: &ChangePasswordRequest,
+    ) -> Result<(u32, u64), MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(MetadataSubmitError::NotCaughtUp);
+        }
+        if consensus.pipeline_has_message_from_client(RESERVED_CLIENT_ID) {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::ChangePassword,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        let op = prepare.header().op;
+        let status = self
+            .dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map(|reply| reply.header().status)
+            .map_err(|Canceled| MetadataSubmitError::Canceled)?;
+        Ok((status, op))
     }
 
     /// Submit a replicated `DeletePersonalAccessToken` originated by the

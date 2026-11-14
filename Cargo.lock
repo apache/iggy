@@ -9872,6 +9872,7 @@ dependencies = [
  "mime_guess",
  "nix",
  "partitions",
+ "passterm",
  "proc-macro2",
  "prometheus-client",
  "quote",
