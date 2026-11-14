@@ -26,7 +26,7 @@ use compio::io::AsyncWriteAtExt;
 use consensus::LocalPipeline;
 use iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
 use iggy_binary_protocol::{
-    Command, CommitHeader, CommitReplyHeader, ConsensusHeader, HEADER_SIZE, ReplyHeader,
+    Command, CommitEntry, CommitReplyEntry, ConsensusHeader, HeartbeatState, ReplyHeader,
     StartViewHeader, WireConsumer, WireEncode, WireName,
 };
 use iggy_common::Aes256GcmEncryptor;
@@ -679,17 +679,9 @@ async fn commit_on_heartbeat(
     commit: u64,
 ) {
     let group = partition.namespace().inner();
-    let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-        |_, header: &mut CommitHeader| {
-            header.command = Command::Commit;
-            header.cluster = TEST_CLUSTER;
-            header.group = group;
-            header.commit = commit;
-            header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-        },
-    );
+    let heartbeat = CommitEntry::new(group, 0, 0, commit, 0, HeartbeatState::Busy, 0);
     assert!(matches!(
-        partition.consensus().handle_commit(heartbeat.header()),
+        partition.consensus().handle_commit(&heartbeat),
         consensus::CommitOutcome::Advanced
     ));
     partition.commit_journal(config).await;

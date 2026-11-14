@@ -15988,7 +15988,7 @@ fn accumulate_committed_info(
 /// A SEGMENT budget standing in for a time bound, so the margin is filesystem
 /// specific: 16 segments is at most 32 unlinks (log plus index), a few hundred
 /// milliseconds on commodity `NVMe` against the shipped 5 s
-/// `cluster.heartbeat_timeout`, and still under 2 s if each unlink costs a
+/// `cluster.commit_busy_heartbeat_timeout`, and still under 2 s if each unlink costs a
 /// pathological 50 ms on a contended journal. Large enough that steady-state
 /// retention, which reclaims a handful of segments per interval, never reaches
 /// it -- only a backlog does, and that one drains over several passes.

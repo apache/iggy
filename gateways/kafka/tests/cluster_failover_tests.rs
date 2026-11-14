@@ -215,7 +215,7 @@ const SHORT_SESSIONS: Sessions = Sessions {
 const TAKEOVER_SLACK: Duration = Duration::from_secs(4);
 
 /// How long the metadata plane takes to elect a primary for a lost one: its 5 s
-/// `cluster.heartbeat_timeout`, and an election.
+/// `cluster.commit_busy_heartbeat_timeout`, and an election.
 const VIEW_CHANGE: Duration = Duration::from_secs(10);
 
 /// How long the groups of a gateway may take to move after its SIGTERM. A successor reads its lease

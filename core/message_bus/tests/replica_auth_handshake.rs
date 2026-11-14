@@ -35,7 +35,9 @@ use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 use iggy_common::IggyError;
 use message_bus::connector::start as start_connector;
 use message_bus::framing::{self, MAX_MESSAGE_SIZE};
-use message_bus::replica::auth::{self, HandshakeStatus, LinkPlacement, ReplicaAuth};
+use message_bus::replica::auth::{
+    self, HandshakeStatus, HeartbeatTimings, LinkPlacement, ReplicaAuth,
+};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::replica::preamble::{Preamble, read_preamble, write_preamble};
 use message_bus::{IggyMessageBus, MessageBus, MessageBusConfig};
@@ -423,6 +425,47 @@ async fn acceptor_refuses_a_hello_whose_placement_differs() {
         assert!(!acceptor.replicas().contains(0));
         acceptor.shutdown(Duration::from_secs(2)).await;
     }
+}
+
+/// A node with another heartbeat value is refused. The refusal carries the
+/// values of the acceptor, so the dialer names the option that differs.
+#[compio::test]
+async fn acceptor_refuses_a_hello_whose_heartbeat_values_differ() {
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let addr = spawn_acceptor(&acceptor, None).await;
+    let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
+    let dialer_timings = HeartbeatTimings {
+        busy_timeout_ms: 6_000,
+        ..HeartbeatTimings::default()
+    };
+    let hello =
+        build_hello(CLUSTER, 0, None).transmute_header(|old, header: &mut GenericHeader| {
+            *header = old;
+            dialer_timings.write(&mut header.reserved_command);
+        });
+    framing::write_message(&mut stream, hello)
+        .await
+        .expect("write hello");
+
+    let response = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+        .await
+        .expect("read refusal");
+
+    assert_eq!(
+        auth::read_status(&response.header().reserved_command),
+        HandshakeStatus::HeartbeatMismatch
+    );
+    let mismatch = dialer_timings
+        .first_mismatch(HeartbeatTimings::read(&response.header().reserved_command))
+        .expect("the refusal carries other values");
+    assert_eq!(mismatch.option, "cluster.commit_busy_heartbeat_timeout");
+    assert!(
+        mismatch
+            .to_string()
+            .contains("cluster.commit_busy_heartbeat_timeout")
+    );
+    assert!(!acceptor.replicas().contains(0));
+    acceptor.shutdown(Duration::from_secs(2)).await;
 }
 
 /// Shard 0 placed the link for the dialer its preamble named, so a hello

@@ -43,6 +43,7 @@ fn given_held_commits_when_more_are_deferred_should_keep_the_latest_per_target()
         commit: 1,
         group: partition.namespace().inner(),
         timestamp_monotonic,
+        heartbeat_state: HeartbeatState::Busy,
         target,
     };
 

@@ -20,7 +20,9 @@ use crate::executor::{PendingSpawns, TimerHandle};
 use clock::Clock;
 #[cfg(test)]
 use futures::channel::oneshot;
-use iggy_binary_protocol::GenericHeader;
+use iggy_binary_protocol::{
+    Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader, GenericHeader,
+};
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::ClientConnMeta;
@@ -34,6 +36,7 @@ use server_common::{
     MESSAGE_ALIGN, Message,
     iobuf::{Frozen, Owned},
 };
+use shard::commit_batch;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -48,6 +51,51 @@ use std::time::{Duration, Instant};
 fn frozen_to_message(frozen: &Frozen<MESSAGE_ALIGN>) -> Message<GenericHeader> {
     Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(frozen.as_slice()))
         .expect("simulator bus must receive a valid generic message")
+}
+
+/// The frames that go on the simulated wire for `message`. A `Commit` or a
+/// `CommitReply` batch becomes one frame per entry, so the network drops,
+/// delays and reorders each entry alone. Each other frame stays as it is.
+fn split_commit_batch(message: Message<GenericHeader>) -> Vec<Message<GenericHeader>> {
+    let header = *message.header();
+    let parts = match header.command {
+        Command::Commit => message
+            .try_as_typed::<CommitHeader>()
+            .ok()
+            .and_then(|batch| {
+                let entries: Vec<CommitEntry> =
+                    commit_batch::verified_entries(batch, batch.header().checksum_body)?;
+                entries
+                    .iter()
+                    .map(|entry| {
+                        commit_batch::encode_commit_batch(header.cluster, header.replica, &[*entry])
+                            .map(Message::into_generic)
+                    })
+                    .collect()
+            }),
+        Command::CommitReply => {
+            message
+                .try_as_typed::<CommitReplyHeader>()
+                .ok()
+                .and_then(|batch| {
+                    let entries: Vec<CommitReplyEntry> =
+                        commit_batch::verified_entries(batch, batch.header().checksum_body)?;
+                    entries
+                        .iter()
+                        .map(|entry| {
+                            commit_batch::encode_commit_reply_batch(
+                                header.cluster,
+                                header.replica,
+                                &[*entry],
+                            )
+                            .map(Message::into_generic)
+                        })
+                        .collect()
+                })
+        }
+        _ => None,
+    };
+    parts.unwrap_or_else(|| vec![message])
 }
 
 /// Message envelope for tracking sender/recipient
@@ -243,12 +291,15 @@ impl MessageBus for SimOutbox {
             }
         }
 
-        self.pending_messages.borrow_mut().push_back(Envelope {
-            from_replica: Some(self.self_id),
-            to_replica: Some(replica),
-            to_client: None,
-            payload: EnvelopePayload::Replica(frozen_to_message(&data)),
-        });
+        let mut pending = self.pending_messages.borrow_mut();
+        for message in split_commit_batch(frozen_to_message(&data)) {
+            pending.push_back(Envelope {
+                from_replica: Some(self.self_id),
+                to_replica: Some(replica),
+                to_client: None,
+                payload: EnvelopePayload::Replica(message),
+            });
+        }
 
         Ok(())
     }
