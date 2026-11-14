@@ -1061,14 +1061,14 @@ where
                 "invalid session finalization",
             )
         });
-        if mux_stm.streams().read(|inner| inner.namespace_revision) == request.namespace_revision {
-            if table_mutations_allowed {
-                client_table.borrow_mut().finalize_session(request.identity);
-            }
-            mux_stm
-                .streams()
-                .record_retirement_debt(&request.debt, header.op);
+        if table_mutations_allowed {
+            client_table
+                .borrow_mut()
+                .finalize_sessions_through(request.retired_through);
         }
+        mux_stm
+            .streams()
+            .record_retirement_debt(&request.debt, header.op);
         return CommittedApply {
             reply: build_reply_message(&header, &bytes::Bytes::new()),
             changes: Vec::new(),
@@ -3336,17 +3336,17 @@ where
             .map_err(|Canceled| MetadataSubmitError::Canceled)
     }
 
-    /// Finalize once every currently allocated partition group either proved
-    /// this exact ended session retired on a quorum of its members or is
-    /// listed in `debt`, which its next primary pays before serving sessions.
+    /// Finalize every ended session whose end op is at or below
+    /// `retired_through`. Each partition incarnation must have proved all of
+    /// them retired on a quorum of its members, or be listed in `debt`, which
+    /// its next primary pays before serving sessions.
     ///
     /// # Errors
     /// Returns an admission or consensus error before finalization commits.
     #[allow(clippy::future_not_send)]
     pub async fn submit_session_finalization(
         &self,
-        identity: SessionIdentity,
-        namespace_revision: u64,
+        retired_through: u64,
         debt: Vec<RetirementDebt>,
     ) -> Result<Option<u64>, MetadataSubmitError> {
         let consensus = self
@@ -3356,19 +3356,11 @@ where
         if !self.is_caught_up_primary() {
             return Err(MetadataSubmitError::NotCaughtUp);
         }
-        if self
-            .mux_stm
-            .streams()
-            .read(|inner| inner.namespace_revision)
-            != namespace_revision
-        {
-            return Ok(None);
-        }
         if !self
             .client_table
             .borrow()
             .ended_sessions()
-            .any(|ended| ended == identity)
+            .any(|ended| ended.metadata_watermark <= retired_through)
         {
             return Ok(None);
         }
@@ -3379,7 +3371,7 @@ where
         let header = RoutedRequestHeader {
             client: message_bus::AUTO_COMMIT_CLIENT_ID,
             session: 1,
-            request: identity.metadata_watermark,
+            request: retired_through,
             group: server_common::sharding::METADATA_GROUP,
             ..RoutedRequestHeader::default()
         };
@@ -3389,8 +3381,7 @@ where
                 &header,
                 Operation::FinalizeSession,
                 &FinalizeSessionRequest {
-                    identity,
-                    namespace_revision,
+                    retired_through,
                     debt,
                 }
                 .to_bytes(),
@@ -11477,10 +11468,9 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_group_logout_when_finalizing_session_should_preserve_retirement_coverage() {
+    async fn given_group_logout_when_finalizing_through_its_end_should_release_the_session() {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
-        let namespace_revision = metadata.mux_stm.namespace_revision();
         let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
         metadata
             .submit_logout_in_process(CLIENT, session, 1)
@@ -11492,19 +11482,21 @@ mod tests {
             .ended_sessions()
             .next()
             .unwrap();
-        assert_eq!(metadata.mux_stm.namespace_revision(), namespace_revision);
-        assert_ne!(
-            metadata.mux_stm.streams().read(|inner| inner.revision),
-            namespace_revision
-        );
 
+        assert_eq!(
+            metadata
+                .submit_session_finalization(identity.metadata_watermark - 1, Vec::new())
+                .await
+                .unwrap(),
+            None,
+            "a watermark below every session end has nothing to finalize"
+        );
         assert!(
             metadata
-                .submit_session_finalization(identity, namespace_revision, Vec::new())
+                .submit_session_finalization(identity.metadata_watermark, Vec::new())
                 .await
                 .unwrap()
-                .is_some(),
-            "membership changes must preserve retirement coverage"
+                .is_some()
         );
         assert_eq!(
             metadata.client_table.borrow().ended_sessions().next(),
@@ -11514,8 +11506,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_retirement_reports_when_namespace_changes_before_apply_should_keep_the_session()
-    {
+    async fn given_a_partition_created_after_a_session_ended_when_finalizing_should_release_it() {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
@@ -11529,8 +11520,9 @@ mod tests {
             .ended_sessions()
             .next()
             .unwrap();
-        let revision = metadata.mux_stm.namespace_revision();
         let consensus = metadata.consensus.as_ref().unwrap();
+        // A partition created after the end starts its frontier above it, so
+        // the finalization does not depend on it.
         let create = build_prepare_message(
             consensus,
             &RoutedRequestHeader::default(),
@@ -11554,27 +11546,18 @@ mod tests {
             gated_apply(metadata.mux_stm.as_ref(), create).unwrap().code,
             0
         );
-        let current_revision = metadata.mux_stm.namespace_revision();
-        assert_ne!(current_revision, revision);
-        assert_eq!(
-            metadata
-                .submit_session_finalization(identity, revision, Vec::new())
-                .await
-                .unwrap(),
-            None
-        );
 
-        for (reported_revision, expected_session) in
-            [(revision, Some(identity)), (current_revision, None)]
-        {
+        for (retired_through, expected_session) in [
+            (identity.metadata_watermark - 1, Some(identity)),
+            (identity.metadata_watermark, None),
+        ] {
             let prepare = consensus::seal_prepare_capacity(
                 build_prepare_message(
                     consensus,
                     &RoutedRequestHeader::default(),
                     Operation::FinalizeSession,
                     &FinalizeSessionRequest {
-                        identity,
-                        namespace_revision: reported_revision,
+                        retired_through,
                         debt: Vec::new(),
                     }
                     .to_bytes(),
@@ -11591,7 +11574,7 @@ mod tests {
             assert_eq!(
                 metadata.client_table.borrow().ended_sessions().next(),
                 expected_session,
-                "finalization must use the namespace revision at ordered apply"
+                "finalization releases exactly the sessions that ended at or below its watermark"
             );
         }
     }
@@ -11625,8 +11608,7 @@ mod tests {
                 &RoutedRequestHeader::default(),
                 Operation::FinalizeSession,
                 &FinalizeSessionRequest {
-                    identity,
-                    namespace_revision: metadata.mux_stm.namespace_revision(),
+                    retired_through: identity.metadata_watermark,
                     debt: vec![
                         RetirementDebt {
                             namespace: namespace.inner(),
@@ -11904,7 +11886,10 @@ mod tests {
                     ClientTable::decode(&metadata.client_table.borrow().encode()).unwrap();
                 let ended = table.end_user_sessions(USER, tail[0].header().op);
                 if finalized {
-                    assert!(table.finalize_session(ended[0]));
+                    assert_eq!(
+                        table.finalize_sessions_through(ended[0].metadata_watermark),
+                        1
+                    );
                     consensus.sequencer().set_sequence(tail[0].header().op);
                     tail.push(consensus::seal_prepare_capacity(
                         build_prepare_message(
@@ -11912,8 +11897,7 @@ mod tests {
                             &request,
                             Operation::FinalizeSession,
                             &FinalizeSessionRequest {
-                                identity: ended[0],
-                                namespace_revision: metadata.mux_stm.namespace_revision(),
+                                retired_through: ended[0].metadata_watermark,
                                 debt: Vec::new(),
                             }
                             .to_bytes(),

@@ -150,17 +150,23 @@ async fn given_deleted_history_when_retirement_read_names_old_incarnation_should
         owner
             .on_partition_read(
                 namespace,
-                PartitionRead::SessionRetired {
-                    identity,
+                PartitionRead::SessionsRetired {
+                    ended: Arc::from([identity]),
+                    retired_through: identity.metadata_watermark,
                     created_revision: ORIGINAL_REVISION,
                 },
                 reply,
             )
             .await;
-        assert!(matches!(
-            replies.try_recv().unwrap(),
-            PartitionReadReply::SessionRetired(retired) if retired == (revision == ORIGINAL_REVISION)
-        ));
+        let reply = replies.try_recv().unwrap();
+        if revision == ORIGINAL_REVISION {
+            assert!(matches!(
+                reply,
+                PartitionReadReply::SessionsRetired(partitions::BatchRetirement::Retired)
+            ));
+        } else {
+            assert!(matches!(reply, PartitionReadReply::NotFound));
+        }
     }
 }
 
@@ -1350,13 +1356,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
             }
             Change::SessionReplacement => {
                 assert!(table.end_session(PARENT, USER, registration.op, registration.op + 1));
-                assert!(table.finalize_session(
-                    iggy_binary_protocol::requests::system::SessionIdentity {
-                        client_id: PARENT,
-                        session: registration.op,
-                        metadata_watermark: registration.op + 1,
-                    }
-                ));
+                assert_eq!(table.finalize_sessions_through(registration.op + 1), 1);
                 registration.op += 1;
                 table
                     .commit_register(

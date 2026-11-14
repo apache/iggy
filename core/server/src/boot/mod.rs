@@ -93,7 +93,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-METADATA-CHANGE-LOG-1\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-METADATA-CHANGE-LOG-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -1417,6 +1417,7 @@ mod tests {
             b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-1\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();
@@ -1465,6 +1466,7 @@ mod tests {
             b"IGGY-BOUND-GRANTS-4\n",
             b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-1\n",
         ] {
             assert_ne!(
                 message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),

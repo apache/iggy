@@ -32,7 +32,9 @@ use iggy_binary_protocol::{
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyError};
 use server_common::Message;
 
-use crate::{PollingConsumer, RetirementDebtStatus, iggy_partition::PendingCheckpoint};
+use crate::{
+    BatchRetirement, PollingConsumer, RetirementDebtStatus, iggy_partition::PendingCheckpoint,
+};
 
 /// Pins the barrier count of a burst of ended sessions: the sweep sends the
 /// oldest `MAX_SESSIONS_PER_RETIREMENT` identities in one barrier, so one
@@ -160,6 +162,182 @@ async fn given_ended_sessions_when_retiring_batch_should_use_one_partition_commi
     for identity in identities {
         assert!(partition.session_retired(identity));
     }
+}
+
+/// A walk proves its whole batch with barriers that name only the sessions
+/// holding a slice entry. The watermark covers the sessions that never wrote,
+/// an entry of a session that ended later does not hold the proof back, and a
+/// pending request of a batch client does.
+#[compio::test]
+async fn given_a_walk_batch_when_proving_should_name_only_writers_and_cover_the_rest_by_its_watermark()
+ {
+    const RETIRED_THROUGH: u64 = 20;
+    let (mut partition, _) = recording_partition_at(0, 3);
+    let writer = SessionIdentity {
+        client_id: 1,
+        session: 1,
+        metadata_watermark: 12,
+    };
+    let silent = SessionIdentity {
+        client_id: 2,
+        session: 1,
+        metadata_watermark: RETIRED_THROUGH,
+    };
+    let later = SessionIdentity {
+        client_id: 3,
+        session: 1,
+        metadata_watermark: RETIRED_THROUGH + 1,
+    };
+    let batch = [writer, silent, later];
+    let namespace = partition.namespace();
+    let send = |client_id: u128, session: u64, metadata_watermark: u64| {
+        let mut send = checksumless_send_request(namespace, 1).transmute_header(
+            |header, next: &mut RoutedRequestHeader| {
+                *next = header;
+                next.client = client_id;
+                next.session = session;
+                next.metadata_watermark = metadata_watermark;
+            },
+        );
+        send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+            .copy_from_slice(&build_segment_record(namespace, 0));
+        send
+    };
+    let mut op = 0;
+
+    for identity in [writer, later] {
+        partition
+            .on_request(send(identity.client_id, identity.session, 0), None)
+            .await;
+        op += 1;
+        partition.consensus.advance_commit_max(op);
+        partition.commit_journal(&repair_config()).await;
+    }
+    assert_eq!(partition.consensus.commit_min(), op);
+    assert_eq!(
+        partition.sessions_retired(&batch, RETIRED_THROUGH),
+        BatchRetirement::Owed(vec![writer, later])
+    );
+
+    for (identities, retired_through) in [(vec![writer], 0), (Vec::new(), RETIRED_THROUGH)] {
+        partition
+            .on_request(
+                retirement_request(
+                    namespace,
+                    &RetireSessionsRequest {
+                        identities,
+                        paid_through: 0,
+                        retired_through,
+                    },
+                ),
+                None,
+            )
+            .await;
+        op += 1;
+        partition.consensus.advance_commit_max(op);
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(partition.consensus.commit_min(), op);
+        assert_eq!(
+            partition.sessions_retired(&batch, RETIRED_THROUGH),
+            if retired_through == 0 {
+                BatchRetirement::Owed(vec![later])
+            } else {
+                BatchRetirement::Retired
+            },
+            "only the walk watermark covers the session that never wrote"
+        );
+    }
+    assert_eq!(partition.required_metadata_frontier, RETIRED_THROUGH);
+    assert_eq!(
+        partition.retirement_paid_through, 0,
+        "a walk barrier pays no retirement debt"
+    );
+
+    // A newer session of a batch client holds the proof only while pending.
+    partition
+        .on_request(
+            send(silent.client_id, silent.session + 1, RETIRED_THROUGH),
+            None,
+        )
+        .await;
+    assert_eq!(
+        partition.sessions_retired(&batch, RETIRED_THROUGH),
+        BatchRetirement::Owed(vec![later])
+    );
+    op += 1;
+    partition.consensus.advance_commit_max(op);
+    partition.commit_journal(&repair_config()).await;
+    assert_eq!(partition.consensus.commit_min(), op);
+    assert_eq!(
+        partition.sessions_retired(&batch, RETIRED_THROUGH),
+        BatchRetirement::Retired
+    );
+
+    partition
+        .on_request(
+            retirement_request(
+                namespace,
+                &RetireSessionsRequest {
+                    identities: Vec::new(),
+                    paid_through: 0,
+                    retired_through: later.metadata_watermark,
+                },
+            ),
+            None,
+        )
+        .await;
+    op += 1;
+    partition.consensus.advance_commit_max(op);
+    partition.commit_journal(&repair_config()).await;
+    assert_eq!(
+        partition.required_metadata_frontier,
+        later.metadata_watermark
+    );
+    assert_eq!(
+        partition.sessions_retired(&batch, later.metadata_watermark),
+        BatchRetirement::Owed(vec![later]),
+        "an entry of a session that ended at the watermark blocks the proof"
+    );
+}
+
+/// A partition created after a session ended refuses every request of that
+/// session, so it proves the session retired without a barrier.
+#[compio::test]
+async fn given_a_partition_started_at_its_create_op_when_proving_an_older_batch_should_need_no_barrier()
+ {
+    const CREATE_OP: u64 = 30;
+    let (mut partition, _) = recording_partition_at(0, 3);
+    partition.start_at_create_op(CREATE_OP);
+    partition.start_at_create_op(CREATE_OP - 1);
+    assert_eq!(
+        partition.required_metadata_frontier, CREATE_OP,
+        "the create op never lowers the frontier that the retained log assigned"
+    );
+    let ended = [SessionIdentity {
+        client_id: 1,
+        session: 1,
+        metadata_watermark: CREATE_OP - 1,
+    }];
+    assert_eq!(
+        partition.sessions_retired(&ended, CREATE_OP - 1),
+        BatchRetirement::Retired
+    );
+
+    let namespace = partition.namespace();
+    let mut send = checksumless_send_request(namespace, 1).transmute_header(
+        |header, next: &mut RoutedRequestHeader| {
+            *next = header;
+            next.metadata_watermark = CREATE_OP - 1;
+        },
+    );
+    send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+        .copy_from_slice(&build_segment_record(namespace, 0));
+    partition.on_request(send, None).await;
+    assert_eq!(
+        partition.consensus.sequencer().current_sequence(),
+        0,
+        "a request stamped below the create op must not prepare"
+    );
 }
 
 #[compio::test]
@@ -341,14 +519,17 @@ async fn given_retirement_debt_when_session_requests_arrive_should_refuse_them_u
 
     partition
         .on_request(
-            retirement_payment_request(
+            retirement_request(
                 namespace,
-                vec![SessionIdentity {
-                    client_id: FINALIZED_CLIENT,
-                    session: 1,
-                    metadata_watermark: DEBT_OP,
-                }],
-                DEBT_OP,
+                &RetireSessionsRequest {
+                    identities: vec![SessionIdentity {
+                        client_id: FINALIZED_CLIENT,
+                        session: 1,
+                        metadata_watermark: DEBT_OP,
+                    }],
+                    paid_through: DEBT_OP,
+                    retired_through: 0,
+                },
             ),
             None,
         )

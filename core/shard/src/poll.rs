@@ -181,7 +181,7 @@ where
             return;
         }
         let partitions = self.plane.partitions();
-        if matches!(read, PartitionRead::SessionRetired { .. }) {
+        if matches!(read, PartitionRead::SessionsRetired { .. }) {
             let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
                 partitions
                     .with_partition(&namespace, |partition| {
@@ -234,16 +234,19 @@ where
             read => (read, None),
         };
         let result = match read {
-            PartitionRead::SessionRetired {
-                identity,
+            PartitionRead::SessionsRetired {
+                ended,
+                retired_through,
                 created_revision,
             } => partitions
                 .with_partition(&namespace, |partition| {
-                    PartitionReadReply::SessionRetired(
-                        partition.created_revision() == created_revision
-                            && partition.session_retired(identity),
-                    )
+                    (partition.created_revision() == created_revision).then(|| {
+                        PartitionReadReply::SessionsRetired(
+                            partition.sessions_retired(&ended, retired_through),
+                        )
+                    })
                 })
+                .flatten()
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::RetirementDebt {
                 created_revision,
