@@ -96,13 +96,13 @@ components:
       - "core/binary_protocol/**"
 
   # Miri (UB detector) runs the tests of `iggy_binary_protocol` and
-  # `consensus`. The `consensus` crate has no unsafe code, but its tests
-  # exercise the unsafe code of `server_common`: `iobuf.rs` (ref-counted
-  # CoW buffer, manual atomics, pointer arithmetic) and
-  # `consensus_message.rs`. Other crates (journal, metadata, partitions,
-  # common) instantiate compio, which uses io_uring syscalls Miri cannot
-  # emulate. See the `# Alignment` doc on the `ConsensusHeader` trait for
-  # the alignment contract that motivates this check.
+  # `consensus`, and the tests of the unsafe `server_common` files:
+  # `iobuf.rs` (ref-counted CoW buffer, manual atomics, pointer
+  # arithmetic), `consensus_message.rs` and `buffer.rs`. Other crates
+  # (journal, metadata, partitions, common) instantiate compio, which uses
+  # io_uring syscalls Miri cannot emulate. See the `# Alignment` doc on the
+  # `ConsensusHeader` trait for the alignment contract that motivates this
+  # check.
   rust-miri:
     depends_on:
       - "rust-workspace"
@@ -112,6 +112,7 @@ components:
       - "core/consensus/**"
       - "core/server_common/src/iobuf.rs"
       - "core/server_common/src/consensus_message.rs"
+      - "core/server_common/src/buffer.rs"
       - ".config/nextest.toml"
     tasks:
       - "miri"

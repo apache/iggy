@@ -506,6 +506,13 @@ runs:
         nextest_args=("${miri_args[@]}")
         if [[ "$MIRI_TASK" == "miri-nightly" ]]; then
           nextest_args+=(--ignore-default-filter -E 'not default()')
+        else
+          # Only the tests of the unsafe server_common files. Some other
+          # tests start compio or use serial_test, which Miri cannot run.
+          nextest_args+=(-p server_common -E '
+            not package(=server_common)
+            | test(/^(iobuf|consensus_message)::tests::/)
+            | test(/^buffer::miri_tests::/)')
         fi
         TIMEFORMAT='Miri test compilation: %3R seconds'
         time cargo +"$MIRI_TOOLCHAIN" miri nextest run --no-run "${nextest_args[@]}"
