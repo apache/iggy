@@ -9402,13 +9402,14 @@ where
             return;
         }
 
-        // A header-only StartView can announce bodies this backup still lacks.
-        // Live same-view retransmits may fill its next verified slot; repair
-        // frames above commit still require the elected canonical headers.
+        // A StartView can announce bodies this backup still lacks. Live
+        // same-view retransmits may fill its next verified slot, unless the
+        // parked log names another prepare there; repair frames above commit
+        // still require the elected canonical headers.
         let is_backup = self.consensus().is_follower();
         if is_backup {
             let fills_announced_gap = header.op <= current_op
-                && !self.consensus().view_log_is_pending()
+                && self.view_log_admits(&header)
                 && self
                     .log
                     .journal()
@@ -9583,6 +9584,12 @@ where
                     self.advance_head_over_journaled_run();
                 }
             }
+            if header.op <= current_op {
+                // A parked log can name its head only by op. The body that
+                // fills that head gives the view-log proof its header, as a
+                // repaired body does.
+                consensus.note_repaired_view_header(header, RepairEvidence::Proven);
+            }
             consensus.observe_prepare_timestamp(header.timestamp);
         }
         if let Err(error) = replicate_frozen_prepare(consensus, frozen_for_forward).await {
@@ -9622,6 +9629,29 @@ where
             return;
         }
         self.send_prepare_ok(&header).await;
+    }
+
+    /// Whether the parked log of the adopted view lets a live prepare fill a
+    /// hole at or below the head.
+    ///
+    /// A backup keeps that log parked until the next view change, so a refusal
+    /// while it is parked leaves every hole to journal repair. The preflight
+    /// matched the view stamp, which only the primary of the view writes. So
+    /// the log refuses only a prepare that it names differently, the rule of
+    /// the repair ingest.
+    fn view_log_admits(&self, header: &PrepareHeader) -> bool {
+        let consensus = self.consensus();
+        let journal = &self.log.journal().inner;
+        let held_at = |op| {
+            journal
+                .header_by_op(op)
+                .map(|held| (held, consensus.view_log_entry_proven(op)))
+        };
+        consensus
+            .with_pending_view_log(|pending| {
+                repaired_prepare_evidence(header, consensus.view(), Some(pending), held_at)
+            })
+            .is_none_or(|evidence| evidence == RepairEvidence::Proven)
     }
 
     /// Whether `header` chains onto the entry this replica holds one op below
