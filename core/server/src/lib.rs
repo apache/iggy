@@ -77,6 +77,7 @@ pub use partition_reconciler::{
 pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;
+pub(crate) mod store_identity;
 pub(crate) mod sysinfo_printer;
 pub(crate) mod tiered_storage;
 

@@ -63,6 +63,13 @@ where
         *self.segment_uploader.borrow_mut() = uploader;
     }
 
+    /// The uploader this shard's upload passes run. `None` on a shard that
+    /// was given none.
+    #[must_use]
+    pub fn segment_uploader(&self) -> Option<Rc<dyn SegmentUploader>> {
+        self.segment_uploader.borrow().clone()
+    }
+
     /// Stage an upload pass for the partition `namespace` names now on this
     /// shard's pump. A refused frame is picked up by the cleaner's next tick.
     pub fn request_upload_segments(&self, namespace: IggyNamespace) {

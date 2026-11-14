@@ -5599,6 +5599,66 @@ mod tests {
         ));
     }
 
+    /// An evicted segment is read back from the store, so the cleaner stages
+    /// an eviction only while the node reads remote segments and passes the
+    /// store identity check.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_node_cannot_tier_topics_should_stage_no_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "evicted-stream");
+        seed_topic(&mux, 2, 0, "evicted-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let explicit: ResourceOptions = std::iter::once((
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(HeaderValue::from(true)),
+        ))
+        .collect();
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &enable))
+            .expect("UpdateTopic apply succeeds");
+        let evictions = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut evicted = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::EvictPartition {
+                    namespace,
+                    ..
+                }) = frame
+                {
+                    evicted.push(namespace);
+                }
+            }
+            evicted
+        };
+        let frontier = shard.plane.metadata().applied_frontier();
+
+        assert_eq!(evictions(), Vec::<IggyNamespace>::new());
+        frontier.set_store_identity_verified(true);
+        assert_eq!(evictions(), Vec::<IggyNamespace>::new());
+        frontier.set_tiered_storage_ready(true);
+        assert_eq!(evictions(), [namespace]);
+        frontier.set_store_identity_verified(false);
+        assert_eq!(evictions(), Vec::<IggyNamespace>::new());
+    }
+
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this
     /// time: a wire-valid consensus frame carrying an operation only a newer
     /// release defines must leave an accounted, operator-visible trace instead

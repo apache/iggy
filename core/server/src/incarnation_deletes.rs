@@ -33,9 +33,8 @@
 //! the metadata primary. A restart, a primary change, a change feed that
 //! overflowed and a full queue each leave objects in the store, for a sweep
 //! of unowned prefixes to find. Nothing is queued on a shard without an
-//! object deleter. No boot path sets one, so these deletes run only where a
-//! caller of `IggyShard::set_object_deleter` supplies it to the shard that
-//! holds the metadata consensus.
+//! object deleter, and a shard holds one only while its node passes the
+//! store identity check of [`crate::store_identity`].
 
 use crate::shell::ServerShard;
 use consensus::MetadataHandle;

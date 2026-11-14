@@ -1749,6 +1749,7 @@ async fn given_peer_tiered_storage_reports_when_the_coordinator_ticks_should_adm
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
     let metadata = shard.plane.metadata();
     let frontier = metadata.applied_frontier();
+    frontier.set_store_identity_verified(true);
     frontier.set_tiered_storage_ready(true);
 
     shard.tick_primary_rebalance().await;
@@ -1809,6 +1810,9 @@ async fn let_one_peer_age_out(shard: &TestShard) {
 async fn given_a_ready_cluster_when_a_peer_reports_not_ready_should_refuse_before_the_next_tick() {
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
     let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
     metadata.applied_frontier().set_tiered_storage_ready(true);
     shard.tick_primary_rebalance().await;
     assert!(probe_round(&shard, [1, 1]).await);
@@ -1828,6 +1832,9 @@ async fn given_a_ready_cluster_when_the_metadata_view_is_contested_should_refuse
  {
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, REPLICAS, 0);
     let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
     metadata.applied_frontier().set_tiered_storage_ready(true);
     shard.tick_primary_rebalance().await;
     assert!(probe_round(&shard, [1, 1]).await);
@@ -1857,6 +1864,9 @@ async fn given_a_ready_cluster_when_the_metadata_view_is_contested_should_refuse
 async fn given_a_backup_when_the_coordinator_ticks_should_hold_no_tiered_storage_verdict() {
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, REPLICAS, 0);
     let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
     metadata.applied_frontier().set_tiered_storage_ready(true);
     metadata.observe_tiered_storage_readiness(true);
     shard.tick_primary_rebalance().await;
@@ -1868,6 +1878,9 @@ async fn given_a_single_node_when_the_coordinator_ticks_should_follow_its_own_ti
 {
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 0, 1, 0);
     let metadata = shard.plane.metadata();
+    metadata
+        .applied_frontier()
+        .set_store_identity_verified(true);
     shard.tick_primary_rebalance().await;
     assert!(!metadata.tiered_storage_cluster_ready());
     for ready in [true, false, true] {
@@ -1882,8 +1895,18 @@ async fn given_a_metadata_probe_when_a_node_answers_should_report_its_tiered_sto
     let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, REPLICAS, 0);
     let metadata = shard.plane.metadata();
     let consensus = metadata.consensus.as_ref().unwrap();
-    for (nonce, ready) in [(NONCE, false), (NONCE + 1, true), (NONCE + 2, false)] {
+    // A node that fails the store identity check reports 0 however its
+    // partitions read.
+    for (nonce, ready, verified) in [
+        (NONCE, false, true),
+        (NONCE + 1, true, true),
+        (NONCE + 2, true, false),
+        (NONCE + 3, false, true),
+    ] {
         metadata.applied_frontier().set_tiered_storage_ready(ready);
+        metadata
+            .applied_frontier()
+            .set_store_identity_verified(verified);
         let mut probe = probe_header(consensus, nonce);
         probe.replica = 0;
         shard.on_primary_rebalance(probe, Vec::new()).await;
@@ -1896,6 +1919,6 @@ async fn given_a_metadata_probe_when_a_node_answers_should_report_its_tiered_sto
         assert_eq!(target, 0);
         assert_eq!(reply.kind, PrimaryRebalanceKind::MetadataReply);
         assert_eq!(reply.nonce, nonce);
-        assert_eq!(reply.tiered_storage_ready, u8::from(ready));
+        assert_eq!(reply.tiered_storage_ready, u8::from(ready && verified));
     }
 }

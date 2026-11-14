@@ -1773,6 +1773,19 @@ impl Streams {
         })
     }
 
+    /// Whether any topic is tiered. A node claims the object store's root for
+    /// this cluster only while no topic is tiered.
+    #[must_use]
+    pub fn has_tiered_topic(&self) -> bool {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .any(|(_, topic)| topic.resolved.tiered_storage)
+        })
+    }
+
     /// A partition's incarnation and its topic's partition count, read under
     /// one guard so a recreated topic never pairs an old incarnation with a
     /// new count. `None` while a lifecycle operation blocks the topic, as for
@@ -6036,6 +6049,32 @@ mod tests {
             IggyTimestamp::now(),
         );
         assert_eq!(apply.code, 0);
+    }
+
+    #[test]
+    fn given_topic_turned_tiered_when_checking_should_report_tiered_topic() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 1);
+        assert!(!Streams::from(inner.clone()).has_tiered_topic());
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert!(Streams::from(inner).has_tiered_topic());
     }
 
     /// Every replica of every partition starts its chain file when the topic
