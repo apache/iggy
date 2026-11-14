@@ -41,7 +41,7 @@ use tokio::time::Instant;
 use iggy_gateway_kafka::auth::{IggyAuthenticator, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::{
     BridgeError, DEFAULT_FETCH_SLOTS, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig,
-    IggyTls, KnownNodes, OffsetCalls, PartitionBatch, ProduceSessionLimits, Producer,
+    IggyTls, KnownNodes, OffsetCalls, PartitionBatch, ProduceSessionLimits, Producer, Reach,
     TopicCreationOutcome, TopicDefaults, TopicMapping, TopicOverride,
 };
 use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
@@ -200,6 +200,11 @@ async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lan
             result.expect("produce recovers the prior retained send");
         }
     }
+    assert_eq!(
+        bridge.sends_in_doubt(),
+        1,
+        "the held send may have landed although the client got an error"
+    );
     for (offset, hold) in [(0, false), (1, true), (2, false)] {
         replies.send(!hold).expect("reply gate");
         let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
@@ -1194,6 +1199,47 @@ async fn given_a_stopped_configured_node_when_connecting_should_dial_the_next_kn
         .ensure_stream_and_topic("orders", 1)
         .await
         .expect("the bridge serves through that node");
+}
+
+/// The readiness probe dials every known node at once after a failed ping. So when the
+/// configured node stops and another answers, the gateway stays ready: a dial of the stopped node
+/// alone outlasts two checks.
+#[tokio::test]
+#[serial]
+async fn given_the_configured_node_stops_when_another_answers_should_stay_reachable() {
+    let first_dir = tempfile::tempdir().expect("tempdir");
+    let first = TestServer::spawn(first_dir.path()).await;
+    let second_dir = tempfile::tempdir().expect("tempdir");
+    let second = TestServer::spawn(second_dir.path()).await;
+    let config = first.test_config();
+    let nodes = config.nodes.clone();
+    let bridge = IggyBridge::connect(config).await.expect("bridge");
+    // After the connect, which reads the first node's own roster.
+    nodes.learn(&roster_at(&second.test_config().address));
+    let mut reach = bridge.reach();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        reach.wait_for(|reach| *reach == Reach::Reachable),
+    )
+    .await
+    .expect("the probe reaches the first node")
+    .expect("the probe runs");
+
+    let _stopped = first.stop();
+
+    let turned_unreachable = tokio::time::timeout(
+        Duration::from_secs(8),
+        reach.wait_for(|reach| matches!(reach, Reach::Unreachable(_))),
+    )
+    .await
+    .is_ok();
+    assert!(
+        !turned_unreachable,
+        "the second node answers: {:?}",
+        *reach.borrow()
+    );
+    assert_eq!(*reach.borrow(), Reach::Reachable);
+    bridge.close().await.ok();
 }
 
 /// A SASL login dials the same known nodes, so it is checked beside a stopped node too.

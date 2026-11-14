@@ -18,13 +18,15 @@
 transport = "http" # http or stdio are supported
 
 [http] # Optional HTTP API configuration
-address = "127.0.0.1:8082"
+address = "127.0.0.1:8082" # A non-loopback address requires auth_token
 path = "/mcp"
+auth_token = "" # Bearer token MCP clients must send, a literal or file:/path/to/token
+allowed_hosts = ["localhost", "127.0.0.1", "::1"] # Host header names the server answers
 
 [http.cors] # Optional CORS configuration for HTTP API
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
-allowed_origins = ["*"]
+allowed_origins = [] # Browser origins such as "http://localhost:5173", "*" requires auth_token
 allowed_headers = ["content-type"]
 exposed_headers = [""]
 allow_credentials = false
@@ -52,6 +54,7 @@ create = true
 read = true
 update = true
 delete = true
+admin = false # Users, personal access tokens, permissions, passwords and snapshots
 
 [telemetry]
 enabled = false

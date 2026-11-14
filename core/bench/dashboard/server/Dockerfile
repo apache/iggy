@@ -80,6 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the built binary and frontend files
 COPY --from=builder /usr/src/iggy-bench-dashboard/target/release/iggy-bench-dashboard-server /app/
 COPY --from=builder /usr/src/iggy-bench-dashboard/core/bench/dashboard/frontend/dist /app/frontend/dist
+COPY core/bench/dashboard/dashboard.toml /app/
 COPY --from=builder /usr/src/iggy-bench-dashboard/LICENSE-binary /usr/share/doc/iggy-bench-dashboard/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy-bench-dashboard/
 
@@ -98,7 +99,8 @@ RUN chmod +x /app/docker-entrypoint.sh && \
 # Set default environment variables for configuration
 ENV HOST=0.0.0.0 \
     PORT=80 \
-    RESULTS_DIR=/data/performance_results
+    RESULTS_DIR=/data/performance_results \
+    CONFIG=/app/dashboard.toml
 
 # Set volume for results with proper permissions
 VOLUME ["/data/performance_results"]

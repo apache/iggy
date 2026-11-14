@@ -1,0 +1,193 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# -- Gateways to run. Each one is a Kafka broker with node id `ordinal + 1`, listed to the others
+# in `IGGY_KAFKA_BROKERS`. With more than one, the gateways share the consumer groups through the
+# coordinator log in Iggy, and fail to start unless `iggy.username` has `manage_servers`. One
+# release per Iggy stream: two releases on one stream share the log with the same node ids.
+replicaCount: 3
+
+image:
+  # -- Gateway image repository
+  repository: apache/iggy-kafka-gateway
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Gateway image tag. Empty uses the chart appVersion. Pin a version, not `edge`.
+  tag: ""
+
+# -- Secrets for pulling the image from a private registry
+imagePullSecrets: []
+# -- Override the chart name
+nameOverride: ""
+# -- Override the full name of the resources
+fullnameOverride: ""
+# -- Labels added to every resource
+additionalLabels: {}
+
+iggy:
+  # -- Address of the Iggy server's TCP transport, `host:port`. Required. In a cluster, any node:
+  # the gateway learns the other nodes from it and dials them when it is down.
+  address: ""
+  # -- Iggy user that the gateways sign in as. With several gateways it needs the
+  # `manage_servers` permission, to read Iggy's metadata change log for the coordinator log.
+  username: iggy
+  # -- Password of `iggy.username`. Stored in a Secret this chart creates. Ignored when
+  # `iggy.existingSecret.name` is set.
+  password: ""
+  # -- Default Iggy stream of Kafka topics (`IGGY_KAFKA_IGGY_STREAM`). It also holds the
+  # coordinator log. Empty uses the gateway default, `kafka`. One release per stream.
+  stream: ""
+  existingSecret:
+    # -- Name of an existing Secret with the Iggy credentials. Empty creates one from
+    # `iggy.username` and `iggy.password`.
+    name: ""
+    # -- Key of the username in the existing Secret
+    usernameKey: username
+    # -- Key of the password in the existing Secret
+    passwordKey: password
+  tls:
+    # -- Encrypt the gateways' connections to Iggy
+    enabled: false
+    # -- Server name that Iggy's certificate must carry. Empty uses the host of `iggy.address`.
+    domain: ""
+    # -- Name of a Secret with the CA that signed Iggy's certificate. Empty trusts the system CAs.
+    caSecret: ""
+    # -- Key of the CA certificate in `iggy.tls.caSecret`
+    caKey: ca.crt
+
+kafka:
+  # -- Port of the Kafka listener, in the container and on the Services
+  port: 9093
+  sasl:
+    # -- Run SASL/PLAIN on the Kafka listener (SASL_PLAINTEXT). Clients sign in with Iggy users.
+    # Off, any pod that reaches the listener can create and delete topics as `iggy.username`.
+    # Turn it on, and give the bridge a user without root rights where you can.
+    enabled: false
+  # -- Cluster domain of the per-pod DNS names that each gateway advertises to Kafka clients
+  clusterDomain: cluster.local
+  autoCreateTopics:
+    # -- Create a missing topic when a client looks it up in Metadata
+    # (`auto.create.topics.enable`)
+    enabled: false
+    # -- Partitions of a topic created that way
+    partitions: 1
+
+http:
+  # -- Port of /metrics, /ready and /live. No authentication: keep it inside the cluster.
+  port: 9096
+
+# -- Extra environment variables of the gateway container, such as `IGGY_KAFKA_FETCH_SLOTS`. See
+# the gateway README for every `IGGY_KAFKA_*` variable. The render fails on a variable the chart
+# sets, and on `IGGY_KAFKA_LISTENERS`, `IGGY_KAFKA_ADVERTISED_LISTENERS` and `IGGY_KAFKA_TLS_*`.
+extraEnv: []
+# -- Extra volumes of the gateway pods
+extraVolumes: []
+# -- Extra volume mounts of the gateway container
+extraVolumeMounts: []
+
+service:
+  # -- Type of the bootstrap Service that Kafka clients connect to first. Clients then connect to
+  # each gateway by the per-pod DNS name of the headless Service, so they run inside the cluster.
+  type: ClusterIP
+  # -- Annotations of the bootstrap Service
+  annotations: {}
+
+serviceMonitor:
+  # -- Create a ServiceMonitor for the Prometheus Operator
+  enabled: false
+  # -- Namespace of the ServiceMonitor. Empty uses the release namespace.
+  namespace: ""
+  # -- Scrape interval. Empty uses the Prometheus default.
+  interval: 30s
+  # -- Scrape timeout
+  scrapeTimeout: 10s
+  # -- Labels added to the ServiceMonitor, such as the one your Prometheus selects
+  additionalLabels: {}
+
+podDisruptionBudget:
+  # -- Create a PodDisruptionBudget, so a voluntary disruption stops one gateway at a time
+  enabled: true
+  # -- Gateways that a voluntary disruption may stop at once
+  maxUnavailable: 1
+  # -- `AlwaysAllow` evicts a gateway that is not ready, so a node drain does not wait out an
+  # Iggy outage. Needs Kubernetes 1.27+.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+
+serviceAccount:
+  # -- Create a ServiceAccount
+  create: true
+  # -- Name of the ServiceAccount. Empty uses the full name.
+  name: ""
+  # -- Annotations of the ServiceAccount
+  annotations: {}
+
+# -- Seconds that Kubernetes waits between SIGTERM and SIGKILL. The gateway hands its consumer
+# groups to the other gateways and drains its connections for up to 25 s, then signs out of Iggy
+# for up to 5 s.
+terminationGracePeriodSeconds: 40
+
+# -- Liveness probe on /live. It fails only when the process stops answering, not while Iggy is
+# unreachable: a restart does not bring Iggy back.
+livenessProbe:
+  httpGet:
+    path: /live
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# -- Readiness probe on /ready. It fails while the gateway starts or drains, and within about 5 s
+# after the gateway loses Iggy.
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 2
+
+# -- Pod security context. The image runs as user 10001.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context. The gateway writes no file.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Resource requests and limits of the gateway container
+resources: {}
+# -- Annotations of the gateway pods
+podAnnotations: {}
+# -- Labels of the gateway pods
+podLabels: {}
+# -- Node selector of the gateway pods
+nodeSelector: {}
+# -- Tolerations of the gateway pods
+tolerations: []
+# -- Affinity of the gateway pods
+affinity: {}
+# -- Topology spread constraints of the gateway pods, such as one gateway per node
+topologySpreadConstraints: []

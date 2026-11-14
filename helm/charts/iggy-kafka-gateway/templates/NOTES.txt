@@ -1,0 +1,15 @@
+{{ .Values.replicaCount }} Kafka gateway(s) for Iggy at {{ .Values.iggy.address }}.
+
+Kafka clients inside the cluster bootstrap from:
+
+  {{ include "iggy-kafka-gateway.fullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.kafka.clusterDomain }}:{{ .Values.kafka.port }}
+
+Each gateway advertises its own name, such as:
+
+  {{ include "iggy-kafka-gateway.advertisedHost" (dict "root" . "ordinal" 0) }}:{{ .Values.kafka.port }}
+
+Metrics, readiness and liveness are on port {{ .Values.http.port }} of each pod:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward {{ include "iggy-kafka-gateway.fullname" . }}-0 {{ .Values.http.port }}
+  curl http://127.0.0.1:{{ .Values.http.port }}/ready
+  curl http://127.0.0.1:{{ .Values.http.port }}/metrics

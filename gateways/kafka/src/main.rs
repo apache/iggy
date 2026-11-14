@@ -16,6 +16,7 @@
 // under the License.
 
 use std::fmt::Display;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,19 +36,46 @@ use iggy_gateway_kafka::listener::{
     ListenerConfig, SecurityProtocol, apply_advertised_listeners, check_brokers, parse_brokers,
     parse_listeners,
 };
+use iggy_gateway_kafka::observability::{HealthCheck, HttpEndpoint, Observability, check};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use iggy_gateway_kafka::{CoordinatorLog, GatewayConfig, KafkaGateway};
 
+/// `--check-ready` or `--check-live` asks that path of a running gateway and exits 0 when it
+/// answers 200, for a container health check in an image without an HTTP client.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let Some(arg) = args.next() else {
+        return serve().await;
+    };
+    let health: HealthCheck = arg.parse()?;
+    if let Some(extra) = args.next() {
+        return Err(format!("unexpected argument `{extra}` after {arg}").into());
+    }
+    let addr = load_http_addr()?
+        .ok_or("IGGY_KAFKA_HTTP_ADDR is not set, so the gateway serves no endpoint to ask")?;
+    Ok(check(addr, health).await?)
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Held for the lifetime of main: dropping it stops the non-blocking log writer's worker
     // thread, and any buffered-but-unflushed log lines are lost. Binding to `_` instead of a
     // named variable would drop it immediately.
     let _tracing_guard = init_tracing();
 
     let config = load_config()?;
+    let observability = Arc::new(Observability::new());
+    // Before Iggy is reached, so a probe sees the gateway live, and not ready, while it waits.
+    let http = match load_http_addr()? {
+        Some(addr) => Some(
+            HttpEndpoint::start(addr, Arc::clone(&observability))
+                .await
+                .map_err(|e| format!("failed to bind IGGY_KAFKA_HTTP_ADDR {addr}: {e}"))?,
+        ),
+        None => None,
+    };
     let sasl_enabled = config.sasl_enabled();
     let plaintext_sasl = config
         .listeners
@@ -68,7 +96,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listeners = bind_listeners(&config).map_err(|e| e.to_string())?;
-    let mut server = KafkaGateway::new(config).with_bridge(bridge.clone());
+    let mut server = KafkaGateway::new(config)
+        .with_bridge(bridge.clone())
+        .with_observability(observability);
     if let Some(cluster_id) = cluster_id {
         server = server.with_cluster_id(cluster_id);
     }
@@ -110,6 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_task.await
     };
     close_bridge(bridge.as_deref()).await;
+    // Last, so an orchestrator reads not ready through the whole drain.
+    if let Some(http) = http {
+        http.stop().await;
+    }
     Ok(outcome??)
 }
 
@@ -202,6 +236,7 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
     "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
     "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS",
+    "IGGY_KAFKA_HTTP_ADDR",
 ];
 
 /// The variables of the single-listener form, which `IGGY_KAFKA_LISTENERS` replaces as a whole.
@@ -679,6 +714,18 @@ fn reject_unread_iggy_tls(
     ))
 }
 
+/// `IGGY_KAFKA_HTTP_ADDR`, the address of the endpoint of metrics, readiness and liveness. Unset
+/// means no endpoint. An IP and a port, not a host name: the endpoint binds it.
+fn load_http_addr() -> Result<Option<SocketAddr>, String> {
+    env_var("IGGY_KAFKA_HTTP_ADDR")
+        .map(|raw| {
+            raw.parse().map_err(|e| {
+                format!("invalid IGGY_KAFKA_HTTP_ADDR `{raw}`: {e}; expected an IP and a port")
+            })
+        })
+        .transpose()
+}
+
 fn env_var(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
@@ -776,7 +823,7 @@ mod tests {
     use iggy_gateway_kafka::tls::ClientAuth;
 
     use super::{
-        KNOWN_KAFKA_ENV_VARS, bridge_enabled, load_config, parse_positive,
+        KNOWN_KAFKA_ENV_VARS, bridge_enabled, load_config, load_http_addr, parse_positive,
         reject_unknown_kafka_env_vars, reject_unread_iggy_tls,
     };
 
@@ -1339,6 +1386,33 @@ mod tests {
             Some("alice")
         );
         assert!(complete.maps_certificate_identities());
+    }
+
+    /// `#[serial]` and `# Safety` as on
+    /// `reject_unknown_kafka_env_vars_flags_typo_but_accepts_known_keys` above.
+    #[test]
+    #[serial]
+    fn given_an_http_address_should_parse_it_and_refuse_a_host_name() {
+        clear_gateway_env();
+        let unset = load_http_addr();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_HTTP_ADDR", "0.0.0.0:9096");
+        }
+        let wildcard = load_http_addr();
+        let accepted = load_config().map(|_| ());
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_HTTP_ADDR", "localhost:9096");
+        }
+        let host_name = load_http_addr();
+        clear_gateway_env();
+
+        assert_eq!(unset, Ok(None), "no variable, no endpoint");
+        assert_eq!(wildcard, Ok(Some("0.0.0.0:9096".parse().unwrap())));
+        assert_eq!(accepted, Ok(()), "a known variable");
+        assert!(
+            host_name.unwrap_err().contains("IGGY_KAFKA_HTTP_ADDR"),
+            "the endpoint binds the address, so a host name is refused"
+        );
     }
 
     #[test]

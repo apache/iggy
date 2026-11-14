@@ -23,6 +23,10 @@ on:
         description: "JSON with checks (component/task entries)"
         type: string
         required: true
+      stack-base:
+        description: "Base branch commit under a stack, for checks that compare against the base"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -82,6 +86,7 @@ jobs:
         with:
           task: ${{ matrix.task }}
           component: ${{ matrix.component }}
+          stack-base: ${{ inputs.stack-base }}
 
       - name: Upload reports
         if: always()

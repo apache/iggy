@@ -1391,7 +1391,7 @@ route them through.
 ```bash
 cargo build --bin iggy-server --bin iggy
 
-docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server:test .
+docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy --build-arg LICENSE_STAGE=license-skip -t iggy-server:test .
 ```
 
 #### 2. Build the Test Project

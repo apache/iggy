@@ -1397,17 +1397,34 @@ describe('partition reader', () => {
       }
     });
 
-  it('moves an on read offset back to the last batch taken when it closes', async () => {
-    const topic = new FakeTopic(2n);
-    const reader = await open(topic, [0, 1], { commit: CommitPolicy.OnRead });
-    const taken = await reader.next();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    await reader.close();
-
-    assert.equal(topic.stored.get(taken.partitionId), 1n);
-    assert.equal(topic.stored.has(taken.partitionId === 0 ? 1 : 0), false);
-  });
+  for (const [name, start, firstOffset, partitions] of [
+    ['next', PollingStrategy.Next, 0n, [0, 1]],
+    ['next', PollingStrategy.Next, 0n, [1, 3]],
+    ['offset 0', PollingStrategy.Offset(0n), 0n, [0, 1]],
+    ['offset 4', PollingStrategy.Offset(4n), 4n, [0, 1]]
+  ] as const) {
+    it(`rewinds unread on read batches on close from ${name}, partitions ${partitions}`, async () => {
+      const topic = new FakeTopic(firstOffset + 2n);
+      const reader = await open(topic, [...partitions], { commit: CommitPolicy.OnRead }, start);
+      let taken: number;
+      try {
+        taken = (await reader.next()).partitionId;
+        await waitFor(() => partitions.every((partition) => topic.stored.get(partition) === firstOffset + 1n),
+          'both partitions were not committed by their reads');
+      } finally {
+        await reader.close();
+      }
+      assert.equal(topic.stored.get(taken), firstOffset + 1n);
+      const unread = partitions.find((partition) => partition !== taken)!;
+      assert.equal(topic.stored.get(unread), firstOffset === 0n ? undefined : firstOffset - 1n);
+      const resumed = await open(topic, [unread], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [firstOffset, firstOffset + 1n]);
+      } finally {
+        await resumed.close();
+      }
+    });
+  }
 
   it('stores the offset before an on read seek to an offset, so a restart resumes at the sought offset', async () => {
     const topic = new FakeTopic(10n);
@@ -2952,6 +2969,12 @@ describe('partition reader', () => {
       assert.deepEqual(topic.fetches[0], [1, 3]);
       assert.deepEqual([topic.stored.get(taken.partitionId), topic.stored.get(undelivered), topic.offsetDeletes],
         [start + 1n, start === 0n ? undefined : start - 1n, start === 0n ? [undelivered] : []]);
+      const resumed = await open(topic, [undelivered], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [start, start + 1n]);
+      } finally {
+        await resumed.close();
+      }
     });
   }
 
