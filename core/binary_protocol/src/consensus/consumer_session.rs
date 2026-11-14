@@ -78,8 +78,8 @@ pub struct ConsumerSessionHeartbeatHeader {
     /// 1 if any local shard failed to report its clients, otherwise 0.
     pub incomplete: u8,
     pub reserved: [u8; 119],
-    /// Namespace revision swept by retirement reports; zero for heartbeats.
-    pub namespace_revision: u64,
+    /// Watermark of the retirement walk a report covers; zero for heartbeats.
+    pub retired_through: u64,
 }
 
 const _: () = assert!(size_of::<ConsumerSessionHeartbeatHeader>() == HEADER_SIZE);
@@ -148,9 +148,9 @@ impl ConsensusHeader for ConsumerSessionHeartbeatHeader {
                 "consumer session heartbeat release must be zero".into(),
             ));
         }
-        if self.command == Command::ConsumerSessionHeartbeat && self.namespace_revision != 0 {
+        if (self.command == Command::ConsumerSessionHeartbeat) != (self.retired_through == 0) {
             return Err(ConsensusError::InvalidField(
-                "consumer session heartbeat namespace revision must be zero".into(),
+                "only a retirement report carries a retirement watermark".into(),
             ));
         }
         if self.reserved_frame != [0; 66] || self.reserved != [0; 119] {
@@ -198,7 +198,7 @@ mod tests {
             reserved_frame: [0; 66],
             incomplete: 0,
             reserved: [0; 119],
-            namespace_revision: 0,
+            retired_through: 0,
         };
         for count in [0, 1, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT] {
             header.size =
@@ -230,13 +230,15 @@ mod tests {
         header.reserved_frame[0] = 1;
         assert!(header.validate().is_err());
         header.reserved_frame[0] = 0;
-        header.namespace_revision = 1;
+        header.retired_through = 1;
         assert!(header.validate().is_err());
         header.command = Command::SessionRetirementProgress;
         assert!(header.validate().is_ok());
         header.seal();
         assert!(header.verify_frame().is_ok());
-        header.namespace_revision += 1;
+        header.retired_through += 1;
         assert!(header.verify_frame().is_err());
+        header.retired_through = 0;
+        assert!(header.validate().is_err());
     }
 }
