@@ -110,6 +110,7 @@ vergen-git2 = { workspace = true }
 assert_cmd = { workspace = true }
 bytemuck = { workspace = true }
 iggy = { workspace = true }
+iggy_object_store = { workspace = true }
 metadata = { workspace = true, features = ["simulator"] }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }

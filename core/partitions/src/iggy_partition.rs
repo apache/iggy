@@ -24,6 +24,7 @@ use crate::journal::{
 };
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
+use crate::object_delete::{RetiredSegment, RetiredSegments};
 use crate::persistence::{
     FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
@@ -205,6 +206,11 @@ where
     /// metadata for this partition. The watermark only rises, so the one
     /// metadata holds now is never below it.
     committed_truncation: u64,
+    /// What this replica deletes from the object store while it is the
+    /// primary.
+    object_deletes: ObjectDeletes,
+    /// Number of the last object-delete job this partition started.
+    object_delete_jobs: u64,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1025,6 +1031,8 @@ where
             upload_cursor: None,
             upload_wanted: Cell::new(false),
             committed_truncation: 0,
+            object_deletes: ObjectDeletes::default(),
+            object_delete_jobs: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -13196,6 +13204,11 @@ where
             self.namespace(),
             Some((segment.start_offset, segment.end_offset)),
         );
+        self.retire_segment_objects(
+            segment.start_offset,
+            segment.end_offset,
+            IggyTimestamp::now(),
+        );
         Some(messages)
     }
 
@@ -13477,6 +13490,9 @@ where
     /// A failure leaves the segment local, so a later scan offers it again. A
     /// failure that no retry changes is reported: the segment and everything
     /// after it stay out of the store until someone repairs it.
+    ///
+    /// An upload whose segment left the list while it ran yields no advance,
+    /// and its objects are queued for their delete.
     pub fn finish_segment_upload(
         &mut self,
         attempt: crate::SegmentUploadAttempt,
@@ -13487,6 +13503,22 @@ where
             return None;
         }
         self.segment_upload = None;
+        let listed = self
+            .log
+            .segments()
+            .binary_search_by_key(&record.start_offset, |segment| segment.start_offset)
+            .is_ok();
+        if !listed {
+            // Retention removed the segment while its upload ran. An advance
+            // over it would tell every replica the store holds a segment that
+            // is gone, and a failed upload can still have stored its `.log`.
+            self.retire_segment_objects(
+                record.start_offset,
+                record.end_offset,
+                IggyTimestamp::now(),
+            );
+            return None;
+        }
         match outcome {
             Ok(Ok(())) if self.consensus.is_primary() && self.consensus.is_normal() => {
                 self.note_segment_uploaded(record)
@@ -13635,6 +13667,212 @@ where
             local_bytes -= segment.size.as_bytes_u64();
         }
         false
+    }
+
+    /// Whether this replica is the one that deletes the partition's objects:
+    /// the primary of a tiered partition that applied the view it started,
+    /// as for [`Self::total_retention_end`].
+    fn deletes_objects(&self) -> bool {
+        let consensus = &self.consensus;
+        self.is_tiered()
+            && consensus.is_primary()
+            && consensus.is_normal()
+            && !consensus.is_transferring()
+            && consensus.applied_view_start()
+    }
+
+    /// The delete state of the current view. What an earlier view left is
+    /// dropped, and its job cancelled: a primary only acts on what it learned
+    /// while it has been the primary without a break.
+    fn object_deletes_of_this_view(&mut self) -> &mut ObjectDeletes {
+        let view = self.consensus.view();
+        if self.object_deletes.view != Some(view) {
+            self.object_deletes = ObjectDeletes {
+                view: Some(view),
+                ..ObjectDeletes::default()
+            };
+        }
+        &mut self.object_deletes
+    }
+
+    /// Queue the objects of the segment from `start_offset` to `end_offset`
+    /// for their delete, when this replica is the one that deletes. Any
+    /// other replica keeps nothing: the next primary finds the objects by
+    /// listing them.
+    fn retire_segment_objects(
+        &mut self,
+        start_offset: u64,
+        end_offset: u64,
+        retired_at: IggyTimestamp,
+    ) {
+        if !self.deletes_objects() {
+            return;
+        }
+        self.object_deletes_of_this_view()
+            .retired
+            .retire(start_offset, end_offset, retired_at);
+    }
+
+    /// The last offset a segment may hold for its objects to be deleted: the
+    /// lower of the committed truncation watermark and this replica's own
+    /// trim point. `None` while either is missing. A watermark of zero is
+    /// the one metadata starts with, so it proves nothing.
+    fn object_delete_bound(&self, committed_up_to: u64) -> Option<u64> {
+        let trim_point = self.chain_trim_point()?;
+        (committed_up_to > 0).then(|| committed_up_to.min(trim_point))
+    }
+
+    fn segment_start_offsets(&self) -> Vec<u64> {
+        self.log
+            .segments()
+            .iter()
+            .map(|segment| segment.start_offset)
+            .collect()
+    }
+
+    /// Start the next object-store job of this partition's deletes, when
+    /// this replica is the primary and none is in flight. The caller runs it
+    /// under the returned scope and hands the result to
+    /// [`Self::finish_object_delete`].
+    ///
+    /// The first job of a primary lists the incarnation's objects, since the
+    /// segments an earlier primary queued are not known here, and reads
+    /// where the ones that may be gone end. Every later
+    /// job deletes the objects of the queued segments whose grace period
+    /// ended by `now` and that end at or below both `committed_up_to`, the
+    /// truncation watermark metadata holds, and this replica's trim point.
+    ///
+    /// A replica that is not the primary drops what it queued and cancels
+    /// the job it started, so a pass over a demoted replica is what stops
+    /// its job.
+    pub fn begin_object_delete(
+        &mut self,
+        now: IggyTimestamp,
+        committed_up_to: u64,
+    ) -> Option<(crate::ObjectDeleteJob, iggy_object_store::TierScopeToken)> {
+        if !self.deletes_objects() {
+            self.object_deletes = ObjectDeletes::default();
+            return None;
+        }
+        let prefix = self.object_prefix()?;
+        let bound = self.object_delete_bound(committed_up_to)?;
+        let deletes = self.object_deletes_of_this_view();
+        if deletes.running.is_some() || (deletes.swept && deletes.retired.is_empty()) {
+            return None;
+        }
+        let (work, running) = if self.object_deletes.swept {
+            let segments = self.log.segments();
+            let due = self.object_deletes.retired.due(now, bound, |start_offset| {
+                segments
+                    .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+                    .is_ok()
+            });
+            if due.is_empty() {
+                return None;
+            }
+            let start_offsets = due.iter().map(|(start_offset, _)| *start_offset).collect();
+            (
+                crate::ObjectDeleteWork::Delete { start_offsets },
+                RunningObjectDelete::Delete(due),
+            )
+        } else {
+            (
+                crate::ObjectDeleteWork::Sweep {
+                    segment_starts: self.segment_start_offsets(),
+                    bound,
+                },
+                RunningObjectDelete::Sweep { committed_up_to },
+            )
+        };
+        let scope = iggy_object_store::TierScope::new();
+        let token = scope.token();
+        self.object_delete_jobs += 1;
+        let id = self.object_delete_jobs;
+        self.object_deletes.running = Some((id, running, scope));
+        Some((crate::ObjectDeleteJob { id, prefix, work }, token))
+    }
+
+    /// Take the result of the job numbered `id`. A result of a job this
+    /// partition does not wait for, or one that arrives after primacy moved,
+    /// changes nothing.
+    ///
+    /// A sweep queues the segments that [`crate::SweptObjects::ended_by`]
+    /// proves gone, each with the end its object records, to wait their
+    /// grace period from `now`. A sweep that failed is repeated by a later
+    /// pass. A delete forgets the segments it removed, and the ones it
+    /// did not stay queued.
+    pub fn finish_object_delete(
+        &mut self,
+        id: u64,
+        outcome: crate::ObjectDeleteOutcome,
+        now: IggyTimestamp,
+    ) {
+        let awaited = self
+            .object_deletes
+            .running
+            .as_ref()
+            .is_some_and(|(running, _, _)| *running == id);
+        if !awaited {
+            return;
+        }
+        if !self.deletes_objects() || self.object_deletes.view != Some(self.consensus.view()) {
+            self.object_deletes = ObjectDeletes::default();
+            return;
+        }
+        let Some((_, running, _scope)) = self.object_deletes.running.take() else {
+            return;
+        };
+        let namespace_raw = self.namespace().inner();
+        match (running, outcome) {
+            (
+                RunningObjectDelete::Sweep { committed_up_to },
+                Ok(crate::ObjectDeleteDone::Swept(Ok(swept))),
+            ) => {
+                // The watermark the pass came with only trails the one
+                // metadata holds now, so it never proves more than is true.
+                let found = self
+                    .object_delete_bound(committed_up_to)
+                    .map_or_default(|bound| swept.ended_by(&self.segment_start_offsets(), bound));
+                let deletes = &mut self.object_deletes;
+                for (start_offset, end_offset) in &found {
+                    deletes
+                        .retired
+                        .retire_swept(*start_offset, *end_offset, now);
+                }
+                deletes.swept = true;
+                debug!(
+                    namespace_raw,
+                    listed = swept.listed.len(),
+                    queued = found.len(),
+                    "listed the objects of the partition for the segments that are gone"
+                );
+            }
+            (RunningObjectDelete::Sweep { .. }, Ok(crate::ObjectDeleteDone::Swept(Err(error)))) => {
+                warn!(
+                    namespace_raw,
+                    %error,
+                    "sweeping the objects of the partition failed and is tried again"
+                );
+            }
+            (
+                RunningObjectDelete::Delete(sent),
+                Ok(crate::ObjectDeleteDone::Deleted { failed }),
+            ) => {
+                self.object_deletes.retired.settle(&sent, &failed);
+                if !failed.is_empty() {
+                    warn!(
+                        namespace_raw,
+                        failed = failed.len(),
+                        queued = self.object_deletes.retired.len(),
+                        "some objects of removed segments were not deleted and are tried again"
+                    );
+                }
+            }
+            // A cancelled job, or a result of the other kind of work, settles
+            // nothing: the queue is as the job found it, and a sweep that did
+            // not finish runs again.
+            (RunningObjectDelete::Sweep { .. } | RunningObjectDelete::Delete(_), _) => {}
+        }
     }
 
     /// Account for a finished upload of the segment in `record`, and return
@@ -15608,6 +15846,30 @@ pub enum RetirementDebtStatus {
     Paid,
     /// The retry slice as `(client_id, session)` when this replica can pay now.
     Unpaid(Option<Vec<(u128, u64)>>),
+}
+
+/// What a replica deletes from the object store while it is the primary of
+/// a tiered partition. Nothing here is persisted.
+#[derive(Default)]
+struct ObjectDeletes {
+    /// The view this state belongs to, `None` until the replica acts as the
+    /// primary.
+    view: Option<u32>,
+    /// Whether the objects of the incarnation were listed in this view.
+    swept: bool,
+    /// The segments whose objects wait for their delete.
+    retired: RetiredSegments,
+    /// The job in flight: its number, what it does, and the scope whose end
+    /// stops it.
+    running: Option<(u64, RunningObjectDelete, iggy_object_store::TierScope)>,
+}
+
+/// What the object-delete job in flight was started with.
+enum RunningObjectDelete {
+    /// A sweep, with the truncation watermark its pass came with.
+    Sweep { committed_up_to: u64 },
+    /// A delete of these segments, as they were queued when it started.
+    Delete(Vec<(u64, RetiredSegment)>),
 }
 
 /// What one call to [`IggyPartition::remove_sealed_segments_up_to`] reclaimed.
