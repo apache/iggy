@@ -5683,6 +5683,7 @@ dependencies = [
  "tracing",
  "trait-variant",
  "webpki-roots 1.0.11",
+ "whichever",
 ]
 
 [[package]]
@@ -5919,6 +5920,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "whichever",
  "xaes-256-gcm",
 ]
 
@@ -12086,6 +12088,26 @@ dependencies = [
  "home",
  "rustix 0.38.44",
  "winsafe",
+]
+
+[[package]]
+name = "whichever"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68887c9512981e597d730f1d95b2eb6abdd53385e4e76c35a95e7121e16232b0"
+dependencies = [
+ "whichever-macros",
+]
+
+[[package]]
+name = "whichever-macros"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb15ad553239d9fdefac12e31e16c7682dc62a2106ba035aec69c5dd15835a7b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
