@@ -5814,9 +5814,12 @@ name = "iggy_object_store"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "compio",
  "crc32c",
  "futures",
  "hex",
+ "rand 0.10.3",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

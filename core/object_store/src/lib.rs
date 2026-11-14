@@ -24,15 +24,16 @@
 //! segment's `.log` object. [`TierExecutor`] is how uploads, cold reads and
 //! deletes hand work to the tier service of a shard.
 //!
-//! [`MemoryStore`] and [`InlineTierExecutor`] stand in for a provider and for
-//! the tier service in tests, and [`contract`] holds the cases that providers
-//! pass.
+//! [`FsStore`] keeps objects as files in a directory. [`MemoryStore`] and
+//! [`InlineTierExecutor`] stand in for a provider and for the tier service in
+//! tests, and [`contract`] holds the cases that providers pass.
 
 // Every future here runs on the shard that owns it and never crosses threads.
 #![allow(clippy::future_not_send)]
 
 pub mod contract;
 mod error;
+mod fs;
 mod inline;
 mod layout;
 mod memory;
@@ -41,6 +42,7 @@ mod store;
 mod tier;
 
 pub use error::{ErrorClass, ObjectStoreError};
+pub use fs::FsStore;
 pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, ObjectPrefix, SegmentKey, SegmentObject};
 pub use memory::MemoryStore;
