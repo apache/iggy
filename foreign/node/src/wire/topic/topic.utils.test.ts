@@ -115,6 +115,7 @@ describe('deserializeBaseTopic', () => {
     assert.equal(topic.compressionAlgorithm, 1);
     assert.equal(topic.messageExpiry, 0xffff_ffff_ffff_ffffn);
     assert.equal(topic.maxTopicSize, 0xffff_ffff_ffff_ffffn);
+    assert.equal(topic.segmentMaxAge, 0xffff_ffff_ffff_ffffn);
   });
 });
 

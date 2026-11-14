@@ -341,6 +341,11 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_replication_factor = false;
             ffi_options.replication_factor     = 0;
         }
+        if (const auto &value = options.SegmentMaxAge()) {
+            ffi_options.has_segment_max_age   = true;
+            ffi_options.segment_max_age_kind  = std::string(value->Kind());
+            ffi_options.segment_max_age_value = value->Value();
+        }
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options), error_info));
     });
 }

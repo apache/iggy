@@ -110,6 +110,8 @@ pub enum TopicOptionKey {
     PreallocateSegments,
     #[php(value = "replication_factor")]
     ReplicationFactor,
+    #[php(value = "segment_max_age")]
+    SegmentMaxAge,
 }
 
 impl From<TopicOptionKey> for OptionKey {
@@ -127,6 +129,7 @@ impl From<TopicOptionKey> for OptionKey {
             TopicOptionKey::SizeOfMessagesRequiredToSave => Self::SizeOfMessagesRequiredToSave,
             TopicOptionKey::PreallocateSegments => Self::PreallocateSegments,
             TopicOptionKey::ReplicationFactor => Self::ReplicationFactor,
+            TopicOptionKey::SegmentMaxAge => Self::SegmentMaxAge,
         }
     }
 }
@@ -147,6 +150,7 @@ impl StubLiteral for TopicOptionKey {
             Self::SizeOfMessagesRequiredToSave => "SizeOfMessagesRequiredToSave",
             Self::PreallocateSegments => "PreallocateSegments",
             Self::ReplicationFactor => "ReplicationFactor",
+            Self::SegmentMaxAge => "SegmentMaxAge",
         };
         format!("\\Iggy\\TopicOptionKey::{case}")
     }

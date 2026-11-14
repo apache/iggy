@@ -3056,6 +3056,7 @@ enum class TopicOptionKey : std::uint8_t {
     SizeOfMessagesRequiredToSave,
     PreallocateSegments,
     ReplicationFactor,
+    SegmentMaxAge,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3084,6 +3085,8 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "preallocate_segments";
         case TopicOptionKey::ReplicationFactor:
             return "replication_factor";
+        case TopicOptionKey::SegmentMaxAge:
+            return "segment_max_age";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3364,6 +3367,33 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns the age at which a partition's active segment rolls.
+     * @return Configured age, or `std::nullopt` to roll segments by size alone.
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &SegmentMaxAge() const noexcept { return segment_max_age_; }
+
+    /**
+     * @brief Sets the age at which a partition's active segment rolls.
+     *
+     * A batch stamped this long after the active segment's first batch starts
+     * the next segment. A fully idle partition keeps its segment open.
+     * @param segment_max_age Age to roll at, at least 10 minutes, or
+     *        Expiry::NeverExpire() to roll by size alone.
+     *        Expiry::ServerDefault() clears an explicitly configured age.
+     * @return Reference to this options object.
+     * @note The server refuses a duration together with
+     *       SetPreallocateSegments(true).
+     */
+    TopicCreateOptions &SetSegmentMaxAge(::iggy::Expiry segment_max_age) {
+        if (segment_max_age.Kind() == "server_default") {
+            segment_max_age_.reset();
+        } else {
+            segment_max_age_ = std::move(segment_max_age);
+        }
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3415,6 +3445,7 @@ class TopicCreateOptions final {
     std::optional<std::uint64_t> size_of_messages_required_to_save_;
     std::optional<bool> preallocate_segments_;
     std::optional<std::uint32_t> replication_factor_;
+    std::optional<::iggy::Expiry> segment_max_age_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;

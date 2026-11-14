@@ -104,6 +104,8 @@ pub enum OptionKey {
     /// Fingerprints of the server keys wrapping the stream's key, computed by
     /// the server.
     EncryptionKekFingerprint,
+    /// Topic segment age roll, fixed at creation.
+    SegmentMaxAge,
 }
 
 /// Whether partitions can be added to or deleted from a topic after creation.
@@ -233,17 +235,23 @@ impl TopicOptions {
     ///         accepting writes while either node is down. The server rejects
     ///         an out-of-range value with an `OptionError` of kind
     ///         `invalid_replication_factor`.
+    ///     segment_max_age: Age past a segment's first batch at which a batch
+    ///         starts the next segment, as `IggyExpiry | None`, at least 10
+    ///         minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+    ///         which rolls segments by size alone. The server refuses a
+    ///         duration together with `preallocate_segments=True`.
     ///     raw: Additional option keys as `dict[str, str]`, sent as string
     ///         values so a key newer than this build can be set. A typed field
     ///         wins on collision.
     ///
     /// Raises:
-    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     ValueError: If `message_expiry`, `max_topic_size` or
+    ///         `segment_max_age` is out of range.
     ///     RuntimeError: If `compression_algorithm` names no known algorithm.
     ///     TypeError: If a durability is not a `Durability`.
     #[new]
     #[pyo3(
-        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, raw = None)
+        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, segment_max_age = None, raw = None)
     )]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -275,6 +283,9 @@ impl TopicOptions {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
             u32,
         >,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] segment_max_age: Option<
+            &IggyExpiry,
+        >,
         #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
         raw: Option<BTreeMap<String, String>>,
     ) -> PyResult<Self> {
@@ -291,6 +302,10 @@ impl TopicOptions {
             .map(RustMaxTopicSize::try_from)
             .transpose()?
             .filter(|size| *size != RustMaxTopicSize::ServerDefault);
+        let segment_max_age = segment_max_age
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .filter(|age| *age != RustIggyExpiry::ServerDefault);
         Ok(Self {
             inner: TopicCreateOptions {
                 partitions_count: Some(partitions_count),
@@ -307,6 +322,7 @@ impl TopicOptions {
                     .map(IggyByteSize::from),
                 preallocate_segments,
                 replication_factor,
+                segment_max_age,
                 raw: raw.unwrap_or_default(),
             },
         })
@@ -386,6 +402,7 @@ impl From<OptionKey> for RustOptionKey {
             OptionKey::EncryptionKeySource => Self::EncryptionKeySource,
             OptionKey::EncryptionKeyFingerprint => Self::EncryptionKeyFingerprint,
             OptionKey::EncryptionKekFingerprint => Self::EncryptionKekFingerprint,
+            OptionKey::SegmentMaxAge => Self::SegmentMaxAge,
         }
     }
 }

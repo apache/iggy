@@ -261,6 +261,7 @@ struct ResourceOptionsTests {
             #expect(topic.compressionAlgorithm.description == expected.compressionAlgorithm)
             #expect(try topic.messageExpiry.wireMicroseconds().map(String.init) == expected.messageExpiry)
             #expect(String(topic.maxTopicSize.wireValue) == expected.maxTopicSize)
+            #expect(try topic.segmentMaxAge.wireMicroseconds().map(String.init) == expected.options["segment_max_age"]?.value)
             #expect(neverReturned.isDisjoint(with: topic.options.keys))
         }
         for vector in fixture.userResponses {
@@ -300,7 +301,7 @@ struct ResourceOptionsTests {
         let topicCreate = TopicCreateOptions(
             partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .never, maxTopicSize: .bytes(1 << 30), segmentSizeBytes: 1 << 20,
             durability: .persisted, consumerOffsetDurability: .persisted, partitionResizePolicy: .fixed, messagesRequiredToSave: 10,
-            sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true, replicationFactor: 3)
+            sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true, replicationFactor: 3, segmentMaxAge: .after(.seconds(3_600)))
         #expect(unsetFields(streamCreate, except: ["raw"]).isEmpty)
         #expect(unsetFields(topicCreate, except: ["raw"]).isEmpty)
         #expect(Set(try streamCreate.toResourceOptions().keys) == creatable("stream"))

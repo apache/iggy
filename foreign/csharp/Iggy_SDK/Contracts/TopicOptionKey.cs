@@ -57,5 +57,8 @@ public enum TopicOptionKey
     PreallocateSegments,
 
     /// <summary><c>replication_factor</c>, create-only.</summary>
-    ReplicationFactor
+    ReplicationFactor,
+
+    /// <summary><c>segment_max_age</c>, create-only.</summary>
+    SegmentMaxAge
 }

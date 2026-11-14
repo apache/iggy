@@ -343,7 +343,8 @@ describe('given shared vectors when encoding should match server contract', () =
         messages_required_to_save: () => topicBlock({ messagesRequiredToSave: 1 }),
         size_of_messages_required_to_save: () => topicBlock({ sizeOfMessagesRequiredToSave: 1n }),
         preallocate_segments: () => topicBlock({ preallocateSegments: true }),
-        replication_factor: () => topicBlock({ replicationFactor: 1 })
+        replication_factor: () => topicBlock({ replicationFactor: 1 }),
+        segment_max_age: () => topicBlock({ segmentMaxAge: 1n })
       },
       user: {}
     };
@@ -492,6 +493,7 @@ describe('given shared vectors when encoding should match server contract', () =
         message_expiry: topic.messageExpiry.toString(),
         max_topic_size: topic.maxTopicSize.toString()
       }, expected, name);
+      assert.equal(topic.segmentMaxAge.toString(), expected.options.segment_max_age.value, name);
     }
   });
 

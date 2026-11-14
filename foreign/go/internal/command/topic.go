@@ -138,6 +138,9 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 	if options.ReplicationFactor != nil {
 		typed = append(typed, iggcon.ReplicationFactorOption(*options.ReplicationFactor))
 	}
+	if options.SegmentMaxAge != nil && *options.SegmentMaxAge != iggcon.IggyExpiryServerDefault {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionSegmentMaxAge), uint64(*options.SegmentMaxAge)))
+	}
 	return typed, nil
 }
 

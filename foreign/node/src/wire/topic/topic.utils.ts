@@ -21,7 +21,10 @@ import type { ValueOf } from '../../type.utils.js';
 import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
 import { deserializeError } from '../error.utils.js';
 
-/** Default of `message_expiry` and `max_topic_size`: never expire, no cap. */
+/**
+ * Default of `message_expiry`, `max_topic_size` and `segment_max_age`: never
+ * expire, no cap, never roll by age.
+ */
 const UNLIMITED = 0xffff_ffff_ffff_ffffn;
 
 /** Partition id, counters and context, before the two node lists. */
@@ -48,6 +51,8 @@ export type BaseTopic = {
   messageExpiry: bigint,
   /** Maximum topic size in bytes, read from the options (u64 max = unlimited) */
   maxTopicSize: bigint,
+  /** Segment roll age in microseconds, read from the options (u64 max = never) */
+  segmentMaxAge: bigint,
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
@@ -178,6 +183,7 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
     ? CompressionAlgorithm.Gzip : CompressionAlgorithm.None;
   const messageExpiry = limit('message_expiry');
   const maxTopicSize = limit('max_topic_size');
+  const segmentMaxAge = limit('segment_max_age');
 
   return {
     bytesRead: pos - start,
@@ -189,6 +195,7 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       compressionAlgorithm,
       maxTopicSize,
       messageExpiry,
+      segmentMaxAge,
       messagesCount,
       sizeBytes,
       options: explicit.options,

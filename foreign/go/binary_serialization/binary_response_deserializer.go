@@ -580,6 +580,7 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 
 	topic.MessageExpiry = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionMessageExpiry, uint64(iggcon.IggyExpiryNeverExpire)))
 	topic.MaxTopicSize = topicUint64Option(topic, iggcon.TopicOptionMaxTopicSize, math.MaxUint64)
+	topic.SegmentMaxAge = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionSegmentMaxAge, uint64(iggcon.IggyExpiryNeverExpire)))
 	topic.CompressionAlgorithm = uint8(iggcon.CompressionAlgorithmNone)
 	if value, ok := topicOption(topic, iggcon.TopicOptionCompressionAlgorithm); ok && value.Kind == iggcon.String {
 		if algorithm, known := compressionAlgorithms[string(value.Value)]; known {

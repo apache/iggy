@@ -510,7 +510,8 @@ public sealed class ResourceOptionsTests
                     MessagesRequiredToSave = 64,
                     SizeOfMessagesRequiredToSave = 4096,
                     PreallocateSegments = true,
-                    ReplicationFactor = 3
+                    ReplicationFactor = 3,
+                    SegmentMaxAge = TimeSpan.FromHours(1)
                 }.ToDictionary().Keys.ToHashSet());
                 Assert.Equal(updateKeys, new TopicUpdate
                 {
@@ -807,6 +808,8 @@ public sealed class ResourceOptionsTests
                 topic.CompressionAlgorithm);
             Assert.Equal(ParseU64(expected, "message_expiry"), DurationHelpers.ToDuration(topic.MessageExpiry));
             Assert.Equal(ParseU64(expected, "max_topic_size"), topic.MaxTopicSize);
+            Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("segment_max_age"), "value"),
+                DurationHelpers.ToDuration(topic.SegmentMaxAge));
             AssertNeverReturned(topic.Options, topic.DerivedOptions);
         }
 

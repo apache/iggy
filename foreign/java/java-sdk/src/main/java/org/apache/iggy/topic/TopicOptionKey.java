@@ -21,6 +21,7 @@ package org.apache.iggy.topic;
 
 import org.apache.iggy.system.OptionKey;
 
+import static org.apache.iggy.system.OptionSpec.FLAG_CRITICAL;
 import static org.apache.iggy.system.OptionSpec.FLAG_RESETTABLE;
 import static org.apache.iggy.system.OptionSpec.FLAG_UPDATABLE;
 
@@ -42,7 +43,8 @@ public enum TopicOptionKey implements OptionKey {
     MESSAGES_REQUIRED_TO_SAVE("messages_required_to_save", 0),
     SIZE_OF_MESSAGES_REQUIRED_TO_SAVE("size_of_messages_required_to_save", 0),
     PREALLOCATE_SEGMENTS("preallocate_segments", 0),
-    REPLICATION_FACTOR("replication_factor", 0);
+    REPLICATION_FACTOR("replication_factor", 0),
+    SEGMENT_MAX_AGE("segment_max_age", FLAG_CRITICAL);
 
     private final String value;
     private final int flags;

@@ -62,7 +62,7 @@ use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
     OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
     TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_preallocated_topic_bytes,
-    validate_topic_segment_size,
+    validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -410,6 +410,7 @@ where
                 if resolved.runtime.preallocate_segments == Some(true) {
                     validate_preallocated_topic_bytes(segment_size, create_topic.partitions_count)?;
                 }
+                validate_segment_max_age(resolved.runtime)?;
                 let max_topic_size = resolved.max_topic_size;
                 validate_topic_bounds(create_topic.partitions_count, max_topic_size, segment_size)?;
                 warn_unenforceable_topic_size(

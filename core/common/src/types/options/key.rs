@@ -58,6 +58,7 @@ pub enum OptionKey {
     EncryptionKeySource,
     EncryptionKeyFingerprint,
     EncryptionKekFingerprint,
+    SegmentMaxAge,
     CriticalKeys,
 }
 

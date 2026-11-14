@@ -487,6 +487,7 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.TopicOptionSizeOfMessagesRequiredToSave),
 			string(iggcon.TopicOptionPreallocateSegments),
 			string(iggcon.TopicOptionReplicationFactor),
+			string(iggcon.TopicOptionSegmentMaxAge),
 		},
 		"user": {
 			string(iggcon.UserOptionUsername),
@@ -563,6 +564,7 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"size_of_messages_required_to_save": {create: "SizeOfMessagesRequiredToSave"},
 			"preallocate_segments":              {create: "PreallocateSegments"},
 			"replication_factor":                {create: "ReplicationFactor"},
+			"segment_max_age":                   {create: "SegmentMaxAge"},
 		},
 		"user": {
 			"username": {update: "Username"},
@@ -721,6 +723,9 @@ func checkTopicResponse(t *testing.T, constants fixtureConstants, vector topicRe
 	assert.Equal(t, uint8(compression[expected.CompressionAlgorithm]), topic.CompressionAlgorithm)
 	assert.Equal(t, parseUint64(t, expected.MessageExpiry), uint64(topic.MessageExpiry))
 	assert.Equal(t, parseUint64(t, expected.MaxTopicSize), topic.MaxTopicSize)
+	if segmentMaxAge, ok := expected.Options[string(iggcon.TopicOptionSegmentMaxAge)]; ok {
+		assert.Equal(t, parseUint64(t, segmentMaxAge.Value), uint64(topic.SegmentMaxAge))
+	}
 }
 
 func checkUserResponse(t *testing.T, constants fixtureConstants, vector userResponseVector) {

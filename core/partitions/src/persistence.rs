@@ -551,6 +551,7 @@ enum Mutation<S: DurableStorage> {
         epoch: u64,
         initial: SegmentPosition,
         max_size: u64,
+        max_age: Option<u64>,
     },
     ReanchorSegments {
         epoch: u64,
@@ -605,7 +606,7 @@ enum Mutation<S: DurableStorage> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     },
 }
 
@@ -890,11 +891,17 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             });
     }
 
-    pub fn enable_segment_storage(&self, initial: SegmentPosition, max_size: u64) {
+    pub fn enable_segment_storage(
+        &self,
+        initial: SegmentPosition,
+        max_size: u64,
+        max_age: Option<u64>,
+    ) {
         self.queue.borrow_mut().push_back(Mutation::EnableSegments {
             epoch: self.epoch.get(),
             initial,
             max_size,
+            max_age,
         });
     }
 
@@ -1245,7 +1252,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     ) {
         self.offset_files.clear();
         self.certified_log_view.set(None);
@@ -1622,8 +1629,15 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     ) -> io::Result<()> {
         match mutation {
             Mutation::EnableSegments {
-                initial, max_size, ..
-            } => logs.data.enable_segment_storage(initial, max_size).await,
+                initial,
+                max_size,
+                max_age,
+                ..
+            } => {
+                logs.data
+                    .enable_segment_storage(initial, max_size, max_age)
+                    .await
+            }
             Mutation::ReanchorSegments { next_offset, .. } => {
                 logs.data.reanchor_segment_storage(next_offset).await
             }
@@ -1775,7 +1789,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     ) -> io::Result<()> {
         let (data_prepare, command_prepare) = match prepare {
             Some(prepare)
@@ -1785,9 +1799,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             }
             prepare => (prepare, None),
         };
-        if let Some((position, max_size)) = segments {
+        if let Some((position, max_size, max_age)) = segments {
             logs.data
-                .reset_with_segment_checkpoint(op, checksum, data_prepare, position, max_size)
+                .reset_with_segment_checkpoint(
+                    op,
+                    checksum,
+                    data_prepare,
+                    position,
+                    max_size,
+                    max_age,
+                )
                 .await?;
         } else if let Some(prepare) = data_prepare {
             logs.data.reset_with_prepare(prepare).await?;

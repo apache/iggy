@@ -343,6 +343,10 @@ pub mod topic_option_keys {
     /// Nodes that store each partition: `Uint32`, create-only. Bounded by
     /// [`super::MAX_REPLICATION_FACTOR`] and the cluster's node count.
     pub const REPLICATION_FACTOR: &str = "replication_factor";
+    /// Age roll: `Uint64` micros or a humantime string (`1h`), create-only.
+    /// At least [`super::MIN_SEGMENT_MAX_AGE`], or `never`; refused together
+    /// with [`PREALLOCATE_SEGMENTS`].
+    pub const SEGMENT_MAX_AGE: &str = "segment_max_age";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -368,6 +372,11 @@ pub const DEFAULT_MESSAGES_REQUIRED_TO_SAVE: u32 = 1024;
 pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
 /// 1 MiB (was `[partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
+/// `IggyExpiry::NeverExpire`: segments roll by size alone.
+pub const DEFAULT_SEGMENT_MAX_AGE: u64 = u64::MAX;
+/// Ten minutes, in microseconds. Every segment costs uploads, a floor command
+/// and an eviction once tiered, so this caps one partition at 144 a day.
+pub const MIN_SEGMENT_MAX_AGE: u64 = 10 * 60 * 1_000_000;
 
 /// Largest partition group consensus supports.
 pub const MAX_REPLICATION_FACTOR: u32 = 32;
@@ -434,6 +443,23 @@ pub fn validate_preallocated_topic_bytes(
     if reserved > MAX_PREALLOCATED_TOPIC_BYTES {
         return Err(IggyError::InvalidOptionValue(
             topic_option_keys::PREALLOCATE_SEGMENTS.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an age roll on a topic that preallocates its segments.
+/// Preallocation reserves a full `segment_size` per segment, so every small
+/// segment the age roll seals would pin that much space.
+///
+/// # Errors
+///
+/// Returns `IggyError::InvalidOptionValue("segment_max_age")` when `runtime`
+/// rolls by age and preallocates.
+pub fn validate_segment_max_age(runtime: TopicRuntimeOptions) -> Result<(), IggyError> {
+    if runtime.effective_segment_max_age().is_some() && runtime.preallocate_segments == Some(true) {
+        return Err(IggyError::InvalidOptionValue(
+            topic_option_keys::SEGMENT_MAX_AGE.to_string(),
         ));
     }
     Ok(())
@@ -1132,6 +1158,7 @@ pub struct TopicRuntimeOptions {
     pub messages_required_to_save: Option<u32>,
     pub size_of_messages_required_to_save: Option<IggyByteSize>,
     pub preallocate_segments: Option<bool>,
+    pub segment_max_age: Option<IggyExpiry>,
 }
 
 impl TopicRuntimeOptions {
@@ -1139,6 +1166,16 @@ impl TopicRuntimeOptions {
     pub fn effective_segment_size(self) -> IggyByteSize {
         self.segment_size
             .unwrap_or_else(|| IggyByteSize::from(DEFAULT_SEGMENT_SIZE))
+    }
+
+    /// Microseconds past a segment's first batch at which a batch starts the
+    /// next segment, or `None` when segments roll by size alone.
+    #[must_use]
+    pub fn effective_segment_max_age(self) -> Option<u64> {
+        match self.segment_max_age {
+            Some(IggyExpiry::ExpireDuration(age)) => Some(age.as_micros()),
+            Some(IggyExpiry::ServerDefault | IggyExpiry::NeverExpire) | None => None,
+        }
     }
 
     /// Derive the runtime knobs from a topic's persisted options map.
@@ -1162,6 +1199,7 @@ impl From<&TopicCreateOptions> for TopicRuntimeOptions {
             messages_required_to_save: parsed.messages_required_to_save,
             size_of_messages_required_to_save: parsed.size_of_messages_required_to_save,
             preallocate_segments: parsed.preallocate_segments,
+            segment_max_age: parsed.segment_max_age,
         }
     }
 }
@@ -1205,6 +1243,9 @@ pub struct TopicCreateOptions {
     /// server's `[cluster] default_replication_factor`, every node unless an
     /// operator set a number.
     pub replication_factor: Option<u32>,
+    /// Age past a segment's first batch at which a batch starts the next
+    /// segment. `None` resolves to never: segments roll by size alone.
+    pub segment_max_age: Option<IggyExpiry>,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
     /// server catalog after this build shipped. Outbound only: a typed field
@@ -1325,6 +1366,10 @@ impl TopicCreateOptions {
             OptionKey::ReplicationFactor => {
                 self.replication_factor = Some(u32::decode(option, entry)?);
             }
+            OptionKey::SegmentMaxAge => {
+                let age = IggyExpiry::decode(option, entry)?;
+                self.segment_max_age = (age != IggyExpiry::ServerDefault).then_some(age);
+            }
             OptionKey::Name
             | OptionKey::Username
             | OptionKey::Status
@@ -1369,6 +1414,7 @@ impl TopicCreateOptions {
                 .or(defaults.size_of_messages_required_to_save),
             preallocate_segments: self.preallocate_segments.or(defaults.preallocate_segments),
             replication_factor: self.replication_factor.or(defaults.replication_factor),
+            segment_max_age: self.segment_max_age.or(defaults.segment_max_age),
             raw: BTreeMap::new(),
         }
     }
@@ -1481,6 +1527,13 @@ impl TopicCreateOptions {
                 HeaderKey::from_str(topic_option_keys::REPLICATION_FACTOR)
                     .expect("catalog key is a valid header key"),
                 OptionValue::explicit(HeaderValue::from(replication_factor)),
+            );
+        }
+        if let Some(segment_max_age) = self.segment_max_age {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::SEGMENT_MAX_AGE)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from(u64::from(segment_max_age))),
             );
         }
         Ok(options)
@@ -1758,6 +1811,7 @@ mod tests {
             size_of_messages_required_to_save: Some(IggyByteSize::from(2_097_152u64)),
             preallocate_segments: Some(false),
             replication_factor: Some(2),
+            segment_max_age: Some(IggyExpiry::from(3_600_000_000u64)),
             partitions_count: None,
             consumer_offset_durability: Durability::Replicated,
             partition_resize_policy: Some(PartitionResizePolicy::Fixed),
