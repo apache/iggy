@@ -210,7 +210,7 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
+    IggyPartition, Segment, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -2021,7 +2021,8 @@ fn enable_committed_tiering(ctx: &ReconcilerCtx, ns: IggyNamespace, created_revi
 
 /// Enforce the committed `TruncatePartition` watermark of a live owned
 /// partition. A watermark whose enforcement is still incomplete (first local
-/// segment starts below it) is pending work: the pump may be blocked by a
+/// segment starts below it, or is a sealed segment that ends on it) is
+/// pending work: the pump may be blocked by a
 /// consumer barrier, by a rejoin whose offsets arrive via journal repair, or by
 /// the per-pass removal budget that keeps one trim from monopolising the pump,
 /// and no such unblocking commits anything, so the namespace stays in the work
@@ -2040,14 +2041,28 @@ fn trim_to_watermark(
         .plane
         .partitions()
         .get_by_ns(&ns)
-        .and_then(|partition| partition.log.segments().first())
-        .is_none_or(|first| first.start_offset >= watermark);
+        .is_none_or(|partition| !trim_is_owed(partition.log.segments(), watermark));
     if trimmed {
         return Convergence::Converged;
     }
     ctx.shard.request_truncate_partition(ns, watermark);
     counters.trims_pending += 1;
     Convergence::Pending
+}
+
+/// Whether the front of `segments` still holds an offset at or below
+/// `watermark` that a trim removes. The watermark is the last deleted offset,
+/// so a sealed segment whose only message sits on it starts at the watermark
+/// and is owed like one that starts below it. The active segment never goes.
+const fn trim_is_owed(segments: &[Segment], watermark: u64) -> bool {
+    let Some((first, later)) = segments.split_first() else {
+        return false;
+    };
+    first.start_offset < watermark
+        || (first.start_offset == watermark
+            && first.end_offset == watermark
+            && first.sealed
+            && !later.is_empty())
 }
 
 /// A report relays committed local evidence. Only the partition primary orders a fence.
@@ -2465,9 +2480,9 @@ mod tests {
     };
     use iggy_common::wire_conversions::resource_options_to_wire;
     use iggy_common::{
-        Durability, HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance,
-        ResourceOptions, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrapSet,
-        critical_keys_marker,
+        Durability, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue,
+        OptionsProvenance, ResourceOptions, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin,
+        WrapSet, critical_keys_marker,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -2485,14 +2500,15 @@ mod tests {
     use metadata::stm::user::Users;
     use partitions::{
         IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairSession,
+        Segment,
     };
     use rand::prelude::{RngExt, SeedableRng, StdRng};
     use server_common::sharding::{IggyNamespace, ShardId};
-    use server_common::{Message, MessageBag};
+    use server_common::{Message, MessageBag, SegmentStorage};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::mem::size_of;
     use std::path::Path;
     use std::rc::Rc;
@@ -4912,6 +4928,258 @@ mod tests {
             assert_eq!(trims(), [(namespace, WATERMARK)]);
             assert!(ctx.pending.borrow().contains(&namespace));
         }
+    }
+
+    /// The watermark names the last deleted offset, so a sealed segment whose
+    /// only message sits on it starts at the watermark and is still owed.
+    #[compio::test]
+    async fn given_a_sealed_one_message_segment_at_the_watermark_when_reconciling_should_request_the_trim_until_it_is_gone()
+     {
+        const WATERMARK: u64 = 10;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "trim-stream");
+        seed_topic(&mux, 2, 0, "trim-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let trims = || {
+            let mut trims = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::TruncatePartition {
+                    namespace,
+                    up_to_offset,
+                }) = frame
+                {
+                    trims.push((namespace, up_to_offset));
+                }
+            }
+            trims
+        };
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            let first = &mut partition.log.segments_mut()[0];
+            first.start_offset = WATERMARK;
+            first.end_offset = WATERMARK;
+            first.sealed = true;
+            let max_size = first.max_size;
+            partition.log.add_persisted_segment(
+                Segment::new(WATERMARK + 1, max_size),
+                SegmentStorage::default(),
+                None,
+                None,
+            );
+        }
+        let stm = &shard.plane.metadata().mux_stm;
+        let created_revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        stm.update(build_prepare(
+            3,
+            Operation::TruncatePartition,
+            &TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: WATERMARK,
+                expected_history: Some(created_revision),
+            },
+        ))
+        .expect("TruncatePartition apply succeeds");
+
+        for _ in 0..2 {
+            reconcile_pass(&ctx).await;
+            assert_eq!(trims(), [(namespace, WATERMARK)]);
+            assert!(ctx.pending.borrow().contains(&namespace));
+        }
+
+        // What the trim leaves: the log starts right after the watermark.
+        shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .unwrap()
+            .log
+            .retire_front()
+            .expect("the sealed segment is retired");
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            trims(),
+            Vec::new(),
+            "a log that starts above the watermark is trimmed"
+        );
+        assert!(!ctx.pending.borrow().contains(&namespace));
+    }
+
+    /// A tiered topic gets no per-replica expiry. Its retention is a pass on
+    /// the partition primary, which needs the watermark already committed to
+    /// tell a new decision from the one it made on the last tick.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_cleaner_passes_should_stage_retention_with_the_committed_watermark()
+     {
+        const WATERMARK: u64 = 10;
+        const EXPIRY_MICROS: u64 = 60_000_000;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "retained-stream");
+        seed_topic(&mux, 2, 0, "retained-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let stm = &shard.plane.metadata().mux_stm;
+        let update_options = |op, options: &[(OptionKey, HeaderValue)]| {
+            let explicit: ResourceOptions = options
+                .iter()
+                .map(|(key, value)| (HeaderKey::from(*key), OptionValue::explicit(value.clone())))
+                .collect();
+            let update = UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: None,
+                explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                    .expect("options fit the wire"),
+                derived_options: WireOptions::empty(),
+            };
+            stm.update(build_prepare(op, Operation::UpdateTopicResolved, &update))
+                .expect("UpdateTopic apply succeeds");
+        };
+        // The retention passes the cleaner staged, and how many per-replica
+        // expiry passes went with them.
+        let staged = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut retention = Vec::new();
+            let mut expiry_passes = 0;
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::RetainPartition {
+                        namespace,
+                        created_revision,
+                        message_expiry,
+                        max_bytes,
+                        committed_up_to,
+                        ..
+                    }) => {
+                        assert_eq!(
+                            Some(created_revision),
+                            shard
+                                .plane
+                                .metadata()
+                                .mux_stm
+                                .streams()
+                                .created_revision_for_namespace(namespace),
+                            "the pass names the incarnation its policy was read for"
+                        );
+                        retention.push((namespace, message_expiry, max_bytes, committed_up_to));
+                    }
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::CleanPartition {
+                        ..
+                    }) => expiry_passes += 1,
+                    _ => {}
+                }
+            }
+            (retention, expiry_passes)
+        };
+        let tiered = (OptionKey::TieredStorage, HeaderValue::from(true));
+
+        update_options(3, std::slice::from_ref(&tiered));
+        assert_eq!(
+            staged(),
+            (Vec::new(), 0),
+            "a tiered topic without a retention policy stages no retention"
+        );
+        // Uploads do not depend on a retention policy.
+        crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+        let mut upload_passes = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
+                namespace,
+                created_revision,
+                resend_advance: true,
+                committed_up_to: Some(0),
+            }) = frame
+            {
+                assert_eq!(
+                    Some(created_revision),
+                    shard
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .created_revision_for_namespace(namespace),
+                    "the pass names the incarnation its watermark was read for"
+                );
+                upload_passes.push(namespace);
+            }
+        }
+        assert_eq!(upload_passes, [namespace]);
+
+        update_options(
+            4,
+            &[
+                tiered,
+                (OptionKey::MessageExpiry, HeaderValue::from(EXPIRY_MICROS)),
+            ],
+        );
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(EXPIRY_MICROS));
+        assert_eq!(staged(), (vec![(namespace, expiry, None, 0)], 0));
+
+        let created_revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        stm.update(build_prepare(
+            5,
+            Operation::TruncatePartition,
+            &TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: WATERMARK,
+                expected_history: Some(created_revision),
+            },
+        ))
+        .expect("TruncatePartition apply succeeds");
+        assert_eq!(staged(), (vec![(namespace, expiry, None, WATERMARK)], 0));
+        // The upload pass carries the watermark too: a primary holds back
+        // its uploads until it covers the trim point.
+        crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+        let mut upload_watermarks = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
+                committed_up_to,
+                ..
+            }) = frame
+            {
+                upload_watermarks.push(committed_up_to);
+            }
+        }
+        assert_eq!(upload_watermarks, [Some(WATERMARK)]);
+
+        // A size cap alone is a retention policy too.
+        update_options(
+            6,
+            &[
+                (OptionKey::TieredStorage, HeaderValue::from(true)),
+                (OptionKey::MessageExpiry, HeaderValue::from(0u64)),
+                (OptionKey::MaxTopicSize, HeaderValue::from(u64::MAX / 2)),
+            ],
+        );
+        let (retention, expiry_passes) = staged();
+        assert_eq!(expiry_passes, 0);
+        assert!(matches!(
+            retention[..],
+            [(staged_namespace, IggyExpiry::NeverExpire, Some(_), WATERMARK)]
+                if staged_namespace == namespace
+        ));
     }
 
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this

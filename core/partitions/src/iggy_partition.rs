@@ -201,6 +201,10 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
+    /// The highest committed truncation watermark a timed pass read from
+    /// metadata for this partition. The watermark only rises, so the one
+    /// metadata holds now is never below it.
+    committed_truncation: u64,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1020,6 +1024,7 @@ where
             segment_upload_attempts: 0,
             upload_cursor: None,
             upload_wanted: Cell::new(false),
+            committed_truncation: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -12983,7 +12988,8 @@ where
         consumers.chain(groups).min_by_key(|(offset, _, _)| *offset)
     }
 
-    /// Time-expiry plus size-retention in one pass: remove the leading sealed
+    /// Time-expiry plus size-retention in one pass, for a partition that is not
+    /// tiered: remove the leading sealed
     /// segments that have expired or that push the partition's SEALED bytes
     /// past `max_bytes`. Capped per call by
     /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
@@ -12995,6 +13001,13 @@ where
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
     ) -> SegmentRemoval {
+        // A tiered partition's retention is one decision for the local and
+        // the remote segments together, which the primary commits as a
+        // truncation. A replica that expired segments by itself could drop
+        // one that was never uploaded.
+        if self.is_tiered() {
+            return SegmentRemoval::default();
+        }
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
             max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
@@ -13002,6 +13015,45 @@ where
             return SegmentRemoval::default();
         };
         self.remove_sealed_segments_up_to(up_to).await
+    }
+
+    /// What the retention policy of a tiered topic removes from this
+    /// partition: the end offset of the last leading sealed segment that
+    /// expired or that pushes the SEALED bytes past `max_bytes`, held at the
+    /// consumer barrier as [`Self::remove_sealed_segments_up_to`] holds a
+    /// removal. Segments whose `.log` already left the disk count like local
+    /// ones, since the store still holds their bytes.
+    ///
+    /// Nothing is removed here. The caller commits the offset as a
+    /// truncation, which is what removes the segments on every replica.
+    ///
+    /// `None` on a partition without a chain, and on every replica but a
+    /// primary that applied the view it started: a backup's segment list can
+    /// trail the primary's, and one decision per partition is what keeps the
+    /// replicas and the store on the same front.
+    #[must_use]
+    pub fn total_retention_end(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> Option<u64> {
+        let consensus = &self.consensus;
+        if !self.is_tiered()
+            || !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || !consensus.applied_view_start()
+        {
+            return None;
+        }
+        retention_end(
+            self.log.segments(),
+            now,
+            message_expiry,
+            max_bytes,
+            self.min_committed_offset().map(|(barrier, _, _)| barrier),
+        )
     }
 
     /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
@@ -13306,6 +13358,43 @@ where
         true
     }
 
+    /// Take the committed truncation watermark that metadata holds for this
+    /// partition. Uploads and floor advances are judged against the highest
+    /// one taken, so a pass that cannot read metadata still judges against a
+    /// watermark that was committed.
+    pub fn note_committed_truncation(&mut self, committed_up_to: u64) {
+        self.committed_truncation = self.committed_truncation.max(committed_up_to);
+    }
+
+    /// The trim point this primary has to commit as a truncation before it
+    /// uploads: the last offset its own retention removed, when neither the
+    /// tiered floor nor `committed_up_to`, the truncation watermark metadata
+    /// holds, has reached it.
+    ///
+    /// The offsets up to it are gone here, but another replica can still
+    /// hold them, and a floor advance over them would declare them stored.
+    /// Only the recorded trim point is offered, never the front of the
+    /// segment list by itself.
+    ///
+    /// `None` on a partition without a chain or a trim point, and on every
+    /// replica but a primary that applied the view it started, as for
+    /// [`Self::total_retention_end`].
+    #[must_use]
+    pub fn trim_point_to_commit(&self, committed_up_to: u64) -> Option<u64> {
+        let consensus = &self.consensus;
+        if !self.is_tiered()
+            || !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || !consensus.applied_view_start()
+        {
+            return None;
+        }
+        let trim_point = self.chain_trim_point()?;
+        let above_floor = self.tiered_floor().is_none_or(|floor| trim_point > floor);
+        (above_floor && trim_point > committed_up_to).then_some(trim_point)
+    }
+
     /// The segment the primary uploads next: the oldest sealed one that is
     /// still local and above the tiered floor.
     ///
@@ -13354,6 +13443,9 @@ where
             return None;
         }
         let upload = self.next_segment_upload()?;
+        // A segment whose advance cannot be sent stays local: storing it
+        // would spend the budget on bytes no replica may evict.
+        self.floor_advance_over(&upload.record)?;
         if !admit(upload.record.size) {
             return None;
         }
@@ -13397,7 +13489,7 @@ where
         self.segment_upload = None;
         match outcome {
             Ok(Ok(())) if self.consensus.is_primary() && self.consensus.is_normal() => {
-                Some(self.note_segment_uploaded(record))
+                self.note_segment_uploaded(record)
             }
             Ok(Ok(())) | Err(_) => None,
             Ok(Err(failure)) => {
@@ -13548,12 +13640,15 @@ where
     /// Account for a finished upload of the segment in `record`, and return
     /// the advance that tells every replica the store holds it.
     ///
-    /// The advance starts right after the floor. Uploads go oldest first, so
-    /// no local segment holds an offset between the floor and this segment.
+    /// `None` when the advance would reach over offsets that this replica
+    /// removed and nothing committed as deleted, as for
+    /// `floor_advance_over`. The segment counts as uploaded either
+    /// way, and [`Self::pending_floor_advance`] offers its advance once the
+    /// watermark covers them.
     pub fn note_segment_uploaded(
         &mut self,
         record: &crate::segment_chain::SegmentRecord,
-    ) -> crate::tiered_floor::AdvanceTieredFloor {
+    ) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
         let oldest = self.oldest_unuploaded_segment();
         let slot = self
             .log
@@ -13577,7 +13672,8 @@ where
     ///
     /// Only the oldest segment above the floor can owe one, since an advance
     /// starts right after the floor. `None` while that segment is still
-    /// local, so no advance reaches over a segment the store does not hold.
+    /// local, so no advance reaches over a segment the store does not hold,
+    /// and while offsets this replica removed are not committed as deleted.
     #[must_use]
     pub fn pending_floor_advance(&self) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
         let segment = self.log.segments()[self.first_slot_above_floor()..]
@@ -13587,7 +13683,7 @@ where
             return None;
         }
         let record = self.undisputed_segment_record(segment.start_offset)?;
-        Some(self.floor_advance_over(&record))
+        self.floor_advance_over(&record)
     }
 
     /// The chain's record of the sealed segment at `start_offset`, unless an
@@ -13608,18 +13704,36 @@ where
         })
     }
 
+    /// The advance that tells every replica the store holds the segment in
+    /// `record`. It starts right after the floor, which the floor machine
+    /// requires, so it also covers every offset between the floor and the
+    /// segment.
+    ///
+    /// The store holds the ones in this replica's earlier segments, since
+    /// uploads go oldest first. It holds none below this replica's first
+    /// segment, and only a committed truncation says no other replica holds
+    /// them either: each replica expired its own segments before the topic
+    /// was tiered. `None` while one of those is above the committed
+    /// truncation watermark.
     fn floor_advance_over(
         &self,
         record: &crate::segment_chain::SegmentRecord,
-    ) -> crate::tiered_floor::AdvanceTieredFloor {
+    ) -> Option<crate::tiered_floor::AdvanceTieredFloor> {
         let next = self
             .tiered_floor()
             .map_or(0, |floor| floor.saturating_add(1));
-        crate::tiered_floor::AdvanceTieredFloor {
+        let front = self.log.segments().first()?.start_offset;
+        if let Some(last_removed) = front.checked_sub(1)
+            && last_removed >= next
+            && last_removed > self.committed_truncation
+        {
+            return None;
+        }
+        Some(crate::tiered_floor::AdvanceTieredFloor {
             start: next.min(record.start_offset),
             up_to: record.end_offset,
             hash: record.hash,
-        }
+        })
     }
 
     /// Drop the leading advances that the chain holds or a segment settled,
@@ -15663,6 +15777,29 @@ fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
         up_to = Some(segment.end_offset);
     }
     up_to
+}
+
+/// Highest `end_offset` retention removes from `segments`: the longer of the
+/// expired and the over-budget leading runs, cut back to the last segment that
+/// ends at or below `barrier`. `None` when retention removes nothing. The
+/// active segment (last element) is never named.
+fn retention_end(
+    segments: &[Segment],
+    now: IggyTimestamp,
+    expiry: IggyExpiry,
+    max_bytes: Option<u64>,
+    barrier: Option<u64>,
+) -> Option<u64> {
+    let expired = leading_expired_end(segments, now, expiry);
+    let oversized = max_bytes.and_then(|max_bytes| leading_oversized_end(segments, max_bytes));
+    let up_to = expired.into_iter().chain(oversized).max()?;
+    let through = barrier.map_or(up_to, |barrier| up_to.min(barrier));
+    // `up_to` ends a sealed segment, so the walk stops before the active one.
+    segments
+        .iter()
+        .take_while(|segment| segment.end_offset <= through)
+        .map(|segment| segment.end_offset)
+        .last()
 }
 
 /// `end_offset` of the `count`-th oldest sealed (non-active) segment of

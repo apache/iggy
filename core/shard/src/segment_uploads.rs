@@ -25,11 +25,17 @@
 //! A pass comes from the cleaner's timer, from a segment that sealed, or from
 //! an upload that stored. Whether it starts an upload is up to the shard's
 //! byte budget and the partition's wait after a failure.
+//!
+//! Only the timed pass carries the truncation watermark metadata holds. A
+//! primary whose own retention removed offsets that nothing committed as
+//! deleted uploads nothing until a timed pass has had that truncation
+//! committed, since its floor advance would declare those offsets stored.
 
 use crate::shards_table::ShardsTable;
 use crate::upload_pacing::{LagChange, UPLOAD_LAG_ALARM};
 use crate::{
-    FinishedSegmentUpload, IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel,
+    FinishedSegmentUpload, IggyShard, LifecycleFrame, MetadataSubmit, RestorableMetadataStm,
+    ShardFrame, channel,
 };
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::{PrepareHeader, RoutedRequestHeader};
@@ -57,28 +63,33 @@ where
         *self.segment_uploader.borrow_mut() = uploader;
     }
 
-    /// Stage an upload pass for `namespace` on this shard's pump. A refused
-    /// frame is picked up by the cleaner's next tick.
+    /// Stage an upload pass for the partition `namespace` names now on this
+    /// shard's pump. A refused frame is picked up by the cleaner's next tick.
     pub fn request_upload_segments(&self, namespace: IggyNamespace) {
-        self.stage_upload_segments(namespace, true);
+        let partitions = self.plane.partitions();
+        if let Some(partition) = partitions.get_by_ns(&namespace) {
+            self.stage_upload_segments(namespace, partition.created_revision(), true, None);
+        }
     }
 
-    /// Stage the timed upload passes of `namespaces`, the tiered partitions
-    /// this shard hosts, and republish how far their uploads are behind at
-    /// `now`.
+    /// Stage the timed upload passes of `passes`, the tiered partitions this
+    /// shard hosts, each as `(namespace, created_revision, committed_up_to)`:
+    /// the incarnation metadata holds and its truncation watermark. Republish
+    /// how far their uploads are behind at `now`.
     ///
     /// The partitions whose local eviction waits for an upload are staged
     /// first: the shard's byte budget goes to the passes that run first, and
     /// those partitions hold disk they are configured to give back.
-    pub fn request_upload_passes(&self, namespaces: &[IggyNamespace], now: IggyTimestamp) {
+    pub fn request_upload_passes(&self, passes: &[(IggyNamespace, u64, u64)], now: IggyTimestamp) {
         let partitions = self.plane.partitions();
+        let namespaces: Vec<_> = passes.iter().map(|(namespace, ..)| *namespace).collect();
         let mut pacing = self.upload_pacing.borrow_mut();
-        pacing.retain(namespaces);
+        pacing.retain(&namespaces);
         let mut oldest = Duration::ZERO;
-        let mut unhurried = Vec::with_capacity(namespaces.len());
-        for &namespace in namespaces {
+        let mut unhurried = Vec::with_capacity(passes.len());
+        for &(namespace, created_revision, committed_up_to) in passes {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
-                unhurried.push(namespace);
+                unhurried.push((namespace, created_revision, committed_up_to));
                 continue;
             };
             let lag = partition.upload_lag(now).unwrap_or_default();
@@ -100,14 +111,19 @@ where
                 None => {}
             }
             if partition.eviction_awaits_upload(now) {
-                self.request_upload_segments(namespace);
+                self.stage_upload_segments(
+                    namespace,
+                    created_revision,
+                    true,
+                    Some(committed_up_to),
+                );
             } else {
-                unhurried.push(namespace);
+                unhurried.push((namespace, created_revision, committed_up_to));
             }
         }
         drop(pacing);
-        for namespace in unhurried {
-            self.request_upload_segments(namespace);
+        for (namespace, created_revision, committed_up_to) in unhurried {
+            self.stage_upload_segments(namespace, created_revision, true, Some(committed_up_to));
         }
         self.metrics.set_segment_upload_lag(oldest);
     }
@@ -121,30 +137,108 @@ where
         partition: &IggyPartition<B, SB>,
     ) {
         if partition.take_upload_wanted() && self.segment_uploader.borrow().is_some() {
-            self.stage_upload_segments(namespace, false);
+            self.stage_upload_segments(namespace, partition.created_revision(), false, None);
         }
     }
 
-    fn stage_upload_segments(&self, namespace: IggyNamespace, resend_advance: bool) {
+    fn stage_upload_segments(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        resend_advance: bool,
+        committed_up_to: Option<u64>,
+    ) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
         };
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::UploadSegments {
             namespace,
+            created_revision,
             resend_advance,
+            committed_up_to,
         }));
     }
 
+    /// Run an upload pass over `namespace` on the pump, when its partition is
+    /// the incarnation `created_revision` the pass was staged for.
     #[allow(clippy::future_not_send)]
-    pub(crate) async fn on_upload_segments(&self, namespace: IggyNamespace, resend_advance: bool)
+    pub(crate) async fn on_upload_segments(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        resend_advance: bool,
+        committed_up_to: Option<u64>,
+    ) where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        let now = Instant::now();
+        // The watermark belongs to `created_revision`. Noted into any other
+        // incarnation it would let a floor advance pass over offsets nothing
+        // committed as deleted there. The finished uploads are still settled:
+        // they wait for a pass, whatever partition it is for.
+        let staged_for_this_incarnation = self
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(|partition| partition.created_revision() == created_revision);
+        if !staged_for_this_incarnation {
+            self.settle_undelivered_uploads(namespace, now).await;
+            return;
+        }
+        if let Some(committed_up_to) = committed_up_to {
+            self.commit_trim_point(namespace, committed_up_to);
+        }
+        self.upload_segments_at(namespace, resend_advance, now)
+            .await;
+    }
+
+    /// Hand the partition of `namespace` the truncation watermark metadata
+    /// holds, and when it is a primary whose trim point is above both that
+    /// and its tiered floor, hand the trim point to shard 0 to commit, the
+    /// way a retention decision is. Does nothing on a shard without an
+    /// uploader, which has no advance to make honest.
+    ///
+    /// The same offset is handed over on every timed pass until a pass
+    /// comes with a watermark that covers it.
+    fn commit_trim_point(&self, namespace: IggyNamespace, committed_up_to: u64) {
+        if self.segment_uploader.borrow().is_none() {
+            return;
+        }
+        let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) else {
+            return;
+        };
+        partition.note_committed_truncation(committed_up_to);
+        if let Some(up_to_offset) = partition.trim_point_to_commit(committed_up_to) {
+            self.forward_metadata_submit(MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision: partition.created_revision(),
+                up_to_offset,
+            });
+        }
+    }
+
+    /// Settle the uploads that finished and could not report it. Every pass
+    /// settles all of them, whatever partition it is for, so a result is not
+    /// left waiting for a pass over a deleted partition. Returns whether one
+    /// of them sent the floor advance of `namespace`.
+    #[allow(clippy::future_not_send)]
+    async fn settle_undelivered_uploads(&self, namespace: IggyNamespace, now: Instant) -> bool
     where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        self.upload_segments_at(namespace, resend_advance, Instant::now())
-            .await;
+        let undelivered = std::mem::take(&mut *self.undelivered_segment_uploads.borrow_mut());
+        let mut advance_sent = false;
+        for finished in undelivered {
+            let settled = finished.namespace;
+            advance_sent |= self.settle_segment_upload(finished, now).await && settled == namespace;
+        }
+        advance_sent
     }
 
     /// [`Self::on_upload_segments`] at a given time.
@@ -163,14 +257,7 @@ where
         let Some(uploader) = self.segment_uploader.borrow().clone() else {
             return;
         };
-        // Every pass settles all of them, whatever partition it is for, so a
-        // result is not left waiting for a pass over a deleted partition.
-        let undelivered = std::mem::take(&mut *self.undelivered_segment_uploads.borrow_mut());
-        let mut advance_sent = false;
-        for finished in undelivered {
-            let settled = finished.namespace;
-            advance_sent |= self.settle_segment_upload(finished, now).await && settled == namespace;
-        }
+        let advance_sent = self.settle_undelivered_uploads(namespace, now).await;
 
         let partitions = self.plane.partitions();
         let owed = partitions
@@ -253,12 +340,13 @@ where
         M: RestorableMetadataStm,
     {
         let namespace = finished.namespace;
+        let created_revision = finished.created_revision;
         let stored = matches!(finished.outcome, Ok(Ok(())));
         self.settle_segment_upload(finished, now).await;
         // A backlog drains without waiting for the timer. A failure waits for
         // it, so a store that refuses every upload is not asked in a loop.
         if stored {
-            self.stage_upload_segments(namespace, false);
+            self.stage_upload_segments(namespace, created_revision, false, None);
         }
     }
 
