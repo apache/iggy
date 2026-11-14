@@ -72,7 +72,7 @@ pub(super) async fn chain_records(directory: &Path) -> Vec<ChainRecord> {
 }
 
 /// A tiered partition under `root`, at the path boot recovery looks in.
-async fn tiered_partition_on_disk(
+pub(super) async fn tiered_partition_on_disk(
     root: &Path,
 ) -> (PartitionsConfig, IggyPartition<IggyMessageBus>) {
     let mut config = repair_config();

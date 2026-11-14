@@ -1757,6 +1757,22 @@ impl Streams {
         })
     }
 
+    /// What a tiered topic keeps on local disk: its `local_retention_age`
+    /// and `local_retention_size`. `None` for a topic that is not tiered.
+    #[must_use]
+    pub fn topic_local_retention(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Option<(IggyExpiry, MaxTopicSize)> {
+        self.inner.read(|inner| {
+            let resolved = &inner.items.get(stream_id)?.topics.get(topic_id)?.resolved;
+            resolved
+                .tiered_storage
+                .then_some((resolved.local_retention_age, resolved.local_retention_size))
+        })
+    }
+
     /// A partition's incarnation and its topic's partition count, read under
     /// one guard so a recreated topic never pairs an old incarnation with a
     /// new count. `None` while a lifecycle operation blocks the topic, as for

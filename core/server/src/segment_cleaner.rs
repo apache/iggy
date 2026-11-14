@@ -30,6 +30,7 @@ use crate::shell::ServerShard;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::{IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::LocalEnvelope;
 use shard::Receiver;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -109,6 +110,15 @@ fn stage_owned_partitions(
             segment_size.saturating_add(max_message_size),
         );
 
+        if let Some((age, size)) =
+            streams.topic_local_retention(namespace.stream_id(), namespace.topic_id())
+        {
+            shard.request_evict_partition(
+                namespace,
+                now,
+                local_envelope(age, size, partition_count),
+            );
+        }
         if !has_expiry && budget.is_none() {
             continue;
         }
@@ -140,6 +150,19 @@ fn stage_owned_partitions(
             budget.map(|budget| budget.max_bytes),
         );
     }
+}
+
+/// What one partition of a tiered topic keeps on local disk. The topic's
+/// `local_retention_size` is shared evenly between its partitions, as
+/// `max_topic_size` is.
+fn local_envelope(age: IggyExpiry, size: MaxTopicSize, partition_count: usize) -> LocalEnvelope {
+    let size = match size {
+        MaxTopicSize::Custom(size) => {
+            Some(size.as_bytes_u64() / u64::try_from(partition_count.max(1)).unwrap_or(u64::MAX))
+        }
+        MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
+    };
+    LocalEnvelope { age, size }
 }
 
 /// A topic's enforced per-partition budget, next to the share it was derived
@@ -203,6 +226,38 @@ fn per_partition_size_budget(
 #[cfg(test)]
 mod tests {
     use super::{PartitionSizeBudget, per_partition_size_budget};
+
+    #[test]
+    fn given_local_retention_when_resolving_an_envelope_should_share_the_size_between_partitions() {
+        let age = iggy_common::IggyExpiry::NeverExpire;
+        let size =
+            |bytes: u64| iggy_common::MaxTopicSize::Custom(iggy_common::IggyByteSize::from(bytes));
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, size(900), 3),
+            partitions::LocalEnvelope {
+                age,
+                size: Some(300)
+            }
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, size(900), 0).size,
+            Some(900)
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(age, iggy_common::MaxTopicSize::Unlimited, 3)
+                .size,
+            None
+        );
+        assert_eq!(
+            crate::segment_cleaner::local_envelope(
+                age,
+                iggy_common::MaxTopicSize::ServerDefault,
+                3
+            )
+            .size,
+            None
+        );
+    }
     use iggy_common::MaxTopicSize;
 
     /// A ceiling low enough that the share is what the assertion is about.

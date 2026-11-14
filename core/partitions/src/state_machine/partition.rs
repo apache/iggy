@@ -231,8 +231,16 @@ where
         else {
             return self.stop_on_command(header, "committed command is malformed");
         };
+        let advance = (command.kind == crate::tiered_floor::ADVANCE_TIERED_FLOOR)
+            .then(|| crate::tiered_floor::AdvanceTieredFloor::try_from(command.payload).ok())
+            .flatten();
         match self.state_machines.apply(header.op, command) {
-            Ok(Applied::Changed) => true,
+            Ok(Applied::Changed) => {
+                if let Some(advance) = advance {
+                    self.note_tiered_advance(advance);
+                }
+                true
+            }
             Ok(Applied::Refused) => {
                 debug!(
                     namespace_raw = header.group,
