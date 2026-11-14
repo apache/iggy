@@ -36,11 +36,11 @@ interval = "1 m"
 
 # The volume holding the data directory.
 [disk]
-# Refuses new messages and new consumer offset keys with DiskUsageLimitReached
-# (HTTP 507) while the volume is at or above 'usage_limit_percent'. Reads,
-# existing consumer offsets, deletes, the segment cleaner and replication keep
-# running, and the server accepts data again once a sample, taken every second,
-# is back under the limit.
+# Refuses new messages, new consumer offset keys, new topics and new partitions
+# with DiskUsageLimitReached (HTTP 507) while the volume is at or above
+# 'usage_limit_percent'. Reads, existing consumer offsets, deletes, the segment
+# cleaner and replication keep running, and the server accepts data again once
+# a sample, taken every second, is back under the limit.
 usage_limit_enabled = true
 
 # Percent of the volume, counted the way the Use% column of `df` counts it.

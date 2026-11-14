@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A server over its disk usage limit refuses new messages and new consumer
-//! offset keys, and keeps serving reads, existing offsets and deletes.
+//! A server over its disk usage limit refuses new messages, new consumer
+//! offset keys, new topics and new partitions, and keeps serving reads,
+//! existing offsets and deletes.
 //!
 //! The test restarts the same server with a limit its volume is already over,
 //! so no disk has to fill and nothing depends on what other tests write. The
@@ -35,6 +36,8 @@ use super::http_client::HttpClient;
 const MESSAGES: u32 = 10;
 const CONSUMER_WITH_OFFSET: u32 = 1;
 const NEW_CONSUMER: u32 = 2;
+/// Created under the limit and deleted over it.
+const SPARE_TOPIC: &str = "spare";
 /// Any volume holding a server's data is more than a millionth used.
 const LIMIT_REACHED_PERCENT: &str = "0.0001";
 
@@ -52,6 +55,9 @@ async fn given_a_disk_over_the_limit_when_writing_should_refuse_new_data_and_kee
         .store_consumer_offset(&consumer(CONSUMER_WITH_OFFSET), &stream, &topic, Some(0), 4)
         .await
         .expect("store an offset under the limit");
+    create_topic(&client, &stream, SPARE_TOPIC)
+        .await
+        .expect("create a topic under the limit");
     drop(client);
 
     harness
@@ -101,6 +107,23 @@ async fn given_a_disk_over_the_limit_when_writing_should_refuse_new_data_and_kee
         .delete_consumer_offset(&consumer(CONSUMER_WITH_OFFSET), &stream, &topic, Some(0))
         .await
         .expect("a delete frees space, so it must be admitted");
+    assert_eq!(
+        create_topic(&client, &stream, "new").await.map(drop),
+        Err(IggyError::DiskUsageLimitReached),
+        "a new topic must be refused"
+    );
+    assert_eq!(
+        client.create_partitions(&stream, &topic, 1).await,
+        Err(IggyError::DiskUsageLimitReached),
+        "new partitions must be refused"
+    );
+    client
+        .delete_topic(
+            &stream,
+            &Identifier::named(SPARE_TOPIC).expect("topic identifier"),
+        )
+        .await
+        .expect("deleting a topic frees space, so it must be admitted");
 
     let http = HttpClient::login_root(&harness).await;
     let response = http_send(&http).await;
@@ -132,6 +155,24 @@ async fn given_a_disk_over_the_limit_when_writing_should_refuse_new_data_and_kee
     send(&client, &stream, &topic)
         .await
         .expect("without the limit, sends must be admitted again");
+}
+
+async fn create_topic(
+    client: &IggyClient,
+    stream: &Identifier,
+    name: &str,
+) -> Result<TopicDetails, IggyError> {
+    client
+        .create_topic(
+            stream,
+            name,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
 }
 
 async fn send(

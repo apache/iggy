@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, ConfigEnv)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiskConfig {
-    /// Whether the server refuses new messages and new consumer offset keys
-    /// at or above [`Self::usage_limit_percent`].
+    /// Whether the server refuses new messages, new consumer offset keys, new
+    /// topics and new partitions at or above [`Self::usage_limit_percent`].
     pub usage_limit_enabled: bool,
     /// Percent of the data volume, counted the way the Use% column of `df`
     /// counts it. Space the filesystem reserves for root is not counted, so

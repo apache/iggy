@@ -36,6 +36,11 @@ pub trait PartitionClient {
     /// partitions_max`, a binary transport returns
     /// `IggyError::PartitionsLimitReached`. `HttpClient` returns
     /// `IggyError::HttpResponseError` instead.
+    ///
+    /// While the data volume of the metadata primary is at or above
+    /// `[disk] usage_limit_percent`, a binary transport returns
+    /// `IggyError::DiskUsageLimitReached` (4109). `HttpClient` returns
+    /// `IggyError::HttpResponseError` with status 507.
     async fn create_partitions(
         &self,
         stream_id: &Identifier,

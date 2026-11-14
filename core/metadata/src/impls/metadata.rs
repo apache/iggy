@@ -90,10 +90,10 @@ use journal::superblock::{
 };
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use server_common::Message;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use server_common::sharding::IggyNamespace;
+use server_common::{DISK_USAGE, DiskUsage, Message};
 use std::cell::{Cell, RefCell};
 use std::io;
 #[cfg(feature = "simulator")]
@@ -1289,6 +1289,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// `[metadata] partitions_max`, zero for no cap. See
     /// [`Self::admit_partitions`].
     partitions_max: Cell<u32>,
+    /// The estimate whose flag refuses new topics and partitions. See
+    /// [`Self::admit_disk_usage`].
+    disk_usage: &'static DiskUsage,
     /// `[personal_access_token] max_tokens_per_user`, zero for no cap. See
     /// [`Self::admit_personal_access_token`].
     max_tokens_per_user: Cell<u32>,
@@ -1370,6 +1373,7 @@ where
             transfer_offer_cache: RefCell::new(None),
             prepare_gap_drops: Cell::new(0),
             partitions_max: Cell::new(0),
+            disk_usage: &DISK_USAGE,
             max_tokens_per_user: Cell::new(0),
             default_replication_factor: Cell::new(None),
             applied_frontier: Arc::default(),
@@ -1661,6 +1665,11 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// `CreatePartitions`, so every node needs the same value.
     pub fn set_partitions_max(&self, partitions_max: u32) {
         self.partitions_max.set(partitions_max);
+    }
+
+    #[cfg(test)]
+    const fn set_disk_usage(&mut self, disk_usage: &'static DiskUsage) {
+        self.disk_usage = disk_usage;
     }
 
     /// Give a topic created without a replication factor `factor` nodes, or
@@ -4852,6 +4861,27 @@ where
         admitted
     }
 
+    /// `[disk] usage_limit_percent` admission for a `CreateTopic` or
+    /// `CreatePartitions`. Other operations pass, so deletes can still free
+    /// space.
+    ///
+    /// With `preallocate_segments`, each new partition reserves a whole segment
+    /// as soon as it is created. The check reads the volume of the metadata
+    /// primary, which is not always the one that will hold the new partitions.
+    /// It runs before [`Self::admit_partitions`] and needs only the operation,
+    /// so it also refuses a create that the apply would refuse for another
+    /// reason.
+    fn admit_disk_usage(&self, message: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
+        let creates_topic_or_partitions = matches!(
+            message.header().operation,
+            Operation::CreateTopic | Operation::CreatePartitions
+        );
+        if creates_topic_or_partitions && self.disk_usage.is_blocked() {
+            return Err(IggyError::DiskUsageLimitReached);
+        }
+        Ok(())
+    }
+
     /// `[personal_access_token] max_tokens_per_user` admission for a
     /// `CreatePersonalAccessToken`. Other operations pass, so a user at the
     /// cap can still delete a token to free a slot.
@@ -5039,6 +5069,7 @@ where
         // The caps count the creates already in the prepare pipeline, and every
         // caller pushes this prepare before its next await, so no create passes
         // on a count that misses another.
+        self.admit_disk_usage(&message)?;
         self.admit_partitions(&message)?;
         self.admit_personal_access_token(&message)?;
 
@@ -5968,6 +5999,7 @@ const fn is_admission_refusal(error: &IggyError) -> bool {
         error,
         IggyError::TransientNotAccepted
             | IggyError::PartitionsLimitReached
+            | IggyError::DiskUsageLimitReached
             | IggyError::PersonalAccessTokensLimitReached(..)
     )
 }
@@ -8368,6 +8400,93 @@ mod tests {
             iggy_binary_protocol::result_code(&denied.as_slice()[size_of::<ReplyHeader>()..]),
             Some(IggyError::PartitionsLimitReached.as_code()),
             "a new create past the cap must be denied"
+        );
+    }
+
+    /// An estimate already at its limit, so its flag is set.
+    fn disk_at_limit() -> &'static DiskUsage {
+        let usage: &'static DiskUsage = Box::leak(Box::new(DiskUsage::new()));
+        usage.rebase(|| {
+            Some((
+                (),
+                server_common::VolumeSample {
+                    used_bytes: 100,
+                    limit_bytes: Some(100),
+                },
+            ))
+        });
+        assert!(usage.is_blocked());
+        usage
+    }
+
+    #[test]
+    fn given_a_full_disk_when_admitting_should_refuse_only_new_topics_and_partitions() {
+        let mut metadata = placement_metadata();
+        metadata.set_disk_usage(disk_at_limit());
+        let add_partitions = pat_request(
+            2,
+            1,
+            Operation::CreatePartitions,
+            &WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            }
+            .to_bytes(),
+        );
+
+        for create in [placement_request(1, "full", 1), add_partitions] {
+            assert!(matches!(
+                metadata.admit_disk_usage(&create),
+                Err(IggyError::DiskUsageLimitReached)
+            ));
+        }
+        assert!(
+            metadata
+                .admit_disk_usage(&create_stream_request(1, 1, "unrelated"))
+                .is_ok(),
+            "only creates that add partitions take segment space"
+        );
+    }
+
+    #[test]
+    fn given_an_open_disk_when_admitting_a_create_topic_should_pass() {
+        let mut metadata = placement_metadata();
+        metadata.set_disk_usage(Box::leak(Box::new(DiskUsage::new())));
+
+        assert!(
+            metadata
+                .admit_disk_usage(&placement_request(1, "open", 1))
+                .is_ok()
+        );
+    }
+
+    /// The refusal reaches the client as a typed reply. An error that
+    /// `is_admission_refusal` does not list would evict the session instead.
+    #[compio::test]
+    async fn given_a_full_disk_when_creating_a_topic_should_reply_with_the_refusal() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = TOPIC_MANAGER;
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata.set_disk_usage(disk_at_limit());
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, 1))
+            .unwrap();
+
+        let denied = metadata
+            .submit_request_in_process(create_topic_request(CLIENT, USER))
+            .await
+            .expect("a denial is a reply, not a submit error");
+
+        assert_eq!(
+            iggy_binary_protocol::result_code(&denied.as_slice()[size_of::<ReplyHeader>()..]),
+            Some(IggyError::DiskUsageLimitReached.as_code())
         );
     }
 
