@@ -44,6 +44,7 @@ pub use repair_memory::RepairMemoryBudget;
 mod segment;
 pub mod segment_anchor;
 mod segment_recovery;
+pub mod state_machine;
 pub mod state_transfer;
 mod stream_keyring;
 mod types;
@@ -102,10 +103,9 @@ pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
-    CREATED_REVISION_FILE, clamp_consumer_offsets, configure_consumer_offsets,
-    configure_consumer_offsets_with_storage, create_partition_file_hierarchy,
-    delete_partitions_from_disk, ensure_initial_segment, hydrate_partition_log,
-    read_created_revision, read_revision_record, recover_consumer_offsets,
+    CREATED_REVISION_FILE, clamp_consumer_offsets, configure_consumer_offsets_with_storage,
+    create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
+    hydrate_partition_log, read_created_revision, read_revision_record, recover_consumer_offsets,
     recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
 };
 pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
@@ -138,6 +138,7 @@ pub type RetainedPartitionLog =
 /// Everything a partition hands its own next incarnation across a simulated
 /// restart.
 #[cfg(any(test, feature = "simulator"))]
+#[derive(Default)]
 pub struct RetainedPartitionState {
     pub log: RetainedPartitionLog,
     pub head_op: u64,
@@ -162,6 +163,26 @@ pub struct RetainedPartitionState {
     pub(crate) owner_retirement:
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
     pub(crate) producers: producer_state::ProducerTable,
+    pub(crate) machines: Option<state_machine::StateMachineSnapshot>,
+}
+
+#[cfg(any(test, feature = "simulator"))]
+impl RetainedPartitionState {
+    /// The state of a partition whose boot recovered a log with nothing in it:
+    /// the first segment of the chain, as
+    /// [`IggyPartition::with_in_memory_storage`] plants it, and no op.
+    /// `Default` alone leaves the chain without that segment.
+    #[must_use]
+    pub fn empty(segment_size: iggy_common::IggyByteSize) -> Self {
+        let mut state = Self::default();
+        state.log.add_persisted_segment(
+            Segment::new(0, segment_size),
+            server_common::SegmentStorage::default(),
+            None,
+            None,
+        );
+        state
+    }
 }
 
 /// Partition-level data plane operations.

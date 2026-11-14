@@ -37,6 +37,9 @@ use crate::producer_state::{
     PRODUCER_BATCHES_RETAINED, PRODUCERS_MAX, ProducerBatch, ProducerEntry,
 };
 use crate::segment_anchor::ANCHOR_SUFFIX;
+use crate::state_machine::{
+    SNAPSHOT_BYTES_MAX, SnapshotDecodeError, StateMachineError, StateMachineSnapshot,
+};
 use crate::types::{OFFSETS_DIR, PartitionsConfig};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use consensus::client_table::{CLIENTS_TABLE_SLOT_MAX, ClientTable, ClientTableMode};
@@ -57,13 +60,13 @@ use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use server_common::Message;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::run_blocking;
 use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
+use server_common::{DISK_USAGE, Message};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -103,7 +106,9 @@ const RETRY_CHECKPOINT_BYTES_MAX: usize = journal::partition_journal::PREPARE_BY
     + CONSUMER_GROUP_OWNERS_MAX as usize * size_of::<u64>()
     + size_of::<PrepareHeader>()
     + size_of::<u32>()
-    + PRODUCERS_MAX * PRODUCER_ENTRY_LEN_MAX;
+    + PRODUCERS_MAX * PRODUCER_ENTRY_LEN_MAX
+    + size_of::<u32>()
+    + SNAPSHOT_BYTES_MAX;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -599,6 +604,11 @@ pub(crate) struct ConsumerOffsetsWire {
     pub retirement_paid_through: u64,
     /// The committed producer table, ascending by producer id.
     pub producers: Vec<(u64, ProducerEntry)>,
+    /// The state machines at the artifact's op, `None` for a partition that
+    /// registers none. An optional tail: without it the artifact is the version
+    /// 9 layout byte for byte, and a decoder that predates it refuses the tail
+    /// as trailing bytes.
+    pub machines: Option<StateMachineSnapshot>,
 }
 
 impl ConsumerOffsetsWire {
@@ -614,7 +624,8 @@ impl ConsumerOffsetsWire {
     /// prepare_checksum u128 | prepare_length u32 | checkpoint_prepare bytes |
     /// retirement_paid_through u64 | producer_count u32 | {producer_id u64,
     /// epoch u16, last_timestamp u64, batch_count u8, {first_sequence u32,
-    /// last_sequence u32, base_offset u64}xB}xP | XxHash3_64 trailer`.
+    /// last_sequence u32, base_offset u64}xB}xP | [machines_length u32 |
+    /// state machine snapshot] | XxHash3_64 trailer`.
     /// Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -710,6 +721,7 @@ impl ConsumerOffsetsWire {
                 out.extend_from_slice(&batch.base_offset.to_le_bytes());
             }
         }
+        self.encode_machine_section(&mut out);
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
         out.extend_from_slice(&trailer.to_le_bytes());
@@ -814,10 +826,17 @@ impl ConsumerOffsetsWire {
         } else {
             Self::decode_producer_section(&mut cursor)?
         };
+        let machines = if version == CONSUMER_OFFSETS_VERSION_MIN {
+            None
+        } else {
+            Self::decode_machine_section(&mut cursor)?
+        };
         if !cursor.remaining().is_empty() {
-            // Distinct from `Truncated`: extra bytes point at a NEWER
+            // Distinct from `Truncated`: extra bytes past the optional machine
+            // section, the last one version 9 can carry, point at a NEWER
             // encoder, and telling the operator the artifact is short would
-            // send them the wrong way.
+            // send them the wrong way. A section after it needs version 10,
+            // since an optional tail cannot tell what follows it.
             return Err(ConsumerOffsetsWireError::TrailingBytes {
                 extra: cursor.remaining().len(),
             });
@@ -838,7 +857,39 @@ impl ConsumerOffsetsWire {
             owner_retirement,
             retirement_paid_through,
             producers,
+            machines,
         })
+    }
+
+    /// `[length u32 | snapshot bytes]`, absent without machines.
+    ///
+    /// # Panics
+    /// When the snapshot is past `u32::MAX` bytes, which the capture bound of
+    /// [`SNAPSHOT_BYTES_MAX`] rules out.
+    fn encode_machine_section(&self, out: &mut Vec<u8>) {
+        if let Some(machines) = &self.machines {
+            let length =
+                u32::try_from(machines.encoded_size()).expect("bounded state machine snapshot");
+            out.extend_from_slice(&length.to_le_bytes());
+            machines.encode_into(out);
+        }
+    }
+
+    fn decode_machine_section(
+        cursor: &mut LeCursor<'_>,
+    ) -> Result<Option<StateMachineSnapshot>, ConsumerOffsetsWireError> {
+        if cursor.remaining().is_empty() {
+            return Ok(None);
+        }
+        let length = cursor.u32()? as usize;
+        if length > SNAPSHOT_BYTES_MAX {
+            return Err(ConsumerOffsetsWireError::InvalidStateMachines(
+                SnapshotDecodeError::TooLarge { length },
+            ));
+        }
+        StateMachineSnapshot::decode(cursor.take(length)?)
+            .map(Some)
+            .map_err(ConsumerOffsetsWireError::InvalidStateMachines)
     }
 
     /// The producer section, ascending by producer id. Every field stays
@@ -949,6 +1000,10 @@ impl ConsumerOffsetsWire {
                     PRODUCER_ENTRY_PREFIX_LEN + entry.batches().len() * PRODUCER_BATCH_LEN
                 })
                 .sum::<usize>()
+            + self
+                .machines
+                .as_ref()
+                .map_or(0, |machines| size_of::<u32>() + machines.encoded_size())
             + size_of::<u64>()
             + size_of::<u64>()
     }
@@ -1154,7 +1209,8 @@ pub enum ConsumerOffsetsWireError {
     UnsupportedVersion {
         version: u8,
     },
-    /// Bytes remained after this version's field set: a newer encoder.
+    /// Bytes remained after this version's last section, the optional
+    /// state-machine snapshot: a newer encoder.
     TrailingBytes {
         extra: usize,
     },
@@ -1185,6 +1241,8 @@ pub enum ConsumerOffsetsWireError {
     /// A producer entry is out of order, above a field maximum, or keeps no
     /// batch or too many.
     InvalidProducer,
+    /// The state-machine snapshot is malformed or oversized.
+    InvalidStateMachines(SnapshotDecodeError),
 }
 
 impl From<Truncated> for ConsumerOffsetsWireError {
@@ -1255,6 +1313,12 @@ impl fmt::Display for ConsumerOffsetsWireError {
             Self::InvalidProducer => {
                 write!(f, "invalid producer entry in consumer-offsets artifact")
             }
+            Self::InvalidStateMachines(source) => {
+                write!(
+                    f,
+                    "invalid state machine snapshot in consumer-offsets artifact: {source}"
+                )
+            }
         }
     }
 }
@@ -1270,911 +1334,6 @@ const fn validate_consumer_offset_transfer_count(
         return Ok(());
     }
     Err(PartitionTransferUnavailable::ConsumerOffsetsTooLarge { kind, count, max })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
-
-    #[test]
-    fn given_a_prefix_read_that_stops_without_a_result_should_land_an_error_and_wake() {
-        let result = Rc::new(RefCell::new(None));
-        let woken = Rc::new(Cell::new(false));
-        let io = Rc::new(PartitionIoQuiescence::default());
-        assert!(io.begin_local_work());
-        let landing = Landing {
-            io: Rc::clone(&io),
-            result: Rc::clone(&result),
-            wake: {
-                let woken = Rc::clone(&woken);
-                move || woken.set(true)
-            },
-            stopped: prefix_read_stopped,
-        };
-
-        drop(landing);
-
-        assert!(
-            matches!(result.borrow().as_ref(), Some(Err(_))),
-            "the pull must see a failed read and fetch the whole artifact"
-        );
-        assert!(woken.get(), "the partition must resume the pull");
-        assert!(
-            io.is_interrupted(),
-            "teardown must keep interrupted I/O fenced"
-        );
-    }
-
-    #[test]
-    fn given_segment_read_error_when_classifying_should_tell_local_faults_from_stale_offers() {
-        const EIO: i32 = 5;
-
-        assert!(matches!(
-            SegmentLoadError::classify(std::io::Error::from_raw_os_error(EIO)),
-            SegmentLoadError::LocalFault(_)
-        ));
-        assert!(matches!(
-            SegmentLoadError::classify(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-            SegmentLoadError::LocalFault(_)
-        ));
-        assert!(matches!(
-            SegmentLoadError::classify(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-            SegmentLoadError::Stale(_)
-        ));
-    }
-
-    #[compio::test]
-    async fn given_segment_read_error_when_loading_artifact_should_classify_the_os_error() {
-        // The open succeeds on a directory, and the read then fails with EISDIR.
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let entry = consensus::StateArtifact {
-            kind: artifact_kind::SEGMENT_LOG,
-            frontier: 0,
-            len: 1,
-            checksum: 0,
-        };
-
-        let error =
-            load_verified_segment_artifact(directory.path().to_str().expect("UTF-8 path"), &entry)
-                .await
-                .expect_err("a directory holds no segment bytes");
-
-        assert!(
-            matches!(&error, SegmentLoadError::Stale(source) if source.raw_os_error().is_some()),
-            "the read error must reach the classification with its OS code, got {error:?}"
-        );
-    }
-
-    #[compio::test]
-    async fn given_transient_offset_io_failure_when_retried_should_succeed_without_exhausting_budget()
-     {
-        let attempts = std::cell::Cell::new(0);
-        let result = retry_offset_mutation(|| {
-            attempts.set(attempts.get() + 1);
-            std::future::ready(if attempts.get() == 1 { Err(()) } else { Ok(7) })
-        })
-        .await;
-        assert_eq!(result, Ok(7));
-        assert_eq!(attempts.get(), 2);
-    }
-
-    #[compio::test]
-    async fn given_persistent_offset_io_failure_when_retried_should_stop_at_attempt_limit() {
-        let attempts = std::cell::Cell::new(0);
-        let result = retry_offset_mutation(|| {
-            attempts.set(attempts.get() + 1);
-            std::future::ready(Err::<(), _>(7))
-        })
-        .await;
-        assert_eq!(result, Err(7));
-        assert_eq!(attempts.get(), OFFSET_IO_ATTEMPTS);
-    }
-
-    fn table() -> ConsumerOffsetsWire {
-        ConsumerOffsetsWire {
-            owner_retirement: None,
-            owners: Vec::new(),
-            history_transition: None,
-            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 0,
-            prepare_checksum: None,
-            checkpoint_prepare: Vec::new(),
-            next_offset: 43,
-            emptied_at: 0,
-            consumers: vec![(1, 10), (7, 42)],
-            groups: vec![(2, 5)],
-            external_groups: Vec::new(),
-            dedup: vec![
-                dedup_entry(11, 4, 90),
-                dedup_entry(usize::MAX as u128 + 5, 9, 91),
-            ],
-            retirement_paid_through: 0,
-            producers: Vec::new(),
-        }
-    }
-
-    /// A producer entry with `(first_sequence, last_sequence, base_offset)`
-    /// batches, oldest first.
-    fn producer_entry(producer_id: u64, batches: &[(u32, u32, u64)]) -> (u64, ProducerEntry) {
-        let batches: Vec<ProducerBatch> = batches
-            .iter()
-            .map(
-                |&(first_sequence, last_sequence, base_offset)| ProducerBatch {
-                    first_sequence,
-                    last_sequence,
-                    base_offset,
-                },
-            )
-            .collect();
-        (
-            producer_id,
-            ProducerEntry::restored(3, 1_000, &batches).expect("at most the retained batches"),
-        )
-    }
-
-    #[test]
-    fn given_producers_when_encoded_should_round_trip() {
-        let wire = ConsumerOffsetsWire {
-            producers: vec![
-                producer_entry(4, &[(0, 2, 10)]),
-                producer_entry(9, &[(0, 0, 11), (1, 4, 12)]),
-            ],
-            ..table()
-        };
-
-        assert_eq!(ConsumerOffsetsWire::decode(&wire.encode()), Ok(wire));
-    }
-
-    #[test]
-    fn given_a_malformed_producer_entry_when_decoded_should_reject_it() {
-        let one = [(0, 0, 1)];
-        let mut epoch_over_max = producer_entry(1, &one);
-        epoch_over_max.1.epoch = BatchProducer::EPOCH_MAX + 1;
-        let cases = [
-            vec![producer_entry(2, &one), producer_entry(2, &one)],
-            vec![producer_entry(3, &one), producer_entry(2, &one)],
-            vec![producer_entry(1, &[])],
-            vec![producer_entry(BatchProducer::PRODUCER_ID_MAX + 1, &one)],
-            vec![epoch_over_max],
-            vec![producer_entry(
-                1,
-                &[(BatchProducer::SEQUENCE_MAX + 1, 0, 1)],
-            )],
-        ];
-        for producers in cases {
-            let wire = ConsumerOffsetsWire {
-                producers: producers.clone(),
-                ..table()
-            };
-            assert_eq!(
-                ConsumerOffsetsWire::decode(&wire.encode()),
-                Err(ConsumerOffsetsWireError::InvalidProducer),
-                "{producers:?}"
-            );
-        }
-    }
-
-    /// A writer with a wider window stores more batches, and the decoder keeps
-    /// the newest.
-    #[test]
-    fn given_more_batches_than_the_window_when_decoded_should_keep_the_newest() {
-        let newest: Vec<(u32, u32, u64)> = (1..=PRODUCER_BATCHES_RETAINED)
-            .map(|batch| {
-                let sequence = u32::try_from(batch).unwrap();
-                (sequence, sequence, u64::from(sequence))
-            })
-            .collect();
-        let kept = ConsumerOffsetsWire {
-            producers: vec![producer_entry(1, &newest)],
-            ..table()
-        };
-        let encoded = kept.encode();
-        // An entry cannot hold one batch more, so the older batch goes in on the wire.
-        let content_len = encoded.len() - size_of::<u64>();
-        let batches_at = content_len - PRODUCER_BATCHES_RETAINED * PRODUCER_BATCH_LEN;
-        let mut wider = encoded[..batches_at].to_vec();
-        wider[batches_at - 1] += 1;
-        wider.extend_from_slice(&[0; PRODUCER_BATCH_LEN]);
-        wider.extend_from_slice(&encoded[batches_at..content_len]);
-        let trailer = state_artifact_checksum(&wider);
-        wider.extend_from_slice(&trailer.to_le_bytes());
-
-        assert_eq!(ConsumerOffsetsWire::decode(&wider), Ok(kept));
-    }
-
-    /// Version 8 ends at the paid-through op, and its builds kept no
-    /// producers.
-    #[test]
-    fn given_version_8_offsets_artifact_when_decoded_should_read_no_producers() {
-        const RELEASED_VERSION: u8 = 8;
-        let paid = ConsumerOffsetsWire {
-            retirement_paid_through: 9,
-            ..table()
-        };
-        let encoded = paid.encode();
-        let content_end = encoded.len() - size_of::<u64>() - size_of::<u32>();
-        let mut released = encoded[..content_end].to_vec();
-        released[CONSUMER_OFFSETS_MAGIC.len()] = RELEASED_VERSION;
-        let trailer = state_artifact_checksum(&released);
-        released.extend_from_slice(&trailer.to_le_bytes());
-
-        assert_eq!(ConsumerOffsetsWire::decode(&released), Ok(paid));
-    }
-
-    fn dedup_entry(client: u128, watermark: u64, latest_commit: u64) -> DedupWatermark {
-        let header = ReplyHeader {
-            command: iggy_binary_protocol::Command::Reply,
-            operation: Operation::StoreConsumerOffset,
-            client,
-            request: watermark,
-            commit: latest_commit,
-            size: u32::try_from(size_of::<ReplyHeader>()).unwrap(),
-            ..Default::default()
-        };
-        DedupWatermark {
-            session: 1,
-            reply: bytemuck::bytes_of(&header).to_vec(),
-            client,
-            user_id: 1,
-            watermark,
-            latest_commit,
-            committed_window: 0b1011,
-        }
-    }
-
-    #[test]
-    fn given_zero_frontier_transfer_when_capacity_is_uncommitted_should_keep_local_limit() {
-        const LOCAL_CAPACITY: usize = 2;
-        const FIRST_COMMITTED_CAPACITY: usize = 3;
-        let wire = ConsumerOffsetsWire {
-            dedup_capacity: 0,
-            ..Default::default()
-        };
-        let decoded = ConsumerOffsetsWire::decode(&wire.encode()).unwrap();
-        let mut restored = checked_retry_table(&decoded, 0, LOCAL_CAPACITY).unwrap();
-        assert!(!restored.capacity_committed());
-        assert_eq!(restored.capacity(), LOCAL_CAPACITY);
-        restored.commit_capacity(FIRST_COMMITTED_CAPACITY).unwrap();
-        assert_eq!(restored.capacity(), FIRST_COMMITTED_CAPACITY);
-        assert!(checked_retry_table(&decoded, 1, LOCAL_CAPACITY).is_err());
-        let with_receipt = ConsumerOffsetsWire {
-            owner_retirement: None,
-            dedup: vec![dedup_entry(1, 1, 1)],
-            ..wire
-        };
-        assert!(ConsumerOffsetsWire::decode(&with_receipt.encode()).is_err());
-    }
-
-    #[test]
-    fn given_offset_table_when_encoded_should_round_trip() {
-        let encoded = table().encode();
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&encoded).expect("round trip"),
-            table()
-        );
-    }
-
-    #[test]
-    fn given_history_and_owner_evidence_when_restored_should_validate_order_and_identity() {
-        const INCARNATION: u64 = 7;
-        let mut wire = table();
-        wire.required_metadata_frontier = 13;
-        wire.history_transition = Some(InstalledPartitionHistory {
-            transition: TransitionPartitionHistoryRequest {
-                incarnation: INCARNATION,
-                metadata_op: 12,
-            },
-            partition_op: 6,
-        });
-        wire.owners.push(InstalledConsumerGroupOwner {
-            installation: InstallConsumerGroupOwnerRequest {
-                incarnation: INCARNATION,
-                group_id: 2,
-                owner: iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner {
-                    client_id: 11,
-                    session: 4,
-                    generation: 9,
-                },
-                metadata_op: 13,
-            },
-            partition_op: 5,
-        });
-        wire.owner_retirement = Some(
-            iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest {
-                incarnation: INCARNATION,
-                metadata_op: 13,
-                next_group_id: 4,
-                live_group_ids: vec![2],
-            },
-        );
-        let restored = ConsumerOffsetsWire::decode(&wire.encode()).unwrap();
-        assert_eq!(wire, restored);
-        assert!(restored.validate_owners(INCARNATION, 91).is_ok());
-        assert_eq!(
-            restored.validate_owners(INCARNATION + 1, 91),
-            Err(ConsumerOffsetsWireError::InvalidOwnership)
-        );
-        assert_eq!(
-            restored.validate_owners(INCARNATION, 5),
-            Err(ConsumerOffsetsWireError::InvalidOwnership)
-        );
-
-        let mut invalid = wire.clone();
-        invalid
-            .owner_retirement
-            .as_mut()
-            .unwrap()
-            .live_group_ids
-            .clear();
-        assert_eq!(
-            invalid.validate_owners(INCARNATION, 91),
-            Err(ConsumerOffsetsWireError::InvalidOwnership)
-        );
-        invalid = wire.clone();
-        invalid.owner_retirement.as_mut().unwrap().metadata_op += 1;
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&invalid.encode()),
-            Err(ConsumerOffsetsWireError::InvalidOwnership)
-        );
-        // The delete fence is terminal, so no owner shares or follows its op.
-        for partition_op in [6, 7] {
-            invalid = wire.clone();
-            invalid.owners[0].partition_op = partition_op;
-            assert_eq!(
-                invalid.validate_owners(INCARNATION, 91),
-                Err(ConsumerOffsetsWireError::InvalidOwnership)
-            );
-        }
-        invalid = wire.clone();
-        invalid.owners[0].installation.incarnation += 1;
-        assert_eq!(
-            invalid.validate_owners(INCARNATION, 91),
-            Err(ConsumerOffsetsWireError::InvalidOwnership)
-        );
-        invalid = wire.clone();
-        invalid.owners.push(invalid.owners[0]);
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&invalid.encode()),
-            Err(ConsumerOffsetsWireError::InvalidOwnership)
-        );
-        invalid = wire;
-        invalid.required_metadata_frontier = 11;
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&invalid.encode()),
-            Err(ConsumerOffsetsWireError::InvalidOwnership)
-        );
-    }
-
-    #[test]
-    fn transferred_prepare_checksum_is_covered_by_the_artifact() {
-        let mut table = table();
-        table.prepare_checksum = Some(u128::MAX - 7);
-        let bytes = table.encode();
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&bytes)
-                .unwrap()
-                .prepare_checksum,
-            table.prepare_checksum
-        );
-        let mut corrupt = bytes;
-        let position = corrupt.len() - 9;
-        corrupt[position] ^= 1;
-        assert!(matches!(
-            ConsumerOffsetsWire::decode(&corrupt),
-            Err(ConsumerOffsetsWireError::ChecksumMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn given_empty_table_when_encoded_should_round_trip() {
-        let empty = ConsumerOffsetsWire {
-            owner_retirement: None,
-            owners: Vec::new(),
-            history_transition: None,
-            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 0,
-            prepare_checksum: None,
-            checkpoint_prepare: Vec::new(),
-            next_offset: 0,
-            emptied_at: 0,
-            consumers: Vec::new(),
-            groups: Vec::new(),
-            external_groups: Vec::new(),
-            dedup: Vec::new(),
-            retirement_paid_through: 0,
-            producers: Vec::new(),
-        };
-        let encoded = empty.encode();
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&encoded).expect("round trip"),
-            empty
-        );
-    }
-
-    #[test]
-    fn given_emptied_table_when_encoded_should_round_trip_the_emptied_op() {
-        let emptied = ConsumerOffsetsWire {
-            emptied_at: 9,
-            consumers: Vec::new(),
-            groups: Vec::new(),
-            ..table()
-        };
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&emptied.encode()).expect("round trip"),
-            emptied
-        );
-    }
-
-    /// Version 7 had no emptied-at op after the next offset. Read in place, its
-    /// later fields would land one word early.
-    #[test]
-    fn given_version_7_offsets_artifact_when_decoded_should_reject_it() {
-        const RELEASED_VERSION: u8 = 7;
-        const EMPTIED_AT_START: usize =
-            CONSUMER_OFFSETS_MAGIC.len() + size_of::<u8>() + size_of::<u64>();
-        let encoded = table().encode();
-        let mut released = encoded[..encoded.len() - size_of::<u64>()].to_vec();
-        released.drain(EMPTIED_AT_START..EMPTIED_AT_START + size_of::<u64>());
-        released[CONSUMER_OFFSETS_MAGIC.len()] = RELEASED_VERSION;
-        let trailer = state_artifact_checksum(&released);
-        released.extend_from_slice(&trailer.to_le_bytes());
-
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&released),
-            Err(ConsumerOffsetsWireError::UnsupportedVersion {
-                version: RELEASED_VERSION
-            })
-        );
-    }
-
-    #[test]
-    fn given_flipped_bit_when_decoded_should_reject_checksum() {
-        let mut encoded = table().encode();
-        encoded[6] ^= 1;
-        assert!(matches!(
-            ConsumerOffsetsWire::decode(&encoded),
-            Err(ConsumerOffsetsWireError::ChecksumMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn given_truncated_bytes_when_decoded_should_reject() {
-        let encoded = table().encode();
-        for len in 0..encoded.len() {
-            assert!(
-                ConsumerOffsetsWire::decode(&encoded[..len]).is_err(),
-                "strict prefix of {len} bytes must fail closed"
-            );
-        }
-    }
-
-    #[test]
-    fn given_unknown_version_when_decoded_should_reject() {
-        for version in [
-            CONSUMER_OFFSETS_VERSION_MIN - 1,
-            CONSUMER_OFFSETS_VERSION + 1,
-        ] {
-            let mut wrong = table().encode();
-            wrong[CONSUMER_OFFSETS_MAGIC.len()] = version;
-            let content_len = wrong.len() - size_of::<u64>();
-            let trailer = state_artifact_checksum(&wrong[..content_len]);
-            wrong[content_len..].copy_from_slice(&trailer.to_le_bytes());
-            assert_eq!(
-                ConsumerOffsetsWire::decode(&wrong),
-                Err(ConsumerOffsetsWireError::UnsupportedVersion { version })
-            );
-        }
-    }
-
-    #[test]
-    fn given_entry_in_every_section_when_encoded_should_match_the_version_pins() {
-        // Nothing else fails when a layout changes and its version bump is
-        // forgotten, and a peer on another release then reads the artifact out
-        // of place. One entry per section makes each length cover the header,
-        // every count field and every entry stride. Changing a length is the
-        // reminder to change its version.
-        const WITHOUT_EXTERNAL_LEN: usize = 602;
-        const WITH_EXTERNAL_LEN: usize = 614;
-
-        const INCARNATION: u64 = 1;
-        let with_external = ConsumerOffsetsWire {
-            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 3,
-            prepare_checksum: Some(1),
-            checkpoint_prepare: Vec::new(),
-            next_offset: 0,
-            emptied_at: 0,
-            consumers: vec![(1, 0)],
-            groups: vec![(1, 0)],
-            external_groups: vec![(1, 0)],
-            dedup: vec![dedup_entry(1, 0, 0)],
-            owners: vec![InstalledConsumerGroupOwner {
-                installation: InstallConsumerGroupOwnerRequest {
-                    incarnation: INCARNATION,
-                    group_id: 1,
-                    owner: ConsumerGroupOwner {
-                        client_id: 1,
-                        session: 1,
-                        generation: 1,
-                    },
-                    metadata_op: 2,
-                },
-                partition_op: 1,
-            }],
-            history_transition: Some(InstalledPartitionHistory {
-                transition: TransitionPartitionHistoryRequest {
-                    incarnation: INCARNATION,
-                    metadata_op: 3,
-                },
-                partition_op: 2,
-            }),
-            owner_retirement: Some(RetireConsumerGroupOwnersRequest {
-                incarnation: INCARNATION,
-                metadata_op: 3,
-                next_group_id: 2,
-                live_group_ids: vec![1],
-            }),
-            retirement_paid_through: 0,
-            producers: vec![producer_entry(1, &[(0, 2, 7)])],
-        };
-        let without_external = ConsumerOffsetsWire {
-            external_groups: Vec::new(),
-            ..with_external.clone()
-        };
-
-        for (wire, len) in [
-            (&without_external, WITHOUT_EXTERNAL_LEN),
-            (&with_external, WITH_EXTERNAL_LEN),
-        ] {
-            let encoded = wire.encode();
-            assert_eq!(
-                (encoded[CONSUMER_OFFSETS_MAGIC.len()], encoded.len()),
-                (CONSUMER_OFFSETS_VERSION, len),
-                "a consumer-offsets layout changed; bump its version with it"
-            );
-        }
-        assert_eq!(
-            CONSUMER_OFFSETS_VERSION, 9,
-            "a consumer-offsets version moved; confirm its layout moved with it"
-        );
-    }
-
-    /// Legacy artifacts omit session-qualified receipts and cannot restore retry protection.
-    #[test]
-    fn given_server_0_9_0_artifact_when_decoded_should_reject() {
-        let wire = ConsumerOffsetsWire {
-            prepare_checksum: Some(u128::MAX - 7),
-            checkpoint_prepare: vec![1, 2, 3],
-            ..table()
-        };
-        let mut released = Vec::new();
-        released.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
-        released.push(1);
-        // 0.9.0 wrote its purge generation here.
-        released.extend_from_slice(&0u64.to_le_bytes());
-        released.extend_from_slice(&wire.next_offset.to_le_bytes());
-        for count in [wire.consumers.len(), wire.groups.len(), wire.dedup.len()] {
-            released.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
-        }
-        for (id, offset) in wire.consumers.iter().chain(&wire.groups) {
-            released.extend_from_slice(&id.to_le_bytes());
-            released.extend_from_slice(&offset.to_le_bytes());
-        }
-        for entry in &wire.dedup {
-            released.extend_from_slice(&entry.client.to_le_bytes());
-            released.extend_from_slice(&entry.watermark.to_le_bytes());
-            released.extend_from_slice(&entry.latest_commit.to_le_bytes());
-            released.extend_from_slice(&entry.user_id.to_le_bytes());
-            released.extend_from_slice(&entry.committed_window.to_le_bytes());
-        }
-        released.push(1);
-        released.extend_from_slice(&wire.prepare_checksum.unwrap().to_le_bytes());
-        released.extend_from_slice(
-            &u32::try_from(wire.checkpoint_prepare.len())
-                .unwrap()
-                .to_le_bytes(),
-        );
-        released.extend_from_slice(&wire.checkpoint_prepare);
-        let trailer = state_artifact_checksum(&released);
-        released.extend_from_slice(&trailer.to_le_bytes());
-
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&released),
-            Err(ConsumerOffsetsWireError::UnsupportedVersion { version: 1 })
-        );
-    }
-
-    #[test]
-    fn given_external_groups_when_encoded_should_round_trip() {
-        let wire = ConsumerOffsetsWire {
-            external_groups: vec![(2, 0), (9, 1 << 40)],
-            ..table()
-        };
-
-        assert_eq!(ConsumerOffsetsWire::decode(&wire.encode()), Ok(wire));
-    }
-
-    #[test]
-    fn given_foreign_magic_when_decoded_should_reject() {
-        let mut wrong = table().encode();
-        // Rewrite the magic and re-seal so only the magic check can fire.
-        wrong[0] = b'X';
-        let content_len = wrong.len() - size_of::<u64>();
-        let trailer = state_artifact_checksum(&wrong[..content_len]);
-        wrong[content_len..].copy_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&wrong),
-            Err(ConsumerOffsetsWireError::BadMagic)
-        );
-    }
-
-    #[test]
-    fn given_unordered_dedup_clients_when_decoded_should_reject() {
-        let unordered = ConsumerOffsetsWire {
-            owner_retirement: None,
-            owners: Vec::new(),
-            history_transition: None,
-            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 0,
-            prepare_checksum: None,
-            checkpoint_prepare: Vec::new(),
-            next_offset: 0,
-            emptied_at: 0,
-            consumers: Vec::new(),
-            groups: Vec::new(),
-            external_groups: Vec::new(),
-            dedup: vec![dedup_entry(9, 1, 1), dedup_entry(4, 2, 2)],
-            retirement_paid_through: 0,
-            producers: Vec::new(),
-        };
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&unordered.encode()),
-            Err(ConsumerOffsetsWireError::NonAscendingClient { client: 4 })
-        );
-    }
-
-    #[test]
-    fn given_reserved_client_in_dedup_when_decoded_should_reject() {
-        let reserved = ConsumerOffsetsWire {
-            owner_retirement: None,
-            owners: Vec::new(),
-            history_transition: None,
-            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 0,
-            prepare_checksum: None,
-            checkpoint_prepare: Vec::new(),
-            next_offset: 0,
-            emptied_at: 0,
-            consumers: Vec::new(),
-            groups: Vec::new(),
-            external_groups: Vec::new(),
-            dedup: vec![dedup_entry(0, 1, 1), dedup_entry(4, 2, 2)],
-            retirement_paid_through: 0,
-            producers: Vec::new(),
-        };
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&reserved.encode()),
-            Err(ConsumerOffsetsWireError::ReservedClient)
-        );
-    }
-
-    #[test]
-    fn given_unknown_artifact_formats_when_decoded_should_reject() {
-        for magic in [b"BAD1", b"ICO9"] {
-            let mut bytes = table().encode();
-            bytes[..4].copy_from_slice(magic);
-            let length = bytes.len() - 8;
-            let checksum = state_artifact_checksum(&bytes[..length]);
-            bytes[length..].copy_from_slice(&checksum.to_le_bytes());
-            assert_eq!(
-                ConsumerOffsetsWire::decode(&bytes),
-                Err(ConsumerOffsetsWireError::BadMagic)
-            );
-        }
-    }
-
-    #[test]
-    fn given_dedup_count_past_ceiling_when_decoded_should_reject_before_allocating() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
-        bytes.push(CONSUMER_OFFSETS_VERSION);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
-        let trailer = state_artifact_checksum(&bytes);
-        bytes.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&bytes),
-            Err(ConsumerOffsetsWireError::TooManyEntries {
-                section: "dedup",
-                count: CONSUMER_OFFSETS_ENTRIES_MAX + 1,
-                max: u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap(),
-            })
-        );
-    }
-
-    #[test]
-    fn given_dedup_count_exceeding_bytes_when_decoded_should_reject_as_truncated() {
-        // Under the ceiling but past the bytes present: the stride guard is
-        // what stops a ~30 byte artifact reserving megabytes.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
-        bytes.push(CONSUMER_OFFSETS_VERSION);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&1_000u32.to_le_bytes());
-        let trailer = state_artifact_checksum(&bytes);
-        bytes.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&bytes),
-            Err(ConsumerOffsetsWireError::Truncated)
-        );
-    }
-
-    #[test]
-    fn given_count_past_ceiling_when_decoded_should_reject_before_allocating() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
-        bytes.push(CONSUMER_OFFSETS_VERSION);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
-        bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        let trailer = state_artifact_checksum(&bytes);
-        bytes.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&bytes),
-            Err(ConsumerOffsetsWireError::TooManyEntries {
-                section: "consumers",
-                count: CONSUMER_OFFSETS_ENTRIES_MAX + 1,
-                max: CONSUMER_OFFSETS_ENTRIES_MAX,
-            })
-        );
-    }
-
-    #[test]
-    fn given_owner_count_past_ceiling_when_decoded_should_reject_before_allocating() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
-        bytes.push(CONSUMER_OFFSETS_VERSION);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&(u32::try_from(CLIENTS_TABLE_SLOT_MAX).unwrap()).to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
-        let trailer = state_artifact_checksum(&bytes);
-        bytes.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&bytes),
-            Err(ConsumerOffsetsWireError::TooManyEntries {
-                section: "owners",
-                count: CONSUMER_OFFSETS_ENTRIES_MAX + 1,
-                max: CONSUMER_OFFSETS_ENTRIES_MAX,
-            })
-        );
-    }
-
-    #[test]
-    fn given_duplicate_or_unordered_ids_when_decoded_should_reject() {
-        let duplicate = ConsumerOffsetsWire {
-            owner_retirement: None,
-            owners: Vec::new(),
-            history_transition: None,
-            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 0,
-            prepare_checksum: None,
-            checkpoint_prepare: Vec::new(),
-            next_offset: 0,
-            emptied_at: 0,
-            consumers: vec![(5, 1), (5, 2)],
-            groups: Vec::new(),
-            external_groups: Vec::new(),
-            dedup: Vec::new(),
-            retirement_paid_through: 0,
-            producers: Vec::new(),
-        };
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&duplicate.encode()),
-            Err(ConsumerOffsetsWireError::NonAscendingId {
-                section: "consumers",
-                id: 5,
-            })
-        );
-        let unordered = ConsumerOffsetsWire {
-            owner_retirement: None,
-            owners: Vec::new(),
-            history_transition: None,
-            dedup_capacity: consensus::CLIENTS_TABLE_MAX,
-            required_metadata_frontier: 0,
-            prepare_checksum: None,
-            checkpoint_prepare: Vec::new(),
-            next_offset: 0,
-            emptied_at: 0,
-            consumers: Vec::new(),
-            groups: vec![(9, 1), (4, 2)],
-            external_groups: Vec::new(),
-            dedup: Vec::new(),
-            retirement_paid_through: 0,
-            producers: Vec::new(),
-        };
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&unordered.encode()),
-            Err(ConsumerOffsetsWireError::NonAscendingId {
-                section: "groups",
-                id: 4,
-            })
-        );
-    }
-
-    #[test]
-    fn given_trailing_bytes_when_decoded_should_reject() {
-        let mut padded = table().encode();
-        let content_len = padded.len() - size_of::<u64>();
-        padded.truncate(content_len);
-        padded.push(0);
-        let trailer = state_artifact_checksum(&padded);
-        padded.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(
-            ConsumerOffsetsWire::decode(&padded),
-            Err(ConsumerOffsetsWireError::TrailingBytes { extra: 1 }),
-            "bytes past the last section must fail closed"
-        );
-    }
-
-    #[test]
-    fn given_an_artifact_without_paid_through_when_decoded_should_read_it_as_zero() {
-        let paid = ConsumerOffsetsWire {
-            retirement_paid_through: 9,
-            ..table()
-        };
-        let encoded = paid.encode();
-        assert_eq!(ConsumerOffsetsWire::decode(&encoded), Ok(paid));
-        // Version 8 builds from before retirement debt end at the prepare.
-        let content_end = encoded.len() - 2 * size_of::<u64>() - size_of::<u32>();
-        let mut legacy = encoded[..content_end].to_vec();
-        legacy[CONSUMER_OFFSETS_MAGIC.len()] = 8;
-        let trailer = state_artifact_checksum(&legacy);
-        legacy.extend_from_slice(&trailer.to_le_bytes());
-        assert_eq!(ConsumerOffsetsWire::decode(&legacy), Ok(table()));
-    }
-
-    #[test]
-    fn given_offset_count_above_transfer_ceiling_when_validated_should_reject() {
-        assert!(validate_consumer_offset_transfer_count(ConsumerKind::Consumer, 4, 4).is_ok());
-        assert!(matches!(
-            validate_consumer_offset_transfer_count(ConsumerKind::ConsumerGroup, 5, 4),
-            Err(PartitionTransferUnavailable::ConsumerOffsetsTooLarge {
-                kind: ConsumerKind::ConsumerGroup,
-                count: 5,
-                max: 4,
-            })
-        ));
-        let error = validate_consumer_offset_transfer_count(ConsumerKind::Consumer, 5, 4)
-            .expect_err("count above ceiling");
-        assert!(
-            !error.transient(),
-            "an artifact that cannot fit the decoder will not heal by retrying"
-        );
-    }
 }
 
 /// What a full validation walk over one segment payload derived.
@@ -2526,7 +1685,9 @@ pub enum PartitionTransferUnavailable {
     },
     /// Primary-by-index of a group that has committed nothing: an empty group
     /// is trivially "caught up", so this is the only thing separating a real
-    /// primary from a view-0 phantom whose directory vanished.
+    /// primary from a view-0 phantom whose directory vanished. The primary of
+    /// a group of two that holds nothing serves instead, because this refusal
+    /// would never end there.
     NothingCommitted,
     /// More retained segments than the manifest can carry entries for.
     ManifestTooLarge {
@@ -2556,6 +1717,8 @@ pub enum PartitionTransferUnavailable {
         start_offset: u64,
         source: std::io::Error,
     },
+    /// The machines' snapshot is past the size a receiver accepts.
+    StateMachines(StateMachineError),
 }
 
 impl PartitionTransferUnavailable {
@@ -2581,7 +1744,8 @@ impl PartitionTransferUnavailable {
             | Self::ConsumerOffsetStateInconsistent { .. }
             | Self::ManifestTooLarge { .. }
             | Self::FlushFailed(_)
-            | Self::SegmentUnreadable { .. } => false,
+            | Self::SegmentUnreadable { .. }
+            | Self::StateMachines(_) => false,
         }
     }
 
@@ -2635,6 +1799,9 @@ impl fmt::Display for PartitionTransferUnavailable {
                 start_offset,
                 source,
             } => write!(f, "segment {start_offset:0>20}.log is unreadable: {source}"),
+            Self::StateMachines(source) => {
+                write!(f, "cannot offer the state machines: {source}")
+            }
         }
     }
 }
@@ -2671,9 +1838,10 @@ pub enum PartitionInstallError {
         commit_op: u64,
         commit_min: u64,
     },
-    /// The install wipes the journal, which holds an op above `commit_op` that
-    /// this replica may have acknowledged: one at or below `held_max`, its
-    /// accepted WAL head, or the known commit without a WAL.
+    /// The install wipes the journal and resets the WAL, which hold an op above
+    /// `commit_op` that this replica may have acknowledged: one at or below
+    /// `held_max`, its accepted WAL head, the known commit without a WAL, or
+    /// the commit point the WAL names when boot skipped its replay.
     OfferErasesHeldOps {
         commit_op: u64,
         held_max: u64,
@@ -2710,6 +1878,9 @@ pub enum PartitionInstallError {
         source: iggy_common::IggyError,
     },
     Offsets(ConsumerOffsetsWireError),
+    /// The offer's state machines are not this replica's: its snapshot is at
+    /// another op, or names a machine this replica does not register.
+    StateMachines(StateMachineError),
     RetryProtection(consensus::ClientTableWireError),
     /// Duplicate base offset in the staged set.
     DuplicateSegment {
@@ -2796,6 +1967,9 @@ impl fmt::Display for PartitionInstallError {
                 write!(f, "consumer offset persistence failed at {path}: {source}")
             }
             Self::Offsets(source) => write!(f, "consumer-offsets artifact rejected: {source}"),
+            Self::StateMachines(source) => {
+                write!(f, "transferred state machines rejected: {source}")
+            }
             Self::RetryProtection(source) => write!(f, "retry protection rejected: {source}"),
             Self::DuplicateSegment { start_offset } => {
                 write!(f, "duplicate staged segment at base offset {start_offset}")
@@ -3073,7 +2247,8 @@ fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
     )
 }
 
-/// Consumer-offset files written concurrently while installing a transfer.
+/// Consumer-offset files written concurrently while installing a transfer or
+/// clamping recovered offsets at boot.
 /// Each is an open + write + optional fsync, so the width trades reactor queue
 /// depth against how long one partition monopolises it; matches the tick's
 /// superblock pre-pass.
@@ -3448,23 +2623,48 @@ where
         if self.repair.is_some() {
             return Err(PartitionTransferUnavailable::RepairInProgress);
         }
-        // Primary-by-index at view 0 over an empty log passes every gate above
-        // yet knows nothing: a group whose directory is absent boots through
-        // `consensus.init()`, comes up Normal at view 0, and an empty group is
-        // trivially "caught up". Its offer would be zero segments at frontier
-        // 0, which makes a receiver holding real data unlink its own chain.
+        // A primary by index over an empty log passes every gate above yet can
+        // know nothing: a group whose directory is absent boots through
+        // `consensus.init()`, comes up Normal, and an empty group is trivially
+        // "caught up". Its offer would be zero segments at frontier 0, which
+        // tells a receiver holding real data to unlink its own chain.
         //
-        // A RESTARTED replica holding a full chain matches this shape too
-        // (`commit_max == 0` because the partition journal is memory-only,
-        // `installed_frontier == None` for a recovered non-empty chain). That
-        // is the load-bearing reason this refusal is safe rather than a
-        // wedge: every transfer-arm site presupposes a peer that already
-        // reported commit > 0 (repair floor refusals, StartView adoption), so
-        // nobody ever asks a cluster where everything still reports 0.
-        // Extending the gate with `recovered_durable_offset.is_some()` would
-        // be WRONG: such an offer carries `commit_op = 0`, so the receiver's
-        // floor becomes a no-op while its counter jumps to the frontier.
-        if self.consensus().commit_max() == 0 && self.installed_frontier.is_none() {
+        // A RESTARTED replica holding a full chain matches this shape too: WAL
+        // replay restores the commit point from the checkpoint and the commit
+        // numbers in its prepares, which can all be 0, and
+        // `installed_frontier` is `None` for a recovered chain. Its offer
+        // would carry `commit_op = 0`, so the receiver's floor becomes a no-op
+        // while its counter jumps to the frontier.
+        //
+        // In a group of three or more the other members commit without the
+        // requester, and the first commit ends the refusal. In a group of two
+        // the requester is the only other member and acknowledges nothing
+        // while it waits, so the refusal would never end. There the primary
+        // serves when it holds nothing applied and no consumer offset: the
+        // offer is its true state at op 0, and the prepares it journaled reach
+        // the receiver by replication or repair. The boot clamp removes each
+        // consumer and group offset from a log that holds nothing, so only an
+        // external group offset keeps such a primary from serving.
+        //
+        // A primary that lost its storage unnoticed looks the same, so the
+        // receiver's own refusals stay the guard for what it still holds: its
+        // sized segments, its stored consumer offsets and a WAL that names a
+        // commit. Its superblock record is no guard: a group that acks before
+        // it persists ignores the record, see `restore_offset_frontier`. A
+        // replica that itself waits for a transfer skipped its WAL replay and
+        // can read as empty while its WAL holds prepares, so it never serves.
+        let empty_group_of_two = || {
+            self.consensus().replica_count() == 2
+                && !self.materialization_missing
+                && self.held_offset_frontier() == 0
+                && ConsumerKind::ALL
+                    .into_iter()
+                    .all(|kind| self.durable_consumer_offsets.count(kind) == 0)
+        };
+        if self.consensus().commit_max() == 0
+            && self.installed_frontier.is_none()
+            && !empty_group_of_two()
+        {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
         if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
@@ -3901,6 +3101,9 @@ where
             owner_retirement: self.owner_retirement.clone(),
             retirement_paid_through: self.retirement_paid_through,
             producers: self.producer_entries(),
+            machines: self
+                .machines_snapshot_at(commit_op)
+                .map_err(PartitionTransferUnavailable::StateMachines)?,
         })
     }
 
@@ -4483,6 +3686,17 @@ where
             }
             InstallPhase::WalReset => {
                 if let Some(persistence) = &self.persistence {
+                    let wal_head = persistence.head();
+                    if wal_head > install.commit_op {
+                        tracing::warn!(
+                            namespace_raw = self.consensus().group(),
+                            commit_op = install.commit_op,
+                            wal_head,
+                            wal_commit = self.unreplayed_commit,
+                            "partition state transfer install resets a WAL that holds ops \
+                             above the offer"
+                        );
+                    }
                     let prepare =
                         (!install.offsets_wire.checkpoint_prepare.is_empty()).then(|| {
                             Owned::<4096>::copy_from_slice(&install.offsets_wire.checkpoint_prepare)
@@ -4930,7 +4144,12 @@ where
                 }
                 InstallFilePhase::CommitOffsets { start, end } => {
                     for write in &install.planned_offsets[start..end] {
-                        self.publish_transferred_offset(write);
+                        self.publish_persisted_offset(
+                            write.kind,
+                            write.id,
+                            write.value,
+                            write.path.clone(),
+                        );
                         install.offset_dirs_changed[write.kind.index()] = true;
                     }
                     InstallPhase::CommitOffsets(end)
@@ -5135,33 +4354,53 @@ where
         }
     }
 
-    fn publish_transferred_offset(&self, write: &PlannedOffsetWrite) {
-        let entry = ConsumerOffset::new(write.kind, write.id, write.value, write.path.clone());
-        match write.kind {
+    /// Publish an offset whose file at `path` already holds `value`. An install
+    /// and the boot clamp both end a file write with it.
+    pub(crate) fn publish_persisted_offset(
+        &self,
+        kind: ConsumerKind,
+        id: u32,
+        value: u64,
+        path: String,
+    ) {
+        let entry = ConsumerOffset::new(kind, id, value, path);
+        match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().insert(write.id as usize, entry);
+                self.consumer_offsets.pin().insert(id as usize, entry);
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
                     .pin()
-                    .insert(ConsumerGroupId(write.id as usize), entry);
+                    .insert(ConsumerGroupId(id as usize), entry);
             }
             // Recorded below: the durable table is the only store of an external offset.
             ConsumerKind::ExternalGroup => {}
         }
-        self.durable_consumer_offsets.record_explicit(
-            write.kind,
-            write.id,
-            write.value,
-            write.value,
-        );
-        self.consumer_offset_capacity_for(write.kind)
-            .clear_stranded(write.id);
+        self.durable_consumer_offsets
+            .record_explicit(kind, id, value, value);
+        self.consumer_offset_capacity_for(kind).clear_stranded(id);
     }
 
     fn publish_installed_state(&mut self, install: &mut PendingInstall) {
         if let Some(retry_table) = install.retry_table.take() {
             *self.dedup_mut() = retry_table;
+        }
+        // Checked before the install began, so only a machine that refuses a
+        // snapshot it produced fails here.
+        if let Err(error) =
+            self.restore_machines(install.offsets_wire.machines.as_ref(), install.commit_op)
+        {
+            tracing::error!(
+                namespace_raw = self.consensus().group(),
+                commit_op = install.commit_op,
+                %error,
+                "cannot install the transferred state machines"
+            );
+            self.fatal = Some(crate::types::FatalCommit {
+                namespace_raw: self.consensus().group(),
+                op: install.commit_op,
+                operation: None,
+            });
         }
         self.restore_producers(std::mem::take(&mut install.offsets_wire.producers));
         self.required_metadata_frontier = self
@@ -5325,8 +4564,24 @@ where
                 held_max,
             });
         }
+        // A replica that booted awaiting a transfer skipped its WAL replay, so
+        // the journal read above is empty while its WAL still holds ops. An
+        // offer at op 0 comes from a primary that holds nothing applied, and a
+        // commit number in that WAL proves the group committed an op that the
+        // offer would erase. Offers above op 0 pass: a commit number is a lower
+        // bound, so a primary holding every op can offer less than this WAL
+        // names, and in a group of two the refusal would never end, because a
+        // waiting replica acknowledges nothing.
+        if commit_op == 0 && self.unreplayed_commit > 0 {
+            return Err(PartitionInstallError::OfferErasesHeldOps {
+                commit_op,
+                held_max: self.unreplayed_commit,
+            });
+        }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
         offsets_wire.validate_owners(self.created_revision(), commit_op)?;
+        self.check_machines_snapshot(offsets_wire.machines.as_ref(), commit_op)
+            .map_err(PartitionInstallError::StateMachines)?;
         if self.history_deleted() && offsets_wire.history_transition != self.history_transition {
             return Err(ConsumerOffsetsWireError::InvalidOwnership.into());
         }
@@ -6268,6 +5523,9 @@ where
             owner_retirement: self.owner_retirement.clone(),
             retirement_paid_through: self.retirement_paid_through,
             producers: self.producer_entries(),
+            machines: self
+                .machines_snapshot_at(through_op)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
             ..Default::default()
         };
         Ok(retry_checkpoint_bytes(
@@ -6284,6 +5542,7 @@ where
     /// Returns an error for missing, corrupt, or incompatible retry protection.
     pub async fn restore_retry_checkpoint(&mut self, through_op: u64) -> std::io::Result<()> {
         if through_op == 0 {
+            self.state_machines.reset();
             if self.partition_dir.is_some()
                 && let Err(error) = self.reclaim_retry_checkpoints(through_op).await
             {
@@ -6343,6 +5602,8 @@ where
         wire.validate_owners(self.created_revision(), through_op)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let table = checked_retry_table(&wire, through_op, self.dedup().capacity())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.restore_machines(wire.machines.as_ref(), through_op)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         *self.dedup_mut() = table;
         self.restore_producers(wire.producers);
@@ -6426,6 +5687,7 @@ pub(crate) async fn reclaim_retry_checkpoint_files(
 /// to a live segment that the reuse scan linked. Writing through that name in
 /// place changes the live segment, so the old name goes first.
 async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()> {
+    let len = payload.len() as u64;
     remove_if_present(path).await?;
     let mut file = compio::fs::OpenOptions::new()
         .write(true)
@@ -6433,7 +5695,9 @@ async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()
         .open(path)
         .await
         .note_descriptor_exhaustion(|| format!("creating {}", path.display()))?;
+    let charge = DISK_USAGE.charge(len);
     let (result, _) = file.write_all_at(payload, 0).await.into();
+    drop(charge);
     result?;
     file.sync_data().await?;
     Ok(())
@@ -6487,3 +5751,6 @@ async fn names_file_of(live: &compio::fs::Metadata, staged: &Path) -> bool {
 async fn names_file_of(_live: &compio::fs::Metadata, _staged: &Path) -> bool {
     false
 }
+
+#[cfg(test)]
+mod tests;

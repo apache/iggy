@@ -72,6 +72,7 @@ excludes = [
     "**/*.pem",
     "**/*.pfx",
     "**/*.json",
+    "core/bench/dashboard/fixtures/**/*.log",
     "**/*.svg",
     "**/go.mod",
     "**/go.sum",

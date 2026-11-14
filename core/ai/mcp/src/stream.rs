@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::{configs::IggyConfig, error::McpRuntimeError};
-use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
+use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilder};
 use std::path::PathBuf;
 use tracing::{error, info};
 
@@ -35,7 +35,7 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn resolve_token(token: &str) -> Result<String, McpRuntimeError> {
+pub(crate) fn resolve_token(token: &str) -> Result<String, McpRuntimeError> {
     if let Some(path) = token.strip_prefix(TOKEN_FILE_PREFIX) {
         let file_path = expand_home(path);
 
@@ -63,60 +63,50 @@ fn resolve_token(token: &str) -> Result<String, McpRuntimeError> {
 }
 
 pub async fn init(config: IggyConfig) -> Result<IggyClient, McpRuntimeError> {
-    let address = config.address;
-    let username = config.username;
-    let password = config.password;
-    let token = if config.token.is_empty() {
-        None
-    } else {
-        Some(resolve_token(&config.token)?)
-    };
+    let client = build_client(config)?;
+    client.connect().await?;
+    Ok(client)
+}
 
-    let connection_string = if let Some(token) = token {
-        let redacted_token = token.chars().take(3).collect::<String>();
-        info!("Using token: {redacted_token}*** for Iggy authentication");
-        format!("iggy://{token}@{address}")
-    } else {
-        info!("Using username and password for Iggy authentication");
-        if username.is_empty() {
+fn build_client(config: IggyConfig) -> Result<IggyClient, McpRuntimeError> {
+    let credentials = if config.token.is_empty() {
+        if config.username.is_empty() {
             error!("Iggy username cannot be empty (if token is not provided)");
             return Err(McpRuntimeError::MissingIggyCredentials);
         }
 
-        if password.is_empty() {
+        if config.password.is_empty() {
             error!("Iggy password cannot be empty (if token is not provided)");
             return Err(McpRuntimeError::MissingIggyCredentials);
         }
 
-        let redacted_username = username.chars().take(3).collect::<String>();
-        let redacted_password = password.chars().take(3).collect::<String>();
-        info!(
-            "Using username: {redacted_username}***, password: {redacted_password}*** for Iggy authentication"
-        );
-        format!("iggy://{username}:{password}@{address}")
+        info!("Using username and password for Iggy authentication");
+        Credentials::UsernamePassword(config.username, config.password.into())
+    } else {
+        let token = resolve_token(&config.token)?;
+        info!("Using a personal access token for Iggy authentication");
+        Credentials::PersonalAccessToken(token.into())
     };
 
-    let connection_string = if config.tls.enabled {
-        let ca_file = &config.tls.ca_file;
-        if ca_file.is_empty() {
+    // A connection string would split credentials or paths that hold `@`, `:`, `?` or `&`.
+    let mut client = IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address(config.address)
+        .with_auto_sign_in(AutoLogin::Enabled(credentials));
+    if config.tls.enabled {
+        if config.tls.ca_file.is_empty() {
             error!("TLS CA file must be provided when TLS is enabled.");
             return Err(McpRuntimeError::MissingTlsCertificateFile);
         }
-        let domain = config
-            .tls
-            .domain
-            .clone()
-            .filter(|domain| !domain.is_empty())
-            .map(|domain| format!("&tls_domain={domain}"))
-            .unwrap_or_default();
-        format!("{connection_string}?tls=true&tls_ca_file={ca_file}{domain}")
-    } else {
-        connection_string
-    };
+        client = client
+            .with_tls_enabled(true)
+            .with_tls_ca_file(config.tls.ca_file);
+        if let Some(domain) = config.tls.domain.filter(|domain| !domain.is_empty()) {
+            client = client.with_tls_domain(domain);
+        }
+    }
 
-    let client = IggyClientBuilder::from_connection_string(&connection_string)?.build()?;
-    client.connect().await?;
-    Ok(client)
+    Ok(client.build()?)
 }
 
 #[cfg(test)]
@@ -208,6 +198,19 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result, Err(McpRuntimeError::TokenFileEmpty(_))));
+    }
+
+    #[tokio::test]
+    async fn given_credentials_with_url_delimiters_when_building_the_client_should_accept_them() {
+        let config = IggyConfig {
+            username: "agent:reader".to_owned(),
+            password: "p@ss:w/rd?tls=false&x".to_owned(),
+            ..IggyConfig::default()
+        };
+
+        let client = build_client(config);
+
+        assert!(client.is_ok(), "{:?}", client.err());
     }
 
     #[test]

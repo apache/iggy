@@ -30,6 +30,7 @@ Requirements:
       docker build -f core/server/Dockerfile --target runtime-prebuilt \
         --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
         --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+        --build-arg LICENSE_STAGE=license-skip \
         -t iggy-server:local .
 """
 

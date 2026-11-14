@@ -1158,7 +1158,8 @@ where
         partition: Box<IggyPartition<B, SB>>,
         epoch: u64,
     },
-    /// Seed a routing row for a partition owned by a peer shard.
+    /// Seed a routing row for a partition owned by a peer shard. The owner
+    /// also rewrites its own row this way when a live partition lost it.
     InsertRouted {
         namespace: IggyNamespace,
         owner: ShardId,
@@ -1172,6 +1173,21 @@ where
     ConfirmRemove { namespace: IggyNamespace },
     /// Drop a routing row (peer's partition gone from committed metadata).
     RemoveRouted { namespace: IggyNamespace },
+}
+
+impl<B, SB> ReconcileOp<B, SB>
+where
+    B: MessageBus,
+{
+    #[must_use]
+    pub const fn namespace(&self) -> IggyNamespace {
+        match self {
+            Self::InsertOwned { namespace, .. }
+            | Self::InsertRouted { namespace, .. }
+            | Self::ConfirmRemove { namespace }
+            | Self::RemoveRouted { namespace } => *namespace,
+        }
+    }
 }
 
 /// Inter-shard channel envelope.
@@ -1886,6 +1902,9 @@ where
     /// Reconciler → pump funnel. Borrow discipline: every push / drain
     /// runs without `.await` inside the borrow.
     reconcile_queue: RefCell<VecDeque<ReconcileOp<B, SB>>>,
+    /// Namespaces the reconciler must check again for a local change that no
+    /// metadata commit announces.
+    reconcile_needed: RefCell<BTreeSet<IggyNamespace>>,
     shutting_down: Cell<bool>,
 
     /// Partition-plane frames that arrived before this shard's reconciler
@@ -2214,6 +2233,7 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
@@ -3174,6 +3194,7 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
@@ -3293,6 +3314,21 @@ where
         self.wake_reconcile_apply();
     }
 
+    /// The namespaces recorded for the reconciler since the last call: every
+    /// op the pump applied, and every partition install that finished. An op
+    /// staged before a delete and applied after it leaves a ghost that only
+    /// this record names.
+    #[must_use]
+    pub fn take_reconcile_needed(&self) -> BTreeSet<IggyNamespace> {
+        self.reconcile_needed.take()
+    }
+
+    /// Whether `namespace` is recorded and not yet taken.
+    #[must_use]
+    pub fn reconcile_needed_contains(&self, namespace: IggyNamespace) -> bool {
+        self.reconcile_needed.borrow().contains(&namespace)
+    }
+
     /// Wake the pump after off-pump work becomes visible. A refused marker is
     /// safe because a full inbox has already woken the pump, whose frame and
     /// tick arms both apply staged reconciliation work.
@@ -3405,6 +3441,7 @@ where
         let partitions = self.plane.partitions();
         let mut confirmed_remove = false;
         for op in staged {
+            self.reconcile_needed.borrow_mut().insert(op.namespace());
             match op {
                 ReconcileOp::InsertOwned {
                     namespace,
@@ -3422,9 +3459,9 @@ where
                     // the first: its VSR group + segment writers leak and `len`
                     // inflates.
                     //
-                    // A backstop, not the mechanism. `reconcile_additions`
-                    // skips a namespace whose `InsertOwned` is already staged
-                    // ([`Self::has_staged_insert_owned`]), so a second op for a
+                    // A backstop, not the mechanism. The reconciler's target
+                    // check skips a namespace whose `InsertOwned` is already
+                    // staged ([`Self::has_staged_insert_owned`]), so a second op for a
                     // live namespace should not be built at all. Dropping one
                     // here is damage control rather than a free no-op: the
                     // build already planted its initial segment over the live
@@ -3772,9 +3809,11 @@ enum ParkOutcome<H> {
 /// incarnation - and never the frame's provenance.
 struct ParkedFrame {
     epoch: Option<u64>,
-    /// Reconciler passes survived. `reconcile_parked_frames` increments it and
-    /// answers CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the
-    /// simulator's virtual clock controls.
+    /// Reconciler passes survived, counting only a pass that ends a round over
+    /// the work set. `reconcile_parked_frames` increments it and answers
+    /// CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the simulator's
+    /// virtual clock controls. A pass that stops at its build cap does not
+    /// count, because the builds it leaves are queued for the next pass.
     ///
     /// Never expires a replicated prepare: no client can retry it, and forcing
     /// the same-view repair backstop to recover a gap is worse than retaining
@@ -3920,11 +3959,13 @@ const fn superblock_wedged(failures: u64, fatal_after: u64) -> bool {
     fatal_after != 0 && failures >= fatal_after
 }
 
-/// Reconciler passes a frame may survive before it is answered rather than held.
+/// Reconciler passes that end a round over the work set, which a frame may
+/// survive before it is answered rather than held.
 ///
 /// Passes, not seconds, and deliberately not described in seconds: a pass fires
-/// on the periodic interval OR on a commit-tick wake, so the wall-clock window
-/// this maps to spans orders of magnitude. `reconcile_periodic_interval` legally
+/// on the periodic interval OR on a commit-tick wake, and a large work set
+/// spreads one round over many passes, so the wall-clock window this maps to
+/// spans orders of magnitude. `reconcile_periodic_interval` legally
 /// reaches 30s, which would put four passes at 120s -- four times the SDK's
 /// response read-timeout, so the client times out first and the bound stops
 /// being the thing that answers it. Commit-tick wakes collapse it the other way,
@@ -4505,17 +4546,6 @@ where
         false
     }
 
-    /// Whether any frame is parked. Cheap enough for the reconciler's per-tick
-    /// fast-skip guard: a non-empty buffer means the shard is by definition not
-    /// converged, so the skip must not fire.
-    ///
-    /// Read from the map, not the byte cell: an empty entry is never left
-    /// behind, but keying convergence off bytes makes that a silent invariant.
-    #[must_use]
-    pub fn has_parked_partition_frames(&self) -> bool {
-        !self.pending_partition_frames.borrow().is_empty()
-    }
-
     /// Namespaces currently holding parked frames. The reconciler pairs this
     /// against committed metadata to find the ones that will never materialise,
     /// which no `ConfirmRemove` / `RemoveRouted` can reach: a namespace that was
@@ -4592,15 +4622,17 @@ where
         staged
     }
 
-    /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
-    /// past `MAX_PARKED_PASSES`. Returns the number answered.
+    /// Age every frame under `namespace` by one pass that ended a round over
+    /// the work set, answering CLIENT REQUESTS past `MAX_PARKED_PASSES`.
+    /// Returns the number answered.
     ///
     /// Prepares age but never expire. Expiry would manufacture a gap that a
     /// later commit heartbeat must repair (see `ParkedFrame::passes`), and
-    /// passes are commit-driven: a non-empty buffer defeats the reconciler
-    /// fast-skip, so a create burst elapses four in milliseconds across every
-    /// parked namespace rather than the one it concerns. Byte budgets bound
-    /// them instead. Only [`Self::discard_parked_partition_frames`] still
+    /// passes are commit-driven and every pass that ends a round ages every
+    /// parked namespace. On a small work set each pass ends a round, so a
+    /// create burst elapses four in milliseconds across every parked
+    /// namespace rather than the one it concerns. Byte budgets bound them
+    /// instead. Only [`Self::discard_parked_partition_frames`] still
     /// destroys a prepare.
     ///
     /// Passes, not wall-clock, so the simulator's virtual clock governs it.
@@ -4811,7 +4843,7 @@ where
         let parked_bytes = self.parked_partition_bytes.get();
         // Read the entry without `entry().or_default()`: inserting first would
         // leave an empty entry behind on the overflow path below, which reads as
-        // a parked namespace to the reconciler sweep and its fast-skip guard.
+        // a parked namespace to the reconciler sweep.
         let existing = pending.get_mut(&namespace);
         let parked_len = existing.as_ref().map_or(0, |entry| entry.frames.len());
         let namespace_bytes = existing.as_ref().map_or(0, |entry| entry.bytes);
@@ -5293,6 +5325,29 @@ where
                 .is_some_and(VsrConsensus::has_loopback)
     }
 
+    /// The runtime options that `init_partition` gives the partition of
+    /// `namespace`: those of its topic, or the defaults without one.
+    #[cfg(feature = "simulator")]
+    #[must_use]
+    pub fn topic_runtime_options(
+        &self,
+        namespace: IggyNamespace,
+    ) -> iggy_common::TopicRuntimeOptions
+    where
+        M: metadata::impls::metadata::StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map(|topic| {
+                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                })
+                .unwrap_or_default()
+        })
+    }
+
     /// Simulator-only: mutates `IggyPartitions` off the pump task, bypassing the
     /// reconciler's `ReconcileOp::InsertOwned` funnel (production's runtime path;
     /// bootstrap recovery uses `load_partition`). VSR replica id comes from
@@ -5403,17 +5458,7 @@ where
             partitions.config().segment_size,
         );
         partition.set_created_revision(epoch);
-        let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
-            inner
-                .items
-                .get(namespace.stream_id())
-                .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                .map(|topic| {
-                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
-                })
-                .unwrap_or_default()
-        });
-        partition.set_runtime_options(runtime_options);
+        partition.set_runtime_options(self.topic_runtime_options(namespace));
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state);
@@ -8035,8 +8080,10 @@ where
         .await;
     }
 
-    // The shard pump serializes these rewrites with append. The journal's drain
-    // guard excludes concurrent compaction, but does not exclude append itself.
+    // The journal's drain guard excludes concurrent compaction, but does not
+    // exclude append itself, and an in-process submit appends on its caller's
+    // task, not the pump's. The journal gate serializes these rewrites with it:
+    // a write in flight lands first and is reconciled, and none starts during.
     #[allow(clippy::future_not_send)]
     async fn reconcile_metadata_view_divergence(&self)
     where
@@ -8049,6 +8096,7 @@ where
         let (Some(consensus), Some(journal)) = (&metadata.consensus, &metadata.journal) else {
             return;
         };
+        let _journal_writes = metadata.hold_journal_writes().await;
         while reconcile_metadata_view_log(self.id, consensus, journal.handle()).await
             == MetadataViewLogStep::PersistFirst
         {
@@ -8091,6 +8139,10 @@ where
         // Before the coverage scan, and a primary-elect's only shot at it: the repair
         // ingest skips an op it already holds a header for, so a diverging entry would
         // never be replaced. No-op when nothing diverges.
+        //
+        // It also waits for a submit admitted before the election and still in its
+        // append. Nothing awaits from here to `start_pending_view`, so the view
+        // starts on a journal no prepare of an earlier view can still land in.
         self.reconcile_metadata_view_divergence().await;
         if consensus.view_log_unproven() && consensus.view_log_repair_op().is_none() {
             return;
@@ -11013,9 +11065,13 @@ where
     const PARTITION_TRANSFER_TOTAL_LEN_MAX: u64 = 1 << 40;
 
     /// Bound the buffered offset and dedup state plus one maximum-sized
-    /// checkpoint prepare and its length prefix before allocating the artifact.
-    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 =
-        (32 << 20) + journal::partition_journal::PREPARE_BYTES_MAX as u64 + 4;
+    /// checkpoint prepare and state-machine snapshot, each with its length
+    /// prefix, before allocating the artifact.
+    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 = (32 << 20)
+        + journal::partition_journal::PREPARE_BYTES_MAX as u64
+        + 4
+        + partitions::state_machine::SNAPSHOT_BYTES_MAX as u64
+        + 4;
 
     /// Concurrent partition transfers this shard will run as a RECEIVER. A
     /// whole-node rejoin arms one per lagging partition; unbounded, the sum
@@ -12225,6 +12281,11 @@ where
             .set_state_transfer_stage(consensus::StateTransferStage::Idle);
         match outcome {
             Ok(outcome) => {
+                // The installed chain can start below the committed delete
+                // watermark, and only the reconciler trims to it.
+                self.reconcile_needed
+                    .borrow_mut()
+                    .insert(IggyNamespace::from_raw(namespace));
                 partition.note_transfer_progress();
                 partition.note_transfer_installed();
                 partition.transfer_rearm = None;
@@ -12650,9 +12711,10 @@ where
     /// tick's walk has advanced, and at or under `commit_max`, so a quorum
     /// holds it and repair can serve it back.
     ///
-    /// SERIALIZATION: same argument as `reconcile_metadata_view_divergence`,
-    /// which is the other shard-side `truncate_from` caller. This runs on the
-    /// pump between frames, so no append is in flight for these ops.
+    /// SERIALIZATION: holds the journal gate, as
+    /// `reconcile_metadata_view_divergence` does, the other shard-side
+    /// `truncate_from` caller. An in-process submit appends on its caller's
+    /// task, so running on the pump does not keep an append off these ops.
     #[allow(clippy::future_not_send)]
     async fn drop_unwalkable_metadata_entry<P>(
         &self,
@@ -12675,15 +12737,16 @@ where
         let Ok(slot) = usize::try_from(stuck_op) else {
             return;
         };
+        let view = consensus.view();
+        let _journal_writes = self.plane.metadata().hold_journal_writes().await;
         let Some(header) = journal.handle().header(slot).map(|header| *header) else {
             return;
         };
-        let view = consensus.view();
         if journal.handle().entry(&header).await.is_some() {
             return;
         }
-        // The read can yield to a pipeline driver or a view change. Never
-        // truncate a suffix another driver owns, even when this body is absent.
+        // The gate and the read can yield to a pipeline driver or a view change.
+        // Never truncate a suffix another driver owns, even when this body is absent.
         if consensus.view() != view
             || consensus.view_log_unproven()
             || consensus.is_transferring()
@@ -14334,13 +14397,13 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 // journal already held the adopted head, no repair frame moves the
                 // anchor, which then names a dropped op the WAL cannot certify.
                 // A durable commit point survives only in the repair ring.
-                if let Some(head) = partition
-                    .log
-                    .journal()
-                    .inner
-                    .repair_header(consensus.sequencer().current_sequence())
-                {
+                let head_op = consensus.sequencer().current_sequence();
+                if let Some(head) = partition.log.journal().inner.repair_header(head_op) {
                     consensus.set_last_prepare_checksum(head.checksum);
+                } else if head_op == 0 {
+                    // An empty log has no header to take the anchor from, and the
+                    // WAL certifies op 0 only with a zero checksum.
+                    consensus.set_last_prepare_checksum(0);
                 }
                 return;
             }
@@ -16191,6 +16254,31 @@ mod installed_transfer_dvc_tests {
         );
     }
 
+    #[compio::test]
+    async fn given_a_transfer_installed_above_the_adopted_head_when_the_view_log_is_reconciled_should_prove_the_log_at_the_checkpoint()
+     {
+        let transfer = HEAD + 3;
+        // Boxed: the setup future carries a whole partition.
+        let mut partition = Box::pin(lagging_after_install(IggyMessageBus::new(0), transfer)).await;
+
+        // `finish_partition_install`: the repair pass reconciles an open proof.
+        let pending = partition.consensus().pending_view_log();
+        reconcile_partition_view_divergence(0, &mut partition, pending.as_ref()).await;
+
+        let consensus = partition.consensus();
+        assert!(
+            !consensus.view_log_unproven(),
+            "the checkpoint at op {transfer} holds every op of the adopted view up to its head \
+             {HEAD}, so nothing is left to prove"
+        );
+        assert!(
+            !consensus.view_log_is_pending(),
+            "the adopted log still ends at op {HEAD}, below the commit point {}",
+            consensus.commit_min(),
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), transfer);
+    }
+
     /// The lagging replica's vote for `NEXT_VIEW`, and the frame the shard sends
     /// for it. Before the vote, the replica adopts the `ADOPTED_VIEW` `StartView`,
     /// installs a peer's state transfer at `transfer`, and then stops hearing the
@@ -16207,6 +16295,47 @@ mod installed_transfer_dvc_tests {
         for peer in (0..REPLICA_COUNT).filter(|&peer| peer != LAGGING) {
             crate::test_support::connect_replica_on(&bus, peer, 1);
         }
+        let partition = Box::pin(lagging_after_install(bus, transfer)).await;
+
+        // The heartbeat timeout votes to leave the view, so the `StartViewChange`
+        // of replica 1 completes a quorum of votes.
+        let voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            .flat_map(|_| partition.consensus().tick(PlaneKind::Partitions))
+            .any(|action| {
+                matches!(action, VsrAction::SendStartViewChange { view, .. } if view == NEXT_VIEW)
+            });
+        assert!(voted, "the lagging replica votes to leave the view");
+
+        // `on_start_view_change`: snapshot the suffix, then vote.
+        refresh_partition_dvc_suffix(&partition);
+        let consensus = partition.consensus();
+        let actions =
+            consensus.handle_start_view_change(PlaneKind::Partitions, start_view_change().header());
+        let vote = actions
+            .iter()
+            .find(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
+            .cloned()
+            .expect("the lagging replica votes");
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
+            .await;
+        let message = sent
+            .borrow()
+            .iter()
+            .find_map(|frame| {
+                Message::<DoViewChangeHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .ok()
+            })
+            .expect("the vote goes out on the wire");
+        (vote, message)
+    }
+
+    /// The lagging replica on `bus`, after it adopts the `ADOPTED_VIEW` `StartView`
+    /// and then installs a peer's state transfer at `transfer`.
+    #[allow(clippy::future_not_send)]
+    async fn lagging_after_install(
+        bus: IggyMessageBus,
+        transfer: u64,
+    ) -> IggyPartition<IggyMessageBus> {
         let consensus = VsrConsensus::new(
             CLUSTER,
             LAGGING,
@@ -16255,37 +16384,7 @@ mod installed_transfer_dvc_tests {
         partition
             .consensus()
             .install_checkpoint(transfer, Some(checkpoint.header().checksum));
-
-        // The heartbeat timeout votes to leave the view, so the `StartViewChange`
-        // of replica 1 completes a quorum of votes.
-        let voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
-            .flat_map(|_| partition.consensus().tick(PlaneKind::Partitions))
-            .any(|action| {
-                matches!(action, VsrAction::SendStartViewChange { view, .. } if view == NEXT_VIEW)
-            });
-        assert!(voted, "the lagging replica votes to leave the view");
-
-        // `on_start_view_change`: snapshot the suffix, then vote.
-        refresh_partition_dvc_suffix(&partition);
-        let consensus = partition.consensus();
-        let actions =
-            consensus.handle_start_view_change(PlaneKind::Partitions, start_view_change().header());
-        let vote = actions
-            .iter()
-            .find(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
-            .cloned()
-            .expect("the lagging replica votes");
-        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
-            .await;
-        let message = sent
-            .borrow()
-            .iter()
-            .find_map(|frame| {
-                Message::<DoViewChangeHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
-                    .ok()
-            })
-            .expect("the vote goes out on the wire");
-        (vote, message)
+        partition
     }
 
     /// The `ADOPTED_VIEW` `StartView`: its head and commit point, with the
