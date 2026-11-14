@@ -99,6 +99,7 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
         trim: Option<Box<crate::segment_chain::ChainAppend>>,
     },
     EvictSegment(Box<crate::segment_chain::EvictionJob>),
+    Tiering(Box<crate::segment_chain::TieringJob>),
     EmptySegment(SegmentIoJob),
     OffsetCleanup {
         directory: String,
@@ -141,6 +142,7 @@ pub enum PartitionIoResult {
     },
     SegmentRemoved(Result<(), IggyError>),
     SegmentEvicted(crate::segment_chain::EvictionResult),
+    Tiering(crate::segment_chain::TieringResult),
     EmptySegment(Result<InstalledSegment, IggyError>),
     OffsetCleanup(OffsetCleanupIoResult),
     RetryCheckpoint(std::io::Result<()>),
@@ -165,6 +167,7 @@ pub enum PartitionIoContinuation {
     Checkpoint,
     Retention,
     Eviction,
+    Tiering,
     Quarantine,
 }
 
@@ -698,6 +701,7 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             | Self::SegmentDirectory(_)
             | Self::RemoveSegment { .. }
             | Self::EvictSegment(_)
+            | Self::Tiering(_)
             | Self::EmptySegment(_)
             | Self::OffsetCleanup { .. }
             | Self::RetryCheckpoint { .. }
@@ -757,6 +761,7 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             Self::EvictSegment(job) => {
                 PartitionIoResult::SegmentEvicted(Box::pin(job.execute()).await)
             }
+            Self::Tiering(job) => PartitionIoResult::Tiering(Box::pin(job.execute()).await),
             Self::EmptySegment(job) => PartitionIoResult::EmptySegment(job.execute().await),
             Self::OffsetCleanup {
                 directory,

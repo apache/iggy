@@ -61,9 +61,8 @@ use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
     OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
-    TopicResolvedOptions, UserStatus, admit, derived_defaults, refuse_tiered_storage,
-    validate_local_retention, validate_preallocated_topic_bytes, validate_segment_max_age,
-    validate_topic_segment_size,
+    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_local_retention,
+    validate_preallocated_topic_bytes, validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -404,7 +403,9 @@ where
                     );
                     return Err(IggyError::InvalidReplicationFactor);
                 }
-                refuse_tiered_storage(&admitted.explicit)?;
+                // No ruling on `tiered_storage` here: whether the cluster can
+                // tier is known to the metadata primary alone, and it checks
+                // every request it prepares.
                 let mut stored = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
                 stored.extend(admitted.explicit);
                 validate_local_retention(&stored)?;
@@ -536,12 +537,6 @@ where
     let is_topic_patch = matches!(patch.target, ResourceTarget::Topic { .. });
     let patched_from = is_topic_patch.then(|| current.clone()).flatten();
     let admitted = admit_patch(patch, current)?;
-    if is_topic_patch {
-        // Reads the request alone, so it also covers a target this caller
-        // cannot see. Past the edge the primary refuses the same patch as a
-        // malformed request and evicts the session.
-        refuse_tiered_storage(&admitted.explicit)?;
-    }
     if let Some(current) = patched_from {
         // A rule between two keys reads the one this patch leaves alone from
         // the stored map, so a patch of either key meets it.
@@ -702,7 +697,7 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
     };
-    use iggy_binary_protocol::{MAX_OPTIONS, WireName};
+    use iggy_binary_protocol::{Command, MAX_OPTIONS, WireName};
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
@@ -884,41 +879,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn given_tiered_storage_when_patching_a_topic_should_refuse_on_and_off_on_either_chain() {
+    /// The edge cannot tell whether the cluster can tier, so turning tiered
+    /// storage on passes both chains and the metadata primary refuses it, as
+    /// a reply that leaves the session in place.
+    #[compio::test]
+    async fn given_tiered_storage_when_turned_on_should_pass_either_chain_and_be_refused_by_the_primary()
+     {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, 1));
         create_one_partition(&shard);
         let sessions = root_sessions(&shard, 1);
-        for (enabled, expected) in [
-            ("true", IggyError::FeatureUnavailable),
-            (
-                "false",
-                IggyError::OptionNotUpdatable(OptionKey::TieredStorage.to_string()),
-            ),
+        let create = CreateTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            partitions_count: 1,
+            name: WireName::new("tiered").unwrap(),
+            options: TopicCreateOptions {
+                tiered_storage: Some(true),
+                ..TopicCreateOptions::default()
+            }
+            .to_wire()
+            .unwrap(),
+        }
+        .to_bytes();
+        let patch = topic_patch(&[(OptionKey::TieredStorage, "true")], &[]);
+
+        for (operation, body) in [
+            (Operation::CreateTopic, &create),
+            (Operation::UpdateResource, &patch),
         ] {
-            let body = topic_patch(&[(OptionKey::TieredStorage, enabled)], &[]);
             let tcp = tcp_chain(
                 &shard,
                 &sessions,
                 1,
-                request_message(Operation::UpdateResource, 1, 1, 1, &body),
-            )
-            .map(|_| ())
-            .map_err(|deny| deny.error);
-            let http = http_chain(
+                request_message(operation, 1, 1, 1, body),
+            );
+            assert!(tcp.is_ok(), "binary chain, {operation:?}");
+            let (admitted, _) = http_chain(
                 &shard,
                 DEFAULT_ROOT_USER_ID,
-                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+                request_message(operation, 1, 1, 1, body),
             )
-            .map(|_| ());
-            assert_eq!(tcp, Err(expected.clone()), "binary chain, {enabled}");
-            assert_eq!(http, Err(expected), "HTTP chain, {enabled}");
+            .unwrap_or_else(|error| panic!("HTTP chain, {operation:?}: {error}"));
+
+            let metadata = shard.plane.metadata();
+            assert!(!metadata.tiered_storage_cluster_ready());
+            let reply = metadata
+                .submit_request_in_process(admitted)
+                .await
+                .expect("the primary answers");
+            assert_eq!(reply.header().command, Command::Reply, "{operation:?}");
+            assert_eq!(
+                iggy_binary_protocol::result_code(reply.body()),
+                Some(IggyError::FeatureUnavailable.as_code()),
+                "{operation:?}"
+            );
         }
     }
 
     #[test]
-    fn given_tiered_storage_on_when_patching_a_topic_whose_state_is_hidden_should_refuse_on_either_chain()
+    fn given_tiered_storage_when_a_patch_turns_it_off_should_refuse_it_on_either_chain() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let sessions = root_sessions(&shard, 1);
+        let expected = IggyError::OptionNotUpdatable(OptionKey::TieredStorage.to_string());
+        let body = topic_patch(&[(OptionKey::TieredStorage, "false")], &[]);
+        let tcp = tcp_chain(
+            &shard,
+            &sessions,
+            1,
+            request_message(Operation::UpdateResource, 1, 1, 1, &body),
+        )
+        .map(|_| ())
+        .map_err(|deny| deny.error);
+        let http = http_chain(
+            &shard,
+            DEFAULT_ROOT_USER_ID,
+            request_message(Operation::UpdateResource, 1, 1, 1, &body),
+        )
+        .map(|_| ());
+        assert_eq!(tcp, Err(expected.clone()), "binary chain");
+        assert_eq!(http, Err(expected), "HTTP chain");
+    }
+
+    /// The edge rules on the request alone, so a patch that turns tiered
+    /// storage on passes both chains whether or not its topic exists or its
+    /// caller may see it. The metadata primary refuses it as a reply, which
+    /// leaves the session in place: an eviction here would disconnect a client
+    /// for naming a topic it cannot know to be missing.
+    #[compio::test]
+    async fn given_tiered_storage_on_when_patching_a_missing_or_hidden_topic_should_be_refused_by_the_primary_as_a_reply()
      {
         const READER: u32 = 1;
         const MISSING_TOPIC: u32 = 99;
@@ -961,34 +1011,69 @@ mod tests {
                 user_id,
                 request_message(Operation::UpdateResource, 1, 1, 1, body),
             )
-            .map(|_| ())
+            .map(|(admitted, _)| admitted)
         };
 
         let missing = patch(MISSING_TOPIC, OptionKey::TieredStorage, "true");
+        let hidden = patch(0, OptionKey::TieredStorage, "true");
         let tcp = tcp_chain(
             &shard,
             &sessions,
             1,
             request_message(Operation::UpdateResource, 1, 1, 1, &missing),
-        )
-        .map(|_| ())
-        .map_err(|deny| deny.error);
-        assert_eq!(tcp, Err(IggyError::FeatureUnavailable));
-        assert_eq!(
-            http(DEFAULT_ROOT_USER_ID, &missing),
-            Err(IggyError::FeatureUnavailable)
         );
-        assert_eq!(
-            http(READER, &patch(0, OptionKey::TieredStorage, "true")),
-            Err(IggyError::FeatureUnavailable)
-        );
+        assert!(tcp.is_ok(), "binary chain");
+        let metadata = shard.plane.metadata();
+        let refused = [
+            (DEFAULT_ROOT_USER_ID, &missing, "a missing topic"),
+            (READER, &hidden, "a hidden topic"),
+        ];
+
+        assert!(!metadata.tiered_storage_cluster_ready());
+        for (user_id, body, case) in refused {
+            let admitted = http(user_id, body).unwrap_or_else(|error| panic!("{case}: {error}"));
+            let reply = metadata
+                .submit_request_in_process(admitted)
+                .await
+                .expect("the primary answers");
+            assert_eq!(reply.header().command, Command::Reply, "{case}");
+            assert_eq!(
+                iggy_binary_protocol::result_code(reply.body()),
+                Some(IggyError::FeatureUnavailable.as_code()),
+                "{case}"
+            );
+        }
+
+        // A cluster that can tier leaves the target to apply, which answers
+        // a missing topic with a result as for any other patch of it.
+        let admitted = http(DEFAULT_ROOT_USER_ID, &missing).expect("the patch is admitted");
+        let admitted = UpdateResourceRequest::decode_from(crate::wire::request_body(&admitted))
+            .expect("the admitted patch decodes");
+        let resolved = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(MISSING_TOPIC),
+            name: None,
+            explicit_options: admitted.options,
+            derived_options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let applied = metadata
+            .mux_stm
+            .update(prepare_message(
+                Operation::UpdateTopicResolved,
+                1,
+                4,
+                &resolved,
+            ))
+            .expect("apply answers with a result");
+        assert_ne!(applied.code, 0);
         // Without the option the missing topic stays the apply's to report.
-        assert_eq!(
+        assert!(
             http(
                 DEFAULT_ROOT_USER_ID,
                 &patch(MISSING_TOPIC, OptionKey::MessageExpiry, "1h")
-            ),
-            Ok(())
+            )
+            .is_ok()
         );
     }
 

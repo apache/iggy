@@ -43,11 +43,14 @@ use iggy_object_store::SEGMENT_HASH_LEN;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::sharding::IggyNamespace;
 use tracing::warn;
 
 use crate::IggyPartition;
 use crate::segment::{Segment, SegmentLocation};
-use crate::state_transfer::{ChunkHasher, STAGING_SUFFIX, fsync_dir, hash_segment_range};
+use crate::state_transfer::{
+    ChunkHasher, OFFER_HASH_CHUNK_LEN, STAGING_SUFFIX, fsync_dir, hash_segment_range,
+};
 
 #[cfg(test)]
 mod tests;
@@ -595,6 +598,25 @@ impl SegmentDigest {
     pub fn finalize(&self) -> SegmentHashes {
         self.hasher.finalize()
     }
+
+    /// Whether the digest holds the first bytes of the segment starting at
+    /// `start_offset` and not yet all `size` of them.
+    pub(crate) const fn resumes(&self, start_offset: u64, size: u64) -> bool {
+        self.start_offset == start_offset && self.hashed_len < size
+    }
+
+    /// Whether this is the digest `captured` was before a step of the same
+    /// segment's hash.
+    pub(crate) const fn continues(&self, captured: &Self) -> bool {
+        self.start_offset == captured.start_offset && self.hashed_len > captured.hashed_len
+    }
+
+    /// Bytes the next step of a hash from disk reads of a segment of `size`
+    /// bytes, which is the buffer the step allocates.
+    pub(crate) fn step_len(&self, size: u64) -> usize {
+        usize::try_from(size.saturating_sub(self.hashed_len))
+            .map_or(HASH_STEP_LEN, |left| left.min(HASH_STEP_LEN))
+    }
 }
 
 impl ChunkHasher for SegmentDigest {
@@ -701,6 +723,114 @@ impl ChainAppend {
     pub(crate) async fn execute(&self) -> io::Result<()> {
         append_record(&self.path, self.at, &self.record).await
     }
+}
+
+/// The prefix of the partition `namespace` names in the incarnation that
+/// `created_revision` identifies.
+#[must_use]
+pub fn object_prefix(namespace: IggyNamespace, created_revision: u64) -> ObjectPrefix {
+    ObjectPrefix {
+        stream_id: namespace.stream_id() as u64,
+        topic_id: namespace.topic_id() as u64,
+        partition_id: namespace.partition_id() as u64,
+        created_revision,
+    }
+}
+
+/// One step of turning tiering on for a partition, or of keeping its chain
+/// complete afterwards. Each runs on the partition's I/O lane.
+pub enum TieringJob {
+    /// Load the chain in the directory, or create it holding `prefix`.
+    Open {
+        directory: String,
+        prefix: ObjectPrefix,
+    },
+    /// Record the front that retention had left before tiering was enabled.
+    Trim(ChainAppend),
+    /// Hash the next `HASH_STEP_LEN` bytes of a sealed segment that has no
+    /// record from its `.log`, and record the segment once `digest` holds all
+    /// of it. `append` holds the record with a zero hash.
+    Hash {
+        log_path: String,
+        append: ChainAppend,
+        digest: Box<SegmentDigest>,
+    },
+}
+
+/// Bytes one step of a hash from disk reads. A step is one job on the
+/// partition's I/O lane, so this bounds how long other work waits behind it.
+pub(crate) const HASH_STEP_LEN: usize = OFFER_HASH_CHUNK_LEN;
+
+pub enum TieringResult {
+    Opened(Result<Chain, ChainError>),
+    Appended(io::Result<ChainRecord>),
+    /// The digest after a step that left bytes of the segment unread.
+    Hashed(Box<SegmentDigest>),
+}
+
+impl TieringJob {
+    pub(crate) async fn execute(self) -> TieringResult {
+        match self {
+            Self::Open { directory, prefix } => {
+                TieringResult::Opened(open(&directory, prefix).await)
+            }
+            Self::Trim(append) => {
+                TieringResult::Appended(append.execute().await.map(|()| append.record))
+            }
+            Self::Hash {
+                log_path,
+                append,
+                digest,
+            } => hash_step(&log_path, append, digest)
+                .await
+                .unwrap_or_else(|error| TieringResult::Appended(Err(error))),
+        }
+    }
+}
+
+async fn hash_step(
+    log_path: &str,
+    mut append: ChainAppend,
+    mut digest: Box<SegmentDigest>,
+) -> io::Result<TieringResult> {
+    let ChainRecord::Sealed(segment) = &mut append.record else {
+        return Err(io::Error::other(
+            "a hash from disk records a sealed segment",
+        ));
+    };
+    let from = digest.hashed_len;
+    let to = from + digest.step_len(segment.size) as u64;
+    hash_segment_range(log_path, from, to, &mut *digest, None).await?;
+    if !digest.covers(segment.start_offset, segment.size) {
+        return Ok(TieringResult::Hashed(digest));
+    }
+    let hashes = digest.finalize();
+    segment.hash = hashes.blake3;
+    segment.crc32c = hashes.crc32c;
+    append.execute().await?;
+    Ok(TieringResult::Appended(Ok(append.record)))
+}
+
+/// The chain in `directory`, created holding `prefix` when there is none.
+async fn open(directory: &str, prefix: ObjectPrefix) -> Result<Chain, ChainError> {
+    if let Some(chain) = read_chain(directory).await? {
+        if chain.prefix != prefix {
+            return Err(ChainError::Prefix {
+                recorded: chain.prefix,
+            });
+        }
+        // The chain may be here by a rename no directory sync followed, and
+        // a record appended to a name a power loss takes back is lost.
+        fsync_dir(directory).await?;
+        return Ok(chain);
+    }
+    create_chain(directory, &prefix).await?;
+    Ok(Chain {
+        prefix,
+        records: Vec::new(),
+        valid_len: HEADER_SIZE as u64,
+        torn_tail: false,
+    })
 }
 
 /// Evicts one sealed segment: a durable remote record first, so no crash
@@ -904,6 +1034,36 @@ impl SegmentChain {
         })
     }
 
+    /// Whether the chain holds neither a record of `segment` nor a trim point
+    /// that retires it.
+    pub(crate) fn lacks_record(&self, segment: &Segment) -> bool {
+        !self.sealed.contains_key(&segment.start_offset)
+            && self
+                .trim_point
+                .is_none_or(|trim_point| segment.end_offset > trim_point)
+    }
+
+    /// The record of `segment` hashed from disk, with the hash still to fill
+    /// in, `None` when the chain already records the segment.
+    pub(crate) fn hash_from_disk(
+        &self,
+        segment: &Segment,
+        incarnation: u64,
+    ) -> Option<ChainAppend> {
+        if !self.lacks_record(segment) {
+            return None;
+        }
+        Some(self.append(ChainRecord::Sealed(SegmentRecord::new(
+            segment,
+            incarnation,
+            SegmentHashes {
+                blake3: [0; SEGMENT_HASH_SIZE],
+                crc32c: 0,
+            },
+            HashSource::Disk,
+        ))))
+    }
+
     /// Account for the remote record an eviction appended for the segment
     /// starting at `start_offset`.
     pub(crate) fn note_evicted(&mut self, start_offset: u64) {
@@ -961,25 +1121,7 @@ where
     /// be created or read, or it records another prefix.
     pub async fn open_segment_chain(&mut self, prefix: ObjectPrefix) -> Result<(), ChainError> {
         let directory = self.partition_dir.clone().ok_or(ChainError::NoDirectory)?;
-        let chain = if let Some(chain) = read_chain(&directory).await? {
-            if chain.prefix != prefix {
-                return Err(ChainError::Prefix {
-                    recorded: chain.prefix,
-                });
-            }
-            // The chain may be here by a rename no directory sync followed, and
-            // a record appended to a name a power loss takes back is lost.
-            crate::state_transfer::fsync_dir(&directory).await?;
-            chain
-        } else {
-            create_chain(&directory, &prefix).await?;
-            Chain {
-                prefix,
-                records: Vec::new(),
-                valid_len: HEADER_SIZE as u64,
-                torn_tail: false,
-            }
-        };
+        let chain = open(&directory, prefix).await?;
         self.adopt_segment_chain(&chain)
     }
 
@@ -1029,6 +1171,7 @@ where
     /// and its sweep replaces or removes the file.
     pub(crate) fn drop_segment_chain(&mut self) {
         self.segment_chain = None;
+        self.restart_tiering();
     }
 
     /// What a state transfer carries of the chain, `None` without one.

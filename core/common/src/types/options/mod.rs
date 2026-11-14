@@ -515,17 +515,24 @@ pub fn validate_local_retention(stored: &ResourceOptions) -> Result<(), IggyErro
     Ok(())
 }
 
-/// Refuse a request that turns tiered storage on. The option exists ahead of
-/// the code that tiers a topic, so a topic that claimed it would not be
-/// tiered. A build that tiers topics drops this check.
+/// Admit a request that turns tiered storage on only in a cluster whose every
+/// member can tier topics. A tiered topic's partitions can land on any member,
+/// and one that cannot reach the object store would keep its copy untiered.
 ///
-/// `explicit` holds the keys the request sets.
+/// `explicit` holds the keys the request sets. `cluster_ready` is the metadata
+/// primary's verdict on the whole cluster, so only the primary can rule here.
 ///
 /// # Errors
 ///
-/// `FeatureUnavailable` when `explicit` sets `tiered_storage` to true.
-pub fn refuse_tiered_storage(explicit: &ResourceOptions) -> Result<(), IggyError> {
-    if TopicCreateOptions::from_resource_options(explicit).tiered_storage == Some(true) {
+/// `FeatureUnavailable` when `explicit` sets `tiered_storage` to true and
+/// `cluster_ready` is false.
+pub fn admit_tiered_storage(
+    explicit: &ResourceOptions,
+    cluster_ready: bool,
+) -> Result<(), IggyError> {
+    if !cluster_ready
+        && TopicCreateOptions::from_resource_options(explicit).tiered_storage == Some(true)
+    {
         return Err(IggyError::FeatureUnavailable);
     }
     Ok(())
@@ -1315,6 +1322,8 @@ pub struct TopicRuntimeOptions {
     pub size_of_messages_required_to_save: Option<IggyByteSize>,
     pub preallocate_segments: Option<bool>,
     pub segment_max_age: Option<IggyExpiry>,
+    /// Whether each partition of the topic keeps a chain file.
+    pub tiered_storage: bool,
 }
 
 impl TopicRuntimeOptions {
@@ -1356,6 +1365,7 @@ impl From<&TopicCreateOptions> for TopicRuntimeOptions {
             size_of_messages_required_to_save: parsed.size_of_messages_required_to_save,
             preallocate_segments: parsed.preallocate_segments,
             segment_max_age: parsed.segment_max_age,
+            tiered_storage: parsed.tiered_storage == Some(true),
         }
     }
 }
@@ -2107,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn given_tiered_storage_when_a_request_turns_it_on_should_refuse_it_as_unavailable() {
+    fn given_tiered_storage_when_a_request_turns_it_on_should_admit_it_only_in_a_ready_cluster() {
         let request = |enabled: bool| -> ResourceOptions {
             [(
                 HeaderKey::from(OptionKey::TieredStorage),
@@ -2117,11 +2127,17 @@ mod tests {
         };
 
         assert_eq!(
-            refuse_tiered_storage(&request(true)),
+            admit_tiered_storage(&request(true), false),
             Err(IggyError::FeatureUnavailable)
         );
-        assert_eq!(refuse_tiered_storage(&request(false)), Ok(()));
-        assert_eq!(refuse_tiered_storage(&ResourceOptions::new()), Ok(()));
+        assert_eq!(admit_tiered_storage(&request(true), true), Ok(()));
+        for cluster_ready in [false, true] {
+            assert_eq!(admit_tiered_storage(&request(false), cluster_ready), Ok(()));
+            assert_eq!(
+                admit_tiered_storage(&ResourceOptions::new(), cluster_ready),
+                Ok(())
+            );
+        }
     }
 
     #[test]
