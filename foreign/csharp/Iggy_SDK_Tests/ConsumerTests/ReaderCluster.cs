@@ -51,6 +51,8 @@ internal readonly record struct ReceivedPoll(uint PartitionId, MessagePolling Ki
 /// </summary>
 internal sealed class ReaderCluster : IDisposable
 {
+    internal Func<ulong, byte[]>? FetchRecords { get; init; }
+
     private const int PartitionsCount = 4;
 
     /// <summary>The context of every route and every read.</summary>
@@ -569,6 +571,10 @@ internal sealed class ReaderCluster : IDisposable
             served = true;
             held += GOLDEN_BATCH_MESSAGES;
             var section = GoldenSection(partition, start, ReadContext);
+            if (FetchRecords is { } records)
+            {
+                section = section with { Records = records(start) };
+            }
             section = ReportsHead ? section with { CurrentOffset = Limit - 1 } : section;
             sections.Add(Undecodable.Contains(start) ? section with { Records = [] } : section);
             if (fetch.AutoCommit)

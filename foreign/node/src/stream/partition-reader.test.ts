@@ -26,6 +26,7 @@ import type { CommandResponse, RawClient, SendCommandOptions } from '../client/c
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { responseError } from '../wire/error.utils.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
+import { HeaderKeyFactory, HeaderValue, serializeHeaders } from '../wire/message/header.utils.js';
 import { encodeMessagesBatch } from '../wire/message/message.utils.js';
 import { BATCH_HEADER_SIZE, FRAME_HEADER_SIZE } from '../wire/message/iggy-header.utils.js';
 import { u128ToBuf } from '../wire/number.utils.js';
@@ -107,10 +108,10 @@ type Read = { code: number, partition: number, kind: number, value: bigint, auto
 const UNPARSABLE_HEADERS = Buffer.from([1, 0, 0, 0, 0]);
 
 /** `count` messages from `offset` as batch records, two by default. */
-const records = (offset: bigint, unparsableHeaders = new Set<bigint>(), count = 2): Buffer => {
+const records = (offset: bigint, unparsableHeaders = new Set<bigint>(), count = 2, data?: { payload: Buffer, userHeaders: Buffer }): Buffer => {
   const batch = encodeMessagesBatch(Array.from({ length: count }, (_, index) => ({
-    id: u128ToBuf(BigInt(index + 1)), payload: Buffer.from(`m${offset + BigInt(index)}`),
-    userHeaders: unparsableHeaders.has(offset + BigInt(index)) ? UNPARSABLE_HEADERS : Buffer.alloc(0),
+    id: u128ToBuf(BigInt(index + 1)), payload: data?.payload ?? Buffer.from(`m${offset + BigInt(index)}`),
+    userHeaders: unparsableHeaders.has(offset + BigInt(index)) ? UNPARSABLE_HEADERS : data?.userHeaders ?? Buffer.alloc(0),
     originTimestamp: 0n
   })));
   batch.writeBigUInt64LE(offset, BATCH_BASE_OFFSET_AT);
@@ -131,6 +132,7 @@ const records = (offset: bigint, unparsableHeaders = new Set<bigint>(), count = 
  * that another primary leads.
  */
 class FakeTopic {
+  messageData?: { payload: Buffer, userHeaders: Buffer };
   primaries = 2;
   /** The primary of each partition that moved away from `partition % primaries`. */
   readonly movedPrimaries = new Map<number, number>();
@@ -414,7 +416,7 @@ class FakeTopic {
         this.onLostCommittingRead?.();
         throw new FetchProgressUncertainError(1n, new Error('reply lost after storing'));
       }
-      const batch = records(start, this.unparsableHeaders, held);
+      const batch = records(start, this.unparsableHeaders, held, this.messageData);
       const data = pollReply(partition, start + BigInt(held) - 1n,
         this.undecodable.has(start) ? batch.subarray(0, batch.length - 1) : batch, held, this.served());
       return reply(this.truncatedReplies.has(start) ? data.subarray(0, TRUNCATED_POLL_REPLY_SIZE) : data);
@@ -551,7 +553,7 @@ class FakeTopic {
       }
       held += 2;
       if (autocommit) this.autoCommit(partition, start + 1n);
-      const batch = records(start, this.unparsableHeaders);
+      const batch = records(start, this.unparsableHeaders, 2, this.messageData);
       sections.push({ partition, status: 0, start,
         records: this.undecodable.has(start) ? batch.subarray(0, batch.length - 1) : batch });
     }
@@ -762,6 +764,45 @@ const nextOf = async (reader: PartitionReader, partition: number) => {
 };
 
 describe('partition reader', () => {
+  for (const [headers, payloadBytes] of [[false, 1077], [true, 1], [false, 1]] as const) {
+    it(`bounds read-ahead bytes and frees space with user headers ${headers} and payload ${payloadBytes}`, async () => {
+      const budget = 128 * 1024;
+      const maxBytes = 4096;
+      const userHeaders = serializeHeaders(Array.from({ length: 4 }, (_, index) => ({
+        key: HeaderKeyFactory.String(`key${index}`), value: HeaderValue.Raw(Buffer.alloc(255))
+      })));
+      const topic = new FakeTopic(4000n);
+      topic.reportsHead = topic.countLimited = true;
+      topic.messageData = { payload: Buffer.alloc(payloadBytes),
+        userHeaders: headers ? userHeaders : Buffer.alloc(0) };
+      const frameBytes = FRAME_HEADER_SIZE + payloadBytes + topic.messageData.userHeaders.length;
+      const reader = await PartitionReader.open(async () => topic.client(), {
+        streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Single, id: 4 }, partitions: [1],
+        start: PollingStrategy.Offset(0n), options: { count: 2, maxBytes, maxWait: 100, commit: CommitPolicy.Manual },
+        prefetchBytes: budget, prefetchMessages: 4000
+      });
+      try {
+        await waitFor(() => topic.reads.length * 2 * frameBytes >= budget - maxBytes, 'prefetch did not fill');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.ok(topic.reads.length * 2 * frameBytes <= budget + 2 * maxBytes,
+          'queued message frames exceeded the byte budget');
+        const reads = topic.reads.length;
+        const queuedBytes = reader['queuedBytes'];
+        const batch = await reader.next();
+        reader.returned(batch);
+        assert.equal(reader['queuedBytes'], queuedBytes, 'returning a batch did not restore its byte budget');
+        const returned = await reader.next();
+        assert.equal(returned, batch);
+        assert.equal(batch.messages.length, 2);
+        assert.equal(batch.messages[0].headers.userHeadersLength, headers ? userHeaders.length : 0);
+        for (let index = 0; index < reads; index++) await reader.next();
+        await waitFor(() => topic.reads.length > reads, 'delivery did not free the byte budget');
+      } finally {
+        await reader.close();
+      }
+    });
+  }
+
   it('reads the partitions of each primary in one fetch and hands over every partition', async () => {
     const topic = new FakeTopic();
     const reader = await open(topic, [0, 1, 2, 3]);
