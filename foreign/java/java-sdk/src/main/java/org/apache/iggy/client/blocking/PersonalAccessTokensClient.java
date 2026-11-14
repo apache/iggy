@@ -53,6 +53,13 @@ public interface PersonalAccessTokensClient {
 
     List<PersonalAccessTokenInfo> getPersonalAccessTokens();
 
+    /**
+     * Deletes a personal access token by name.
+     *
+     * @param name The name of the token
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException over HTTP, if the name is null, is "." or "..",
+     *     or is not valid Unicode
+     */
     void deletePersonalAccessToken(String name);
 
     IdentityInfo loginWithPersonalAccessToken(String token);

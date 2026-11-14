@@ -1288,7 +1288,15 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default)
     {
-        var response = await _httpClient.DeleteAsync($"/personal-access-tokens/{name}", token);
+        ArgumentNullException.ThrowIfNull(name);
+
+        // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
+        if (name is "." or "..")
+        {
+            throw new ArgumentException("Personal access token name must not be '.' or '..'.", nameof(name));
+        }
+
+        var response = await _httpClient.DeleteAsync($"/personal-access-tokens/{Uri.EscapeDataString(name)}", token);
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);
