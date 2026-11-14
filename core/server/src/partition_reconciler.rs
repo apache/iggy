@@ -1217,6 +1217,7 @@ async fn reconcile_target(
     match built {
         Ok(Some(mut partition)) => {
             partition.set_encryptor(encryptor);
+            partition.start_at_create_op(partition_metadata.created_op);
             ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                 namespace: ns,
                 partition: Box::new(partition),
@@ -2484,6 +2485,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::{
         CreateStreamRequest, DeleteStreamRequest, RewrapStreamKeyEntry, RewrapStreamKeysRequest,
     };
+    use iggy_binary_protocol::requests::system::SessionIdentity;
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
         UpdateTopicResolvedRequest,
@@ -2518,8 +2520,8 @@ mod tests {
     };
     use metadata::stm::user::Users;
     use partitions::{
-        ExecutorDeleter, IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig,
-        RETIRED_OBJECT_GRACE, RepairSession, Segment, object_prefix,
+        BatchRetirement, ExecutorDeleter, IggyPartition, IggyPartitions, PartitionPathLayout,
+        PartitionsConfig, RETIRED_OBJECT_GRACE, RepairSession, Segment, object_prefix,
     };
     use rand::prelude::{RngExt, SeedableRng, StdRng};
     use server_common::sharding::{IggyNamespace, ShardId};
@@ -6439,6 +6441,44 @@ mod tests {
             batches[0].0.completions(),
             [completion(RETIRED_PARTITION_OP)],
             "two copies left cannot elect a primary of four"
+        );
+    }
+
+    /// A built partition refuses every request stamped below its create op, so
+    /// a session that ended before the create needs no barrier there.
+    #[compio::test]
+    async fn given_a_created_partition_when_built_should_start_at_its_create_op() {
+        const TOPIC_OP: u64 = 9;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, TOPIC_OP, 0, "topic", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_by_ns(&namespace)
+            .expect("the passes built the partition");
+        let ended_before = |metadata_watermark| {
+            [SessionIdentity {
+                client_id: 1,
+                session: 1,
+                metadata_watermark,
+            }]
+        };
+        assert_eq!(
+            partition.sessions_retired(&ended_before(TOPIC_OP), TOPIC_OP),
+            BatchRetirement::Retired
+        );
+        assert_eq!(
+            partition.sessions_retired(&ended_before(TOPIC_OP + 1), TOPIC_OP + 1),
+            BatchRetirement::Owed(Vec::new()),
+            "the frontier stops at the create op"
         );
     }
 

@@ -84,7 +84,8 @@ pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::{
-    IggyPartition, LocalEnvelope, RetirementDebtStatus, SegmentEviction, SegmentRemoval,
+    BatchRetirement, IggyPartition, LocalEnvelope, RetirementDebtStatus, SegmentEviction,
+    SegmentRemoval,
 };
 pub use iggy_partitions::{IggyPartitions, SentReport};
 pub(crate) use io::PartitionIoVerdict;

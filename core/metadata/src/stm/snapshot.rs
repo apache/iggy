@@ -71,7 +71,10 @@ use crate::stm::user::UsersSnapshot;
 /// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op`,
 /// and each pending lifecycle target `retired_members`, as trailing, defaulted
 /// fields.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 15;
+///
+/// Version 16: `PartitionSnapshot` gained `created_op`, the metadata op of a
+/// partition incarnation, as a trailing, defaulted field.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 16;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -659,7 +662,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 15;
+        const PINNED_VERSION: u32 = 16;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -692,8 +695,9 @@ mod tests {
         const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
         // Version 5 appended `created_view` the same way. Version 10 dropped
         // `purge_generation` from the middle, which no default can cover.
-        // `members` and `retirement_debt_op` are appended with defaults.
-        const PARTITION_FIELD_COUNT: u32 = 8;
+        // `members`, `retirement_debt_op` and `created_op` are appended with
+        // defaults.
+        const PARTITION_FIELD_COUNT: u32 = 9;
 
         let client_table = consensus::ClientTableSnapshot {
             slots: Vec::new(),
@@ -739,6 +743,7 @@ mod tests {
             created_view: 0,
             members: Vec::new(),
             retirement_debt_op: 0,
+            created_op: 0,
         };
         let encoded = rmp_serde::to_vec(&partition).unwrap();
         assert_eq!(
@@ -885,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn given_format_fourteen_partition_when_decoding_should_default_members_and_debt() {
+    fn given_format_fourteen_partition_when_decoding_should_default_the_appended_fields() {
         #[derive(Serialize)]
         struct FormatFourteenPartition {
             id: usize,
@@ -912,6 +917,7 @@ mod tests {
         assert_eq!((decoded.id, decoded.created_view), (2, 7));
         assert!(decoded.members.is_empty(), "stored on every node");
         assert_eq!(decoded.retirement_debt_op, 0);
+        assert_eq!(decoded.created_op, 0);
     }
 
     #[test]
@@ -1049,6 +1055,7 @@ mod tests {
                                 created_view: 0,
                                 members: vec![2, 0, 1],
                                 retirement_debt_op: 9,
+                                created_op: 11,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the
@@ -1087,6 +1094,7 @@ mod tests {
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
         assert_eq!(topic.partitions[0].retirement_debt_op, 9);
+        assert_eq!(topic.partitions[0].created_op, 11);
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);

@@ -118,6 +118,10 @@ pub struct PartitionSnapshot {
     /// `#[serde(default)]` so snapshots predating retirement debt restore at 0.
     #[serde(default)]
     pub retirement_debt_op: u64,
+    /// `#[serde(default)]` so older snapshots restore at 0, the frontier every
+    /// partition started at before it existed.
+    #[serde(default)]
+    pub created_op: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +151,10 @@ pub struct Partition {
     /// had not proven retired, `0` for none. The partition pays it by
     /// committing a retirement whose `paid_through` reaches it.
     pub retirement_debt_op: u64,
+    /// Metadata op that created this incarnation. Its replicas refuse every
+    /// request stamped below it, so a session that ended before it needs no
+    /// retirement walk over it.
+    pub created_op: u64,
 }
 
 impl Partition {
@@ -167,6 +175,7 @@ impl Partition {
             deleted_up_to_offset: 0,
             members: None,
             retirement_debt_op: 0,
+            created_op: 0,
         }
     }
 
@@ -298,6 +307,7 @@ impl TryFrom<PartitionSnapshot> for Partition {
                 .then(|| ReplicaSet::new(&snapshot.members))
                 .transpose()?,
             retirement_debt_op: snapshot.retirement_debt_op,
+            created_op: snapshot.created_op,
         })
     }
 }
@@ -1015,8 +1025,9 @@ define_state! {
         // `recent_partition_changes` use it as their cursor. Deterministic
         // across replicas: same ops, same order.
         pub revision: u64,
-        // Retirement proofs survive truncation, but not a changed set of
-        // partition incarnations.
+        // Changes with the set of partition incarnations, never with a
+        // truncation. Keys the caches that the retirement sweep builds from
+        // that set.
         pub namespace_revision: u64,
         // Newest op that recorded a retirement debt. Rebuilt on restore.
         pub retirement_debt_revision: u64,
@@ -3492,6 +3503,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                     deleted_up_to_offset: 0,
                     members,
                     retirement_debt_op: 0,
+                    created_op: state.apply_context.metadata_op,
                 };
                 state.placement_index.insert(&partition);
                 state.recent_partition_changes.push(
@@ -3986,6 +3998,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 deleted_up_to_offset: 0,
                 members,
                 retirement_debt_op: 0,
+                created_op: state.apply_context.metadata_op,
             };
             state.placement_index.insert(&partition);
             state.recent_partition_changes.push(
@@ -4167,6 +4180,7 @@ impl Snapshotable for Streams {
                                                 .members
                                                 .map_or_default(|members| members.nodes().to_vec()),
                                             retirement_debt_op: p.retirement_debt_op,
+                                            created_op: p.created_op,
                                         })
                                         .collect(),
                                     consumer_groups: topic
@@ -4551,7 +4565,10 @@ mod tests {
     }
 
     #[test]
-    fn given_committed_assignments_when_replaying_should_preserve_each_initial_view() {
+    fn given_committed_assignments_when_replaying_should_preserve_each_initial_view_and_create_op()
+    {
+        const TOPIC_OP: u64 = 5;
+        const PARTITIONS_OP: u64 = 6;
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "s");
 
@@ -4580,6 +4597,7 @@ mod tests {
         };
         let create_topic =
             CreateTopicWithAssignmentsRequest::decode_from(&create_topic.to_bytes()).unwrap();
+        inner.apply_context.metadata_op = TOPIC_OP;
         let reply = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::from(1));
         assert_eq!(reply.code, 0, "create topic must succeed");
 
@@ -4614,6 +4632,7 @@ mod tests {
 
         let replayed =
             CreatePartitionsWithAssignmentsRequest::decode_from(&committed_body).unwrap();
+        restored.apply_context.metadata_op = PARTITIONS_OP;
         let reply = StateHandler::apply(&replayed, &mut restored, IggyTimestamp::from(2));
         assert_eq!(reply.code, 0, "create partitions must succeed");
 
@@ -4629,11 +4648,20 @@ mod tests {
                         partition.id,
                         partition.consensus_group_id,
                         partition.created_view,
+                        partition.created_op,
                     )
                 })
                 .collect::<Vec<_>>()
         });
-        assert_eq!(assignments, [(0, 1, 7), (1, 2, 8), (2, 3, 9), (3, 4, 10)]);
+        assert_eq!(
+            assignments,
+            [
+                (0, 1, 7, TOPIC_OP),
+                (1, 2, 8, TOPIC_OP),
+                (2, 3, 9, PARTITIONS_OP),
+                (3, 4, 10, PARTITIONS_OP)
+            ]
+        );
     }
 
     /// A client may send the literal 0 that means "resolve the default". The

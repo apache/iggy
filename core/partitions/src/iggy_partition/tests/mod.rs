@@ -547,16 +547,18 @@ async fn commit_log(partition: &mut IggyPartition<IggyMessageBus>) {
     }
 }
 
-fn retirement_payment_request(
+fn retirement_request(
     namespace: IggyNamespace,
-    identities: Vec<SessionIdentity>,
-    paid_through: u64,
+    retirement: &RetireSessionsRequest,
 ) -> Message<RoutedRequestHeader> {
-    let body = RetireSessionsRequest {
-        identities,
-        paid_through,
-    }
-    .to_bytes();
+    let body = retirement.to_bytes();
+    let watermark = retirement
+        .identities
+        .iter()
+        .map(|identity| identity.metadata_watermark)
+        .chain([retirement.paid_through, retirement.retired_through])
+        .max()
+        .unwrap_or_default();
     let size = size_of::<RoutedRequestHeader>() + body.len();
     let mut request = Message::<RoutedRequestHeader>::new(size).transmute_header(
         |_, header: &mut RoutedRequestHeader| {
@@ -565,14 +567,25 @@ fn retirement_payment_request(
             header.cluster = TEST_CLUSTER;
             header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
             header.session = 1;
-            header.request = paid_through;
-            header.metadata_watermark = paid_through;
+            header.request = watermark;
+            header.metadata_watermark = watermark;
             header.group = namespace.inner();
             header.size = u32::try_from(size).unwrap();
         },
     );
     request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
     request
+}
+
+/// A one-session batch through [`IggyPartition::sessions_retired`].
+trait SessionRetired {
+    fn session_retired(&self, identity: SessionIdentity) -> bool;
+}
+
+impl<B: MessageBus, SB: SuperblockStore> SessionRetired for IggyPartition<B, SB> {
+    fn session_retired(&self, identity: SessionIdentity) -> bool {
+        self.sessions_retired(&[identity], identity.metadata_watermark) == BatchRetirement::Retired
+    }
 }
 
 /// Run the owner's I/O continuations the way the shard lane would, until

@@ -146,9 +146,6 @@ pub trait GatedApply:
     /// Propagates the underlying [`StateMachine::update`] error.
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError>;
 
-    /// Partition-set revision used to validate retirement coverage during WAL replay.
-    fn namespace_revision(&self) -> u64;
-
     /// Records the retirement debt a replayed `FinalizeSession` carried.
     fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64);
 
@@ -217,10 +214,6 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
 
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         gated_apply(self, prepare)
-    }
-
-    fn namespace_revision(&self) -> u64 {
-        self.streams().read(|inner| inner.namespace_revision)
     }
 
     fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64) {
@@ -635,10 +628,6 @@ impl GatedApply for MuxStateMachine<()> {
 
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         self.update(prepare)
-    }
-
-    fn namespace_revision(&self) -> u64 {
-        0
     }
 
     fn record_retirement_debt(&self, _debts: &[RetirementDebt], _metadata_op: u64) {}

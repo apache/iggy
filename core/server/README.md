@@ -74,6 +74,12 @@ release before the option, keep the old layout. Set `[cluster]
 default_replication_factor` to a number to give those topics fewer copies.
 Topic responses carry each partition's member list and in-sync members, a client
 wire change that SDKs from before this release cannot decode.
+Batched session retirement changes the body of the session finalization
+(op 70). It also raises the replica wire revision to 3, so a build from before
+it and a build after it refuse each other. A metadata journal entry from an older
+build that finalized a session cannot replay on the new build. A node whose
+journal holds one above its last checkpoint fails to boot. Start every replica
+of such a cluster from fresh storage.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -645,7 +651,7 @@ This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a brea
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 15 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
+Metadata snapshot format 16 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The
@@ -743,11 +749,19 @@ If the fence cannot be persisted, the session remains retained and retirement
 retries. Temporary teardown tombstones and state transfer do not qualify as
 permanent failures.
 
-Partition retirement barriers batch up to 128 ended sessions per commit. Each
-session still requires retirement reports covering every allocated partition
-from a common replica quorum before metadata releases its registry slot. Segment
-deletion does not invalidate those reports; changes to partition incarnations
-do. Metadata snapshot format 10 persists that separate revision.
+Each node retires ended sessions in batches. When a walk starts, its watermark
+is the highest end op among the ended sessions. Its batch is every session that
+ended at or below the watermark. The walk visits each partition that the node
+stores. A partition proves the batch once its metadata frontier reaches the
+watermark and no batch session holds an entry or a pending request on it. A
+partition retirement barrier names up to 128 of the sessions that
+still hold entries, and it raises the frontier.
+
+A partition created above the watermark cannot hold a session of the batch, so
+the walk skips it. A topic created or deleted during a walk does not restart
+it. Metadata releases the registry slots of every session at or below the
+lowest watermark among the reports of a replica quorum. A partition whose
+members did not prove the batch owes the retirement, as described above.
 
 A committed partition that has never initialized on this replica can finish
 initialization after a crash, including when all replicas stopped before their
