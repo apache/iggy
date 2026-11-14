@@ -17,7 +17,19 @@
 
 //! Helpers shared by the unit tests of this crate.
 
-use message_bus::{IggyMessageBus, ReplicaLinkId};
+use consensus::{PlaneKind, VsrAction, VsrConsensus};
+use message_bus::{IggyMessageBus, MessageBus, ReplicaLinkId};
+
+/// One tick of a group alone: advance its clock, then tick it, as the shard
+/// drivers do. A partition in a table runs on the table clock, so the other
+/// partitions of the table see the tick too.
+pub fn advance_and_tick<B: MessageBus>(
+    consensus: &VsrConsensus<B>,
+    plane: PlaneKind,
+) -> Vec<VsrAction> {
+    consensus.tick_clock().advance();
+    consensus.tick(plane)
+}
 
 /// Make `replica` reachable from `bus` over one link that shard `owner`
 /// holds, the way an installed one-link bundle does: a frame to `replica`

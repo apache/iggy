@@ -854,7 +854,7 @@ mod tests {
     use crate::host::NoopHost;
     use crate::metrics::ShardMetrics;
     use crate::shards_table::{PapayaShardsTable, ShardsTable};
-    use crate::test_support::connect_replica_on;
+    use crate::test_support::{advance_and_tick, connect_replica_on};
     use crate::{
         IggyShard, LifecycleFrame, PARTITION_REPAIRS_INFLIGHT_MAX, PartitionConsensusConfig,
         REPAIR_GAP_DEBOUNCE_TICKS_MIN, Receiver, ReconcileOp, ReplicaTopology, ShardFrame,
@@ -1291,7 +1291,9 @@ mod tests {
                 "snapshot tail lost op {op}"
             );
         }
-        owner.ticks.set(9);
+        for _ in 0..9 {
+            partitions.tick_clock().advance();
+        }
         let repair = Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
             .transmute_header(|_, header: &mut RequestPreparesHeader| {
                 header.command = Command::RequestPrepares;
@@ -1825,6 +1827,7 @@ mod tests {
                         scan: None,
                         seed: None,
                         pulled_len: 0,
+                        slot: partitions.transfer_slot(),
                     }));
                 }
                 partitions.insert(namespace, partition);
@@ -2929,7 +2932,7 @@ mod tests {
                 } else {
                     partition.begin_shutdown_io();
                 }
-                assert!(!owner.arm_partition_transfer(partition, 0, 0).await);
+                owner.arm_partition_transfer(partition, 0).await;
                 assert!(partition.transfer().is_none());
                 assert!(partition.transfer_rearm.is_none());
                 partition
@@ -2949,6 +2952,7 @@ mod tests {
                     scan: None,
                     seed: None,
                     pulled_len: 0,
+                    slot: partitions.transfer_slot(),
                 }));
 
                 owner
@@ -4235,6 +4239,7 @@ mod tests {
                 read: LocalWork::default(),
             }),
             pulled_len: 0,
+            slot: partitions.transfer_slot(),
         }));
         partitions.insert(namespace, partition);
         let bound = RETRY_TICKS * crate::STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE
@@ -4369,6 +4374,7 @@ mod tests {
                 },
             }),
             pulled_len: 0,
+            slot: partitions.transfer_slot(),
         }));
         partitions.insert(namespace, partition);
         partitions.set_io_notifier(
@@ -4642,6 +4648,7 @@ mod tests {
                     scan: None,
                     seed: None,
                     pulled_len: 0,
+                    slot: partitions::state_transfer::TransferSlot::new(&Rc::default()),
                 }));
             }),
         ];
@@ -4756,6 +4763,79 @@ mod tests {
             (cap, LAGGING_GROUPS - cap, true),
             "(armed, deferred, deferred groups unchanged a round later) per group: {spent:?}"
         );
+    }
+
+    /// Every path that ends a session frees its transfer slot, a partition
+    /// removed during its transfer included. So the count matches a scan of
+    /// the table, and a group deferred at the cap arms once a slot frees.
+    #[compio::test]
+    async fn given_full_transfer_slots_when_sessions_end_should_free_their_slots() {
+        let cap = <IoTestShard>::PARTITION_TRANSFERS_INFLIGHT_MAX;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespaces: Vec<_> = (0..=cap)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        for &namespace in &namespaces {
+            partitions.insert(
+                namespace,
+                repairing_replica(
+                    &bus,
+                    namespace,
+                    (PAIR_BACKUP, 2),
+                    REPAIR_PRIMARY,
+                    LAGGING_COMMIT_MIN,
+                    LAGGING_COMMIT_MAX,
+                ),
+            );
+        }
+        let counted = || {
+            let sessions = namespaces
+                .iter()
+                .filter_map(|namespace| partitions.get_by_ns(namespace))
+                .filter(|partition| partition.transfer().is_some())
+                .count();
+            (partitions.transfers_inflight(), sessions)
+        };
+        for &namespace in &namespaces {
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            partition.consensus().begin_state_transfer_await();
+            owner
+                .arm_partition_transfer(partition, REPAIR_PRIMARY)
+                .await;
+        }
+        let deferred = namespaces[cap];
+        assert!(
+            partitions
+                .get_by_ns(&deferred)
+                .unwrap()
+                .transfer()
+                .is_none()
+        );
+        assert_eq!(counted(), (cap, cap));
+
+        let failed = partitions.get_mut_by_ns(&namespaces[0]).unwrap();
+        owner
+            .abandon_or_rearm_partition_transfer(failed, REPAIR_PRIMARY)
+            .await;
+        assert_eq!(counted(), (cap - 1, cap - 1));
+        assert!(partitions.remove(&namespaces[1]).is_some());
+        assert_eq!(counted(), (cap - 2, cap - 2));
+
+        let partition = partitions.get_mut_by_ns(&deferred).unwrap();
+        partition.consensus().begin_state_transfer_await();
+        owner
+            .arm_partition_transfer(partition, REPAIR_PRIMARY)
+            .await;
+        assert!(
+            partitions
+                .get_by_ns(&deferred)
+                .unwrap()
+                .transfer()
+                .is_some()
+        );
+        assert_eq!(counted(), (cap - 1, cap - 1));
     }
 
     /// A session that the ring drops without a successor leaves the gap to
@@ -5293,11 +5373,10 @@ mod tests {
             let mut backup =
                 repairing_backup(&bus, transferring, LAGGING_COMMIT_MIN, LAGGING_COMMIT_MAX);
             backup.consensus().begin_state_transfer_await();
-            assert!(
-                owner
-                    .arm_partition_transfer(&mut backup, REPAIR_PRIMARY, 0)
-                    .await
-            );
+            owner
+                .arm_partition_transfer(&mut backup, REPAIR_PRIMARY)
+                .await;
+            assert!(backup.transfer().is_some());
             for _ in 0..consensus::STATE_TRANSFER_MAX_STALL_RETRIES {
                 assert!(!backup.burn_transfer_attempt());
             }
@@ -5361,11 +5440,10 @@ mod tests {
         backup.repair_mut().unwrap().peer = REPAIR_NEXT_PEER;
         backup.consensus().begin_state_transfer_await();
 
-        assert!(
-            owner
-                .arm_partition_transfer(&mut backup, REPAIR_PRIMARY, 0)
-                .await
-        );
+        owner
+            .arm_partition_transfer(&mut backup, REPAIR_PRIMARY)
+            .await;
+        assert!(backup.transfer().is_some());
         assert!(backup.repair().is_none());
         assert_eq!(backup.repair_rotations(), 0);
         owner
@@ -7236,7 +7314,7 @@ mod tests {
         // proof settled. Its own vote stays unsent, and the vote of the candidate
         // completes its quorum.
         let backup_heartbeat_voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
-            .flat_map(|_| backup_consensus().tick(consensus::PlaneKind::Partitions))
+            .flat_map(|_| advance_and_tick(backup_consensus(), consensus::PlaneKind::Partitions))
             .any(|action| {
                 matches!(
                     action,
@@ -11063,6 +11141,7 @@ mod tests {
             scan: Some(LocalWork::default()),
             seed: None,
             pulled_len: 0,
+            slot: partitions.transfer_slot(),
         }));
         partitions.insert(namespace, partition);
         ScanningReceiver {

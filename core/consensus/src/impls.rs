@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::oneshot::{self, Receiver, Sender};
-use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
+use crate::vsr_timeout::{TickClock, TimeoutKind, TimeoutManager, jitter_salt};
 use crate::{
     AckLogEvent, Consensus, ControlActionLogEvent, DvcHeaderKind, DvcQuorumArray, DvcSuffix,
     HistoryCertificate, HistoryRecovery, IgnoreReason, MergeOutcome, MergeQuorums, MergedLog,
@@ -2036,10 +2036,6 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "VsrConsensus group must be METADATA_GROUP or a packable \
              IggyNamespace; got {group:#x}"
         );
-        // Jitter only has to desynchronize replicas of one group, whose ids
-        // differ, so the XOR cannot collide where it matters; `seed_from_u64`
-        // (SplitMix64) decorrelates the streams of nearby seeds.
-        let timeout_seed = u128::from(replica) ^ u128::from(group);
         let prepare_queue_max = pipeline.prepare_queue_max();
         // A metadata replica with no history holds view 0's empty log until boot
         // restores what recovery decided. Partitions keep no certificate.
@@ -2101,7 +2097,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
-            timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
+            timeouts: RefCell::new(TimeoutManager::new(TickClock::default())),
             heartbeat_watermark: Cell::new((0, 0)),
             quorum_heartbeat_floor: Cell::new(0),
             heartbeat_replies: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
@@ -2169,6 +2165,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.timeouts
             .borrow_mut()
             .set_request_start_view_ticks(ticks);
+    }
+
+    /// Move the timers from the private clock every constructor makes onto
+    /// `clock`, which the driver of this group advances. Running timers keep
+    /// the ticks they have left, so a timer that `init` started does not fire
+    /// at once on a clock that is far ahead.
+    pub fn install_tick_clock(&self, clock: TickClock) {
+        self.timeouts.borrow_mut().install_clock(clock);
+    }
+
+    /// The clock of the timers. Its driver advances it once per tick, before
+    /// it ticks the groups on it.
+    #[must_use]
+    pub fn tick_clock(&self) -> TickClock {
+        self.timeouts.borrow().clock().clone()
     }
 
     /// Override the recovering-replica probe-attempt ceiling before it falls
@@ -2363,10 +2374,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // sustained load the backoff ratchets up to 16x base and the tail
             // op's retransmit fires too rarely to recover a lost backup ack,
             // stalling commit. `start` (not `reset`) forces the timer ticking
-            // at the base interval - `reset` alone leaves `ticking` untouched,
-            // so a timer stopped earlier would be armed-but-dead and never
-            // fire. When nothing is pending the timer self-stops via the
-            // empty-pipeline branch in `handle_prepare_timeout`.
+            // at the base interval - `reset` leaves a timer stopped earlier
+            // stopped, so it would never fire. When nothing is pending the
+            // timer self-stops via the empty-pipeline branch in
+            // `handle_prepare_timeout`.
             if self.sequencer.current_sequence() > commit {
                 self.timeouts.borrow_mut().start(TimeoutKind::Prepare);
             }
@@ -2747,10 +2758,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if empty {
             timeouts.stop(TimeoutKind::Prepare);
         } else {
-            // `start`, not `reset`: `reset` leaves `ticking` untouched, so a timer
-            // stopped earlier would come back armed-but-dead and never fire. On an
-            // already-ticking timer the two are the same call. Same trap
-            // `advance_commit_max` documents.
+            // `start`, not `reset`: `reset` leaves a timer stopped earlier
+            // stopped, so it would never fire. On an already-ticking timer the
+            // two are the same call. Same trap `advance_commit_max` documents.
             timeouts.start(TimeoutKind::Prepare);
         }
     }
@@ -3425,7 +3435,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         pipeline.clear_request_queue();
     }
 
-    /// Process one tick. Call this every [`crate::TICK_INTERVAL`].
+    /// Handle the timeouts that fired on [`Self::tick_clock`]. The driver
+    /// advances that clock once per [`crate::TICK_INTERVAL`] before it ticks
+    /// the groups on it.
     ///
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
@@ -3443,10 +3455,6 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let mut actions = Vec::new();
         let mut timeouts = self.timeouts.borrow_mut();
 
-        // Phase 1: Tick all timeouts
-        timeouts.tick();
-
-        // Phase 2: Handle fired timeouts
         if timeouts.fired(TimeoutKind::CheckQuorum) {
             drop(timeouts);
             self.handle_check_quorum_timeout();
@@ -3850,16 +3858,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Resend DVC message if we've sent one.
     fn handle_do_view_change_message_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        if self.status.get() != Status::ViewChange {
-            return Vec::new();
-        }
-
-        if !self.sent_own_do_view_change.get() {
-            return Vec::new();
-        }
-
-        // If we're primary candidate with quorum, don't resend
-        if self.is_primary() && self.do_view_change_quorum.get() {
+        // Nothing to resend outside a view change, before this view's own
+        // DVC, or on a candidate that holds a quorum. The fired timer would
+        // refire every tick, and the next DVC send starts it again.
+        if self.status.get() != Status::ViewChange
+            || !self.sent_own_do_view_change.get()
+            || (self.is_primary() && self.do_view_change_quorum.get())
+        {
+            self.timeouts
+                .borrow_mut()
+                .stop(TimeoutKind::DoViewChangeMessage);
             return Vec::new();
         }
 
@@ -4014,7 +4022,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let (targets, local_retries) = self.prepare_timeout_targets();
         if targets.is_empty() && local_retries.is_empty() {
             // In-flight ops all have their acks; re-check after backoff.
-            self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
+            self.timeouts
+                .borrow_mut()
+                .backoff_prepare(jitter_salt(self.group, self.replica));
             return Vec::new();
         }
 
@@ -4027,7 +4037,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             first_local_retry_op = local_retries.first(),
             "prepare timeout: re-driving un-acked prepares"
         );
-        self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
+        self.timeouts
+            .borrow_mut()
+            .backoff_prepare(jitter_salt(self.group, self.replica));
 
         let mut actions =
             Vec::with_capacity(local_retries.len() + usize::from(!targets.is_empty()));
@@ -4045,7 +4057,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Primary heartbeat: send commit point to all backups so they know
     /// the primary is alive and can advance their own `commit_max`.
     fn handle_commit_message_timeout(&self) -> Vec<VsrAction> {
+        // A primary that left Normal has no commit point to send, and the
+        // fired timer would refire every tick. Becoming a Normal primary
+        // again starts it.
         if !self.is_primary() || self.status.get() != Status::Normal {
+            self.timeouts.borrow_mut().stop(TimeoutKind::CommitMessage);
             return Vec::new();
         }
 
@@ -6861,11 +6877,28 @@ mod pipeline_entry_tests {
 /// Fixtures every consensus test module needs.
 #[cfg(test)]
 pub mod test_bus {
-    use super::{Command, METADATA_GROUP, Message, StartViewChangeHeader, StartViewHeader};
+    use super::{
+        Command, METADATA_GROUP, Message, Pipeline, PipelineEntry, PlaneKind,
+        StartViewChangeHeader, StartViewHeader, VsrAction, VsrConsensus,
+    };
     use iggy_binary_protocol::{CommitHeader, ConsensusHeader};
     use message_bus::{BusMessage, MessageBus};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
+
+    /// One tick of a group that has a clock of its own: advance the clock,
+    /// then tick, as the shard drivers do.
+    pub fn advance_and_tick<B, P>(
+        consensus: &VsrConsensus<B, P>,
+        plane: PlaneKind,
+    ) -> Vec<VsrAction>
+    where
+        B: MessageBus,
+        P: Pipeline<Entry = PipelineEntry>,
+    {
+        consensus.tick_clock().advance();
+        consensus.tick(plane)
+    }
 
     /// A `StartView` at `view` announcing head `op`. `commit == op` is the steady
     /// case (no suffix); a lower `commit` keeps an uncommitted suffix.
@@ -7625,6 +7658,7 @@ mod timestamp_clamp_tests {
 #[cfg(test)]
 mod vsr_consensus_tests {
     use super::*;
+    use crate::test_bus::advance_and_tick;
     use futures::FutureExt;
     use message_bus::BusMessage;
 
@@ -8139,7 +8173,7 @@ mod vsr_consensus_tests {
         backup.begin_view_probe();
         for _ in 0..TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS * u64::from(PROBE_ATTEMPTS_MAX)
         {
-            backup.tick(plane);
+            advance_and_tick(&backup, plane);
         }
         assert_eq!(backup.view(), 1);
         assert_eq!(backup.status(), Status::ViewChange);
@@ -8163,12 +8197,12 @@ mod vsr_consensus_tests {
         backup.observe_newer_view(SETTLED_VIEW);
 
         for _ in 0..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
-            backup.tick(plane);
+            advance_and_tick(&backup, plane);
         }
         assert_eq!((backup.view(), backup.status()), (1, Status::Recovering));
 
         let probe = (0..TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS)
-            .flat_map(|_| backup.tick(plane))
+            .flat_map(|_| advance_and_tick(&backup, plane))
             .find_map(|action| match action {
                 VsrAction::SendRequestStartView { view, group } => Some(
                     Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
@@ -8347,7 +8381,7 @@ mod vsr_consensus_tests {
         consensus.init();
         let pass_heartbeat_interval = || {
             for _ in 0..HEARTBEAT_TICKS {
-                let _ = consensus.tick(PlaneKind::Metadata);
+                let _ = advance_and_tick(&consensus, PlaneKind::Metadata);
             }
         };
 
@@ -8474,8 +8508,7 @@ mod vsr_consensus_tests {
                 _ => unreachable!(),
             }
             assert!(
-                !consensus
-                    .tick(PlaneKind::Metadata)
+                !advance_and_tick(&consensus, PlaneKind::Metadata)
                     .iter()
                     .any(|action| matches!(action, VsrAction::SendCommit { .. })),
                 "announced a commit after {reason}"
@@ -8490,7 +8523,7 @@ mod vsr_consensus_tests {
                 VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
             consensus.init();
             for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
-                for action in consensus.tick(PlaneKind::Metadata) {
+                for action in advance_and_tick(&consensus, PlaneKind::Metadata) {
                     if let VsrAction::SendCommit {
                         view,
                         timestamp_monotonic,
@@ -8526,7 +8559,7 @@ mod vsr_consensus_tests {
                         test_bus::make_commit(1, 1, tick / TimeoutManager::COMMIT_MESSAGE_TICKS);
                     consensus.handle_commit(heartbeat.header());
                 }
-                let _ = consensus.tick(PlaneKind::Metadata);
+                let _ = advance_and_tick(&consensus, PlaneKind::Metadata);
                 assert_eq!(
                     (consensus.view(), consensus.votes_to_leave_view()),
                     (1, false),
@@ -8536,7 +8569,7 @@ mod vsr_consensus_tests {
             }
 
             for _ in 0..TimeoutManager::NORMAL_HEARTBEAT_TICKS {
-                let _ = consensus.tick(PlaneKind::Metadata);
+                let _ = advance_and_tick(&consensus, PlaneKind::Metadata);
             }
             assert_eq!(
                 (consensus.view(), consensus.votes_to_leave_view()),
@@ -8571,7 +8604,7 @@ mod vsr_consensus_tests {
                     consensus.handle_commit(heartbeat.header());
                 }
             }
-            let _ = consensus.tick(PlaneKind::Metadata);
+            let _ = advance_and_tick(&consensus, PlaneKind::Metadata);
         }
         assert_eq!(
             (consensus.view(), consensus.votes_to_leave_view()),
@@ -8669,8 +8702,7 @@ mod vsr_consensus_tests {
 
     /// The `Commit`s the next tick sends, as `(target, commit)`.
     fn tick_commits(consensus: &VsrConsensus<StageNoopBus>) -> Vec<(Option<u8>, u64)> {
-        consensus
-            .tick(PlaneKind::Metadata)
+        advance_and_tick(consensus, PlaneKind::Metadata)
             .into_iter()
             .filter_map(|action| match action {
                 VsrAction::SendCommit { target, commit, .. } => Some((target, commit)),
@@ -9132,6 +9164,37 @@ mod vsr_consensus_tests {
         assert!(
             matches!(receiver.now_or_never(), Some(Err(crate::oneshot::Canceled))),
             "dropping the entry must cancel its awaiter"
+        );
+    }
+
+    #[test]
+    fn given_timers_started_on_the_private_clock_when_moved_to_a_clock_far_ahead_should_fire_after_the_ticks_left()
+     {
+        const ELAPSED: u64 = 7;
+        const FAR_AHEAD: u64 = 1 << 20;
+        let backup = VsrConsensus::new(1, 1, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        backup.init();
+        for _ in 0..ELAPSED {
+            assert!(advance_and_tick(&backup, PlaneKind::Metadata).is_empty());
+        }
+        let table = TickClock::default();
+        for _ in 0..FAR_AHEAD {
+            table.advance();
+        }
+
+        backup.install_tick_clock(table.clone());
+
+        let votes_after = (1..=TimeoutManager::NORMAL_HEARTBEAT_TICKS).find(|_| {
+            table.advance();
+            backup
+                .tick(PlaneKind::Metadata)
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartViewChange { .. }))
+        });
+        assert_eq!(
+            votes_after,
+            Some(TimeoutManager::NORMAL_HEARTBEAT_TICKS - ELAPSED),
+            "the heartbeat timeout keeps the ticks it had left on the private clock"
         );
     }
 }
@@ -9615,7 +9678,7 @@ mod recovery_election_tests {
     use super::*;
     use crate::LocalPipeline;
     use crate::dvc_merge::suffix_all_present;
-    use crate::test_bus::NoopBus;
+    use crate::test_bus::{NoopBus, advance_and_tick};
     use crate::view_change_quorum::encode_prepare_headers;
     use iggy_binary_protocol::{CommitHeader, CommitReplyHeader, HEADER_SIZE, Operation};
 
@@ -9730,7 +9793,7 @@ mod recovery_election_tests {
     fn survivor_voting_alone(plane: PlaneKind) -> VsrConsensus<NoopBus, LocalPipeline> {
         let consensus = backup_in_old_view(SURVIVOR);
         while !consensus.votes_to_leave_view() {
-            consensus.tick(plane);
+            advance_and_tick(&consensus, plane);
         }
         assert_eq!(
             (consensus.status(), consensus.view()),
@@ -9997,7 +10060,7 @@ mod recovery_election_tests {
             for tick in 0..ticks {
                 let mut outbox = VecDeque::new();
                 for index in 0..REPLICA_COUNT {
-                    for action in self.replica(index).tick(self.plane) {
+                    for action in advance_and_tick(self.replica(index), self.plane) {
                         outbox.push_back((index, action));
                     }
                 }
@@ -10054,7 +10117,7 @@ mod recovery_election_tests {
         for tick in 0..TICKS {
             let mut outbox = VecDeque::new();
             for index in 0..REPLICA_COUNT {
-                for action in cluster.replica(index).tick(plane) {
+                for action in advance_and_tick(cluster.replica(index), plane) {
                     outbox.push_back((index, action));
                 }
             }
@@ -10111,9 +10174,7 @@ mod recovery_election_tests {
 
         let probe = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
             .find_map(|_| {
-                cluster
-                    .replica(RESTARTED_PRIMARY)
-                    .tick(plane)
+                advance_and_tick(cluster.replica(RESTARTED_PRIMARY), plane)
                     .into_iter()
                     .find(|action| matches!(action, VsrAction::SendRequestStartView { .. }))
             })
@@ -10272,7 +10333,7 @@ mod recovery_election_tests {
         for tick in 0..TICKS {
             let mut outbox = VecDeque::new();
             for index in 0..REPLICA_COUNT {
-                for action in cluster.replica(index).tick(plane) {
+                for action in advance_and_tick(cluster.replica(index), plane) {
                     outbox.push_back((index, action));
                 }
             }
@@ -10430,7 +10491,7 @@ mod recovery_election_tests {
         let plane = PlaneKind::Partitions;
         let candidate = restarted(LAGGING_BACKUP, LAGGING_HEAD, false);
         while candidate.status() == Status::Recovering {
-            candidate.tick(plane);
+            advance_and_tick(&candidate, plane);
         }
         let view = candidate.view();
         assert_eq!(candidate.primary_index(view), LAGGING_BACKUP);
@@ -10871,7 +10932,7 @@ mod recovery_election_tests {
         let plane = PlaneKind::Partitions;
         let candidate = restarted(LAGGING_BACKUP, LAGGING_HEAD, false);
         while candidate.status() == Status::Recovering {
-            candidate.tick(plane);
+            advance_and_tick(&candidate, plane);
         }
         assert!(candidate.has_untrusted_log());
         let view = (candidate.view() + 1..=candidate.view() + u32::from(REPLICA_COUNT))
@@ -10970,7 +11031,7 @@ mod recovery_election_tests {
 #[cfg(test)]
 mod check_quorum_tests {
     use super::*;
-    use crate::test_bus::NoopBus;
+    use crate::test_bus::{NoopBus, advance_and_tick};
     use iggy_binary_protocol::CommitReplyHeader;
 
     const WINDOW_TICKS: u64 = 8;
@@ -11002,7 +11063,7 @@ mod check_quorum_tests {
         for replicas in 1..=5 {
             let consensus = primary(replicas);
             for _ in 0..3 * WINDOW_TICKS {
-                for action in consensus.tick(PlaneKind::Metadata) {
+                for action in advance_and_tick(&consensus, PlaneKind::Metadata) {
                     if let VsrAction::SendCommit {
                         timestamp_monotonic,
                         ..
@@ -11022,6 +11083,7 @@ mod check_quorum_tests {
     fn given_duplicate_replies_below_quorum_when_history_is_leased_should_stop_leading() {
         let consensus = primary(5);
         for _ in 0..WINDOW_TICKS {
+            consensus.tick_clock().advance();
             for action in consensus.tick_with_history_fence(PlaneKind::Metadata, true) {
                 if let VsrAction::SendCommit {
                     timestamp_monotonic,
@@ -11062,7 +11124,7 @@ mod check_quorum_tests {
         let _ = consensus.commit_heartbeat();
         consensus.handle_commit_reply(&delayed);
         for _ in 0..WINDOW_TICKS {
-            consensus.tick(PlaneKind::Metadata);
+            advance_and_tick(&consensus, PlaneKind::Metadata);
         }
         assert!(
             consensus.is_acting_primary(),
@@ -11070,7 +11132,7 @@ mod check_quorum_tests {
         );
         for _ in 0..WINDOW_TICKS {
             consensus.handle_commit_reply(&delayed);
-            consensus.tick(PlaneKind::Metadata);
+            advance_and_tick(&consensus, PlaneKind::Metadata);
         }
         assert_eq!(
             consensus.status(),
@@ -11118,7 +11180,7 @@ mod check_quorum_tests {
             let _ = consensus.commit_heartbeat();
             consensus.handle_commit_reply(&header);
             for _ in 0..WINDOW_TICKS {
-                consensus.tick(PlaneKind::Metadata);
+                advance_and_tick(&consensus, PlaneKind::Metadata);
             }
             assert_eq!(consensus.status(), Status::Recovering, "{header:?}");
         }
@@ -11132,7 +11194,7 @@ mod view_change_vote_tests {
 
     use super::*;
     use crate::LocalPipeline;
-    use crate::test_bus::{NoopBus, make_commit, make_start_view_change};
+    use crate::test_bus::{NoopBus, advance_and_tick, make_commit, make_start_view_change};
 
     const REPLICA_COUNT: u8 = 3;
     const VIEW: u32 = 0;
@@ -11169,7 +11231,7 @@ mod view_change_vote_tests {
         let probing =
             TimeoutManager::REQUEST_START_VIEW_MESSAGE_TICKS * u64::from(PROBE_ATTEMPTS_MAX);
         let actions = (0..probing)
-            .flat_map(|_| consensus.tick(PLANE))
+            .flat_map(|_| advance_and_tick(&consensus, PLANE))
             .collect::<Vec<_>>();
         assert!(!sends_do_view_change(&actions), "{actions:?}");
         assert_eq!(
@@ -11197,6 +11259,55 @@ mod view_change_vote_tests {
         actions
             .iter()
             .any(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
+    }
+
+    /// A primary that enters a view change keeps the commit timer of its old
+    /// view. When it fires, the handler stops it instead of leaving it fired.
+    #[test]
+    fn given_a_primary_in_a_view_change_when_its_commit_timer_fires_should_stop_it() {
+        let consensus = replica(PRIMARY);
+        let _ = consensus.enter_view_change(
+            PLANE,
+            NEXT_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+
+        for _ in 0..TimeoutManager::COMMIT_MESSAGE_TICKS {
+            let _ = advance_and_tick(&consensus, PLANE);
+        }
+
+        assert!(
+            !consensus
+                .timeouts
+                .borrow()
+                .is_ticking(TimeoutKind::CommitMessage)
+        );
+    }
+
+    /// A replica that sent its DVC and then moved to the next view change has
+    /// no DVC of that view to resend yet. The handler stops the fired timer.
+    #[test]
+    fn given_a_later_view_change_before_its_do_view_change_when_the_timer_fires_should_stop_it() {
+        let consensus = replica(BACKUP);
+        let _ = consensus.handle_normal_heartbeat_timeout(PLANE);
+        let sent = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
+        assert!(sends_do_view_change(&sent), "{sent:?}");
+        let _ = consensus.enter_view_change(
+            PLANE,
+            NEXT_VIEW + 1,
+            ViewChangeReason::ViewChangeStatusTimeout,
+        );
+
+        for _ in 0..TimeoutManager::DO_VIEW_CHANGE_MESSAGE_TICKS {
+            let _ = advance_and_tick(&consensus, PLANE);
+        }
+
+        assert!(
+            !consensus
+                .timeouts
+                .borrow()
+                .is_ticking(TimeoutKind::DoViewChangeMessage)
+        );
     }
 
     #[test]
@@ -11242,7 +11353,7 @@ mod view_change_vote_tests {
         let _ = consensus.handle_commit(make_commit(VIEW, PRIMARY, 1).header());
 
         let resent = (0..TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS)
-            .flat_map(|_| consensus.tick(PLANE))
+            .flat_map(|_| advance_and_tick(&consensus, PLANE))
             .collect::<Vec<_>>();
         assert!(!votes_for(&resent, NEXT_VIEW), "{resent:?}");
         let actions = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
@@ -11331,7 +11442,7 @@ mod view_change_vote_tests {
         let consensus = alone_in_next_view(2, PRIMARY);
 
         let alone = (0..TimeoutManager::DO_VIEW_CHANGE_MESSAGE_TICKS)
-            .flat_map(|_| consensus.tick(PLANE))
+            .flat_map(|_| advance_and_tick(&consensus, PLANE))
             .collect::<Vec<_>>();
         let with_peer = start_view_change(&consensus, CANDIDATE, NEXT_VIEW);
 

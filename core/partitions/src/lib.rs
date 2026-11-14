@@ -86,7 +86,7 @@ pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::{
     IggyPartition, LocalEnvelope, RetirementDebtStatus, SegmentEviction, SegmentRemoval,
 };
-pub use iggy_partitions::IggyPartitions;
+pub use iggy_partitions::{IggyPartitions, SentReport};
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
