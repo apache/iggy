@@ -189,6 +189,19 @@ impl Default for MetadataConfig {
     }
 }
 
+impl Default for NodeConfig {
+    fn default() -> NodeConfig {
+        NodeConfig {
+            advertised_address: None,
+            free_space_reserve: SERVER_CONFIG
+                .node
+                .free_space_reserve
+                .parse()
+                .expect("static_toml node.free_space_reserve must parse as IggyByteSize"),
+        }
+    }
+}
+
 impl Default for PartitionConfig {
     fn default() -> PartitionConfig {
         // Read from the embedded TOML so the Default impl and the on-disk

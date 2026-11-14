@@ -300,6 +300,7 @@ pub fn bootstrap(
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
+    crate::sysinfo_probe::init_free_space_reserve(config.node.free_space_reserve.as_bytes_u64());
     // Before the shards, so the first count is there when a client connects.
     let sysinfo_print_interval = config.logging.sysinfo_print_interval.get_duration();
     crate::sysinfo_probe::start_system_stats_sampler(sysinfo_print_interval)

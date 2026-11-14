@@ -18,6 +18,7 @@
 #![allow(clippy::future_not_send)]
 
 mod consumer_offset_capacity;
+mod free_space;
 mod iggy_index;
 mod iggy_index_reader;
 mod iggy_index_writer;
@@ -59,6 +60,7 @@ pub use wal_storage::{InjectedFile, InjectedStorage, WalFile, WalStorage};
 pub type WalStorage = ::journal::durable_storage::DiskStorage;
 
 pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
+pub use free_space::{FreeSpaceChange, FreeSpaceReserve};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
