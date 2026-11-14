@@ -662,6 +662,10 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     }
 
     async fn drop_tail(&mut self, from_op: u64) -> io::Result<()> {
+        let dropped_segments = self
+            .written_segment_references(from_op)
+            .map(|(_, reference)| reference.start_offset)
+            .collect();
         self.rewrite(
             self.state.checkpoint,
             self.state.checkpoint_checksum,
@@ -669,7 +673,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             None,
         )
         .await?;
-        self.truncate_segment_tail().await
+        self.truncate_segment_tail(&dropped_segments).await
     }
 
     /// Synchronize required materialized files before removing their WAL coverage.
@@ -1987,7 +1991,11 @@ mod tests {
     use compio::io::AsyncWriteAtExt;
     use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::batch::BatchHeader;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use tempfile::tempdir;
+
+    use crate::durable_storage::StorageEntry;
 
     #[cfg(target_os = "linux")]
     use server_common::fs_utils::supports_preallocation;
@@ -3426,7 +3434,7 @@ mod tests {
                 .len(),
             BODY_BYTES as u64
         );
-        assert!(partition.path().join("00000000000000000002.log").exists());
+        assert!(!partition.path().join("00000000000000000002.log").exists());
         let replacement = segment_prepare(2, first.header().checksum, 1, BODY_BYTES / 2);
         journal
             .append(replacement.clone().into_frozen())
@@ -3482,6 +3490,214 @@ mod tests {
         let recovered = journal.prepares().await.unwrap();
         assert_eq!(recovered[0].as_slice(), first.as_slice());
         assert_eq!(recovered[1].as_slice(), replacement.as_slice());
+    }
+
+    #[compio::test]
+    async fn given_a_rewind_across_two_rolls_when_the_replacement_rolls_elsewhere_should_leave_no_orphan_segment()
+     {
+        const BODY_BYTES: usize = 8192;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (2 * BODY_BYTES) as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        let mut parent = first.header().checksum;
+        for (op, offset) in (2..=5).zip(1..) {
+            let dropped = segment_prepare(op, parent, offset, BODY_BYTES);
+            parent = dropped.header().checksum;
+            journal.append(dropped.into_frozen()).await.unwrap();
+        }
+        assert_eq!(
+            segment_names(partition.path()),
+            [
+                "00000000000000000000.log",
+                "00000000000000000002.log",
+                "00000000000000000004.log"
+            ]
+        );
+
+        journal.truncate_from(2).await.unwrap();
+        // Shorter bodies fill segment 0 through offset 2, so the replacement
+        // rolls at 3 and the dropped segment at 2 would sit inside segment 0.
+        let mut replacements = Vec::new();
+        let mut parent = first.header().checksum;
+        for (op, offset, body) in [
+            (2, 1, BODY_BYTES / 2),
+            (3, 2, BODY_BYTES / 2),
+            (4, 3, BODY_BYTES),
+        ] {
+            let replacement = segment_prepare(op, parent, offset, body);
+            parent = replacement.header().checksum;
+            journal
+                .append(replacement.clone().into_frozen())
+                .await
+                .unwrap();
+            replacements.push(replacement);
+        }
+        let expected = ["00000000000000000000.log", "00000000000000000003.log"];
+        assert_eq!(segment_names(partition.path()), expected);
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(segment_names(partition.path()), expected);
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 4);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        for (recovered, replacement) in recovered[1..].iter().zip(&replacements) {
+            assert_eq!(recovered.as_slice(), replacement.as_slice());
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_rewind_across_a_roll_when_power_is_lost_after_the_replacement_should_not_restore_the_dropped_segment()
+     {
+        const BODY_BYTES: usize = 8192;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let storage = UnlinkLosingStorage::default();
+        let mut journal =
+            PartitionPrepareJournal::open_with_storage(&directory, 42, 7, storage.clone())
+                .await
+                .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (2 * BODY_BYTES) as u64)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        let mut parent = first.header().checksum;
+        for (op, offset) in (2..=3).zip(1..) {
+            let dropped = segment_prepare(op, parent, offset, BODY_BYTES);
+            parent = dropped.header().checksum;
+            journal.append(dropped.into_frozen()).await.unwrap();
+        }
+        assert_eq!(
+            segment_names(partition.path()),
+            ["00000000000000000000.log", "00000000000000000002.log"]
+        );
+
+        journal.truncate_from(2).await.unwrap();
+        // Shorter bodies keep the replacement inside segment 0 while its tail
+        // moves past offset 2, where recovery no longer sweeps the dropped name.
+        let mut replacements = Vec::new();
+        let mut parent = first.header().checksum;
+        for (op, offset) in (2..=3).zip(1..) {
+            let replacement = segment_prepare(op, parent, offset, BODY_BYTES / 2);
+            parent = replacement.header().checksum;
+            journal
+                .append(replacement.clone().into_frozen())
+                .await
+                .unwrap();
+            replacements.push(replacement);
+        }
+        drop(journal);
+        storage.lose_power();
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            segment_names(partition.path()),
+            ["00000000000000000000.log"]
+        );
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        for (recovered, replacement) in recovered[1..].iter().zip(&replacements) {
+            assert_eq!(recovered.as_slice(), replacement.as_slice());
+        }
+    }
+
+    /// Disk storage whose unlinks survive a power loss only once their
+    /// directory has been synced.
+    #[derive(Clone, Default)]
+    struct UnlinkLosingStorage {
+        volatile_unlinks: Rc<RefCell<BTreeMap<PathBuf, Vec<u8>>>>,
+    }
+
+    impl UnlinkLosingStorage {
+        fn lose_power(&self) {
+            for (path, bytes) in std::mem::take(&mut *self.volatile_unlinks.borrow_mut()) {
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+    }
+
+    impl DurableStorage for UnlinkLosingStorage {
+        type File = <DiskStorage as DurableStorage>::File;
+
+        fn writer_identity(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+            DiskStorage.writer_identity(path)
+        }
+
+        async fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Self::File> {
+            DiskStorage.open(path, mode).await
+        }
+
+        async fn create_directories(&self, path: &Path) -> io::Result<()> {
+            DiskStorage.create_directories(path).await
+        }
+
+        async fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            DiskStorage.sync_directory(path).await?;
+            self.volatile_unlinks
+                .borrow_mut()
+                .retain(|unlinked, _| unlinked.parent() != Some(path));
+            Ok(())
+        }
+
+        async fn rename(&self, source: &Path, target: &Path) -> io::Result<()> {
+            DiskStorage.rename(source, target).await
+        }
+
+        async fn remove_file(&self, path: &Path) -> io::Result<()> {
+            let bytes = std::fs::read(path);
+            DiskStorage.remove_file(path).await?;
+            if let Ok(bytes) = bytes {
+                self.volatile_unlinks
+                    .borrow_mut()
+                    .insert(path.to_path_buf(), bytes);
+            }
+            Ok(())
+        }
+
+        async fn hard_link(&self, source: &Path, target: &Path) -> io::Result<()> {
+            DiskStorage.hard_link(source, target).await
+        }
+
+        async fn exists(&self, path: &Path) -> io::Result<bool> {
+            DiskStorage.exists(path).await
+        }
+
+        async fn entries(&self, path: &Path) -> io::Result<Vec<StorageEntry>> {
+            DiskStorage.entries(path).await
+        }
+
+        async fn remove_tree(&self, path: &Path) -> io::Result<()> {
+            DiskStorage.remove_tree(path).await
+        }
+    }
+
+    fn segment_names(partition: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(partition)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "log" || extension == "index")
+            })
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[compio::test]
