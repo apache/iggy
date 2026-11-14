@@ -168,7 +168,8 @@ async fn reference_wal_backlog_keeps_disk_poll_seek_bounded() {
                 checkpoint,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .segments;
             assert_eq!(recovered.len(), 1);
             assert_eq!(recovered[0].segment.end_offset, RECORDS - 1);
             assert_eq!(

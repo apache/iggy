@@ -32,7 +32,7 @@ use crate::poll_plan::{
     PollTier, ResidentTailSnapshot,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
-use crate::segment::Segment;
+use crate::segment::{Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
@@ -177,7 +177,7 @@ where
     /// The partition's state machines, applied at commit in op order.
     pub(crate) state_machines: StateMachines,
     /// The chain of a tiered partition, `None` until it opens one.
-    pub(crate) segment_chain: Option<crate::segment_chain::SegmentChain>,
+    pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
@@ -769,6 +769,9 @@ struct PendingPartitionMaintenance {
     checkpoint: Option<PendingCheckpoint>,
     retention: Option<u64>,
     removing: Option<Segment>,
+    /// The trim point the removal appends before it unlinks.
+    removal_trim: Option<u64>,
+    eviction: Option<u64>,
 }
 
 struct PendingWireActions {
@@ -2125,13 +2128,15 @@ where
                     .sum::<usize>(),
         );
         for start_offset in segments {
-            // Retention may already have removed a dirty sealed segment.
-            if self
+            // Retention may already have removed a dirty sealed segment, and
+            // an evicted one has no `.log` left to sync: boot marks every
+            // recovered segment dirty, remote ones included.
+            let local = self
                 .log
                 .segments()
                 .binary_search_by_key(&start_offset, |segment| segment.start_offset)
-                .is_err()
-            {
+                .is_ok_and(|slot| self.log.segments()[slot].location != SegmentLocation::Remote);
+            if !local {
                 continue;
             }
             paths.push(config.get_messages_path(
@@ -2250,6 +2255,7 @@ where
     pub(crate) fn cancel_history_maintenance(&mut self) {
         self.maintenance.checkpoint = None;
         self.maintenance.retention = None;
+        self.maintenance.eviction = None;
     }
 
     fn capture_checkpoint_phase(
@@ -6252,6 +6258,7 @@ where
                 || self.maintenance.flush_through.is_some()
                 || self.maintenance.checkpoint.is_some()
                 || self.maintenance.retention.is_some()
+                || self.maintenance.eviction.is_some()
                 || self
                     .maintenance
                     .shutdown
@@ -6749,6 +6756,11 @@ where
         {
             return self.io_plan(crate::PartitionIoContinuation::Retention);
         }
+        if let Some(through) = self.maintenance.eviction
+            && self.eviction_is_ready(through)
+        {
+            return self.io_plan(crate::PartitionIoContinuation::Eviction);
+        }
         if self.maintenance.shutdown.is_some() && self.consensus.request_queue_len() > 0 {
             self.deny_queued_requests("shutdown queued request reply failed")
                 .await;
@@ -6882,6 +6894,7 @@ where
                 })
             }
             crate::PartitionIoContinuation::Retention => self.capture_segment_removal(),
+            crate::PartitionIoContinuation::Eviction => self.capture_segment_eviction(),
             crate::PartitionIoContinuation::Checkpoint => self.capture_checkpoint_phase()?,
             crate::PartitionIoContinuation::Superblock => {
                 let Some(guard) = self.superblock_lock.try_acquire_owned() else {
@@ -6985,6 +6998,9 @@ where
                 .accept_segment_removal(&result)
                 .map(|_| ())
                 .ok_or(IggyError::CannotDeleteFile),
+            crate::PartitionIoContinuation::Eviction => {
+                self.accept_segment_eviction(result).map(|_| ())
+            }
             crate::PartitionIoContinuation::Checkpoint => self.accept_checkpoint_io(result),
             crate::PartitionIoContinuation::Superblock => {
                 let Some((intent, backoff)) = self.superblock_running.take() else {
@@ -7039,6 +7055,7 @@ where
                 }
             }
             crate::PartitionIoContinuation::Retention => self.maintenance.retention = None,
+            crate::PartitionIoContinuation::Eviction => self.maintenance.eviction = None,
             _ => self.fail_io_work(
                 &error,
                 continuation == crate::PartitionIoContinuation::Checkpoint,
@@ -12923,6 +12940,24 @@ where
         self.segment_checksum_cache
             .borrow_mut()
             .remove(&segment.start_offset);
+        // Boot refuses a front above the trim point, and keeps no record at or
+        // below it, so the trim point must cover the segment before it goes.
+        // It runs up to the next segment: the anchor that certifies a gap
+        // between the two names the segment leaving now, so past this removal
+        // only the trim point vouches for the new front.
+        let trim_point = self
+            .log
+            .segments()
+            .first()
+            .map_or(segment.end_offset, |next| {
+                next.start_offset.saturating_sub(1).max(segment.end_offset)
+            });
+        let trim = self
+            .segment_chain
+            .as_ref()
+            .and_then(|chain| chain.trim(trim_point))
+            .map(Box::new);
+        self.maintenance.removal_trim = trim.as_ref().map(|_| trim_point);
         self.maintenance.removing = Some(segment);
         self.clear_state_transfer_offer_cache();
         Some(crate::PartitionIoJob::RemoveSegment {
@@ -12931,20 +12966,207 @@ where
             // TODO: Retain failed retention unlinks for retry and sync the
             // partition directory before reporting cleanup complete.
             strict: false,
+            trim,
         })
     }
 
     fn accept_segment_removal(&mut self, result: &crate::PartitionIoResult) -> Option<u64> {
+        let trim_point = self.maintenance.removal_trim.take();
         if !matches!(result, crate::PartitionIoResult::SegmentRemoved(Ok(()))) {
             return None;
         }
         let segment = self.maintenance.removing.take()?;
+        if let (Some(trim_point), Some(chain)) = (trim_point, self.segment_chain.as_mut()) {
+            chain.note_appended(&crate::segment_chain::ChainRecord::TrimPoint(trim_point));
+        }
         let (messages, shortfall) = settle_cleaned_segment(&self.stats, &segment);
         shortfall.report(
             self.namespace(),
             Some((segment.start_offset, segment.end_offset)),
         );
         Some(messages)
+    }
+
+    /// Evict the leading uploaded segments that left the local envelope. Each
+    /// one's remote record is made durable before its `.log` is unlinked, and
+    /// the segment stays in the list as `Remote`, so offsets and timestamps
+    /// resolve as before and the partition's sizes do not change.
+    ///
+    /// The run starts after the segments already remote and stops at the first
+    /// of: the active segment, a segment the WAL checkpoint still reaches, one
+    /// ending above `floor`, one whose hash no floor advance matched, or one the
+    /// envelope keeps. A partition without a chain evicts nothing.
+    ///
+    /// Capped per call like [`Self::remove_sealed_segments_up_to`], with the
+    /// same split between the I/O lane and an idle partition without a
+    /// dispatcher.
+    pub async fn evict_segments(
+        &mut self,
+        now: IggyTimestamp,
+        floor: u64,
+        envelope: LocalEnvelope,
+    ) -> SegmentEviction {
+        let Some(through) = self.eviction_end(now, floor, envelope) else {
+            return SegmentEviction::default();
+        };
+        self.maintenance.eviction = Some(
+            self.maintenance
+                .eviction
+                .map_or(through, |previous| previous.max(through)),
+        );
+        if self.has_io_dispatcher() || self.history_is_busy() {
+            self.notify_io();
+            return SegmentEviction::default();
+        }
+        let mut eviction = SegmentEviction::default();
+        for _ in 0..SEGMENT_REMOVAL_BUDGET_PER_PASS {
+            if !self.eviction_is_ready(through) {
+                break;
+            }
+            let Some(job) = self.capture_segment_eviction() else {
+                break;
+            };
+            if !matches!(self.accept_segment_eviction(job.execute().await), Ok(true)) {
+                break;
+            }
+            eviction.segments += 1;
+        }
+        eviction.budget_spent = self.eviction_is_ready(through);
+        self.maintenance.eviction = None;
+        eviction
+    }
+
+    /// The end offset of the last segment the pass may evict, judged by the
+    /// rules that do not move while it runs.
+    fn eviction_end(&self, now: IggyTimestamp, floor: u64, envelope: LocalEnvelope) -> Option<u64> {
+        let chain = self.segment_chain.as_ref()?;
+        let sealed = self.log.segments().split_last()?.1;
+        let mut local: u64 = sealed
+            .iter()
+            .filter(|segment| segment.location != SegmentLocation::Remote)
+            .map(|segment| segment.size.as_bytes_u64())
+            .sum();
+        let mut through = None;
+        for segment in sealed
+            .iter()
+            .filter(|segment| segment.location != SegmentLocation::Remote)
+        {
+            let outside = segment.is_expired(now, envelope.age)
+                || envelope.size.is_some_and(|size| local > size);
+            if !segment.sealed
+                || segment.end_offset > floor
+                || !chain.evictable(segment.start_offset, segment.end_offset)
+                || !outside
+            {
+                break;
+            }
+            local -= segment.size.as_bytes_u64();
+            through = Some(segment.end_offset);
+        }
+        through
+    }
+
+    fn eviction_is_ready(&mut self, through: u64) -> bool {
+        let segments = self.log.segments();
+        let slot = self.first_local_slot();
+        let next = segments
+            .get(slot)
+            .filter(|_| slot + 1 < segments.len())
+            .filter(|segment| {
+                segment.sealed
+                    && segment.end_offset <= through
+                    && self.segment_chain.as_ref().is_some_and(|chain| {
+                        chain.evictable(segment.start_offset, segment.end_offset)
+                    })
+            });
+        let Some(segment) = next else {
+            self.maintenance.eviction = None;
+            return false;
+        };
+        let (start_offset, end_offset) = (segment.start_offset, segment.end_offset);
+        if self.persistence_checkpoint_pending() {
+            return false;
+        }
+        // The WAL links its tail and checkpoint-cursor segments and boot reads
+        // the latter, so evicting either would wedge every replica's boot.
+        if let Some(persistence) = &self.persistence
+            && let Some(checkpoint) = persistence.segment_checkpoint()
+            && (start_offset >= checkpoint.start_offset || end_offset >= checkpoint.next_offset)
+        {
+            persistence.request_checkpoint();
+            return false;
+        }
+        true
+    }
+
+    /// The slot of the first segment still on local disk. Remote segments are
+    /// always the front of the list, so a binary search finds where they end
+    /// without walking a prefix that grows with every eviction.
+    fn first_local_slot(&self) -> usize {
+        self.log
+            .segments()
+            .partition_point(|segment| segment.location == SegmentLocation::Remote)
+    }
+
+    fn capture_segment_eviction(&self) -> Option<crate::PartitionIoJob<SB>> {
+        let slot = self.first_local_slot();
+        let start_offset = self.log.segments().get(slot)?.start_offset;
+        let messages_path = self.log.storages()[slot].segment_and_index_paths().0;
+        let job = self
+            .segment_chain
+            .as_ref()?
+            .evict(start_offset, messages_path)?;
+        self.clear_state_transfer_offer_cache();
+        Some(crate::PartitionIoJob::EvictSegment(Box::new(job)))
+    }
+
+    /// Mark the evicted segment `Remote` and drop what still names its `.log`,
+    /// as retention does after an unlink. Returns whether the segment left the
+    /// disk.
+    ///
+    /// A record or an unlink that may not be durable fails like any other
+    /// durability failure. A failed unlink only ends the pass: the record is
+    /// durable, so the next pass retries the unlink alone.
+    fn accept_segment_eviction(
+        &mut self,
+        result: crate::PartitionIoResult,
+    ) -> Result<bool, IggyError> {
+        let crate::PartitionIoResult::SegmentEvicted(evicted) = result else {
+            return Err(IggyError::CannotDeleteFile);
+        };
+        let start_offset = evicted.start_offset;
+        if evicted.appended
+            && let Some(chain) = self.segment_chain.as_mut()
+        {
+            chain.note_evicted(start_offset);
+        }
+        match evicted.outcome {
+            Ok(()) => {}
+            Err(crate::segment_chain::EvictionFailure::Unlink) => {
+                self.maintenance.eviction = None;
+                return Ok(false);
+            }
+            Err(crate::segment_chain::EvictionFailure::Record) => {
+                return Err(IggyError::CannotWriteToFile);
+            }
+            Err(crate::segment_chain::EvictionFailure::Sync) => {
+                return Err(IggyError::CannotSyncFile);
+            }
+        }
+        let slot = self
+            .log
+            .segments()
+            .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+            .map_err(|_| IggyError::CannotDeleteFile)?;
+        self.log.segments_mut()[slot].location = SegmentLocation::Remote;
+        self.log.storages_mut()[slot].messages_reader = None;
+        self.log.reset_read_state(slot);
+        self.log.journal().inner.forget_segment(start_offset);
+        self.segment_checksum_cache
+            .borrow_mut()
+            .remove(&start_offset);
+        self.clear_state_transfer_offer_cache();
+        Ok(true)
     }
 
     pub(crate) async fn install_empty_segment(
@@ -14474,6 +14696,25 @@ pub struct SegmentRemoval {
     pub segments: u64,
     pub messages: u64,
     pub budget_spent: bool,
+}
+
+/// What one [`IggyPartition::evict_segments`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentEviction {
+    pub segments: u64,
+    /// Segments the pass would evict are still waiting for the next call.
+    pub budget_spent: bool,
+}
+
+/// How much of a tiered partition stays on local disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalEnvelope {
+    /// Uploaded segments whose newest message is older than this leave the
+    /// disk.
+    pub age: IggyExpiry,
+    /// Uploaded segments leave the disk, oldest first, until the sealed
+    /// segments still local fit in this many bytes.
+    pub size: Option<u64>,
 }
 
 /// Counter shortfalls from removing one segment, reported with its offset range.
