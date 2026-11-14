@@ -1358,6 +1358,7 @@ mod tests {
                     entry,
                     log_path: log_path.to_str().unwrap().to_owned(),
                 }],
+                chain: None,
                 offsets: (
                     StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
                     Rc::new(Vec::new()),
@@ -1445,6 +1446,7 @@ mod tests {
                     entry: StateArtifact::for_bytes(artifact_kind::SEGMENT_LOG, 0, bytes),
                     log_path: log_path.to_str().unwrap().to_owned(),
                 }],
+                chain: None,
                 offsets: (
                     StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
                     Rc::new(Vec::new()),
@@ -5854,6 +5856,7 @@ mod tests {
         let offer = partitions::state_transfer::PartitionStateTransferOffer {
             commit_op: 0,
             segments: Vec::new(),
+            chain: None,
             offsets: (
                 StateArtifact::for_bytes(artifact_kind::CONSUMER_OFFSETS, 0, &[]),
                 Rc::new(Vec::new()),

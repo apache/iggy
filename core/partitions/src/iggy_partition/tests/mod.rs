@@ -1332,10 +1332,11 @@ async fn install_offer_with_reuse(
         }
     }
     receiver
-        .queue_state_transfer_install(
+        .queue_state_transfer_install_with_chain(
             offer.commit_op,
             staged.into_iter().map(Option::unwrap).collect(),
             &offer.offsets.1,
+            offer.chain.as_ref().map(|chain| chain.1.as_slice()),
             0,
         )
         .unwrap();
@@ -1891,6 +1892,7 @@ async fn partition_with_pending_durable_ack() -> (
 }
 
 mod age_roll;
+mod chain_transfer;
 mod consensus_tests;
 mod consumer_group_ownership;
 mod disk_poll;

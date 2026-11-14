@@ -37,6 +37,7 @@ use std::path::Path;
 
 use compio::io::AsyncWriteAtExt;
 use consensus::state_artifact_checksum;
+use iggy_common::IggyByteSize;
 pub use iggy_object_store::ObjectPrefix;
 use iggy_object_store::SEGMENT_HASH_LEN;
 use journal::superblock::SuperblockStore;
@@ -45,7 +46,7 @@ use server_common::fatal::NoteDescriptorExhaustion;
 use tracing::warn;
 
 use crate::IggyPartition;
-use crate::segment::Segment;
+use crate::segment::{Segment, SegmentLocation};
 use crate::state_transfer::{ChunkHasher, STAGING_SUFFIX, fsync_dir, hash_segment_range};
 
 #[cfg(test)]
@@ -65,6 +66,13 @@ pub const HEADER_SIZE: usize = 48;
 /// start_timestamp | end_timestamp | max_timestamp | size | incarnation | hash
 /// | checksum`, the integers `u64` little-endian.
 pub const RECORD_SIZE: usize = 104;
+
+/// The longest chain a state transfer carries, one record per segment and its
+/// trim point.
+pub const CHAIN_ARTIFACT_LEN_MAX: u64 =
+    (HEADER_SIZE + (CHAIN_ARTIFACT_SEGMENTS_MAX + 1) * RECORD_SIZE) as u64;
+
+const CHAIN_ARTIFACT_SEGMENTS_MAX: usize = 1 << 20;
 
 const HEADER_MAGIC: u64 = u64::from_le_bytes(*b"IGGYCHN1");
 const HEADER_CHECKSUM_AT: usize = HEADER_SIZE - size_of::<u64>();
@@ -142,6 +150,21 @@ pub struct SegmentRecord {
 }
 
 impl SegmentRecord {
+    /// The segment this record stands in for once its `.log` left the disk.
+    #[must_use]
+    pub fn remote_segment(&self, max_size: IggyByteSize) -> Segment {
+        let mut segment = Segment::new(self.start_offset, max_size);
+        segment.sealed = true;
+        segment.location = SegmentLocation::Remote;
+        segment.start_timestamp = self.start_timestamp;
+        segment.end_timestamp = self.end_timestamp;
+        segment.max_timestamp = self.max_timestamp;
+        segment.end_offset = self.end_offset;
+        segment.size = IggyByteSize::from(self.size);
+        segment.current_position = self.size;
+        segment
+    }
+
     /// The record of `segment` sealed with `hashes`.
     #[must_use]
     pub fn new(
@@ -293,6 +316,35 @@ impl Chain {
             .max()
     }
 
+    /// The length of [`Self::encode`].
+    #[must_use]
+    pub const fn encoded_len(&self) -> usize {
+        HEADER_SIZE + self.records.len() * RECORD_SIZE
+    }
+
+    /// The file bytes of the chain: its header, then every record in order.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.encoded_len());
+        bytes.extend_from_slice(&encode_header(&self.prefix));
+        for record in &self.records {
+            bytes.extend_from_slice(&record.encode());
+        }
+        bytes
+    }
+
+    /// The live segments whose latest record is remote, in offset order.
+    #[must_use]
+    pub fn remote_segments(&self) -> Vec<SegmentRecord> {
+        self.live_segments()
+            .into_values()
+            .filter_map(|record| match record {
+                ChainRecord::Remote(segment) => Some(segment),
+                ChainRecord::Sealed(_) | ChainRecord::TrimPoint(_) => None,
+            })
+            .collect()
+    }
+
     /// The latest record of every segment the trim point has not retired, by
     /// start offset.
     #[must_use]
@@ -410,6 +462,16 @@ pub fn chain_path(partition_dir: &str) -> String {
 /// # Errors
 /// Any I/O failure, after which no chain exists under the final name.
 pub async fn create_chain(partition_dir: &str, prefix: &ObjectPrefix) -> io::Result<()> {
+    replace_chain(partition_dir, encode_header(prefix).to_vec()).await?;
+    crate::state_transfer::fsync_dir(partition_dir).await
+}
+
+/// Put `bytes` in place as the chain of `partition_dir`, whole or not at all.
+/// The caller fsyncs the directory.
+///
+/// # Errors
+/// Any I/O failure, after which the previous chain, if any, is still in place.
+pub(crate) async fn replace_chain(partition_dir: &str, bytes: Vec<u8>) -> io::Result<()> {
     let path = chain_path(partition_dir);
     // A staging file every sweep already removes, renamed into place, so a
     // crash never leaves a torn header under the chain's name.
@@ -417,10 +479,9 @@ pub async fn create_chain(partition_dir: &str, prefix: &ObjectPrefix) -> io::Res
     let mut file = compio::fs::File::create(&staging)
         .await
         .note_descriptor_exhaustion(|| format!("creating {staging}"))?;
-    file.write_all_at(encode_header(prefix), 0).await.0?;
+    file.write_all_at(bytes, 0).await.0?;
     file.sync_all().await?;
-    compio::fs::rename(&staging, &path).await?;
-    crate::state_transfer::fsync_dir(partition_dir).await
+    compio::fs::rename(&staging, &path).await
 }
 
 /// Read the chain in `partition_dir`, `None` when there is none.
@@ -543,6 +604,70 @@ impl ChunkHasher for SegmentDigest {
     }
 }
 
+/// A chain reduced to its trim point and the latest record of every segment
+/// the trim point has not retired. Building it walks every record, so a reader
+/// that needs it more than once keeps it.
+pub(crate) struct LiveChain {
+    prefix: ObjectPrefix,
+    valid_len: u64,
+    trim_point: Option<u64>,
+    sealed: BTreeMap<u64, SegmentRecord>,
+    /// The segments in `sealed` whose latest record is remote.
+    remote: BTreeSet<u64>,
+}
+
+impl LiveChain {
+    pub(crate) fn new(chain: &Chain) -> Self {
+        let trim_point = chain.trim_point();
+        let mut latest: Vec<(&SegmentRecord, bool)> = chain
+            .records
+            .iter()
+            .filter_map(|record| {
+                let segment = record.segment()?;
+                trim_point
+                    .is_none_or(|trim_point| segment.end_offset > trim_point)
+                    .then_some((segment, matches!(record, ChainRecord::Remote(_))))
+            })
+            .collect();
+        // Sorted and deduplicated up front, so both collections below are
+        // built in one linear pass instead of an insert per record. The sort
+        // is stable and the walk is reversed, so the record kept for a start
+        // offset is the last the chain holds for it.
+        latest.sort_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        latest.dedup_by_key(|(segment, _)| segment.start_offset);
+        latest.reverse();
+        Self {
+            prefix: chain.prefix,
+            valid_len: chain.valid_len,
+            trim_point,
+            sealed: latest
+                .iter()
+                .map(|(segment, _)| (segment.start_offset, **segment))
+                .collect(),
+            remote: latest
+                .iter()
+                .filter(|(_, remote)| *remote)
+                .map(|(segment, _)| segment.start_offset)
+                .collect(),
+        }
+    }
+
+    pub(crate) const fn trim_point(&self) -> Option<u64> {
+        self.trim_point
+    }
+
+    /// The segments whose latest record is remote, in offset order.
+    pub(crate) fn remote_segments(&self) -> Vec<SegmentRecord> {
+        let mut remote = self.remote.iter().peekable();
+        self.sealed
+            .iter()
+            .filter(|(start_offset, _)| remote.next_if_eq(start_offset).is_some())
+            .map(|(_, segment)| *segment)
+            .collect()
+    }
+}
+
 /// What a partition with a chain keeps of it between appends.
 pub(crate) struct SegmentChain {
     path: String,
@@ -660,17 +785,7 @@ async fn unlink_log(path: &str, start_offset: u64) -> Result<(), EvictionFailure
 }
 
 impl SegmentChain {
-    fn load(path: String, chain: &Chain, active: Option<&Segment>) -> Self {
-        let mut sealed = BTreeMap::new();
-        let mut remote = BTreeSet::new();
-        for (start_offset, record) in chain.live_segments() {
-            if matches!(record, ChainRecord::Remote(_)) {
-                remote.insert(start_offset);
-            }
-            if let Some(segment) = record.segment() {
-                sealed.insert(start_offset, *segment);
-            }
-        }
+    fn load(path: String, chain: LiveChain, active: Option<&Segment>) -> Self {
         let digest = active
             .filter(|active| active.size.as_bytes_u64() == 0)
             .map(|active| Box::new(SegmentDigest::new(active.start_offset)));
@@ -678,10 +793,10 @@ impl SegmentChain {
             path,
             prefix: chain.prefix,
             valid_len: chain.valid_len,
-            sealed,
-            remote,
+            sealed: chain.sealed,
+            remote: chain.remote,
             confirmed: BTreeSet::new(),
-            trim_point: chain.trim_point(),
+            trim_point: chain.trim_point,
             digest,
         }
     }
@@ -726,6 +841,32 @@ impl SegmentChain {
             self.note_appended(record);
         }
         self.digest = Some(Box::new(SegmentDigest::new(next_start)));
+    }
+
+    /// The chain as a state transfer carries it: the trim point and the latest
+    /// record of every live segment, without the records a reader no longer
+    /// needs.
+    ///
+    /// A segment is remote only when `without_log`, ascending, holds its start
+    /// offset. The chain's own remote records do not decide it: an eviction cut
+    /// short after its record leaves the `.log` in place, and that segment
+    /// travels as bytes.
+    fn snapshot(&self, without_log: &[u64]) -> Chain {
+        let mut records = Vec::with_capacity(self.sealed.len() + 1);
+        records.extend(self.trim_point.map(ChainRecord::TrimPoint));
+        records.extend(self.sealed.values().map(|segment| {
+            if without_log.binary_search(&segment.start_offset).is_ok() {
+                ChainRecord::Remote(*segment)
+            } else {
+                ChainRecord::Sealed(*segment)
+            }
+        }));
+        Chain {
+            prefix: self.prefix,
+            valid_len: (HEADER_SIZE + records.len() * RECORD_SIZE) as u64,
+            records,
+            torn_tail: false,
+        }
     }
 
     /// The trim point retention appends before it unlinks the segment ending at
@@ -849,21 +990,19 @@ where
     /// [`ChainError::Prefix`] when the chain names another partition or
     /// incarnation.
     pub fn adopt_segment_chain(&mut self, chain: &Chain) -> Result<(), ChainError> {
+        self.adopt_live_chain(LiveChain::new(chain))
+    }
+
+    /// [`Self::adopt_segment_chain`] of a chain already reduced.
+    pub(crate) fn adopt_live_chain(&mut self, chain: LiveChain) -> Result<(), ChainError> {
         let directory = self
             .partition_dir
             .as_deref()
             .ok_or(ChainError::NoDirectory)?;
-        let namespace = self.namespace();
-        let recorded = chain.prefix;
-        if (recorded.stream_id, recorded.topic_id, recorded.partition_id)
-            != (
-                namespace.stream_id() as u64,
-                namespace.topic_id() as u64,
-                namespace.partition_id() as u64,
-            )
-            || recorded.created_revision != self.created_revision()
-        {
-            return Err(ChainError::Prefix { recorded });
+        if !self.owns_chain_prefix(&chain.prefix) {
+            return Err(ChainError::Prefix {
+                recorded: chain.prefix,
+            });
         }
         let active = self.log.segments().last();
         self.segment_chain = Some(Box::new(SegmentChain::load(
@@ -874,10 +1013,31 @@ where
         Ok(())
     }
 
+    /// Whether `prefix` names this partition and its incarnation.
+    pub(crate) fn owns_chain_prefix(&self, prefix: &ObjectPrefix) -> bool {
+        let namespace = self.namespace();
+        (prefix.stream_id, prefix.topic_id, prefix.partition_id)
+            == (
+                namespace.stream_id() as u64,
+                namespace.topic_id() as u64,
+                namespace.partition_id() as u64,
+            )
+            && prefix.created_revision == self.created_revision()
+    }
+
     /// Forget the chain: an install is replacing the segments it describes,
-    /// and its sweep removes the file.
+    /// and its sweep replaces or removes the file.
     pub(crate) fn drop_segment_chain(&mut self) {
         self.segment_chain = None;
+    }
+
+    /// What a state transfer carries of the chain, `None` without one.
+    /// `without_log` holds the start offsets of the segments the same transfer
+    /// sends no bytes for, ascending.
+    pub(crate) fn segment_chain_snapshot(&self, without_log: &[u64]) -> Option<Chain> {
+        self.segment_chain
+            .as_ref()
+            .map(|chain| chain.snapshot(without_log))
     }
 
     /// The object prefix the chain records, `None` without a chain.
