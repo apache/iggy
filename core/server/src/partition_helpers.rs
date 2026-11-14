@@ -753,6 +753,9 @@ async fn load_partition(
     };
     let segment_checkpoint = recovered_persistence.0.segment_checkpoint();
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
     partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Recovered partitions honor the same config-surfaced ring ceilings as the
@@ -1136,6 +1139,9 @@ pub async fn build_partition_fresh(
     );
 
     let mut partition = IggyPartition::new(stats, consensus);
+    partition
+        .register_builtin_state_machines()
+        .map_err(ServerError::PartitionStateMachines)?;
     partition
         .consensus()
         .set_recovery_election_allowed(first_initialization && !lost_with_storage);

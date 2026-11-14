@@ -48,6 +48,7 @@ mod segment_recovery;
 pub mod state_machine;
 pub mod state_transfer;
 mod stream_keyring;
+pub mod tiered_floor;
 mod types;
 mod view_fence;
 #[cfg(feature = "simulator")]
