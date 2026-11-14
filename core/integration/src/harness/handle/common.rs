@@ -19,9 +19,11 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::harness::error::TestBinaryError;
 
 pub const DEFAULT_HEALTH_CHECK_RETRIES: u32 = 1000;
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_MS: u64 = 20;
@@ -50,10 +52,20 @@ pub fn cargo_bin_path(name: &str) -> io::Result<PathBuf> {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
-                    "no {file_name} in any parent directory of {}, run `cargo build` first",
+                    "no {file_name} in any parent directory of {}, run `cargo build --bin {name}` first",
                     test_binary.display()
                 ),
             )
+        })
+}
+
+/// [`cargo_bin_path`] as a command, with the error that a failed start reports.
+pub(crate) fn cargo_bin_command(name: &str) -> Result<Command, TestBinaryError> {
+    cargo_bin_path(name)
+        .map(Command::new)
+        .map_err(|source| TestBinaryError::ProcessSpawn {
+            binary: name.to_string(),
+            source,
         })
 }
 

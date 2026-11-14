@@ -16,7 +16,7 @@
 // under the License.
 
 use super::client_builder::{ClientBuilder, ServerConnection};
-use super::common::{SIGTERM_TIMEOUT, cargo_bin_path};
+use super::common::{SIGTERM_TIMEOUT, cargo_bin_command};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
 use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
@@ -1061,24 +1061,12 @@ impl TestBinary for ServerHandle {
         let mut command = if let Some(ref path) = self.config.executable_path {
             let path_ref = Path::new(path);
             if path_ref.components().count() == 1 && !path_ref.exists() {
-                Command::new(cargo_bin_path(path).map_err(|source| {
-                    TestBinaryError::ProcessSpawn {
-                        binary: launched_binary.clone(),
-                        source,
-                    }
-                })?)
+                cargo_bin_command(path)?
             } else {
                 Command::new(path)
             }
         } else {
-            Command::new(
-                cargo_bin_path(Self::default_server_binary()).map_err(|source| {
-                    TestBinaryError::ProcessSpawn {
-                        binary: launched_binary.clone(),
-                        source,
-                    }
-                })?,
-            )
+            cargo_bin_command(Self::default_server_binary())?
         };
 
         command.env("IGGY_PATH", data_path.display().to_string());

@@ -178,12 +178,7 @@ impl TestBinary for ConnectorsRuntimeHandle {
         let mut command = if let Some(ref path) = self.config.executable_path {
             Command::new(path)
         } else {
-            Command::new(common::cargo_bin_path("iggy-connectors").map_err(|source| {
-                TestBinaryError::ProcessSpawn {
-                    binary: "iggy-connectors".to_string(),
-                    source,
-                }
-            })?)
+            common::cargo_bin_command("iggy-connectors")?
         };
 
         command.envs(&self.envs);

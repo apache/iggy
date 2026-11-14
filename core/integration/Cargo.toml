@@ -27,6 +27,8 @@ ignored = ["cfg_aliases"]
 
 [features]
 default = ["login-session"]
+# Gates only the keyring backend of the CLI login tests. Its store is a
+# dev-dependency, and a dev-dependency cannot be optional.
 login-session = []
 
 [dependencies]

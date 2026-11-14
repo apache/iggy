@@ -160,12 +160,7 @@ impl TestBinary for McpHandle {
         let mut command = if let Some(ref path) = self.config.executable_path {
             Command::new(path)
         } else {
-            Command::new(common::cargo_bin_path("iggy-mcp").map_err(|source| {
-                TestBinaryError::ProcessSpawn {
-                    binary: "iggy-mcp".to_string(),
-                    source,
-                }
-            })?)
+            common::cargo_bin_command("iggy-mcp")?
         };
 
         command.envs(&self.envs);
