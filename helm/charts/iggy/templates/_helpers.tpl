@@ -317,10 +317,15 @@ Secret owns it.
   {{- $generated := include "iggy.secretName" . }}
   {{- if or $server.encryption.enabled $server.encryption.key $server.encryption.existingSecret.name }}
     {{- $configVersion := $server.encryption.configVersion | default "auto" }}
+    {{- $imageTag := $server.image.tag | default .Chart.AppVersion }}
+    {{- $versioned := regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $imageTag }}
+    {{- /* Key rotation arrived in 0.9.1-edge.2; earlier flat builds reject IGGY_ENCRYPTION_PREVIOUS_KEYS. */}}
+    {{- $rotation := not (and $versioned (semverCompare "<0.9.1-edge.2" $imageTag)) }}
     {{- if eq $configVersion "auto" }}
-      {{- $imageTag := $server.image.tag | default .Chart.AppVersion }}
-      {{- if and (regexMatch "^v?[0-9]+\\.[0-9]+\\.[0-9]+([+-].*)?$" $imageTag) (semverCompare "<=0.9.0-edge.7" $imageTag) }}
+      {{- if and $versioned (semverCompare "<=0.9.0-edge.7" $imageTag) }}
         {{- $configVersion = "legacy" }}
+      {{- else if $versioned }}
+        {{- $configVersion = "flat" }}
       {{- else }}
         {{- fail "Cannot determine the encryption config layout for this server image. Set server.encryption.configVersion to flat for builds using [encryption], or legacy for builds using [system.encryption]." }}
       {{- end }}
@@ -342,8 +347,11 @@ Secret owns it.
       {{- if eq $configVersion "legacy" }}
         {{- fail "server.encryption.previousKeys needs a server build using [encryption]. The legacy [system.encryption] layout has no key rotation. Set server.encryption.configVersion to flat for such a build." }}
       {{- end }}
+      {{- if not $rotation }}
+        {{- fail (printf "server.encryption.previousKeys needs server 0.9.1-edge.2 or later, which added key rotation. Image %s rejects IGGY_ENCRYPTION_PREVIOUS_KEYS." $imageTag) }}
+      {{- end }}
     {{- end }}
-    {{- if and (eq $configVersion "flat") (or $server.encryption.previousKeys $server.encryption.existingSecret.name) }}
+    {{- if and (eq $configVersion "flat") $rotation (or $server.encryption.previousKeys $server.encryption.existingSecret.name) }}
 - name: IGGY_ENCRYPTION_PREVIOUS_KEYS
   valueFrom:
     secretKeyRef:

@@ -39,7 +39,7 @@ spec:
   {{- if .Values.server.strategy }}
   strategy:
     {{- toYaml .Values.server.strategy | nindent 4 }}
-  {{- else if .Values.server.hostNetwork }}
+  {{- else if or .Values.server.hostNetwork .Values.server.persistence.enabled }}
   strategy:
     type: Recreate
   {{- end }}
