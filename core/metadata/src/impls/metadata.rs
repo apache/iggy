@@ -80,8 +80,9 @@ use iggy_common::{
     HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
-    TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, stream_wrap_set,
-    topic_option_keys, validate_segment_max_age, validate_topic_segment_size,
+    TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults,
+    refuse_tiered_storage, stream_wrap_set, topic_option_keys, validate_local_retention,
+    validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
@@ -5119,6 +5120,8 @@ where
                     ));
                 }
                 validate_segment_max_age(resolved.runtime)?;
+                refuse_tiered_storage(&admitted.explicit)?;
+                validate_local_retention(&stored)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
                 let mut counts = self.placement_counts()?;
                 let partitions = self
@@ -5695,6 +5698,9 @@ fn resolve_update_resource(
         .find(|key| key.descriptor().visibility == OptionVisibility::Secret)
     {
         return Err(IggyError::OptionNotUpdatable(secret.to_string()));
+    }
+    if scope == OptionsScope::Topic {
+        refuse_tiered_storage(&admitted.explicit)?;
     }
     let critical: Vec<OptionKey> = set_keys
         .into_iter()
@@ -7994,6 +8000,118 @@ mod tests {
                 ..Default::default()
             })
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_tiered_storage_when_preparing_create_topic_should_refuse_on_and_mark_off() {
+        assert_eq!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                tiered_storage: Some(true),
+                ..Default::default()
+            })
+            .err(),
+            Some(IggyError::FeatureUnavailable)
+        );
+
+        let persisted = prepare_topic_with(&iggy_common::TopicCreateOptions {
+            tiered_storage: Some(false),
+            ..Default::default()
+        })
+        .expect("a topic that states it is not tiered is admitted");
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        assert_eq!(
+            explicit[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"tiered_storage"
+        );
+        assert!(!TopicResolvedOptions::from(&explicit).tiered_storage);
+    }
+
+    #[test]
+    fn given_local_retention_above_the_topic_retention_when_preparing_create_topic_should_refuse_it()
+     {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                message_expiry: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+                local_retention_age: Some(iggy_common::IggyExpiry::from(2 * HOUR_MICROS)),
+                ..Default::default()
+            })
+            .err(),
+            Some(IggyError::InvalidOptionValue(
+                "local_retention_age".to_owned()
+            ))
+        );
+        assert_eq!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                max_topic_size: Some(iggy_common::MaxTopicSize::from(2 * GIB)),
+                local_retention_size: Some(iggy_common::MaxTopicSize::from(4 * GIB)),
+                ..Default::default()
+            })
+            .err(),
+            Some(IggyError::InvalidOptionValue(
+                "local_retention_size".to_owned()
+            ))
+        );
+
+        let persisted = prepare_topic_with(&iggy_common::TopicCreateOptions {
+            message_expiry: Some(iggy_common::IggyExpiry::from(2 * HOUR_MICROS)),
+            local_retention_age: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+            max_topic_size: Some(iggy_common::MaxTopicSize::from(4 * GIB)),
+            local_retention_size: Some(iggy_common::MaxTopicSize::from(2 * GIB)),
+            ..Default::default()
+        })
+        .expect("a local retention within the topic retention is admitted");
+        let stored = TopicResolvedOptions::from(
+            &resource_options_from_wire(&persisted.request.options, true)
+                .expect("explicit block decodes"),
+        );
+        assert_eq!(
+            stored.local_retention_age,
+            iggy_common::IggyExpiry::from(HOUR_MICROS)
+        );
+        assert_eq!(
+            stored.local_retention_size,
+            iggy_common::MaxTopicSize::from(2 * GIB)
+        );
+
+        // The one-day default is above this expiry and yields to it.
+        assert!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                message_expiry: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_tiered_storage_when_resolving_a_topic_update_should_refuse_on_and_off() {
+        let update = |enabled: &str| {
+            let patch = TopicUpdateOptions {
+                raw: BTreeMap::from([(OptionKey::TieredStorage.to_string(), enabled.to_owned())]),
+                ..TopicUpdateOptions::default()
+            }
+            .to_patch()
+            .unwrap();
+            resolve_update_resource(&UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            })
+            .map(|_| ())
+        };
+
+        assert_eq!(update("true"), Err(IggyError::FeatureUnavailable));
+        assert_eq!(
+            update("false"),
+            Err(IggyError::OptionNotUpdatable("tiered_storage".to_owned()))
         );
     }
 

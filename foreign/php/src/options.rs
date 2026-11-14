@@ -80,8 +80,8 @@ impl StubLiteral for StreamOptionKey {
 
 /// Topic option keys, as the cases an update's reset list takes.
 ///
-/// Only `MessageExpiry` and `MaxTopicSize` are resettable in this release. The server refuses
-/// every other case with its own category.
+/// Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
+/// resettable in this release. The server refuses every other case with its own category.
 #[php_enum]
 #[php(name = "Iggy\\TopicOptionKey")]
 #[derive(Clone, Copy)]
@@ -112,6 +112,12 @@ pub enum TopicOptionKey {
     ReplicationFactor,
     #[php(value = "segment_max_age")]
     SegmentMaxAge,
+    #[php(value = "tiered_storage")]
+    TieredStorage,
+    #[php(value = "local_retention_age")]
+    LocalRetentionAge,
+    #[php(value = "local_retention_size")]
+    LocalRetentionSize,
 }
 
 impl From<TopicOptionKey> for OptionKey {
@@ -130,6 +136,9 @@ impl From<TopicOptionKey> for OptionKey {
             TopicOptionKey::PreallocateSegments => Self::PreallocateSegments,
             TopicOptionKey::ReplicationFactor => Self::ReplicationFactor,
             TopicOptionKey::SegmentMaxAge => Self::SegmentMaxAge,
+            TopicOptionKey::TieredStorage => Self::TieredStorage,
+            TopicOptionKey::LocalRetentionAge => Self::LocalRetentionAge,
+            TopicOptionKey::LocalRetentionSize => Self::LocalRetentionSize,
         }
     }
 }
@@ -151,6 +160,9 @@ impl StubLiteral for TopicOptionKey {
             Self::PreallocateSegments => "PreallocateSegments",
             Self::ReplicationFactor => "ReplicationFactor",
             Self::SegmentMaxAge => "SegmentMaxAge",
+            Self::TieredStorage => "TieredStorage",
+            Self::LocalRetentionAge => "LocalRetentionAge",
+            Self::LocalRetentionSize => "LocalRetentionSize",
         };
         format!("\\Iggy\\TopicOptionKey::{case}")
     }

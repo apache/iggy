@@ -73,6 +73,9 @@ constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
     iggy::TopicOptionKey::PreallocateSegments,
     iggy::TopicOptionKey::ReplicationFactor,
     iggy::TopicOptionKey::SegmentMaxAge,
+    iggy::TopicOptionKey::TieredStorage,
+    iggy::TopicOptionKey::LocalRetentionAge,
+    iggy::TopicOptionKey::LocalRetentionSize,
 };
 
 constexpr iggy::UserOptionKey kUserOptionKeys[] = {

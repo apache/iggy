@@ -119,6 +119,23 @@ describe('CreateTopic', () => {
       );
     });
 
+    it('serialize the tiering options, omitting the 0n sentinels', () => {
+      const t = {
+        ...t1,
+        tieredStorage: false,
+        localRetentionAge: 21_600_000_000n,
+        localRetentionSize: 10_737_418_240n
+      };
+      const options = deserializeOptions(CREATE_TOPIC.serialize(t), fixedSize + t.name.length);
+      assert.equal(options.tiered_storage, false);
+      assert.equal(options.local_retention_age, 21_600_000_000n);
+      assert.equal(options.local_retention_size, 10_737_418_240n);
+      assert.equal(
+        CREATE_TOPIC.serialize({ ...t1, localRetentionAge: 0n, localRetentionSize: 0n }).length,
+        fixedSize + t1.name.length + defaultPolicySize
+      );
+    });
+
     it('serialize caller-supplied option keys, typed fields winning', () => {
       const t = {
         ...t1,

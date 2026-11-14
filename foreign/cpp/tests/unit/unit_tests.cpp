@@ -134,6 +134,9 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.PreallocateSegments().has_value());
     EXPECT_FALSE(options.ReplicationFactor().has_value());
     EXPECT_FALSE(options.SegmentMaxAge().has_value());
+    EXPECT_FALSE(options.TieredStorage().has_value());
+    EXPECT_FALSE(options.LocalRetentionAge().has_value());
+    EXPECT_FALSE(options.LocalRetentionSize().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
 }
 
@@ -246,19 +249,38 @@ TEST(TopicCreateOptionsTest, ServerDefaultSentinelsClearValues) {
     iggy::TopicCreateOptions options;
     options.SetMessageExpiry(iggy::Expiry::Duration(15))
         .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024))
-        .SetSegmentMaxAge(iggy::Expiry::Duration(600000000));
+        .SetSegmentMaxAge(iggy::Expiry::Duration(600000000))
+        .SetLocalRetentionAge(iggy::Expiry::Duration(1800000000))
+        .SetLocalRetentionSize(iggy::MaxTopicSize::FromBytes(512));
     ASSERT_TRUE(options.MessageExpiry().has_value());
     ASSERT_TRUE(options.MaxTopicSize().has_value());
     ASSERT_TRUE(options.SegmentMaxAge().has_value());
     EXPECT_EQ(options.SegmentMaxAge()->Kind(), "duration");
     EXPECT_EQ(options.SegmentMaxAge()->Value(), 600000000u);
+    ASSERT_TRUE(options.LocalRetentionAge().has_value());
+    EXPECT_EQ(options.LocalRetentionAge()->Kind(), "duration");
+    EXPECT_EQ(options.LocalRetentionAge()->Value(), 1800000000u);
+    ASSERT_TRUE(options.LocalRetentionSize().has_value());
+    EXPECT_EQ(options.LocalRetentionSize()->Value(), "512");
 
     options.SetMessageExpiry(iggy::Expiry::ServerDefault())
         .SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault())
-        .SetSegmentMaxAge(iggy::Expiry::ServerDefault());
+        .SetSegmentMaxAge(iggy::Expiry::ServerDefault())
+        .SetLocalRetentionAge(iggy::Expiry::ServerDefault())
+        .SetLocalRetentionSize(iggy::MaxTopicSize::ServerDefault());
     EXPECT_FALSE(options.MessageExpiry().has_value());
     EXPECT_FALSE(options.MaxTopicSize().has_value());
     EXPECT_FALSE(options.SegmentMaxAge().has_value());
+    EXPECT_FALSE(options.LocalRetentionAge().has_value());
+    EXPECT_FALSE(options.LocalRetentionSize().has_value());
+}
+
+TEST(TopicCreateOptionsTest, TieredStorageKeepsAnExplicitFalse) {
+    iggy::TopicCreateOptions options;
+    options.SetTieredStorage(false);
+    EXPECT_EQ(options.TieredStorage(), std::optional<bool>(false));
+    options.SetTieredStorage(true);
+    EXPECT_EQ(options.TieredStorage(), std::optional<bool>(true));
 }
 
 TEST(TopicCreateOptionsTest, RawMapStoresForwardCompatibleKeys) {
@@ -296,6 +318,9 @@ TEST(TopicUpdateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.Name().has_value());
     EXPECT_FALSE(options.MessageExpiry().has_value());
     EXPECT_FALSE(options.MaxTopicSize().has_value());
+    EXPECT_FALSE(options.TieredStorage().has_value());
+    EXPECT_FALSE(options.LocalRetentionAge().has_value());
+    EXPECT_FALSE(options.LocalRetentionSize().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
     EXPECT_TRUE(options.ResetKeys().empty());
 }
@@ -304,23 +329,41 @@ TEST(TopicUpdateOptionsTest, StoresUpdatableFields) {
     iggy::TopicUpdateOptions options;
     options.SetName("renamed")
         .SetMessageExpiry(iggy::Expiry::NeverExpire())
-        .SetMaxTopicSize(iggy::MaxTopicSize::Unlimited());
+        .SetMaxTopicSize(iggy::MaxTopicSize::Unlimited())
+        .SetTieredStorage(true)
+        .SetLocalRetentionAge(iggy::Expiry::Duration(1800000000))
+        .SetLocalRetentionSize(iggy::MaxTopicSize::FromBytes(512));
     EXPECT_EQ(options.Name(), std::optional<std::string>("renamed"));
     ASSERT_TRUE(options.MessageExpiry().has_value());
     EXPECT_EQ(options.MessageExpiry()->Kind(), "never_expire");
     ASSERT_TRUE(options.MaxTopicSize().has_value());
     EXPECT_EQ(options.MaxTopicSize()->Value(), "unlimited");
+    EXPECT_EQ(options.TieredStorage(), std::optional<bool>(true));
+    ASSERT_TRUE(options.LocalRetentionAge().has_value());
+    EXPECT_EQ(options.LocalRetentionAge()->Value(), 1800000000u);
+    ASSERT_TRUE(options.LocalRetentionSize().has_value());
+    EXPECT_EQ(options.LocalRetentionSize()->Value(), "512");
 }
 
 TEST(TopicUpdateOptionsTest, ServerDefaultSentinelsClearValues) {
     iggy::TopicUpdateOptions options;
-    options.SetMessageExpiry(iggy::Expiry::Duration(15)).SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    options.SetMessageExpiry(iggy::Expiry::Duration(15))
+        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024))
+        .SetLocalRetentionAge(iggy::Expiry::Duration(10))
+        .SetLocalRetentionSize(iggy::MaxTopicSize::FromBytes(512));
     ASSERT_TRUE(options.MessageExpiry().has_value());
     ASSERT_TRUE(options.MaxTopicSize().has_value());
+    ASSERT_TRUE(options.LocalRetentionAge().has_value());
+    ASSERT_TRUE(options.LocalRetentionSize().has_value());
 
-    options.SetMessageExpiry(iggy::Expiry::ServerDefault()).SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault());
+    options.SetMessageExpiry(iggy::Expiry::ServerDefault())
+        .SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault())
+        .SetLocalRetentionAge(iggy::Expiry::ServerDefault())
+        .SetLocalRetentionSize(iggy::MaxTopicSize::ServerDefault());
     EXPECT_FALSE(options.MessageExpiry().has_value());
     EXPECT_FALSE(options.MaxTopicSize().has_value());
+    EXPECT_FALSE(options.LocalRetentionAge().has_value());
+    EXPECT_FALSE(options.LocalRetentionSize().has_value());
 }
 
 TEST(TopicUpdateOptionsTest, RawMapStoresKeys) {
@@ -361,6 +404,9 @@ TEST(OptionKeyTest, ReturnsCatalogNames) {
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKekFingerprint), "encryption_kek_fingerprint");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SizeOfMessagesRequiredToSave), "size_of_messages_required_to_save");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SegmentMaxAge), "segment_max_age");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TieredStorage), "tiered_storage");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LocalRetentionAge), "local_retention_age");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LocalRetentionSize), "local_retention_size");
     EXPECT_EQ(iggy::to_string(iggy::UserOptionKey::Status), "status");
     EXPECT_EQ(iggy::to_string(iggy::OptionsScope::User), "user");
     EXPECT_EQ(iggy::to_string(iggy::StreamEncryptionSource::Server), "server");
