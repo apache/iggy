@@ -22,6 +22,7 @@ pub mod host;
 pub mod metrics;
 mod partition_io;
 pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
+mod object_deletes;
 mod poll;
 mod primary_rebalance;
 mod router;
@@ -1212,6 +1213,34 @@ pub enum LifecycleFrame {
     /// The result of an upload that an [`Self::UploadSegments`] pass started,
     /// sent by the task that ran it.
     SegmentUploadFinished(Box<FinishedSegmentUpload>),
+    /// Per-shard pass over a partition of a tiered topic: start the next
+    /// object-store job of its deletes, when this replica is the primary and
+    /// none is in flight. The timer task stamps `now` and reads the
+    /// truncation watermark metadata holds. Does nothing on a shard without
+    /// a deleter.
+    DeleteObjects {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for, as on
+        /// [`Self::UploadSegments`]: `committed_up_to` bounds what a sweep
+        /// may delete, and says nothing about a recreated partition.
+        created_revision: u64,
+        now: IggyTimestamp,
+        committed_up_to: u64,
+    },
+    /// The result of a job that a [`Self::DeleteObjects`] pass started, sent
+    /// by the task that ran it.
+    ObjectDeleteFinished(Box<FinishedObjectDelete>),
+}
+
+/// What the task running an object-delete job hands back to the pump.
+pub struct FinishedObjectDelete {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the job. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the job.
+    pub id: u64,
+    pub outcome: partitions::ObjectDeleteOutcome,
 }
 
 /// What the task running a segment upload hands back to the pump.
@@ -2001,6 +2030,17 @@ where
     /// draws from, and the wait of each partition whose upload failed.
     upload_pacing: RefCell<upload_pacing::UploadPacing>,
 
+    /// Late-bound deleter of the objects of removed segments. `None` on a
+    /// shard without an object store, where every delete pass is a no-op. No
+    /// boot path sets it, so deletes run only where a caller of
+    /// [`Self::set_object_deleter`] supplies one.
+    object_deleter: RefCell<Option<Rc<dyn partitions::ObjectDeleter>>>,
+
+    /// Results of object-delete jobs whose frame the inbox refused. The
+    /// partition counts such a job as in flight until it sees the result, so
+    /// the next delete pass takes them from here.
+    undelivered_object_deletes: Rc<RefCell<Vec<FinishedObjectDelete>>>,
+
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
     /// number only tells two advances apart in a prepare.
@@ -2342,6 +2382,8 @@ where
             segment_uploader: RefCell::new(None),
             undelivered_segment_uploads: Rc::default(),
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
+            object_deleter: RefCell::new(None),
+            undelivered_object_deletes: Rc::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3307,6 +3349,8 @@ where
             segment_uploader: RefCell::new(None),
             undelivered_segment_uploads: Rc::default(),
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
+            object_deleter: RefCell::new(None),
+            undelivered_object_deletes: Rc::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),

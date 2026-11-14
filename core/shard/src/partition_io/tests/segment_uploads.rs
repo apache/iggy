@@ -32,16 +32,16 @@ use partitions::{
 use std::time::Instant;
 
 /// Sealed segments the fixture's primary holds, of one message each.
-const SEALED_SEGMENTS: u64 = 3;
+pub(super) const SEALED_SEGMENTS: u64 = 3;
 
 /// The partition every test here uploads from.
-fn namespace() -> IggyNamespace {
+pub(super) fn namespace() -> IggyNamespace {
     IggyNamespace::new(0, 0, 0)
 }
 
 /// The incarnation of the fixture's partition, which its passes are staged
 /// for.
-fn staged_revision(owner: &IoTestShard) -> u64 {
+pub(super) fn staged_revision(owner: &IoTestShard) -> u64 {
     owner
         .plane
         .partitions()
@@ -110,7 +110,7 @@ impl SegmentUploader for RecordingUploader {
 /// A shard whose partition [`namespace`] is a tiered single-replica primary
 /// on disk, with a segment size that seals every segment at its first batch.
 #[allow(clippy::future_not_send)]
-async fn tiered_owner(directory: &Path) -> IoTestShard {
+pub(super) async fn tiered_owner(directory: &Path) -> IoTestShard {
     let bus = Rc::new(IggyMessageBus::new(0));
     let (owner, _sender) = test_owner(&bus, None);
     let partitions = owner.plane.partitions();
@@ -138,7 +138,7 @@ async fn tiered_owner(directory: &Path) -> IoTestShard {
 /// Run `body` beside the owner's pump, and stop the pump when it ends. A
 /// shard runs its pump once, so everything that needs a commit goes in here.
 #[allow(clippy::future_not_send)]
-async fn pumped<T>(owner: &IoTestShard, body: impl Future<Output = T>) -> T {
+pub(super) async fn pumped<T>(owner: &IoTestShard, body: impl Future<Output = T>) -> T {
     let (stop, stopped) = channel(1);
     let pump = owner.run_message_pump(stopped, Arc::new(AtomicBool::new(false)));
     let body = async {
@@ -151,7 +151,7 @@ async fn pumped<T>(owner: &IoTestShard, body: impl Future<Output = T>) -> T {
 
 /// Wait for the pump to bring the owner to `done`.
 #[allow(clippy::future_not_send)]
-async fn until(owner: &IoTestShard, done: impl Fn(&IoTestShard) -> bool) {
+pub(super) async fn until(owner: &IoTestShard, done: impl Fn(&IoTestShard) -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !done(owner) {
         assert!(
@@ -165,7 +165,7 @@ async fn until(owner: &IoTestShard, done: impl Fn(&IoTestShard) -> bool) {
 /// Commit [`SEALED_SEGMENTS`] sends, each of which seals its segment and
 /// records it in the chain on the commit path.
 #[allow(clippy::future_not_send)]
-async fn seal_segments(owner: &IoTestShard) {
+pub(super) async fn seal_segments(owner: &IoTestShard) {
     for request in 1..=SEALED_SEGMENTS {
         owner.senders[0]
             .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
@@ -191,13 +191,13 @@ async fn seal_segments(owner: &IoTestShard) {
 /// [`tiered_owner`] with its segments sealed and its pump stopped, for the
 /// tests that call the pump's handlers themselves.
 #[allow(clippy::future_not_send)]
-async fn sealed_owner(directory: &Path) -> IoTestShard {
+pub(super) async fn sealed_owner(directory: &Path) -> IoTestShard {
     let owner = tiered_owner(directory).await;
     pumped(&owner, seal_segments(&owner)).await;
     owner
 }
 
-fn floor(owner: &IoTestShard) -> Option<u64> {
+pub(super) fn floor(owner: &IoTestShard) -> Option<u64> {
     owner
         .plane
         .partitions()

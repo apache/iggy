@@ -42,7 +42,7 @@ use consensus::{
     VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
     build_eviction_message, build_reply_message, build_reply_message_with,
     build_result_rejection_reply, emit_sim_event, fatal, fence_old_prepare_by_commit,
-    is_caught_up_primary, is_caught_up_primary_except_barrier,
+    is_caught_up_primary, is_caught_up_primary_except_barrier, is_settled_primary,
     panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
     register_preflight, replicate_preflight, replicate_prepare, request_preflight,
     send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
@@ -3525,6 +3525,15 @@ where
     #[must_use]
     pub fn is_caught_up_primary(&self) -> bool {
         self.consensus.as_ref().is_some_and(is_caught_up_primary)
+    }
+
+    /// `true` when this node is the primary of the metadata consensus group
+    /// in a normal view, however far it is from applying what is committed.
+    /// Enough for maintenance that acts only on state already applied here,
+    /// and that a commit still to apply must not pause.
+    #[must_use]
+    pub fn is_settled_primary(&self) -> bool {
+        self.consensus.as_ref().is_some_and(is_settled_primary)
     }
 
     /// Replicate initial root creation with a precomputed password hash.

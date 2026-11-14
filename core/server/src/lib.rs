@@ -68,6 +68,7 @@ pub(crate) mod wire;
 pub(crate) mod http;
 
 // background: per-shard maintenance loops.
+pub(crate) mod incarnation_deletes;
 pub(crate) mod partition_reconciler;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,

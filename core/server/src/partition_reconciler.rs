@@ -181,6 +181,7 @@
 //! helping; consider a distinct "retry here shortly" code that keeps the route.
 //!
 
+use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
 };
@@ -343,6 +344,9 @@ pub struct ReconcilerCtx {
     repair_scrub: RefCell<Option<BTreeSet<IggyNamespace>>>,
     group_offset_cleanup: GroupOffsetCleanup,
     lifecycle_reports: LifecycleReports,
+    /// The incarnations whose delete this node saw commit as the metadata
+    /// primary, and whose objects wait for their delete.
+    incarnation_deletes: IncarnationDeletes,
 }
 
 impl ReconcilerCtx {
@@ -379,6 +383,7 @@ impl ReconcilerCtx {
             repair_scrub: RefCell::new(None),
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
+            incarnation_deletes: IncarnationDeletes::default(),
         }
     }
 
@@ -557,6 +562,7 @@ pub async fn run_reconciler(
         }
     }
 
+    ctx.incarnation_deletes.stop();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -643,6 +649,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         reconcile_stream_keys(ctx);
     }
     report_lifecycles(ctx).await;
+    ctx.incarnation_deletes
+        .pass(&ctx.shard, IggyTimestamp::now());
 
     if counters.total() > 0 {
         debug!(
@@ -688,6 +696,12 @@ async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
         partition_may_be_gone = changes
             .iter()
             .any(|change| change.kind == PartitionChangeKind::Removed);
+        // Only here: a pass that lost the feed tears down what it finds
+        // missing, and that proves no committed delete.
+        if partition_may_be_gone {
+            ctx.incarnation_deletes
+                .observe(&ctx.shard, &changes, IggyTimestamp::now());
+        }
         ctx.add_announced(
             changes
                 .iter()
@@ -2480,9 +2494,13 @@ mod tests {
     };
     use iggy_common::wire_conversions::resource_options_to_wire;
     use iggy_common::{
-        Durability, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue,
-        OptionsProvenance, ResourceOptions, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin,
-        WrapSet, critical_keys_marker,
+        Durability, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, IggyTimestamp, OptionKey,
+        OptionValue, OptionsProvenance, ResourceOptions, ServerKeyContext, StreamEncryptionKey,
+        StreamKeyOrigin, WrapSet, critical_keys_marker,
+    };
+    use iggy_object_store::{
+        InlineTierExecutor, KeyLayout, MemoryStore, ObjectPrefix, ObjectStore, PutBody, PutOptions,
+        SegmentKey, SegmentObject,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -2495,12 +2513,13 @@ mod tests {
         RETIRED_PARTITION_OP, retired_member_op,
     };
     use metadata::stm::stream::{
-        PartitionChangeKind, RECENT_PARTITION_CHANGES_RETAINED, Streams, TruncatePartitionRequest,
+        PartitionChange, PartitionChangeKind, RECENT_PARTITION_CHANGES_RETAINED, Streams,
+        TruncatePartitionRequest,
     };
     use metadata::stm::user::Users;
     use partitions::{
-        IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairSession,
-        Segment,
+        ExecutorDeleter, IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig,
+        RETIRED_OBJECT_GRACE, RepairSession, Segment, object_prefix,
     };
     use rand::prelude::{RngExt, SeedableRng, StdRng};
     use server_common::sharding::{IggyNamespace, ShardId};
@@ -3018,13 +3037,42 @@ mod tests {
         mux: TestMux,
         key_context: Arc<ServerKeyContext>,
     ) -> Rc<TestShard> {
+        build_test_shard_with_metadata_replica(shard_id, config, mux, key_context, None)
+    }
+
+    /// [`build_test_shard`] on the metadata primary of a one-node cluster.
+    fn build_metadata_primary_shard(config: &ServerConfig, mux: TestMux) -> Rc<TestShard> {
+        build_test_shard_with_metadata_replica(0, config, mux, Arc::default(), Some((0, 1)))
+    }
+
+    /// [`build_test_shard_with_keys`] whose metadata plane holds the
+    /// consensus of `(replica, replica count)`, in the view replica 0 leads.
+    fn build_test_shard_with_metadata_replica(
+        shard_id: u16,
+        config: &ServerConfig,
+        mux: TestMux,
+        key_context: Arc<ServerKeyContext>,
+        metadata_replica: Option<(u8, u8)>,
+    ) -> Rc<TestShard> {
         let bus = Rc::new(IggyMessageBus::with_config(shard_id, config));
+        let metadata_consensus = metadata_replica.map(|(replica, replica_count)| {
+            let consensus = consensus::VsrConsensus::new(
+                CLUSTER_ID,
+                replica,
+                replica_count,
+                server_common::sharding::METADATA_GROUP,
+                Rc::clone(&bus),
+                consensus::LocalPipeline::new(),
+            );
+            consensus.init();
+            consensus
+        });
         let metadata: IggyMetadata<
             consensus::VsrConsensus<Rc<IggyMessageBus>>,
             journal::prepare_journal::PrepareJournal,
             IggySnapshot,
             _,
-        > = IggyMetadata::new(None, None, None, None, mux, None);
+        > = IggyMetadata::new(metadata_consensus, None, None, None, mux, None);
         let partitions = IggyPartitions::new(
             ShardId::new(shard_id),
             PartitionsConfig {
@@ -4208,6 +4256,375 @@ mod tests {
             shard.shards_table().namespaces().is_empty(),
             "shards_table must be empty after DeleteStream"
         );
+    }
+
+    type MemoryDeleter = ExecutorDeleter<InlineTierExecutor<MemoryStore>>;
+
+    fn object_layout() -> KeyLayout {
+        KeyLayout::new("iggy").unwrap()
+    }
+
+    /// Give `shard` a deleter over a memory store, and return it for the
+    /// test to reach the store.
+    fn install_memory_deleter(shard: &TestShard) -> Rc<MemoryDeleter> {
+        let deleter = Rc::new(ExecutorDeleter::new(
+            InlineTierExecutor::new(MemoryStore::new()),
+            object_layout(),
+        ));
+        shard.set_object_deleter(Some(
+            Rc::clone(&deleter) as Rc<dyn partitions::ObjectDeleter>
+        ));
+        deleter
+    }
+
+    /// The object prefix of the committed incarnation of `ns`.
+    fn committed_prefix(shard: &TestShard, ns: IggyNamespace) -> ObjectPrefix {
+        let created_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(ns)
+            .expect("committed namespace has an incarnation");
+        object_prefix(ns, created_revision)
+    }
+
+    /// Store both objects of one segment and the manifest of `prefix`, and
+    /// return their keys.
+    async fn store_incarnation(deleter: &MemoryDeleter, prefix: ObjectPrefix) -> Vec<String> {
+        let layout = object_layout();
+        let mut keys: Vec<String> = SegmentObject::ALL
+            .into_iter()
+            .map(|object| {
+                layout.segment_key(&SegmentKey {
+                    prefix,
+                    start_offset: 0,
+                    object,
+                })
+            })
+            .collect();
+        keys.push(layout.manifest_key(&prefix));
+        for key in &keys {
+            deleter
+                .executor()
+                .store()
+                .put(key, PutBody::from_bytes(vec![1]), &PutOptions::default())
+                .await
+                .unwrap();
+        }
+        keys.sort();
+        keys
+    }
+
+    fn stored_keys(deleter: &MemoryDeleter) -> Vec<String> {
+        deleter.executor().store().keys()
+    }
+
+    /// A moment by which everything queued so far has waited its grace
+    /// period.
+    fn past_the_grace_period() -> IggyTimestamp {
+        IggyTimestamp::from(
+            IggyTimestamp::now().as_micros()
+                + u64::try_from(RETIRED_OBJECT_GRACE.as_micros()).unwrap(),
+        )
+    }
+
+    /// Run the delete pass as of `now` and let its task finish.
+    async fn incarnation_delete_pass(ctx: &ReconcilerCtx, now: IggyTimestamp) {
+        ctx.incarnation_deletes.pass(&ctx.shard, now);
+        for _ in 0..16 {
+            super::yield_now().await;
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_completed_topic_delete_when_the_metadata_primary_reconciles_should_delete_the_objects_of_each_partition_after_the_grace_period()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-objects");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "deleted",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_topic(&mux, 3, 0, "kept", vec![assignment(0, 3)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let deleted = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)]
+            .map(|ns| committed_prefix(&shard, ns));
+        let kept = committed_prefix(&shard, IggyNamespace::new(0, 1, 0));
+        for prefix in deleted {
+            store_incarnation(&deleter, prefix).await;
+        }
+        let kept_keys = store_incarnation(&deleter, kept).await;
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 4, 0, 0);
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 2);
+        for prefix in deleted {
+            assert!(ctx.incarnation_deletes.is_queued(
+                IggyNamespace::new(0, 0, usize::try_from(prefix.partition_id).unwrap()),
+                prefix.created_revision
+            ));
+        }
+        // The pass of the reconciler ran inside the grace period.
+        incarnation_delete_pass(&ctx, IggyTimestamp::now()).await;
+        assert_eq!(stored_keys(&deleter).len(), 9);
+
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+
+        assert_eq!(stored_keys(&deleter), kept_keys);
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+        // A pass with nothing queued starts nothing.
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), kept_keys);
+    }
+
+    #[compio::test]
+    async fn given_a_completed_stream_delete_when_the_metadata_primary_reconciles_should_queue_every_partition_of_the_stream()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "deleted");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "first",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_topic(&mux, 3, 0, "second", vec![assignment(0, 3)]);
+        seed_stream(&mux, 4, "kept");
+        seed_topic(&mux, 5, 1, "third", vec![assignment(0, 4)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let deleted = [
+            IggyNamespace::new(0, 0, 0),
+            IggyNamespace::new(0, 0, 1),
+            IggyNamespace::new(0, 1, 0),
+        ]
+        .map(|ns| (ns, committed_prefix(&shard, ns)));
+        for (_, prefix) in deleted {
+            store_incarnation(&deleter, prefix).await;
+        }
+        let kept_keys = store_incarnation(
+            &deleter,
+            committed_prefix(&shard, IggyNamespace::new(1, 0, 0)),
+        )
+        .await;
+
+        seed_delete_stream(&shard.plane.metadata().mux_stm, 6, 0);
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 3);
+        for (ns, prefix) in deleted {
+            assert!(
+                ctx.incarnation_deletes
+                    .is_queued(ns, prefix.created_revision)
+            );
+        }
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), kept_keys);
+    }
+
+    #[compio::test]
+    async fn given_a_topic_recreated_into_the_same_ids_when_the_deleted_one_is_cleaned_should_keep_the_objects_of_the_new_incarnation()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-reuse");
+        seed_topic(&mux, 2, 0, "topic-reuse", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let old = committed_prefix(&shard, ns);
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-reuse",
+            vec![assignment(0, 1)],
+        );
+        let new = committed_prefix(&shard, ns);
+        assert_ne!(old.created_revision, new.created_revision);
+        store_incarnation(&deleter, old).await;
+        let new_keys = store_incarnation(&deleter, new).await;
+        reconcile_pass(&ctx).await;
+
+        assert!(ctx.incarnation_deletes.is_queued(ns, old.created_revision));
+        assert!(!ctx.incarnation_deletes.is_queued(ns, new.created_revision));
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), new_keys);
+    }
+
+    #[compio::test]
+    async fn given_a_queued_incarnation_that_committed_metadata_holds_when_the_delete_pass_runs_should_drop_it_and_keep_its_objects()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-live");
+        seed_topic(&mux, 2, 0, "topic-live", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let live = committed_prefix(&shard, ns);
+        let live_keys = store_incarnation(&deleter, live).await;
+
+        // A removal that names the incarnation metadata still holds, which
+        // no commit records.
+        ctx.incarnation_deletes.observe(
+            &shard,
+            &[PartitionChange {
+                namespace: ns,
+                created_revision: live.created_revision,
+                kind: PartitionChangeKind::Removed,
+            }],
+            IggyTimestamp::now(),
+        );
+        assert!(ctx.incarnation_deletes.is_queued(ns, live.created_revision));
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+
+        assert_eq!(stored_keys(&deleter), live_keys);
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+    }
+
+    #[compio::test]
+    async fn given_a_node_that_is_not_the_metadata_primary_when_a_topic_delete_completes_should_queue_nothing()
+     {
+        // A backup of the metadata group, and a shard without its consensus.
+        for metadata_replica in [Some((1, 3)), None] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let mux = TestMux::default();
+            seed_stream(&mux, 1, "stream-backup");
+            seed_topic(&mux, 2, 0, "topic-backup", vec![assignment(0, 1)]);
+            let shard = build_test_shard_with_metadata_replica(
+                0,
+                &config,
+                mux,
+                Arc::default(),
+                metadata_replica,
+            );
+            let deleter = install_memory_deleter(&shard);
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            reconcile_pass(&ctx).await;
+            let ns = IggyNamespace::new(0, 0, 0);
+            let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
+
+            seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+            reconcile_pass(&ctx).await;
+
+            assert!(!shard.plane.partitions().contains(&ns));
+            assert_eq!(ctx.incarnation_deletes.queued(), 0);
+            // Not even until the next pass, which would drop it.
+            ctx.incarnation_deletes.observe(
+                &shard,
+                &[PartitionChange {
+                    namespace: ns,
+                    created_revision: 1,
+                    kind: PartitionChangeKind::Removed,
+                }],
+                IggyTimestamp::now(),
+            );
+            assert_eq!(ctx.incarnation_deletes.queued(), 0);
+            incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+            assert_eq!(stored_keys(&deleter), stored);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_teardown_the_change_feed_did_not_announce_when_reconciling_should_queue_nothing()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-unannounced");
+        seed_topic(&mux, 2, 0, "topic-unannounced", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
+
+        // The pass finds the partition gone by walking the tree, as after a
+        // restart or a feed that overflowed, and tears the local copy down.
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        ctx.synced_revision.set(None);
+        reconcile_pass(&ctx).await;
+
+        assert!(!shard.plane.partitions().contains(&ns));
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), stored);
+    }
+
+    #[compio::test]
+    async fn given_a_shard_without_an_object_deleter_when_a_topic_delete_completes_should_queue_nothing()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-no-deleter");
+        seed_topic(&mux, 2, 0, "topic-no-deleter", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+    }
+
+    #[compio::test]
+    async fn given_queued_incarnations_when_the_node_stops_being_the_metadata_primary_should_drop_them_and_delete_nothing()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-demoted");
+        seed_topic(&mux, 2, 0, "topic-demoted", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+        assert_eq!(ctx.incarnation_deletes.queued(), 1);
+
+        // The node leaves the normal view it led.
+        shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap()
+            .begin_view_probe();
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+        assert_eq!(stored_keys(&deleter), stored);
     }
 
     /// A delete+recreate of the same (stream, topic, partition) tuple
