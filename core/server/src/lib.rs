@@ -75,6 +75,7 @@ pub use partition_reconciler::{
     reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
 pub(crate) mod personal_access_token_cleaner;
+pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;
 pub(crate) mod store_identity;

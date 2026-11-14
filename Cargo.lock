@@ -5964,6 +5964,7 @@ dependencies = [
 name = "iggy_object_store"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64 0.23.1",
  "bytes",
  "chrono",
@@ -5981,6 +5982,7 @@ dependencies = [
  "rustls",
  "send_wrapper",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "url",

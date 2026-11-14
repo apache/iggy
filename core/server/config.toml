@@ -1393,10 +1393,14 @@ handshake_grace = "10 s"
 # "virtual_hosted" (bucket.endpoint/key) or "auto", which picks
 # "virtual_hosted" for AWS and "path" for any other endpoint.
 #url_style = "auto"
-# Static s3 credentials, which the s3 backend needs. Set them in the
-# environment, with IGGY_TIERED_STORAGE_ACCESS_KEY_ID and
-# IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY, rather than in this file. The
-# printed configuration never shows them.
+# Static s3 credentials. Set them in the environment, with
+# IGGY_TIERED_STORAGE_ACCESS_KEY_ID and IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY,
+# rather than in this file. The printed configuration never shows them.
+# Without static keys, the s3 backend takes temporary credentials, in the
+# order of the AWS SDKs: from web identity (AWS_WEB_IDENTITY_TOKEN_FILE and
+# AWS_ROLE_ARN, as on EKS), and then from the role of the EC2 instance
+# (AWS_EC2_METADATA_DISABLED=true turns that off). The node fetches new
+# credentials 5 minutes before the old ones expire, and every shard uses them.
 #access_key_id = ""
 #secret_access_key = ""
 # The tuning values below are provisional.

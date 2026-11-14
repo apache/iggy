@@ -20,7 +20,7 @@
 
 use iggy_object_store::s3::{Credentials, S3Config, S3Store};
 use iggy_object_store::{ListRequest, ObjectStore, ObjectStoreError};
-use integration::harness::floci::{self, FlociBucket};
+use integration::harness::floci::{self, ACCESS_KEY_ID, FlociBucket};
 
 macro_rules! s3_store {
     ($($case:ident),* $(,)?) => {$(
@@ -42,13 +42,14 @@ iggy_object_store::if_absent_contract_cases!(s3_store);
 #[test]
 fn given_wrong_secret_when_listing_should_fail_as_auth() {
     let bucket = bucket();
-    let config = bucket.s3_config();
     let wrong = S3Config {
         credentials: Credentials {
+            access_key_id: ACCESS_KEY_ID.to_owned(),
             secret_access_key: "wrong".to_owned(),
-            ..config.credentials.clone()
-        },
-        ..config
+            session_token: None,
+        }
+        .into(),
+        ..bucket.s3_config()
     };
 
     let result = list(wrong);

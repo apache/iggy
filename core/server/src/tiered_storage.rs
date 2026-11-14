@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use configs::tiered_storage::{S3UrlStyle, TieredStorageBackend, TieredStorageConfig};
 use iggy_common::IggyByteSize;
-use iggy_object_store::s3::{Credentials, S3Config, S3Store, UrlStyle};
+use iggy_object_store::s3::{S3Config, S3Store, SharedCredentials, UrlStyle};
 use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, ObjectStoreError, StoreIdentity,
 };
@@ -52,14 +52,7 @@ const IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn preflight(config: &TieredStorageConfig) -> Result<(), ServerError> {
     match config.backend {
         TieredStorageBackend::None => return Ok(()),
-        // Static keys are the only credentials that the provider takes yet.
-        TieredStorageBackend::S3 if config.access_key_id.is_empty() => {
-            return Err(ServerError::TieredStorage {
-                reason: "the s3 backend needs tiered_storage.access_key_id and \
-                         tiered_storage.secret_access_key"
-                    .to_owned(),
-            });
-        }
+        // The credentials of the s3 backend come from `crate::s3_credentials`.
         TieredStorageBackend::S3 => {}
         TieredStorageBackend::Fs => {
             let metadata = std::fs::metadata(&config.path).map_err(|source| {
@@ -93,7 +86,10 @@ pub fn preflight(config: &TieredStorageConfig) -> Result<(), ServerError> {
 /// [`ServerError::TieredStorageProbe`] when the bucket is missing or the
 /// store refuses the credentials. [`ServerError::TieredStorageProbeRuntime`]
 /// when the runtime for the read cannot start.
-pub fn probe(config: &TieredStorageConfig) -> Result<bool, ServerError> {
+pub fn probe(
+    config: &TieredStorageConfig,
+    credentials: Option<&SharedCredentials>,
+) -> Result<bool, ServerError> {
     if config.backend == TieredStorageBackend::None {
         return Ok(true);
     }
@@ -104,7 +100,7 @@ pub fn probe(config: &TieredStorageConfig) -> Result<bool, ServerError> {
         }
     })?;
     runtime.block_on(async {
-        let Some(store) = store(config)? else {
+        let Some(store) = store(config, credentials)? else {
             return Ok(true);
         };
         let read = compio::time::timeout(
@@ -127,9 +123,10 @@ pub fn start(
     bus: &Rc<IggyMessageBus>,
     shard: &Rc<ServerShard>,
     replica_id: u8,
+    credentials: Option<&SharedCredentials>,
 ) -> Option<Sender<()>> {
     // `preflight` and `probe` refused the boot already when these fail.
-    let backend = store(config).ok().flatten()?;
+    let backend = store(config, credentials).ok().flatten()?;
     let layout = layout(config).ok()?;
     let service = TierService::new(backend, Rc::clone(bus), &service_config(config));
     let handlers = TierHandlers::new(
@@ -139,7 +136,7 @@ pub fn start(
     // The check gets a store of its own, outside the service, so no queued
     // job and no retry delays what it finds.
     let checker = if shard.id == 0 {
-        store(config).ok().flatten().map(|store| {
+        store(config, credentials).ok().flatten().map(|store| {
             IdentityChecker::new(store, layout, replica_id == 0, identity_timeout(config))
         })
     } else {
@@ -190,41 +187,46 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
     }
 }
 
-/// The configured store, or `None` without a backend.
+/// The configured store, or `None` without a backend. An `s3` store signs
+/// with `credentials`, which every shard of the node shares.
 ///
 /// # Errors
 /// [`ServerError::TieredStorage`] for an `s3` endpoint that cannot address a
-/// bucket.
-fn store(config: &TieredStorageConfig) -> Result<Option<Backend>, ServerError> {
+/// bucket, or an `s3` backend without credentials.
+fn store(
+    config: &TieredStorageConfig,
+    credentials: Option<&SharedCredentials>,
+) -> Result<Option<Backend>, ServerError> {
+    let refuse = |reason: String| ServerError::TieredStorage { reason };
     Ok(match config.backend {
         TieredStorageBackend::None => None,
         TieredStorageBackend::Fs => Some(Backend::Fs(FsStore::new(&config.path))),
-        TieredStorageBackend::S3 => Some(Backend::S3(S3Store::new(s3_config(config)).map_err(
-            |error| ServerError::TieredStorage {
-                reason: error.to_string(),
-            },
-        )?)),
+        TieredStorageBackend::S3 => {
+            let credentials = credentials
+                .cloned()
+                .ok_or_else(|| refuse("the s3 backend has no credentials".to_owned()))?;
+            Some(Backend::S3(
+                S3Store::new(s3_config(config, credentials))
+                    .map_err(|error| refuse(error.to_string()))?,
+            ))
+        }
     })
 }
 
 /// Where the store keeps objects, for the log.
 fn store_location(config: &TieredStorageConfig) -> String {
     match config.backend {
-        TieredStorageBackend::S3 => format!("{}/{}", s3_config(config).endpoint, config.bucket),
+        TieredStorageBackend::S3 => format!("{}/{}", s3_endpoint(config), config.bucket),
         TieredStorageBackend::Fs | TieredStorageBackend::None => config.path.clone(),
     }
 }
 
 /// The `s3` section in the form the provider takes. An empty endpoint is AWS
 /// in the configured region.
-fn s3_config(config: &TieredStorageConfig) -> S3Config {
+fn s3_config(config: &TieredStorageConfig, credentials: SharedCredentials) -> S3Config {
     let aws = config.endpoint.trim().is_empty();
     S3Config {
-        endpoint: if aws {
-            format!("https://s3.{}.amazonaws.com", config.region)
-        } else {
-            config.endpoint.clone()
-        },
+        endpoint: s3_endpoint(config),
         region: config.region.clone(),
         bucket: config.bucket.clone(),
         url_style: match config.url_style {
@@ -232,11 +234,16 @@ fn s3_config(config: &TieredStorageConfig) -> S3Config {
             S3UrlStyle::VirtualHosted => UrlStyle::VirtualHosted,
             S3UrlStyle::Auto | S3UrlStyle::Path => UrlStyle::Path,
         },
-        credentials: Credentials {
-            access_key_id: config.access_key_id.clone(),
-            secret_access_key: config.secret_access_key.clone(),
-            session_token: None,
-        },
+        credentials,
+    }
+}
+
+/// The configured endpoint, or AWS in the configured region when it is empty.
+fn s3_endpoint(config: &TieredStorageConfig) -> String {
+    if config.endpoint.trim().is_empty() {
+        format!("https://s3.{}.amazonaws.com", config.region)
+    } else {
+        config.endpoint.clone()
     }
 }
 
@@ -380,14 +387,14 @@ mod tests {
 
     #[test]
     fn given_no_backend_when_probing_should_accept() {
-        assert!(probe(&TieredStorageConfig::default()).unwrap());
+        assert!(probe(&TieredStorageConfig::default(), None).unwrap());
     }
 
     #[test]
     fn given_fs_backend_with_a_directory_when_probing_should_accept() {
         let directory = tempfile::tempdir().unwrap();
 
-        assert!(probe(&fs_config(directory.path())).unwrap());
+        assert!(probe(&fs_config(directory.path()), None).unwrap());
     }
 
     /// A file that no node wrote fails the store identity check, but it
@@ -403,14 +410,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(probe(&fs_config(directory.path())).unwrap());
+        assert!(probe(&fs_config(directory.path()), None).unwrap());
     }
 
     #[test]
     fn given_fs_backend_without_its_directory_when_probing_should_refuse_the_boot() {
         let directory = tempfile::tempdir().unwrap();
 
-        let error = probe(&fs_config(&directory.path().join("missing"))).unwrap_err();
+        let error = probe(&fs_config(&directory.path().join("missing")), None).unwrap_err();
 
         assert!(
             matches!(
@@ -458,15 +465,15 @@ mod tests {
         }
     }
 
+    /// Credentials come from `crate::s3_credentials`, after the preflight.
     #[test]
-    fn given_s3_backend_without_credentials_when_preflighting_should_refuse_the_boot() {
-        let config = TieredStorageConfig {
-            access_key_id: String::new(),
-            secret_access_key: String::new(),
-            ..s3_section("")
-        };
+    fn given_s3_backend_without_static_keys_when_preflighting_should_accept() {
+        assert!(preflight(&s3_section("")).is_ok());
+    }
 
-        let error = preflight(&config).unwrap_err();
+    #[test]
+    fn given_s3_backend_without_credentials_when_probing_should_refuse_the_boot() {
+        let error = probe(&s3_section("http://localhost:4566"), None).unwrap_err();
 
         assert!(
             matches!(error, ServerError::TieredStorage { .. }),
@@ -475,31 +482,34 @@ mod tests {
     }
 
     #[test]
-    fn given_s3_backend_with_credentials_when_preflighting_should_accept() {
-        assert!(preflight(&s3_section("")).is_ok());
-    }
-
-    #[test]
     fn given_s3_sections_when_mapping_should_pick_the_endpoint_and_url_style() {
-        let aws = s3_config(&s3_section(""));
-        let custom = s3_config(&s3_section("http://localhost:4566"));
-        let forced = s3_config(&TieredStorageConfig {
-            url_style: S3UrlStyle::Path,
-            ..s3_section("")
-        });
+        let aws = s3_config(&s3_section(""), keys());
+        let custom = s3_config(&s3_section("http://localhost:4566"), keys());
+        let forced = s3_config(
+            &TieredStorageConfig {
+                url_style: S3UrlStyle::Path,
+                ..s3_section("")
+            },
+            keys(),
+        );
 
         assert_eq!(aws.endpoint, "https://s3.eu-central-1.amazonaws.com");
         assert_eq!(aws.url_style, UrlStyle::VirtualHosted);
         assert_eq!(custom.endpoint, "http://localhost:4566");
         assert_eq!(custom.url_style, UrlStyle::Path);
         assert_eq!(forced.url_style, UrlStyle::Path);
-        assert_eq!(aws.credentials.access_key_id, "AKIDEXAMPLE");
-        assert_eq!(aws.credentials.session_token, None);
+        assert_eq!(
+            aws.credentials
+                .current()
+                .map(|keys| keys.access_key_id.clone())
+                .as_deref(),
+            Some("AKIDEXAMPLE")
+        );
     }
 
     #[test]
     fn given_s3_endpoint_that_cannot_address_a_bucket_when_probing_should_refuse_the_boot() {
-        let error = probe(&s3_section("http://store/with-a-path")).unwrap_err();
+        let error = probe(&s3_section("http://store/with-a-path"), Some(&keys())).unwrap_err();
 
         assert!(
             matches!(error, ServerError::TieredStorage { .. }),
@@ -516,7 +526,7 @@ mod tests {
         drop(listener);
 
         assert!(
-            !probe(&s3_section(&endpoint)).unwrap(),
+            !probe(&s3_section(&endpoint), Some(&keys())).unwrap(),
             "the store did not answer"
         );
     }
@@ -527,9 +537,16 @@ mod tests {
             bucket: "segments".to_owned(),
             region: "eu-central-1".to_owned(),
             endpoint: endpoint.to_owned(),
-            access_key_id: "AKIDEXAMPLE".to_owned(),
-            secret_access_key: "secret".to_owned(),
             ..TieredStorageConfig::default()
         }
+    }
+
+    fn keys() -> SharedCredentials {
+        iggy_object_store::s3::Credentials {
+            access_key_id: "AKIDEXAMPLE".to_owned(),
+            secret_access_key: "secret".to_owned(),
+            session_token: None,
+        }
+        .into()
     }
 }

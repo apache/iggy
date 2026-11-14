@@ -463,6 +463,19 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "tiered storage cannot start: the {source_name} of the s3 backend handed out no credentials"
+    )]
+    TieredStorageCredentials {
+        source_name: &'static str,
+        #[source]
+        source: iggy_object_store::s3::credentials::CredentialError,
+    },
+    #[error("tiered storage cannot start: the credentials refresher of the s3 backend")]
+    TieredStorageCredentialsThread {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]
