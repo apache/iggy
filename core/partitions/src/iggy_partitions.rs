@@ -718,7 +718,9 @@ where
     /// # Errors
     /// Rejects stale history, unavailable partition or admission state, invalid
     /// consumer identifiers, and exhausted consumer, queue, or journal capacity.
-    /// Rejection does not accept progress from this read.
+    /// A read of the served history that the object store failed for good is
+    /// rejected with that failure. Rejection does not accept progress from
+    /// this read.
     pub fn complete_poll(
         &self,
         namespace: &IggyNamespace,

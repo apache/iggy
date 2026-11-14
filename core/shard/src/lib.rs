@@ -656,6 +656,14 @@ impl Drop for ParkedReadiness<'_> {
 /// 30s request deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a poll may wait on the object store, counted from its dispatch.
+///
+/// Half the read timeout: the other half is for the reply and, over HTTP, for
+/// the relay to the primary, which started its own read timeout earlier. A
+/// poll that reaches it returns the messages it has, or asks for a retry.
+const COLD_POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const _: () = assert!(COLD_POLL_BUDGET.as_millis() * 2 <= PARTITION_READ_TIMEOUT.as_millis());
+
 /// Budget for a partition write's wait on its committed reply. Longer than a
 /// read: the wait spans replication quorum plus any park-and-promote the
 /// request rides through, and a view change mid-flight re-proposes under the

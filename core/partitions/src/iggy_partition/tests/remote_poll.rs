@@ -31,10 +31,11 @@ use iggy_object_store::{
     SegmentKey, SegmentObject,
 };
 use server_common::SegmentStorage;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops.
 const SEALED: [u64; 2] = [0, 2];
@@ -227,9 +228,10 @@ async fn given_a_corrupt_index_object_when_polling_should_refuse_it_and_write_no
     let torn = index[..index.len() - 1].to_vec();
     for corrupt in [past_the_segment, before_the_segment, torn] {
         put(&store, &object_key(0, SegmentObject::Index), corrupt).await;
+        forget_failures(&partition);
         assert_eq!(
             Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
-            IggyError::CannotReadMessage
+            IggyError::TieredReadFailed
         );
         assert!(!index_path(directory.path(), 0).exists());
     }
@@ -239,29 +241,72 @@ async fn given_a_corrupt_index_object_when_polling_should_refuse_it_and_write_no
     assert_eq!(last, Some(RECEIVER_OPS - 1));
 }
 
+/// The descriptors a plan's segments cache. A walk keeps none for the segments
+/// it only passes through, so without them it opens every segment by path.
+fn forget_descriptors(plan: &PollPlan) {
+    let PollTier::Disk { disk, .. } = &plan.tier else {
+        panic!("the poll reads from disk");
+    };
+    for segment in &disk.segments {
+        segment.read_state.fd.borrow_mut().take();
+    }
+}
+
 #[compio::test]
-async fn given_a_segment_evicted_after_planning_when_the_walk_reaches_it_should_read_it_remotely() {
+async fn given_a_segment_evicted_after_planning_when_a_cold_walk_reaches_it_should_read_it_remotely()
+ {
     let (directory, mut partition, store, local) = Box::pin(uploaded_partition()).await;
     attach(&mut partition, store);
-    let planned = strategies().map(|strategy| plan(&mut partition, strategy));
-    // A walk keeps no descriptor for the segments it only passes through, so
-    // it opens them by path when it gets there.
+    // Only the first sealed segment is remote when the polls are planned.
+    let first_end = partition.sealed_segment_record(0).unwrap().end_offset;
+    Box::pin(evict(&mut partition, first_end, KEEP_NOTHING)).await;
+    assert!(
+        directory
+            .path()
+            .join(format!("{:020}.log", SEALED[1]))
+            .exists()
+    );
+    let from_the_first = [0, 1, 3].map(|poll| (strategies()[poll], &local[poll]));
+    let planned = from_the_first.map(|(strategy, _)| plan(&mut partition, strategy));
     for plan in &planned {
-        let PollTier::Disk { disk, .. } = &plan.tier else {
-            panic!("the poll reads from disk");
-        };
-        for segment in &disk.segments {
-            segment.read_state.fd.borrow_mut().take();
-        }
+        assert!(plan.reads_remote());
+        forget_descriptors(plan);
     }
     Box::pin(evict_sealed(&mut partition, directory.path())).await;
 
-    let mut polls = Vec::new();
-    for plan in planned {
+    for (plan, (_, local)) in planned.into_iter().zip(from_the_first) {
         let result = plan.execute().await;
-        polls.push(accepted(&mut partition, result));
+        assert_eq!(&accepted(&mut partition, result), local);
     }
-    assert_eq!(polls, local);
+}
+
+#[compio::test]
+async fn given_a_segment_evicted_after_planning_when_a_warm_walk_reaches_it_should_ask_for_a_retry()
+{
+    let (directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let local = Box::pin(polled(&mut partition, PollingStrategy::offset(0))).await;
+    let outage = Rc::new(Outage::default());
+    upload(&outage.store, directory.path()).await;
+    confirm(&mut partition, &SEALED);
+    attach(&mut partition, outage.clone());
+    let warm = plan(&mut partition, PollingStrategy::offset(0));
+    assert!(!warm.reads_remote());
+    forget_descriptors(&warm);
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+
+    // The owner admitted the poll without a place among the cold ones, so it
+    // may not wait on the store.
+    let result = warm.execute().await;
+    assert_eq!(outage.gets.get(), 0, "a warm poll reached the store");
+    assert_eq!(result.message_count, 0);
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+
+    // Its retry is planned against the remote segments, and admitted as cold.
+    let retry = plan(&mut partition, PollingStrategy::offset(0));
+    assert!(retry.reads_remote());
+    let result = retry.execute().await;
+    assert_eq!(accepted(&mut partition, result), local);
 }
 
 #[compio::test]
@@ -315,20 +360,42 @@ impl RemoteObjects for Failing {
 
 #[compio::test]
 async fn given_a_failing_store_when_polling_should_map_the_error_to_its_class() {
-    let cases: [(StoreFailure, IggyError); 3] = [
+    let cases: [(StoreFailure, IggyError); 8] = [
         (
             |_| ObjectStoreError::Throttled("slow down".to_owned()),
+            IggyError::TransientNotAccepted,
+        ),
+        (
+            |_| ObjectStoreError::Unavailable("503".to_owned()),
+            IggyError::TransientNotAccepted,
+        ),
+        (
+            |_| ObjectStoreError::Transport("reset".to_owned()),
             IggyError::TransientNotAccepted,
         ),
         (
             |key| ObjectStoreError::NotFound {
                 key: key.to_owned(),
             },
-            IggyError::CannotReadMessage,
+            IggyError::TieredReadFailed,
         ),
         (
             |_| ObjectStoreError::Auth("denied".to_owned()),
-            IggyError::CannotReadMessage,
+            IggyError::TieredReadFailed,
+        ),
+        (
+            |_| ObjectStoreError::BucketNotFound("iggy".to_owned()),
+            IggyError::TieredReadFailed,
+        ),
+        (
+            |key| ObjectStoreError::Archived {
+                key: key.to_owned(),
+            },
+            IggyError::TieredReadFailed,
+        ),
+        (
+            |_| ObjectStoreError::Malformed("xml".to_owned()),
+            IggyError::TieredReadFailed,
         ),
     ];
     for (error, expected) in cases {
@@ -336,11 +403,316 @@ async fn given_a_failing_store_when_polling_should_map_the_error_to_its_class() 
         attach(&mut partition, Rc::new(Failing(error)));
         Box::pin(evict_sealed(&mut partition, directory.path())).await;
 
+        // Only a failure for good is shown to a poll whose reply has no status.
+        let result = plan(&mut partition, PollingStrategy::offset(0))
+            .execute()
+            .await;
+        assert_eq!(
+            result.tiered_read_failure(),
+            (expected == IggyError::TieredReadFailed).then_some(IggyError::TieredReadFailed)
+        );
+        forget_failures(&partition);
+
         assert_eq!(
             Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
             expected
         );
     }
+}
+
+/// The result of a poll whose read the store failed for good.
+async fn read_failed_for_good(partition: &mut IggyPartition<IggyMessageBus>) -> PollReadResult {
+    forget_failures(partition);
+    let result = plan(partition, PollingStrategy::offset(0)).execute().await;
+    assert_eq!(
+        result.tiered_read_failure(),
+        Some(IggyError::TieredReadFailed)
+    );
+    result
+}
+
+#[compio::test]
+async fn given_a_read_the_store_failed_for_good_when_completing_should_check_its_history_first() {
+    let (directory, mut partition, _store, _local) = Box::pin(uploaded_partition()).await;
+    attach(
+        &mut partition,
+        Rc::new(Failing(|key| ObjectStoreError::NotFound {
+            key: key.to_owned(),
+        })),
+    );
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    // The history the read captured is still served, so its failure stands.
+    let current = Box::pin(read_failed_for_good(&mut partition)).await;
+    assert_eq!(
+        partition.complete_poll(current).err(),
+        Some(IggyError::TieredReadFailed)
+    );
+
+    // A read of a history that was replaced meanwhile says nothing about the
+    // one served now, whose objects may all be there.
+    let obsolete = Box::pin(read_failed_for_good(&mut partition)).await;
+    partition.invalidate_poll_history();
+    assert_eq!(
+        partition.complete_poll(obsolete).err(),
+        Some(IggyError::TransientNotAccepted)
+    );
+}
+
+fn forget_failures(partition: &IggyPartition<IggyMessageBus>) {
+    for state in partition.log.sealed_read_state() {
+        state.remote_failure.set(None);
+    }
+}
+
+/// A [`MemoryStore`] that counts its reads, fails them all while `failure` is
+/// set, never answers a read of a key in `stalled`, and answers a read of the
+/// key in `slow` only after its delay.
+#[derive(Default)]
+struct Outage {
+    store: MemoryStore,
+    gets: Cell<usize>,
+    failure: Cell<Option<StoreFailure>>,
+    stalled: RefCell<Vec<String>>,
+    slow: RefCell<Option<(String, Duration)>>,
+}
+
+impl RemoteObjects for Outage {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        self.gets.set(self.gets.get() + 1);
+        async move {
+            if self.stalled.borrow().iter().any(|stalled| stalled == key) {
+                futures::future::pending::<()>().await;
+            }
+            let delay = self
+                .slow
+                .borrow()
+                .as_ref()
+                .and_then(|(slow, delay)| (slow == key).then_some(*delay));
+            if let Some(delay) = delay {
+                compio::time::sleep(delay).await;
+            }
+            match self.failure.get() {
+                Some(failure) => Err(failure(key)),
+                None => ObjectStore::get_range(&self.store, key, range).await,
+            }
+        }
+        .boxed_local()
+    }
+}
+
+/// A tiered partition whose sealed segments are evicted to a store that can
+/// be told to fail or stall.
+async fn partition_on_outage() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    Rc<Outage>,
+    Vec<(Option<u64>, Vec<u8>)>,
+) {
+    let (directory, mut partition) =
+        Box::pin(tiered_partition(&segment_records(RECEIVER_OPS), 0)).await;
+    let local = Box::pin(polled_all(&mut partition)).await;
+    let outage = Rc::new(Outage::default());
+    upload(&outage.store, directory.path()).await;
+    confirm(&mut partition, &SEALED);
+    attach(&mut partition, outage.clone());
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    (directory, partition, outage, local)
+}
+
+#[compio::test]
+async fn given_a_store_outage_when_clients_retry_should_answer_at_once_without_asking_the_store() {
+    let (_directory, mut partition, outage, local) = Box::pin(partition_on_outage()).await;
+    outage
+        .failure
+        .set(Some(|_| ObjectStoreError::Unavailable("503".to_owned())));
+
+    for _retry in 0..5 {
+        assert_eq!(
+            Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
+            IggyError::TransientNotAccepted
+        );
+    }
+    assert_eq!(outage.gets.get(), 1, "the retries reached the store");
+
+    // The store is asked again once the failure is forgotten, and a read that
+    // works clears it.
+    compio::time::sleep(crate::poll_plan::REMOTE_FAILURE_BACKOFF_MIN * 2).await;
+    assert_eq!(
+        Box::pin(failed(&mut partition, PollingStrategy::offset(0))).await,
+        IggyError::TransientNotAccepted
+    );
+    assert_eq!(outage.gets.get(), 2);
+    let remembered = partition.log.sealed_read_state()[0]
+        .remote_failure
+        .get()
+        .unwrap();
+    assert_eq!(remembered.failures, 2);
+    outage.failure.set(None);
+    compio::time::sleep(crate::poll_plan::REMOTE_FAILURE_BACKOFF_MIN * 4).await;
+    assert_eq!(
+        Box::pin(polled(&mut partition, PollingStrategy::offset(0))).await,
+        local[0]
+    );
+    assert!(
+        partition.log.sealed_read_state()[0]
+            .remote_failure
+            .get()
+            .is_none()
+    );
+}
+
+#[compio::test]
+async fn given_a_stalled_store_when_the_deadline_passes_should_return_what_the_poll_has() {
+    let (_directory, mut partition, outage, local) = Box::pin(partition_on_outage()).await;
+    let deadline = || Instant::now() + Duration::from_millis(50);
+
+    // The second remote segment never answers, so the poll keeps the first.
+    outage
+        .stalled
+        .borrow_mut()
+        .push(object_key(2, SegmentObject::Log));
+    let started = Instant::now();
+    let result = plan(&mut partition, PollingStrategy::offset(0))
+        .with_deadline(deadline())
+        .execute()
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(result.truncated);
+    let (last, bytes) = accepted(&mut partition, result);
+    assert_eq!(last, Some(1));
+    assert!(local[0].1.starts_with(&bytes));
+
+    // With nothing to return, the poll asks for a retry.
+    forget_failures(&partition);
+    let result = plan(&mut partition, PollingStrategy::offset(2))
+        .with_deadline(deadline())
+        .execute()
+        .await;
+    assert_eq!(result.message_count, 0);
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+
+    // A deadline that is already past is no failure of the store.
+    forget_failures(&partition);
+    let gets = outage.gets.get();
+    let result = plan(&mut partition, PollingStrategy::offset(2))
+        .with_deadline(Instant::now())
+        .execute()
+        .await;
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert_eq!(outage.gets.get(), gets);
+    assert!(
+        partition.log.sealed_read_state()[1]
+            .remote_failure
+            .get()
+            .is_none()
+    );
+}
+
+/// How long the store of [`partition_with_a_slow_index`] takes to answer a
+/// read of the index, several times what a poll waits there.
+const SLOW_INDEX: Duration = Duration::from_millis(600);
+
+/// [`partition_on_outage`] whose first segment has no local index, on a store
+/// that takes [`SLOW_INDEX`] to answer a read of its `.index` object.
+async fn partition_with_a_slow_index() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    Rc<Outage>,
+    Vec<(Option<u64>, Vec<u8>)>,
+) {
+    let (directory, partition, outage, local) = Box::pin(partition_on_outage()).await;
+    std::fs::remove_file(index_path(directory.path(), 0)).unwrap();
+    *outage.slow.borrow_mut() = Some((object_key(0, SegmentObject::Index), SLOW_INDEX));
+    (directory, partition, outage, local)
+}
+
+/// A poll of the first segment that waits on the store for a fraction of
+/// [`SLOW_INDEX`].
+async fn polled_briefly(partition: &mut IggyPartition<IggyMessageBus>) -> PollReadResult {
+    plan(partition, PollingStrategy::offset(0))
+        .with_deadline(Instant::now() + SLOW_INDEX / 12)
+        .execute()
+        .await
+}
+
+#[compio::test]
+async fn given_an_index_slower_than_a_poll_when_polls_retry_should_join_one_fetch_until_it_lands() {
+    let (directory, mut partition, outage, local) = Box::pin(partition_with_a_slow_index()).await;
+
+    // No single poll waits long enough for the index, and none of them asks
+    // the store for it again.
+    for _retry in 0..3 {
+        let result = polled_briefly(&mut partition).await;
+        assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+        assert_eq!(outage.gets.get(), 1);
+    }
+    assert!(
+        partition.log.sealed_read_state()[0]
+            .remote_failure
+            .get()
+            .is_none(),
+        "a deadline that ends the wait for a running fetch is no failure of the store"
+    );
+
+    compio::time::sleep(SLOW_INDEX).await;
+    assert!(index_path(directory.path(), 0).exists());
+    assert_eq!(outage.gets.get(), 1);
+    let result = polled_briefly(&mut partition).await;
+    assert_eq!(accepted(&mut partition, result), local[0]);
+}
+
+#[compio::test]
+async fn given_a_running_index_fetch_when_the_read_state_is_wiped_should_cancel_it() {
+    let (directory, mut partition, outage, _local) = Box::pin(partition_with_a_slow_index()).await;
+    let result = polled_briefly(&mut partition).await;
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert_eq!(outage.gets.get(), 1);
+
+    // An install or a converge recreates the segment files.
+    partition.invalidate_poll_history();
+    partition.log.invalidate_sealed_read_state();
+
+    compio::time::sleep(SLOW_INDEX * 2).await;
+    assert!(!index_path(directory.path(), 0).exists());
+}
+
+#[compio::test]
+async fn given_an_index_fetch_that_fails_when_a_poll_waits_for_it_should_remember_the_failure() {
+    let (directory, mut partition, outage, local) = Box::pin(partition_with_a_slow_index()).await;
+    outage.slow.borrow_mut().take();
+    outage
+        .failure
+        .set(Some(|_| ObjectStoreError::Unavailable("503".to_owned())));
+
+    for _retry in 0..3 {
+        let result = polled_briefly(&mut partition).await;
+        assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    }
+    assert_eq!(outage.gets.get(), 1, "the retries reached the store");
+
+    // The fetch that failed is over, so the next poll starts another.
+    outage.failure.set(None);
+    forget_failures(&partition);
+    let result = polled_briefly(&mut partition).await;
+    assert_eq!(accepted(&mut partition, result), local[0]);
+    assert!(index_path(directory.path(), 0).exists());
+}
+
+#[compio::test]
+async fn given_a_plan_when_asked_whether_it_reads_remote_should_follow_its_segments() {
+    let (directory, mut partition, store, _local) = Box::pin(uploaded_partition()).await;
+    assert!(!plan(&mut partition, PollingStrategy::offset(0)).reads_remote());
+    attach(&mut partition, store);
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+
+    assert!(plan(&mut partition, PollingStrategy::offset(0)).reads_remote());
+    assert!(plan(&mut partition, PollingStrategy::offset(3)).reads_remote());
+    // The active segment is local, and a poll of it names nothing else.
+    assert!(!plan(&mut partition, PollingStrategy::offset(4)).reads_remote());
 }
 
 fn planned_segments(plan: &PollPlan) -> (Vec<u64>, bool) {
@@ -526,6 +898,59 @@ async fn given_an_index_fetch_in_flight_when_the_partition_is_torn_down_should_w
     ))
     .await;
     drain.await.unwrap();
+}
+
+/// The fetch outlives the polls that started it, so the teardown has to wait
+/// for the task itself.
+#[compio::test]
+async fn given_an_index_fetch_no_poll_waits_for_when_the_partition_is_torn_down_should_wait_for_it()
+{
+    let (directory, mut partition, outage, _local) = Box::pin(partition_with_a_slow_index()).await;
+    let result = polled_briefly(&mut partition).await;
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert_eq!(outage.gets.get(), 1);
+
+    let mut drain = Box::pin(partition.capture_teardown().drain());
+    for _ in 0..3 {
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+    drain.await.unwrap();
+
+    assert_eq!(outage.gets.get(), 1);
+    assert!(!index_path(directory.path(), 0).exists());
+}
+
+#[compio::test]
+async fn given_a_poll_waiting_for_an_index_fetch_when_the_history_is_replaced_should_end_at_once() {
+    let (directory, mut partition, poll, release) = Box::pin(fetching_partition()).await;
+
+    partition.invalidate_poll_history();
+
+    // The store has not answered, and the poll does not wait for it.
+    let result = compio::time::timeout(Duration::from_secs(5), poll)
+        .await
+        .expect("a cancelled fetch releases its waiters");
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
+    assert!(
+        partition.log.sealed_read_state()[0]
+            .remote_failure
+            .get()
+            .is_none(),
+        "a cancelled fetch is no failure of the store"
+    );
+
+    // The task ends on its own once the store answers, and keeps nothing.
+    release.send(()).unwrap();
+    Box::pin(partition.capture_teardown().drain())
+        .await
+        .unwrap();
+    let index_name = format!("{:020}.index", 0);
+    let kept = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&index_name));
+    assert!(!kept);
 }
 
 #[compio::test]
