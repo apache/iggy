@@ -363,7 +363,8 @@ The partitions that a read served go last in the next read of their group, so a 
   `AutoCommit.default` stores every 10,000 messages or 5 seconds after `.processing`. A store only moves forward, and a position of an older generation is dropped.
 
 A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. For a lost range it has `lost`.
-The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek. A lost range itself does not stop the partition and needs no seek.
+The reader reads its partitions again after `retryInterval`. A message that does not decode, `historyUnavailable` for a position read in a history that is gone, and `tieredReadFailed` for tiered data that the object store refuses for good, stop the partition until a seek. A lost range itself does not stop the partition and needs no seek.
+A read refused with `tieredReadFailed` is never sent again.
 
 `consumerGroupPartitionNotOwned` on a read of a group member is not a leave. A new session and a move of the partition away and back look the same. The partition keeps its position and what `close()` needs of it. The reader syncs its assignment and reads the partition again after `retryInterval`.
 Each further refusal in a row doubles that wait, up to 32 times `retryInterval` at the sixth. The sixth refusal in a row also makes `next()` throw one `ReadError` for the partition, the partition reads on, and the count starts again.
@@ -458,7 +459,7 @@ A handler that throws leaves its message uncounted and ends `consumeMessages(_:)
 
 `pollingStrategy` says where a partition without a position starts. With `.onRead` it applies only to a partition without a stored offset, and a partition with one resumes after it. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
 
-`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek. A lost range (`ReadError.lost`, error 14010) ends `consumeMessages(_:)` with that error. A new call reads on.
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode, `historyUnavailable` or `tieredReadFailed`, which stop the partition until a seek. A lost range (`ReadError.lost`, error 14010) ends `consumeMessages(_:)` with that error. A new call reads on.
 
 It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
 

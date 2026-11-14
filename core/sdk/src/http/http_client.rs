@@ -858,7 +858,8 @@ fn deferred_reply_limit(max_bytes: u32) -> usize {
 /// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried,
 /// non-admission and capacity refusals permit a retry without risking duplicate progress, a
 /// poll refused for its byte limit returns `InvalidSizeBytes`, and a topic refused for a factor
-/// above the node count returns `InvalidReplicationFactor`, as over the binary transports.
+/// above the node count returns `InvalidReplicationFactor`, and a read of tiered data that the
+/// object store refused for good returns `TieredReadFailed`, as over the binary transports.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     let id = error_id(body)?;
     [
@@ -869,6 +870,7 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::DeferredPollCapacityExceeded,
         IggyError::InvalidSizeBytes,
         IggyError::InvalidReplicationFactor,
+        IggyError::TieredReadFailed,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -1008,6 +1010,24 @@ mod tests {
         assert_eq!(server.requests().len(), 2);
     }
 
+    /// The object store failed for good, so the read is not sent again.
+    #[tokio::test(start_paused = true)]
+    async fn given_read_when_tiered_read_fails_should_report_it_without_a_resend() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(424, &IggyError::TieredReadFailed),
+            Reply::stream(),
+        ])
+        .await;
+
+        let refused = server.client().get_stream(&stream_id()).await;
+
+        assert!(
+            matches!(refused, Err(IggyError::TieredReadFailed)),
+            "{refused:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
     /// A read commits nothing, so the refusal of its resend is definitive.
     #[tokio::test(start_paused = true)]
     async fn given_resend_of_a_read_when_refused_should_report_the_refusal() {
@@ -1065,6 +1085,7 @@ mod tests {
             IggyError::DeferredPollCapacityExceeded,
             IggyError::InvalidSizeBytes,
             IggyError::InvalidReplicationFactor,
+            IggyError::TieredReadFailed,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));

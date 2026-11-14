@@ -286,7 +286,9 @@ try {
   names the partition of an error, or none for an error of the whole reader,
   and the reader retries by itself. Error 87 stops a partition until `seek`
   when its position is tied to the history of an earlier read, and so do error
-  80 and a refusal other than 5009 that six retries did not change. A context
+  80, error 96 (the object store refuses a read of tiered data for good, so
+  the reader never sends it again) and a refusal other than 5009 that six
+  retries did not change. A context
   that is all zero ties a position to no history. The error of each stop sets
   `stopsPartition`, and that of an 87 or a refusal stop also sets `resumable`:
   a `seek` to Next reads the partition again after its stored offset. When

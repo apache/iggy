@@ -37,17 +37,19 @@ internal static class CommitOutcome
     {
         return scope switch
         {
-            // A first message above the byte limit and a new offset key above the limit are refused before the store.
+            // A first message above the byte limit, a new offset key above the limit and a read that the object store
+            // refused are refused before the store.
             CommitErrorScope.Request => status is VsrError.FEATURE_UNAVAILABLE or VsrError.INVALID_IDENTIFIER
                 or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.INVALID_SIZE_BYTES or VsrError.HISTORY_UNAVAILABLE
                 or VsrError.NOT_PRIMARY or VsrError.DEFERRED_POLL_CAPACITY_EXCEEDED or VsrError.STREAM_ID_NOT_FOUND
                 or VsrError.STREAM_NAME_NOT_FOUND or VsrError.TOPIC_ID_NOT_FOUND or VsrError.TOPIC_NAME_NOT_FOUND
                 or VsrError.PARTITION_NOT_FOUND or VsrError.TOO_MANY_CONSUMER_OFFSETS or VsrError.INVALID_OFFSET
-                or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED,
+                or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED or VsrError.TIERED_READ_FAILED,
             // A section whose read may have stored never carries one of these.
             _ => status is VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.INVALID_SIZE_BYTES
                 or VsrError.HISTORY_UNAVAILABLE or VsrError.NOT_PRIMARY or VsrError.PARTITION_NOT_FOUND
                 or VsrError.TOO_MANY_CONSUMER_OFFSETS or VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED
+                or VsrError.TIERED_READ_FAILED
         };
     }
 }

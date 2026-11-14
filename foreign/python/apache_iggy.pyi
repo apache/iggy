@@ -4512,7 +4512,8 @@ class ReadError(IggyError):
     def is_lasting_refusal(self) -> builtins.bool:
         r"""
         Whether the reader stopped the partition after six refusals in a row that a retry does
-        not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+        not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+        of the partition reads it again.
         """
     @property
     def lost(self) -> tuple[builtins.int, builtins.int] | None:
