@@ -43,13 +43,18 @@ type Topic struct {
 	CreatedAt uint64 `json:"createdAt"`
 	Name      string `json:"name"`
 	Size      uint64 `json:"size"`
-	// MessageExpiry, CompressionAlgorithm and MaxTopicSize are read from the
-	// options, or are the catalog default when the server reported none or a
-	// value this build cannot read, such as an algorithm a newer server added.
-	// The server's own value stays in Options or DerivedOptions.
+	// MessageExpiry, CompressionAlgorithm, MaxTopicSize, SegmentMaxAge,
+	// TieredStorage, LocalRetentionAge and LocalRetentionSize are read from
+	// the options, or are the catalog default when the server reported none or
+	// a value this build cannot read, such as an algorithm a newer server
+	// added. The server's own value stays in Options or DerivedOptions.
 	MessageExpiry        Duration               `json:"messageExpiry"`
 	CompressionAlgorithm uint8                  `json:"compressionAlgorithm"`
 	MaxTopicSize         uint64                 `json:"maxTopicSize"`
+	SegmentMaxAge        Duration               `json:"segmentMaxAge"`
+	TieredStorage        bool                   `json:"tieredStorage"`
+	LocalRetentionAge    Duration               `json:"localRetentionAge"`
+	LocalRetentionSize   uint64                 `json:"localRetentionSize"`
 	MessagesCount        uint64                 `json:"messagesCount"`
 	PartitionsCount      uint32                 `json:"partitionsCount"`
 	Options              map[string]HeaderValue `json:"options,omitempty"`

@@ -32,7 +32,7 @@ mod partition;
 pub(crate) mod registry;
 mod snapshot;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use codec::{CommandDecodeError, CommandEncodeError, MachineCommand};
 pub(crate) use log::StateMachineLog;

@@ -31,5 +31,5 @@ pub use configs_impl::{
 };
 pub use server_config::{
     cluster, external_auth, message_bus, metadata, partition, quic, server, sharding, tcp,
-    websocket,
+    tiered_storage, websocket,
 };

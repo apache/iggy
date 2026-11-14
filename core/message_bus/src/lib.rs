@@ -702,7 +702,9 @@ pub trait MessageBus {
     /// silently no-opping, so a bus that forgets to override cannot hang
     /// undetected.
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
-        compio::time::sleep(duration)
+        // `compio::time::sleep` reads the clock at its first poll, so the
+        // deadline is taken here to anchor it at creation.
+        compio::time::sleep_until(Instant::now() + duration)
     }
 
     /// Spawn a detached background task on the ambient runtime.
@@ -2031,6 +2033,24 @@ mod tests {
             .insert(replica, sender, writer, reader, conn_shutdown)
             .expect("free registry slot");
         conn_token
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_sleep_built_before_a_wait_when_polled_should_count_from_its_creation() {
+        let duration = Duration::from_millis(50);
+        let bus = IggyMessageBus::new(0);
+        let sleep = bus.sleep(duration);
+        compio::time::sleep(duration).await;
+
+        let first_poll = Instant::now();
+        sleep.await;
+
+        assert!(
+            first_poll.elapsed() < duration,
+            "{:?}",
+            first_poll.elapsed()
+        );
     }
 
     #[compio::test]

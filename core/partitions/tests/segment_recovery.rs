@@ -249,6 +249,7 @@ async fn recover_with(
         &PartitionStats::default(),
     )
     .await
+    .map(|recovered| recovered.segments)
 }
 
 fn read_u64_le(bytes: &[u8], at: usize) -> u64 {
@@ -912,6 +913,7 @@ async fn given_a_later_checkpoint_when_recovering_should_preserve_sealed_index_e
             start_offset: 2,
             length: tail.len() as u64,
             next_offset: 3,
+            first_timestamp: 0,
         };
         let result = load_persisted_segments_with_checkpoint(
             &config,
@@ -934,7 +936,7 @@ async fn given_a_later_checkpoint_when_recovering_should_preserve_sealed_index_e
                 "sealed index evidence must not be erased by an unrelated checkpoint"
             );
         } else {
-            let recovered = result.unwrap();
+            let recovered = result.unwrap().segments;
             assert_eq!(recovered.len(), 2);
             assert_eq!(recovered[0].segment.end_offset, 1);
             assert!(recovered[0].storage.messages_size.is_none());
@@ -958,6 +960,7 @@ async fn given_checkpointed_prefix_when_recovering_should_hide_tails_and_refuse_
         start_offset: 0,
         length: committed.len() as u64,
         next_offset: 3,
+        first_timestamp: 0,
     };
     let namespace = IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID);
     let recovered = load_persisted_segments_with_checkpoint(
@@ -969,7 +972,8 @@ async fn given_checkpointed_prefix_when_recovering_should_hide_tails_and_refuse_
         Some(checkpoint),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .segments;
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].segment.end_offset, 2);
     assert_eq!(recovered[0].segment.size.as_bytes_u64(), checkpoint.length);

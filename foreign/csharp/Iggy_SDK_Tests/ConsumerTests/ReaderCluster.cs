@@ -84,6 +84,7 @@ internal sealed class ReaderCluster : IDisposable
     private int _cancels;
     private int _joins;
     private int _leaves;
+    private int _tieredReadRefusals;
     private int _syncs;
     private int _routeLookups;
     private int _refusedRouteLookups;
@@ -249,6 +250,12 @@ internal sealed class ReaderCluster : IDisposable
     internal HashSet<ulong> Undecodable { get; } = [];
 
     internal ConcurrentBag<uint> HistoryRefused { get; } = [];
+
+    /// <summary>Partitions whose fetch section is refused as a failed tiered read.</summary>
+    internal ConcurrentBag<uint> TieredReadRefused { get; } = [];
+
+    /// <summary>The fetch sections refused as a failed tiered read so far.</summary>
+    internal int TieredReadRefusals => Volatile.Read(ref _tieredReadRefusals);
 
     /// <summary>Partitions whose fetch section is refused as unauthorized.</summary>
     internal ConcurrentBag<uint> Unauthorized { get; } = [];
@@ -533,6 +540,14 @@ internal sealed class ReaderCluster : IDisposable
             if (HistoryRefused.Contains(partition))
             {
                 sections.Add(EmptySection(partition, 0, default, VsrError.HISTORY_UNAVAILABLE));
+                served = true;
+                continue;
+            }
+
+            if (TieredReadRefused.Contains(partition))
+            {
+                Interlocked.Increment(ref _tieredReadRefusals);
+                sections.Add(EmptySection(partition, 0, default, VsrError.TIERED_READ_FAILED));
                 served = true;
                 continue;
             }

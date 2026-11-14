@@ -128,7 +128,8 @@ pub struct ReadError {
     offset: Option<u64>,
     record: Option<Bytes>,
     /// Whether the reader stopped the partition after six refusals in a row that a retry does
-    /// not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+    /// not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+    /// of the partition reads it again.
     #[pyo3(get)]
     is_lasting_refusal: bool,
     /// For messages that a lost read committed and that the reader could not read again: their
@@ -1215,26 +1216,41 @@ impl IggyClient {
     ///         nothing either, reset `OptionKey.MaxTopicSize` to return to the
     ///         default.
     ///     reset: Keys to return to their defaults as `list[OptionKey] | None`:
-    ///         `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+    ///         `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+    ///         `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
     ///     options: Additional option keys as `dict[str, str] | None`, sent
     ///         verbatim so an updatable server key can be set from this build.
     ///         A create-only key is refused by name.
     ///     raw_reset: Additional reset names as `list[str] | None`, sent
     ///         verbatim so a key newer than this build can be reset. The
     ///         server decides them.
+    ///     tiered_storage: `True` turns tiered storage on, unchanged when
+    ///         `None`. The server refuses `False`, an update never turns it
+    ///         off, and refuses `True` with `FeatureUnavailable` until it
+    ///         tiers topics.
+    ///     local_retention_age: How long a tiered topic keeps an uploaded
+    ///         segment on local disk as `IggyExpiry | None`, unchanged when
+    ///         `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+    ///         reset `OptionKey.LocalRetentionAge` to return to the default.
+    ///     local_retention_size: Topic-wide cap on the uploaded segments a
+    ///         tiered topic keeps on local disk as `MaxTopicSize | None`,
+    ///         unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+    ///         nothing either, reset `OptionKey.LocalRetentionSize` to return
+    ///         to the default.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     ValueError: If `message_expiry`, `max_topic_size`,
+    ///         `local_retention_age` or `local_retention_size` is out of range.
     ///     OptionError: A `RuntimeError` carrying the error `code` and
     ///         `kind` when the client or the server refuses an option.
     ///     RuntimeError: Before anything is sent, if the update changes
     ///         nothing, names a key both set and reset, the name does not fit,
     ///         or a reset key cannot be reset. Otherwise if the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None)
+        signature = (stream_id, topic_id, name = None, message_expiry = None, max_topic_size = None, reset = None, options = None, raw_reset = None, tiered_storage = None, local_retention_age = None, local_retention_size = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -1257,11 +1273,25 @@ impl IggyClient {
         options: Option<BTreeMap<String, String>>,
         #[gen_stub(override_type(type_repr = "builtins.list[builtins.str] | None"))]
         raw_reset: Option<Vec<String>>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tiered_storage: Option<bool>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] local_retention_age: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let update_options = TopicUpdateOptions {
             name,
             message_expiry: message_expiry.map(RustIggyExpiry::try_from).transpose()?,
             max_topic_size: max_topic_size.map(RustMaxTopicSize::try_from).transpose()?,
+            tiered_storage,
+            local_retention_age: local_retention_age
+                .map(RustIggyExpiry::try_from)
+                .transpose()?,
+            local_retention_size: local_retention_size
+                .map(RustMaxTopicSize::try_from)
+                .transpose()?,
             reset: reset_keys(reset),
             raw_reset: raw_reset.into_iter().flatten().collect(),
             raw: options.unwrap_or_default(),
@@ -2639,6 +2669,53 @@ mod tests {
                 );
                 assert!(value.setattr("is_lasting_refusal", false).is_err());
             }
+        });
+    }
+
+    #[test]
+    fn given_tiered_read_failure_when_mapping_should_keep_its_code_and_flag_the_stop() {
+        const TIERED_READ_FAILED_CODE: u32 = 96;
+        const PARTITION_ID: u32 = 1;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::TieredReadFailed);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            assert_eq!(
+                raised
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+
+            let read = to_read_error(RustReadError::new(
+                Some(PARTITION_ID),
+                IggyError::TieredReadFailed,
+            ));
+
+            assert!(read.is_instance_of::<ReadError>(py));
+            let value = read.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
+            assert!(
+                value
+                    .getattr("is_lasting_refusal")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                "the first tiered read failure stops its partition"
+            );
+            let cause = value.getattr("error").unwrap();
+            assert_eq!(
+                cause.getattr("code").unwrap().extract::<u32>().unwrap(),
+                TIERED_READ_FAILED_CODE
+            );
         });
     }
 

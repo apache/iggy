@@ -156,11 +156,16 @@ const checkPatch = (scope: OptionsScope, set: OptionEntry[], reset: string[], ra
   const createOnly = first(keys, ({ flags }) => (flags & OptionFlag.Updatable) === 0);
   if (createOnly !== undefined)
     refuse(OPTION_NOT_UPDATABLE, `key '${createOnly}'`);
+  const enableOnlyReset = first(reset, ({ enableOnly }) => enableOnly === true);
+  if (enableOnlyReset !== undefined)
+    refuse(OPTION_NOT_UPDATABLE, `reset of '${enableOnlyReset}'`);
   const fixed = first(reset, ({ flags }) => (flags & OptionFlag.Resettable) === 0);
   if (fixed !== undefined)
     refuse(OPTION_NOT_RESETTABLE, `reset of '${fixed}'`);
 
   for (const { key, value } of set) {
+    if (OPTION_CATALOG.get(key)?.enableOnly && value.kind === HeaderKind.Bool && !value.value)
+      refuse(OPTION_NOT_UPDATABLE, `key '${key}' cannot be turned off`);
     const text = value.kind === HeaderKind.String ? value.value : undefined;
     const length = text === undefined ? 0 : Buffer.byteLength(text);
     if (key === 'name' && (length < 1 || length > MAX_NAME_LENGTH))

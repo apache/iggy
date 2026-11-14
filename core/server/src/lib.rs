@@ -68,15 +68,19 @@ pub(crate) mod wire;
 pub(crate) mod http;
 
 // background: per-shard maintenance loops.
+pub(crate) mod incarnation_deletes;
 pub(crate) mod partition_reconciler;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
     reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
 pub(crate) mod personal_access_token_cleaner;
+pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;
+pub(crate) mod store_identity;
 pub(crate) mod sysinfo_printer;
+pub(crate) mod tiered_storage;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;

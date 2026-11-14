@@ -540,7 +540,7 @@ A fetch takes only an offset or `Next`. So the reader first polls a timestamp or
 - `Auto(AutoCommit)`: the reader counts each batch as `CommitAfter` says (`PROCESSING` at the next `next()` or the close, `DELIVERY` when `next()` returns it, `MARKED` on `mark(checkpoint)`), and stores the latest counted position at its `interval`, on its `every` event, before a rebalance takes a partition away, and on close.
   A store whose outcome stays unknown is released in the client, so the next store of the partition goes through. `AutoCommit.defaults()` stores every 10,000 messages or 5 s after processing.
 
-A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone.
+A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone. `TIERED_READ_FAILED` (96) stops a partition until `seek` at the first refusal: the object store refused the read of tiered data for a reason that a retry does not change, so neither the reader nor a poll sends the request again.
 
 A message that does not decode arrives as a `ReadException` whose `skip()` is the continuation after it, after a batch with the messages before it, and the partition stops until a `seek`.
 
@@ -622,7 +622,7 @@ stale-client eviction or a malformed reply, the call replays the same request on
 connection within its deadline. If the server refuses to bind the session again, the client
 registers a new session and drops the operation.
 
-A call that loses its connection before it sends its request, or that cannot open one, waits for a connection within its deadline. If no connection carries it by then, the call ends with 58 (`TRANSIENT_NOT_ACCEPTED`).
+A call that loses its connection before it sends its request, or that cannot open one, waits for a connection within its deadline. If no connection carries it by then, the call ends with 58 (`TRANSIENT_NOT_ACCEPTED`). A poll, a fetch or a send to a partition that the server refuses with 58 is sent again within the same deadline, after a pause that is a random time up to a ceiling. The ceiling doubles from 50 ms to 1 s over the refusals of one call.
 
 An eviction and a reply can carry the same status, for example 30 (`STALE_CLIENT`) or 40
 (`UNAUTHENTICATED`). Only the eviction is a lost connection, so the call does not replay a

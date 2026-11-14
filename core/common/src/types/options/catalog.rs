@@ -18,12 +18,13 @@
 use super::codec::{OptionValueCodec, invalid};
 use super::key::OptionKey;
 use super::{
-    DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
-    MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE,
-    MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions,
-    erase_options,
+    DEFAULT_LOCAL_RETENTION_AGE, DEFAULT_LOCAL_RETENTION_SIZE, DEFAULT_MAX_TOPIC_SIZE,
+    DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE, DEFAULT_PREALLOCATE_SEGMENTS,
+    DEFAULT_SEGMENT_MAX_AGE, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    DEFAULT_TIERED_STORAGE, Durability, MAX_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_TOPIC_SEGMENT_SIZE, MIN_SEGMENT_MAX_AGE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
+    PartitionResizePolicy, ResourceOptions, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -68,7 +69,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 20] = [
+pub static CATALOG: [OptionDescriptor; 24] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -381,6 +382,72 @@ pub static CATALOG: [OptionDescriptor; 20] = [
         },
     },
     OptionDescriptor {
+        key: OptionKey::SegmentMaxAge,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_SEGMENT_MAX_AGE))),
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would roll segments at different batches
+        // from its peers.
+        critical: true,
+        description: || {
+            format!(
+                "Start a new segment once a batch is stamped this long after the active \
+                 segment's first batch, in microseconds or a humantime string (e.g. 1h); at \
+                 least {} minutes, or never. Bounds how long a slow partition's active segment \
+                 stays unsealed, so retention and tiering reach it. A fully idle partition \
+                 stays open. Refused together with preallocate_segments",
+                MIN_SEGMENT_MAX_AGE / 60_000_000
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::TieredStorage,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Bool,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::EnableOnly,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_TIERED_STORAGE))),
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would keep reading segments that its peers
+        // moved to the object store.
+        critical: true,
+        description: || {
+            "Move sealed segments to the object store and keep only the local retention on              disk. An update can turn it on and never off, because the removed local              segments cannot come back. Not available yet: turning it on is refused"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::LocalRetentionAge,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_LOCAL_RETENTION_AGE))),
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How long a tiered topic keeps an uploaded segment on local disk, in microseconds              or a humantime string (e.g. 6h), or never. A value above a finite message_expiry              is refused, and the default yields to a shorter message_expiry. No effect              without tiered_storage"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::LocalRetentionSize,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_LOCAL_RETENTION_SIZE))),
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "Topic-wide cap on the uploaded segments a tiered topic keeps on local disk, split              across all partitions, in bytes or a byte-size string (e.g. 10 GiB), or              unlimited. A value above a finite max_topic_size is refused. No effect without              tiered_storage"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
         key: OptionKey::CriticalKeys,
         scopes: ALL_SCOPES,
         kind: HeaderKind::String,
@@ -427,6 +494,8 @@ pub enum OptionStorage {
 pub enum OptionMutability {
     CreateOnly,
     Updatable,
+    /// A boolean that a create sets either way and an update only turns on.
+    EnableOnly,
     ReadOnly,
 }
 
@@ -548,14 +617,18 @@ impl OptionDescriptor {
 
     #[must_use]
     pub fn is_updatable(&self) -> bool {
-        self.mutability == OptionMutability::Updatable
+        matches!(
+            self.mutability,
+            OptionMutability::Updatable | OptionMutability::EnableOnly
+        )
     }
 
     /// An update may reset only a mutable map key with a default. A default
-    /// alone does not make a create-only setting resettable.
+    /// alone does not make a create-only setting resettable, and a reset of
+    /// an enable-only key would turn it off.
     #[must_use]
     pub fn is_resettable(&self) -> bool {
-        self.is_updatable()
+        self.mutability == OptionMutability::Updatable
             && self.storage == OptionStorage::Map
             && matches!(self.default, OptionDefault::Const(_))
     }
@@ -645,7 +718,8 @@ pub fn derived_defaults(
 ///    name, an update with nothing to change, a reset on a create.
 /// 2. `UnsupportedOptionKey`: a key outside the catalog or outside `scope`.
 /// 3. `ReadOnlyOption`: an internal or read-only key.
-/// 4. `OptionNotUpdatable`: a create-only key in an update's set or reset.
+/// 4. `OptionNotUpdatable`: a create-only key in an update's set or reset, or
+///    an enable-only key that an update resets or sets to false.
 /// 5. `OptionNotResettable`: a reset of a column or of a key without default.
 /// 6. Value errors: a column inside a create block is `InvalidOptionValue`,
 ///    column values keep their own errors, other keys `InvalidOptionValue`,
@@ -714,6 +788,12 @@ pub fn admit(
     }
     if let Some(key) = reset_keys
         .iter()
+        .find(|key| key.descriptor().mutability == OptionMutability::EnableOnly)
+    {
+        return Err(IggyError::OptionNotUpdatable(key.to_string()));
+    }
+    if let Some(key) = reset_keys
+        .iter()
         .find(|key| !key.descriptor().is_resettable())
     {
         return Err(IggyError::OptionNotResettable(key.to_string()));
@@ -734,10 +814,18 @@ pub fn admit(
     for (key, entry) in set_keys.iter().zip(&entries) {
         let decoded = match key.descriptor().storage {
             OptionStorage::Column => decode_column(scope, *key, entry, &mut columns),
-            OptionStorage::Map => canonical_value(*key, entry).map(|value| {
-                if let Some(value) = value {
-                    explicit.insert(HeaderKey::from(*key), OptionValue::explicit(value));
+            OptionStorage::Map => canonical_value(*key, entry).and_then(|value| {
+                let Some(value) = value else {
+                    return Ok(());
+                };
+                if operation == OptionOperation::Update
+                    && key.descriptor().mutability == OptionMutability::EnableOnly
+                    && value.as_bool().is_ok_and(|enabled| !enabled)
+                {
+                    return Err(IggyError::OptionNotUpdatable(key.to_string()));
                 }
+                explicit.insert(HeaderKey::from(*key), OptionValue::explicit(value));
+                Ok(())
             }),
             OptionStorage::Computed => Err(IggyError::ReadOnlyOption(key.to_string())),
         };
@@ -765,6 +853,27 @@ pub fn admit(
     })
 }
 
+impl AdmittedOptions {
+    /// The map `current` becomes once this update applies: each reset key at
+    /// its catalog default, each set key at its admitted value. For rules
+    /// that span keys, which need the values this update leaves alone.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a default that does not fit a header value, which the
+    /// catalog tests rule out.
+    pub fn patched(&self, current: &ResourceOptions) -> Result<ResourceOptions, IggyError> {
+        let mut patched = current.clone();
+        for key in &self.reset {
+            if let Some(default) = key.descriptor().default_value()? {
+                patched.insert(HeaderKey::from(*key), OptionValue::derived(default));
+            }
+        }
+        patched.extend(self.explicit.clone());
+        Ok(patched)
+    }
+}
+
 /// The canonical value of one map key, or `None` for a zero sentinel that
 /// means "use the default" and therefore sets nothing. A secret key's value
 /// is the secret itself, for the caller to erase.
@@ -779,14 +888,14 @@ pub fn canonical_value(
 ) -> Result<Option<HeaderValue>, IggyError> {
     let value = match key {
         OptionKey::CompressionAlgorithm => CompressionAlgorithm::decode(key, entry)?.encode()?,
-        OptionKey::MessageExpiry => {
+        OptionKey::MessageExpiry | OptionKey::SegmentMaxAge | OptionKey::LocalRetentionAge => {
             let expiry = IggyExpiry::decode(key, entry)?;
             if expiry == IggyExpiry::ServerDefault {
                 return Ok(None);
             }
             expiry.encode()?
         }
-        OptionKey::MaxTopicSize => {
+        OptionKey::MaxTopicSize | OptionKey::LocalRetentionSize => {
             let size = MaxTopicSize::decode(key, entry)?;
             if size == MaxTopicSize::ServerDefault {
                 return Ok(None);
@@ -807,7 +916,9 @@ pub fn canonical_value(
         OptionKey::MessagesRequiredToSave | OptionKey::ReplicationFactor => {
             u32::decode(key, entry)?.encode()?
         }
-        OptionKey::PreallocateSegments => bool::decode(key, entry)?.encode()?,
+        OptionKey::PreallocateSegments | OptionKey::TieredStorage => {
+            bool::decode(key, entry)?.encode()?
+        }
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }
@@ -1173,6 +1284,16 @@ mod tests {
                 topic_option_keys::REPLICATION_FACTOR,
                 OptionKey::ReplicationFactor,
             ),
+            (topic_option_keys::SEGMENT_MAX_AGE, OptionKey::SegmentMaxAge),
+            (topic_option_keys::TIERED_STORAGE, OptionKey::TieredStorage),
+            (
+                topic_option_keys::LOCAL_RETENTION_AGE,
+                OptionKey::LocalRetentionAge,
+            ),
+            (
+                topic_option_keys::LOCAL_RETENTION_SIZE,
+                OptionKey::LocalRetentionSize,
+            ),
         ] {
             assert_eq!(constant, key.to_string());
         }
@@ -1181,7 +1302,141 @@ mod tests {
             .collect();
         assert_eq!(
             resettable,
-            [OptionKey::MessageExpiry, OptionKey::MaxTopicSize]
+            [
+                OptionKey::MessageExpiry,
+                OptionKey::MaxTopicSize,
+                OptionKey::LocalRetentionAge,
+                OptionKey::LocalRetentionSize,
+            ]
+        );
+    }
+
+    #[test]
+    fn given_enable_only_option_when_creating_should_accept_on_and_off() {
+        let key = OptionKey::TieredStorage;
+        for enabled in [false, true] {
+            let admitted = admit(
+                OptionsScope::Topic,
+                OptionOperation::Create,
+                &block(&[(key, HeaderValue::from(enabled))]),
+                &[],
+                &OptionAdmissionContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                admitted.explicit.get(&HeaderKey::from(key)),
+                Some(&OptionValue::explicit(HeaderValue::from(enabled)))
+            );
+        }
+    }
+
+    #[test]
+    fn given_enable_only_option_when_updating_should_accept_on_and_refuse_off() {
+        let key = OptionKey::TieredStorage;
+        let update = |options: &WireOptions, reset: &[String]| {
+            admit(
+                OptionsScope::Topic,
+                OptionOperation::Update,
+                options,
+                reset,
+                &OptionAdmissionContext::default(),
+            )
+        };
+
+        let admitted = update(&block(&[(key, HeaderValue::from(true))]), &[]).unwrap();
+        assert_eq!(
+            admitted.explicit.get(&HeaderKey::from(key)),
+            Some(&OptionValue::explicit(HeaderValue::from(true)))
+        );
+        for off in [
+            HeaderValue::from(false),
+            HeaderValue::try_from("false").unwrap(),
+        ] {
+            assert_eq!(
+                update(&block(&[(key, off)]), &[]),
+                Err(IggyError::OptionNotUpdatable(key.to_string()))
+            );
+        }
+        assert_eq!(
+            update(&WireOptions::empty(), &[key.to_string()]),
+            Err(IggyError::OptionNotUpdatable(key.to_string()))
+        );
+        let descriptor = key.descriptor();
+        assert!(descriptor.is_updatable());
+        assert!(!descriptor.is_resettable());
+        assert_eq!(
+            descriptor.flags(),
+            OPTION_FLAG_UPDATABLE | OPTION_FLAG_CRITICAL
+        );
+    }
+
+    #[test]
+    fn given_local_retention_sentinels_when_decoding_should_set_nothing() {
+        for key in [OptionKey::LocalRetentionAge, OptionKey::LocalRetentionSize] {
+            assert_eq!(
+                canonical_value(key, &entry(key, &HeaderValue::from(0u64))),
+                Ok(None)
+            );
+            assert_eq!(
+                canonical_value(key, &entry(key, &HeaderValue::from(u64::MAX))),
+                Ok(Some(HeaderValue::from(u64::MAX)))
+            );
+        }
+        assert_eq!(
+            canonical_value(
+                OptionKey::LocalRetentionAge,
+                &entry(
+                    OptionKey::LocalRetentionAge,
+                    &HeaderValue::try_from("6h").unwrap()
+                )
+            ),
+            Ok(Some(HeaderValue::from(6 * 3_600_000_000u64)))
+        );
+        assert_eq!(
+            canonical_value(
+                OptionKey::LocalRetentionSize,
+                &entry(
+                    OptionKey::LocalRetentionSize,
+                    &HeaderValue::try_from("10 GiB").unwrap()
+                )
+            ),
+            Ok(Some(HeaderValue::from(10u64 << 30)))
+        );
+    }
+
+    #[test]
+    fn given_an_update_when_patching_should_reset_then_set_over_the_stored_map() {
+        let stored: ResourceOptions = [
+            (
+                HeaderKey::from(OptionKey::MessageExpiry),
+                OptionValue::explicit(HeaderValue::from(7u64)),
+            ),
+            (
+                HeaderKey::from(OptionKey::LocalRetentionAge),
+                OptionValue::explicit(HeaderValue::from(5u64)),
+            ),
+        ]
+        .into();
+        let admitted = admit(
+            OptionsScope::Topic,
+            OptionOperation::Update,
+            &block(&[(OptionKey::MessageExpiry, HeaderValue::from(9u64))]),
+            &[OptionKey::LocalRetentionAge.to_string()],
+            &OptionAdmissionContext::default(),
+        )
+        .unwrap();
+
+        let patched = admitted.patched(&stored).unwrap();
+
+        assert_eq!(
+            patched.get(&HeaderKey::from(OptionKey::MessageExpiry)),
+            Some(&OptionValue::explicit(HeaderValue::from(9u64)))
+        );
+        assert_eq!(
+            patched.get(&HeaderKey::from(OptionKey::LocalRetentionAge)),
+            Some(&OptionValue::derived(HeaderValue::from(
+                DEFAULT_LOCAL_RETENTION_AGE
+            )))
         );
     }
 

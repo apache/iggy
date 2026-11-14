@@ -47,8 +47,32 @@ public sealed class TopicUpdate
     public ulong? MaxTopicSize { get; init; }
 
     /// <summary>
-    ///     Keys to reset to their defaults: <see cref="TopicOptionKey.MessageExpiry" /> or
-    ///     <see cref="TopicOptionKey.MaxTopicSize" />. Any other key is refused, before anything is sent unless
+    ///     Turns tiered storage on. It never turns off again, so <c>false</c> is refused, before anything is sent
+    ///     unless the update carries a raw key. Null changes nothing.
+    /// </summary>
+    /// <remarks>
+    ///     Not available yet: the server refuses <c>true</c> with <c>feature_unavailable</c>.
+    /// </remarks>
+    public bool? TieredStorage { get; init; }
+
+    /// <summary>
+    ///     How long a tiered topic keeps an uploaded segment on local disk, at most a finite message expiry.
+    ///     <see cref="TimeSpan.MaxValue" /> never removes it, zero changes nothing. Reset
+    ///     <see cref="TopicOptionKey.LocalRetentionAge" /> to return to the default.
+    /// </summary>
+    public TimeSpan? LocalRetentionAge { get; init; }
+
+    /// <summary>
+    ///     The new topic-wide cap in bytes on the uploaded segments a tiered topic keeps on local disk, at most a
+    ///     finite topic size cap. <see cref="ulong.MaxValue" /> is unlimited, zero changes nothing. Reset
+    ///     <see cref="TopicOptionKey.LocalRetentionSize" /> to return to the default.
+    /// </summary>
+    public ulong? LocalRetentionSize { get; init; }
+
+    /// <summary>
+    ///     Keys to reset to their defaults: <see cref="TopicOptionKey.MessageExpiry" />,
+    ///     <see cref="TopicOptionKey.MaxTopicSize" />, <see cref="TopicOptionKey.LocalRetentionAge" /> or
+    ///     <see cref="TopicOptionKey.LocalRetentionSize" />. Any other key is refused, before anything is sent unless
     ///     the update carries a raw key.
     /// </summary>
     public IReadOnlySet<TopicOptionKey>? Reset { get; init; }
@@ -80,6 +104,23 @@ public sealed class TopicUpdate
         if (MaxTopicSize is { } maxTopicSize and not 0)
         {
             set[OptionKeys.Describe(TopicOptionKey.MaxTopicSize).Name] = HeaderValue.FromUInt64(maxTopicSize);
+        }
+
+        if (TieredStorage is { } tieredStorage)
+        {
+            set[OptionKeys.Describe(TopicOptionKey.TieredStorage).Name] = HeaderValue.FromBool(tieredStorage);
+        }
+
+        if (LocalRetentionAge is { } localRetentionAge
+            && DurationHelpers.ToDuration(localRetentionAge) is not 0 and var localAgeMicros)
+        {
+            set[OptionKeys.Describe(TopicOptionKey.LocalRetentionAge).Name] = HeaderValue.FromUInt64(localAgeMicros);
+        }
+
+        if (LocalRetentionSize is { } localRetentionSize and not 0)
+        {
+            set[OptionKeys.Describe(TopicOptionKey.LocalRetentionSize).Name] =
+                HeaderValue.FromUInt64(localRetentionSize);
         }
 
         return OptionKeys.Patch(OptionsScope.Topic, set, (Reset ?? NoReset).Select(OptionKeys.Describe),

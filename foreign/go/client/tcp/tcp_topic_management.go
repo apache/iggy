@@ -83,14 +83,17 @@ func (c *IggyTcpClient) UpdateTopic(
 	update iggcon.TopicUpdate,
 ) error {
 	_, err := c.do(ctx, &command.UpdateTopic{
-		StreamId:      streamId,
-		TopicId:       topicId,
-		Name:          update.Name,
-		MessageExpiry: update.MessageExpiry,
-		MaxTopicSize:  update.MaxTopicSize,
-		Reset:         update.Reset,
-		RawReset:      update.RawReset,
-		Options:       update.Options,
+		StreamId:           streamId,
+		TopicId:            topicId,
+		Name:               update.Name,
+		MessageExpiry:      update.MessageExpiry,
+		MaxTopicSize:       update.MaxTopicSize,
+		TieredStorage:      update.TieredStorage,
+		LocalRetentionAge:  update.LocalRetentionAge,
+		LocalRetentionSize: update.LocalRetentionSize,
+		Reset:              update.Reset,
+		RawReset:           update.RawReset,
+		Options:            update.Options,
 	})
 	return err
 }

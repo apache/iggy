@@ -854,6 +854,9 @@ impl TryFrom<UpdateTopic> for TopicUpdateOptions {
                 .max_size
                 .map(|value| parsed(&value, "maximum size"))
                 .transpose()?,
+            tiered_storage: None,
+            local_retention_age: None,
+            local_retention_size: None,
             reset,
             raw_reset,
             raw: update.options,

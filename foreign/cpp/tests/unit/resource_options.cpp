@@ -185,6 +185,29 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                [] { return TopicCreateOptions().SetPreallocateSegments(true).PreallocateSegments().has_value(); }},
               {"replication_factor",
                [] { return TopicCreateOptions().SetReplicationFactor(1).ReplicationFactor().has_value(); }},
+              {"segment_max_age",
+               [] {
+                   return TopicCreateOptions()
+                       .SetSegmentMaxAge(iggy::Expiry::NeverExpire())
+                       .SegmentMaxAge()
+                       .has_value();
+               }},
+              {"tiered_storage",
+               [] { return TopicCreateOptions().SetTieredStorage(true).TieredStorage().has_value(); }},
+              {"local_retention_age",
+               [] {
+                   return TopicCreateOptions()
+                       .SetLocalRetentionAge(iggy::Expiry::NeverExpire())
+                       .LocalRetentionAge()
+                       .has_value();
+               }},
+              {"local_retention_size",
+               [] {
+                   return TopicCreateOptions()
+                       .SetLocalRetentionSize(iggy::MaxTopicSize::Unlimited())
+                       .LocalRetentionSize()
+                       .has_value();
+               }},
           },
           {
               {"name", [] { return TopicUpdateOptions().SetName("renamed").Name().has_value(); }},
@@ -202,10 +225,28 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                        .MaxTopicSize()
                        .has_value();
                }},
+              {"tiered_storage",
+               [] { return TopicUpdateOptions().SetTieredStorage(true).TieredStorage().has_value(); }},
+              {"local_retention_age",
+               [] {
+                   return TopicUpdateOptions()
+                       .SetLocalRetentionAge(iggy::Expiry::NeverExpire())
+                       .LocalRetentionAge()
+                       .has_value();
+               }},
+              {"local_retention_size",
+               [] {
+                   return TopicUpdateOptions()
+                       .SetLocalRetentionSize(iggy::MaxTopicSize::Unlimited())
+                       .LocalRetentionSize()
+                       .has_value();
+               }},
           },
           {
               {"message_expiry", ResetMember<TopicUpdateOptions>(iggy::TopicOptionKey::MessageExpiry)},
               {"max_topic_size", ResetMember<TopicUpdateOptions>(iggy::TopicOptionKey::MaxTopicSize)},
+              {"local_retention_age", ResetMember<TopicUpdateOptions>(iggy::TopicOptionKey::LocalRetentionAge)},
+              {"local_retention_size", ResetMember<TopicUpdateOptions>(iggy::TopicOptionKey::LocalRetentionSize)},
           },
           {}}},
         {"stream",
@@ -303,14 +344,16 @@ TEST(ResourceOptionsFixtureTest, GivenFixtureCatalogWhenListingPublicKeyEnumsSho
 TEST(ResourceOptionsFixtureTest, GivenFixtureCatalogWhenComparingTypedSurfaceShouldCoverEveryKeyByMutability) {
     const auto flags      = Fixture().at("constants").at("option_flags");
     const auto resettable = flags.at("resettable").get<std::uint32_t>();
+    // An enable-only key has a setter on an update too: the update turns it on.
+    const auto updatable = [](const nlohmann::json &row) {
+        return row.at("mutability") == "updatable" || row.at("mutability") == "enable_only";
+    };
     for (const auto &[scope, surface] : TypedSurface()) {
         SCOPED_TRACE(scope);
-        EXPECT_EQ(SurfaceKeys(surface.create), CatalogKeys(scope, [](const nlohmann::json &row) {
-                      return row.at("storage") == "map" &&
-                             (row.at("mutability") == "create_only" || row.at("mutability") == "updatable");
+        EXPECT_EQ(SurfaceKeys(surface.create), CatalogKeys(scope, [&updatable](const nlohmann::json &row) {
+                      return row.at("storage") == "map" && (row.at("mutability") == "create_only" || updatable(row));
                   }));
-        EXPECT_EQ(SurfaceKeys(surface.update),
-                  CatalogKeys(scope, [](const nlohmann::json &row) { return row.at("mutability") == "updatable"; }));
+        EXPECT_EQ(SurfaceKeys(surface.update), CatalogKeys(scope, updatable));
         EXPECT_EQ(SurfaceKeys(surface.reset), CatalogKeys(scope, [resettable](const nlohmann::json &row) {
                       return (row.at("flags").get<std::uint32_t>() & resettable) != 0;
                   }));

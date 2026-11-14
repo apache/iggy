@@ -66,7 +66,8 @@ pub enum TestBinaryError {
     NotStarted,
     AlreadyStarted,
     SeedFailed(String),
-    /// Only the fixtures in apache/iggy-connectors return this.
+    /// A fixture that did not start, such as Floci or a fixture of
+    /// apache/iggy-connectors.
     FixtureSetup {
         fixture_type: String,
         message: String,

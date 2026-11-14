@@ -33,6 +33,7 @@ use super::{
     state_machine_pipeline_slots,
 };
 use crate::IggyPartition;
+use crate::tiered_floor::TieredFloor;
 use crate::types::FatalCommit;
 
 impl<B, SB> IggyPartition<B, SB>
@@ -57,6 +58,17 @@ where
         machine: Box<dyn PartitionStateMachine>,
     ) -> Result<(), RegistrationError> {
         self.state_machines.register(machine)
+    }
+
+    /// Register every machine this release runs on a partition. Every builder
+    /// calls it right after constructing the partition, so every replica
+    /// registers the same set.
+    ///
+    /// # Errors
+    /// Returns an error when called twice, or after the partition restored or
+    /// applied an op.
+    pub fn register_builtin_state_machines(&mut self) -> Result<(), RegistrationError> {
+        self.register_state_machine(Box::new(TieredFloor::default()))
     }
 
     #[must_use]
@@ -219,8 +231,16 @@ where
         else {
             return self.stop_on_command(header, "committed command is malformed");
         };
+        let advance = (command.kind == crate::tiered_floor::ADVANCE_TIERED_FLOOR)
+            .then(|| crate::tiered_floor::AdvanceTieredFloor::try_from(command.payload).ok())
+            .flatten();
         match self.state_machines.apply(header.op, command) {
-            Ok(Applied::Changed) => true,
+            Ok(Applied::Changed) => {
+                if let Some(advance) = advance {
+                    self.note_tiered_advance(advance);
+                }
+                true
+            }
             Ok(Applied::Refused) => {
                 debug!(
                     namespace_raw = header.group,
@@ -249,8 +269,9 @@ where
         false
     }
 
-    /// Every machine at `op`, which must be the applied frontier. `None` for
-    /// a partition that registers no machine.
+    /// Every machine at `op`, which must be the applied frontier. `None` while
+    /// no machine holds state, so the checkpoint and the transfer stay what a
+    /// partition without machines writes.
     ///
     /// # Errors
     /// Returns an error when the snapshot is past the size every reader
@@ -259,7 +280,7 @@ where
         &self,
         op: u64,
     ) -> Result<Option<StateMachineSnapshot>, StateMachineError> {
-        if self.state_machines.is_empty() {
+        if !self.state_machines.holds_state() {
             return Ok(None);
         }
         self.state_machines.snapshot_at(op).map(Some)

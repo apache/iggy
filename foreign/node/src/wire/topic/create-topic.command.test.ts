@@ -108,6 +108,34 @@ describe('CreateTopic', () => {
       assert.equal(deserializeOptions(b, fixedSize + t.name.length).replication_factor, 2);
     });
 
+    it('serialize segmentMaxAge as a uint64 option, omitting the 0n sentinel', () => {
+      const t = { ...t1, segmentMaxAge: 3_600_000_000n };
+      const b = CREATE_TOPIC.serialize(t);
+      const options = deserializeOptions(b, fixedSize + t.name.length);
+      assert.equal(options.segment_max_age, 3_600_000_000n);
+      assert.equal(
+        CREATE_TOPIC.serialize({ ...t1, segmentMaxAge: 0n }).length,
+        fixedSize + t1.name.length + defaultPolicySize
+      );
+    });
+
+    it('serialize the tiering options, omitting the 0n sentinels', () => {
+      const t = {
+        ...t1,
+        tieredStorage: false,
+        localRetentionAge: 21_600_000_000n,
+        localRetentionSize: 10_737_418_240n
+      };
+      const options = deserializeOptions(CREATE_TOPIC.serialize(t), fixedSize + t.name.length);
+      assert.equal(options.tiered_storage, false);
+      assert.equal(options.local_retention_age, 21_600_000_000n);
+      assert.equal(options.local_retention_size, 10_737_418_240n);
+      assert.equal(
+        CREATE_TOPIC.serialize({ ...t1, localRetentionAge: 0n, localRetentionSize: 0n }).length,
+        fixedSize + t1.name.length + defaultPolicySize
+      );
+    });
+
     it('serialize caller-supplied option keys, typed fields winning', () => {
       const t = {
         ...t1,

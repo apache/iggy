@@ -97,6 +97,11 @@ impl Validatable<ConfigurationError> for ServerConfig {
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate external auth config")
             })?;
+        self.tiered_storage
+            .validate()
+            .error(|e: &ConfigurationError| {
+                format!("{COMPONENT} (error: {e}) - failed to validate tiered storage config")
+            })?;
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
