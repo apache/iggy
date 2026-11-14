@@ -24,12 +24,11 @@ pub(crate) use crate::cli::common::keyring::clear_session_entry;
 #[cfg(not(any(target_os = "macos", target_env = "musl")))]
 pub(crate) use crate::cli::common::keyring::ensure_keyring_store;
 use assert_cmd::assert::{Assert, OutputAssertExt};
-use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use integration::harness::{
     ServerHandle, TestBinary, TestHarness, TestHarnessBuilder, TestServerConfig,
-    backup_commit_budget,
+    backup_commit_budget, cargo_bin_path,
 };
 use std::fmt::{Display, Formatter, Result};
 use std::io::Write;
@@ -217,8 +216,7 @@ impl IggyCmdTest {
         // Prepare iggy server state before test
         test_case.prepare_server_state(&client).await;
         // Get iggy tool
-        #[allow(deprecated)]
-        let mut command = Command::cargo_bin("iggy").unwrap();
+        let mut command = Command::new(cargo_bin_path("iggy").unwrap());
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
         // Clear any IGGY_TOKEN inherited from the test process before the
@@ -288,8 +286,7 @@ impl IggyCmdTest {
 
     pub(crate) async fn execute_test_for_help_command(&mut self, test_case: TestHelpCmd) {
         // Get iggy tool
-        #[allow(deprecated)]
-        let mut command = Command::cargo_bin("iggy").unwrap();
+        let mut command = Command::new(cargo_bin_path("iggy").unwrap());
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
         // Clear any IGGY_TOKEN inherited from the test process before the

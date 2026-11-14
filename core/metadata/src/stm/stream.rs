@@ -3508,10 +3508,7 @@ fn encode_create_topic_reply(
                 },
                 // A new topic always lists its members. Nothing is in sync
                 // before the partition's primary first reports.
-                members: p
-                    .members
-                    .map(|members| members.nodes().to_vec())
-                    .unwrap_or_default(),
+                members: p.members.map_or_default(|members| members.nodes().to_vec()),
                 in_sync_members: Vec::new(),
             })
         })
@@ -4072,8 +4069,7 @@ impl Snapshotable for Streams {
                                             deleted_up_to_offset: p.deleted_up_to_offset,
                                             members: p
                                                 .members
-                                                .map(|members| members.nodes().to_vec())
-                                                .unwrap_or_default(),
+                                                .map_or_default(|members| members.nodes().to_vec()),
                                             retirement_debt_op: p.retirement_debt_op,
                                         })
                                         .collect(),

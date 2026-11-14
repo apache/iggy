@@ -251,8 +251,7 @@ Prerequisites that step 1 checks:
   - rustup and rustc ${MIN_RUSTC_VERSION} or later. rustc 1.99 miscompiles the PGO counters:
     ${RUSTC_PGO_BUG_URL}
     A beta or nightly toolchain also needs a commit date of ${MIN_PRERELEASE_COMMIT_DATE} or
-    later. If the pinned toolchain is older, set RUSTUP_TOOLCHAIN, for
-    example RUSTUP_TOOLCHAIN=beta.
+    later.
   - llvm-profdata of that toolchain. Step 1 prints the install command:
     rustup component add llvm-tools-preview --toolchain <toolchain>
   - cargo-pgo 0.3.x (${CARGO_PGO_URL}):
@@ -284,7 +283,7 @@ when the current command ends. In a terminal, Ctrl-C also stops that command.
 
 Examples:
   ${SCRIPT_NAME}
-  RUSTUP_TOOLCHAIN=beta ${SCRIPT_NAME} --bolt
+  ${SCRIPT_NAME} --bolt
   ${SCRIPT_NAME} --target-cpu icelake-server
 EOF
 }
@@ -342,7 +341,7 @@ check_rustc_version() {
         return 0
     fi
     echo "  ${FAIL_TAG} rustc ${release} (${commit_date}) - PGO needs ${MIN_RUSTC_VERSION} or later, and a beta or nightly from ${MIN_PRERELEASE_COMMIT_DATE} or later (${RUSTC_PGO_BUG_URL})" >&2
-    echo "         update the toolchain, or override the pinned one, for example: RUSTUP_TOOLCHAIN=beta" >&2
+    echo "         use the pinned toolchain, or update the toolchain that overrides it" >&2
     return 1
 }
 

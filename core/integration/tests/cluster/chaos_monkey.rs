@@ -246,20 +246,18 @@ use std::io::Read;
 use std::ops::RangeInclusive;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::path::PathBuf;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use assert_cmd::cargo::CommandCargoExt;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use iggy::prelude::*;
 use integration::harness::handle::common::SIGTERM_TIMEOUT;
 use integration::harness::{
     GroupPoller, ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness,
-    TestServerConfig, disk, log_capture, resolve_config_paths,
+    TestServerConfig, cargo_bin_path, disk, log_capture, resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -4264,8 +4262,7 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
 }
 
 fn server_binary_metadata() -> serde_json::Value {
-    let command = Command::cargo_bin("iggy-server").expect("locate the prebuilt server");
-    let path = PathBuf::from(command.get_program());
+    let path = cargo_bin_path("iggy-server").expect("locate the prebuilt server");
     let fingerprint = || -> std::io::Result<String> {
         let mut file = File::open(&path)?;
         let mut digest = Context::new(&SHA256);

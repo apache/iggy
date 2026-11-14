@@ -20,6 +20,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::*;
+use integration::harness::cargo_bin_path;
 use predicates::str::contains;
 use serial_test::parallel;
 
@@ -170,8 +171,7 @@ pub async fn should_poll_messages_as_consumer_group_member() {
 fn given_http_transport_when_polling_consumer_group_should_reject_before_connecting() {
     let cli_home = tempfile::tempdir().unwrap();
 
-    #[allow(deprecated)]
-    let mut command = assert_cmd::Command::cargo_bin("iggy").unwrap();
+    let mut command = assert_cmd::Command::new(cargo_bin_path("iggy").unwrap());
     command
         .env("IGGY_HOME", cli_home.path())
         .args([

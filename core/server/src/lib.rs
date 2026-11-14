@@ -20,6 +20,10 @@
 use iggy_common::SemanticVersion;
 #[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
 use mimalloc::MiMalloc;
+// `--all-features` leaves the allocator off, and cargo then reports the crate
+// as an unused dependency.
+#[cfg(all(feature = "mimalloc", feature = "disable-mimalloc"))]
+use mimalloc as _;
 
 // Both features are checked because `--all-features` turns on `mimalloc` and
 // `disable-mimalloc` at once, while `--no-default-features` drops the crate.

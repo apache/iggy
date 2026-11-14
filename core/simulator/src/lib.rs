@@ -17956,10 +17956,9 @@ mod review_4092_dst_tests {
                     .items
                     .get(namespace.stream_id())
                     .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                    .map(|topic| {
+                    .map_or_default(|topic| {
                         iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
                     })
-                    .unwrap_or_default()
             });
 
         assert!(

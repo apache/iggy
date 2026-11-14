@@ -338,8 +338,7 @@ impl FromRequestParts<HttpState> for Identity {
         let path_and_query = parts
             .uri
             .path_and_query()
-            .map(|value| value.as_str().to_owned())
-            .unwrap_or_default();
+            .map_or_default(|value| value.as_str().to_owned());
         let client_ip = parts
             .extensions
             .get::<ConnectInfo<ClientAddr>>()
