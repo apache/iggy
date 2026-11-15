@@ -188,6 +188,7 @@ impl ffi::ReadErrorInfo {
         let lost = error.lost.as_ref().map(|lost| (*lost.start(), *lost.end()));
         self.has_lost = lost.is_some();
         (self.lost_first, self.lost_last) = lost.unwrap_or_default();
+        self.lasting_refusal = error.is_lasting_refusal();
     }
 }
 
@@ -259,6 +260,24 @@ mod tests {
     }
 
     #[test]
+    fn given_tiered_read_failure_when_recording_should_keep_its_code_and_kind() {
+        let mut read_error = ffi::ReadErrorInfo::default();
+
+        read_error.record(&ReadError::new(
+            Some(PARTITION),
+            IggyError::TieredReadFailed,
+        ));
+
+        assert_eq!(read_error.error.code, 96);
+        assert_eq!(read_error.error.kind, "tiered_read_failed");
+        assert!(!read_error.error.has_operation_id);
+        assert!(!read_error.error.has_blocked_partition_id);
+        assert!(read_error.has_partition_id);
+        assert_eq!(read_error.partition_id, PARTITION);
+        assert!(read_error.skip.is_empty());
+    }
+
+    #[test]
     fn given_reader_shared_by_threads_when_calling_should_serve_every_call() {
         const THREADS: usize = 4;
         let reader = PartitionReader {
@@ -322,11 +341,11 @@ mod tests {
             Some(PARTITION),
             IggyError::FetchProgressUncertain(OPERATION),
         );
-        lost.skip = Some(continuation_at(LAST + 1));
         lost.lost = Some(FIRST..=LAST);
 
         info.record(&lost);
         assert!(info.has_lost);
+        assert!(info.skip.is_empty());
         assert_eq!((info.lost_first, info.lost_last), (FIRST, LAST));
 
         info.record(&ReadError::new(Some(PARTITION), IggyError::ClientShutdown));
@@ -335,6 +354,21 @@ mod tests {
             "a later error must not keep the lost range of an earlier one"
         );
         assert_eq!((info.lost_first, info.lost_last), (0, 0));
+    }
+
+    #[test]
+    fn given_a_read_error_of_a_lasting_refusal_when_recording_should_flag_only_the_stop() {
+        let mut info = ffi::ReadErrorInfo::default();
+        // The flagged error goes first, so each later one must also clear the flag.
+        for (partition_id, error, flagged) in [
+            (Some(PARTITION), IggyError::Unauthorized, true),
+            (None, IggyError::Unauthorized, false),
+            (Some(PARTITION), IggyError::HistoryUnavailable, false),
+        ] {
+            info.record(&ReadError::new(partition_id, error));
+
+            assert_eq!(info.lasting_refusal, flagged);
+        }
     }
 
     #[test]

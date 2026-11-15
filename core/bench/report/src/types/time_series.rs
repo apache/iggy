@@ -47,7 +47,8 @@ pub enum TimeSeriesKind {
     Latency,
 }
 
-const MAX_CHART_POINTS: usize = 3000;
+/// Most points per chart series, to keep ECharts responsive.
+pub const MAX_CHART_POINTS: usize = 3000;
 
 impl TimeSeries {
     pub fn as_charming_points(&self) -> Vec<Vec<f64>> {

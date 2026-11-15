@@ -27,12 +27,14 @@ ignored = ["cfg_aliases"]
 
 [features]
 default = ["login-session"]
-login-session = ["dep:zbus-secret-service-keyring-store"]
+# Gates only the keyring backend of the CLI login tests. Its store is a
+# dev-dependency, and a dev-dependency cannot be optional.
+login-session = []
 
 [dependencies]
-assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+compio = { workspace = true }
 configs = { workspace = true }
 # Decodes a metadata replica's durable `VsrState` off disk in the superblock
 # recovery test.
@@ -44,6 +46,8 @@ harness_derive = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+# The S3 provider, which creates the buckets of the Floci fixture.
+iggy_object_store = { workspace = true }
 # Locates and decodes the on-disk superblock slot files in the recovery test
 # (`SLOT_FILE_NAMES`, `decode_slots`).
 journal = { workspace = true }
@@ -58,6 +62,8 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 serde_json = { workspace = true }
+# Starts Floci, the S3 store of the tests that run tiered storage on s3.
+testcontainers = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
@@ -65,18 +71,15 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-zbus-secret-service-keyring-store = { workspace = true, optional = true }
-
 [build-dependencies]
 cfg_aliases = { workspace = true }
 
 [dev-dependencies]
+assert_cmd = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
-compio = { workspace = true }
 configs_derive = { workspace = true }
 ctor = { workspace = true }
 dtor = { workspace = true }
@@ -97,6 +100,9 @@ tempfile = { workspace = true }
 test-case = { workspace = true }
 twox-hash = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dev-dependencies]
+zbus-secret-service-keyring-store = { workspace = true }
 
 [lints]
 workspace = true

@@ -39,7 +39,8 @@ impl Display for ServerConfig {
              heartbeat: {}, path: {}, runtime: {{ path: {} }}, logging: {}, \
              encryption: {}, memory_pool: {:?}, sharding: {:?}, \
              quic: {}, tcp: {}, http: {}, telemetry: {}, \
-             metadata: {}, message_bus: {}, partition: {}, external_auth: {} }}",
+             metadata: {}, message_bus: {}, partition: {}, external_auth: {}, \
+             tiered_storage: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
@@ -57,6 +58,7 @@ impl Display for ServerConfig {
             self.message_bus,
             self.partition,
             self.external_auth,
+            self.tiered_storage,
         )
     }
 }

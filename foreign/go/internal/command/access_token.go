@@ -21,6 +21,12 @@ import (
 	"encoding/binary"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
+
+const (
+	minAccessTokenNameLength = 1
+	maxAccessTokenNameLength = 255
 )
 
 type CreatePersonalAccessToken struct {
@@ -33,6 +39,9 @@ func (c *CreatePersonalAccessToken) Code() Code {
 }
 
 func (c *CreatePersonalAccessToken) MarshalBinary() ([]byte, error) {
+	if len(c.Name) < minAccessTokenNameLength || len(c.Name) > maxAccessTokenNameLength {
+		return nil, ierror.ErrInvalidPersonalAccessTokenName
+	}
 	length := 1 + len(c.Name) + 8
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(c.Name))
@@ -60,6 +69,9 @@ func (d *DeletePersonalAccessToken) Code() Code {
 }
 
 func (d *DeletePersonalAccessToken) MarshalBinary() ([]byte, error) {
+	if len(d.Name) < minAccessTokenNameLength || len(d.Name) > maxAccessTokenNameLength {
+		return nil, ierror.ErrInvalidPersonalAccessTokenName
+	}
 	length := 1 + len(d.Name)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(d.Name))

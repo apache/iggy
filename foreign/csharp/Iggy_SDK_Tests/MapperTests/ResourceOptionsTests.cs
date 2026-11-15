@@ -447,11 +447,11 @@ public sealed class ResourceOptionsTests
             .ToList();
         var createKeys = rows
             .Where(row => row.GetProperty("storage").GetString() == "map"
-                          && row.GetProperty("mutability").GetString() is "create_only" or "updatable")
+                          && row.GetProperty("mutability").GetString() is "create_only" or "updatable" or "enable_only")
             .Select(row => row.GetProperty("key").GetString()!)
             .ToHashSet();
         var updateKeys = rows
-            .Where(row => row.GetProperty("mutability").GetString() == "updatable")
+            .Where(row => row.GetProperty("mutability").GetString() is "updatable" or "enable_only")
             .Select(row => row.GetProperty("key").GetString()!)
             .ToHashSet();
 
@@ -510,14 +510,22 @@ public sealed class ResourceOptionsTests
                     MessagesRequiredToSave = 64,
                     SizeOfMessagesRequiredToSave = 4096,
                     PreallocateSegments = true,
-                    ReplicationFactor = 3
+                    ReplicationFactor = 3,
+                    SegmentMaxAge = TimeSpan.FromHours(1),
+                    TieredStorage = false,
+                    LocalRetentionAge = TimeSpan.FromHours(6),
+                    LocalRetentionSize = 536_870_912
                 }.ToDictionary().Keys.ToHashSet());
                 Assert.Equal(updateKeys, new TopicUpdate
                 {
                     Name = "renamed",
                     MessageExpiry = TimeSpan.FromDays(1),
-                    MaxTopicSize = 1_073_741_824
+                    MaxTopicSize = 1_073_741_824,
+                    TieredStorage = true,
+                    LocalRetentionAge = TimeSpan.FromHours(6),
+                    LocalRetentionSize = 536_870_912
                 }.ToPatch().Set.Keys.ToHashSet());
+                AssertEnableOnlyKeys(rows);
                 break;
             case "user":
                 AssertKeyMembers<UserOptionKey>(describedKeys, resettableKeys, OptionKeys.Describe,
@@ -529,6 +537,29 @@ public sealed class ResourceOptionsTests
                         .ToHashSet());
                 break;
         }
+    }
+
+    private static void AssertEnableOnlyKeys(List<JsonElement> rows)
+    {
+        var enableOnlyKeys = rows
+            .Where(row => row.GetProperty("mutability").GetString() == "enable_only")
+            .Select(row => row.GetProperty("key").GetString()!)
+            .ToHashSet();
+        Assert.Equal(enableOnlyKeys, OptionKeys.For(OptionsScope.Topic).Where(descriptor => descriptor.EnableOnly)
+            .Select(descriptor => descriptor.Name).ToHashSet());
+
+        foreach (var key in Enum.GetValues<TopicOptionKey>()
+                     .Where(key => enableOnlyKeys.Contains(OptionKeys.Describe(key).Name)))
+        {
+            var reset = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+                new TopicUpdate { Reset = new HashSet<TopicOptionKey> { key } }.ToPatch());
+            Assert.Equal(VsrError.OPTION_NOT_UPDATABLE, reset.StatusCode);
+        }
+
+        Assert.True(new TopicUpdate { TieredStorage = true }.ToPatch().Set["tiered_storage"].ToBool());
+        var turnedOff = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+            new TopicUpdate { TieredStorage = false }.ToPatch());
+        Assert.Equal(VsrError.OPTION_NOT_UPDATABLE, turnedOff.StatusCode);
     }
 
     /// <summary>
@@ -807,6 +838,14 @@ public sealed class ResourceOptionsTests
                 topic.CompressionAlgorithm);
             Assert.Equal(ParseU64(expected, "message_expiry"), DurationHelpers.ToDuration(topic.MessageExpiry));
             Assert.Equal(ParseU64(expected, "max_topic_size"), topic.MaxTopicSize);
+            Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("segment_max_age"), "value"),
+                DurationHelpers.ToDuration(topic.SegmentMaxAge));
+            Assert.Equal(expected.GetProperty("options").GetProperty("tiered_storage").GetProperty("value").GetString(),
+                topic.TieredStorage ? "true" : "false");
+            Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("local_retention_age"), "value"),
+                DurationHelpers.ToDuration(topic.LocalRetentionAge));
+            Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("local_retention_size"), "value"),
+                topic.LocalRetentionSize);
             AssertNeverReturned(topic.Options, topic.DerivedOptions);
         }
 

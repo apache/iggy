@@ -36,7 +36,11 @@ use crate::partition_storage::{read_revision_record, write_revision_record};
 use crate::producer_state::{
     PRODUCER_BATCHES_RETAINED, PRODUCERS_MAX, ProducerBatch, ProducerEntry,
 };
+use crate::segment::SegmentLocation;
 use crate::segment_anchor::ANCHOR_SUFFIX;
+use crate::segment_chain::{
+    CHAIN_FILE, Chain, ChainRecord, LiveChain, ObjectPrefix, SegmentRecord, decode_chain,
+};
 use crate::state_machine::{
     SNAPSHOT_BYTES_MAX, SnapshotDecodeError, StateMachineError, StateMachineSnapshot,
 };
@@ -687,8 +691,7 @@ impl ConsumerOffsetsWire {
         let retirement_bytes = self
             .owner_retirement
             .as_ref()
-            .map(WireEncode::to_bytes)
-            .unwrap_or_default();
+            .map_or_default(WireEncode::to_bytes);
         out.extend_from_slice(
             &u32::try_from(retirement_bytes.len())
                 .expect("bounded owner retirement")
@@ -1572,6 +1575,7 @@ pub struct SegmentArtifactSource {
 #[derive(Debug)]
 pub enum PartitionArtifactSource<'a> {
     Segment(&'a SegmentArtifactSource),
+    Chain(&'a std::rc::Rc<Vec<u8>>),
     Offsets(&'a std::rc::Rc<Vec<u8>>),
 }
 
@@ -1584,18 +1588,23 @@ pub struct PartitionStateTransferOffer {
     /// `commit_min` when the offer's `TransferPlan` was pinned: the segments
     /// hold every op through it and none after it.
     pub commit_op: u64,
-    /// Ascending base offset; one artifact per non-empty retained segment.
+    /// Ascending base offset; one artifact per non-empty local segment. A
+    /// segment whose `.log` left the disk travels only as its chain record.
     pub segments: Vec<SegmentArtifactSource>,
+    /// The tiered partition's chain, `None` for a partition without one.
+    pub chain: Option<(consensus::StateArtifact, std::rc::Rc<Vec<u8>>)>,
     /// Resident consumer offsets, dedup state, and an optional checkpoint prepare.
     pub offsets: (consensus::StateArtifact, std::rc::Rc<Vec<u8>>),
 }
 
 impl PartitionStateTransferOffer {
-    /// Manifest order: segments ascending, then the offsets artifact last,
-    /// so a receiver spills every segment before it holds the table.
+    /// Manifest order: segments ascending, then the chain if any, then the
+    /// offsets artifact last, so a receiver spills every segment before it
+    /// holds the table.
     #[must_use]
     pub fn manifest(&self) -> Vec<consensus::StateArtifact> {
         let mut entries: Vec<_> = self.segments.iter().map(|source| source.entry).collect();
+        entries.extend(self.chain.as_ref().map(|chain| chain.0));
         entries.push(self.offsets.0);
         entries
     }
@@ -1603,19 +1612,21 @@ impl PartitionStateTransferOffer {
     /// Never zero: the offsets artifact is always present.
     #[must_use]
     pub const fn artifact_count(&self) -> usize {
-        self.segments.len() + 1
+        self.segments.len() + self.chain.is_some() as usize + 1
     }
 
-    /// The artifact at `index` in [`Self::manifest`] order (segments
-    /// ascending, offsets last) without materialising the manifest vec.
+    /// The artifact at `index` in [`Self::manifest`] order without
+    /// materialising the manifest vec.
     #[must_use]
     pub fn artifact_at(&self, index: usize) -> Option<PartitionArtifactSource<'_>> {
-        match index.cmp(&self.segments.len()) {
-            std::cmp::Ordering::Less => {
-                Some(PartitionArtifactSource::Segment(&self.segments[index]))
-            }
-            std::cmp::Ordering::Equal => Some(PartitionArtifactSource::Offsets(&self.offsets.1)),
-            std::cmp::Ordering::Greater => None,
+        if let Some(segment) = self.segments.get(index) {
+            return Some(PartitionArtifactSource::Segment(segment));
+        }
+        let index = index - self.segments.len();
+        match (index, &self.chain) {
+            (0, Some(chain)) => Some(PartitionArtifactSource::Chain(&chain.1)),
+            (0, None) | (1, Some(_)) => Some(PartitionArtifactSource::Offsets(&self.offsets.1)),
+            _ => None,
         }
     }
 
@@ -1625,6 +1636,7 @@ impl PartitionStateTransferOffer {
             .iter()
             .map(|source| source.entry.len)
             .sum::<u64>()
+            + self.chain.as_ref().map_or(0, |chain| chain.0.len)
             + self.offsets.0.len
     }
 }
@@ -1634,8 +1646,10 @@ impl PartitionStateTransferOffer {
 /// these lengths, so hash rounds that span them still describe `commit_op`.
 pub(crate) struct TransferPlan {
     commit_op: u64,
-    /// Each non-empty segment, in chain order.
+    /// Each non-empty local segment, in chain order.
     segments: Vec<PlannedSegment>,
+    /// The chain as of `commit_op`, `None` for a partition without one.
+    chain: Option<Chain>,
     offsets: ConsumerOffsetsWire,
 }
 
@@ -1685,7 +1699,9 @@ pub enum PartitionTransferUnavailable {
     },
     /// Primary-by-index of a group that has committed nothing: an empty group
     /// is trivially "caught up", so this is the only thing separating a real
-    /// primary from a view-0 phantom whose directory vanished.
+    /// primary from a view-0 phantom whose directory vanished. The primary of
+    /// a group of two that holds nothing serves instead, because this refusal
+    /// would never end there.
     NothingCommitted,
     /// More retained segments than the manifest can carry entries for.
     ManifestTooLarge {
@@ -1836,9 +1852,10 @@ pub enum PartitionInstallError {
         commit_op: u64,
         commit_min: u64,
     },
-    /// The install wipes the journal, which holds an op above `commit_op` that
-    /// this replica may have acknowledged: one at or below `held_max`, its
-    /// accepted WAL head, or the known commit without a WAL.
+    /// The install wipes the journal and resets the WAL, which hold an op above
+    /// `commit_op` that this replica may have acknowledged: one at or below
+    /// `held_max`, its accepted WAL head, the known commit without a WAL, or
+    /// the commit point the WAL names when boot skipped its replay.
     OfferErasesHeldOps {
         commit_op: u64,
         held_max: u64,
@@ -1883,10 +1900,23 @@ pub enum PartitionInstallError {
     DuplicateSegment {
         start_offset: u64,
     },
-    /// A hole between consecutive staged segments.
+    /// A hole between consecutive staged segments, or between the chain's
+    /// remote segments and the first staged one.
     SegmentSetHole {
         previous_end: u64,
         next_start: u64,
+    },
+    /// The transferred chain does not decode, or ends in a torn record.
+    ChainUnreadable,
+    /// The transferred chain names another partition or incarnation.
+    ForeignChain {
+        recorded: ObjectPrefix,
+    },
+    /// The transferred segments start above the chain's trim point, which
+    /// boot would refuse.
+    ChainFrontAboveTrimPoint {
+        first_start: u64,
+        trim_point: u64,
     },
     /// A writer sync or backup preparation failure returns before the swap;
     /// the old in-memory partition remains in place and may be fenced.
@@ -1977,6 +2007,19 @@ impl fmt::Display for PartitionInstallError {
             } => write!(
                 f,
                 "staged segment set holds a hole: previous ends at {previous_end}, next starts at {next_start}"
+            ),
+            Self::ChainUnreadable => f.write_str("transferred segment chain does not decode"),
+            Self::ForeignChain { recorded } => write!(
+                f,
+                "transferred segment chain names another partition or incarnation: {recorded:?}"
+            ),
+            Self::ChainFrontAboveTrimPoint {
+                first_start,
+                trim_point,
+            } => write!(
+                f,
+                "transferred segments start at {first_start}, above the chain's trim point \
+                 {trim_point}"
             ),
             Self::SwapIo { path, source } => write!(f, "swap io failed at {path}: {source}"),
             Self::SegmentOpen { path, source } => {
@@ -2149,7 +2192,7 @@ pub async fn quarantine_partition_files(
         for entry in std::fs::read_dir(source)? {
             let path = entry?.path();
             let quarantined = path.to_str().is_some_and(|path| {
-                [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
+                [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX, CHAIN_FILE]
                     .iter()
                     .any(|suffix| path.ends_with(suffix))
             });
@@ -2244,7 +2287,8 @@ fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
     )
 }
 
-/// Consumer-offset files written concurrently while installing a transfer.
+/// Consumer-offset files written concurrently while installing a transfer or
+/// clamping recovered offsets at boot.
 /// Each is an open + write + optional fsync, so the width trades reactor queue
 /// depth against how long one partition monopolises it; matches the tick's
 /// superblock pre-pass.
@@ -2294,6 +2338,8 @@ pub(crate) struct PendingInstall {
     peer: u8,
     partition_dir: String,
     staged: Vec<StagedSegmentMeta>,
+    /// The sender's chain, which replaces this replica's.
+    chain: Option<TransferredChain>,
     offsets_wire: ConsumerOffsetsWire,
     /// The emptied-at op the installed table keeps, `0` for none.
     emptied_at: u64,
@@ -2316,6 +2362,19 @@ enum InstallDisposition {
     Prepared,
     Backup,
     Mutating,
+}
+
+/// The chain an offer carried, decoded and reduced once when the install was
+/// checked. A chain holds a record per segment the partition ever sealed and
+/// every install step runs on the shard thread, so no step walks it again to
+/// rebuild what an earlier one had.
+struct TransferredChain {
+    /// The file the sweep writes.
+    chain: Chain,
+    /// What the partition keeps of it once the install is published.
+    live: LiveChain,
+    /// The segments planted without bytes, in offset order.
+    remote: Vec<SegmentRecord>,
 }
 
 enum InstallPhase {
@@ -2619,23 +2678,48 @@ where
         if self.repair.is_some() {
             return Err(PartitionTransferUnavailable::RepairInProgress);
         }
-        // Primary-by-index at view 0 over an empty log passes every gate above
-        // yet knows nothing: a group whose directory is absent boots through
-        // `consensus.init()`, comes up Normal at view 0, and an empty group is
-        // trivially "caught up". Its offer would be zero segments at frontier
-        // 0, which makes a receiver holding real data unlink its own chain.
+        // A primary by index over an empty log passes every gate above yet can
+        // know nothing: a group whose directory is absent boots through
+        // `consensus.init()`, comes up Normal, and an empty group is trivially
+        // "caught up". Its offer would be zero segments at frontier 0, which
+        // tells a receiver holding real data to unlink its own chain.
         //
-        // A RESTARTED replica holding a full chain matches this shape too
-        // (`commit_max == 0` because the partition journal is memory-only,
-        // `installed_frontier == None` for a recovered non-empty chain). That
-        // is the load-bearing reason this refusal is safe rather than a
-        // wedge: every transfer-arm site presupposes a peer that already
-        // reported commit > 0 (repair floor refusals, StartView adoption), so
-        // nobody ever asks a cluster where everything still reports 0.
-        // Extending the gate with `recovered_durable_offset.is_some()` would
-        // be WRONG: such an offer carries `commit_op = 0`, so the receiver's
-        // floor becomes a no-op while its counter jumps to the frontier.
-        if self.consensus().commit_max() == 0 && self.installed_frontier.is_none() {
+        // A RESTARTED replica holding a full chain matches this shape too: WAL
+        // replay restores the commit point from the checkpoint and the commit
+        // numbers in its prepares, which can all be 0, and
+        // `installed_frontier` is `None` for a recovered chain. Its offer
+        // would carry `commit_op = 0`, so the receiver's floor becomes a no-op
+        // while its counter jumps to the frontier.
+        //
+        // In a group of three or more the other members commit without the
+        // requester, and the first commit ends the refusal. In a group of two
+        // the requester is the only other member and acknowledges nothing
+        // while it waits, so the refusal would never end. There the primary
+        // serves when it holds nothing applied and no consumer offset: the
+        // offer is its true state at op 0, and the prepares it journaled reach
+        // the receiver by replication or repair. The boot clamp removes each
+        // consumer and group offset from a log that holds nothing, so only an
+        // external group offset keeps such a primary from serving.
+        //
+        // A primary that lost its storage unnoticed looks the same, so the
+        // receiver's own refusals stay the guard for what it still holds: its
+        // sized segments, its stored consumer offsets and a WAL that names a
+        // commit. Its superblock record is no guard: a group that acks before
+        // it persists ignores the record, see `restore_offset_frontier`. A
+        // replica that itself waits for a transfer skipped its WAL replay and
+        // can read as empty while its WAL holds prepares, so it never serves.
+        let empty_group_of_two = || {
+            self.consensus().replica_count() == 2
+                && !self.materialization_missing
+                && self.held_offset_frontier() == 0
+                && ConsumerKind::ALL
+                    .into_iter()
+                    .all(|kind| self.durable_consumer_offsets.count(kind) == 0)
+        };
+        if self.consensus().commit_max() == 0
+            && self.installed_frontier.is_none()
+            && !empty_group_of_two()
+        {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
         if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
@@ -2652,13 +2736,14 @@ where
             return Err(PartitionTransferUnavailable::FlushPending);
         };
         let planned = plan.segments.as_slice();
-        // One manifest entry per planned segment plus the offsets table. The
-        // manifest encoder ASSERTS its entry ceiling and that assert survives
-        // release builds, so a partition retaining more segments than the
-        // ceiling would panic this shard the moment a peer asked it to serve.
-        // A small configured `segment_size` makes a chain that long ordinary,
-        // so refuse the request instead of tripping the assert.
-        let manifest_entries = planned.len() + 1;
+        // One manifest entry per planned segment plus the chain and the
+        // offsets table. The manifest encoder ASSERTS its entry ceiling and
+        // that assert survives release builds, so a partition retaining more
+        // segments than the ceiling would panic this shard the moment a peer
+        // asked it to serve. A small configured `segment_size` makes a chain
+        // that long ordinary, so refuse the request instead of tripping the
+        // assert.
+        let manifest_entries = planned.len() + usize::from(plan.chain.is_some()) + 1;
         let manifest_entries_max = consensus::state_manifest::STATE_MANIFEST_ENTRIES_MAX as usize;
         if manifest_entries > manifest_entries_max {
             return Err(PartitionTransferUnavailable::ManifestTooLarge {
@@ -2734,10 +2819,12 @@ where
                 .log
                 .segments()
                 .iter()
+                .filter(|segment| segment.location != SegmentLocation::Remote)
                 .map(|segment| (segment.start_offset, segment.size.as_bytes_u64()))
                 .collect();
             // Append-only within a segment instance, so a live size BELOW the
-            // planned one means the file was replaced rather than extended.
+            // planned one means the file was replaced rather than extended,
+            // and a planned segment gone remote lost the file it names.
             let changed = planned.iter().any(|segment| {
                 live.get(&segment.start_offset)
                     .is_none_or(|live_size| *live_size < segment.len)
@@ -2775,9 +2862,19 @@ where
             plan.commit_op,
             &offsets_bytes,
         );
+        let chain = plan.chain.as_ref().map(|chain| {
+            let bytes = Rc::new(chain.encode());
+            let entry = consensus::StateArtifact::for_bytes(
+                artifact_kind::SEGMENT_CHAIN,
+                plan.commit_op,
+                &bytes,
+            );
+            (entry, bytes)
+        });
         let offer = Rc::new(PartitionStateTransferOffer {
             commit_op: plan.commit_op,
             segments,
+            chain,
             offsets: (offsets_entry, offsets_bytes),
         });
         *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
@@ -2791,8 +2888,14 @@ where
     ) -> Result<TransferPlan, PartitionTransferUnavailable> {
         let memos = self.segment_checksum_cache.borrow();
         let mut segments = Vec::with_capacity(self.log.segments().len());
+        let mut without_log = Vec::new();
         for (segment, storage) in self.log.segments().iter().zip(self.log.storages()) {
             let size = segment.size.as_bytes_u64();
+            // A segment whose `.log` left the disk travels as its chain record.
+            if segment.location == SegmentLocation::Remote {
+                without_log.push(segment.start_offset);
+                continue;
+            }
             if size == 0 {
                 continue;
             }
@@ -2817,6 +2920,9 @@ where
         Ok(TransferPlan {
             commit_op: self.consensus().commit_min(),
             segments,
+            // The same pass decides which segments send bytes and which the
+            // chain marks remote, so the two never name one segment twice.
+            chain: self.segment_chain_snapshot(&without_log),
             offsets: self.offsets_wire_snapshot()?,
         })
     }
@@ -3481,7 +3587,6 @@ where
     /// # Errors
     /// [`PartitionInstallError`]; check-phase variants mutate nothing. Shutdown
     /// refuses new installs without changing an install already in progress.
-    #[allow(clippy::too_many_lines)]
     pub fn queue_state_transfer_install(
         &mut self,
         commit_op: u64,
@@ -3489,11 +3594,33 @@ where
         offsets_bytes: &[u8],
         peer: u8,
     ) -> Result<(), PartitionInstallError> {
+        self.queue_state_transfer_install_with_chain(commit_op, staged, offsets_bytes, None, peer)
+    }
+
+    /// [`Self::queue_state_transfer_install`] of an offer that carries the
+    /// sender's segment chain.
+    ///
+    /// # Errors
+    /// As [`Self::queue_state_transfer_install`], plus the chain's own
+    /// refusals.
+    pub fn queue_state_transfer_install_with_chain(
+        &mut self,
+        commit_op: u64,
+        staged: Vec<StagedSegmentMeta>,
+        offsets_bytes: &[u8],
+        chain_bytes: Option<&[u8]>,
+        peer: u8,
+    ) -> Result<(), PartitionInstallError> {
         if self.is_shutting_down() {
             return Err(PartitionInstallError::ShuttingDown);
         }
-        let pending =
-            self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        let pending = self.prepare_state_transfer_install(
+            commit_op,
+            staged,
+            offsets_bytes,
+            chain_bytes,
+            peer,
+        )?;
         self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
@@ -3518,7 +3645,12 @@ where
             | InstallPhase::DiscardOffsets(_)
             | InstallPhase::CommitOffsets(_) => base.checked_mul(OFFSET_PERSIST_CONCURRENCY),
             InstallPhase::Sweep => pending.staged.iter().try_fold(
-                base.checked_add(SEGMENT_SWEEP_STACK_BYTES)?,
+                base.checked_add(SEGMENT_SWEEP_STACK_BYTES)?.checked_add(
+                    pending
+                        .chain
+                        .as_ref()
+                        .map_or(0, |transferred| transferred.chain.encoded_len()),
+                )?,
                 |charge, segment| {
                     charge
                         .checked_add(segment.log_staging.capacity())?
@@ -3535,6 +3667,7 @@ where
                 base.checked_add(self.offset_cleanup_charge(kind)?)?
                     .checked_add(retained.checked_mul(size_of::<u32>())?)
             }
+            InstallPhase::Backup => base.checked_add(crate::install_backup::COPY_BUFFER_BYTES),
             InstallPhase::RetryCheckpoint => base.checked_add(pending.retry_checkpoint.capacity()),
             InstallPhase::Converge => ConsumerKind::ALL.into_iter().try_fold(
                 base.checked_add(size_of::<[HashSet<u32>; ConsumerKind::COUNT]>())?,
@@ -3612,6 +3745,7 @@ where
                         self.invalidate_poll_history();
                         self.log.invalidate_sealed_read_state();
                         self.segment_checksum_cache.borrow_mut().clear();
+                        self.drop_segment_chain();
                         self.reuse_scan_memo.borrow_mut().take();
                         if let Some(persistence) = &self.persistence {
                             persistence.retire_offset_files();
@@ -3628,6 +3762,7 @@ where
             }
             InstallPhase::RenameLogs(cursor) if cursor == install.staged.len() => {
                 install.directory_handle = None;
+                self.plant_transferred_remote_segments(install.chain.as_ref());
                 install.phase = InstallPhase::OpenSegments(0);
             }
             InstallPhase::OpenSegments(cursor) if cursor > 0 && cursor >= install.staged.len() => {
@@ -3657,6 +3792,17 @@ where
             }
             InstallPhase::WalReset => {
                 if let Some(persistence) = &self.persistence {
+                    let wal_head = persistence.head();
+                    if wal_head > install.commit_op {
+                        tracing::warn!(
+                            namespace_raw = self.consensus().group(),
+                            commit_op = install.commit_op,
+                            wal_head,
+                            wal_commit = self.unreplayed_commit,
+                            "partition state transfer install resets a WAL that holds ops \
+                             above the offer"
+                        );
+                    }
                     let prepare =
                         (!install.offsets_wire.checkpoint_prepare.is_empty()).then(|| {
                             Owned::<4096>::copy_from_slice(&install.offsets_wire.checkpoint_prepare)
@@ -3667,12 +3813,17 @@ where
                         start_offset: segment.start_offset,
                         length: segment.size.as_bytes_u64(),
                         next_offset: install.next_offset,
+                        first_timestamp: segment.start_timestamp,
                     };
                     persistence.reset_with_segments(
                         install.commit_op,
                         install.offsets_wire.prepare_checksum,
                         prepare,
-                        Some((position, segment.max_size.as_bytes_u64())),
+                        Some((
+                            position,
+                            segment.max_size.as_bytes_u64(),
+                            self.effective_segment_max_age(),
+                        )),
                     );
                     self.start_persistence();
                     install.drain = Some(persistence.begin_drain());
@@ -3880,6 +4031,7 @@ where
                             self.anchor_cleanup_path(segment.start_offset),
                         ],
                         strict: true,
+                        trim: None,
                     },
                     InstallFilePhase::RemoveSegment,
                 )
@@ -3893,6 +4045,10 @@ where
                         .flat_map(|meta| [meta.log_staging.clone(), meta.index_staging.clone()])
                         .collect(),
                     bodies: self.persistence.is_some(),
+                    chain: install
+                        .chain
+                        .as_ref()
+                        .map(|transferred| transferred.chain.encode()),
                 }),
                 InstallFilePhase::Sweep,
             ),
@@ -4104,7 +4260,12 @@ where
                 }
                 InstallFilePhase::CommitOffsets { start, end } => {
                     for write in &install.planned_offsets[start..end] {
-                        self.publish_transferred_offset(write);
+                        self.publish_persisted_offset(
+                            write.kind,
+                            write.id,
+                            write.value,
+                            write.path.clone(),
+                        );
                         install.offset_dirs_changed[write.kind.index()] = true;
                     }
                     InstallPhase::CommitOffsets(end)
@@ -4309,28 +4470,31 @@ where
         }
     }
 
-    fn publish_transferred_offset(&self, write: &PlannedOffsetWrite) {
-        let entry = ConsumerOffset::new(write.kind, write.id, write.value, write.path.clone());
-        match write.kind {
+    /// Publish an offset whose file at `path` already holds `value`. An install
+    /// and the boot clamp both end a file write with it.
+    pub(crate) fn publish_persisted_offset(
+        &self,
+        kind: ConsumerKind,
+        id: u32,
+        value: u64,
+        path: String,
+    ) {
+        let entry = ConsumerOffset::new(kind, id, value, path);
+        match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().insert(write.id as usize, entry);
+                self.consumer_offsets.pin().insert(id as usize, entry);
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
                     .pin()
-                    .insert(ConsumerGroupId(write.id as usize), entry);
+                    .insert(ConsumerGroupId(id as usize), entry);
             }
             // Recorded below: the durable table is the only store of an external offset.
             ConsumerKind::ExternalGroup => {}
         }
-        self.durable_consumer_offsets.record_explicit(
-            write.kind,
-            write.id,
-            write.value,
-            write.value,
-        );
-        self.consumer_offset_capacity_for(write.kind)
-            .clear_stranded(write.id);
+        self.durable_consumer_offsets
+            .record_explicit(kind, id, value, value);
+        self.consumer_offset_capacity_for(kind).clear_stranded(id);
     }
 
     fn publish_installed_state(&mut self, install: &mut PendingInstall) {
@@ -4410,20 +4574,53 @@ where
             );
         }
         *self.segment_checksum_cache.borrow_mut() = memos;
+        self.publish_installed_segments(install);
+        self.stats.set_current_offset(end);
+    }
+
+    /// Keep the transferred chain, and count every installed segment, the
+    /// remote ones included.
+    fn publish_installed_segments(&mut self, install: &mut PendingInstall) {
+        self.drop_segment_chain();
+        let (remote_size, remote_messages) = install.chain.as_ref().map_or((0, 0), |chain| {
+            chain
+                .remote
+                .iter()
+                .fold((0, 0), |(size, messages), segment| {
+                    (
+                        size + segment.size,
+                        messages + (segment.end_offset - segment.start_offset + 1),
+                    )
+                })
+        });
+        // No later step reads the chain, so the partition takes the reduced
+        // form instead of walking the records again.
+        if let Some(chain) = install.chain.take()
+            && let Err(error) = self.adopt_live_chain(chain.live)
+        {
+            // The chain was checked against this partition before the install
+            // began, so only a programming error lands here.
+            tracing::error!(
+                namespace_raw = self.consensus().group(),
+                %error,
+                "cannot keep the transferred segment chain"
+            );
+        }
         self.stats.zero_out_all();
         self.stats.increment_segments_count(
             u32::try_from(self.log.segments().len()).expect("manifest segment count fits u32"),
         );
-        self.stats
-            .increment_size_bytes(install.staged.iter().map(|meta| meta.size).sum());
+        self.stats.increment_size_bytes(
+            install.staged.iter().map(|meta| meta.size).sum::<u64>() + remote_size,
+        );
         self.stats.increment_messages_count(
             install
                 .staged
                 .iter()
                 .map(|meta| meta.end_offset - meta.start_offset + 1)
-                .sum(),
+                .sum::<u64>()
+                + remote_messages,
         );
-        self.stats.set_current_offset(end);
     }
 
     fn publish_installed_consensus(&mut self, install: &PendingInstall) {
@@ -4456,6 +4653,7 @@ where
         self.consensus().clear_pipeline();
         self.clear_install_offsets(0);
         self.segment_checksum_cache.borrow_mut().clear();
+        self.drop_segment_chain();
         self.reuse_scan_memo.borrow_mut().take();
         let end = install.offsets_wire.next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
@@ -4478,6 +4676,7 @@ where
         commit_op: u64,
         mut staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
+        chain_bytes: Option<&[u8]>,
         peer: u8,
     ) -> Result<PendingInstall, PartitionInstallError> {
         // ---- check phase: nothing below may mutate live state. Staging
@@ -4514,6 +4713,20 @@ where
             return Err(PartitionInstallError::OfferErasesHeldOps {
                 commit_op,
                 held_max,
+            });
+        }
+        // A replica that booted awaiting a transfer skipped its WAL replay, so
+        // the journal read above is empty while its WAL still holds ops. An
+        // offer at op 0 comes from a primary that holds nothing applied, and a
+        // commit number in that WAL proves the group committed an op that the
+        // offer would erase. Offers above op 0 pass: a commit number is a lower
+        // bound, so a primary holding every op can offer less than this WAL
+        // names, and in a group of two the refusal would never end, because a
+        // waiting replica acknowledges nothing.
+        if commit_op == 0 && self.unreplayed_commit > 0 {
+            return Err(PartitionInstallError::OfferErasesHeldOps {
+                commit_op,
+                held_max: self.unreplayed_commit,
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;
@@ -4627,6 +4840,10 @@ where
         let next_offset = offsets_wire
             .next_offset
             .max(installed_end.map_or(0, |end| end + 1));
+        let first_local = staged.first().map_or(next_offset, |meta| meta.start_offset);
+        let chain = chain_bytes
+            .map(|bytes| self.check_transferred_chain(bytes, first_local))
+            .transpose()?;
         let planned_offsets = self.plan_transfer_offset_writes(&offsets_wire, next_offset)?;
         let retry_checkpoint = if self.persistence.is_some() {
             retry_checkpoint_bytes(
@@ -4643,6 +4860,7 @@ where
             peer,
             partition_dir,
             staged,
+            chain,
             offsets_wire,
             emptied_at: if planned_offsets.is_empty() {
                 emptied_at
@@ -4663,6 +4881,79 @@ where
         })
     }
 
+    /// Decode the chain an offer carries and check that it describes this
+    /// partition, with its remote segments running up to `first_local`, the
+    /// first offset the install holds locally.
+    fn check_transferred_chain(
+        &self,
+        bytes: &[u8],
+        first_local: u64,
+    ) -> Result<TransferredChain, PartitionInstallError> {
+        let chain = decode_chain(bytes)
+            .ok()
+            .filter(|chain| !chain.torn_tail)
+            .ok_or(PartitionInstallError::ChainUnreadable)?;
+        let created_revision = chain.prefix.created_revision;
+        if !self.owns_chain_prefix(&chain.prefix)
+            || chain
+                .records
+                .iter()
+                .filter_map(ChainRecord::segment)
+                .any(|segment| segment.incarnation != created_revision)
+        {
+            return Err(PartitionInstallError::ForeignChain {
+                recorded: chain.prefix,
+            });
+        }
+        let live = LiveChain::new(&chain);
+        let remote = live.remote_segments();
+        let mut next_start = remote
+            .first()
+            .map_or(first_local, |first| first.start_offset);
+        if let Some(trim_point) = live.trim_point()
+            && next_start > trim_point.saturating_add(1)
+        {
+            return Err(PartitionInstallError::ChainFrontAboveTrimPoint {
+                first_start: next_start,
+                trim_point,
+            });
+        }
+        for segment in &remote {
+            if segment.start_offset != next_start {
+                return Err(PartitionInstallError::SegmentSetHole {
+                    previous_end: next_start.saturating_sub(1),
+                    next_start: segment.start_offset,
+                });
+            }
+            next_start = segment.end_offset.saturating_add(1);
+        }
+        if remote.last().is_some() && next_start != first_local {
+            return Err(PartitionInstallError::SegmentSetHole {
+                previous_end: next_start.saturating_sub(1),
+                next_start: first_local,
+            });
+        }
+        Ok(TransferredChain {
+            chain,
+            live,
+            remote,
+        })
+    }
+
+    /// Put the chain's remote segments in front of the staged ones. No bytes
+    /// of theirs crossed, and their indexes are fetched when a read needs them.
+    fn plant_transferred_remote_segments(&mut self, chain: Option<&TransferredChain>) {
+        let max_size = self.effective_segment_size();
+        for record in chain.map_or(&[][..], |transferred| transferred.remote.as_slice()) {
+            self.log.add_persisted_segment(
+                record.remote_segment(max_size),
+                server_common::SegmentStorage::without_messages(None),
+                None,
+                None,
+            );
+        }
+    }
+
     /// Execute the install phases for an isolated, unmounted partition.
     ///
     /// # Errors
@@ -4674,9 +4965,31 @@ where
         staged: Vec<StagedSegmentMeta>,
         offsets_bytes: &[u8],
     ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
+        self.install_state_transfer_with_chain(config, commit_op, staged, offsets_bytes, None)
+            .await
+    }
+
+    /// [`Self::install_state_transfer`] of an offer that carries the sender's
+    /// segment chain.
+    ///
+    /// # Errors
+    /// As [`Self::install_state_transfer`], plus the chain's own refusals.
+    pub async fn install_state_transfer_with_chain(
+        &mut self,
+        config: &PartitionsConfig,
+        commit_op: u64,
+        staged: Vec<StagedSegmentMeta>,
+        offsets_bytes: &[u8],
+        chain_bytes: Option<&[u8]>,
+    ) -> Result<PartitionInstallOutcome, PartitionInstallError> {
         let peer = self.consensus().primary_index(self.consensus().view());
-        let pending =
-            self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        let pending = self.prepare_state_transfer_install(
+            commit_op,
+            staged,
+            offsets_bytes,
+            chain_bytes,
+            peer,
+        )?;
         self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
@@ -4777,7 +5090,7 @@ const INDEX_STRIDE_BYTES: usize = 64 * 1024;
 /// chunk) the yields would add over half the pass again; 4 MiB keeps the
 /// un-yielded stretch a bounded ~80 us CPU pass at ~15% overhead, and
 /// matches the recovery walk's `SCAN_WINDOW_CAPACITY`.
-const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
+pub(crate) const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 
 /// Bytes one offer-build round may read and hash before it refuses and resumes
 /// on the next request.
@@ -4809,11 +5122,11 @@ const PREFIX_READ_PIECE_LEN: u64 = 16 * OFFER_HASH_CHUNK_LEN as u64;
 /// build's checksum extension (no sink) and the serving side's load + re-verify
 /// (sink collects the artifact). Errors on a file shorter than `to`: the segment
 /// accounts bytes the disk does not hold.
-async fn hash_segment_range(
+pub(crate) async fn hash_segment_range<H: ChunkHasher + ?Sized>(
     path: &str,
     from: u64,
     to: u64,
-    hasher: &mut StateArtifactHasher,
+    hasher: &mut H,
     mut sink: Option<&mut Vec<u8>>,
 ) -> std::io::Result<()> {
     if from >= to {
@@ -5329,8 +5642,26 @@ async fn verify_state_artifact_yielding(entry: &consensus::StateArtifact, bytes:
     hasher.finish() == entry.checksum
 }
 
-pub(crate) async fn hash_yielding<'a>(
-    hasher: &mut StateArtifactHasher,
+/// A hash the chunked segment readers feed, so one reader serves the transfer
+/// checksum and the tiered segment hash alike.
+pub(crate) trait ChunkHasher {
+    fn update(&mut self, bytes: &[u8]);
+}
+
+impl ChunkHasher for StateArtifactHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        Self::update(self, bytes);
+    }
+}
+
+impl<H: ChunkHasher + ?Sized> ChunkHasher for Box<H> {
+    fn update(&mut self, bytes: &[u8]) {
+        H::update(self, bytes);
+    }
+}
+
+pub(crate) async fn hash_yielding<'a, H: ChunkHasher + ?Sized>(
+    hasher: &mut H,
     slices: impl IntoIterator<Item = &'a [u8]>,
 ) {
     let mut remaining = OFFER_HASH_CHUNK_LEN;

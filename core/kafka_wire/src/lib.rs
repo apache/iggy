@@ -22,6 +22,7 @@
 
 pub mod acl;
 pub mod api;
+pub mod api_versions;
 pub mod bounds_guard;
 pub mod codec;
 pub mod dedup;

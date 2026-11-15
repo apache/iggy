@@ -124,6 +124,27 @@ updates the branch before the merge.
 
 If GitHub reports a merge conflict, or if a maintainer asks you to, update your branch.
 
+### Stacked PRs
+
+These rules apply to a GitHub native stack, for example one made with `gh stack`. Each PR
+in a stack builds on the one below it. CI runs for every PR in a stack, and the position
+decides what a run does:
+
+- The lowest unmerged PR runs the full CI for its own changes.
+- The top PR runs the full CI for its own changes and for the changes of the PRs between.
+- Each PR between them runs only `Common checks` and the Rust `fmt`, `sort`, `machete`
+  and `clippy` tasks. Its run shows a notice that says so.
+
+Merge the lowest PR alone, or merge the whole stack from the top PR. Do not merge a group
+that ends at a PR between them. GitHub permits that merge, but only lint ran for those
+PRs. To land only the lower part of a stack, merge its PRs one at a time from the bottom.
+
+GitHub keeps a closed PR in the stack count, so the PR below a closed top PR does not
+become the top. In that case, merge the remaining PRs one at a time from the bottom.
+
+To merge the whole stack, use the merge box of the top PR, or run `gh stack merge` from
+the `github/gh-stack` extension.
+
 ### Quality Checks
 
 For Rust code:
