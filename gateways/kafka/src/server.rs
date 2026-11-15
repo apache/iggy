@@ -142,8 +142,7 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
-    /// Consumer-group timeouts and capacity caps. No environment variable maps onto these yet;
-    /// Kafka's own defaults apply.
+    /// Consumer-group timeouts and capacity caps.
     pub group: GroupCoordinatorConfig,
     /// This gateway's number among the gateways fronting one Iggy cluster
     /// (`IGGY_KAFKA_INSTANCE_ID`). It is the high half of every producer id handed out by

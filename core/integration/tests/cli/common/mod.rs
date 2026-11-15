@@ -17,6 +17,7 @@
 
 pub(crate) mod command;
 pub(crate) mod help;
+pub(crate) mod json_output;
 pub(crate) mod keyring;
 pub(crate) use crate::cli::common::command::IggyCmdCommand;
 pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX};
@@ -34,6 +35,22 @@ use std::fmt::{Display, Formatter, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+/// The ID that the command printed right after `prefix`, as in "... and ID: 3 created".
+pub(crate) fn printed_id(command_state: &Assert, prefix: &str) -> u32 {
+    let stdout = std::str::from_utf8(&command_state.get_output().stdout)
+        .expect("CLI output should be UTF-8");
+    stdout
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(prefix)?;
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        })
+        .expect("CLI should print the ID")
+}
 
 pub(crate) enum TestIdentifier {
     Numeric,
