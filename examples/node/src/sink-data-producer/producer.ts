@@ -170,7 +170,6 @@ async function produceData(client: Client, streamName: string, topicName: string
     await client.topic.delete({
       streamId: stream.id,
       topicId: topic.id,
-      partitionsCount: 1,
     });
     log('Topic deleted');
   } catch (error) {
