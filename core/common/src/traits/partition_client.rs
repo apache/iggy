@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the partition module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait PartitionClient {
     /// Create new N partitions for a topic by unique ID or name.
     ///

@@ -61,6 +61,7 @@ twox-hash = { workspace = true }
 ulid = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+whichever = { workspace = true }
 
 [dev-dependencies]
 bytemuck = { workspace = true }
