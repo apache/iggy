@@ -21,6 +21,7 @@ use async_trait::async_trait;
 /// This trait defines the methods to interact with the topic module.
 #[allow(clippy::too_many_arguments)]
 #[async_trait]
+#[whichever::dispatchable]
 pub trait TopicClient {
     /// Get the info about a specific topic by unique ID or name.
     ///

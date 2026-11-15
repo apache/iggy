@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the partition module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait SegmentClient {
     /// Delete the oldest N sealed segments of a partition by unique ID or name.
     ///

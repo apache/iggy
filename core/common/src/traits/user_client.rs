@@ -23,6 +23,7 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the user module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait UserClient {
     /// Get the info about a specific user by unique ID or username.
     ///
