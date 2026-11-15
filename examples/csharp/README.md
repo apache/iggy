@@ -82,7 +82,7 @@ Fills a topic with JSON records so a sink connector has something to read:
 dotnet run --project  examples/csharp/src/SinkDataProducer/Iggy_SDK.Examples.SinkDataProducer.Producer
 ```
 
-Creates the stream and topic if they are missing, then sends 100 batches of 100 to 499 records each. Every record has `user_id`, `user_type`, `email`, `source`, `state`, `message` and `created_at`, the same fields the other SDKs' sink data producers write. It writes to stream `qw` and topic `records`, both hardcoded in `Program.cs`.
+Creates the stream and topic if they are missing, then sends 100 batches of 100 to 499 records each. Every record has `user_id`, `user_type`, `email`, `source`, `state`, `message` and `created_at`, the same fields the other SDKs' sink data producers write. The default stream is `qw` and the default topic is `records`. Change them in `appsettings.json`.
 
 Example sink configs live in [`core/connectors/runtime/example_config/connectors/`](../../core/connectors/runtime/example_config/connectors/). [`quickwit_sink.toml`](../../core/connectors/runtime/example_config/connectors/quickwit_sink.toml) already reads `qw`/`records`. See the [connectors README](../../core/connectors/README.md) for how to run the connectors runtime with them.
 
