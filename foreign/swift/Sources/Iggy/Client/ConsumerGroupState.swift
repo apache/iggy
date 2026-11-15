@@ -81,7 +81,8 @@ final class ConsumerGroupState: Sendable {
     /// or nil for a client that is not a member. A new generation, a
     /// rebalance, restarts the round-robin. A reply of a session that ended
     /// since is dropped, so it cannot repopulate the session that replaced
-    /// it. Reports whether the reply was applied.
+    /// it. Reports whether the reply cached a new assignment: one where none
+    /// was cached, or with another generation or other partitions.
     @discardableResult
     func applySync(_ key: GroupKey, member: (generation: UInt64, partitions: [UInt32])?, scope: UInt64) -> Bool {
         storage.withLockedValue { storage in
@@ -91,17 +92,18 @@ final class ConsumerGroupState: Sendable {
             guard let member else {
                 storage.assignments.removeValue(forKey: key)
                 storage.joinedGroups.remove(key)
-                return true
+                return false
             }
             storage.joinedGroups.insert(key)
-            var assignment = storage.assignments[key] ?? Assignment()
+            let cached = storage.assignments[key]
+            var assignment = cached ?? Assignment()
             if assignment.generation != member.generation {
                 assignment.cursor = 0
             }
             assignment.generation = member.generation
             assignment.partitions = member.partitions
             storage.assignments[key] = assignment
-            return true
+            return cached.map { $0.generation != member.generation || $0.partitions != member.partitions } ?? true
         }
     }
 

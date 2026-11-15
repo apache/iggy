@@ -67,7 +67,8 @@ export const Operation = {
   RetireSession: 166,
   InstallConsumerGroupOwner: 167,
   TransitionPartitionHistory: 168,
-  RetireConsumerGroupOwners: 169
+  RetireConsumerGroupOwners: 169,
+  StateMachineCommand: 170
 } as const;
 
 const INTERNAL_START = 64;
@@ -119,7 +120,8 @@ export const isInternal = (operation: number): boolean =>
     operation === Operation.RetireSession ||
     operation === Operation.InstallConsumerGroupOwner ||
     operation === Operation.TransitionPartitionHistory ||
-    operation === Operation.RetireConsumerGroupOwners;
+    operation === Operation.RetireConsumerGroupOwners ||
+    operation === Operation.StateMachineCommand;
 
 /**
  * Metadata classification is an explicit allowlist, not a range:

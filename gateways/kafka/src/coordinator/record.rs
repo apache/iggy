@@ -91,7 +91,7 @@ pub enum Body {
     /// id.
     TopicOffsetsDeleted { topic: String, incarnation: u64 },
     /// The group had no members and no commit for the retention period, so the log drops its
-    /// offsets. Iggy still holds them.
+    /// offsets. The owner deletes them in Iggy before it appends this.
     GroupOffsetsExpired { group_id: String },
     /// A checkpoint's mark that the log holds every offset of the group, as after
     /// [`Body::GroupOffsetsDeleted`]. The group's offsets follow it. It removes none, so a load
@@ -105,6 +105,8 @@ pub struct CommittedOffset {
     pub offset: i64,
     pub leader_epoch: i32,
     pub metadata: Option<String>,
+    /// When the offset was committed, or when its group lost its last member after that
+    /// (`GroupOffsets::emptied_at`). Expiry counts the retention from the newest of a group.
     pub commit_timestamp_ms: i64,
     /// The op of Iggy's metadata log that created the topic the offset was committed to, as the
     /// change log names it. `None` when the gateway did not know it, and any deletion of the topic

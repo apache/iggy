@@ -32,13 +32,14 @@ use std::{
     cell::{Cell, RefCell, UnsafeCell},
     collections::{BTreeMap, VecDeque},
     fmt::Debug,
-    ops::RangeInclusive,
+    ops::{RangeBounds, RangeInclusive},
     rc::{Rc, Weak},
 };
 use tracing::warn;
 
 use crate::log::SegmentedLog;
 use crate::repair_memory::RepairMemoryReservation;
+use crate::state_machine::{COMMANDS_RETAINED_BYTES_MAX, COMMANDS_RETAINED_MAX, StateMachineLog};
 use crate::{Fragment, PollFragments, PollQueryResult};
 
 const ZERO_LEN: usize = 0;
@@ -665,6 +666,11 @@ where
     /// ticks resume the walk from here instead of rescanning the held prefix, and
     /// any removal resets it.
     held_run: Cell<(u64, u64)>,
+    /// The ops of the group's state-machine log. They share the op sequence
+    /// with the entries above but never become one: polls, flushes and the
+    /// repair ring see message batches and control ops only, while every
+    /// lookup by op answers from both.
+    commands: RefCell<StateMachineLog>,
 }
 
 /// How many evicted entries each partition retains for repair with their
@@ -787,6 +793,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         self.clear_resident_indexes();
         self.clear_evicted();
         self.evicted_through.set(0);
+        self.commands.borrow_mut().clear();
     }
 
     /// Disable repair retention (single-replica groups: nobody to repair).
@@ -889,6 +896,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
     /// Restore the materialized commit point for elections and body repair.
     pub fn restore_checkpoint_prepare(&self, op: u64, prepare: JournalBuffer) {
+        if is_command(&prepare) {
+            let mut commands = self.commands.borrow_mut();
+            commands.set_retained_from(op);
+            commands.insert(op, prepare);
+            return;
+        }
         let ring = unsafe { &mut *self.evicted_ring.get() };
         debug_assert!(ring.is_empty() && unsafe { &*self.evicted_headers.get() }.is_empty());
         self.evicted_ring_bytes.set(prepare.len() as u64);
@@ -916,6 +929,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         ring.get(&op)
             .map(|entry| entry.prepare.clone())
             .or_else(|| self.repair_tail.borrow().bodies.get(&op).cloned())
+            .or_else(|| self.commands.borrow().get(op))
     }
 
     /// The lowest resident `SendMessages` op in `ops` with its entry bytes, in
@@ -1011,7 +1025,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                 found.insert(*op, *header);
             }
         }
-        for (op, entry) in self.repair_tail.borrow().bodies.range(ops) {
+        for (op, entry) in self.repair_tail.borrow().bodies.range(ops.clone()) {
             if found.contains_key(op) {
                 continue;
             }
@@ -1022,6 +1036,9 @@ impl PartitionJournal<PartitionJournalMemStorage> {
                 found.insert(*op, *header);
             }
         }
+        for (op, header) in self.commands.borrow().headers(ops) {
+            found.entry(op).or_insert(header);
+        }
         found
     }
 
@@ -1029,6 +1046,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// backfills older than the retained repair range and bodies read back
     /// from segments.
     pub fn repair_retained_from(&self) -> Option<u64> {
+        self.with_command_floor(self.data_repair_retained_from())
+    }
+
+    fn data_repair_retained_from(&self) -> Option<u64> {
         let headers = unsafe { &*self.evicted_headers.get() };
         self.oldest_in_memory()
             .into_iter()
@@ -1046,6 +1067,22 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// Oldest op from which this journal holds every body up to its head in
     /// memory, so repair serves that tail without a disk read.
     pub fn memory_retained_from(&self) -> Option<u64> {
+        self.with_command_floor(self.data_memory_retained_from())
+    }
+
+    /// A floor the data entries set, raised to where the state-machine log
+    /// still holds every command, so a window from it has no released command
+    /// in it. Without data entries the oldest held command is the floor.
+    fn with_command_floor(&self, data_floor: Option<u64>) -> Option<u64> {
+        let commands = self.commands.borrow();
+        let retained_from = commands.retained_from();
+        data_floor.map_or_else(
+            || commands.ops(retained_from..).next(),
+            |floor| Some(floor.max(retained_from)),
+        )
+    }
+
+    fn data_memory_retained_from(&self) -> Option<u64> {
         let headers = unsafe { &*self.evicted_headers.get() };
         let oldest = self.oldest_in_memory()?;
         let newest_released = headers
@@ -1250,9 +1287,16 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         headers
             .iter()
             .take_while(|header| {
-                let connected = previous.map_or(header.op <= first_max, |op| {
-                    op.checked_add(1) == Some(header.op)
-                });
+                // Commands between two entries hold no segment bytes, so the
+                // prefix steps over them.
+                let connected = previous.map_or_else(
+                    || header.op <= first_max || self.commands_fill(first_max, header.op),
+                    |op| {
+                        op.checked_add(1).is_some_and(|next| {
+                            header.op >= next && self.commands_fill(next, header.op)
+                        })
+                    },
+                );
                 if header.op > through || !connected {
                     return false;
                 }
@@ -1470,6 +1514,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let header_bytes = &entry[..PREPARE_HEADER_SIZE];
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
+        if header.operation == Operation::StateMachineCommand {
+            self.commands.borrow_mut().insert(header.op, entry);
+            return;
+        }
         let op = header.op;
         let meta = RetainedBatchMeta::of(&header, &entry);
 
@@ -1525,6 +1573,11 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     pub fn is_empty(&self) -> bool {
         let inner = unsafe { &*self.inner.get() };
         inner.storage.is_empty()
+    }
+
+    /// No data entry and no command is held.
+    pub fn holds_no_ops(&self) -> bool {
+        self.is_empty() && self.commands.borrow().is_empty()
     }
 
     /// Owned, offset-ascending clones of the resident `SendMessages` entries a
@@ -1590,6 +1643,7 @@ where
             evicted_through: Cell::new(0),
             out_of_order: Cell::new(false),
             held_run: Cell::new((0, 0)),
+            commands: RefCell::new(StateMachineLog::default()),
         }
     }
 
@@ -1609,6 +1663,11 @@ where
     }
 
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
+        self.data_header_by_op(op)
+            .or_else(|| self.commands.borrow().header(op))
+    }
+
+    fn data_header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
         if headers.front().is_some_and(|header| header.op == op) {
             return headers.front().copied();
@@ -1619,6 +1678,59 @@ where
             .and_then(|index| headers.get(index));
         debug_assert!(header.is_some_and(|header| header.op == op));
         header.copied()
+    }
+
+    /// Whether the state-machine log holds every op in `from..to`, so the data
+    /// entries on either side of that span are adjacent in the sequence.
+    fn commands_fill(&self, from: u64, to: u64) -> bool {
+        from >= to || {
+            let commands = self.commands.borrow();
+            commands.ops(from..to).count() as u64 == to - from
+        }
+    }
+
+    /// How many commands of the group's state-machine log this journal holds
+    /// in `ops`.
+    pub fn commands_in(&self, ops: impl RangeBounds<u64>) -> usize {
+        self.commands.borrow().ops(ops).count()
+    }
+
+    /// The ops of the commands this journal holds, ascending.
+    #[cfg(test)]
+    pub fn command_ops(&self) -> Vec<u64> {
+        self.commands.borrow().ops(..).collect()
+    }
+
+    /// Mark the commands below `op` as gone, as a replica restored from a
+    /// checkpoint at `op` holds none of them.
+    pub fn retain_commands_from(&self, op: u64) {
+        self.commands.borrow_mut().set_retained_from(op);
+        self.held_run.set((0, 0));
+    }
+
+    /// Release the oldest commands at or below `checkpoint_op` past the
+    /// retention caps. Released only once checkpointed, they lift the repair
+    /// floor no higher than ops both WALs already dropped.
+    ///
+    /// Returns whether the held commands are still past a cap, so the caller
+    /// asks for the checkpoint that lets more go.
+    pub fn release_checkpointed_commands(&self, checkpoint_op: u64) -> bool {
+        let mut commands = self.commands.borrow_mut();
+        let before = commands.len();
+        // Without repair retention nothing serves a released command, so every
+        // checkpointed one goes, as the evicted data entries do.
+        if !self.repair_retention.get() {
+            commands.release_checkpointed(checkpoint_op, 0, 0);
+        }
+        let over = commands.release_checkpointed(
+            checkpoint_op,
+            COMMANDS_RETAINED_MAX,
+            COMMANDS_RETAINED_BYTES_MAX,
+        );
+        if commands.len() != before {
+            self.held_run.set((0, 0));
+        }
+        over
     }
 
     pub(crate) fn headers_for_commit(
@@ -1656,16 +1768,18 @@ where
     /// consistent throughout every externally observable owner state.
     pub fn holds_op(&self, op: u64) -> bool {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-        op_to_storage_offset.contains_key(&op)
+        op_to_storage_offset.contains_key(&op) || self.commands.borrow().contains(op)
     }
 
     /// Highest resident op below `op`.
     pub fn held_below(&self, op: u64) -> Option<u64> {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-        op_to_storage_offset
+        let data = op_to_storage_offset
             .range(..op)
             .next_back()
-            .map(|(held, _)| *held)
+            .map(|(held, _)| *held);
+        let command = self.commands.borrow().ops(..op).next_back();
+        data.max(command)
     }
 
     /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
@@ -1687,14 +1801,22 @@ where
             floor
         };
         if through < top {
-            for op in op_to_storage_offset
+            let commands = self.commands.borrow();
+            let mut data = op_to_storage_offset
                 .range(through + 1..=top)
                 .map(|(op, _)| *op)
-            {
-                if op != through + 1 {
+                .peekable();
+            let mut command = commands.ops(through + 1..=top).peekable();
+            while through < top {
+                let next = through + 1;
+                // Both walks only move forward, so a copy of an op in both logs
+                // is stepped over in either.
+                let held_in_data = data.next_if_eq(&next).is_some();
+                let held_in_commands = command.next_if_eq(&next).is_some();
+                if !held_in_data && !held_in_commands {
                     break;
                 }
-                through = op;
+                through = next;
             }
         }
         if through > floor && (run_floor > floor || run_through < through) {
@@ -1708,6 +1830,7 @@ where
     pub fn holds_op_in(&self, ops: RangeInclusive<u64>) -> bool {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().any(|header| ops.contains(&header.op))
+            || self.commands.borrow().ops(ops).next().is_some()
     }
 
     /// Presence shape of the repair window `(floor, to_op]` in ONE pass over
@@ -1719,13 +1842,18 @@ where
     /// The evicted ring is deliberately NOT consulted, matching the op-by-op
     /// form: consulting it would change the floor-refusal verdict.
     pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
+        // A repair that reached its target asks about an empty window.
+        if floor >= to_op {
+            return RepairedWindowShape { complete: true };
+        }
         let headers = unsafe { &*self.headers.get() };
+        let commands = self.commands.borrow();
         let expected = to_op.saturating_sub(floor);
         // More in-window ops than resident headers can never be covered, and
         // `expected` is unbounded here (`to_op` rides the local `commit_max`),
         // so this is both the early answer and what keeps the bitset below from
         // being sized off an arbitrary number.
-        if expected > headers.len() as u64 {
+        if expected > (headers.len() + commands.len()) as u64 {
             return RepairedWindowShape { complete: false };
         }
         // Dense window, so a flat presence vector beats a `HashSet`: no hashing
@@ -1737,12 +1865,14 @@ where
         let expected_len = expected as usize;
         let mut present = vec![false; expected_len];
         let mut covered = 0usize;
-        for header in headers
+        let in_window = headers
             .iter()
-            .filter(|header| header.op > floor && header.op <= to_op)
-        {
+            .map(|header| header.op)
+            .filter(|op| *op > floor && *op <= to_op)
+            .chain(commands.ops(floor.saturating_add(1)..=to_op));
+        for op in in_window {
             #[allow(clippy::cast_possible_truncation)]
-            let slot = (header.op - floor - 1) as usize;
+            let slot = (op - floor - 1) as usize;
             if !present[slot] {
                 present[slot] = true;
                 covered += 1;
@@ -1752,22 +1882,6 @@ where
             // In-window ops only, deduplicated, so a count match IS coverage.
             complete: covered == expected_len,
         }
-    }
-
-    /// Highest `commit` any resident header stamped, in ONE pass.
-    ///
-    /// A lower bound on the group's commit point, which is what a rebuilt replica
-    /// can recover from a log alone: a prepare records the primary's commit point
-    /// at send time, so the true point may be one higher.
-    ///
-    /// Scans resident headers without probing every op up to the log head.
-    pub fn max_commit_watermark(&self) -> u64 {
-        let headers = unsafe { &*self.headers.get() };
-        headers
-            .iter()
-            .map(|header| header.commit)
-            .max()
-            .unwrap_or(0)
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
@@ -1854,7 +1968,10 @@ where
     async fn bytes_by_op(&self, op: u64) -> Option<JournalBuffer> {
         let storage_offset = {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-            *op_to_storage_offset.get(&op)?
+            let Some(storage_offset) = op_to_storage_offset.get(&op) else {
+                return self.commands.borrow().get(op);
+            };
+            *storage_offset
         };
 
         let bytes = {
@@ -1918,7 +2035,10 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     /// higher ops and stay there until `sort_by_op` runs.
     fn last_op(&self) -> Option<u64> {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-        op_to_storage_offset.last_key_value().map(|(op, _)| *op)
+        op_to_storage_offset
+            .last_key_value()
+            .map(|(op, _)| *op)
+            .max(self.commands.borrow().last_op())
     }
 
     /// Removed entries must stay refillable and cannot enter the committed repair ring.
@@ -1941,7 +2061,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         };
         self.clear_resident_indexes();
 
-        let mut removed = 0usize;
+        let mut removed = self.commands.borrow_mut().remove(ops.clone());
         for (op, entry) in entry_ops.into_iter().zip(all_entries) {
             if ops.contains(&op) {
                 removed += 1;
@@ -1952,6 +2072,14 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         }
         Ok(removed)
     }
+}
+
+fn is_command(prepare: &JournalBuffer) -> bool {
+    prepare
+        .as_slice()
+        .get(..PREPARE_HEADER_SIZE)
+        .and_then(|bytes| bytemuck::checked::try_from_bytes::<PrepareHeader>(bytes).ok())
+        .is_some_and(|header| header.operation == Operation::StateMachineCommand)
 }
 
 pub fn select_batch_slice(
@@ -3103,6 +3231,145 @@ mod tests {
                 control.operation = Operation::StoreConsumerOffset;
             })
             .into_frozen()
+    }
+
+    fn build_command_prepare(op: u64) -> Frozen<4096> {
+        build_prepare(op, HEADER_SIZE + 16)
+            .transmute_header(|header: PrepareHeader, command: &mut PrepareHeader| {
+                *command = header;
+                command.operation = Operation::StateMachineCommand;
+                command.commit = op - 1;
+            })
+            .into_frozen()
+    }
+
+    /// Ops 1 and 4 carry messages, 2 and 5 are commands, 3 is a consumer
+    /// offset op.
+    async fn interleaved_journal() -> PartitionJournal<PartitionJournalMemStorage> {
+        journal_with(&[
+            build_message_prepare(1, 0, 1, 8),
+            build_command_prepare(2),
+            build_control_prepare(3),
+            build_message_prepare(4, 1, 1, 8),
+            build_command_prepare(5),
+        ])
+        .await
+    }
+
+    #[compio::test]
+    async fn given_commands_between_entries_when_looking_up_by_op_should_answer_from_both_logs() {
+        let journal = interleaved_journal().await;
+
+        assert_eq!(journal.held_through(0), 5);
+        assert_eq!(journal.last_op(), Some(5));
+        assert_eq!(journal.held_below(5), Some(4));
+        assert_eq!(journal.held_below(4), Some(3));
+        for op in 1..=5 {
+            assert!(journal.holds_op(op), "op {op}");
+            assert_eq!(journal.header_by_op(op).map(|header| header.op), Some(op));
+            assert!(journal.repair_entry(op).is_some(), "op {op}");
+        }
+        assert_eq!(
+            journal
+                .repair_headers_in(1..=5)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert!(journal.repaired_window_shape(0, 5).complete);
+        assert_eq!(
+            journal
+                .committed_headers_from(1, 5, usize::MAX)
+                .iter()
+                .map(|header| header.op)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // Polls, flushes and the control-op bound see the data log only.
+        assert_eq!(entry_ops(&journal.resident_entries()), vec![1, 3, 4]);
+        assert_eq!(journal.resident_control_ops(), 1);
+        assert_eq!(journal.resident_messages(), 2);
+        assert_eq!(journal.command_ops(), vec![2, 5]);
+    }
+
+    #[compio::test]
+    async fn given_commands_between_entries_when_flushing_should_step_over_them() {
+        let journal = interleaved_journal().await;
+        // Ops 1 to 4 are contiguous once the command at 2 fills its gap.
+        assert_eq!(journal.committed_prefix_len(0, 4), 3);
+        assert_eq!(journal.committed_prefix_len(0, 1), 1);
+        // A command at the front starts the prefix right above the flushed ops.
+        let leading =
+            journal_with(&[build_command_prepare(1), build_message_prepare(2, 0, 1, 8)]).await;
+        assert_eq!(leading.committed_prefix_len(0, 2), 1);
+        // A missing op is a hole either way.
+        let holed = journal_with(&[
+            build_message_prepare(1, 0, 1, 8),
+            build_message_prepare(4, 1, 1, 8),
+            build_command_prepare(2),
+        ])
+        .await;
+        assert_eq!(holed.held_through(0), 2);
+    }
+
+    #[compio::test]
+    async fn given_commands_when_removing_a_suffix_should_drop_both_logs_and_refill() {
+        let journal = interleaved_journal().await;
+        assert_eq!(journal.remove_range(4..=u64::MAX).await.unwrap(), 2);
+        assert_eq!(journal.last_op(), Some(3));
+        assert_eq!(journal.held_through(0), 3);
+        journal.append(build_command_prepare(4)).await.unwrap();
+        assert_eq!(journal.held_through(0), 4);
+        assert_eq!(journal.commands_in(4..=4), 1);
+        journal.clear_all();
+        assert!(journal.holds_no_ops());
+    }
+
+    #[compio::test]
+    async fn given_committed_commands_when_releasing_should_raise_the_repair_floor() {
+        let journal = journal_with(&[build_command_prepare(1), build_command_prepare(2)]).await;
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        journal.retain_commands_from(2);
+        assert_eq!(journal.repair_retained_from(), Some(2));
+        journal.restore_checkpoint_prepare(3, build_command_prepare(3));
+        assert_eq!(journal.commands_in(3..=3), 1);
+        assert_eq!(journal.repair_retained_from(), Some(3));
+    }
+
+    /// Nothing serves a released command without repair retention, so every
+    /// checkpointed command goes and only the ones above the checkpoint stay.
+    #[compio::test]
+    async fn given_no_repair_retention_when_releasing_should_drop_every_checkpointed_command() {
+        let commands: Vec<_> = (1..=4).map(build_command_prepare).collect();
+        let retained = journal_with(&commands).await;
+        assert!(!retained.release_checkpointed_commands(3));
+        assert_eq!(
+            retained.commands_in(..),
+            4,
+            "within the caps, repair keeps them"
+        );
+
+        let unretained = journal_with(&commands).await;
+        unretained.set_repair_retention(false);
+        assert!(!unretained.release_checkpointed_commands(3));
+        assert_eq!(unretained.commands_in(..), 1);
+        assert_eq!(unretained.commands_in(4..=4), 1);
+        assert_eq!(unretained.repair_retained_from(), Some(4));
+    }
+
+    /// A completed suffix repair asks about the window above its target,
+    /// which is empty, while commands are still held.
+    #[compio::test]
+    #[allow(clippy::reversed_empty_ranges)]
+    async fn given_held_commands_when_the_repair_window_is_empty_should_report_it_complete() {
+        let journal =
+            journal_with(&[build_message_prepare(1, 0, 1, 8), build_command_prepare(2)]).await;
+        assert!(journal.repaired_window_shape(2, 2).complete);
+        assert!(journal.repaired_window_shape(5, 2).complete);
+        assert!(journal.repaired_window_shape(0, 2).complete);
+        assert!(!journal.repaired_window_shape(0, 3).complete);
+        assert!(!journal.holds_op_in(3..=2));
     }
 
     fn entry_ops(entries: &[Frozen<4096>]) -> Vec<u64> {

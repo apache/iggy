@@ -468,6 +468,7 @@ mod tests {
                 manage_topics,
                 ..PrincipalPermissions::default()
             },
+            topic_reads: Arc::default(),
             permissions_known,
         }
     }

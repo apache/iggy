@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::analytics::report_builder::{BenchmarkReportBuilder, cluster_suffix};
+use crate::analytics::report_builder::BenchmarkReportBuilder;
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::plot::{ChartType, plot_chart};
-use crate::utils::cpu_name::append_cpu_name_lowercase;
 use crate::utils::{collect_server_logs_and_save_to_file, params_from_args_and_metrics};
 use bench_report::hardware::BenchmarkHardware;
 use iggy::prelude::IggyError;
@@ -37,8 +36,9 @@ impl BenchmarkRunner {
         Self { args: Some(args) }
     }
 
+    /// Writes the report, charts and server logs into `run_dir`, the directory of `bench.log`.
     #[allow(clippy::cognitive_complexity)]
-    pub async fn run(mut self) -> Result<(), IggyError> {
+    pub async fn run(mut self, run_dir: Option<&Path>) -> Result<(), IggyError> {
         let args = self.args.take().unwrap();
         let pretty = args.pretty;
         let should_open_charts = args.open_charts();
@@ -84,25 +84,13 @@ impl BenchmarkRunner {
 
         report.print_summary(pretty);
 
-        if let Some(output_dir) = benchmark.args().output_dir() {
-            // Generate the full output path using the directory name generator
-            let mut dir_name = benchmark.args().generate_dir_name();
-            append_cpu_name_lowercase(&mut dir_name);
-            // Cluster runs share params (and thus the dir name) with single-node
-            // runs; suffix keeps them from overwriting each other's results.
-            dir_name.push_str(&cluster_suffix(report.cluster.as_ref()));
-            let full_output_path = Path::new(&output_dir)
-                .join(dir_name.clone())
-                .to_string_lossy()
-                .to_string();
+        if let Some(run_dir) = run_dir {
+            let full_output_path = run_dir.to_string_lossy();
 
             // Dump the report to JSON
             report.dump_to_json(&full_output_path);
 
-            if let Err(e) =
-                collect_server_logs_and_save_to_file(&admin_client, Path::new(&full_output_path))
-                    .await
-            {
+            if let Err(e) = collect_server_logs_and_save_to_file(&admin_client, run_dir).await {
                 error!("Failed to collect server logs: {e}");
             }
 

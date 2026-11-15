@@ -21,13 +21,19 @@ use crate::http::http_transport::HttpTransport;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
+use iggy_binary_protocol::WireDecode;
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
 use iggy_common::locking::IggyRwLockFn;
+use iggy_common::wire_conversions::{
+    consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
+};
 use iggy_common::{
     AssignmentVersion, BinaryClient, BinaryOperationLineage, BinarySendPartitioning,
     BinaryTransport, ClientState, Consumer, DeferredPollOptions, FetchedSection, Identifier,
-    IggyError, IggyMessage, MessageClient, Partitioning, PollingStrategy, SendMessagesResponse,
-    SystemClient, fetch_binary_messages, group_cache_key, select_send_partition,
-    send_binary_messages, sync_group_assignment,
+    IggyError, IggyMessage, MessageClient, PartitionContext, Partitioning, PollOptions,
+    PollingStrategy, SendMessagesResponse, SystemClient, fetch_binary_messages, group_cache_key,
+    select_send_partition, send_binary_messages, sync_group_assignment,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -48,6 +54,17 @@ impl ClientWrapper {
             Self::Tcp(client) => client.operation_lineage(),
             Self::Quic(client) => client.operation_lineage(),
             Self::WebSocket(client) => client.operation_lineage(),
+        }
+    }
+
+    /// The highest metadata op that a reply of the session showed. HTTP keeps no session.
+    pub(crate) async fn metadata_watermark(&self) -> u64 {
+        match self {
+            Self::Iggy(client) => Box::pin(client.client.read().await.metadata_watermark()).await,
+            Self::Http(_) => 0,
+            Self::Tcp(client) => client.driver.session().metadata_watermark(),
+            Self::Quic(client) => client.driver.session().metadata_watermark(),
+            Self::WebSocket(client) => client.driver.session().metadata_watermark(),
         }
     }
 
@@ -225,6 +242,60 @@ impl ClientWrapper {
                     .collect())
             }
         }
+    }
+
+    /// The context of the reply to a poll that commits nothing. The records of the reply stay
+    /// undecoded, so a message that does not decode cannot fail it. HTTP returns
+    /// `FeatureUnavailable`.
+    pub(crate) async fn poll_context(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PartitionContext, IggyError> {
+        let request = PollMessagesRequest {
+            consumer: consumer_to_wire(consumer)?,
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            partition_id: Some(partition_id),
+            strategy: polling_strategy_to_wire(strategy),
+            count: options.count,
+            auto_commit: false,
+        };
+        macro_rules! poll {
+            ($client:expr) => {
+                $client
+                    .send_poll_with_response_and_options(
+                        &request,
+                        strategy.context(),
+                        Some(options.into()),
+                    )
+                    .await
+            };
+        }
+        let reply = match self {
+            Self::Tcp(client) => poll!(client),
+            Self::Quic(client) => poll!(client),
+            Self::WebSocket(client) => poll!(client),
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                return Box::pin(client.client.read().await.poll_context(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy,
+                    options,
+                ))
+                .await;
+            }
+        }?;
+        let (header, _) = PollMessagesResponseHeader::decode(&reply)
+            .map_err(|_| IggyError::InvalidNumberEncoding)?;
+        Ok(header.context)
     }
 
     /// The partitions grouped by primary endpoint and split to fit one request

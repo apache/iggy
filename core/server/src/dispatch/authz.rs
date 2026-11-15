@@ -125,6 +125,7 @@ where
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
+                | Operation::StateMachineCommand
                 | Operation::CreateStream
                 | Operation::UpdateStreamResolved
                 | Operation::DeleteStream

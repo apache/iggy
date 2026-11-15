@@ -86,6 +86,7 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
                 username: credentials.username.clone(),
                 user: None,
                 permissions: self.permissions,
+                topic_reads: Arc::default(),
                 permissions_known: true,
             })
         } else {
@@ -1123,6 +1124,7 @@ impl SaslAuthenticator for StallingAuthenticator {
             username: credentials.username.clone(),
             user: None,
             permissions: PrincipalPermissions::default(),
+            topic_reads: Arc::default(),
             permissions_known: true,
         })
     }
@@ -1190,6 +1192,7 @@ impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
             username: credentials.username.clone(),
             user: None,
             permissions: PrincipalPermissions::default(),
+            topic_reads: Arc::default(),
             permissions_known: true,
         })
     }
@@ -1589,6 +1592,7 @@ impl SaslAuthenticator for UnreadPermissionsAuthenticator {
             username: credentials.username.clone(),
             user: None,
             permissions: PrincipalPermissions::default(),
+            topic_reads: Arc::default(),
             permissions_known: false,
         })
     }

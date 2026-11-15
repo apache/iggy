@@ -93,6 +93,7 @@ var goOperations = map[string]Operation{
 	"InstallConsumerGroupOwner":       OperationInstallConsumerGroupOwner,
 	"RetireConsumerGroupOwners":       OperationRetireConsumerGroupOwners,
 	"TransitionPartitionHistory":      OperationTransitionPartitionHistory,
+	"StateMachineCommand":             OperationStateMachineCommand,
 }
 
 // goEvictionReasons names every eviction discriminant the codec declares.

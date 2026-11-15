@@ -100,7 +100,9 @@ export type FetchTarget = {
    * Context of the section that the offset came from
    * (`FetchMessagesSection.context`), so a fetch does not read that offset
    * in a partition deleted and recreated since. Without one the client takes
-   * the incarnation of its cached route.
+   * the incarnation of its cached route. A context of incarnation 0 takes the
+   * incarnation of the route once and keeps its owner generation. A target
+   * carries no metadata op.
    */
   context?: PartitionContext
 };

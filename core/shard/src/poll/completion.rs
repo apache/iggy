@@ -24,6 +24,11 @@
 //! timeout does not cancel detached I/O, so its reservation remains occupied.
 //! Dropping the read, dequeuing its result, or discarding it releases the slot.
 //!
+//! A poll that can wait on the object store is cold. Cold polls are admitted
+//! against their own cap, a share of the lane, before they reserve a slot.
+//! A store that stops answering then holds that share at most, and the rest
+//! of the lane stays free for polls of local data.
+//!
 //! Reservation, delivery, and closure run on the owner's shard. Delivery never
 //! yields between checking closure and enqueueing, so the pump cannot close and
 //! drain the lane between those steps. The atomic flag alone would not provide
@@ -41,6 +46,10 @@ use super::{PollAttachment, PollCompleted, PollTarget};
 use crate::coordinator::classify_try_send_err;
 use crate::metrics::{FrameDropMetrics, ShardMetrics, frame_drop_reason, frame_drop_variant};
 use crate::{PartitionReadReply, Receiver, Sender, channel};
+
+/// The part of the lane that cold polls may hold: one slot in this many, and
+/// never less than one slot.
+const COLD_POLL_SHARE: usize = 2;
 
 /// A private bounded lane, with capacity shared by pending reads and results.
 /// It lives on the owner; its raw sender cannot bypass reservation accounting.
@@ -65,6 +74,8 @@ impl PollCompletionLane {
             state: Arc::new(LaneState {
                 capacity,
                 reserved: AtomicUsize::new(0),
+                cold_capacity: (capacity / COLD_POLL_SHARE).max(1),
+                cold: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
                 metrics: metrics.frame_drop_metrics().clone(),
             }),
@@ -119,6 +130,24 @@ impl PollCompletionLane {
                 _reservation: reservation,
             },
         })
+    }
+
+    /// Admit a poll before it reserves a slot. A poll of local data needs no
+    /// permit. A cold one gets `Err` when cold polls already hold their share
+    /// of the lane: the caller refuses the poll, which its client retries.
+    pub(crate) fn admit(&self, cold: bool) -> Result<Option<ColdPollPermit>, ColdPollsFull> {
+        if !cold {
+            return Ok(None);
+        }
+        self.state
+            .cold
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cold| {
+                (cold < self.state.cold_capacity).then_some(cold + 1)
+            })
+            .map_err(|_| ColdPollsFull)?;
+        Ok(Some(ColdPollPermit {
+            state: self.state.clone(),
+        }))
     }
 
     fn reserve_slot(&self) -> Result<CompletionSlot, &'static str> {
@@ -268,6 +297,10 @@ struct LaneState {
     capacity: usize,
     /// Includes slots held by running reads and by results awaiting dequeue.
     reserved: AtomicUsize,
+    /// The most cold polls that may read at once.
+    cold_capacity: usize,
+    /// Cold polls whose read has not returned yet.
+    cold: AtomicUsize,
     /// Closing stops both new reservations and delivery by existing reads.
     closed: AtomicBool,
     /// Share the registered family and cache through the existing slot handle.
@@ -284,6 +317,23 @@ impl Drop for CompletionSlot {
     fn drop(&mut self) {
         let previous = self.state.reserved.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "poll completion reservation underflow");
+    }
+}
+
+/// Cold polls hold their whole share of the lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdPollsFull;
+
+/// One cold poll's place under the cap, held while its read can still wait
+/// on the object store and released when the read returns.
+pub struct ColdPollPermit {
+    state: Arc<LaneState>,
+}
+
+impl Drop for ColdPollPermit {
+    fn drop(&mut self) {
+        let previous = self.state.cold.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "cold poll admission underflow");
     }
 }
 
@@ -315,7 +365,7 @@ mod tests {
     use prometheus_client::registry::Registry;
     use server_common::sharding::{IggyNamespace, ShardId};
 
-    use super::{PollCompletionLane, PollCompletionSender};
+    use super::{COLD_POLL_SHARE, ColdPollsFull, PollCompletionLane, PollCompletionSender};
     use crate::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
     use crate::{PartitionReadReply, Receiver, channel};
 
@@ -488,6 +538,49 @@ mod tests {
             ))
         ));
         assert_eq!(lane.state.reserved.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn given_stalled_cold_polls_when_they_hold_their_share_should_still_admit_warm_polls() {
+        const CAPACITY: usize = 8;
+        let metrics = ShardMetrics::for_shard();
+        let lane = PollCompletionLane::new(CAPACITY, &metrics);
+
+        // An outage: every cold poll that is admitted reserves a slot and
+        // never returns.
+        let mut stalled = Vec::new();
+        while let Ok(permit) = lane.admit(true) {
+            stalled.push((permit.unwrap(), reserve_read(&lane)));
+        }
+        assert_eq!(stalled.len(), CAPACITY / COLD_POLL_SHARE);
+        assert_eq!(lane.admit(true).err(), Some(ColdPollsFull));
+
+        // The rest of the lane takes polls of local data, which need no permit.
+        let mut warm = Vec::new();
+        for _ in stalled.len()..CAPACITY {
+            assert!(matches!(lane.admit(false), Ok(None)));
+            warm.push(reserve_read(&lane));
+        }
+        let (reply, _replies) = channel(1);
+        assert!(
+            lane.try_reserve(namespace(), reply, None).is_none(),
+            "the warm polls hold every slot the cold ones left"
+        );
+
+        // A cold read that returns frees its place for the next cold poll.
+        stalled.pop();
+        assert!(matches!(lane.admit(true), Ok(Some(_))));
+        assert_eq!(warm.len() + stalled.len(), CAPACITY - 1);
+    }
+
+    #[test]
+    fn given_a_lane_of_one_slot_when_a_cold_poll_arrives_should_admit_one() {
+        let metrics = ShardMetrics::for_shard();
+        let lane = PollCompletionLane::new(1, &metrics);
+
+        let permit = lane.admit(true).unwrap();
+        assert!(permit.is_some());
+        assert_eq!(lane.admit(true).err(), Some(ColdPollsFull));
     }
 
     fn reserve_read(

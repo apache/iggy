@@ -164,8 +164,8 @@ impl BenchmarkInit for LowLevelConsumerClient {
                 commit,
                 ..self.config.poll_options
             };
-            // Each timed `next()` measures one fetch round trip, so the reader holds one request
-            // and no prefetch queue.
+            // Request the reader's minimum prefetch budget. Its 32-batch floor lets primary
+            // groups wait independently; timed `next()` calls can consume queued replies.
             self.reader = Some(
                 client
                     .reader(&stream_id, &topic_id, &consumer)

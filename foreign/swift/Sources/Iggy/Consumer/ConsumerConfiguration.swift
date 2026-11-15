@@ -17,7 +17,9 @@
 
 /// Options of an ``IggyConsumer``, with the Rust SDK's defaults.
 public struct ConsumerConfiguration: Sendable {
-    /// Where reading a partition without a position starts.
+    /// Where reading a partition without a position starts. With
+    /// ``CommitPolicy/onRead``, it applies only to a partition without a
+    /// stored offset. A partition with one resumes after it.
     public var pollingStrategy: PollingStrategy
     /// The limits of each read and the commit policy: a five-second wait,
     /// 1000 messages, 1 MiB and ``CommitPolicy/manual`` by default. With
@@ -42,7 +44,15 @@ public struct ConsumerConfiguration: Sendable {
     /// the same partition history is skipped, unless a seek moved back.
     public var allowReplay: Bool
     /// How long ``IggyConsumer/shutdown()`` waits for the reader to store
-    /// its offsets and leave the group before it returns.
+    /// its offsets and leave the group before it cancels the close. The
+    /// close then still sends once each offset write and lookup that it did
+    /// not send yet, and the leave. So after this timeout, the shutdown can
+    /// wait up to 30 seconds for each offset write and lookup in flight or
+    /// not sent yet. This fixed limit includes each resend after a transient
+    /// refusal. The shutdown can also wait up to the request timeout of
+    /// ``pollOptions`` for each read in flight. The leave first waits for a
+    /// join in flight, which sends up to three requests. So the leave can
+    /// take up to four times ``ClientConfiguration/requestTimeout``.
     public var offsetDrainTimeout: Duration
 
     public init(

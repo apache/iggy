@@ -81,6 +81,11 @@ public enum IggyErrorCode {
     LIFECYCLE_BUSY(88),
     NOT_PRIMARY(89),
     DEFERRED_POLL_CAPACITY_EXCEEDED(90),
+    /**
+     * The object store refused a read of tiered data for a reason that a retry does not change. Do not send the
+     * request again.
+     */
+    TIERED_READ_FAILED(96),
 
     // Client errors
     CLIENT_NOT_FOUND(100),

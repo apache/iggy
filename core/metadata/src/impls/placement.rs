@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::impls::metadata::{PartitionPlacementView, PartitionPrimaryTransfer};
-use crate::stm::stream::{Partition, Streams, StreamsInner, find_partition, primary_of};
+use crate::stm::stream::{
+    Partition, PartitionChangeKind, Streams, StreamsInner, find_partition, primary_of,
+};
 use ahash::AHashMap;
 use consensus::{ReplicaSet, quorum_view_change};
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -35,7 +37,7 @@ pub(super) struct PlacementState {
     observations: AHashMap<IggyNamespace, ObservedView>,
     /// Per replica, observed primaries minus created ones, for one replica count.
     moved: Option<(u8, Vec<i64>)>,
-    /// The `namespace_revision` whose removals `observations` reflects.
+    /// The `revision` whose removals `observations` reflects.
     synced_revision: Option<u64>,
     /// Changes with every observation, so a scan can tell its input moved.
     observed_generation: u64,
@@ -507,13 +509,14 @@ impl PlacementState {
     /// last call. When the tree no longer records all of those removals, every
     /// observation is checked against the tree instead.
     fn retire_removed(&mut self, inner: &StreamsInner) {
-        if self.synced_revision == Some(inner.namespace_revision) {
+        if self.synced_revision == Some(inner.revision) {
             return;
         }
-        let removals = self
+        let changes = self
             .synced_revision
-            .and_then(|synced| inner.removed_partitions.since(synced));
-        if let Some(removals) = removals {
+            .and_then(|synced| inner.partition_changes_since(synced));
+        if let Some(changes) = changes {
+            let removals = changes.filter(|change| change.kind == PartitionChangeKind::Removed);
             for removed in removals {
                 if self
                     .observations
@@ -536,7 +539,7 @@ impl PlacementState {
             self.moved = None;
             self.observed_generation += 1;
         }
-        self.synced_revision = Some(inner.namespace_revision);
+        self.synced_revision = Some(inner.revision);
     }
 
     fn moved(&mut self, replicas: u8) -> &[i64] {
@@ -593,7 +596,7 @@ mod tests {
     use crate::stm::StateHandler;
     use crate::stm::lifecycle::apply_with_lifecycle_completion;
     use crate::stm::snapshot::Snapshotable;
-    use crate::stm::stream::{REMOVED_PARTITIONS_RETAINED, StreamsInner};
+    use crate::stm::stream::{RECENT_PARTITION_CHANGES_RETAINED, StreamsInner};
     use iggy_binary_protocol::WireIdentifier;
     use iggy_binary_protocol::requests::partitions::DeletePartitionsRequest;
     use iggy_binary_protocol::requests::streams::DeleteStreamRequest;
@@ -700,9 +703,9 @@ mod tests {
     fn given_more_removals_than_the_tree_keeps_when_counting_should_equal_the_full_walk() {
         const REPLICAS: u8 = 3;
         let (streams, mut placement) = observed_topics(&[0, 1]);
-        let wide = IggyNamespace::new(0, 2, REMOVED_PARTITIONS_RETAINED);
+        let wide = IggyNamespace::new(0, 2, RECENT_PARTITION_CHANGES_RETAINED);
         streams.seed_namespace(wide, 100, 1);
-        let moves: Vec<_> = (0..=REMOVED_PARTITIONS_RETAINED)
+        let moves: Vec<_> = (0..=RECENT_PARTITION_CHANGES_RETAINED)
             .map(|partition| ((2, partition), 2))
             .chain([((0, 0), 4)])
             .collect();
@@ -717,7 +720,7 @@ mod tests {
             },
         );
         assert!(
-            streams.read(|inner| inner.removed_partitions.since(0).is_none()),
+            streams.read(|inner| inner.partition_changes_since(0).is_none()),
             "the delete must outgrow what the tree keeps"
         );
         assert_counts_match_walk(&mut placement, &streams, REPLICAS);

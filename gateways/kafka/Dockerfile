@@ -18,7 +18,7 @@
 # Build context is the repository root (a Cargo workspace member cannot build standalone) -
 # `docker-compose.yml` in this directory sets `context: ../..` accordingly.
 
-ARG RUST_VERSION=1.99.1
+ARG RUST_VERSION=1.100
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
 WORKDIR /build
@@ -61,13 +61,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       --output /build/LICENSE-binary
 
 FROM debian:trixie-slim
-# netcat-openbsd: nothing in the gateway's own dependency graph needs it - it's here only so
-# docker-compose.yml's healthcheck has a TCP-probe primitive to call.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /iggy-gateway-kafka .
+# A fixed numeric user: Kubernetes checks `runAsNonRoot` against the image's user only when it is
+# a number. The gateway writes no file, so the user needs no home directory.
+RUN groupadd --system --gid 10001 iggy \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin iggy
+COPY --from=builder /iggy-gateway-kafka /iggy-gateway-kafka
 COPY --from=builder /build/LICENSE-binary /usr/share/doc/iggy-kafka-gateway/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy-kafka-gateway/
 
@@ -77,5 +79,20 @@ ENV IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
 # without one), and that refusal is deliberate - it forces whoever runs this image to say what
 # host a client can actually reach it on, rather than silently advertising "localhost" to a
 # client on a different machine. docker-compose.yml sets it explicitly for this quick start.
+
+# Metrics, readiness and liveness. Unauthenticated, so publish the port only where a scraper or an
+# orchestrator needs it.
+ENV IGGY_KAFKA_HTTP_ADDR=0.0.0.0:9096
+
+# 9093: Kafka clients. 9096: /metrics, /ready and /live.
+EXPOSE 9093 9096
+
+USER 10001:10001
+
+# /live, not /ready: an orchestrator that restarts unhealthy containers would restart every
+# gateway during an Iggy outage, and a restart does not bring Iggy back. docker-compose.yml asks
+# /ready for depends_on. The binary asks itself, so the image needs no HTTP client.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/iggy-gateway-kafka", "--check-live"]
 
 CMD ["/iggy-gateway-kafka"]

@@ -18,7 +18,7 @@
 use super::key::OptionKey;
 use super::{
     Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_REPLICATION_FACTOR,
-    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, PartitionResizePolicy,
+    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MIN_SEGMENT_MAX_AGE, PartitionResizePolicy,
 };
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKind, HeaderValue};
@@ -77,7 +77,15 @@ impl OptionValueCodec for IggyExpiry {
     const KIND: HeaderKind = HeaderKind::Uint64;
 
     fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
-        decode_u64_or(key, entry, |text| Self::from_str(text).ok().map(u64::from)).map(Self::from)
+        let expiry = decode_u64_or(key, entry, |text| Self::from_str(text).ok().map(u64::from))
+            .map(Self::from)?;
+        if key == OptionKey::SegmentMaxAge
+            && let Self::ExpireDuration(age) = expiry
+            && age.as_micros() < MIN_SEGMENT_MAX_AGE
+        {
+            return Err(invalid(key));
+        }
+        Ok(expiry)
     }
 
     fn encode(&self) -> Result<HeaderValue, IggyError> {

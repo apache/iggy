@@ -25,6 +25,7 @@ pub mod env;
 pub mod error;
 pub mod group;
 pub mod listener;
+pub mod observability;
 pub mod protocol;
 pub mod server;
 pub mod tls;

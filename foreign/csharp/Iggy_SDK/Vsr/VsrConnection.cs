@@ -442,7 +442,7 @@ internal sealed class VsrConnection : IDisposable
                         }
                         var payload = VsrReplyDecoder.Decode(header, buffer.AsMemory(0, bodySize));
                         if (committed && (operation.IsMetadata() || operation == VsrOperation.DeleteSegments)
-                            || request.Code is CommandCodes.GET_CONSUMER_GROUP_CODE or CommandCodes.SYNC_CONSUMER_GROUP_CODE)
+                            || request.Code == CommandCodes.GET_CONSUMER_GROUP_CODE)
                         {
                             _observeMetadataCommit?.Invoke(BinaryPrimitives.ReadUInt64LittleEndian(
                                 header.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
@@ -452,6 +452,11 @@ internal sealed class VsrConnection : IDisposable
                         if (!payload.IsEmpty)
                         {
                             buffer = null;
+                        }
+                        if (request.Code == CommandCodes.SYNC_CONSUMER_GROUP_CODE)
+                        {
+                            var commit = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET));
+                            response = new SyncConsumerGroupReply(response, () => _observeMetadataCommit?.Invoke(commit));
                         }
                         result = VsrAttempt.Ok(response, committed);
                     }
