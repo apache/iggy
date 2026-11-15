@@ -85,9 +85,8 @@ pub async fn handle(
         match decode_requested_topics(api_version, body, state.max_frame_size) {
             Ok(requested) => requested,
             Err(error) => {
-                tracing::warn!(
+                tracing::debug!(
                     %error,
-                    api_key = API_KEY_METADATA,
                     api_version,
                     "Failed to decode Metadata request; closing connection"
                 );
@@ -235,9 +234,9 @@ fn stub_response(
         Err(error) => {
             // Metadata has no top-level error field; a malformed body cannot carry
             // INVALID_REQUEST in a version-correct way for every client. Close.
-            tracing::warn!(
+            // debug!, not warn!: attacker-controlled, not operator-actionable.
+            tracing::debug!(
                 %error,
-                api_key = API_KEY_METADATA,
                 api_version,
                 "Failed to decode Metadata request; closing connection"
             );
