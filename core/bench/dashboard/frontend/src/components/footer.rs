@@ -36,9 +36,15 @@ pub fn footer() -> Html {
                     <a href="https://iggy.apache.org/docs/" target="_blank" rel="noopener noreferrer">
                         {"Docs"}
                     </a>
+                    <a href="https://www.apache.org/licenses/LICENSE-2.0" target="_blank" rel="noopener noreferrer">
+                        {"License"}
+                    </a>
+                    <a href="https://privacy.apache.org/policies/privacy-policy-public.html" target="_blank" rel="noopener noreferrer">
+                        {"Privacy Policy"}
+                    </a>
                 </nav>
                 <div class="footer-meta">
-                    <span class="footer-version">{"v"}{env!("CARGO_PKG_VERSION")}</span>
+                    <span class="footer-version">{"Dashboard v"}{env!("CARGO_PKG_VERSION")}</span>
                     <span class="footer-sep">{"•"}</span>
                     <a href="https://www.apache.org/" target="_blank" rel="noopener noreferrer">
                         {"Apache Software Foundation"}
@@ -50,12 +56,17 @@ pub fn footer() -> Html {
                         {" for the message streaming community"}
                     </span>
                 </div>
+                <p class="footer-trademark">
+                    {"Apache, Apache Iggy, Iggy, and the Apache feather logo are either registered \
+                      trademarks or trademarks of The Apache Software Foundation in the United \
+                      States and other countries."}
+                </p>
             </div>
         </footer>
     }
 }
 
-fn render_github_icon() -> Html {
+pub fn render_github_icon() -> Html {
     html! {
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
              fill="currentColor">

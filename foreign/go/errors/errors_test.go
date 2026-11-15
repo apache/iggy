@@ -132,6 +132,22 @@ func TestIggyError_TooManyConsumerOffsets(t *testing.T) {
 	}
 }
 
+func TestIggyError_TieredReadFailed(t *testing.T) {
+	err := TieredReadFailed{}
+	if err.Code() != Code(96) || TieredReadFailedCode != Code(96) {
+		t.Errorf("Code() = %v, TieredReadFailedCode = %v, want 96", err.Code(), TieredReadFailedCode)
+	}
+	if err.Error() != "tiered data cannot be read from the object store; a retry does not help" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if TieredReadFailedCode.String() != "TieredReadFailed" {
+		t.Errorf("String() = %q", TieredReadFailedCode.String())
+	}
+	if resolved := FromCode(Code(96)); !errors.Is(resolved, ErrTieredReadFailed) {
+		t.Errorf("FromCode(96) = %v, want ErrTieredReadFailed", resolved)
+	}
+}
+
 func TestFromCode_FallsBackToTheGenericError(t *testing.T) {
 	if resolved := FromCode(Code(0xFFFFFF)); !errors.Is(resolved, ErrError) {
 		t.Errorf("FromCode(unknown) = %v, want ErrError", resolved)

@@ -22,9 +22,12 @@ import "encoding/binary"
 // TopicOptionKey names a topic option of the server catalog.
 type TopicOptionKey string
 
-// Topic option keys. Only TopicOptionName, TopicOptionMessageExpiry and
-// TopicOptionMaxTopicSize are updatable, and only the last two resettable.
-// Every other key is create-only, so an update refuses it by name.
+// Topic option keys. TopicOptionName, TopicOptionMessageExpiry,
+// TopicOptionMaxTopicSize, TopicOptionLocalRetentionAge and
+// TopicOptionLocalRetentionSize are updatable, and all but the name
+// resettable. TopicOptionTieredStorage is enable-only: an update may turn it
+// on, never off, and may not reset it. Every other key is create-only, so an
+// update refuses it by name.
 // DescribeOptions enumerates the catalog one server serves, with the bounds
 // each value is checked against.
 const (
@@ -40,6 +43,10 @@ const (
 	TopicOptionSizeOfMessagesRequiredToSave TopicOptionKey = "size_of_messages_required_to_save"
 	TopicOptionPreallocateSegments          TopicOptionKey = "preallocate_segments"
 	TopicOptionReplicationFactor            TopicOptionKey = "replication_factor"
+	TopicOptionSegmentMaxAge                TopicOptionKey = "segment_max_age"
+	TopicOptionTieredStorage                TopicOptionKey = "tiered_storage"
+	TopicOptionLocalRetentionAge            TopicOptionKey = "local_retention_age"
+	TopicOptionLocalRetentionSize           TopicOptionKey = "local_retention_size"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -75,6 +82,23 @@ type TopicOptions struct {
 	PreallocateSegments *bool
 	// ReplicationFactor, see ReplicationFactorOption.
 	ReplicationFactor *uint32
+	// SegmentMaxAge in microseconds rolls the active segment once a batch is
+	// stamped this long after the segment's first batch, IggyExpiryNeverExpire
+	// for never. IggyExpiryServerDefault leaves it derived. The server refuses
+	// values under 10 minutes, and the key alongside PreallocateSegments true.
+	SegmentMaxAge *Duration
+	// TieredStorage, see TieredStorageOption.
+	TieredStorage *bool
+	// LocalRetentionAge in microseconds is how long a tiered topic keeps an
+	// uploaded segment on local disk, IggyExpiryNeverExpire for never.
+	// IggyExpiryServerDefault leaves it derived. The server refuses a value
+	// above a finite MessageExpiry.
+	LocalRetentionAge *Duration
+	// LocalRetentionSize in bytes caps the uploaded segments a tiered topic
+	// keeps on local disk, split across all partitions, math.MaxUint64 for
+	// unlimited. Zero leaves it derived. The server refuses a value above a
+	// finite MaxTopicSize.
+	LocalRetentionSize *uint64
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -90,8 +114,20 @@ type TopicUpdate struct {
 	// MaxTopicSize sets the size cap in bytes. Zero changes nothing, Reset
 	// returns the key to its default.
 	MaxTopicSize *uint64
-	// Reset names keys to return to their defaults: TopicOptionMessageExpiry
-	// or TopicOptionMaxTopicSize.
+	// TieredStorage turns tiering on when true. False is refused with
+	// OptionNotUpdatable before sending, as is a Reset of the key: the local
+	// segments tiering removed cannot come back.
+	TieredStorage *bool
+	// LocalRetentionAge sets the local retention in microseconds.
+	// IggyExpiryServerDefault changes nothing, Reset returns the key to its
+	// default.
+	LocalRetentionAge *Duration
+	// LocalRetentionSize sets the local size cap in bytes. Zero changes
+	// nothing, Reset returns the key to its default.
+	LocalRetentionSize *uint64
+	// Reset names keys to return to their defaults: TopicOptionMessageExpiry,
+	// TopicOptionMaxTopicSize, TopicOptionLocalRetentionAge or
+	// TopicOptionLocalRetentionSize.
 	Reset []TopicOptionKey
 	// RawReset names keys to reset that this build may not know. The server
 	// decides whether each one may be reset, and a patch that carries any raw
@@ -168,6 +204,13 @@ func PreallocateSegmentsOption(enabled bool) HeaderEntry {
 // InvalidReplicationFactor.
 func ReplicationFactorOption(nodes uint32) HeaderEntry {
 	return uint32Option(TopicOptionReplicationFactor, nodes)
+}
+
+// TieredStorageOption moves sealed segments to the object store and keeps only
+// the local retention on disk. The server does not offer tiering yet and
+// refuses true with FeatureUnavailable, on create and on update.
+func TieredStorageOption(enabled bool) HeaderEntry {
+	return boolOption(TopicOptionTieredStorage, enabled)
 }
 
 func stringOption(key TopicOptionKey, value string) HeaderEntry {

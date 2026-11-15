@@ -63,8 +63,10 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// * Any error with a [`ReadError::skip`]: A message of the partition does not decode, and
     ///   the reader reads it again until the caller seeks to the skip.
     /// * `IggyError::FetchProgressUncertain` with a [`ReadError::lost`] range: the reader cannot
-    ///   read again the messages that a read with a lost reply stored. A new call reads on after
-    ///   the range, unless the error also stopped the partition or the partition left.
+    ///   read again the messages that a read with a lost reply stored. The error stops nothing,
+    ///   and a seek after it drops the batch that follows the range. A new call goes on with
+    ///   that batch. If the reader also stopped the partition, that call then ends with the
+    ///   error that stopped it.
     /// * `IggyError::InvalidNumberEncoding`, `IggyError::InvalidMessagePayloadLength` or
     ///   `IggyError::InvalidMessagesCount` without a skip: A reply of the partition does not
     ///   decode, and the reader cannot name the message to skip. With

@@ -410,12 +410,11 @@ fn deleted_group_ids(sim: &Simulator, leader: u8, namespace: IggyNamespace) -> V
                 .items
                 .get(namespace.stream_id())
                 .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                .map(|topic| {
+                .map_or_default(|topic| {
                     (0..topic.next_consumer_group_id)
                         .filter(|group_id| !topic.consumer_groups.contains_key(group_id))
                         .collect()
                 })
-                .unwrap_or_default()
         })
 }
 

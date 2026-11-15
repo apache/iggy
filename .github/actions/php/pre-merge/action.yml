@@ -64,6 +64,7 @@ runs:
       with:
         shared-key: dev
         save-cache: "false"
+        free-disk-space: "false"
 
     - name: Use shared Cargo target directory
       shell: bash

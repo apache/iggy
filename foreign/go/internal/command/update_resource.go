@@ -50,6 +50,9 @@ type optionRule struct {
 	scopes     []iggcon.OptionsScope
 	updatable  bool
 	resettable bool
+	// enableOnly marks a bool an update may set to true, never to false, and
+	// may not reset.
+	enableOnly bool
 	// readOnly covers the internal keys too: a client may send neither.
 	readOnly bool
 }
@@ -75,6 +78,10 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.StreamOptionEncryptionKeySource), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: string(iggcon.StreamOptionEncryptionKeyFingerprint), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: string(iggcon.StreamOptionEncryptionKekFingerprint), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
+	{key: string(iggcon.TopicOptionSegmentMaxAge), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
+	{key: string(iggcon.TopicOptionTieredStorage), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, enableOnly: true},
+	{key: string(iggcon.TopicOptionLocalRetentionAge), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, resettable: true},
+	{key: string(iggcon.TopicOptionLocalRetentionSize), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, resettable: true},
 	{key: "critical_keys", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream, iggcon.OptionsScopeTopic, iggcon.OptionsScopeUser}, readOnly: true},
 }
 
@@ -156,7 +163,7 @@ func validatePatch(scope iggcon.OptionsScope, set []iggcon.HeaderEntry, reset []
 }
 
 // admitUpdate mirrors server admission for a patch of typed fields: reset key
-// categories first, then the column values.
+// categories first, then the values.
 func admitUpdate(scope iggcon.OptionsScope, set []iggcon.HeaderEntry, names []string) error {
 	rules := make([]optionRule, 0, len(names))
 	for _, name := range names {
@@ -172,7 +179,7 @@ func admitUpdate(scope iggcon.OptionsScope, set []iggcon.HeaderEntry, names []st
 		}
 	}
 	for _, rule := range rules {
-		if !rule.updatable {
+		if !rule.updatable || rule.enableOnly {
 			return ierror.OptionNotUpdatable{Key: rule.key}
 		}
 	}
@@ -184,17 +191,22 @@ func admitUpdate(scope iggcon.OptionsScope, set []iggcon.HeaderEntry, names []st
 	for _, entry := range slices.SortedFunc(slices.Values(set), func(left, right iggcon.HeaderEntry) int {
 		return bytes.Compare(left.Key.Value, right.Key.Value)
 	}) {
-		if err := admitColumn(scope, entry); err != nil {
+		if err := admitValue(scope, entry); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// admitColumn applies the server's bounds to a name or username value.
-func admitColumn(scope iggcon.OptionsScope, entry iggcon.HeaderEntry) error {
+// admitValue applies the server's bounds to a name or username value, and
+// refuses turning an enable-only key off.
+func admitValue(scope iggcon.OptionsScope, entry iggcon.HeaderEntry) error {
 	text := entry.Value.Value
 	isText := entry.Value.Kind == iggcon.String
+	if rule, known := catalogRule(scope, string(entry.Key.Value)); known && rule.enableOnly &&
+		entry.Value.Kind == iggcon.Bool && bytes.Equal(entry.Value.Value, []byte{0}) {
+		return ierror.OptionNotUpdatable{Key: rule.key}
+	}
 	switch string(entry.Key.Value) {
 	case string(iggcon.TopicOptionName):
 		if !isText || len(text) == 0 || len(text) > maxOptionField {

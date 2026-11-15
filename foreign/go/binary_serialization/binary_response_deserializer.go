@@ -580,6 +580,12 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 
 	topic.MessageExpiry = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionMessageExpiry, uint64(iggcon.IggyExpiryNeverExpire)))
 	topic.MaxTopicSize = topicUint64Option(topic, iggcon.TopicOptionMaxTopicSize, math.MaxUint64)
+	topic.SegmentMaxAge = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionSegmentMaxAge, uint64(iggcon.IggyExpiryNeverExpire)))
+	topic.LocalRetentionAge = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionLocalRetentionAge, defaultLocalRetentionAge))
+	topic.LocalRetentionSize = topicUint64Option(topic, iggcon.TopicOptionLocalRetentionSize, math.MaxUint64)
+	if value, ok := topicOption(topic, iggcon.TopicOptionTieredStorage); ok && value.Kind == iggcon.Bool && len(value.Value) == 1 {
+		topic.TieredStorage = value.Value[0] != 0
+	}
 	topic.CompressionAlgorithm = uint8(iggcon.CompressionAlgorithmNone)
 	if value, ok := topicOption(topic, iggcon.TopicOptionCompressionAlgorithm); ok && value.Kind == iggcon.String {
 		if algorithm, known := compressionAlgorithms[string(value.Value)]; known {
@@ -589,6 +595,10 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 
 	return topic, readBytes, nil
 }
+
+// defaultLocalRetentionAge is the catalog default of local_retention_age, one
+// day in microseconds.
+const defaultLocalRetentionAge uint64 = 86_400_000_000
 
 // compressionAlgorithms maps the catalog spelling of compression_algorithm to
 // its code.

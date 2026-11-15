@@ -41,7 +41,7 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use membership::Membership;
 use progress::{Progress, in_close};
 use worker::Worker;
-use worker::{lasting_refusal, probe_options};
+use worker::{lasting_refusal, permanent_refusal, probe_options};
 
 #[cfg(test)]
 mod cluster_tests;
@@ -98,8 +98,10 @@ const CLOSE_BUDGET: Duration = Duration::from_secs(10);
 ///   lost read, such a read goes on from where it starts, because the application or another
 ///   session stored that offset. Messages that a lost read committed are lost when the reader
 ///   cannot read them again: a rebalance moved their partition to another member before that,
-///   the partition no longer holds them, or lasting refusals stopped the partition. The reader
-///   then returns one error with their range in [`ReadError::lost`].
+///   the partition no longer holds them, or lasting refusals or a lost history stopped the
+///   partition. The reader then returns one error with their range in [`ReadError::lost`],
+///   then a batch that it holds after the range, and then, for a stopped partition, the error
+///   that stopped it.
 /// - Dropping the reader stops its tasks without waiting, and it moves no offset back.
 pub struct PartitionReader {
     config: Arc<Config>,
@@ -134,9 +136,7 @@ pub struct ReadError {
     pub error: IggyError,
     /// For a message that does not decode: the continuation after it. The reader reads the
     /// message again until a [`seek`](PartitionReader::seek) to this continuation skips it. The
-    /// messages before it arrive in a batch before this error. For a lost range (`lost`): the
-    /// continuation after the range. The reader already reads on from there, unless the error
-    /// stopped the partition or the partition left.
+    /// messages before it arrive in a batch before this error. `None` for every other error.
     pub skip: Option<PollingStrategy>,
     /// For a message that does not decode: its offset, when its frame decoded and a later step
     /// failed. `None` when the framing is malformed, so no record can be isolated.
@@ -148,7 +148,10 @@ pub struct ReadError {
     /// records.
     pub record: Option<Bytes>,
     /// For messages that a lost read committed and that the reader could not read again: their
-    /// first and last offset. `None` for every other error.
+    /// first and last offset. `None` for every other error. This report stops nothing and needs
+    /// no [`seek`](PartitionReader::seek). A batch that the reader holds after the range
+    /// follows the report, and a seek before the application takes it drops it. If the reader
+    /// stopped the partition, the error that stopped it comes after that batch.
     pub lost: Option<RangeInclusive<u64>>,
 }
 
@@ -779,9 +782,12 @@ impl ReadError {
     }
 
     /// Whether the reader stopped the partition of this error after refusals in a row that a
-    /// quick retry does not change. Only a [`seek`](PartitionReader::seek) reads it again.
+    /// quick retry does not change, or after one refusal that no retry changes. Only a
+    /// [`seek`](PartitionReader::seek) reads it again.
     pub fn is_lasting_refusal(&self) -> bool {
-        self.partition_id.is_some() && self.skip.is_none() && lasting_refusal(&self.error)
+        self.partition_id.is_some()
+            && self.skip.is_none()
+            && (lasting_refusal(&self.error) || permanent_refusal(&self.error))
     }
 }
 

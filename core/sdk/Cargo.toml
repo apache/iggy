@@ -60,6 +60,7 @@ tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 trait-variant = { workspace = true }
 webpki-roots = { workspace = true }
+whichever = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }

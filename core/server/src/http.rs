@@ -70,13 +70,14 @@ use tracing::{error, info, warn};
 use crate::cluster_meta::ClusterRoster;
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
-    create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
-    delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
-    get_clients, get_cluster_metadata, get_consumer_offset, get_metadata_changes, get_pats,
-    get_snapshot, get_stats, get_stream, get_streams, get_topic, get_topics, get_user, get_users,
-    login_user, login_with_personal_access_token, logout_user, ping, poll_messages,
-    poll_messages_committing, poll_messages_deferred, refresh_token, send_messages,
-    store_consumer_offset, update_permissions, update_stream, update_topic, update_user,
+    create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat,
+    delete_pat_named_login, delete_segments, delete_stream, delete_topic, delete_user,
+    describe_options, get_cg, get_cgs, get_client, get_clients, get_cluster_metadata,
+    get_consumer_offset, get_metadata_changes, get_pats, get_snapshot, get_stats, get_stream,
+    get_streams, get_topic, get_topics, get_user, get_users, login_user,
+    login_with_personal_access_token, logout_user, ping, poll_messages, poll_messages_committing,
+    poll_messages_deferred, refresh_token, send_messages, store_consumer_offset,
+    update_permissions, update_stream, update_topic, update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
@@ -545,6 +546,12 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         )
         .route("/personal-access-tokens", get(get_pats).post(create_pat))
         .route("/personal-access-tokens/{name}", delete(delete_pat))
+        // Static routes outrank `{name}`, so DELETE on a token named `login` would hit the POST-only
+        // login route (405). Registered here rather than in `local` to keep forwarding to the primary.
+        .route(
+            "/personal-access-tokens/login",
+            delete(delete_pat_named_login),
+        )
         .route_layer(from_fn_with_state(state, forward::forward_to_primary))
 }
 

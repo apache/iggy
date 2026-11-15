@@ -497,6 +497,11 @@
         "status": 11001,
         "error": "shard_communication_error",
         "certain": false
+      },
+      {
+        "status": 96,
+        "error": "tiered_read_failed",
+        "certain": true
       }
     ],
     "section": [
@@ -604,6 +609,11 @@
         "status": 11001,
         "error": "shard_communication_error",
         "certain": false
+      },
+      {
+        "status": 96,
+        "error": "tiered_read_failed",
+        "certain": true
       }
     ]
   }

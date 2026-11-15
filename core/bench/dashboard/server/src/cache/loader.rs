@@ -15,46 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{BenchmarkCache, Result};
+use super::{BenchmarkCache, Result, Runs};
 use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
+use bench_dashboard_shared::summary::BenchmarkSummary;
+use std::collections::HashMap;
 use std::path::Path;
-use tokio::io::AsyncReadExt;
+use std::sync::Arc;
 use tracing::{error, info};
 
 impl BenchmarkCache {
-    pub async fn load(&self) -> Result<()> {
+    pub fn load(&self) -> Result<()> {
         info!(
             "Building benchmark cache from directory {}",
             self.results_dir.display()
         );
 
-        self.load_gh_workflows().await;
-
         let entries: Vec<_> = std::fs::read_dir(&self.results_dir)
             .map_err(IggyBenchDashboardServerError::Io)?
             .filter_map(|r: std::result::Result<std::fs::DirEntry, std::io::Error>| r.ok())
             .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            // Servers from before --cache-dir wrote their PNG cache here. It isn't a benchmark run.
             .filter(|entry| entry.file_name() != "embed_cache")
             .collect();
 
-        let mut total_removed_size = 0;
-
+        let mut reports = HashMap::with_capacity(entries.len());
         entries.iter().for_each(|entry| {
-            // Remove HTML files from the directory
-            match self.remove_html_files(&entry.path()) {
-                Ok(size) => {
-                    total_removed_size += size;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to remove HTML files from {}: {}",
-                        entry.path().display(),
-                        e
-                    );
-                }
-            }
-
             // Relative path to report.json, for example `./performance_results/poll_8_1000_100_10000_tcp_no_cache_e1393367_atlas/report.json`
             let path = entry.path().join("report.json");
 
@@ -72,44 +58,25 @@ impl BenchmarkCache {
 
             info!("Loaded light benchmark report for {:?}", &entry.path());
 
-            let identifier = if let Some(identifier) = &light_report.hardware.identifier {
-                identifier
-            } else {
-                error!(
-                    "No identifier found in benchmark report: {:#?}",
-                    &entry.path()
-                );
-                return;
-            };
-
-            let gitref = if let Some(gitref) = &light_report.params.gitref {
-                gitref
-            } else {
-                error!("No gitref found in benchmark report: {:#?}", &entry.path());
-                return;
-            };
-
-            // Update hardware to gitref mapping
-            self.hardware_to_gitref
-                .entry(identifier.clone())
-                .or_default()
-                .insert(gitref.clone());
-
-            // Update gitref to benchmarks mapping
-            self.gitref_to_benchmarks
-                .entry(gitref.clone())
-                .or_default()
-                .insert(light_report.uuid);
-
             // Store the benchmark report
-            self.benchmarks
-                .insert(light_report.uuid, (light_report, path));
+            reports.insert(light_report.uuid, (light_report, path));
         });
 
-        info!(
-            "Remove HTML files of size: {:.2} MB",
-            total_removed_size as f64 / 1_048_576.0
-        );
+        let mut summaries: Vec<_> = reports
+            .values()
+            .map(|(report, _)| BenchmarkSummary::new(report, &self.thresholds))
+            .collect();
+        summaries.sort_by(|a, b| {
+            b.version_order
+                .timestamp_us
+                .cmp(&a.version_order.timestamp_us)
+                .then_with(|| a.uuid.cmp(&b.uuid))
+        });
+        info!("Built {} benchmark summaries", summaries.len());
+        self.replace_runs(Runs {
+            reports,
+            summaries: Arc::new(summaries),
+        });
 
         Ok(())
     }
@@ -134,73 +101,48 @@ impl BenchmarkCache {
             IggyBenchDashboardServerError::InvalidJson(e.to_string())
         })
     }
+}
 
-    async fn load_gh_workflows(&self) {
-        let mut data = String::new();
-        let read = self
-            .gh_workflows_file
-            .lock()
-            .await
-            .read_to_string(&mut data)
-            .await;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config;
+    use serde_json::Value;
 
-        match read {
-            Ok(0) => {
-                info!("No GH workflows file found")
-            }
-            Ok(1_usize..) => {
-                info!("Loaded GH workflows file");
-                data.lines().for_each(|line| {
-                    info!("Adding GH workflow: {}", line);
-                    self.gh_workflows.insert(line.parse().unwrap());
-                });
-            }
-            Err(e) => {
-                info!("Error reading GH workflows file: {e}");
-            }
-        }
-    }
+    const FIXTURE_RUN_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fixtures/results/live-0.9.0-pinned-producer-20p"
+    );
+    const SHIPPED_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dashboard.toml");
+    const REPORT_FILE: &str = "report.json";
+    /// `server_stats` of the fixture run, which differ from its `identifier` and `gitref`.
+    const FIXTURE_SERVER_HOSTNAME: &str = "ip-10-0-0-40";
+    const FIXTURE_SERVER_VERSION: &str = "0.9.0";
 
-    pub fn remove_html_files(&self, entry_path: &Path) -> std::io::Result<u64> {
-        let html_files: Vec<_> = std::fs::read_dir(entry_path)?
-            .filter_map(|r| r.ok())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .map(|ext| ext == "html")
-                    .unwrap_or(false)
-            })
-            .collect();
+    #[test]
+    fn given_report_without_gitref_and_identifier_when_loading_should_list_run_with_server_labels()
+    {
+        let fixture = std::fs::read_to_string(Path::new(FIXTURE_RUN_DIR).join(REPORT_FILE))
+            .expect("the fixture report is readable");
+        let mut report: Value = serde_json::from_str(&fixture).expect("the fixture report is JSON");
+        report["params"]["gitref"] = Value::Null;
+        report["hardware"]["identifier"] = Value::Null;
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let run_dir = results_dir.path().join("run");
+        std::fs::create_dir(&run_dir).expect("the run directory is created");
+        std::fs::write(run_dir.join(REPORT_FILE), report.to_string())
+            .expect("the report is written");
+        let thresholds = config::load(Path::new(SHIPPED_CONFIG))
+            .expect("the shipped config is valid")
+            .thresholds;
+        let cache = BenchmarkCache::new(results_dir.path().to_path_buf(), thresholds);
 
-        let mut total_size = 0;
+        cache.load().expect("the results directory is readable");
 
-        for html_file in html_files {
-            let metadata = match html_file.metadata() {
-                Ok(meta) => meta,
-                Err(e) => {
-                    error!(
-                        "Failed to get metadata for file {}: {}",
-                        html_file.path().display(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let file_size = metadata.len();
-            if let Err(e) = std::fs::remove_file(html_file.path()) {
-                error!(
-                    "Failed to remove HTML file {} (size: {} bytes): {}",
-                    html_file.path().display(),
-                    file_size,
-                    e
-                );
-            } else {
-                total_size += file_size;
-            }
-        }
-
-        Ok(total_size)
+        let summaries = cache.get_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].machine, FIXTURE_SERVER_HOSTNAME);
+        assert_eq!(summaries[0].version, FIXTURE_SERVER_VERSION);
+        assert_eq!(summaries[0].gitref, None);
     }
 }

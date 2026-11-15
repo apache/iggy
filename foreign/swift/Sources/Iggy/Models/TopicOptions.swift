@@ -33,6 +33,13 @@ public enum TopicOptionKey: String, Sendable, Hashable, CaseIterable {
     case sizeOfMessagesRequiredToSave = "size_of_messages_required_to_save"
     case preallocateSegments = "preallocate_segments"
     case replicationFactor = "replication_factor"
+    case segmentMaxAge = "segment_max_age"
+    /// An update turns it on, never off, and it is never resettable.
+    case tieredStorage = "tiered_storage"
+    /// Updatable and resettable to one day.
+    case localRetentionAge = "local_retention_age"
+    /// Updatable and resettable to unlimited.
+    case localRetentionSize = "local_retention_size"
 }
 
 /// How far a write has to get before the server completes it.
@@ -91,6 +98,30 @@ public struct TopicCreateOptions: Sendable, Hashable {
     /// refuses an out-of-range value with
     /// ``IggyErrorCode/invalidReplicationFactor``.
     public var replicationFactor: UInt32?
+    /// How long after the active segment's first batch a batch starts the
+    /// next segment. Nil or ``IggyExpiry/serverDefault`` leaves the server
+    /// default, ``IggyExpiry/never``, so segments roll by size alone.
+    /// Create-only.
+    ///
+    /// The server refuses less than ten minutes, and any age together with
+    /// `preallocateSegments`.
+    public var segmentMaxAge: IggyExpiry?
+    /// Whether sealed segments move to the object store. Nil leaves the
+    /// server default, off.
+    ///
+    /// The server refuses `true` with ``IggyErrorCode/featureUnavailable``
+    /// until it tiers topics.
+    public var tieredStorage: Bool?
+    /// How long a tiered topic keeps an uploaded segment on local disk. Nil
+    /// or ``IggyExpiry/serverDefault`` leaves the server default, one day.
+    ///
+    /// The server refuses an age above a finite `messageExpiry`.
+    public var localRetentionAge: IggyExpiry?
+    /// Topic-wide cap on the uploaded segments a tiered topic keeps on local
+    /// disk. Nil leaves the server default, ``MaxTopicSize/unlimited``.
+    ///
+    /// The server refuses a size above a finite `maxTopicSize`.
+    public var localRetentionSize: MaxTopicSize?
     public var raw: [String: String]
 
     public init(
@@ -98,6 +129,7 @@ public struct TopicCreateOptions: Sendable, Hashable {
         maxTopicSize: MaxTopicSize? = nil, segmentSizeBytes: UInt64? = nil, durability: Durability = .replicated,
         consumerOffsetDurability: Durability = .replicated, partitionResizePolicy: PartitionResizePolicy? = nil, messagesRequiredToSave: UInt32? = nil,
         sizeOfMessagesRequiredToSaveBytes: UInt64? = nil, preallocateSegments: Bool? = nil, replicationFactor: UInt32? = nil,
+        segmentMaxAge: IggyExpiry? = nil, tieredStorage: Bool? = nil, localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil,
         raw: [String: String] = [:]
     ) {
         self.partitionsCount = partitionsCount
@@ -112,6 +144,10 @@ public struct TopicCreateOptions: Sendable, Hashable {
         self.sizeOfMessagesRequiredToSaveBytes = sizeOfMessagesRequiredToSaveBytes
         self.preallocateSegments = preallocateSegments
         self.replicationFactor = replicationFactor
+        self.segmentMaxAge = segmentMaxAge
+        self.tieredStorage = tieredStorage
+        self.localRetentionAge = localRetentionAge
+        self.localRetentionSize = localRetentionSize
         self.raw = raw
     }
 
@@ -163,6 +199,18 @@ public struct TopicCreateOptions: Sendable, Hashable {
         if let replicationFactor {
             options[TopicOptionKey.replicationFactor.rawValue] = .explicit(.uint32(replicationFactor))
         }
+        if let segmentMaxAge, let microseconds = try segmentMaxAge.wireMicroseconds() {
+            options[TopicOptionKey.segmentMaxAge.rawValue] = .explicit(.uint64(microseconds))
+        }
+        if let tieredStorage {
+            options[TopicOptionKey.tieredStorage.rawValue] = .explicit(.bool(tieredStorage))
+        }
+        if let localRetentionAge, let microseconds = try localRetentionAge.wireMicroseconds() {
+            options[TopicOptionKey.localRetentionAge.rawValue] = .explicit(.uint64(microseconds))
+        }
+        if let localRetentionSize {
+            options[TopicOptionKey.localRetentionSize.rawValue] = .explicit(.uint64(localRetentionSize.wireValue))
+        }
         return options
     }
 
@@ -185,9 +233,23 @@ public struct TopicUpdateOptions: Sendable, Hashable {
     /// nothing: reset ``TopicOptionKey/maxTopicSize`` to return to the
     /// default.
     public var maxTopicSize: MaxTopicSize?
-    /// Keys to return to their defaults: ``TopicOptionKey/messageExpiry`` or
-    /// ``TopicOptionKey/maxTopicSize``. Any other key is refused before
-    /// anything is sent.
+    /// `true` turns tiered storage on. Nil keeps it as it is, and `false` is
+    /// refused: an update never turns it off. The refusal comes before
+    /// anything is sent, or from the server when the patch carries ``raw``
+    /// keys or ``rawReset`` names.
+    public var tieredStorage: Bool?
+    /// Nil keeps the current local retention age.
+    /// ``IggyExpiry/serverDefault`` changes nothing: reset
+    /// ``TopicOptionKey/localRetentionAge`` to return to the default.
+    public var localRetentionAge: IggyExpiry?
+    /// Nil keeps the current local retention size.
+    /// ``MaxTopicSize/serverDefault`` changes nothing: reset
+    /// ``TopicOptionKey/localRetentionSize`` to return to the default.
+    public var localRetentionSize: MaxTopicSize?
+    /// Keys to return to their defaults: ``TopicOptionKey/messageExpiry``,
+    /// ``TopicOptionKey/maxTopicSize``, ``TopicOptionKey/localRetentionAge``
+    /// or ``TopicOptionKey/localRetentionSize``. Any other key is refused
+    /// before anything is sent.
     public var reset: Set<TopicOptionKey>
     /// Updatable keys newer than this SDK, as strings the server parses.
     public var raw: [String: String]
@@ -196,12 +258,16 @@ public struct TopicUpdateOptions: Sendable, Hashable {
     public var rawReset: Set<String>
 
     public init(
-        name: String? = nil, messageExpiry: IggyExpiry? = nil, maxTopicSize: MaxTopicSize? = nil, reset: Set<TopicOptionKey> = [],
-        raw: [String: String] = [:], rawReset: Set<String> = []
+        name: String? = nil, messageExpiry: IggyExpiry? = nil, maxTopicSize: MaxTopicSize? = nil, tieredStorage: Bool? = nil,
+        localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil, reset: Set<TopicOptionKey> = [], raw: [String: String] = [:],
+        rawReset: Set<String> = []
     ) {
         self.name = name
         self.messageExpiry = messageExpiry
         self.maxTopicSize = maxTopicSize
+        self.tieredStorage = tieredStorage
+        self.localRetentionAge = localRetentionAge
+        self.localRetentionSize = localRetentionSize
         self.reset = reset
         self.raw = raw
         self.rawReset = rawReset
@@ -218,6 +284,20 @@ public struct TopicUpdateOptions: Sendable, Hashable {
         if let maxTopicSize, maxTopicSize != .serverDefault {
             options[TopicOptionKey.maxTopicSize.rawValue] = .explicit(.uint64(maxTopicSize.wireValue))
         }
+        if let tieredStorage {
+            // A patch with a raw key or raw reset name is the server's to
+            // refuse, in its own order, so `false` is sent with it.
+            guard tieredStorage || !raw.isEmpty || !rawReset.isEmpty else {
+                throw IggyError(.optionNotUpdatable, context: TopicOptionKey.tieredStorage.rawValue)
+            }
+            options[TopicOptionKey.tieredStorage.rawValue] = .explicit(.bool(tieredStorage))
+        }
+        if let localRetentionAge, let microseconds = try localRetentionAge.wireMicroseconds() {
+            options[TopicOptionKey.localRetentionAge.rawValue] = .explicit(.uint64(microseconds))
+        }
+        if let localRetentionSize, localRetentionSize != .serverDefault {
+            options[TopicOptionKey.localRetentionSize.rawValue] = .explicit(.uint64(localRetentionSize.wireValue))
+        }
         return options
     }
 
@@ -227,6 +307,9 @@ public struct TopicUpdateOptions: Sendable, Hashable {
             name.map { _ in .name },
             messageExpiry.flatMap { $0 == .serverDefault ? nil : .messageExpiry },
             maxTopicSize.flatMap { $0 == .serverDefault ? nil : .maxTopicSize },
+            tieredStorage.map { _ in .tieredStorage },
+            localRetentionAge.flatMap { $0 == .serverDefault ? nil : .localRetentionAge },
+            localRetentionSize.flatMap { $0 == .serverDefault ? nil : .localRetentionSize },
         ].compactMap { $0 }
         return try OptionsPatch(typed: typed, raw: raw, reset: reset, rawReset: rawReset, values: toResourceOptions)
     }
@@ -236,16 +319,22 @@ extension TopicOptionKey: CatalogOptionKey {
     var flags: OptionFlags {
         switch self {
         case .name: .updatable
-        case .messageExpiry, .maxTopicSize: [.updatable, .resettable]
+        case .messageExpiry, .maxTopicSize, .localRetentionAge, .localRetentionSize: [.updatable, .resettable]
+        case .segmentMaxAge: .critical
+        case .tieredStorage: [.updatable, .critical]
         default: []
         }
+    }
+
+    var isEnableOnly: Bool {
+        self == .tieredStorage
     }
 }
 
 extension Topic {
     /// How long messages are kept, from ``options``.
     public var messageExpiry: IggyExpiry {
-        resolvedMessageExpiry(options)
+        resolvedExpiry(options, .messageExpiry)
     }
 
     /// The compression label the topic was created with, from ``options``.
@@ -256,13 +345,36 @@ extension Topic {
     /// The topic's size cap, from ``options``.
     public var maxTopicSize: MaxTopicSize {
         resolvedMaxTopicSize(options)
+    }
+
+    /// How long after a segment's first batch a batch starts the next one,
+    /// from ``options``.
+    public var segmentMaxAge: IggyExpiry {
+        resolvedExpiry(options, .segmentMaxAge)
+    }
+
+    /// Whether sealed segments move to the object store, from ``options``.
+    public var tieredStorage: Bool {
+        resolvedTieredStorage(options)
+    }
+
+    /// How long an uploaded segment stays on local disk, from ``options``.
+    /// Never above ``messageExpiry``.
+    public var localRetentionAge: IggyExpiry {
+        resolvedLocalRetentionAge(options)
+    }
+
+    /// The cap on the uploaded segments kept on local disk, from
+    /// ``options``. Never above ``maxTopicSize``.
+    public var localRetentionSize: MaxTopicSize {
+        resolvedLocalRetentionSize(options)
     }
 }
 
 extension TopicDetails {
     /// How long messages are kept, from ``options``.
     public var messageExpiry: IggyExpiry {
-        resolvedMessageExpiry(options)
+        resolvedExpiry(options, .messageExpiry)
     }
 
     /// The compression label the topic was created with, from ``options``.
@@ -274,12 +386,35 @@ extension TopicDetails {
     public var maxTopicSize: MaxTopicSize {
         resolvedMaxTopicSize(options)
     }
+
+    /// How long after a segment's first batch a batch starts the next one,
+    /// from ``options``.
+    public var segmentMaxAge: IggyExpiry {
+        resolvedExpiry(options, .segmentMaxAge)
+    }
+
+    /// Whether sealed segments move to the object store, from ``options``.
+    public var tieredStorage: Bool {
+        resolvedTieredStorage(options)
+    }
+
+    /// How long an uploaded segment stays on local disk, from ``options``.
+    /// Never above ``messageExpiry``.
+    public var localRetentionAge: IggyExpiry {
+        resolvedLocalRetentionAge(options)
+    }
+
+    /// The cap on the uploaded segments kept on local disk, from
+    /// ``options``. Never above ``maxTopicSize``.
+    public var localRetentionSize: MaxTopicSize {
+        resolvedLocalRetentionSize(options)
+    }
 }
 
 // An unreported or unreadable key resolves to its catalog default, as in the Rust crate.
 
-private func resolvedMessageExpiry(_ options: ResourceOptions) -> IggyExpiry {
-    guard let microseconds = options[TopicOptionKey.messageExpiry.rawValue]?.value.uint64Value, microseconds != 0 else {
+private func resolvedExpiry(_ options: ResourceOptions, _ key: TopicOptionKey) -> IggyExpiry {
+    guard let microseconds = options[key.rawValue]?.value.uint64Value, microseconds != 0 else {
         return .never
     }
     return IggyExpiry(wireMicroseconds: microseconds)
@@ -287,6 +422,29 @@ private func resolvedMessageExpiry(_ options: ResourceOptions) -> IggyExpiry {
 
 private func resolvedCompressionAlgorithm(_ options: ResourceOptions) -> CompressionAlgorithm {
     options[TopicOptionKey.compressionAlgorithm.rawValue]?.value.stringValue.flatMap(CompressionAlgorithm.init(name:)) ?? .none
+}
+
+private func resolvedTieredStorage(_ options: ResourceOptions) -> Bool {
+    options[TopicOptionKey.tieredStorage.rawValue]?.value.boolValue ?? false
+}
+
+// A tiered topic keeps nothing on local disk longer, or in a larger amount,
+// than it keeps at all, so both local bounds yield to the topic's own.
+
+private func resolvedLocalRetentionAge(_ options: ResourceOptions) -> IggyExpiry {
+    let oneDay: UInt64 = 86_400_000_000
+    let local = storedLimit(options, .localRetentionAge) ?? oneDay
+    return IggyExpiry(wireMicroseconds: min(local, storedLimit(options, .messageExpiry) ?? UInt64.max))
+}
+
+private func resolvedLocalRetentionSize(_ options: ResourceOptions) -> MaxTopicSize {
+    let local = storedLimit(options, .localRetentionSize) ?? UInt64.max
+    return MaxTopicSize(wireValue: min(local, storedLimit(options, .maxTopicSize) ?? UInt64.max))
+}
+
+/// The stored value of an expiry or size key, nil when unreported or 0.
+private func storedLimit(_ options: ResourceOptions, _ key: TopicOptionKey) -> UInt64? {
+    options[key.rawValue]?.value.uint64Value.flatMap { $0 == 0 ? nil : $0 }
 }
 
 private func resolvedMaxTopicSize(_ options: ResourceOptions) -> MaxTopicSize {

@@ -22,6 +22,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Tests.ClientTests;
 
@@ -35,6 +36,9 @@ public sealed class HttpCommittingPollTests
     private const string PollPath = "/streams/1/topics/2/messages";
 
     private const string TimedOut = """{"id":57,"code":"transient_not_committed","reason":"timed out"}""";
+
+    private const string TieredReadFailed =
+        """{"id":96,"code":"tiered_read_failed","reason":"object store refused the read","field":null}""";
 
     /// <summary>A reply with one message at offset 42.</summary>
     private const string Batch = """
@@ -131,6 +135,32 @@ public sealed class HttpCommittingPollTests
         var polled = await PollAsync(Client(server), false);
 
         Assert.Equal(42ul, Assert.Single(polled.Messages).Header.Offset);
+        Assert.Equal(2, server.Requests);
+    }
+
+    [Fact]
+    public async Task given_a_poll_without_auto_commit_when_the_tiered_read_fails_should_report_it_without_sending_again()
+    {
+        var server = new ScriptedHandler((HttpStatusCode.FailedDependency, TieredReadFailed), (HttpStatusCode.OK, Batch));
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(Client(server), false));
+
+        Assert.Equal((VsrError.TIERED_READ_FAILED, true), (error.StatusCode, error.FromServer));
+        Assert.Equal(1, server.Requests);
+    }
+
+    /// <summary>A refused read returns no messages, so the server stored nothing and the partition stays open.</summary>
+    [Fact]
+    public async Task given_a_committing_poll_when_the_tiered_read_fails_should_report_it_without_a_block()
+    {
+        var server = new ScriptedHandler((HttpStatusCode.FailedDependency, TieredReadFailed), (HttpStatusCode.OK, Batch));
+        var client = Client(server);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client, true));
+        var polled = await PollAsync(client, true);
+
+        Assert.Equal((VsrError.TIERED_READ_FAILED, true), (error.StatusCode, error.FromServer));
+        Assert.Single(polled.Messages);
         Assert.Equal(2, server.Requests);
     }
 

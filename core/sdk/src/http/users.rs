@@ -17,7 +17,8 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::{Identifier, IggyError};
+use crate::http::path::encode_segment;
+use crate::prelude::{IdKind, Identifier, IggyError};
 use async_trait::async_trait;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
@@ -34,7 +35,7 @@ const PATH: &str = "/users";
 #[async_trait]
 impl UserClient for HttpClient {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
-        let response = self.get(&format!("{PATH}/{user_id}")).await;
+        let response = self.get(&user_path(user_id)?).await;
         if let Err(error) = response {
             if matches!(error, IggyError::ResourceNotFound(_)) {
                 return Ok(None);
@@ -87,8 +88,7 @@ impl UserClient for HttpClient {
     }
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
-        self.delete(&format!("{PATH}/{}", user_id.as_cow_str()))
-            .await?;
+        self.delete(&user_path(user_id)?).await?;
         Ok(())
     }
 
@@ -97,11 +97,8 @@ impl UserClient for HttpClient {
         user_id: &Identifier,
         options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
-        self.put(
-            &format!("{PATH}/{}", user_id.as_cow_str()),
-            &options.to_update_body()?,
-        )
-        .await?;
+        self.put(&user_path(user_id)?, &options.to_update_body()?)
+            .await?;
         Ok(())
     }
 
@@ -111,7 +108,7 @@ impl UserClient for HttpClient {
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
         self.put(
-            &format!("{PATH}/{}/permissions", user_id.as_cow_str()),
+            &format!("{}/permissions", user_path(user_id)?),
             &UpdatePermissions {
                 user_id: user_id.clone(),
                 permissions,
@@ -128,7 +125,7 @@ impl UserClient for HttpClient {
         new_password: &str,
     ) -> Result<(), IggyError> {
         self.put(
-            &format!("{PATH}/{}/password", user_id.as_cow_str()),
+            &format!("{}/password", user_path(user_id)?),
             &ChangePassword {
                 user_id: user_id.clone(),
                 current_password: SecretString::from(current_password),
@@ -163,5 +160,94 @@ impl UserClient for HttpClient {
         self.delete(&format!("{PATH}/logout")).await?;
         self.set_access_token(None).await;
         Ok(())
+    }
+}
+
+fn user_path(user_id: &Identifier) -> Result<String, IggyError> {
+    let identifier = match user_id.kind {
+        IdKind::Numeric => user_id.get_u32_value()?.to_string(),
+        IdKind::String => user_id.get_cow_str_value()?.into_owned(),
+    };
+    // `Url::join` collapses "." and ".." even when percent-encoded, and only
+    // a segment of one or two dots matches. Encoding covers every other value,
+    // so the result is one segment with no query or fragment. Usernames are at
+    // least three bytes, so this guard cannot reject a valid username.
+    if matches!(identifier.as_str(), "." | "..") {
+        return Err(IggyError::InvalidUsername);
+    }
+
+    Ok(format!("{PATH}/{}", encode_segment(&identifier)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::scripted_server::{Reply, ScriptedServer};
+
+    #[test]
+    fn given_numeric_id_when_building_path_should_keep_the_number() {
+        let user_id = Identifier::numeric(42).unwrap();
+
+        assert_eq!(user_path(&user_id).unwrap(), "/users/42");
+    }
+
+    #[test]
+    fn given_reserved_characters_when_building_path_should_percent_encode() {
+        let user_id = Identifier::named("a/b?c").unwrap();
+
+        assert_eq!(user_path(&user_id).unwrap(), "/users/a%2Fb%3Fc");
+
+        let user_id = Identifier::named("a%2Fb").unwrap();
+
+        assert_eq!(user_path(&user_id).unwrap(), "/users/a%252Fb");
+    }
+
+    #[test]
+    fn given_malformed_numeric_id_when_building_path_should_return_an_error() {
+        let user_id = Identifier {
+            kind: IdKind::Numeric,
+            length: 0,
+            value: 42u32.to_le_bytes().to_vec(),
+        };
+
+        assert!(matches!(
+            user_path(&user_id),
+            Err(IggyError::InvalidIdentifier)
+        ));
+    }
+
+    #[test]
+    fn given_dot_segments_when_building_path_should_reject_them() {
+        for name in [".", ".."] {
+            let user_id = Identifier::named(name).unwrap();
+
+            assert!(matches!(
+                user_path(&user_id),
+                Err(IggyError::InvalidUsername)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn given_reserved_characters_in_name_when_deleting_should_send_one_path_segment() {
+        let server = ScriptedServer::start(vec![Reply::empty(200)]).await;
+        let user_id = Identifier::named("a/b?c").unwrap();
+
+        server.client().delete_user(&user_id).await.unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].line, "DELETE /users/a%2Fb%3Fc HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn given_dot_segment_name_when_deleting_should_fail_before_sending() {
+        let server = ScriptedServer::start(vec![Reply::empty(200)]).await;
+        let user_id = Identifier::named("..").unwrap();
+
+        let deleted = server.client().delete_user(&user_id).await;
+
+        assert!(matches!(deleted, Err(IggyError::InvalidUsername)));
+        assert!(server.requests().is_empty());
     }
 }

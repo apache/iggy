@@ -31,7 +31,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{
     DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize,
-    IggyDuration, IggyError, IggyExpiry, PollOptions, TransportProtocol,
+    IggyDuration, IggyError, IggyExpiry, MaxTopicSize, PollOptions, TransportProtocol,
 };
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
 use iggy_binary_protocol::requests::messages::{
@@ -183,8 +183,8 @@ impl IggyBenchArgs {
         }
     }
 
-    /// Producer-only kinds never poll, so their names leave out the poll options.
-    const fn polls(&self) -> bool {
+    /// Producer-only kinds never poll, so their names and reports leave out the poll options.
+    pub const fn polls(&self) -> bool {
         !matches!(
             self.benchmark_kind,
             BenchmarkKindCommand::PinnedProducer(_) | BenchmarkKindCommand::BalancedProducer(_)
@@ -403,6 +403,28 @@ impl IggyBenchArgs {
             })
     }
 
+    pub fn suite(&self) -> Option<String> {
+        self.benchmark_kind
+            .inner()
+            .transport_command()
+            .output_command()
+            .as_ref()
+            .and_then(|cmd| match cmd {
+                BenchmarkOutputCommand::Output(args) => args.suite.clone(),
+            })
+    }
+
+    pub fn workload(&self) -> Option<String> {
+        self.benchmark_kind
+            .inner()
+            .transport_command()
+            .output_command()
+            .as_ref()
+            .and_then(|cmd| match cmd {
+                BenchmarkOutputCommand::Output(args) => args.workload.clone(),
+            })
+    }
+
     pub fn open_charts(&self) -> bool {
         self.benchmark_kind
             .inner()
@@ -416,6 +438,12 @@ impl IggyBenchArgs {
 
     pub fn max_topic_size(&self) -> Option<IggyByteSize> {
         self.benchmark_kind.inner().max_topic_size()
+    }
+
+    /// The size limit that the bench creates topics with: no limit without `--max-topic-size`.
+    pub fn new_topic_max_size(&self) -> MaxTopicSize {
+        self.max_topic_size()
+            .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom)
     }
 
     pub fn message_expiry(&self) -> IggyExpiry {

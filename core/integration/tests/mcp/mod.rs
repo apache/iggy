@@ -16,31 +16,43 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use assert_cmd::prelude::CommandCargoExt;
-
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerOffsetInfo, IggyMessage, MessageClient, Partitioning, PersonalAccessTokenExpiry,
-    PersonalAccessTokenInfo, PolledMessages, RawPersonalAccessToken, Snapshot, Stats, Stream,
-    StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails,
+    ConsumerOffsetInfo, IggyMessage, MessageClient, Partitioning, Permissions,
+    PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
+    RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails,
+    UserClient, UserCreateOptions, UserInfo, UserInfoDetails, UserStatus,
 };
 use integration::{
-    harness::{McpClient, McpConfig, TestHarness, seeds},
+    harness::{McpClient, McpConfig, TestHarness, cargo_bin_path, seeds},
     iggy_harness,
 };
+use reqwest::{
+    StatusCode,
+    header::{self, HeaderName},
+};
 use rmcp::{
-    model::CallToolRequestParams,
+    ServiceExt,
+    model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation},
     serde::de::DeserializeOwned,
     serde_json::{self, json},
     service::ServiceError,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::ChildStdout;
 use tokio::time::timeout;
 
 const MCP_STDIO_TIMEOUT: Duration = Duration::from_secs(10);
+const ADMIN_PERMISSION_ENV: &str = "IGGY_MCP_PERMISSIONS_ADMIN";
+const AUTH_TOKEN_ENV: &str = "IGGY_MCP_HTTP_AUTH_TOKEN";
+const AUTH_TOKEN: &str = "mcp-test-token-for-bearer-checks";
 
 async fn invoke<T: DeserializeOwned>(
     client: &McpClient,
@@ -77,6 +89,86 @@ async fn invoke_empty(client: &McpClient, method: &str, data: Option<serde_json:
         .unwrap_or_else(|e| panic!("Failed to invoke {method}: {e}"));
 
     assert!(!result.is_error.unwrap_or(false), "{method} returned error");
+}
+
+async fn start_mcp(envs: &[(&str, &str)]) -> TestHarness {
+    let mut harness = TestHarness::builder()
+        .default_server()
+        .root_tcp_client()
+        .mcp(
+            McpConfig::builder()
+                .consumer_name(seeds::names::CONSUMER)
+                .extra_envs(
+                    envs.iter()
+                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                        .collect(),
+                )
+                .build(),
+        )
+        .build()
+        .expect("Failed to build MCP harness");
+    harness
+        .start_with_seed(|client| async move { seeds::mcp_standard(&client).await })
+        .await
+        .expect("Failed to start MCP harness");
+    harness
+}
+
+async fn start_administration_mcp() -> TestHarness {
+    start_mcp(&[(ADMIN_PERMISSION_ENV, "true")]).await
+}
+
+async fn post_initialize(url: &str, headers: &[(HeaderName, &str)]) -> StatusCode {
+    let mut request = reqwest::Client::new()
+        .post(url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .body(initialize_request().to_string());
+    for (name, value) in headers {
+        request = request.header(name, *value);
+    }
+    request.send().await.expect("MCP request failed").status()
+}
+
+fn initialize_request() -> serde_json::Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-integration-test", "version": "1"}
+        }
+    })
+}
+
+fn stdio_mcp(address: SocketAddr, username: &str, password: &str) -> tokio::process::Command {
+    let mut command = Command::new(cargo_bin_path("iggy-mcp").expect("MCP binary required"));
+    command
+        .env("IGGY_MCP_TRANSPORT", "stdio")
+        .env("IGGY_MCP_IGGY_ADDRESS", address.to_string())
+        .env("IGGY_MCP_IGGY_USERNAME", username)
+        .env("IGGY_MCP_IGGY_PASSWORD", password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(true);
+    command
+}
+
+async fn read_reply(lines: &mut Lines<BufReader<ChildStdout>>, id: u64) -> serde_json::Value {
+    loop {
+        let line = timeout(MCP_STDIO_TIMEOUT, lines.next_line())
+            .await
+            .expect("MCP reply timed out")
+            .expect("Failed to read MCP reply")
+            .expect("MCP closed stdout before replying");
+        let reply: serde_json::Value = serde_json::from_str(&line).expect("Invalid MCP reply");
+        if reply["id"] == id {
+            return reply;
+        }
+    }
 }
 
 #[iggy_harness(server(mcp))]
@@ -215,6 +307,53 @@ async fn should_return_topic_details(harness: &TestHarness) {
     assert_eq!(topic.id, 0);
     assert_eq!(topic.name, seeds::names::TOPIC);
     assert_eq!(topic.messages_count, 1);
+}
+
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn given_zero_partitions_when_creating_a_topic_should_allow_adding_partitions_later(
+    harness: &TestHarness,
+) {
+    let client = harness.mcp_client().await.expect("MCP client required");
+    let name = "empty-topic";
+    let topic: TopicDetails = invoke(
+        &client,
+        "create_topic",
+        Some(json!({"stream_id": seeds::names::STREAM, "name": name, "partitions_count": 0})),
+    )
+    .await;
+
+    assert_eq!(topic.partitions_count, 0);
+    assert!(topic.partitions.is_empty());
+    invoke_empty(
+        &client,
+        "create_partitions",
+        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": name, "partitions_count": 1})),
+    )
+    .await;
+    let topic: TopicDetails = invoke(
+        &client,
+        "get_topic",
+        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": name})),
+    )
+    .await;
+    assert_eq!(topic.partitions_count, 1);
+    let tools = client
+        .list_tools(Default::default())
+        .await
+        .expect("tools list");
+    let create = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "create_topic")
+        .expect("create_topic is listed");
+    let count = &create.input_schema["properties"]["partitions_count"];
+    assert_eq!(count["minimum"], json!(0));
+    assert!(
+        count["description"]
+            .as_str()
+            .expect("partition guidance")
+            .contains("zero creates a topic with no partitions")
+    );
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
@@ -387,8 +526,10 @@ async fn should_return_clients(harness: &TestHarness) {
     assert!(!clients.is_empty());
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_handle_snapshot(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_handle_snapshot() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let snapshot: Snapshot = invoke(&mcp_client, "snapshot", None).await;
 
@@ -516,8 +657,10 @@ async fn should_delete_consumer_offset(harness: &TestHarness) {
     .await;
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_return_personal_access_tokens(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_return_personal_access_tokens() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let tokens: Vec<PersonalAccessTokenInfo> =
         invoke(&mcp_client, "get_personal_access_tokens", None).await;
@@ -526,8 +669,10 @@ async fn should_return_personal_access_tokens(harness: &TestHarness) {
     assert_eq!(tokens[0].name, seeds::names::PERSONAL_ACCESS_TOKEN);
 }
 
-#[iggy_harness(server(mcp))]
-async fn should_create_personal_access_token(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_create_personal_access_token() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let name = "test_token";
     let expiry = PersonalAccessTokenExpiry::NeverExpire.to_string();
@@ -541,8 +686,10 @@ async fn should_create_personal_access_token(harness: &TestHarness) {
     assert!(!token.token.is_empty());
 }
 
-#[iggy_harness(server(mcp))]
-async fn should_refuse_personal_access_token_with_unparsable_expiry(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_refuse_personal_access_token_with_unparsable_expiry() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let name = "test_token";
     let arguments = json!({"name": name, "expiry": "tomorrow"});
@@ -563,8 +710,10 @@ async fn should_refuse_personal_access_token_with_unparsable_expiry(harness: &Te
     );
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_delete_personal_access_token(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_delete_personal_access_token() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     invoke_empty(
         &mcp_client,
@@ -574,16 +723,20 @@ async fn should_delete_personal_access_token(harness: &TestHarness) {
     .await;
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_return_users(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_return_users() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let users: Vec<UserInfo> = invoke(&mcp_client, "get_users", None).await;
 
     assert_eq!(users.len(), 2);
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_return_user_details(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_return_user_details() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let user: UserInfoDetails = invoke(
         &mcp_client,
@@ -595,8 +748,10 @@ async fn should_return_user_details(harness: &TestHarness) {
     assert_eq!(user.username, seeds::names::USER);
 }
 
-#[iggy_harness(server(mcp))]
-async fn should_create_user(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_create_user() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let username = "test-mcp-user";
     let user: UserInfoDetails = invoke(
@@ -607,10 +762,17 @@ async fn should_create_user(harness: &TestHarness) {
     .await;
 
     assert_eq!(user.username, username);
+    assert_eq!(
+        user.status,
+        UserStatus::Active,
+        "A user created without `active` must be able to sign in"
+    );
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_update_user(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_update_user() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     invoke_empty(
         &mcp_client,
@@ -624,8 +786,10 @@ async fn should_update_user(harness: &TestHarness) {
     .await;
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_delete_user(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_delete_user() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     invoke_empty(
         &mcp_client,
@@ -635,8 +799,10 @@ async fn should_delete_user(harness: &TestHarness) {
     .await;
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_update_permissions(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_update_permissions() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let permissions = json!({
         "global": {
@@ -668,8 +834,10 @@ async fn should_update_permissions(harness: &TestHarness) {
     .await;
 }
 
-#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
-async fn should_change_password(harness: &TestHarness) {
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_change_password() {
+    let harness = start_administration_mcp().await;
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     invoke_empty(
         &mcp_client,
@@ -706,6 +874,7 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
                         "IGGY_MCP_PERMISSIONS_DELETE".to_string(),
                         "false".to_string(),
                     ),
+                    (ADMIN_PERMISSION_ENV.to_string(), "true".to_string()),
                 ]))
                 .build(),
         )
@@ -801,20 +970,10 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
 }
 
 #[iggy_harness]
-#[allow(deprecated)]
 async fn should_exit_stdio_on_disconnect_or_signal(harness: &TestHarness) {
     for close_stdin in [true, false] {
         let address = harness.server().tcp_addr().expect("TCP address required");
-        let mut command = Command::cargo_bin("iggy-mcp").expect("MCP binary required");
-        command
-            .env("IGGY_MCP_TRANSPORT", "stdio")
-            .env("IGGY_MCP_IGGY_ADDRESS", address.to_string())
-            .env("IGGY_MCP_IGGY_USERNAME", "iggy")
-            .env("IGGY_MCP_IGGY_PASSWORD", "iggy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-        let mut child = tokio::process::Command::from(command)
-            .kill_on_drop(true)
+        let mut child = stdio_mcp(address, "iggy", "iggy")
             .spawn()
             .expect("Failed to start stdio MCP server");
         let mut stdin = child.stdin.take().expect("MCP stdin required");
@@ -869,4 +1028,366 @@ async fn should_exit_stdio_on_disconnect_or_signal(harness: &TestHarness) {
             "MCP server failed during shutdown: {status}"
         );
     }
+}
+
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_refuse_administration_tools_by_default(harness: &TestHarness) {
+    let client = harness.mcp_client().await.expect("MCP client required");
+    let mut unexpected = Vec::new();
+    for (method, arguments) in [
+        ("get_personal_access_tokens", json!({})),
+        (
+            "create_personal_access_token",
+            json!({"name": "forbidden-token"}),
+        ),
+        (
+            "delete_personal_access_token",
+            json!({"name": seeds::names::PERSONAL_ACCESS_TOKEN}),
+        ),
+        ("get_users", json!({})),
+        ("get_user", json!({"user_id": seeds::names::USER})),
+        (
+            "create_user",
+            json!({"username": "forbidden-user", "password": "secret"}),
+        ),
+        (
+            "update_user",
+            json!({"user_id": seeds::names::USER, "active": false}),
+        ),
+        ("delete_user", json!({"user_id": seeds::names::USER})),
+        ("update_permissions", json!({"user_id": seeds::names::USER})),
+        (
+            "change_password",
+            json!({
+                "user_id": seeds::names::USER,
+                "current_password": seeds::names::USER_PASSWORD,
+                "new_password": "changed"
+            }),
+        ),
+        ("snapshot", json!({})),
+    ] {
+        let params = CallToolRequestParams::new(method.to_owned())
+            .with_arguments(arguments.as_object().expect("Tool arguments").clone());
+        let result = client.call_tool(params).await;
+        if !matches!(&result, Err(ServiceError::McpError(error))
+            if error.message == "Insufficient 'admin' permissions")
+        {
+            unexpected.push(format!("{method}: {result:?}"));
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "Administration tools ran without the admin permission: {unexpected:?}"
+    );
+
+    let root = harness.root_client().await.expect("Root client required");
+    let users = root.get_users().await.expect("Failed to read users");
+    assert!(users.iter().all(|user| user.username != "forbidden-user"));
+    let user = users
+        .iter()
+        .find(|user| user.username == seeds::names::USER)
+        .expect("The seeded user must remain");
+    assert_eq!(user.status, UserStatus::Active);
+    let tokens = root
+        .get_personal_access_tokens()
+        .await
+        .expect("Failed to read personal access tokens");
+    assert_eq!(tokens.len(), 1, "Refused calls must leave tokens unchanged");
+}
+
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_refuse_send_messages_when_any_message_is_invalid(harness: &TestHarness) {
+    let client = harness.mcp_client().await.expect("MCP client required");
+    let partition = json!({
+        "stream_id": seeds::names::STREAM,
+        "topic_id": seeds::names::TOPIC,
+        "partition_id": 0,
+    });
+    let mut send = partition.clone();
+    send["partitioning"] = json!("partition");
+    send["messages"] = json!([{"payload": "valid"}, {"payload": ""}]);
+    let params = CallToolRequestParams::new("send_messages".to_owned())
+        .with_arguments(send.as_object().expect("Tool arguments").clone());
+    let result = client.call_tool(params).await;
+
+    assert!(
+        matches!(&result, Err(ServiceError::McpError(_))),
+        "A batch with an empty payload must be refused, got {result:?}"
+    );
+    let mut poll = partition;
+    poll["offset"] = json!(1);
+    let messages: PolledMessages = invoke(&client, "poll_messages", Some(poll)).await;
+    assert!(
+        messages.messages.is_empty(),
+        "A refused batch must send no message, got {:?}",
+        messages.messages
+    );
+}
+
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_require_the_configured_bearer_token() {
+    let harness = start_mcp(&[(AUTH_TOKEN_ENV, AUTH_TOKEN)]).await;
+    let mcp = harness.mcp().expect("MCP server required");
+    let url = mcp.mcp_url();
+    let bearer = format!("Bearer {AUTH_TOKEN}");
+    for (headers, expected) in [
+        (vec![], StatusCode::UNAUTHORIZED),
+        (
+            vec![(header::AUTHORIZATION, "Bearer wrong-token")],
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            vec![(header::AUTHORIZATION, AUTH_TOKEN)],
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            vec![
+                (header::AUTHORIZATION, bearer.as_str()),
+                (header::AUTHORIZATION, "Bearer wrong-token"),
+            ],
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            vec![(header::AUTHORIZATION, bearer.as_str())],
+            StatusCode::OK,
+        ),
+    ] {
+        assert_eq!(
+            post_initialize(&url, &headers).await,
+            expected,
+            "Authorization headers {headers:?}"
+        );
+    }
+
+    let health = reqwest::get(format!("http://{}/health", mcp.http_address()))
+        .await
+        .expect("Health request failed");
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(url).auth_header(AUTH_TOKEN),
+    );
+    let client = ClientConfig::new(
+        ClientCapabilities::default(),
+        Implementation::new("mcp-integration-test", "1"),
+    )
+    .serve(transport)
+    .await
+    .expect("Failed to connect with the bearer token");
+    let streams: Vec<Stream> = invoke(&client, "get_streams", None).await;
+    assert_eq!(streams.len(), 1);
+}
+
+#[iggy_harness(server(mcp))]
+async fn should_refuse_browser_origins_when_cors_is_disabled(harness: &TestHarness) {
+    let url = harness.mcp().expect("MCP server required").mcp_url();
+
+    assert_eq!(post_initialize(&url, &[]).await, StatusCode::OK);
+    assert_eq!(
+        post_initialize(&url, &[(header::ORIGIN, "http://untrusted.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_admit_only_listed_origins_when_cors_is_enabled() {
+    let harness = start_mcp(&[
+        ("IGGY_MCP_HTTP_CORS_ENABLED", "true"),
+        (
+            "IGGY_MCP_HTTP_CORS_ALLOWED_ORIGINS",
+            "[http://console.example]",
+        ),
+    ])
+    .await;
+    let url = harness.mcp().expect("MCP server required").mcp_url();
+
+    assert_eq!(
+        post_initialize(&url, &[(header::ORIGIN, "http://console.example")]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_initialize(&url, &[(header::ORIGIN, "http://untrusted.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+#[serial_test::parallel]
+async fn should_accept_only_configured_host_names() {
+    let harness = start_mcp(&[("IGGY_MCP_HTTP_ALLOWED_HOSTS", "[127.0.0.1, mcp.example]")]).await;
+    let url = harness.mcp().expect("MCP server required").mcp_url();
+
+    assert_eq!(
+        post_initialize(&url, &[(header::HOST, "mcp.example")]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_initialize(&url, &[(header::HOST, "untrusted.example")]).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[iggy_harness]
+async fn should_refuse_to_start_with_an_unsafe_or_invalid_http_configuration(
+    harness: &TestHarness,
+) {
+    let address = harness.server().tcp_addr().expect("TCP address required");
+    let mut accepted = Vec::new();
+    for overrides in [
+        vec![("IGGY_MCP_HTTP_ADDRESS", "0.0.0.0:0")],
+        vec![
+            ("IGGY_MCP_HTTP_CORS_ENABLED", "true"),
+            ("IGGY_MCP_HTTP_CORS_ALLOWED_ORIGINS", "[*]"),
+        ],
+        vec![
+            ("IGGY_MCP_HTTP_CORS_ENABLED", "true"),
+            ("IGGY_MCP_HTTP_CORS_ALLOWED_METHODS", "[FETCH]"),
+        ],
+        vec![
+            ("IGGY_MCP_HTTP_TLS_ENABLED", "true"),
+            ("IGGY_MCP_HTTP_TLS_CERT_FILE", "missing-cert.pem"),
+            ("IGGY_MCP_HTTP_TLS_KEY_FILE", "missing-key.pem"),
+        ],
+        vec![("IGGY_MCP_PERMISSIONS_READ", "sometimes")],
+    ] {
+        let mut command = Command::new(cargo_bin_path("iggy-mcp").expect("MCP binary required"));
+        command
+            .env("IGGY_MCP_TRANSPORT", "http")
+            .env("IGGY_MCP_HTTP_ADDRESS", "127.0.0.1:0")
+            .env("IGGY_MCP_IGGY_ADDRESS", address.to_string())
+            .env("IGGY_MCP_IGGY_USERNAME", "iggy")
+            .env("IGGY_MCP_IGGY_PASSWORD", "iggy")
+            .envs(overrides.iter().copied())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("Failed to start MCP server");
+        match timeout(MCP_STDIO_TIMEOUT, child.wait()).await {
+            Ok(status) => {
+                let status = status.expect("Failed to wait for MCP server");
+                if status.code() != Some(1) {
+                    accepted.push(format!("{overrides:?} ended with {status}"));
+                }
+            }
+            Err(_) => accepted.push(format!("{overrides:?} kept running")),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "MCP server must refuse each configuration with an error, not a panic: {accepted:?}"
+    );
+}
+
+#[iggy_harness]
+async fn should_keep_stdio_logs_free_of_call_payloads_by_default(harness: &TestHarness) {
+    const USERNAME: &str = "mcp-log-user";
+    const PASSWORD: &str = "Zq9-mcp-connection-value";
+    const AGENT_PASSWORD: &str = "Xk7-agent-created-value";
+    let root = harness.root_client().await.expect("Root client required");
+    root.create_user(
+        USERNAME,
+        PASSWORD,
+        UserStatus::Active,
+        Some(Permissions::root()),
+        &UserCreateOptions::default(),
+    )
+    .await
+    .expect("Failed to create the MCP user");
+
+    let address = harness.server().tcp_addr().expect("TCP address required");
+    let mut command = stdio_mcp(address, USERNAME, PASSWORD);
+    command
+        .env(ADMIN_PERMISSION_ENV, "true")
+        .env_remove("RUST_LOG")
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("Failed to start stdio MCP server");
+    let mut stdin = child.stdin.take().expect("MCP stdin required");
+    let mut lines = BufReader::new(child.stdout.take().expect("MCP stdout required")).lines();
+    let mut stderr = child.stderr.take().expect("MCP stderr required");
+    let logs = tokio::spawn(async move {
+        let mut logs = String::new();
+        stderr.read_to_string(&mut logs).await.map(|_| logs)
+    });
+
+    let calls = [
+        (1, initialize_request()),
+        (
+            2,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_user",
+                    "arguments": {"username": "agent-made-user", "password": AGENT_PASSWORD}
+                }
+            }),
+        ),
+        (
+            3,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_personal_access_token",
+                    "arguments": {"name": "log-test-token"}
+                }
+            }),
+        ),
+    ];
+    let mut replies = Vec::new();
+    for (id, request) in calls {
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("Failed to write MCP request");
+        replies.push(read_reply(&mut lines, id).await);
+        if id == 1 {
+            let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+            stdin
+                .write_all(format!("{initialized}\n").as_bytes())
+                .await
+                .expect("Failed to confirm MCP initialization");
+        }
+    }
+    for reply in &replies {
+        assert!(
+            reply.get("result").is_some() && reply["result"]["isError"] != true,
+            "MCP call failed: {reply}"
+        );
+    }
+    let token: RawPersonalAccessToken = serde_json::from_str(
+        replies[2]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("Token reply text"),
+    )
+    .expect("Token reply JSON");
+
+    drop(stdin);
+    timeout(MCP_STDIO_TIMEOUT, child.wait())
+        .await
+        .expect("MCP server did not exit")
+        .expect("Failed to wait for MCP server");
+    let logs = logs
+        .await
+        .expect("Log reader failed")
+        .expect("Failed to read MCP logs");
+    let found: Vec<&str> = [
+        (&PASSWORD[..3], "connection setting"),
+        (AGENT_PASSWORD, "tool argument"),
+        (token.token.as_str(), "tool result"),
+    ]
+    .into_iter()
+    .filter(|(value, _)| logs.contains(value))
+    .map(|(_, what)| what)
+    .collect();
+    assert!(
+        found.is_empty(),
+        "MCP stdio logs at the default level hold {found:?}"
+    );
 }
