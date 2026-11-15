@@ -33,9 +33,14 @@ fi
 if [ -n "${CACHE_DIR:-}" ]; then
     ARGS+=(--cache-dir "${CACHE_DIR}")
 fi
+if [ -n "${OMB_RESULTS_DIR:-}" ]; then
+    echo "Checking OMB results directory:"
+    ls -la "${OMB_RESULTS_DIR}"
+    ARGS+=(--omb-results-dir "${OMB_RESULTS_DIR}")
+fi
 
 if [ -n "${GITHUB_TOKEN:-}" ]; then
-    echo "Warning: GITHUB_TOKEN is set, but the server no longer polls GitHub. Put new results into ${RESULTS_DIR}." >&2
+    echo "Warning: GITHUB_TOKEN is set, but the server ignores it. Put new results into ${RESULTS_DIR}." >&2
 fi
 
 exec /app/iggy-bench-dashboard-server "${ARGS[@]}"

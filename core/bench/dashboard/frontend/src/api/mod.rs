@@ -19,6 +19,10 @@ use crate::config::get_api_base_url;
 use crate::error::{IggyBenchDashboardError, Result};
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::DashboardConfig;
+use bench_dashboard_shared::github::GithubStars;
+use bench_dashboard_shared::omb::detail::OmbRunDetail;
+use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::summary::OmbRunList;
 use bench_dashboard_shared::series::{BenchmarkSeries, SeriesMetric, SeriesScope};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use gloo::console::log;
@@ -107,6 +111,31 @@ pub async fn fetch_benchmark_summaries() -> Result<Vec<BenchmarkSummary>> {
 
 pub async fn fetch_dashboard_config() -> Result<DashboardConfig> {
     get_json("/api/config").await
+}
+
+/// The star count that the server got from GitHub, so the page makes no request to GitHub.
+pub async fn fetch_github_stars() -> Result<GithubStars> {
+    get_json("/api/github/stars").await
+}
+
+/// Every OMB run, newest first, and whether the server has an OMB results directory.
+pub async fn fetch_omb_runs() -> Result<OmbRunList> {
+    get_json("/api/omb/runs").await
+}
+
+/// One OMB run with its series and quantile curves.
+pub async fn fetch_omb_run(id: OmbRunId) -> Result<OmbRunDetail> {
+    get_json(&format!("/api/omb/runs/{id}")).await
+}
+
+/// The OMB result file as OMB wrote it.
+pub fn omb_result_url(id: OmbRunId) -> String {
+    format!("{}/api/omb/runs/{id}/result.json", get_api_base_url())
+}
+
+/// The setup sidecar of an OMB run. The server answers 404 for a run without one.
+pub fn omb_setup_url(id: OmbRunId) -> String {
+    format!("{}/api/omb/runs/{id}/setup.toml", get_api_base_url())
 }
 
 pub async fn fetch_benchmark_series(

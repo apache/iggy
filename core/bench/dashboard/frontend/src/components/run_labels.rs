@@ -265,6 +265,16 @@ pub fn version_tag(summary: &BenchmarkSummary) -> String {
     }
 }
 
+/// What a run page's head shows next to the version tag: the commit of a build at a commit, for
+/// example `commit 91e020636`, or [`RELEASE_LABEL`] for a release. `None` for another build.
+pub fn version_detail(commit: Option<&str>, release: bool) -> Option<String> {
+    match (commit, release) {
+        (Some(commit), _) => Some(format!("commit {commit}")),
+        (None, true) => Some(RELEASE_LABEL.to_owned()),
+        (None, false) => None,
+    }
+}
+
 /// The version tag, styled as a release or as a build.
 pub fn version_tag_view(tag: &str, release: bool) -> Html {
     let look = if release {
@@ -302,6 +312,20 @@ fn batches_text(batches: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_builds_when_detailed_should_name_commit_else_release() {
+        assert_eq!(
+            version_detail(Some("91e020636"), false).as_deref(),
+            Some("commit 91e020636")
+        );
+        assert_eq!(
+            version_detail(Some("91e020636"), true).as_deref(),
+            Some("commit 91e020636")
+        );
+        assert_eq!(version_detail(None, true).as_deref(), Some(RELEASE_LABEL));
+        assert_eq!(version_detail(None, false), None);
+    }
 
     #[test]
     fn given_ec2_label_when_shown_should_name_instance_type() {

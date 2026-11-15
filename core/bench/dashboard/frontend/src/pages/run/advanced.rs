@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The Advanced section: views for engineers, closed by default. Its views only mount, and so only
-//! fetch every actor's series, once the reader first opens the section.
+//! The Advanced section: the additional insights, closed by default. Its views only mount, and so
+//! only fetch every actor's series, once the reader first opens the section.
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
@@ -70,7 +70,7 @@ pub fn advanced(props: &AdvancedProps) -> Html {
     };
     html! {
         <details class="run-advanced" {ontoggle}>
-            <summary>{"Show the views for engineers"}</summary>
+            <summary>{"Show the additional insights"}</summary>
             if *opened {
                 <div class="run-advanced-body">
                     { views(props) }
