@@ -22,9 +22,8 @@ using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Iggy_SDK.Examples.Shared;
-using Iggy_SDK.Examples.SinkDataProducer.Producer;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Protocol = Apache.Iggy.Enums.Protocol;
 
 string[] sources = ["browser", "mobile", "desktop", "email", "network", "other"];
 string[] states = ["active", "inactive", "blocked", "deleted", "unknown"];
@@ -38,41 +37,29 @@ var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingP
 var loggerFactory = LoggerFactory.Create(builder => { builder.AddConsole(); });
 var logger = loggerFactory.CreateLogger<Program>();
 
-var configuration = new ConfigurationBuilder().AddJsonFile("appsettings.json").Build();
-var settings = configuration.Get<Settings>() ?? new Settings();
+logger.LogInformation("Starting data producer...");
+logger.LogInformation("Stream: qw, Topic: records");
 
-logger.LogInformation(
-    "Sink data producer has started, selected protocol: {Protocol}",
-    settings.Protocol
-);
-logger.LogInformation("Stream: {Stream}, Topic: {Topic}", settings.StreamName, settings.TopicName);
-
-var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
 {
-    BaseAddress = settings.BaseAddress,
-    Protocol = settings.Protocol,
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp,
     LoggerFactory = loggerFactory
 });
 
 await client.ConnectAsync();
-await client.LoginUserAsync(settings.Username, settings.Password);
+await client.LoginUserAsync("iggy", "iggy");
 
-var streamId = Identifier.String(settings.StreamName);
-var topicId = Identifier.String(settings.TopicName);
+var streamId = Identifier.String("qw");
+var topicId = Identifier.String("records");
 
-await ExampleHelpers.EnsureStreamExists(client, streamId, settings.StreamName);
-await ExampleHelpers.EnsureTopicExists(
-    client,
-    streamId,
-    topicId,
-    settings.TopicName,
-    settings.PartitionsCount
-);
+await ExampleHelpers.EnsureStreamExists(client, streamId, "qw");
+await ExampleHelpers.EnsureTopicExists(client, streamId, topicId, "records", 1);
 
 var totalMessages = 0;
-for (var batch = 0; batch < settings.MaxBatches; batch++)
+for (var batch = 0; batch < 100; batch++)
 {
-    var recordsCount = Random.Shared.Next(settings.MinRecordsPerBatch, settings.MaxRecordsPerBatch);
+    var recordsCount = Random.Shared.Next(100, 500);
     var messages = new List<Message>(recordsCount);
     for (var i = 0; i < recordsCount; i++)
     {
