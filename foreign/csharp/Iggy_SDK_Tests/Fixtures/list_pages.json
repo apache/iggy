@@ -1,0 +1,781 @@
+{
+  "schema_version": 1,
+  "generated_by": "core/common/examples/list_pages_fixtures.rs",
+  "conventions": {
+    "cursor_text": "A cursor text is cursor_prefix and then the cursor bytes as unpadded Base64url. The unused bits of the last character are zero. A client refuses a text that does not encode back to the same text, and a text of 0 bytes or of more than max_cursor_bytes bytes.",
+    "errors": "The server answers invalid_command to a page block that it cannot read or serve. Examples are a cursor of an unknown kind or length, a cursor whose kind does not fit the order, and a name filter on GetPartitions. reply_too_large is new in this protocol version. The server answers it in place of a GetClients reply, or of a reply to a read of streams, topics, partitions, consumer groups, users, tokens, options, stats or cluster metadata, whose frame is above the reply size cap. A page reply stays far below that cap.",
+    "hex": "Every *_hex field is lowercase hex without separators. request_hex is the command payload without framing, and response_hex is the reply payload.",
+    "http_query": "http_query holds the page keys and their text values that a client sends to the HTTP list route. A request with limit or cursor gets one page. A request without both gets the whole list as a bare JSON array, in the order of its order and descending keys and filtered by its name key. The partitions route always answers a page.",
+    "identifiers": "stream_id and topic_id are {kind, value}: kind numeric with a u32 value, or kind named with a string value. They are null for a command that has no such field.",
+    "items": "items hold the id and the name of each item of the page, in reply order. A partition has no name.",
+    "name": "A name is UTF-8 text of 1 to max_name_bytes bytes. Its length on the wire counts bytes, not characters. GetPartitions has no name filter, so its query has no name and its page block has a name length of 0. The server refuses a GetPartitions page block with a name.",
+    "next": "A client sends the next of a page as the cursor of the next request, with the same other fields. A page can be empty and still have a next. A walk ends at the first page without a next.",
+    "opaque_cursors": "A client that encodes the wire format itself does not read the bytes of a cursor. It keeps the bytes of every opaque_cursors entry and of every opaque_responses next. It sends them as it got them, and the server refuses them with invalid_command. The Rust SDK and the SDKs that wrap it read the bytes, so they refuse these cursors and replies.",
+    "refused": "A client refuses every text of refused.cursors, every input of refused.queries before it sends a request, and every body of refused.responses. An input with a name is a query of a list with a name filter.",
+    "walk": "Over TCP, QUIC and WebSocket, a list method that returns a whole list walks the pages with order id, ascending and limit max_limit. Over HTTP, it reads the route without limit and cursor, which answers the whole list as a bare JSON array."
+  },
+  "constants": {
+    "codes": {
+      "get_consumer_groups": 601,
+      "get_partitions": 404,
+      "get_streams": 201,
+      "get_topics": 301,
+      "get_users": 32
+    },
+    "orders": {
+      "created": 1,
+      "id": 0
+    },
+    "cursor_prefix": "pg1_",
+    "max_cursor_bytes": 255,
+    "default_limit": 100,
+    "max_limit": 1000,
+    "max_name_bytes": 255,
+    "errors": {
+      "invalid_command": 3,
+      "reply_too_large": 97
+    }
+  },
+  "cursors": [
+    {
+      "case": "id_seven",
+      "text": "pg1_AQcAAAAAAAAA",
+      "hex": "010700000000000000"
+    },
+    {
+      "case": "id_distinct_bytes",
+      "text": "pg1_AQECAwQFBgcI",
+      "hex": "010102030405060708"
+    },
+    {
+      "case": "id_url_safe_characters",
+      "text": "pg1_AQD_-AAAAAAA",
+      "hex": "0100fff80000000000"
+    },
+    {
+      "case": "created_distinct_bytes",
+      "text": "pg1_AhESExQVFhcYISIjJCUmJyg",
+      "hex": "0211121314151617182122232425262728"
+    }
+  ],
+  "opaque_cursors": [
+    {
+      "case": "kind_zero",
+      "text": "pg1_AAcAAAAAAAAA",
+      "hex": "000700000000000000"
+    },
+    {
+      "case": "unknown_kind",
+      "text": "pg1_AwcAAAAAAAAA",
+      "hex": "030700000000000000"
+    },
+    {
+      "case": "created_kind_with_the_id_length",
+      "text": "pg1_AgcAAAAAAAAA",
+      "hex": "020700000000000000"
+    },
+    {
+      "case": "id_kind_with_the_created_length",
+      "text": "pg1_ARESExQVFhcYISIjJCUmJyg",
+      "hex": "0111121314151617182122232425262728"
+    },
+    {
+      "case": "one_byte",
+      "text": "pg1_AQ",
+      "hex": "01"
+    },
+    {
+      "case": "most_bytes",
+      "text": "pg1_AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-vv8_f7_",
+      "hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+    }
+  ],
+  "requests": [
+    {
+      "case": "streams_first_page",
+      "command": "get_streams",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": null,
+        "name": null
+      },
+      "request_hex": "0000640000000000",
+      "http_query": {
+        "descending": "false",
+        "limit": "100",
+        "order": "id"
+      }
+    },
+    {
+      "case": "streams_whole_list_walk",
+      "command": "get_streams",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "id",
+        "descending": false,
+        "limit": 1000,
+        "cursor": null,
+        "name": null
+      },
+      "request_hex": "0000e80300000000",
+      "http_query": {
+        "descending": "false",
+        "limit": "1000",
+        "order": "id"
+      }
+    },
+    {
+      "case": "streams_created_descending_one_item",
+      "command": "get_streams",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "created",
+        "descending": true,
+        "limit": 1,
+        "cursor": null,
+        "name": null
+      },
+      "request_hex": "0101010000000000",
+      "http_query": {
+        "descending": "true",
+        "limit": "1",
+        "order": "created"
+      }
+    },
+    {
+      "case": "streams_after_id_cursor",
+      "command": "get_streams",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": "pg1_AQECAwQFBgcI",
+        "name": null
+      },
+      "request_hex": "0000640000000901010203040506070800",
+      "http_query": {
+        "cursor": "pg1_AQECAwQFBgcI",
+        "descending": "false",
+        "limit": "100",
+        "order": "id"
+      }
+    },
+    {
+      "case": "streams_created_after_cursor_with_name",
+      "command": "get_streams",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "created",
+        "descending": true,
+        "limit": 20,
+        "cursor": "pg1_AhESExQVFhcYISIjJCUmJyg",
+        "name": "ord"
+      },
+      "request_hex": "010114000000110211121314151617182122232425262728036f7264",
+      "http_query": {
+        "cursor": "pg1_AhESExQVFhcYISIjJCUmJyg",
+        "descending": "true",
+        "limit": "20",
+        "name": "ord",
+        "order": "created"
+      }
+    },
+    {
+      "case": "streams_multi_byte_name",
+      "command": "get_streams",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": null,
+        "name": "café-注文-📦"
+      },
+      "request_hex": "0000640000000011636166c3a92de6b3a8e696872df09f93a6",
+      "http_query": {
+        "descending": "false",
+        "limit": "100",
+        "name": "café-注文-📦",
+        "order": "id"
+      }
+    },
+    {
+      "case": "streams_longest_name",
+      "command": "get_streams",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": null,
+        "name": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééa"
+      },
+      "request_hex": "00006400000000ffc3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a9c3a961",
+      "http_query": {
+        "descending": "false",
+        "limit": "100",
+        "name": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééa",
+        "order": "id"
+      }
+    },
+    {
+      "case": "users_first_page",
+      "command": "get_users",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": null,
+        "name": null
+      },
+      "request_hex": "0000640000000000",
+      "http_query": {
+        "descending": "false",
+        "limit": "100",
+        "order": "id"
+      }
+    },
+    {
+      "case": "users_created_after_cursor_with_name",
+      "command": "get_users",
+      "input": {
+        "stream_id": null,
+        "topic_id": null,
+        "order": "created",
+        "descending": false,
+        "limit": 100,
+        "cursor": "pg1_AgDgkGY8EwYAAQAAAAAAAAA",
+        "name": "adm"
+      },
+      "request_hex": "010064000000110200e090663c13060001000000000000000361646d",
+      "http_query": {
+        "cursor": "pg1_AgDgkGY8EwYAAQAAAAAAAAA",
+        "descending": "false",
+        "limit": "100",
+        "name": "adm",
+        "order": "created"
+      }
+    },
+    {
+      "case": "topics_numeric_stream_first_page",
+      "command": "get_topics",
+      "input": {
+        "stream_id": {
+          "kind": "numeric",
+          "value": 7
+        },
+        "topic_id": null,
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": null,
+        "name": null
+      },
+      "request_hex": "0104070000000000640000000000",
+      "http_query": {
+        "descending": "false",
+        "limit": "100",
+        "order": "id"
+      }
+    },
+    {
+      "case": "topics_named_stream_created_descending_with_name",
+      "command": "get_topics",
+      "input": {
+        "stream_id": {
+          "kind": "named",
+          "value": "orders"
+        },
+        "topic_id": null,
+        "order": "created",
+        "descending": true,
+        "limit": 50,
+        "cursor": "pg1_AgngkGY8EwYAAwAAAAAAAAA",
+        "name": "sens"
+      },
+      "request_hex": "02066f7264657273010132000000110209e090663c13060003000000000000000473656e73",
+      "http_query": {
+        "cursor": "pg1_AgngkGY8EwYAAwAAAAAAAAA",
+        "descending": "true",
+        "limit": "50",
+        "name": "sens",
+        "order": "created"
+      }
+    },
+    {
+      "case": "partitions_numeric_ids_first_page",
+      "command": "get_partitions",
+      "input": {
+        "stream_id": {
+          "kind": "numeric",
+          "value": 7
+        },
+        "topic_id": {
+          "kind": "numeric",
+          "value": 3
+        },
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": null,
+        "name": null
+      },
+      "request_hex": "0104070000000104030000000000640000000000",
+      "http_query": {
+        "descending": "false",
+        "limit": "100",
+        "order": "id"
+      }
+    },
+    {
+      "case": "partitions_named_ids_descending_after_cursor",
+      "command": "get_partitions",
+      "input": {
+        "stream_id": {
+          "kind": "named",
+          "value": "orders"
+        },
+        "topic_id": {
+          "kind": "named",
+          "value": "events"
+        },
+        "order": "id",
+        "descending": true,
+        "limit": 1000,
+        "cursor": "pg1_AecDAAAAAAAA",
+        "name": null
+      },
+      "request_hex": "02066f726465727302066576656e74730001e80300000901e70300000000000000",
+      "http_query": {
+        "cursor": "pg1_AecDAAAAAAAA",
+        "descending": "true",
+        "limit": "1000",
+        "order": "id"
+      }
+    },
+    {
+      "case": "partitions_created_order_after_id_cursor",
+      "command": "get_partitions",
+      "input": {
+        "stream_id": {
+          "kind": "numeric",
+          "value": 7
+        },
+        "topic_id": {
+          "kind": "numeric",
+          "value": 3
+        },
+        "order": "created",
+        "descending": false,
+        "limit": 100,
+        "cursor": "pg1_AQcAAAAAAAAA",
+        "name": null
+      },
+      "request_hex": "0104070000000104030000000100640000000901070000000000000000",
+      "http_query": {
+        "cursor": "pg1_AQcAAAAAAAAA",
+        "descending": "false",
+        "limit": "100",
+        "order": "created"
+      }
+    },
+    {
+      "case": "consumer_groups_numeric_ids_first_page",
+      "command": "get_consumer_groups",
+      "input": {
+        "stream_id": {
+          "kind": "numeric",
+          "value": 7
+        },
+        "topic_id": {
+          "kind": "numeric",
+          "value": 3
+        },
+        "order": "id",
+        "descending": false,
+        "limit": 100,
+        "cursor": null,
+        "name": null
+      },
+      "request_hex": "0104070000000104030000000000640000000000",
+      "http_query": {
+        "descending": "false",
+        "limit": "100",
+        "order": "id"
+      }
+    },
+    {
+      "case": "consumer_groups_named_ids_descending_with_name",
+      "command": "get_consumer_groups",
+      "input": {
+        "stream_id": {
+          "kind": "named",
+          "value": "orders"
+        },
+        "topic_id": {
+          "kind": "named",
+          "value": "events"
+        },
+        "order": "id",
+        "descending": true,
+        "limit": 100,
+        "cursor": "pg1_AQMAAAAAAAAA",
+        "name": "bill"
+      },
+      "request_hex": "02066f726465727302066576656e7473000164000000090103000000000000000462696c6c",
+      "http_query": {
+        "cursor": "pg1_AQMAAAAAAAAA",
+        "descending": "true",
+        "limit": "100",
+        "name": "bill",
+        "order": "id"
+      }
+    }
+  ],
+  "responses": [
+    {
+      "case": "streams_with_next",
+      "command": "get_streams",
+      "response_hex": "09010400000000000000020000000100000005e090663c1306000200000000100000000000006400000000000000066f726465727300000000000000000400000000e090663c13060002000000001000000000000064000000000000000b7061796d656e74732d65750000000000000000",
+      "next": "pg1_AQQAAAAAAAAA",
+      "items": [
+        {
+          "id": 1,
+          "name": "orders"
+        },
+        {
+          "id": 4,
+          "name": "payments-eu"
+        }
+      ]
+    },
+    {
+      "case": "streams_created_order_with_next",
+      "command": "get_streams",
+      "response_hex": "110205e090663c1306000100000000000000020000000400000000e090663c13060002000000001000000000000064000000000000000b7061796d656e74732d657500000000000000000100000005e090663c1306000200000000100000000000006400000000000000066f72646572730000000000000000",
+      "next": "pg1_AgXgkGY8EwYAAQAAAAAAAAA",
+      "items": [
+        {
+          "id": 4,
+          "name": "payments-eu"
+        },
+        {
+          "id": 1,
+          "name": "orders"
+        }
+      ]
+    },
+    {
+      "case": "streams_empty_with_next",
+      "command": "get_streams",
+      "response_hex": "0901e80300000000000000000000",
+      "next": "pg1_AegDAAAAAAAA",
+      "items": []
+    },
+    {
+      "case": "streams_empty_last_page",
+      "command": "get_streams",
+      "response_hex": "0000000000",
+      "next": null,
+      "items": []
+    },
+    {
+      "case": "topics_last_page",
+      "command": "get_topics",
+      "response_hex": "00020000000100000000e090663c1306000300000000080000000000003200000000000000066576656e747300000000000000000200000000e090663c13060003000000000800000000000032000000000000000f73656e736f722d72656164696e67730000000000000000",
+      "next": null,
+      "items": [
+        {
+          "id": 1,
+          "name": "events"
+        },
+        {
+          "id": 2,
+          "name": "sensor-readings"
+        }
+      ]
+    },
+    {
+      "case": "topics_created_descending_with_next",
+      "command": "get_topics",
+      "response_hex": "110200e090663c1306000100000000000000020000000300000009e090663c130600030000000008000000000000320000000000000005617564697400000000000000000100000000e090663c1306000300000000080000000000003200000000000000066576656e74730000000000000000",
+      "next": "pg1_AgDgkGY8EwYAAQAAAAAAAAA",
+      "items": [
+        {
+          "id": 3,
+          "name": "audit"
+        },
+        {
+          "id": 1,
+          "name": "events"
+        }
+      ]
+    },
+    {
+      "case": "partitions_with_next",
+      "command": "get_partitions",
+      "response_hex": "09010100000000000000020000000000000000e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a00000000000000030001020200010100000001e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a00000000000000010100",
+      "next": "pg1_AQEAAAAAAAAA",
+      "items": [
+        {
+          "id": 0,
+          "name": null
+        },
+        {
+          "id": 1,
+          "name": null
+        }
+      ]
+    },
+    {
+      "case": "partitions_descending_last_page",
+      "command": "get_partitions",
+      "response_hex": "00020000000100000001e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a000000000000000101000000000000e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a0000000000000003000102020001",
+      "next": null,
+      "items": [
+        {
+          "id": 1,
+          "name": null
+        },
+        {
+          "id": 0,
+          "name": null
+        }
+      ]
+    },
+    {
+      "case": "consumer_groups_with_next",
+      "command": "get_consumer_groups",
+      "response_hex": "09010300000000000000020000000100000003000000010000000762696c6c696e670300000003000000010000000c616e616c79746963732d6575",
+      "next": "pg1_AQMAAAAAAAAA",
+      "items": [
+        {
+          "id": 1,
+          "name": "billing"
+        },
+        {
+          "id": 3,
+          "name": "analytics-eu"
+        }
+      ]
+    },
+    {
+      "case": "users_with_next",
+      "command": "get_users",
+      "response_hex": "09010200000000000000020000000100000000e090663c13060001046967677900000000000000000200000001e090663c1306000109616c6963652d6f70730000000000000000",
+      "next": "pg1_AQIAAAAAAAAA",
+      "items": [
+        {
+          "id": 1,
+          "name": "iggy"
+        },
+        {
+          "id": 2,
+          "name": "alice-ops"
+        }
+      ]
+    },
+    {
+      "case": "users_created_descending_last_page",
+      "command": "get_users",
+      "response_hex": "00020000000200000001e090663c1306000109616c6963652d6f707300000000000000000100000000e090663c1306000104696767790000000000000000",
+      "next": null,
+      "items": [
+        {
+          "id": 2,
+          "name": "alice-ops"
+        },
+        {
+          "id": 1,
+          "name": "iggy"
+        }
+      ]
+    }
+  ],
+  "opaque_responses": [
+    {
+      "case": "streams_with_unknown_cursor_kind",
+      "command": "get_streams",
+      "response_hex": "09030700000000000000020000000100000005e090663c1306000200000000100000000000006400000000000000066f726465727300000000000000000400000000e090663c13060002000000001000000000000064000000000000000b7061796d656e74732d65750000000000000000",
+      "next": "pg1_AwcAAAAAAAAA",
+      "items": [
+        {
+          "id": 1,
+          "name": "orders"
+        },
+        {
+          "id": 4,
+          "name": "payments-eu"
+        }
+      ]
+    },
+    {
+      "case": "streams_with_most_cursor_bytes",
+      "command": "get_streams",
+      "response_hex": "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff020000000100000005e090663c1306000200000000100000000000006400000000000000066f726465727300000000000000000400000000e090663c13060002000000001000000000000064000000000000000b7061796d656e74732d65750000000000000000",
+      "next": "pg1_AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-vv8_f7_",
+      "items": [
+        {
+          "id": 1,
+          "name": "orders"
+        },
+        {
+          "id": 4,
+          "name": "payments-eu"
+        }
+      ]
+    }
+  ],
+  "refused": {
+    "cursors": [
+      {
+        "case": "empty",
+        "text": ""
+      },
+      {
+        "case": "missing_prefix",
+        "text": "AQcAAAAAAAAA"
+      },
+      {
+        "case": "other_prefix",
+        "text": "mc1_AQcAAAAAAAAA"
+      },
+      {
+        "case": "later_version_prefix",
+        "text": "pg2_AQcAAAAAAAAA"
+      },
+      {
+        "case": "upper_case_prefix",
+        "text": "PG1_AQcAAAAAAAAA"
+      },
+      {
+        "case": "padded",
+        "text": "pg1_AhESExQVFhcYISIjJCUmJyg="
+      },
+      {
+        "case": "standard_alphabet",
+        "text": "pg1_AQD/+AAAAAAA"
+      },
+      {
+        "case": "character_outside_the_alphabet",
+        "text": "pg1_AQcAAAAAAAA*"
+      },
+      {
+        "case": "trailing_newline",
+        "text": "pg1_AQcAAAAAAAAA\n"
+      },
+      {
+        "case": "unused_bit_set",
+        "text": "pg1_AgkAAAAAAAAAAwAAAAAAAAB"
+      },
+      {
+        "case": "no_bytes",
+        "text": "pg1_"
+      },
+      {
+        "case": "more_than_max_cursor_bytes",
+        "text": "pg1_WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWg"
+      }
+    ],
+    "queries": [
+      {
+        "case": "limit_zero",
+        "input": {
+          "stream_id": null,
+          "topic_id": null,
+          "order": "id",
+          "descending": false,
+          "limit": 0,
+          "cursor": null,
+          "name": null
+        }
+      },
+      {
+        "case": "limit_above_max_limit",
+        "input": {
+          "stream_id": null,
+          "topic_id": null,
+          "order": "id",
+          "descending": false,
+          "limit": 1001,
+          "cursor": null,
+          "name": null
+        }
+      },
+      {
+        "case": "empty_name",
+        "input": {
+          "stream_id": null,
+          "topic_id": null,
+          "order": "id",
+          "descending": false,
+          "limit": 100,
+          "cursor": null,
+          "name": ""
+        }
+      },
+      {
+        "case": "name_above_max_name_bytes",
+        "input": {
+          "stream_id": null,
+          "topic_id": null,
+          "order": "id",
+          "descending": false,
+          "limit": 100,
+          "cursor": null,
+          "name": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+        }
+      }
+    ],
+    "responses": [
+      {
+        "case": "empty_body",
+        "command": "get_streams",
+        "response_hex": ""
+      },
+      {
+        "case": "truncated_count",
+        "command": "get_topics",
+        "response_hex": "000200"
+      },
+      {
+        "case": "truncated_next",
+        "command": "get_users",
+        "response_hex": "110211121314"
+      },
+      {
+        "case": "count_above_items",
+        "command": "get_consumer_groups",
+        "response_hex": "00020000000100000003000000010000000762696c6c696e67"
+      },
+      {
+        "case": "count_of_u32_max",
+        "command": "get_consumer_groups",
+        "response_hex": "00ffffffff0100000003000000010000000762696c6c696e67"
+      },
+      {
+        "case": "truncated_item",
+        "command": "get_partitions",
+        "response_hex": "09010100000000000000020000000000000000e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a00000000000000030001020200010100000001e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a000000000000000101"
+      },
+      {
+        "case": "trailing_bytes",
+        "command": "get_partitions",
+        "response_hex": "09010100000000000000020000000000000000e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a00000000000000030001020200010100000001e090663c13060001000000630000000000000000040000000000006400000000000000010000000000000000000000000000002a0000000000000001010000"
+      }
+    ]
+  }
+}

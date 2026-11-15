@@ -69,6 +69,7 @@ use iggy_cli::commands::{
     binary_message::{poll_messages::PollMessagesCmd, send_messages::SendMessagesCmd},
     binary_partitions::{
         create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd,
+        get_partitions::GetPartitionsCmd,
     },
     binary_personal_access_tokens::{
         create_personal_access_token::CreatePersonalAccessTokenCmd,
@@ -132,9 +133,10 @@ fn get_command(
                 args.stream_id.clone(),
                 args.output.into(),
             )),
-            StreamAction::List(args) => {
-                Box::new(GetStreamsCmd::new(args.list_output.output().into()))
-            }
+            StreamAction::List(args) => Box::new(GetStreamsCmd::new(
+                args.list_output.output().into(),
+                args.page.into(),
+            )),
         },
         Command::Topic(command) => match command {
             TopicAction::Create(args) => Box::new(CreateTopicCmd::new(
@@ -165,6 +167,7 @@ fn get_command(
             TopicAction::List(args) => Box::new(GetTopicsCmd::new(
                 args.stream_id.clone(),
                 args.list_output.output().into(),
+                args.page.into(),
             )),
         },
         Command::Partition(command) => match command {
@@ -177,6 +180,12 @@ fn get_command(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
                 args.partitions_count,
+            )),
+            PartitionAction::List(args) => Box::new(GetPartitionsCmd::new(
+                args.stream_id,
+                args.topic_id,
+                args.list_mode.into(),
+                args.page.into(),
             )),
         },
         Command::Segment(command) => match command {
@@ -238,7 +247,10 @@ fn get_command(
                 Box::new(DeleteUserCmd::new(delete_args.user_id.clone()))
             }
             UserAction::Get(get_args) => Box::new(GetUserCmd::new(get_args.user_id.clone())),
-            UserAction::List(list_args) => Box::new(GetUsersCmd::new(list_args.list_mode.into())),
+            UserAction::List(list_args) => Box::new(GetUsersCmd::new(
+                list_args.list_mode.into(),
+                list_args.page.into(),
+            )),
             UserAction::Name(name_args) => Box::new(UpdateUserCmd::new(
                 name_args.user_id.clone(),
                 UpdateUserType::Name(name_args.username.clone()),
@@ -292,6 +304,7 @@ fn get_command(
                 list_args.stream_id.clone(),
                 list_args.topic_id.clone(),
                 list_args.list_mode.into(),
+                list_args.page.into(),
             )),
         },
         Command::Message(command) => match command {

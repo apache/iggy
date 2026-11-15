@@ -66,11 +66,11 @@ use iggy_common::{
     MetadataPartitionsItem, MetadataSession, MetadataSessionClosed, MetadataStreamChange,
     MetadataStreamDeleted, MetadataTokenChange, MetadataTokenDeleted, MetadataTopicChange,
     MetadataTopicDeleted, MetadataTopicItem, MetadataUserChange, MetadataUserIdentity,
-    MetadataUserPermissionsUpdated, Permissions as RustPermissions,
-    PersonalAccessTokenInfo as RustPersonalAccessTokenInfo, Stats as RustStats,
-    StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
-    TransportEndpoints as RustTransportEndpoints, UserInfo as RustUserInfo,
-    UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
+    MetadataUserPermissionsUpdated, NamedPageQuery, Page, PageCursor, PageOrder, PageQuery,
+    Permissions as RustPermissions, PersonalAccessTokenInfo as RustPersonalAccessTokenInfo,
+    Stats as RustStats, StreamPermissions as RustStreamPermissions,
+    TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
+    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 
 use crate::{ffi, messages::BatchPositions};
@@ -1380,6 +1380,72 @@ impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
                 .collect(),
         }
     }
+}
+
+impl TryFrom<ffi::PageQuery> for PageQuery {
+    type Error = IggyError;
+
+    fn try_from(query: ffi::PageQuery) -> Result<Self, Self::Error> {
+        let order = match query.order {
+            ffi::PageOrder::Id => PageOrder::Id,
+            ffi::PageOrder::Created => PageOrder::Created,
+            _ => return Err(IggyError::InvalidCommand),
+        };
+        let query = Self {
+            order,
+            descending: query.descending,
+            limit: query.limit,
+            cursor: page_query_text(query.has_cursor, query.cursor)?
+                .map(|cursor| PageCursor::from_str(&cursor))
+                .transpose()?,
+        };
+        // The binary transports check the session first, so without this a bad
+        // query on a client that is not signed in fails with the session error.
+        query.validate()?;
+        Ok(query)
+    }
+}
+
+impl TryFrom<ffi::NamedPageQuery> for NamedPageQuery {
+    type Error = IggyError;
+
+    fn try_from(query: ffi::NamedPageQuery) -> Result<Self, Self::Error> {
+        let query = Self {
+            page: PageQuery::try_from(query.page)?,
+            name: page_query_text(query.has_name, query.name)?,
+        };
+        query.validate()?;
+        Ok(query)
+    }
+}
+
+fn page_query_text(present: bool, bytes: Vec<u8>) -> Result<Option<String>, IggyError> {
+    present
+        .then(|| String::from_utf8(bytes).map_err(|_| IggyError::InvalidCommand))
+        .transpose()
+}
+
+// cxx has no generic shared structs, so each list has its own page struct.
+macro_rules! page_into_ffi {
+    ($($item:ty => $ffi_page:ident),* $(,)?) => {$(
+        impl From<Page<$item>> for ffi::$ffi_page {
+            fn from(page: Page<$item>) -> Self {
+                ffi::$ffi_page {
+                    items: page.items.into_iter().map(From::from).collect(),
+                    has_next: page.next.is_some(),
+                    next: page.next.map(|cursor| cursor.to_string()).unwrap_or_default(),
+                }
+            }
+        }
+    )*};
+}
+
+page_into_ffi! {
+    RustStream => StreamsPage,
+    RustTopic => TopicsPage,
+    RustPartition => PartitionsPage,
+    RustConsumerGroup => ConsumerGroupsPage,
+    RustUserInfo => UsersPage,
 }
 
 impl TryFrom<ffi::MetadataChangesQuery> for MetadataChangesQuery {
