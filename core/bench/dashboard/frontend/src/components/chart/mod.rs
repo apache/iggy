@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod canvas;
+
+pub use self::canvas::{ChartCanvas, SharedChart};
+
 use js_sys::{Object, Reflect};
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -36,6 +40,12 @@ extern "C" {
 
     #[wasm_bindgen(method, js_name = dispatchAction)]
     fn dispatch_action(this: &EChartsInstance, action: &JsValue);
+}
+
+/// The style that gives an element, such as a run card or a row of a rates card, the color of its
+/// line in the charts. The stylesheet reads it as `--series-color`.
+pub fn series_color(color: &str) -> String {
+    format!("--series-color: {color}")
 }
 
 /// Also works on an element that has left the page, so an unmounted component frees its chart.

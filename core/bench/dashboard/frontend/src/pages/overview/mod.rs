@@ -25,7 +25,9 @@ use yew_router::prelude::Link;
 
 use self::headlines::{HeadlineCard, Headlines, ReleaseLink, SinceRelease};
 use crate::components::headline::{change_chip, headline_card};
-use crate::components::page::{data_status, page_head, page_shell, section_head};
+use crate::components::page::{
+    data_status, page_head, page_head_with_title_tag, page_shell, section_head,
+};
 use crate::components::run_labels::{MachineName, version_tag_view};
 use crate::format::runs_text;
 use crate::pages::methodology::{NOISE_LEAD, PERCENTILE_RULE, THROUGHPUT_RULE};
@@ -36,6 +38,7 @@ use crate::state::data::{Loadable, use_dashboard_data};
 
 const EYEBROW: &str = "Overview";
 const PRODUCT: &str = "Apache Iggy";
+const LATEST_RELEASE_TAG: &str = "Latest release";
 const LEAD_START: &str = "Numbers for the workloads the maintainers chose";
 const LEAD_END: &str = "Each card shows the median of a release's runs and its change against the \
                         previous release.";
@@ -106,21 +109,25 @@ pub fn overview() -> Html {
 }
 
 fn hero(headlines: &Headlines) -> Html {
-    let title = headlines.latest_release.as_ref().map_or_else(
-        || PRODUCT.to_owned(),
-        |release| format!("{PRODUCT} {release}"),
-    );
     let lead = match &headlines.machine {
         Some(machine) => format!("{LEAD_START}, on {}. {LEAD_END}", MachineName(machine)),
         None => format!("{LEAD_START}. {LEAD_END}"),
     };
-    page_head(
-        Html::default(),
-        Some(EYEBROW),
-        &title,
-        &lead,
-        Html::default(),
-    )
+    match &headlines.latest_release {
+        Some(release) => page_head_with_title_tag(
+            Some(EYEBROW),
+            &format!("{PRODUCT} {release}"),
+            LATEST_RELEASE_TAG,
+            &lead,
+        ),
+        None => page_head(
+            Html::default(),
+            Some(EYEBROW),
+            PRODUCT,
+            &lead,
+            Html::default(),
+        ),
+    }
 }
 
 fn cards(headlines: &Headlines) -> Html {
@@ -167,7 +174,7 @@ fn card_view(card: &HeadlineCard, latest: Option<&str>) -> Html {
             <p class="overview-card-run">{ release.run_title.as_str() }</p>
             <p class="overview-card-conditions">{ release.conditions.as_str() }</p>
             <Link<AppRoute>
-                to={AppRoute::Benchmark { uuid: release.newest.to_string() }}
+                to={AppRoute::Run { uuid: release.newest.to_string() }}
                 classes={classes!("overview-card-link")}
             >
                 { NEWEST_RUN_LABEL }

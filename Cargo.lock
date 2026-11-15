@@ -1113,12 +1113,14 @@ name = "bench-dashboard-shared"
 version = "0.1.0"
 dependencies = [
  "bench-report",
+ "blake3",
  "chrono",
  "human-repr",
  "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "toml 1.1.8+spec-1.1.0",
  "uuid",
 ]
 
@@ -5728,8 +5730,11 @@ dependencies = [
  "bench-dashboard-shared",
  "bench-report",
  "charming",
+ "chrono",
  "clap",
+ "nix",
  "notify",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "tempfile",

@@ -15,17 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Runs for the page tests, summarized by the shared crate the way the server does it.
+//! Runs for the page tests, summarized by the shared crate the way the server does it. The OMB runs
+//! are the real results in `core/bench/dashboard/fixtures/omb`.
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::Thresholds;
 use bench_dashboard_shared::metrics::GroupMetrics;
+use bench_dashboard_shared::omb::detail::OmbRunDetail;
+use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::result::OmbResult;
+use bench_dashboard_shared::omb::setup::{OmbSetup, OmbSidecar};
+use bench_dashboard_shared::omb::summary::{OmbRunList, OmbRunSummary, OmbRunTime};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::group_metrics_kind::GroupMetricsKind;
 use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use bench_report::params::BenchmarkParams;
+use chrono::{DateTime, TimeDelta, Utc};
 use uuid::Uuid;
 
 pub const RELEASE: &str = "server-0.9.0";
@@ -143,4 +150,156 @@ pub fn group_summary() -> BenchmarkGroupMetricsSummary {
         max_latency_ms: 10.0,
         std_dev_latency_ms: 0.7,
     }
+}
+
+/// The modification time of every OMB fixture file, so no test depends on the checkout.
+const OMB_MODIFIED: &str = "2026-11-13T09:30:00Z";
+
+/// One OMB run directory: the result file as OMB wrote it, and its optional `setup.toml`.
+pub struct OmbFixture {
+    pub file_name: &'static str,
+    pub json: &'static [u8],
+    pub sidecar: Option<&'static str>,
+}
+
+macro_rules! omb_fixture {
+    ($directory:literal, $file_name:literal) => {
+        OmbFixture {
+            file_name: $file_name,
+            json: include_bytes!(concat!("../../fixtures/omb/", $directory, "/", $file_name)),
+            sidecar: None,
+        }
+    };
+    ($directory:literal, $file_name:literal, with_sidecar) => {
+        OmbFixture {
+            sidecar: Some(include_str!(concat!(
+                "../../fixtures/omb/",
+                $directory,
+                "/setup.toml"
+            ))),
+            ..omb_fixture!($directory, $file_name)
+        }
+    };
+}
+
+/// 0.10.0-rc.1 on 3 nodes of i4i.4xlarge with 2 client hosts: 12 topics of 1 partition, 1 producer
+/// and 1 consumer per topic, 1000 B messages, 18 windows, driver `Iggy`.
+pub const OMB_RC1_DEFAULT: OmbFixture = omb_fixture!(
+    "rc1-12-topics-150mb",
+    "12-topics-1-partition-1kb-150mb-Iggy-2026-11-06-13-26-21.json",
+    with_sidecar
+);
+/// The workload and setup of [`OMB_RC1_DEFAULT`] with the driver configuration `Iggy-persisted`.
+pub const OMB_RC1_PERSISTED: OmbFixture = omb_fixture!(
+    "rc1-12-topics-150mb-persisted",
+    "12-topics-1-partition-1kb-150mb-Iggy-persisted-2026-11-06-13-31-22.json",
+    with_sidecar
+);
+/// The workload, driver and machines of [`OMB_RC1_DEFAULT`] on 0.9.1-edge.8, so it comes before
+/// it in version order. Its sidecar has no `data_file_system` property.
+pub const OMB_EDGE8_DEFAULT: OmbFixture = omb_fixture!(
+    "edge8-12-topics-150mb",
+    "12-topics-1-partition-1kb-150mb-Iggy-2026-11-03-06-24-42.json",
+    with_sidecar
+);
+/// 0.9.1-edge.8 on 3 nodes of i7i.xlarge: 1 topic of 100 partitions, 4 producers and 4 consumers,
+/// 1024 B messages, 30 windows. Every workload field differs from [`OMB_RC1_DEFAULT`].
+pub const OMB_EDGE8_100_PARTITIONS: OmbFixture = omb_fixture!(
+    "edge8-i7i-100-partitions-125mb",
+    "1-topic-100-partitions-1kb-125mb-Iggy-2026-11-02-14-55-18.json",
+    with_sidecar
+);
+/// No consumers, so the end-to-end latency is not measured. No sidecar, so the time comes from the
+/// file name.
+pub const OMB_NO_CONSUMERS: OmbFixture = omb_fixture!(
+    "edge-12-topics-75mb-no-consumers",
+    "12-topics-1-partition-1kb-75mb-no-consumers-Iggy-2026-10-22-10-21-15.json"
+);
+/// Publish errors in every window, so it has the publish errors badge. Driver `Iggy-persisted`, no
+/// sidecar.
+pub const OMB_PUBLISH_ERRORS: OmbFixture = omb_fixture!(
+    "edge-12-topics-75mb-persisted-errors",
+    "12-topics-1-partition-1kb-75mb-Iggy-persisted-2026-10-15-13-33-17.json"
+);
+
+pub const OMB_ALL: [&OmbFixture; 6] = [
+    &OMB_RC1_DEFAULT,
+    &OMB_RC1_PERSISTED,
+    &OMB_EDGE8_DEFAULT,
+    &OMB_EDGE8_100_PARTITIONS,
+    &OMB_NO_CONSUMERS,
+    &OMB_PUBLISH_ERRORS,
+];
+
+impl OmbFixture {
+    pub fn id(&self) -> OmbRunId {
+        OmbRunId::of_file(self.json)
+    }
+
+    pub fn result(&self) -> OmbResult {
+        OmbResult::try_from(self.json).expect("fixture results parse")
+    }
+
+    pub fn setup(&self) -> Option<OmbSetup> {
+        self.sidecar.map(|text| {
+            text.parse::<OmbSidecar>()
+                .expect("fixture sidecars parse")
+                .setup
+        })
+    }
+
+    /// The summary that the server sends in `GET /api/omb/runs`.
+    pub fn summary(&self) -> OmbRunSummary {
+        OmbRunSummary::new(
+            self.id(),
+            self.file_name,
+            omb_modified(),
+            &self.result(),
+            self.setup(),
+        )
+    }
+
+    /// The detail that the server sends in `GET /api/omb/runs/{id}`.
+    pub fn detail(&self) -> OmbRunDetail {
+        OmbRunDetail::new(self.summary(), &self.result())
+    }
+}
+
+pub fn omb_modified() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(OMB_MODIFIED)
+        .expect("the test time parses")
+        .with_timezone(&Utc)
+}
+
+/// Every OMB fixture, newest first, as the server lists them.
+pub fn omb_summaries() -> Vec<OmbRunSummary> {
+    let mut runs: Vec<OmbRunSummary> = OMB_ALL.iter().map(|fixture| fixture.summary()).collect();
+    runs.sort_by(|left, right| {
+        right
+            .time
+            .instant
+            .cmp(&left.time.instant)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    runs
+}
+
+/// The answer of `GET /api/omb/runs` for a server with the OMB fixtures.
+pub fn omb_run_list() -> OmbRunList {
+    OmbRunList {
+        enabled: true,
+        runs: omb_summaries(),
+    }
+}
+
+/// `run` as another run of its line, `hours` later and with its own id, for example
+/// `00000000000000aa`.
+pub fn omb_rerun(run: &OmbRunSummary, id: &str, hours: i64) -> OmbRunSummary {
+    let mut rerun = run.clone();
+    rerun.id = id.parse().expect("a test id parses");
+    rerun.time = OmbRunTime {
+        instant: run.time.instant + TimeDelta::hours(hours),
+        ..run.time.clone()
+    };
+    rerun
 }

@@ -15,14 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod omb;
+
 use crate::artifacts;
 use crate::cache::{SeriesBuilder, SeriesKey};
+use crate::github::StarCount;
 use crate::render::{ChartType, EmbedChart, PngRenderPool};
 use crate::{cache::BenchmarkCache, error::IggyBenchDashboardServerError};
 use actix_files::NamedFile;
 use actix_web::http::header::{ContentDisposition, ContentType, DispositionParam, DispositionType};
 use actix_web::{HttpRequest, HttpResponse, get, web};
 use bench_dashboard_shared::config::DashboardConfig;
+use bench_dashboard_shared::github::GithubStars;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use serde::Deserialize;
 use std::io::{self, Write};
@@ -79,6 +83,13 @@ pub async fn get_dashboard_config(
 ) -> Result<HttpResponse> {
     info!("{}: Getting dashboard configuration", get_client_addr(&req));
     Ok(HttpResponse::Ok().json(data.config.as_ref()))
+}
+
+/// The last star count that the server got from GitHub. The top bar asks once per page load, and
+/// the server answers from memory.
+#[get("/api/github/stars")]
+pub async fn get_github_stars(stars: web::Data<StarCount>) -> HttpResponse {
+    HttpResponse::Ok().json(GithubStars { stars: stars.get() })
 }
 
 #[get("/api/benchmark/full/{unique_id}")]
@@ -855,6 +866,31 @@ mod tests {
         assert_eq!(config, expected);
         assert_eq!(config.suites.len(), 3);
         assert_eq!(config.headlines.len(), 4);
+    }
+
+    #[actix_web::test]
+    async fn given_star_count_when_requesting_stars_should_answer_it_or_null_before_first_answer() {
+        let counted = StarCount::default();
+        counted.record(Ok::<_, &str>(5123));
+
+        for (count, expected) in [(StarCount::default(), None), (counted, Some(5123))] {
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(count))
+                    .service(get_github_stars),
+            )
+            .await;
+
+            let stars: GithubStars = test::call_and_read_body_json(
+                &app,
+                test::TestRequest::get()
+                    .uri("/api/github/stars")
+                    .to_request(),
+            )
+            .await;
+
+            assert_eq!(stars.stars, expected);
+        }
     }
 
     #[actix_web::test]

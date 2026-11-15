@@ -129,14 +129,20 @@ impl Thresholds {
 impl ValueRange {
     /// `None` when `runs` is empty or a run lacks the group.
     pub fn of(runs: &[&BenchmarkSummary], metric: Metric, group: GroupMetricsKind) -> Option<Self> {
-        let mut values = runs
+        let values = runs
             .iter()
             .map(|run| run.group(group).map(|metrics| metrics.value(metric)))
             .collect::<Option<Vec<_>>>()?;
+        Self::of_values(values)
+    }
+
+    /// The range of values that don't come from an iggy-bench summary, for example the numbers of
+    /// OMB runs. `None` without values.
+    pub fn of_values(mut values: Vec<f64>) -> Option<Self> {
         values.sort_by(f64::total_cmp);
         let (&min, &max) = (values.first()?, values.last()?);
         let middle = values.len() / 2;
-        let median = if values.len() % 2 == 0 {
+        let median = if values.len().is_multiple_of(2) {
             (values[middle - 1] + values[middle]) / 2.0
         } else {
             values[middle]

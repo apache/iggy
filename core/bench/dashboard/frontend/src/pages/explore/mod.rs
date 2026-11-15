@@ -36,6 +36,7 @@ use self::catalog::{Catalog, ExploreView, FacetCounts, RunRow, ViewStats};
 use self::query::{ExploreQuery, Facet, Scope, Sort};
 use self::tray::{CompareToggle, CompareTray};
 use crate::api::{api_name, from_api_name};
+use crate::components::framework::{Framework, framework_line};
 use crate::components::page::{Crumb, breadcrumbs, data_status, page_head, page_shell};
 use crate::components::run_labels::{
     END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, RELEASE_LABEL, family_mark, version_tag_view,
@@ -44,7 +45,8 @@ use crate::components::select_field::SelectField;
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, use_dashboard_data};
 
-const SEARCH_KEY: &str = "/";
+/// The key that moves the focus to the search box, here and on the OMB run list.
+pub const SEARCH_KEY: &str = "/";
 /// The elements where "/" is text, not the search shortcut.
 const TEXT_FIELD_TAGS: [&str; 2] = ["INPUT", "TEXTAREA"];
 const NO_VALUE: &str = "-";
@@ -52,7 +54,7 @@ const NO_RELEASE: &str = "None";
 
 /// How a view change enters the browser history.
 #[derive(Clone, Copy)]
-enum HistoryEntry {
+pub enum HistoryEntry {
     /// A step that Back undoes.
     Push,
     /// The next key typed into the search. Otherwise every key would add a step.
@@ -138,7 +140,12 @@ pub fn explore() -> Html {
     let content = html! {
         <>
             { page_head(
-                breadcrumbs(&[Crumb::overview()], "Explore"),
+                html! {
+                    <>
+                        { breadcrumbs(&[Crumb::overview()], "Explore") }
+                        { framework_line(Framework::IggyBench) }
+                    </>
+                },
                 Some("Explore"),
                 "Benchmark runs",
                 "Search the saved runs, narrow them by machine, version, kind and conditions, and \
@@ -191,7 +198,7 @@ fn run_row_view(props: &RunRowProps) -> Html {
     html! {
         <li>
             <Link<AppRoute>
-                to={AppRoute::Benchmark { uuid: row.uuid.to_string() }}
+                to={AppRoute::Run { uuid: row.uuid.to_string() }}
                 classes={classes!("explore-row")}
             >
                 <span class="explore-cell explore-run">
@@ -245,7 +252,7 @@ fn run_row_view(props: &RunRowProps) -> Html {
 }
 
 /// "/" moves the focus to the search box, unless the focus is in a field where "/" is text.
-fn focus_search(event: &Event, search_ref: &NodeRef) {
+pub fn focus_search(event: &Event, search_ref: &NodeRef) {
     let Some(event) = event.dyn_ref::<KeyboardEvent>() else {
         return;
     };
