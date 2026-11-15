@@ -775,6 +775,7 @@ impl TryFrom<&OptionDescriptor> for CatalogRow {
         let mutability = match descriptor.mutability {
             OptionMutability::CreateOnly => "create_only",
             OptionMutability::Updatable => "updatable",
+            OptionMutability::EnableOnly => "enable_only",
             OptionMutability::ReadOnly => "read_only",
         };
         let visibility = match descriptor.visibility {

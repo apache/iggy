@@ -19,11 +19,11 @@ use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
 use std::mem;
-use std::pin::{Pin, pin};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker, ready};
 
-use futures::future::{self, Either, FutureExt, LocalBoxFuture};
+use futures::future::{FutureExt, LocalBoxFuture};
 
 use crate::store::ObjectStore;
 use crate::tier::{TierExecutor, TierJobCancelled, TierJobHandle, TierJobRequest};
@@ -103,17 +103,7 @@ impl<S: ObjectStore + 'static> TierExecutor for InlineTierExecutor<S> {
             return TierJobHandle::ready(Err(TierJobCancelled));
         }
         let store = Rc::clone(&self.store);
-        let mut run = async move {
-            let cancelled = pin!(scope.cancelled());
-            let job = pin!(job(store));
-            // Cancellation is polled first, so a job is never polled again
-            // once its scope is cancelled before a poll.
-            match future::select(cancelled, job).await {
-                Either::Left(((), _)) => Err(TierJobCancelled),
-                Either::Right((output, _)) => Ok(output),
-            }
-        }
-        .boxed_local();
+        let mut run = async move { scope.run_until_cancelled(job(store)).await }.boxed_local();
         match run.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(result) => TierJobHandle::ready(result),
             Poll::Pending => TierJobHandle::new(WaitingJob {

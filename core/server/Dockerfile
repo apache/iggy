@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.99.1
+ARG RUST_VERSION=1.100
 ARG ALPINE_VERSION=3.23
 # Source stage of LICENSE-binary in `runtime-prebuilt`. CI test images set
 # `license-skip`: they are never distributed, and cargo-about costs over a

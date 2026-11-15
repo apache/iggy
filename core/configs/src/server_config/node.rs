@@ -21,20 +21,29 @@ use super::COMPONENT;
 use super::cluster::AdvertisedAddress;
 use crate::ConfigurationError;
 use configs::ConfigEnv;
-use iggy_common::Validatable;
+use iggy_common::{IggyByteSize, Validatable};
 use serde::{Deserialize, Serialize};
 
 /// Named to match its roster counterpart: `advertised_address` here and
 /// `cluster.nodes[*].advertised_address` there are the same setting for the
 /// same question, and an operator moving between the two modes should not have
 /// to learn a second spelling.
-#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Client-facing address: a literal IP or a DNS hostname. `None` leaves
     /// the server deriving one from its bind address.
     #[serde(default)]
     pub advertised_address: Option<String>,
+    /// Free space the node keeps on its data disk. While less is free, the
+    /// node refuses new messages for the partitions it leads. `0` disables it.
+    #[serde(default = "default_free_space_reserve")]
+    #[config_env(leaf)]
+    pub free_space_reserve: IggyByteSize,
+}
+
+fn default_free_space_reserve() -> IggyByteSize {
+    NodeConfig::default().free_space_reserve
 }
 
 impl Validatable<ConfigurationError> for NodeConfig {
@@ -59,7 +68,25 @@ mod tests {
     fn advertised(address: &str) -> NodeConfig {
         NodeConfig {
             advertised_address: Some(address.to_owned()),
+            ..NodeConfig::default()
         }
+    }
+
+    #[test]
+    fn default_reserve_matches_the_shipped_config() {
+        assert_eq!(
+            NodeConfig::default().free_space_reserve.as_bytes_u64(),
+            1 << 30
+        );
+    }
+
+    #[test]
+    fn missing_reserve_takes_the_default() {
+        let node: NodeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            node.free_space_reserve,
+            NodeConfig::default().free_space_reserve
+        );
     }
 
     #[test]

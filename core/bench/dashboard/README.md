@@ -1,18 +1,23 @@
 # Apache Iggy Benchmarks Dashboard
 
 A web dashboard for Apache Iggy benchmark results. It reads the reports that `iggy-bench` saves. From them it
-shows which runs are comparable, how each release did, and what changed between two runs or two versions.
+shows which runs are comparable, how each release did, and what changed between two runs or two versions. It can
+also show OpenMessaging Benchmark (OMB) results of Iggy, in a separate part of the site.
 
 ## Features
 
 - The Overview (`/`) shows the headline workloads from `dashboard.toml`: the latest release's numbers, the
   trend across releases, and the change in newer builds.
-- Explore (`/benchmarks`) lists every run, with search and filters for machine, version, kind, topology,
+- Explore (`/explore`) lists every run, with search and filters for machine, version, kind, topology,
   durability and message size.
-- The run page (`/benchmarks/{uuid}`) shows one run: headline numbers against the previous version, charts
-  over the run, every percentile, history across versions, the command to reproduce it, and its files.
-- Compare (`/compare` and `/compare/releases`) puts two or three runs side by side, or two versions across
-  an official suite.
+- The run page (`/runs/{uuid}`) shows one run: headline numbers against the previous version, latency
+  window by window, every percentile, throughput with the rates of the whole run, history across versions,
+  the command to reproduce it, and its files. An old run link, `/benchmarks/{uuid}`, moves to this page.
+- Compare (`/compare?runs={uuid},{uuid}` and `/compare/releases`) puts two or three runs side by side, or
+  two versions across an official suite. The first run in `runs` is the baseline.
+- If the server has an OMB results directory, OMB (`/omb`) lists its OpenMessaging Benchmark runs. The OMB
+  pages use the same paths under `/omb`: `/omb/runs/{id}` for a run and `/omb/compare?runs={id},{id}` to
+  compare runs. See [OpenMessaging Benchmark Results](#openmessaging-benchmark-results).
 - Methodology (`/methodology`) explains how to run `iggy-bench`, and what every number, threshold and badge
   means.
 
@@ -26,8 +31,8 @@ labeled blocks.
 The dashboard is three crates in the Iggy workspace:
 
 - `frontend/`: the Yew web application, built with Trunk
-- `server/`: the Actix-web server. It reads the results directory, serves the JSON API, the embed pages and
-  the PNG charts, and hosts the built frontend
+- `server/`: the Actix-web server. It reads the results directory and the optional OMB results directory,
+  serves the JSON API, the embed pages and the PNG charts, and hosts the built frontend
 - `shared/`: code that the server and the frontend both use, such as the run summary, the workload key, the
   delta rule and the configuration types
 
@@ -50,6 +55,11 @@ The server provides the following HTTP endpoints:
 - `GET /api/config`
   - Get the dashboard configuration file: official suites, headline workloads, and thresholds
   - Response: Configuration JSON
+
+- `GET /api/github/stars`
+  - Get the star count of the Apache Iggy repository for the top bar. The server asks `api.github.com` when it
+    starts and then every hour, so the pages make no request to GitHub. A failed request keeps the last count
+  - Response: `{"stars": 5123}`, or `{"stars": null}` before the first answer from GitHub
 
 ### Benchmark Reports
 
@@ -104,8 +114,42 @@ The server provides the following HTTP endpoints:
   - Response: PNG image. At the default size it is built on the first request and then served from
     `--cache-dir`. Other sizes are built on every request.
 
-`/health` and the `/api` endpoints return JSON, except `/api/artifacts/{uuid}`, which returns a ZIP file. The embed
-endpoints return HTML or PNG. All of them use standard HTTP status codes:
+### OMB Runs
+
+These endpoints serve the OpenMessaging Benchmark runs of `--omb-results-dir`. An OMB run id has 16 lowercase
+hexadecimal characters. A UUID of an `iggy-bench` run is not an OMB run id, so it gets 400.
+
+- `GET /api/omb/runs`
+  - List the OMB runs as summaries, newest first
+  - Response: `{"enabled": true, "runs": [...]}`. Without `--omb-results-dir`, `enabled` is `false` and `runs`
+    is empty
+
+- `GET /api/omb/runs/{id}`
+  - Get one OMB run: its summary, the series with one value per 10 s window, the quantile curves and the
+    aggregated percentiles
+  - Parameters:
+    - `id`: OMB run id
+  - Response: OMB run JSON. The server reads the result file again for each request
+
+- `GET /api/omb/runs/{id}/result.json`
+  - Download the result file of an OMB run
+  - Parameters:
+    - `id`: OMB run id
+  - Response: the bytes of the file as OMB wrote it, as `application/json` with
+    `Content-Disposition: attachment` and the original file name
+
+- `GET /api/omb/runs/{id}/setup.toml`
+  - Download the setup sidecar of an OMB run
+  - Parameters:
+    - `id`: OMB run id
+  - Response: the bytes of the file as it is on the disk, as `application/toml` with
+    `Content-Disposition: attachment`. The file name is the name of the result file with `.setup.toml` in place
+    of `.json`, so the downloads of several runs do not overwrite each other. 404 for a run without a sidecar,
+    and for a sidecar that does not parse or has a key that looks like a secret.
+
+`/health` and the `/api` endpoints return JSON, with three exceptions. `/api/artifacts/{uuid}` returns a ZIP file,
+and the two OMB downloads return the original files. The embed endpoints return HTML or PNG. All of them use
+standard HTTP status codes:
 
 - 200: Success
 - 400: Invalid parameter
@@ -185,6 +229,15 @@ This will start:
 
 Access the development version at <http://localhost:8060>
 
+To show OMB results too, set `OMB_RESULTS_DIR`. The script has no default for it. This example uses the fixtures
+of the repository:
+
+```bash
+RESULTS_DIR=core/bench/dashboard/fixtures/results \
+OMB_RESULTS_DIR=core/bench/dashboard/fixtures/omb \
+./scripts/dashboard/run_dev.sh
+```
+
 ## Running with Docker
 
 The [docker image](https://hub.docker.com/r/apache/iggy-bench-dashboard) is available, and can be fetched via `docker pull apache/iggy-bench-dashboard`.
@@ -241,6 +294,17 @@ With your own dashboard configuration and a cache directory that persists betwee
         apache/iggy-bench-dashboard
   ```
 
+With OMB results from a local `omb_results` directory:
+
+  ```bash
+  docker run -p 8061:80 \
+        -v "$(pwd)/performance_results:/data/performance_results" \
+        -v "$(pwd)/omb_results:/data/omb_results:ro" \
+        --user "$(id -u):$(id -g)" \
+        -e OMB_RESULTS_DIR=/data/omb_results \
+        apache/iggy-bench-dashboard
+  ```
+
 Using a named volume:
 
   ```bash
@@ -259,13 +323,14 @@ Using a named volume:
 
 #### Environment Variables
 
-| Variable      | Default                     | Description                                                         |
-| ------------- | --------------------------- | ------------------------------------------------------------------- |
-| `HOST`        | `0.0.0.0`                   | Server host address                                                 |
-| `PORT`        | `80`                        | Server port                                                         |
-| `RESULTS_DIR` | `/data/performance_results` | Directory for performance results                                   |
-| `CONFIG`      | `/app/dashboard.toml`       | Dashboard configuration file. The image holds the official one      |
-| `CACHE_DIR`   | not set                     | Directory for cached PNG files and artifact zips. See `--cache-dir` |
+| Variable          | Default                     | Description                                                         |
+| ----------------- | --------------------------- | ------------------------------------------------------------------- |
+| `HOST`            | `0.0.0.0`                   | Server host address                                                 |
+| `PORT`            | `80`                        | Server port                                                         |
+| `RESULTS_DIR`     | `/data/performance_results` | Directory for performance results                                   |
+| `CONFIG`          | `/app/dashboard.toml`       | Dashboard configuration file. The image holds the official one      |
+| `CACHE_DIR`       | not set                     | Directory for cached PNG files and artifact zips. See `--cache-dir` |
+| `OMB_RESULTS_DIR` | not set                     | Directory for OMB results. See `--omb-results-dir`                  |
 
 #### Volume Permissions
 
@@ -292,16 +357,17 @@ Options:
       --cors-origins <CORS_ORIGINS>  Allowed CORS origins (comma-separated) [default: *]
       --cache-dir <CACHE_DIR>        Directory for cached PNG files and artifact zips [default: /tmp/iggy-bench-dashboard]
       --config <CONFIG>              Dashboard configuration file: official suites, headline workloads, and thresholds [default: dashboard.toml]
+      --omb-results-dir <DIR>        Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
   -h, --help                         Print help
   -V, --version                      Print version
 ```
 
-The server only reads `--results-dir`. It writes the files it generates to `--cache-dir`: chart PNG files of
-the default size for `/embed/{uuid}/chart.png` under `embed/` and artifact zips for `/api/artifacts/{uuid}`
-under `artifacts/`. Each file is built on the first request and reused later. When a file in a run directory
+The server only reads `--results-dir` and `--omb-results-dir`. It writes the files it generates to
+`--cache-dir`: chart PNG files of the default size for `/embed/{uuid}/chart.png` under `embed/` and artifact
+zips for `/api/artifacts/{uuid}` under `artifacts/`. Each file is built on the first request and reused later. When a file in a run directory
 changes or is removed, the server rebuilds that run's artifact zip. To rebuild the PNG files, delete the
 directory. The default is `iggy-bench-dashboard` in the system temp directory (`$TMPDIR`, usually `/tmp`). If
-`--cache-dir` is inside `--results-dir`, the server does not start.
+`--cache-dir` is inside `--results-dir` or `--omb-results-dir`, the server does not start.
 
 The server reads `--config` at start. The default is `dashboard.toml` in the working directory, and this
 directory holds the file for the official AWS suites. If a run's `suite` label is in `[[suites]]`, the run is
@@ -313,6 +379,118 @@ For development, you can also use environment variables:
 
 - `RUST_LOG`: Control log level and filters
 - `RUST_BACKTRACE`: Enable backtraces (1 = enabled, full = full backtraces)
+
+## OpenMessaging Benchmark Results
+
+The dashboard can show the results of [OpenMessaging Benchmark](https://github.com/openmessaging/benchmark) (OMB)
+runs of Iggy. The OMB pages are a separate part of the site. OMB measures in a different way from
+`iggy-bench`. For example, its megabyte has 1,048,576 bytes, and it takes one sample every 10 seconds. Thus no page
+puts an OMB number next to an `iggy-bench` number. The Methodology page explains the differences.
+
+### Directory Layout
+
+Start the server with `--omb-results-dir <DIR>`. Without this option, the OMB pages show no runs. The directory
+has the layout of the results directory: one run per direct subdirectory.
+
+```text
+omb_results/
+├── 2026-05-04-1-topic-16-partitions/
+│   ├── 1-topic-16-partitions-1kb-Iggy-2026-05-04-10-21-15.json
+│   └── setup.toml
+└── 2026-05-04-1-topic-16-partitions-fsync/
+    └── 1-topic-16-partitions-1kb-Iggy-fsync-2026-05-04-10-48-02.json
+```
+
+- A run directory holds one OMB result file and an optional `setup.toml` sidecar. The server does not look into
+  deeper directories.
+- The content tells the server which file is the result. If a JSON file has the fields `workload`, `driver`,
+  `messageSize`, `topics`, `partitions`, `producersPerTopic`, `consumersPerTopic` and `publishRate`, it is a
+  result. The server ignores all other files.
+- The server skips a directory with two or more results, because the sidecar cannot tell which result it
+  describes, and logs a warning. It also skips a directory without a result, but it logs this only at debug
+  level (`--log-level debug`), so empty directories do not fill the log.
+- Keep the name that OMB gives the file: `<workload file>-<driver>-<yyyy-MM-dd-HH-mm-ss>.json`. The dashboard
+  reads the workload file name and the run time from it. This time is the end of the run, in the local time of
+  the OMB process, with no time zone. For a file with another name, the dashboard uses the modification time.
+- The run id comes from the BLAKE3 hash of the result file. When the file moves, a link to the run stays valid.
+  Two copies of the same file are one run. A changed file gets a new id.
+- The server reads files of up to 64 MiB. It skips symbolic links.
+- `--omb-results-dir` must be a directory of its own. If it is the same as `--results-dir`, or if one of them is
+  inside the other, the server does not start.
+- The server watches the directory. After a change, it waits 5 seconds and then loads the OMB runs again.
+
+The repository holds six real OMB runs of Iggy in this layout, in `core/bench/dashboard/fixtures/omb`.
+[Development Mode](#development-mode) shows how to start the dashboard with them.
+
+### Setup Sidecar
+
+An OMB result does not record the hardware, the Iggy version or the OMB build. The optional `setup.toml` in the
+run directory adds them. Every table and every field is optional. The values below are examples:
+
+```toml
+# Start of the run, RFC 3339 with a time zone. It replaces the time from the file name.
+timestamp = "2026-05-04T10:15:00Z"
+# A free label for a set of runs.
+suite = "nightly"
+
+[environment]
+# For display only.
+label = "Lab cluster, 3 nodes"
+server_instance = "c7i.2xlarge"
+server_nodes = 3
+client_instance = "c7i.xlarge"
+client_hosts = 2
+
+# The Iggy build of the run, as the iggy-bench options --gitref and --gitref-date give it.
+[server]
+version = "0.10.0"
+gitref = "server-0.10.0"
+gitref_date = "2026-05-01T12:00:00Z"
+
+# The OMB build that ran the benchmark. It holds the Iggy driver code.
+[omb]
+gitref = "a1b2c3d"
+gitref_date = "2026-04-20T08:30:00Z"
+
+# Free properties in groups. A group is a table under [properties].
+[properties.kernel]
+"vm.dirty_bytes" = 1073741824
+
+[properties.server]
+data_file_system = "xfs"
+huge_pages = 1024
+```
+
+| Field           | Use on the pages                                                                  |
+| --------------- | --------------------------------------------------------------------------------- |
+| `timestamp`     | The run time, and the order of the runs. `gitref_date` values use the same format |
+| `suite`         | A filter on the run list                                                          |
+| `[environment]` | The Environment section, the run list's Setup column and filter, comparability    |
+| `[server]`      | The Iggy version, its run list filter, the order in the history. Needs `version`  |
+| `[omb]`         | The Environment section, and the comparability of runs                            |
+| `[properties]`  | One card per group on the run page, and one row per property on the compare page  |
+
+If two runs of the same workload have the same values in `[environment]` and the same `[omb] gitref`, they
+compare like for like. If a value that both runs record differs, the setup differs. If a run has no environment
+values, the setup is unknown. The environment `label` and the properties do not count.
+
+Rules for `[properties]`:
+
+- Keys directly under `[properties]` go to the group `Other`.
+- A value is a string, an integer, a float or a boolean. The server drops arrays, deeper tables and dates.
+- The server drops each key and each group whose name contains `password`, `secret` or `token`, in any case.
+- A run has up to 100 properties, and a value has up to 256 characters. The server drops the rest.
+- The pages show the values as written. The compare page names the properties that differ. The reader decides
+  if a property explains a change.
+
+For each value that it drops, the server logs a warning. It ignores unknown fields, so an older dashboard can read
+a sidecar from a newer writer. If the sidecar is not valid TOML, the run loads without it, and the log gets a
+warning.
+
+**The sidecar is public.** The server publishes the file as it is through `GET /api/omb/runs/{id}/setup.toml`.
+Do not put credentials, host names, IP addresses or private paths into it. If the name of a key looks like a
+secret, at any depth of the file, the server keeps it off the pages and does not send the file. The run page then
+offers no setup download.
 
 ## License
 

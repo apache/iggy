@@ -18,6 +18,7 @@
 use super::{Command, ConsensusError, ConsensusHeader, HEADER_SIZE, Operation};
 use crate::primitives::partition_status::PartitionStatusEntry;
 use bytemuck::{CheckedBitPattern, NoUninit};
+use std::mem::offset_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(u8)]
@@ -65,10 +66,24 @@ pub struct PrimaryRebalanceHeader {
     pub ready: u8,
     /// The replica a `PrimaryTransfer` hands off to. Zero in every other kind.
     pub target: u8,
-    pub reserved: [u8; 73],
+    /// On a `MetadataReply`, 1 when the replying node can tier topics. Zero in
+    /// every other kind.
+    ///
+    /// Taken from the head of `reserved`, which every release requires to be
+    /// zero, so two releases that disagree on this byte fail closed. A node
+    /// that predates it sends zero, which reads as not ready. A primary that
+    /// predates it drops a reply that sets it as a reserved-byte violation,
+    /// and that primary admits no tiered topic whatever its peers report.
+    pub tiered_storage_ready: u8,
+    pub reserved: [u8; 72],
 }
 
-const _: () = assert!(size_of::<PrimaryRebalanceHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(size_of::<PrimaryRebalanceHeader>() == HEADER_SIZE);
+    assert!(offset_of!(PrimaryRebalanceHeader, target) == 182);
+    assert!(offset_of!(PrimaryRebalanceHeader, tiered_storage_ready) == 183);
+    assert!(offset_of!(PrimaryRebalanceHeader, reserved) == 184);
+};
 
 impl PrimaryRebalanceHeader {
     pub const NO_QUORUM_EVIDENCE: u64 = u64::MAX;
@@ -127,7 +142,7 @@ impl ConsensusHeader for PrimaryRebalanceHeader {
                 "primary rebalance body checksum and release must be zero".into(),
             ));
         }
-        if self.reserved_frame != [0; 66] || self.reserved != [0; 73] {
+        if self.reserved_frame != [0; 66] || self.reserved != [0; 72] {
             return Err(ConsensusError::InvalidField(
                 "primary rebalance reserved bytes must be zero".into(),
             ));
@@ -150,6 +165,13 @@ impl ConsensusHeader for PrimaryRebalanceHeader {
             return Err(ConsensusError::InvalidField(
                 "primary rebalance probes and grants cannot be ready; replies require 0 or 1"
                     .into(),
+            ));
+        }
+        if self.tiered_storage_ready > 1
+            || (self.tiered_storage_ready != 0 && self.kind != PrimaryRebalanceKind::MetadataReply)
+        {
+            return Err(ConsensusError::InvalidField(
+                "only a metadata reply can report tiered storage readiness, as 0 or 1".into(),
             ));
         }
         if self.kind != PrimaryRebalanceKind::PrimaryTransfer && self.target != 0 {
@@ -197,7 +219,6 @@ impl ConsensusHeader for PrimaryRebalanceHeader {
 mod tests {
     use super::*;
     use aligned_vec::{AVec, ConstAlign};
-    use std::mem::offset_of;
 
     fn header(kind: PrimaryRebalanceKind) -> PrimaryRebalanceHeader {
         let partition = matches!(
@@ -227,7 +248,8 @@ mod tests {
             kind,
             ready: 0,
             target: u8::from(kind == PrimaryRebalanceKind::PrimaryTransfer),
-            reserved: [0; 73],
+            tiered_storage_ready: 0,
+            reserved: [0; 72],
         }
     }
 
@@ -276,7 +298,12 @@ mod tests {
         assert_eq!(offset_of!(PrimaryRebalanceHeader, kind), 180);
         assert_eq!(offset_of!(PrimaryRebalanceHeader, ready), 181);
         assert_eq!(offset_of!(PrimaryRebalanceHeader, target), 182);
-        assert_eq!(offset_of!(PrimaryRebalanceHeader, reserved), 183);
+        assert_eq!(
+            offset_of!(PrimaryRebalanceHeader, tiered_storage_ready),
+            183
+        );
+        assert_eq!(offset_of!(PrimaryRebalanceHeader, reserved), 184);
+        assert_eq!(size_of::<PrimaryRebalanceHeader>(), HEADER_SIZE);
         for kind in [
             PrimaryRebalanceKind::MetadataProbe,
             PrimaryRebalanceKind::MetadataReply,
@@ -303,6 +330,39 @@ mod tests {
                         | PrimaryRebalanceKind::SourceReply
                 );
                 assert_eq!(decoded.validate().is_ok(), ready == 0 || is_reply);
+            }
+        }
+    }
+
+    #[test]
+    fn given_tiered_storage_readiness_when_encoded_should_round_trip_only_on_a_metadata_reply() {
+        for kind in [
+            PrimaryRebalanceKind::MetadataProbe,
+            PrimaryRebalanceKind::MetadataReply,
+            PrimaryRebalanceKind::PartitionProbe,
+            PrimaryRebalanceKind::PartitionReply,
+            PrimaryRebalanceKind::SourceProbe,
+            PrimaryRebalanceKind::SourceReply,
+            PrimaryRebalanceKind::PrimaryTransfer,
+        ] {
+            for tiered_storage_ready in 0..=2 {
+                let mut original = header(kind);
+                original.tiered_storage_ready = tiered_storage_ready;
+                original.seal();
+                let bytes = bytemuck::bytes_of(&original);
+                assert_eq!(bytes[183], tiered_storage_ready);
+                let decoded =
+                    bytemuck::checked::try_from_bytes::<PrimaryRebalanceHeader>(bytes).unwrap();
+                assert_eq!(decoded.tiered_storage_ready, tiered_storage_ready);
+                assert_eq!(*decoded, original);
+                decoded.verify_frame().unwrap();
+                assert_eq!(
+                    decoded.validate().is_ok(),
+                    tiered_storage_ready == 0
+                        || (tiered_storage_ready == 1
+                            && kind == PrimaryRebalanceKind::MetadataReply),
+                    "{kind:?} {tiered_storage_ready}"
+                );
             }
         }
     }
@@ -351,7 +411,7 @@ mod tests {
         valid.seal();
         let mut bytes: AVec<u8, ConstAlign<16>> = AVec::new(16);
         bytes.extend_from_slice(bytemuck::bytes_of(&valid));
-        for offset in [32, 52, 61, 128, 144, 152, 160, 168, 176, 180, 181, 182] {
+        for offset in [32, 52, 61, 128, 144, 152, 160, 168, 176, 180, 181, 182, 183] {
             bytes[offset] ^= 1;
             let corrupted =
                 bytemuck::checked::try_from_bytes::<PrimaryRebalanceHeader>(&bytes).unwrap();
@@ -379,7 +439,9 @@ mod tests {
             |value: &mut PrimaryRebalanceHeader| value.checksum_body = 1,
             |value: &mut PrimaryRebalanceHeader| value.release = 1,
             |value: &mut PrimaryRebalanceHeader| value.reserved_frame[65] = 1,
-            |value: &mut PrimaryRebalanceHeader| value.reserved[72] = 1,
+            |value: &mut PrimaryRebalanceHeader| value.reserved[0] = 1,
+            |value: &mut PrimaryRebalanceHeader| value.reserved[71] = 1,
+            |value: &mut PrimaryRebalanceHeader| value.tiered_storage_ready = 1,
             |value: &mut PrimaryRebalanceHeader| value.nonce = 0,
             |value: &mut PrimaryRebalanceHeader| value.ready = 2,
             |value: &mut PrimaryRebalanceHeader| value.created_revision = 0,

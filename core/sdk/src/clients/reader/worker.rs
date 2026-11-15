@@ -2691,6 +2691,11 @@ impl Worker {
                     }
                 }
             }
+            error if permanent_refusal(&error) => {
+                for &partition in partitions {
+                    self.stop_refused(partition, &error);
+                }
+            }
             error if lasting_refusal(&error) => self.count_lasting(partitions, &error),
             error => {
                 self.retry(partitions);
@@ -2713,16 +2718,11 @@ impl Worker {
             *refusals += 1;
             let refusals = *refusals;
             if refusals >= MAX_LASTING_REFUSALS {
-                self.lasting_refusals.remove(&partition);
                 if lasting_refusal(error) {
-                    self.retry_at.remove(&partition);
-                    self.stopped.insert(partition);
-                    self.interrupt_catch_up(partition);
-                    if !self.report_pending_loss(partition) {
-                        self.report(ReadError::new(Some(partition), error.clone()));
-                    }
+                    self.stop_refused(partition, error);
                     continue;
                 }
+                self.lasting_refusals.remove(&partition);
                 self.report(ReadError::new(Some(partition), error.clone()));
             }
             let delay = backoff(self.config.retry_interval, refusals);
@@ -2730,6 +2730,19 @@ impl Worker {
                 "Partition: {partition} was refused: {error}. It is read again in {delay:?}, refusal {refusals} of {MAX_LASTING_REFUSALS}."
             );
             self.retry_at.insert(partition, Instant::now() + delay);
+        }
+    }
+
+    /// Stops `partition` until a seek. A catch-up in progress reports its range and hands over
+    /// its retained batch first. The stop then reports `error`, or the lost read that a seek to
+    /// `Next` would skip.
+    fn stop_refused(&mut self, partition: u32, error: &IggyError) {
+        self.lasting_refusals.remove(&partition);
+        self.retry_at.remove(&partition);
+        self.stopped.insert(partition);
+        self.interrupt_catch_up(partition);
+        if !self.report_pending_loss(partition) {
+            self.report(ReadError::new(Some(partition), error.clone()));
         }
     }
 
@@ -2930,6 +2943,11 @@ pub(crate) fn lasting_refusal(error: &IggyError) -> bool {
             | IggyError::TopicIdNotFound(..)
             | IggyError::TopicNameNotFound(..)
     )
+}
+
+/// A refusal that no retry changes, so its partition stops at the first one.
+pub(crate) fn permanent_refusal(error: &IggyError) -> bool {
+    matches!(error, IggyError::TieredReadFailed)
 }
 
 /// A refusal that settles by itself: a partition that is not routable yet, a primary that is
@@ -5887,6 +5905,34 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn given_a_tiered_read_failure_when_a_poll_returns_it_should_stop_the_partition_without_a_retry()
+     {
+        let (mut worker, mut receiver) = worker_of(standalone([0]));
+        assert!(worker.apply(assigned(&worker, SESSION, VERSION, [0])));
+
+        worker.complete(polled(
+            &worker,
+            FetchKind::Alone,
+            PollingStrategy::next(),
+            0,
+            Err(IggyError::TieredReadFailed),
+        ));
+
+        assert!(
+            !worker.retry_at.contains_key(&0),
+            "no retry is scheduled for a failure that a retry does not change"
+        );
+        assert!(
+            worker.stopped.contains(&0),
+            "the partition stops until a seek"
+        );
+        worker.flush_errors();
+        let error = next_error(&mut receiver);
+        assert_eq!(error, ReadError::new(Some(0), IggyError::TieredReadFailed));
+        assert!(error.is_lasting_refusal());
+    }
+
     /// A stopped partition reads again only after a seek, and a seek drops what is queued. So a
     /// stop during a catch-up reports the range that the catch-up did not read again, hands over
     /// the retained batch, and reports its own error last: the application takes the batch
@@ -5899,6 +5945,8 @@ mod tests {
             (IggyError::Unauthorized, false),
             (IggyError::HistoryUnavailable, true),
             (IggyError::HistoryUnavailable, false),
+            (IggyError::TieredReadFailed, true),
+            (IggyError::TieredReadFailed, false),
         ];
         for (stop, retained) in cases {
             let case = format!("stop: {stop}, retained batch: {retained}");

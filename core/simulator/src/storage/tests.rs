@@ -1228,7 +1228,7 @@ fn queued_owned_prepares_share_three_file_barriers_without_directory_mutations()
                 PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                     .await
                     .unwrap();
-            persistence.enable_segment_storage(SegmentPosition::default(), 64 * 1024 * 1024);
+            persistence.enable_segment_storage(SegmentPosition::default(), 64 * 1024 * 1024, None);
             let first = owned_prepare(1, 0, 0);
             let mut parent = first.header().checksum;
             persistence.append(first.into_frozen(), true).unwrap();
@@ -1581,7 +1581,7 @@ async fn owned_journal_for_partition() -> (SimStorage, PartitionPrepareJournal<S
             .await
             .unwrap();
     journal
-        .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64)
+        .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64, None)
         .await
         .unwrap();
     (storage, journal)
@@ -1651,7 +1651,7 @@ async fn segment_roll_during_wal_open(operation: StorageOperation) {
             .await
             .unwrap();
     journal
-        .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64)
+        .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64, None)
         .await
         .unwrap();
     let first = owned_prepare(1, 0, 0);
@@ -1823,8 +1823,11 @@ fn persisted_offsets_wait_for_every_buffered_body_sync_and_fence_on_failure() {
                 PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                     .await
                     .unwrap();
-            persistence
-                .enable_segment_storage(SegmentPosition::default(), OWNED_BATCH_BYTES as u64);
+            persistence.enable_segment_storage(
+                SegmentPosition::default(),
+                OWNED_BATCH_BYTES as u64,
+                None,
+            );
             assert!(persistence.start());
             Rc::clone(&persistence).run().await;
             let mut parent = 0;
@@ -1937,6 +1940,119 @@ fn owned_segment_fault_sweep_preserves_acknowledged_bodies_and_checkpoint_bounds
     });
 }
 
+/// Batch stamps that age segment 0 out at op 3 and segment 2 out at op 5.
+const AGED_STAMPS: [u64; 5] = [1_000, 1_050, 1_100, 1_199, 1_200];
+const AGED_MAX_AGE: u64 = 100;
+const AGED_SEGMENT_STARTS: [u64; 3] = [0, 2, 4];
+
+#[test]
+fn given_a_crash_anywhere_across_an_age_roll_when_replaying_should_roll_at_the_same_batches() {
+    block_on(async {
+        let prepares = aged_prepares();
+        let (storage, mut journal) = aged_baseline(&prepares).await;
+        storage.clear_trace();
+        append_aged_from(&mut journal, &prepares, 2).await.unwrap();
+        assert_eq!(aged_segment_starts(&journal), AGED_SEGMENT_STARTS);
+        let trace = storage.trace();
+        let mut cases = 0;
+        for (cut, operation) in trace.iter().enumerate() {
+            for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
+                for crash in [Crash::Process, Crash::PowerLoss] {
+                    for writeback in [false, true] {
+                        let (storage, mut journal) = aged_baseline(&prepares).await;
+                        storage.fail_at(cut, mode);
+                        let _ = append_aged_from(&mut journal, &prepares, 2).await;
+                        drop(journal);
+                        if writeback {
+                            storage.writeback();
+                        }
+                        storage.crash(crash);
+                        let context = format!(
+                            "cut {cut} {operation:?} {mode:?} {crash:?} writeback={writeback}"
+                        );
+                        let mut recovered = PartitionPrepareJournal::open_with_storage(
+                            Path::new(WAL),
+                            42,
+                            7,
+                            storage,
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: {error}"));
+                        let next = recovered.head() + 1;
+                        append_aged_from(&mut recovered, &prepares, next)
+                            .await
+                            .unwrap_or_else(|error| panic!("{context}: {error}"));
+                        assert_eq!(
+                            aged_segment_starts(&recovered),
+                            AGED_SEGMENT_STARTS,
+                            "{context}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("aged segment fault cases: {cases}");
+    });
+}
+
+fn aged_prepares() -> Vec<Message<PrepareHeader>> {
+    let mut parent = 0;
+    (1..)
+        .zip(AGED_STAMPS)
+        .map(|(op, stamp)| {
+            let prepare = stamped_owned_prepare(op, parent, op - 1, stamp);
+            parent = prepare.header().checksum;
+            prepare
+        })
+        .collect()
+}
+
+/// A WAL that rolls by age, holding op 1 checkpointed.
+async fn aged_baseline(
+    prepares: &[Message<PrepareHeader>],
+) -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
+    let storage = storage_for_partition().await;
+    let mut journal =
+        PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+            .await
+            .unwrap();
+    journal
+        .enable_segment_storage(
+            SegmentPosition::default(),
+            (16 * OWNED_BATCH_BYTES) as u64,
+            Some(AGED_MAX_AGE),
+        )
+        .await
+        .unwrap();
+    journal
+        .append(prepares[0].clone().into_frozen())
+        .await
+        .unwrap();
+    journal.checkpoint(1).await.unwrap();
+    (storage, journal)
+}
+
+async fn append_aged_from(
+    journal: &mut PartitionPrepareJournal<SimStorage>,
+    prepares: &[Message<PrepareHeader>],
+    first_op: u64,
+) -> io::Result<()> {
+    for prepare in &prepares[usize::try_from(first_op - 1).unwrap()..] {
+        journal.append(prepare.clone().into_frozen()).await?;
+    }
+    Ok(())
+}
+
+fn aged_segment_starts(journal: &PartitionPrepareJournal<SimStorage>) -> Vec<u64> {
+    let mut starts: Vec<u64> = journal
+        .written_segment_references(0)
+        .map(|(_, reference)| reference.start_offset)
+        .collect();
+    starts.dedup();
+    starts
+}
+
 async fn owned_segment_baseline(
     buffered: bool,
 ) -> (SimStorage, PartitionPrepareJournal<SimStorage>) {
@@ -1946,7 +2062,11 @@ async fn owned_segment_baseline(
             .await
             .unwrap();
     journal
-        .enable_segment_storage(SegmentPosition::default(), (2 * OWNED_BATCH_BYTES) as u64)
+        .enable_segment_storage(
+            SegmentPosition::default(),
+            (2 * OWNED_BATCH_BYTES) as u64,
+            None,
+        )
         .await
         .unwrap();
     let first = owned_prepare(1, 0, 0);
@@ -2137,6 +2257,7 @@ fn adjacent_segment_bodies_share_writes_bounded_by_rotation_and_iov_max() {
                 .enable_segment_storage(
                     SegmentPosition::default(),
                     (batches_per_segment * OWNED_BATCH_BYTES) as u64,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2237,8 +2358,11 @@ fn completed_prefix_validation_remains_available_during_a_pending_append() {
                 PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
                     .await
                     .unwrap();
-            persistence
-                .enable_segment_storage(SegmentPosition::default(), (4 * OWNED_BATCH_BYTES) as u64);
+            persistence.enable_segment_storage(
+                SegmentPosition::default(),
+                (4 * OWNED_BATCH_BYTES) as u64,
+                None,
+            );
             let first = owned_prepare(1, 0, 0).into_frozen();
             persistence.append(first.clone(), durable).unwrap();
             assert!(persistence.start());
@@ -2311,8 +2435,10 @@ fn completed_prefix_validation_remains_available_during_a_pending_append() {
                         start_offset: 2,
                         length: 0,
                         next_offset: 2,
+                        first_timestamp: 0,
                     },
                     (4 * OWNED_BATCH_BYTES) as u64,
+                    None,
                 )),
             );
             assert!(
@@ -2407,6 +2533,7 @@ async fn mutate_owned_segments(
                     Some(second.into_frozen()),
                     SegmentPosition::default(),
                     (2 * OWNED_BATCH_BYTES) as u64,
+                    None,
                 )
                 .await
         }
@@ -2435,7 +2562,8 @@ async fn assert_owned_segments(
         SegmentPosition {
             start_offset: 0,
             length: checkpointed * OWNED_BATCH_BYTES as u64,
-            next_offset: checkpointed
+            next_offset: checkpointed,
+            first_timestamp: 0,
         },
         "{context}"
     );
@@ -2481,6 +2609,15 @@ async fn assert_owned_segments(
 }
 
 pub(super) fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
+    stamped_owned_prepare(op, parent, offset, 0)
+}
+
+fn stamped_owned_prepare(
+    op: u64,
+    parent: u128,
+    offset: u64,
+    timestamp: u64,
+) -> Message<PrepareHeader> {
     let payload = vec![
         u8::try_from(op).unwrap();
         OWNED_BATCH_BYTES - BATCH_HEADER_SIZE - BATCH_MESSAGE_HEADER_SIZE
@@ -2499,6 +2636,7 @@ pub(super) fn owned_prepare(op: u64, parent: u128, offset: u64) -> Message<Prepa
     assert_eq!(namespace.inner(), 42);
     let mut batch = SendMessagesOwned::from_messages(namespace, &messages).unwrap();
     batch.header.base_offset = offset;
+    batch.header.base_timestamp = timestamp;
     batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
     let mut body = vec![0; BATCH_HEADER_SIZE + batch.blob.len()];
     batch.header.encode_into(&mut body[..BATCH_HEADER_SIZE]);
@@ -3128,6 +3266,7 @@ async fn large_body_batch_metrics(prepares: u64) -> PersistenceMetrics {
     persistence.enable_segment_storage(
         SegmentPosition::default(),
         prepares * LARGE_BATCH_BYTES as u64,
+        None,
     );
     assert!(persistence.start());
     Rc::clone(&persistence).run().await;
