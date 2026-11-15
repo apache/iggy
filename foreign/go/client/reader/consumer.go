@@ -46,14 +46,16 @@ type ReceivedMessage struct {
 // CommitAfterMarked only Mark counts. One caller at a time calls Next or runs
 // Consume.
 type IggyConsumer struct {
-	reader    *PartitionReader
-	after     iggcon.CommitAfter
-	auto      bool
-	mu        sync.Mutex
-	batch     *iggcon.PolledMessage
-	index     int
-	uncounted *ReceivedMessage
-	stopping  atomic.Bool
+	reader *PartitionReader
+	after  iggcon.CommitAfter
+	auto   bool
+	mu     sync.Mutex
+	batch  *iggcon.PolledMessage
+	// generation is the generation of its partition that read batch.
+	generation uint64
+	index      int
+	uncounted  *ReceivedMessage
+	stopping   atomic.Bool
 }
 
 // NewIggyConsumer starts the reader of a consumer, which a group member joins
@@ -141,24 +143,21 @@ func (c *IggyConsumer) Mark(checkpoint iggcon.Checkpoint) error {
 	return c.reader.Mark(checkpoint)
 }
 
-// Seek sets the next position of a partition, see PartitionReader.Seek. The
-// messages of the partition that the consumer still holds are dropped.
+// Seek sets the next position of a partition, see PartitionReader.Seek. When
+// the seek moves, also in the background, the consumer drops the messages of
+// the partition that it still holds. A failed seek keeps them.
 func (c *IggyConsumer) Seek(ctx context.Context, partitionID uint32, start iggcon.PollingStrategy) error {
-	c.mu.Lock()
-	store, err := c.reader.startSeek(partitionID, start)
-	if err == nil {
+	return c.reader.seek(ctx, partitionID, start, func(move func()) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		move()
 		if c.batch != nil && c.batch.PartitionId == partitionID {
 			c.batch = nil
 		}
 		if c.uncounted != nil && c.uncounted.PartitionID == partitionID {
 			c.uncounted = nil
 		}
-	}
-	c.mu.Unlock()
-	if err != nil || store == nil {
-		return err
-	}
-	return store(ctx)
+	})
 }
 
 // Partitions are the partitions of the reader.
@@ -194,9 +193,10 @@ func (c *IggyConsumer) take(ctx context.Context) (ReceivedMessage, error) {
 			return ReceivedMessage{}, err
 		}
 		c.mu.Lock()
-		// A seek of the partition that started after the reader handed the batch over drops it.
+		// A seek of the partition that moved after the reader handed the batch over drops it.
 		if c.reader.keeps(batch.PartitionId, generation) {
 			c.batch = batch
+			c.generation = generation
 			c.index = 0
 		}
 		c.mu.Unlock()
@@ -213,7 +213,7 @@ func (c *IggyConsumer) handOverLocked() ReceivedMessage {
 		Checkpoint:  checkpoint,
 		EndsBatch:   at == len(c.batch.Messages)-1,
 	}
-	c.reader.deliverMessage(checkpoint)
+	c.reader.deliverMessage(checkpoint, c.generation)
 	if c.auto && c.after == iggcon.CommitAfterDelivery {
 		c.reader.countDelivered(checkpoint, 1, message.EndsBatch)
 	}

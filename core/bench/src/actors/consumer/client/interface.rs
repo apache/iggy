@@ -36,6 +36,18 @@ pub struct BenchmarkConsumerConfig {
 pub trait ConsumerClient: Send + Sync {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError>;
 
+    /// Returns no batch once `stop` completes. A group member with drained partitions can wait in
+    /// one call until the request timeout, long after the warmup or the run should end.
+    async fn consume_batch_until(
+        &mut self,
+        stop: impl Future<Output = ()>,
+    ) -> Result<Option<BatchMetrics>, IggyError> {
+        tokio::select! {
+            polled = self.consume_batch() => polled,
+            () = stop => Ok(None),
+        }
+    }
+
     /// Starts each partition at offset 0 after warmup. Explicit offsets avoid a race between
     /// separate store and delete requests when a consumer group transfers a partition.
     async fn reset_offsets(&mut self) -> Result<(), IggyError>;

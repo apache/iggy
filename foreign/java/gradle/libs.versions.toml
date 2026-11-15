@@ -20,7 +20,7 @@
 flink = "2.3.0"
 
 # Pinot
-pinot = "1.5.1"
+pinot = "1.6.0"
 
 # Jackson
 jackson = "3.2.4"
@@ -45,7 +45,7 @@ assertj = "3.27.7"
 testcontainers = "2.0.5"
 
 # Netty
-netty = "4.2.19.Final"
+netty = "4.2.20.Final"
 
 # Spotbugs
 spotbugs = "4.10.5"
@@ -55,7 +55,7 @@ typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.10.4"
+spotless = "8.11.0"
 shadow = "9.6.1"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"

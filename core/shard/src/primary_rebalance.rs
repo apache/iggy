@@ -195,6 +195,8 @@ struct Peer {
     nonce: Option<u128>,
     sent_at: Option<Instant>,
     ready_at: Option<Instant>,
+    /// When the peer last reported that it can tier topics.
+    tiered_storage_ready_at: Option<Instant>,
     /// When the peer last answered a probe of this view, ready or not.
     live_at: Option<Instant>,
     answered_at: Option<Instant>,
@@ -269,6 +271,7 @@ impl PrimaryRebalance {
         peer.nonce = None;
         peer.answered_at = peer.sent_at;
         peer.ready_at = (header.ready == 1).then_some(now);
+        peer.tiered_storage_ready_at = (header.tiered_storage_ready == 1).then_some(now);
         peer.live_at = Some(now);
         peer.heard = true;
         peer.replied = true;
@@ -423,6 +426,9 @@ where
         // so no reply handled meanwhile grants a move or credits admission.
         if invalidates {
             self.primary_rebalance.borrow_mut().reset_authority();
+            self.plane
+                .metadata()
+                .observe_tiered_storage_readiness(false);
         }
     }
 
@@ -442,6 +448,7 @@ where
             state.replication = PartitionReplication::default();
             drop(state);
             metadata.observe_replica_readiness(&[]);
+            metadata.observe_tiered_storage_readiness(false);
             if self.id == 0 {
                 metadata
                     .mux_stm
@@ -565,6 +572,19 @@ where
                     &[]
                 });
             }
+            // A tiered topic's partitions can land on any member, so one that
+            // is unheard in this view or whose report aged out counts against
+            // the whole cluster. Published every tick because this node's own
+            // flag can change without any peer's report changing.
+            let tiered_storage_ready = readiness_known
+                && metadata.applied_frontier().tiered_storage_ready()
+                && state.peers.iter().enumerate().all(|(index, peer)| {
+                    index == usize::from(consensus.replica())
+                        || peer
+                            .tiered_storage_ready_at
+                            .is_some_and(|ready| now.duration_since(ready) <= PROBE_TIMEOUT)
+                });
+            metadata.observe_tiered_storage_readiness(tiered_storage_ready);
             if live_nodes != state.live_nodes {
                 state.live_nodes = live_nodes;
                 metadata
@@ -841,6 +861,14 @@ where
                             .applied_frontier()
                             .has_partition_recovery(),
                 );
+                reply.tiered_storage_ready = u8::from(
+                    header.kind == PrimaryRebalanceKind::MetadataProbe
+                        && self
+                            .plane
+                            .metadata()
+                            .applied_frontier()
+                            .tiered_storage_ready(),
+                );
                 let statuses = if header.kind == PrimaryRebalanceKind::MetadataProbe {
                     self.next_reported_statuses()
                 } else {
@@ -858,6 +886,13 @@ where
                             state.quorum_evidence(consensus.quorum_replication()),
                         )
                     };
+                    // The next tick would reach the same verdict, but a create
+                    // prepared before it would still be admitted.
+                    if answered && header.tiered_storage_ready != 1 {
+                        self.plane
+                            .metadata()
+                            .observe_tiered_storage_readiness(false);
+                    }
                     // Only a reply to the outstanding probe carries reports
                     // newer than what the directory already holds.
                     if answered {
@@ -1306,6 +1341,7 @@ const fn probe_header<B: MessageBus>(
         kind: PrimaryRebalanceKind::MetadataProbe,
         ready: 0,
         target: 0,
-        reserved: [0; 73],
+        tiered_storage_ready: 0,
+        reserved: [0; 72],
     }
 }

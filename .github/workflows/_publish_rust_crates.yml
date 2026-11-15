@@ -107,7 +107,6 @@ jobs:
             web/Dockerfile \
             core/server/Dockerfile \
             core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
             core/bench/dashboard/server/Dockerfile
 
           /tmp/copy-latest-from-master.sh apply

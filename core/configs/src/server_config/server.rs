@@ -25,6 +25,7 @@ use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
 use super::sharding::ShardingConfig;
 use super::tcp::TcpConfig;
+use super::tiered_storage::TieredStorageConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::common::http::HttpConfig;
@@ -197,6 +198,8 @@ pub struct ServerConfig {
     pub message_bus: MessageBusConfig,
     #[serde(default)]
     pub external_auth: ExternalAuthConfig,
+    #[serde(default)]
+    pub tiered_storage: TieredStorageConfig,
 }
 
 /// One client-facing listener, as the client-facing address derivation and
@@ -421,6 +424,7 @@ impl SystemPaths for ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tiered_storage::TieredStorageBackend;
     use super::*;
     use figment::Figment;
 
@@ -480,6 +484,67 @@ mod tests {
         unsafe { env::remove_var(NAME) };
         let cfg = cfg.expect("config with the env override deserializes");
         assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
+    }
+
+    /// The shipped file, like every file written before tiered storage, has
+    /// no `[tiered_storage]` table.
+    #[test]
+    fn given_a_config_file_without_tiered_storage_when_loading_should_turn_tiering_off() {
+        let cfg: ServerConfig = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .extract()
+            .expect("embedded TOML deserializes");
+
+        assert_eq!(cfg.tiered_storage.backend, TieredStorageBackend::None);
+        cfg.validate()
+            .expect("a config without tiered storage validates");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_tiered_storage_env_vars_when_loading_should_set_the_section() {
+        let vars = [
+            ("IGGY_TIERED_STORAGE_BACKEND", "s3"),
+            ("IGGY_TIERED_STORAGE_BUCKET", "segments"),
+            ("IGGY_TIERED_STORAGE_REGION", "eu-central-1"),
+            ("IGGY_TIERED_STORAGE_ACCESS_KEY_ID", "AKIDEXAMPLE"),
+            ("IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY", "wJalrXUtnFEMI"),
+            ("IGGY_TIERED_STORAGE_PROGRESS_TIMEOUT", "1 m"),
+            ("IGGY_TIERED_STORAGE_JOBS_UPLOADS", "5"),
+            ("IGGY_TIERED_STORAGE_JOBS_UPLOAD_BYTES", "4 GiB"),
+        ];
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(&name), "{name}");
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        let tiered = &cfg.tiered_storage;
+        assert_eq!(tiered.backend, TieredStorageBackend::S3);
+        assert_eq!(tiered.bucket, "segments");
+        assert_eq!(tiered.region, "eu-central-1");
+        assert_eq!(tiered.access_key_id, "AKIDEXAMPLE");
+        assert_eq!(tiered.secret_access_key, "wJalrXUtnFEMI");
+        assert_eq!(tiered.progress_timeout.get_duration().as_secs(), 60);
+        assert_eq!(tiered.jobs.uploads, 5);
+        assert_eq!(
+            tiered.jobs.upload_bytes.as_bytes_u64(),
+            4 * 1024 * 1024 * 1024
+        );
+        cfg.validate()
+            .expect("an s3 section from the environment validates");
+        assert!(!cfg.to_string().contains("wJalrXUtnFEMI"));
     }
 
     #[test]

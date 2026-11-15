@@ -18,7 +18,7 @@
 use derive_more::derive::Display;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Display, Default, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Display, Default, Hash)]
 pub enum BenchmarkTransport {
     #[default]
     #[display("TCP")]

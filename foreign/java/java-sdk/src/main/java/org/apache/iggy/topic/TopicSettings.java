@@ -39,6 +39,13 @@ final class TopicSettings {
                 .map(HeaderValue::asUint64);
     }
 
+    static Optional<Boolean> bool(
+            Map<String, HeaderValue> options, Map<String, HeaderValue> derived, TopicOptionKey key) {
+        return value(options, derived, key)
+                .filter(value -> value.kind() == HeaderKind.Bool)
+                .map(HeaderValue::asBool);
+    }
+
     static Optional<CompressionAlgorithm> compression(
             Map<String, HeaderValue> options, Map<String, HeaderValue> derived) {
         return value(options, derived, TopicOptionKey.COMPRESSION_ALGORITHM)

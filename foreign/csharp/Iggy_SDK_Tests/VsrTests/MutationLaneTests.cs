@@ -768,7 +768,7 @@ public sealed class MutationLaneTests
 
     /// <summary>
     ///     Enters the progress lanes of <paramref name="partitions" /> in ascending order, the way a fetch that moves a
-    ///     consumer does. A fetch sends header context zero.
+    ///     consumer does. Its header context is zero, as a fetch sends it before the session saw a metadata commit.
     /// </summary>
     private static Task<ClientOperation> FetchAsync(MutationLanes lanes, uint[] partitions, CancellationToken token) =>
         lanes.EnterAsync([.. partitions.Order().Select(partition => new MutationLane(17, partition, Progress: true))],

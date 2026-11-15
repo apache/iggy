@@ -41,8 +41,6 @@ which the host daemon cannot reach.
 
 ${BOLD}Affected tests:${NC}
   - BDD tests:          ./scripts/run-bdd-tests.sh
-  - HTTP sink:          cargo test -p integration -- connectors::http
-  - HTTP config provider: cargo test -p integration -- connectors::http_config_provider
 
 ${BOLD}Workarounds:${NC}
   - Run affected tests on the host directly, outside the devcontainer

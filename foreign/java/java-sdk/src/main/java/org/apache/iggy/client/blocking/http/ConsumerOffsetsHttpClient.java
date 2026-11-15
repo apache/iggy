@@ -56,11 +56,12 @@ class ConsumerOffsetsHttpClient implements ConsumerOffsetsClient {
             Consumer consumer,
             BigInteger offset,
             PartitionContext context) {
+        // A context that is all zero counts as no context.
+        Optional<PartitionContext> named = Optional.of(context).filter(sent -> !sent.equals(PartitionContext.EMPTY));
         store(
                 streamId,
                 topicId,
-                new StoreConsumerOffset(
-                        consumer.id().toString(), Optional.of(partitionId), offset, Optional.of(context)));
+                new StoreConsumerOffset(consumer.id().toString(), Optional.of(partitionId), offset, named));
     }
 
     @Override

@@ -464,7 +464,7 @@ fn validate_nested_tagged_enum_has_prefixed_tag_mapping() {
 #[serial]
 #[tokio::test]
 async fn validate_tagged_enum_deserialization_with_figment() {
-    // TOML with "local" variant (mirrors connectors/runtime/config.toml)
+    // TOML with "local" variant (mirrors runtime/config.toml in apache/iggy-connectors)
     let toml_content = r#"
         [nested]
         config_type = "local"
