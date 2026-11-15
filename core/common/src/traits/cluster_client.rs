@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the cluster module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait ClusterClient {
     /// Get the metadata of the cluster including node information, roles, and status.
     ///
