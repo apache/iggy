@@ -23,11 +23,12 @@ use std::path::{Path, PathBuf};
 use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::MAX_TOPIC_SEGMENT_SIZE;
-use server_common::iobuf::{Frozen, IOV_MAX};
+use server_common::iobuf::{Frozen, IOV_MAX, Owned};
 use server_common::{DISK_USAGE, DiskCharge, unreserved_bytes};
 
 use super::{
-    JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, invalid, segment_path,
+    JournalState, PartitionPrepareJournal, SegmentReference, StoredPrepare, encode_record_into,
+    invalid, segment_path,
 };
 use crate::durable_storage::{DurableFile, DurableStorage, OpenMode};
 
@@ -549,6 +550,57 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.segment_files_dirty = false;
         self.segment_links_dirty = false;
         Ok(())
+    }
+
+    /// Make the records an open kept past an intact frontier durable, then
+    /// publish them.
+    ///
+    /// The process that wrote them is gone, and a sync through a new handle is
+    /// no barrier for its writes. After a failed writeback the pages can stay
+    /// in the cache, clean and unwritten, and that sync succeeds over them. So
+    /// every kept record and body is written again, the bytes this open
+    /// verified at the positions it found them, and the sync covers writes of
+    /// its own. A crash on the way leaves every file as it was.
+    pub(super) async fn sync_kept_tail(&mut self, published_length: u64) -> io::Result<()> {
+        for index in 0..self.recovered_prepares.len() {
+            let prepare = &self.recovered_prepares[index];
+            let Some(entry) = self
+                .entries
+                .get(&prepare.header().op)
+                .copied()
+                .filter(|entry| entry.position >= published_length)
+            else {
+                continue;
+            };
+            let mut record = Owned::zeroed(entry.length);
+            encode_record_into(
+                prepare.as_slice(),
+                entry.reference,
+                self.state.generation,
+                record.as_mut_slice(),
+            )?;
+            if let Some(reference) = entry.reference {
+                let body = prepare.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+                self.open_segment_file(
+                    reference.generation,
+                    reference.start_offset,
+                    reference.position + reference.length,
+                    None,
+                )
+                .await?;
+                self.segment_files
+                    .get_mut(&(reference.generation, reference.start_offset))
+                    .ok_or_else(|| invalid("kept segment handle is absent"))?
+                    .file
+                    .write(reference.position, body)
+                    .await?;
+                self.segment_files_dirty = true;
+                // The names of a segment the kept records rolled into.
+                self.segment_links_dirty = true;
+            }
+            self.file.write_aligned(entry.position, record).await?;
+        }
+        self.sync().await
     }
 
     pub(super) fn retain_active_segment_file(&mut self) {

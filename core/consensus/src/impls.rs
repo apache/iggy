@@ -3946,7 +3946,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             let mut timeouts = self.timeouts.borrow_mut();
             timeouts.stop(TimeoutKind::NormalHeartbeat);
             timeouts.start(TimeoutKind::StartViewChangeMessage);
-            timeouts.start(TimeoutKind::ViewChangeStatus);
+            timeouts.start_view_change_status();
             timeouts.start(TimeoutKind::RequestStartViewMessage);
         }
 
@@ -4050,9 +4050,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             self.begin_view_probe();
             return Vec::new();
         }
-        self.timeouts
-            .borrow_mut()
-            .reset(TimeoutKind::ViewChangeStatus);
+        self.timeouts.borrow_mut().restart_view_change_status();
         self.vote_for_next_view(plane, ViewChangeReason::ViewChangeStatusTimeout)
     }
 
@@ -4095,6 +4093,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
              so no view starts until a quorum of replicas with intact logs, or every replica, \
              reports"
         );
+    }
+
+    /// Restart the countdowns of this replica that wait for its peers. The
+    /// driver calls it on each tick while the view state of this replica waits
+    /// for its own superblock write.
+    ///
+    /// No peer hears of the view from this replica before that write lands, so
+    /// a countdown that runs in that wait ends a view that nobody tried, and
+    /// the next view costs every replica one more write.
+    pub fn hold_peer_timeouts(&self) {
+        match self.status.get() {
+            // A replica that saw a newer view keeps its countdown: it then
+            // probes, which needs no write.
+            Status::ViewChange if !self.has_observed_newer_view() => {
+                self.timeouts.borrow_mut().restart_view_change_status();
+            }
+            // Its `StartView` and its heartbeats wait behind the write, so no
+            // member can answer yet.
+            Status::Normal if self.is_acting_primary() => {
+                self.timeouts.borrow_mut().reset(TimeoutKind::CheckQuorum);
+            }
+            Status::Normal | Status::ViewChange | Status::Recovering => {}
+        }
     }
 
     /// What the prepare timeout has to re-drive, as `(retransmits, local retries)`.
@@ -5476,9 +5497,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 .heartbeat_schedule
                 .get()
                 .backup_wait_ticks(heartbeat_state);
-            self.timeouts
-                .borrow_mut()
-                .start_with(TimeoutKind::NormalHeartbeat, wait);
+            {
+                let mut timeouts = self.timeouts.borrow_mut();
+                timeouts.start_with(TimeoutKind::NormalHeartbeat, wait);
+                timeouts.end_view_change_rounds();
+            }
             if self.votes_to_leave_view() {
                 self.withdraw_view_change_vote();
             }
@@ -5560,9 +5583,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             self.begin_view_probe();
             return;
         }
-        self.timeouts
-            .borrow_mut()
-            .start_with(TimeoutKind::CheckQuorum, expires - now);
+        let mut timeouts = self.timeouts.borrow_mut();
+        timeouts.start_with(TimeoutKind::CheckQuorum, expires - now);
+        timeouts.end_view_change_rounds();
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.
@@ -11384,6 +11407,74 @@ mod check_quorum_tests {
         );
     }
 
+    /// The `StartView` and the heartbeats of a new primary wait behind its
+    /// superblock write, so no member can answer before the write lands.
+    #[test]
+    fn given_a_pending_superblock_write_when_the_quorum_window_passes_should_lead_one_window_after_it_lands()
+     {
+        let consensus = primary(3);
+        for _ in 0..3 * WINDOW_TICKS {
+            consensus.tick_clock().advance();
+            consensus.hold_peer_timeouts();
+            let _ = consensus.tick(PlaneKind::Metadata);
+        }
+        assert!(consensus.is_acting_primary());
+
+        for _ in 1..WINDOW_TICKS {
+            advance_and_tick(&consensus, PlaneKind::Metadata);
+        }
+        assert!(consensus.is_acting_primary());
+        advance_and_tick(&consensus, PlaneKind::Metadata);
+
+        assert_eq!(consensus.status(), Status::Recovering);
+    }
+
+    /// A quorum that answers shows a primary that its view works, so its next
+    /// view change waits one period again.
+    #[test]
+    fn given_view_changes_in_a_row_when_a_quorum_answers_the_new_primary_should_wait_one_period_again()
+     {
+        const ROW: u32 = 3;
+        let consensus = primary(3);
+        {
+            // The view changes that this primary came through.
+            let mut timeouts = consensus.timeouts.borrow_mut();
+            for _ in 0..ROW {
+                timeouts.start_view_change_status();
+            }
+            timeouts.stop(TimeoutKind::ViewChangeStatus);
+        }
+        for _ in 0..WINDOW_TICKS {
+            for action in advance_and_tick(&consensus, PlaneKind::Metadata) {
+                if let VsrAction::SendCommit {
+                    timestamp_monotonic,
+                    ..
+                } = action
+                {
+                    consensus.handle_commit_reply(&reply(1, timestamp_monotonic));
+                }
+            }
+        }
+        assert!(consensus.is_acting_primary());
+
+        let _ = consensus.enter_view_change(
+            PlaneKind::Metadata,
+            1,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+
+        let waited = (1..=u64::from(ROW) * TimeoutManager::VIEW_CHANGE_STATUS_TICKS)
+            .find(|_| {
+                consensus.tick_clock().advance();
+                consensus
+                    .timeouts
+                    .borrow()
+                    .fired(TimeoutKind::ViewChangeStatus)
+            })
+            .expect("the status timeout runs");
+        assert_eq!(waited, TimeoutManager::VIEW_CHANGE_STATUS_TICKS);
+    }
+
     #[test]
     fn given_foreign_or_unsent_replies_when_a_window_expires_should_not_count_them() {
         let valid = reply(1, 1);
@@ -11472,6 +11563,8 @@ mod view_change_vote_tests {
     /// Leads `NEXT_VIEW`.
     const CANDIDATE: u8 = 1;
     const BACKUP: u8 = 2;
+    /// The third view after `VIEW`, which `PRIMARY` leads again.
+    const STARTED_VIEW: u32 = VIEW + 3;
     const PLANE: PlaneKind = PlaneKind::Metadata;
 
     fn replica(replica: u8) -> VsrConsensus<NoopBus, LocalPipeline> {
@@ -11542,6 +11635,145 @@ mod view_change_vote_tests {
         actions
             .iter()
             .any(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
+    }
+
+    /// One tick on which the view state of `consensus` waits for its superblock
+    /// write, as the shard drives it.
+    fn persist_pending_tick(consensus: &VsrConsensus<NoopBus, LocalPipeline>) -> Vec<VsrAction> {
+        consensus.tick_clock().advance();
+        consensus.hold_peer_timeouts();
+        consensus.tick(PLANE)
+    }
+
+    /// Ticks until `consensus` votes for `view`.
+    fn ticks_until_vote(consensus: &VsrConsensus<NoopBus, LocalPipeline>, view: u32) -> u64 {
+        /// The longest status timeout, and one period more.
+        const TICKS_MAX: u64 = 17 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS;
+        (1..=TICKS_MAX)
+            .find(|_| votes_for(&advance_and_tick(consensus, PLANE), view))
+            .expect("a stuck view change votes for the next view")
+    }
+
+    /// No peer hears of a view from a replica before its superblock holds that
+    /// view, so its wait for the peers starts when the write lands.
+    #[test]
+    fn given_a_pending_superblock_write_when_the_status_timeout_passes_should_vote_one_period_after_it_lands()
+     {
+        let consensus = alone_in_next_view(REPLICA_COUNT, BACKUP);
+
+        let pending = (0..2 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS)
+            .flat_map(|_| persist_pending_tick(&consensus))
+            .collect::<Vec<_>>();
+        assert!(!votes_for(&pending, NEXT_VIEW + 1), "{pending:?}");
+        assert!(!consensus.votes_to_leave_view());
+
+        assert_eq!(
+            ticks_until_vote(&consensus, NEXT_VIEW + 1),
+            TimeoutManager::VIEW_CHANGE_STATUS_TICKS
+        );
+    }
+
+    /// The probe of a replica that saw a newer view needs no write, so a
+    /// pending write does not delay it.
+    #[test]
+    fn given_a_newer_view_seen_when_the_superblock_write_waits_should_probe_at_the_status_timeout()
+    {
+        let consensus = alone_in_next_view(REPLICA_COUNT, CANDIDATE);
+        consensus.observe_newer_view(NEXT_VIEW + 1);
+
+        for _ in 1..TimeoutManager::VIEW_CHANGE_STATUS_TICKS {
+            let _ = persist_pending_tick(&consensus);
+        }
+        assert_eq!(consensus.status(), Status::ViewChange);
+        let _ = persist_pending_tick(&consensus);
+
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::Recovering, NEXT_VIEW)
+        );
+    }
+
+    /// A view change that ran out of time under load runs out again after the
+    /// same wait, so each one in a row waits twice as long.
+    #[test]
+    fn given_a_failed_view_change_when_the_next_one_starts_should_wait_two_status_periods() {
+        let consensus = replica(BACKUP);
+        let _ = consensus.enter_view_change(
+            PLANE,
+            NEXT_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        assert_eq!(
+            ticks_until_vote(&consensus, NEXT_VIEW + 1),
+            TimeoutManager::VIEW_CHANGE_STATUS_TICKS
+        );
+
+        let _ = start_view_change(&consensus, CANDIDATE, NEXT_VIEW + 1);
+        assert_eq!(consensus.view(), NEXT_VIEW + 1);
+
+        assert_eq!(
+            ticks_until_vote(&consensus, NEXT_VIEW + 2),
+            2 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS
+        );
+    }
+
+    /// Enters the views up to `STARTED_VIEW` in a row and adopts the
+    /// `StartView` of the last one, which `PRIMARY` leads.
+    fn backup_in_started_view() -> VsrConsensus<NoopBus, LocalPipeline> {
+        let consensus = replica(BACKUP);
+        for view in NEXT_VIEW..=STARTED_VIEW {
+            let _ =
+                consensus.enter_view_change(PLANE, view, ViewChangeReason::ReceivedStartViewChange);
+        }
+        let _ = consensus.handle_start_view(
+            PLANE,
+            test_bus::make_start_view(STARTED_VIEW, 0, 0, PRIMARY, 0).header(),
+            &[],
+        );
+        assert_eq!(
+            (consensus.status(), consensus.view()),
+            (Status::Normal, STARTED_VIEW)
+        );
+        consensus
+    }
+
+    /// A heartbeat of its primary shows a backup that the view works.
+    #[test]
+    fn given_view_changes_in_a_row_when_the_primary_of_the_last_heartbeats_should_wait_one_period_again()
+     {
+        let consensus = backup_in_started_view();
+        let _ = consensus.handle_commit(&make_commit(STARTED_VIEW, PRIMARY, 1));
+
+        let _ = consensus.enter_view_change(
+            PLANE,
+            STARTED_VIEW + 1,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+
+        assert_eq!(
+            ticks_until_vote(&consensus, STARTED_VIEW + 2),
+            TimeoutManager::VIEW_CHANGE_STATUS_TICKS
+        );
+    }
+
+    /// A primary that starts a view under load can step down before a
+    /// heartbeat leaves. The view change after it is one more of the row.
+    #[test]
+    fn given_view_changes_in_a_row_when_the_primary_of_the_last_stays_silent_should_keep_doubling()
+    {
+        let consensus = backup_in_started_view();
+
+        let _ = consensus.enter_view_change(
+            PLANE,
+            STARTED_VIEW + 1,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+
+        // One doubling for each view change of the row before this one.
+        assert_eq!(
+            ticks_until_vote(&consensus, STARTED_VIEW + 2),
+            TimeoutManager::VIEW_CHANGE_STATUS_TICKS << (STARTED_VIEW - VIEW)
+        );
     }
 
     /// A primary that enters a view change keeps the commit timer of its old

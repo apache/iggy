@@ -2774,45 +2774,72 @@ mod tests {
         assert_eq!(persistence.certified_log_view(), Some(VIEW));
     }
 
-    /// A crash between the two barriers of a command can leave the command
-    /// durable above a data op the data log lost. Nothing from the lost op on
-    /// was acknowledged, so both logs drop it, and what stays is still the
-    /// certified view's history.
-    #[compio::test]
-    async fn given_a_data_op_lost_below_a_durable_command_when_reopened_should_drop_the_tail_and_keep_the_certificate()
-     {
-        const VIEW: u32 = 1;
-        let directory = tempdir().unwrap();
-        let wal = directory.path().join("prepares-7");
+    /// The view that [`crash_between_command_barriers`] certifies.
+    const COMMAND_CRASH_VIEW: u32 = 1;
+
+    /// A WAL certified through op 3, then a crash between the two barriers of
+    /// command 5, which left the command durable. The data op 4 below it is
+    /// in the data log, without a barrier, only if `data_op_written`.
+    async fn crash_between_command_barriers(wal: &Path, data_op_written: bool) {
         let first = prepare(1, 0);
         let second = command(2, first.header().checksum);
         let third = prepare(3, second.header().checksum);
-        let lost = prepare(4, third.header().checksum);
-        let durable = command(5, lost.header().checksum);
-        let (persistence, _) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+        let unsynced = prepare(4, third.header().checksum);
+        let durable = command(5, unsynced.header().checksum);
+        let (persistence, _) = PartitionPersistence::open(wal, 42, 7).await.unwrap();
         write(
             &persistence,
             &[(&first, true), (&second, true), (&third, true)],
         )
         .await;
         persistence.checkpoint(2);
-        assert!(!persistence.certify_log_view(VIEW, 3, third.header().checksum));
+        assert!(!persistence.certify_log_view(COMMAND_CRASH_VIEW, 3, third.header().checksum));
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
         assert_eq!(persistence.checkpoint_op(), 2);
-        assert_eq!(persistence.certified_log_view(), Some(VIEW));
+        assert_eq!(persistence.certified_log_view(), Some(COMMAND_CRASH_VIEW));
         drop(persistence);
 
-        let (mut data, mut commands) = open_raw_logs(&wal).await;
-        data.append_buffered(lost.into_frozen()).await.unwrap();
+        let (mut data, mut commands) = open_raw_logs(wal).await;
+        if data_op_written {
+            data.append_buffered(unsynced.into_frozen()).await.unwrap();
+        }
         commands.append(durable.into_frozen()).await.unwrap();
-        drop((data, commands));
+    }
+
+    /// A power loss between the two barriers of a command can leave the
+    /// command durable above a data op the data log lost. Nothing from the
+    /// lost op on was acknowledged, so both logs drop it, and what stays is
+    /// still the certified view's history.
+    #[compio::test]
+    async fn given_a_data_op_lost_below_a_durable_command_when_reopened_should_drop_the_tail_and_keep_the_certificate()
+     {
+        let directory = tempdir().unwrap();
+        let wal = directory.path().join("prepares-7");
+        crash_between_command_barriers(&wal, false).await;
 
         for _ in 0..2 {
             let (persistence, prepares) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
             assert_eq!(ops(&prepares), vec![2, 3]);
             assert_eq!(persistence.head(), 3);
-            assert_eq!(persistence.certified_log_view(), Some(VIEW));
+            assert_eq!(persistence.certified_log_view(), Some(COMMAND_CRASH_VIEW));
+        }
+    }
+
+    /// The same crash of the process alone: the OS still holds the data op,
+    /// so no gap opens below the command and both logs keep their records.
+    #[compio::test]
+    async fn given_an_unsynced_data_op_below_a_durable_command_when_reopened_should_keep_both_logs()
+    {
+        let directory = tempdir().unwrap();
+        let wal = directory.path().join("prepares-7");
+        crash_between_command_barriers(&wal, true).await;
+
+        for _ in 0..2 {
+            let (persistence, prepares) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+            assert_eq!(ops(&prepares), vec![2, 3, 4, 5]);
+            assert_eq!(persistence.head(), 5);
+            assert_eq!(persistence.certified_log_view(), Some(COMMAND_CRASH_VIEW));
         }
     }
 

@@ -1478,11 +1478,26 @@ impl Simulator {
     /// Crash a replica: abort its pump tasks, disable its network links, discard its
     /// outbox. The object stays alive but receives nothing; a following
     /// [`Self::replica_restart`] drops and rebuilds it from the durable superblock,
-    /// which is where volatile state is actually lost and recovered.
+    /// which is where volatile state is actually lost and recovered. Its machine
+    /// loses power, so the WAL keeps only what it synced.
     ///
     /// # Panics
     /// If the replica is already crashed.
     pub fn replica_crash(&mut self, replica_index: u8) {
+        self.stop_replica(replica_index, Crash::PowerLoss);
+    }
+
+    /// Kill a replica's process on a machine that keeps running. As
+    /// [`Self::replica_crash`], but the OS still holds what the process wrote
+    /// to its WAL without a sync, and the restart reads it back.
+    ///
+    /// # Panics
+    /// If the replica is already crashed.
+    pub fn replica_kill(&mut self, replica_index: u8) {
+        self.stop_replica(replica_index, Crash::Process);
+    }
+
+    fn stop_replica(&mut self, replica_index: u8, crash: Crash) {
         assert!(
             !self.crashed.contains(&replica_index),
             "cannot crash replica {replica_index}: already down"
@@ -1502,11 +1517,11 @@ impl Simulator {
         // Discard any unsent messages (never reached the wire).
         self.outboxes[replica_index as usize].drain();
 
-        // Power loss: the WAL keeps only what it synced. Handles the dead
-        // process held go stale, as they do across a real restart.
+        // Handles the dead process held go stale, as they do across a real
+        // restart.
         self.replicas[replica_index as usize]
             .partition_storage
-            .crash(Crash::PowerLoss);
+            .crash(crash);
 
         // Block all network links to/from this process.
         self.network
@@ -19863,6 +19878,9 @@ mod unsynced_power_loss_tests {
     /// Budget of each wait: the view probe of a lone primary, a view change or
     /// a commit.
     const PROGRESS_STEPS: usize = 4_000;
+    /// Steps in which both WAL writers finish the writes that the last
+    /// acknowledgments queued.
+    const WRITE_STEPS: usize = 100;
 
     /// The primary of `namespace` once both replicas run one view.
     fn settled_primary(sim: &Simulator, namespace: IggyNamespace) -> Option<u8> {
@@ -19919,6 +19937,25 @@ mod unsynced_power_loss_tests {
         }
     }
 
+    /// What a replica holds of the sends up to `through_op`: its offsets and the
+    /// checksum of each journaled prepare.
+    fn held(
+        sim: &Simulator,
+        replica: u8,
+        namespace: IggyNamespace,
+        through_op: u64,
+    ) -> (Option<PartitionOffsets>, Vec<(u64, u128)>) {
+        let replica = usize::from(replica);
+        (
+            sim.offsets(replica, namespace),
+            sim.partition_journaled_headers(replica, namespace, 1..=through_op)
+                .into_iter()
+                .flatten()
+                .map(|(op, header)| (op, header.checksum))
+                .collect(),
+        )
+    }
+
     fn describe(sim: &Simulator, namespace: IggyNamespace) -> String {
         format!(
             "states={:?}, offsets={:?}, recorded frontiers={:?}",
@@ -19932,6 +19969,104 @@ mod unsynced_power_loss_tests {
                 .map(|replica| recorded_frontier(sim, replica, namespace))
                 .collect::<Vec<_>>()
         )
+    }
+
+    /// The twin of the power loss below. The processes die and the machines
+    /// keep running, so the OS still holds what each WAL wrote without a sync,
+    /// and the restart must keep it and elect on it.
+    #[test]
+    fn given_a_replicated_pair_whose_processes_were_killed_when_restarted_should_keep_the_sends_its_wal_had_not_synced()
+     {
+        let (mut sim, client) = sized_cluster(SEED, REPLICAS, 1);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.set_partition_durability(namespace, Durability::Replicated);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+
+        let primary = (0..PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                settled_primary(&sim, namespace)
+            })
+            .expect("the fresh pair elects a primary");
+        let mut kept_op = 0;
+        for _ in 0..LOST_SENDS {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                primary,
+                client.send_messages(namespace, &[Bytes::from_static(b"kept")]),
+            );
+            assert_eq!(reply.header().status, 0);
+            kept_op = reply.header().commit;
+        }
+        // An acknowledgment leaves once its WAL write is queued, and a kill
+        // takes a write that is still queued.
+        for _ in 0..WRITE_STEPS {
+            sim.step();
+        }
+        let before: Vec<_> = (0..REPLICAS)
+            .map(|replica| held(&sim, replica, namespace, kept_op))
+            .collect();
+        assert!(
+            before
+                .iter()
+                .all(|(_, journaled)| journaled.len() as u64 == LOST_SENDS),
+            "every member journals the sends before the kill: {before:?}"
+        );
+
+        for replica in 0..REPLICAS {
+            sim.replica_kill(replica);
+        }
+        for replica in 0..REPLICAS {
+            sim.replica_restart_losing_unsynced_messages(replica);
+        }
+        let after: Vec<_> = (0..REPLICAS)
+            .map(|replica| held(&sim, replica, namespace, kept_op))
+            .collect();
+        assert_eq!(
+            after,
+            before,
+            "a member lost sends that the OS still held: {}",
+            describe(&sim, namespace)
+        );
+
+        let reply =
+            commit_send(&mut sim, &client, namespace, PROGRESS_STEPS).unwrap_or_else(|| {
+                panic!(
+                    "the pair never committed a send after the restart: {}",
+                    describe(&sim, namespace)
+                )
+            });
+        assert_eq!(reply.header().status, 0);
+        let committed_op = reply.header().commit;
+        assert!(
+            committed_op > kept_op,
+            "the new send must land behind the kept ones, not in their place"
+        );
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                (0..REPLICAS).all(|replica| {
+                    sim.partition_consensus_state(usize::from(replica), namespace)
+                        .is_some_and(|state| state.commit_min >= committed_op)
+                })
+            }),
+            "a member never committed the send: {}",
+            describe(&sim, namespace)
+        );
+        for replica in 0..REPLICAS {
+            assert_eq!(
+                held(&sim, replica, namespace, kept_op).1,
+                before[usize::from(replica)].1,
+                "replica {replica} replaced a kept send after the election"
+            );
+        }
+        assert_eq!(
+            sim.offsets(0, namespace),
+            sim.offsets(1, namespace),
+            "the members hold the sends at different offsets"
+        );
     }
 
     #[test]

@@ -47,6 +47,10 @@ const STOPPED: u64 = u64::MAX;
 /// retransmit waits at most 16 periods plus jitter.
 const PREPARE_BACKOFF_SHIFT_MAX: u32 = 4;
 
+/// The view-change status timeout doubles at most this many times, so a
+/// view change waits at most 16 periods for the peers.
+const VIEW_CHANGE_STATUS_BACKOFF_SHIFT_MAX: u32 = 4;
+
 /// Consensus ticks so far. Clones share one count, so every group of one
 /// driver reads the same time.
 #[derive(Debug, Clone, Default)]
@@ -163,8 +167,12 @@ pub struct TimeoutManager {
     view_change_status: Timeout,
     request_start_view_message: Timeout,
     /// Prepare backoffs since the prepare timeout last started, reset or
-    /// stopped. Only Prepare backs off, so one counter serves.
+    /// stopped.
     prepare_attempts: u32,
+    /// View changes that the replica entered since a view last worked for it,
+    /// see [`Self::end_view_change_rounds`]. Each one after the first doubles
+    /// the status timeout.
+    view_change_rounds: u32,
 }
 
 impl TimeoutManager {
@@ -217,6 +225,7 @@ impl TimeoutManager {
             view_change_status: Timeout::new(Self::VIEW_CHANGE_STATUS_TICKS),
             request_start_view_message: Timeout::new(Self::REQUEST_START_VIEW_MESSAGE_TICKS),
             prepare_attempts: 0,
+            view_change_rounds: 0,
         }
     }
 
@@ -259,9 +268,11 @@ impl TimeoutManager {
 
     /// Override the view-change status backstop (`[cluster]
     /// view_change_status_timeout`), in consensus ticks. A view change stalled
-    /// this long escalates to a fresh cluster-wide election. Replaces the
-    /// timeout object, so any countdown already in flight is discarded: call
-    /// before the replica starts ticking (i.e. before `init`).
+    /// this long escalates to a fresh cluster-wide election, and each view
+    /// change in a row doubles the wait, see
+    /// [`Self::start_view_change_status`]. Replaces the timeout object, so any
+    /// countdown already in flight is discarded: call before the replica
+    /// starts ticking (i.e. before `init`).
     pub const fn set_view_change_status_ticks(&mut self, ticks: u64) {
         self.view_change_status = Timeout::new(ticks);
     }
@@ -396,9 +407,49 @@ impl TimeoutManager {
         self.prepare.rearm(now, backoff.saturating_add(jitter));
     }
 
+    /// Start the status timeout of a view change that the replica enters.
+    ///
+    /// Each view change since [`Self::end_view_change_rounds`] doubles the
+    /// period, up to 16 times the configured one. A view change that ran out
+    /// of time because the replicas were slow runs out again after the same
+    /// wait, and each one costs every replica a superblock write.
+    pub fn start_view_change_status(&mut self) {
+        self.view_change_rounds = self.view_change_rounds.saturating_add(1);
+        let (now, period) = (self.clock.now(), self.view_change_status_period());
+        self.view_change_status.start_with(now, period);
+    }
+
+    /// Restart the running status timeout with the period of the view change
+    /// in progress.
+    ///
+    /// # Panics
+    /// In debug builds, if the status timeout is stopped.
+    pub fn restart_view_change_status(&mut self) {
+        let (now, period) = (self.clock.now(), self.view_change_status_period());
+        self.view_change_status.rearm(now, period);
+    }
+
+    /// A view works for the replica: its primary heartbeats, or a quorum
+    /// answers it as the primary. Its next view change waits the configured
+    /// period.
+    ///
+    /// Normal status alone is no proof. A primary that starts a view under load
+    /// can step down before any message of the view leaves it.
+    pub const fn end_view_change_rounds(&mut self) {
+        self.view_change_rounds = 0;
+    }
+
     #[must_use]
     pub const fn is_ticking(&self, kind: TimeoutKind) -> bool {
         self.get(kind).is_ticking()
+    }
+
+    fn view_change_status_period(&self) -> u64 {
+        let shift = self
+            .view_change_rounds
+            .saturating_sub(1)
+            .min(VIEW_CHANGE_STATUS_BACKOFF_SHIFT_MAX);
+        self.view_change_status.after.saturating_mul(1 << shift)
     }
 
     const fn clear_backoff(&mut self, kind: TimeoutKind) {
@@ -647,6 +698,61 @@ mod tests {
         timeouts.start(TimeoutKind::Prepare);
         assert_eq!(
             ticks_until_fired(&clock, &timeouts, TimeoutKind::Prepare),
+            AFTER
+        );
+    }
+
+    #[test]
+    fn given_view_changes_in_a_row_when_each_starts_its_status_timeout_should_double_it_until_the_cap()
+     {
+        let (clock, mut timeouts) = manager();
+        timeouts.set_view_change_status_ticks(AFTER);
+        for round in 0..=VIEW_CHANGE_STATUS_BACKOFF_SHIFT_MAX + 2 {
+            timeouts.start_view_change_status();
+            assert_eq!(
+                ticks_until_fired(&clock, &timeouts, TimeoutKind::ViewChangeStatus),
+                AFTER << round.min(VIEW_CHANGE_STATUS_BACKOFF_SHIFT_MAX),
+                "view change {round} of the row"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_second_view_change_in_a_row_when_its_status_timeout_restarts_should_wait_two_periods()
+     {
+        let (clock, mut timeouts) = manager();
+        timeouts.set_view_change_status_ticks(AFTER);
+        timeouts.start_view_change_status();
+        timeouts.start_view_change_status();
+        advance(&clock, AFTER);
+
+        timeouts.restart_view_change_status();
+
+        assert_eq!(
+            ticks_until_fired(&clock, &timeouts, TimeoutKind::ViewChangeStatus),
+            2 * AFTER
+        );
+    }
+
+    #[test]
+    fn given_view_changes_in_a_row_when_the_row_ends_should_wait_one_period_again() {
+        let (clock, mut timeouts) = manager();
+        timeouts.set_view_change_status_ticks(AFTER);
+        timeouts.start_view_change_status();
+        timeouts.start_view_change_status();
+        timeouts.stop(TimeoutKind::ViewChangeStatus);
+        timeouts.start_view_change_status();
+        assert_eq!(
+            ticks_until_fired(&clock, &timeouts, TimeoutKind::ViewChangeStatus),
+            4 * AFTER,
+            "a stop alone must not end the row"
+        );
+
+        timeouts.end_view_change_rounds();
+        timeouts.start_view_change_status();
+
+        assert_eq!(
+            ticks_until_fired(&clock, &timeouts, TimeoutKind::ViewChangeStatus),
             AFTER
         );
     }

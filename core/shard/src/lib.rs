@@ -22,7 +22,7 @@ pub mod coordinator;
 pub mod host;
 pub mod metrics;
 mod partition_io;
-pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
+pub use partition_io::{DEFAULT_PARTITION_IO_CAPACITY, PartitionIoLimits, PartitionIoLimitsError};
 mod object_deletes;
 mod poll;
 mod primary_rebalance;
@@ -10057,6 +10057,9 @@ where
                     let _ = partition.extend_offset_reservation().await;
                 }
                 let _ = partition.persist_superblock_if_needed().await;
+                if partition.view_persist_pending() {
+                    partition.consensus().hold_peer_timeouts();
+                }
             }
             if let Some(partition) = partitions.get_io_owner(namespace)
                 && partition.needs_io_retry()
@@ -14179,9 +14182,9 @@ const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 /// A node that dies takes the primary of every group it led, and the heartbeat
 /// timers of those groups fire on a few ticks. Each vote that a peer joins
 /// becomes a view change: two superblock writes per replica through the
-/// partition I/O lane, on a status timer that votes for the next view after
-/// `view_change_status_timeout`. More view changes than the lane finishes in
-/// that time turn into a second round of them.
+/// partition I/O lane. A replica that waits `view_change_status_timeout` for
+/// the writes of its peers votes for the next view, so more view changes than
+/// the lane finishes in that time turn into a second round of them.
 ///
 /// Only the vote of the heartbeat timeout is held, and its timer stays fired,
 /// so the sweep asks again on every tick. A backup with a held vote still joins

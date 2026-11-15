@@ -185,8 +185,10 @@ handoff and still waits for the timeout.
 When a node fails, each partition it led elects a new primary after a heartbeat
 timeout. Each shard starts at most 4 of these elections per 10 ms tick, and none
 while 128 of its partitions are in a view change. A view change stops counting
-after `cluster.view_change_status_timeout` (5 s by default). Thus partitions
-that lost their quorum do not stop the elections of other partitions.
+once `cluster.view_change_status_timeout` (5 s by default) passes after its
+replica wrote the new view to disk. Each view change in a row doubles that
+time, up to 16x. Thus partitions that lost their quorum do not stop the
+elections of other partitions.
 `/metrics` reports `partitions_in_view_change`, every partition of a shard in a
 view change, and `partition_view_change_votes_held`, the elections it holds
 back.

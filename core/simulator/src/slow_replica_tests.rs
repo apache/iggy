@@ -41,12 +41,14 @@ use bytes::Bytes;
 use consensus::{PartitionsHandle, Status, TimeoutManager};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader, RequestPreparesHeader};
 use server_common::sharding::IggyNamespace;
+use shard::{CONSENSUS_TICK_INTERVAL, DEFAULT_PARTITION_IO_CAPACITY};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::Simulator;
 use crate::client::SimClient;
 use crate::packet::{Packet, ProcessId};
 use crate::partition_repair_driver_tests::cluster;
+use crate::tests::submit_and_wait_for_reply;
 use crate::workload::{
     self, Workload,
     invariants::Invariants,
@@ -98,6 +100,17 @@ const MANY_GROUPS: usize = 24;
 /// Before `STABLE_INTERVAL` of the rebalancer (500 ticks), so it moved no
 /// primary yet.
 const QUIET_TICKS: u64 = 300;
+/// Four groups for each superblock write that a shard runs at a time, so the
+/// write of a group waits for up to three others.
+const QUEUED_GROUPS: usize = 4 * DEFAULT_PARTITION_IO_CAPACITY;
+/// The last group of the queue waits four writes, 800 ticks: past one
+/// `VIEW_CHANGE_STATUS_TICKS` (500) and inside two.
+const SUPERBLOCK_WRITE_TICKS: u32 = 200;
+/// One view change that fails on the wait and one that completes. A wait past
+/// two status periods costs one more.
+const RESTART_VIEW_CHANGES_MAX: u32 = 2;
+/// 200 s of virtual time.
+const RESTART_TICKS_MAX: u64 = 20_000;
 /// Past `NORMAL_HEARTBEAT_TICKS` (500): the cut lasts long enough that the
 /// group replica 2 led fails over and replica 2 starts a view change itself.
 const CUT_TICKS: u64 = 600;
@@ -420,6 +433,87 @@ fn given_a_crashed_primary_of_many_groups_should_hold_votes_and_change_each_view
         vec![Some(view + 1); MANY_GROUPS],
         "the view in which a survivor first led each group"
     );
+}
+
+/// Every replica restarts with more groups than its I/O lane has slots, and
+/// each superblock write takes long enough that the last group of the queue
+/// waits past one status timeout. A replica that gives up on a view while its
+/// own write still waits leaves a view that no peer heard of, and the next
+/// view costs every replica one more write in the same queue.
+///
+/// The first view fails for every group: its primary needs a second write,
+/// behind the first write of every group, before its `StartView` leaves. The
+/// second view has twice the time and completes.
+#[test]
+fn given_slow_superblock_writes_when_every_replica_restarts_should_change_each_view_at_most_twice()
+{
+    let (mut sim, client) = cluster(SEED);
+    sim.register_client_with_primary(&client);
+    let namespaces: Vec<_> = (0..QUEUED_GROUPS)
+        .map(|partition| IggyNamespace::new(1, 1, partition))
+        .collect();
+    for &namespace in &namespaces {
+        sim.init_partition(namespace);
+    }
+    for _ in 0..QUIET_TICKS {
+        sim.step();
+    }
+    let views: Vec<u32> = namespaces
+        .iter()
+        .map(|&namespace| highest_view(&sim, namespace))
+        .collect();
+    set_superblock_write_ticks(&sim, SUPERBLOCK_WRITE_TICKS);
+    for replica in 0..sim.replica_count {
+        sim.replica_crash(replica);
+    }
+    for replica in 0..sim.replica_count {
+        sim.replica_restart(replica);
+    }
+
+    // A view after the one in which a group first serves again is a move of
+    // the rebalancer.
+    let mut served_in: Vec<Option<u32>> = vec![None; namespaces.len()];
+    for _ in 0..RESTART_TICKS_MAX {
+        if !served_in.contains(&None) {
+            break;
+        }
+        sim.step();
+        for (served, &namespace) in served_in.iter_mut().zip(&namespaces) {
+            if served.is_none() {
+                *served = serving_view(&sim, namespace);
+            }
+        }
+    }
+    let changes: Vec<Option<u32>> = served_in
+        .iter()
+        .zip(&views)
+        .map(|(served, &view)| served.map(|served| served - view))
+        .collect();
+    assert!(
+        changes
+            .iter()
+            .all(|changes| changes.is_some_and(|changes| changes <= RESTART_VIEW_CHANGES_MAX)),
+        "view changes of each group until it served again, `None` for a group that did not \
+         within {RESTART_TICKS_MAX} ticks of the restart: {changes:?}"
+    );
+
+    // A hold that never opens also keeps the views low, so a group must
+    // commit again.
+    set_superblock_write_ticks(&sim, 0);
+    for _ in 0..2 * SUPERBLOCK_WRITE_TICKS {
+        sim.step();
+    }
+    let namespace = namespaces[QUEUED_GROUPS - 1];
+    let primary = (0..RESTART_TICKS_MAX)
+        .find_map(|_| {
+            sim.step();
+            serving_primary(&sim, namespace)
+        })
+        .expect("the last group of the queue has a primary after the restart");
+    sim.discover_partition_contexts(&client);
+    let request = client.send_messages(namespace, &[Bytes::from_static(b"after-restart")]);
+    let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+    assert_eq!(reply.header().status, 0);
 }
 
 /// The rebalancer plans a round of moves per probe interval. One move per
@@ -866,6 +960,37 @@ fn highest_view(sim: &Simulator, namespace: IggyNamespace) -> u32 {
         .map(|state| state.view)
         .max()
         .unwrap_or(0)
+}
+
+/// Makes every superblock write of a partition group take `ticks` from now
+/// on, on every replica.
+fn set_superblock_write_ticks(sim: &Simulator, ticks: u32) {
+    for replica in &sim.replicas {
+        for (_, superblock) in replica.partition_superblocks.borrow().values() {
+            superblock.set_write_delay(sim.executor.timer(), CONSENSUS_TICK_INTERVAL * ticks);
+        }
+    }
+}
+
+/// The view in which `namespace` serves: a primary and a quorum of the
+/// replicas run in normal status in it.
+fn serving_view(sim: &Simulator, namespace: IggyNamespace) -> Option<u32> {
+    let states: Vec<_> = (0..sim.replica_count)
+        .filter_map(|replica| sim.partition_consensus_state(usize::from(replica), namespace))
+        .filter(|state| state.status == Status::Normal)
+        .collect();
+    let view = states.iter().find(|state| state.is_primary)?.view;
+    let quorum = usize::from(sim.replica_count) / 2 + 1;
+    (states.iter().filter(|state| state.view == view).count() >= quorum).then_some(view)
+}
+
+/// The replica that leads `namespace` in the view in which it serves.
+fn serving_primary(sim: &Simulator, namespace: IggyNamespace) -> Option<u8> {
+    let view = serving_view(sim, namespace)?;
+    (0..sim.replica_count).find(|&replica| {
+        sim.partition_consensus_state(usize::from(replica), namespace)
+            .is_some_and(|state| state.is_primary && state.view == view)
+    })
 }
 
 /// The highest view replicas 0 and 1 hold for `namespace`.
