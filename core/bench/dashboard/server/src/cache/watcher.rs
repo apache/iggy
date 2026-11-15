@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::BenchmarkCache;
 use crate::error::IggyBenchDashboardServerError;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -35,10 +34,13 @@ pub struct CacheWatcher {
 }
 
 impl CacheWatcher {
-    pub fn new(
-        cache: Arc<BenchmarkCache>,
-        results_dir: PathBuf,
-    ) -> Result<Self, IggyBenchDashboardServerError> {
+    /// Watches `results_dir` and calls `reload` on a blocking thread after its files change. The
+    /// server starts one watcher per results directory, so a change reloads only the runs of
+    /// that directory.
+    pub fn new<F>(reload: F, results_dir: PathBuf) -> Result<Self, IggyBenchDashboardServerError>
+    where
+        F: Fn() -> Result<(), IggyBenchDashboardServerError> + Send + Sync + 'static,
+    {
         // The one slot keeps a change that comes during a reload, so one more reload follows.
         // The changes after it find the slot full, and that reload covers them too.
         let (changes, pending_changes) = mpsc::channel(1);
@@ -61,26 +63,29 @@ impl CacheWatcher {
             .watch(&results_dir, RecursiveMode::Recursive)
             .map_err(|e| IggyBenchDashboardServerError::InvalidPath(e.to_string()))?;
 
-        tokio::spawn(reload_on_change(cache, pending_changes, RELOAD_DELAY));
+        tokio::spawn(reload_on_change(
+            Arc::new(reload),
+            pending_changes,
+            RELOAD_DELAY,
+        ));
 
         Ok(Self { _watcher: watcher })
     }
 }
 
 /// Runs one reload at a time, so two loads never race to swap in their runs.
-async fn reload_on_change(
-    cache: Arc<BenchmarkCache>,
-    mut pending_changes: Receiver<()>,
-    delay: Duration,
-) {
+async fn reload_on_change<F>(reload: Arc<F>, mut pending_changes: Receiver<()>, delay: Duration)
+where
+    F: Fn() -> Result<(), IggyBenchDashboardServerError> + Send + Sync + 'static,
+{
     while pending_changes.recv().await.is_some() {
         sleep(delay).await;
         // The load below reads after every change so far. A change from here on refills the slot.
         let _ = pending_changes.try_recv();
         info!("Reloading cache...");
 
-        let cache = Arc::clone(&cache);
-        match spawn_blocking(move || cache.load()).await {
+        let reload = Arc::clone(&reload);
+        match spawn_blocking(move || reload()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => error!("Failed to reload cache: {}", e),
             Err(e) => error!("Cache reload task failed: {}", e),
@@ -91,7 +96,10 @@ async fn reload_on_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::BenchmarkCache;
     use crate::config;
+    use crate::omb::OmbCache;
+    use crate::omb::test_fixtures::{NO_CONSUMERS, RC1_DEFAULT};
     use std::path::Path;
     use std::time::Instant;
     use uuid::Uuid;
@@ -141,11 +149,11 @@ mod tests {
             config.thresholds,
         ));
         let (changes, pending_changes) = mpsc::channel(1);
-        let reloads = tokio::spawn(reload_on_change(
-            Arc::clone(&cache),
-            pending_changes,
-            Duration::ZERO,
-        ));
+        let reload = {
+            let cache = Arc::clone(&cache);
+            Arc::new(move || cache.load())
+        };
+        let reloads = tokio::spawn(reload_on_change(reload, pending_changes, Duration::ZERO));
 
         copy_fixture_run(FIRST_RUN_DIR, results_dir.path());
         changes.send(()).await.expect("the reload task runs");
@@ -164,5 +172,34 @@ mod tests {
         let mut expected = vec![run(FIRST_RUN), run(SECOND_RUN)];
         expected.sort_unstable();
         assert_eq!(listed_runs(&cache), expected);
+    }
+
+    #[tokio::test]
+    async fn given_omb_run_written_after_load_when_changes_stop_should_reload_omb_runs() {
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        RC1_DEFAULT.copy_into(results_dir.path());
+        let cache = Arc::new(OmbCache::new(results_dir.path().to_path_buf()));
+        cache.load().expect("the OMB results directory is readable");
+        let (changes, pending_changes) = mpsc::channel(1);
+        let reload = {
+            let cache = Arc::clone(&cache);
+            Arc::new(move || cache.load())
+        };
+        let reloads = tokio::spawn(reload_on_change(reload, pending_changes, Duration::ZERO));
+
+        NO_CONSUMERS.copy_into(results_dir.path());
+        changes.send(()).await.expect("the reload task runs");
+        drop(changes);
+        reloads
+            .await
+            .expect("the reload task ends after the last change");
+
+        let runs: Vec<_> = cache
+            .run_list()
+            .runs
+            .iter()
+            .map(|summary| summary.id)
+            .collect();
+        assert_eq!(runs, [RC1_DEFAULT.id(), NO_CONSUMERS.id()]);
     }
 }

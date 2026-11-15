@@ -17,7 +17,8 @@
 
 //! How to run `iggy-bench` and how to read the dashboard, for readers outside the field. Each fact
 //! comes from the bench, server or `shared` crate code. The thresholds and suites come from
-//! `/api/config`, so the page never repeats them.
+//! `/api/config`, so the page never repeats them. The last section explains the OpenMessaging
+//! Benchmark results and why their numbers don't compare with the iggy-bench numbers.
 
 use crate::components::command_block::CommandBlock;
 use crate::components::page::{Crumb, breadcrumbs, loadable, page_head, page_shell, section_head};
@@ -27,10 +28,16 @@ use crate::state::data::{Loadable, use_dashboard_data};
 use bench_dashboard_shared::config::{DashboardConfig, Thresholds};
 use bench_dashboard_shared::identity::KindFamily;
 use bench_dashboard_shared::metrics::Badge;
+use bench_dashboard_shared::omb::compare::OmbComparability;
+use bench_dashboard_shared::omb::summary::OmbBadge;
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use yew::prelude::*;
+use yew_router::prelude::use_location;
 
-static SECTIONS: [NavSection; 5] = [
+/// The id of the OpenMessaging Benchmark section, which the OMB banner links to.
+pub const OMB_SECTION_ID: &str = "omb";
+
+static SECTIONS: [NavSection; 6] = [
     NavSection {
         id: "quick-start",
         label: "Quick start",
@@ -50,6 +57,10 @@ static SECTIONS: [NavSection; 5] = [
     NavSection {
         id: "results",
         label: "Recorded results",
+    },
+    NavSection {
+        id: OMB_SECTION_ID,
+        label: "OpenMessaging Benchmark",
     },
 ];
 
@@ -351,6 +362,195 @@ const DELTA_RULE: [&str; 2] = [
      as overlapping.",
 ];
 
+const OMB_IGGY_FORK: &str = "https://github.com/laserdata/openmessaging-benchmark";
+
+const OMB_RUN: [TextCard; 3] = [
+    TextCard {
+        title: "The workload",
+        paragraphs: &[
+            "A workload file sets the load of a run: the topics, the partitions per topic, the \
+             message size, the producers per topic, the subscriptions per topic, the consumers per \
+             subscription, the target publish rate and the test length.",
+            "The result file keeps the workload name, the message size, and the counts of topics, \
+             partitions, producers and consumers. The pages show these values, and the compare \
+             page checks them to tell whether two runs ran the same workload.",
+        ],
+        command: None,
+    },
+    TextCard {
+        title: "The driver",
+        paragraphs: &[
+            "The OMB workers send and receive messages through a driver. The Iggy driver uses the \
+             Iggy Java SDK.",
+            "A driver file sets the client options and names the driver, for example Iggy or \
+             Iggy-persisted. The result file keeps only that name, so give each configuration a \
+             name of its own. The driver doesn't change how comparable two runs are, so you can \
+             compare two configurations of one workload.",
+        ],
+        command: None,
+    },
+    TextCard {
+        title: "Windows and warm-up",
+        paragraphs: &[
+            "OMB runs a warm-up first and leaves it out of the result file, so every number covers \
+             the test only.",
+            "During the test, OMB takes its statistics every 10 seconds, a period that is fixed in \
+             its code. The charts show one point per window: the rates, the backlog and the \
+             latency of that window. The file doesn't record the test length, so the pages give \
+             it as the number of windows times 10 seconds.",
+        ],
+        command: None,
+    },
+];
+
+const OMB_NUMBERS: [TextCard; 5] = [
+    TextCard {
+        title: "Throughput",
+        paragraphs: &[
+            "OMB counts the messages that the producers sent and the consumers received in each \
+             10 second window. The dashboard shows the mean of the windows in messages per \
+             second.",
+            "It also shows the rates in MiB/s: the rate times the message size, divided by \
+             1,048,576. OMB itself calls this unit MB/s. iggy-bench counts 1 MB as 1,000,000 \
+             bytes, so the same bytes give a smaller number on the OMB pages.",
+            "The consume rate counts every subscription, so it can be a multiple of the publish \
+             rate.",
+        ],
+        command: None,
+    },
+    TextCard {
+        title: "Publish latency",
+        paragraphs: &[
+            "The time from sending a message until the server confirms it. OMB puts the \
+             latencies of all producers into one histogram for the whole test, and reads the \
+             average and the percentiles from that histogram.",
+            "iggy-bench reads the percentiles of each actor and takes their mean. For the same \
+             messages, the two methods give different numbers.",
+        ],
+        command: None,
+    },
+    TextCard {
+        title: "End-to-end latency",
+        paragraphs: &[
+            "The time from sending a message until a consumer receives it. OMB takes it from the \
+             clock time stamps of the worker hosts, in whole milliseconds.",
+            "Producers and consumers can run on different hosts, so the value depends on how well \
+             the clocks of the hosts agree, and a small change can be noise. A run without \
+             consumers doesn't measure it, and the pages show not measured.",
+        ],
+        command: None,
+    },
+    TextCard {
+        title: "Publish delay",
+        paragraphs: &[
+            "The time from the moment when a message should go out at the target rate until the \
+             producer sends it, in microseconds. A large delay means that the producers couldn't \
+             keep up with the rate.",
+        ],
+        command: None,
+    },
+    TextCard {
+        title: "Backlog",
+        paragraphs: &[
+            "The messages that the producers sent and the consumers didn't receive yet, summed \
+             over all subscriptions, at the end of each 10 second window. OMB counts it as a \
+             signed number.",
+            "The run page shows the backlog at the end of the run and the largest backlog of any \
+             window. A backlog that grows means that the consumers fell behind.",
+        ],
+        command: None,
+    },
+];
+
+/// The topic, then what iggy-bench does, then what OMB does.
+const OMB_DIFFERENCES: [(&str, &str, &str); 8] = [
+    (
+        "Megabyte",
+        "1,000,000 bytes (MB)",
+        "1,048,576 bytes (MiB), which OMB calls MB",
+    ),
+    (
+        "Group percentile",
+        "The mean of the percentiles of the actors",
+        "The percentile of one histogram of all actors",
+    ),
+    (
+        "Sample window",
+        "10 ms by default, smoothed with a moving average",
+        "10 s, fixed in the OMB code",
+    ),
+    (
+        "Latency over time",
+        "The average latency of each window",
+        "The average and the percentiles of each window",
+    ),
+    (
+        "End-to-end latency",
+        "The end-to-end kinds of iggy-bench",
+        "Whole milliseconds from clock time stamps, which depend on the clock sync between the \
+         worker hosts",
+    ),
+    (
+        "Schedule lag",
+        "Badges that come from the rate limit",
+        "The publish delay, measured for each send",
+    ),
+    (
+        "Warm-up",
+        "Recorded in the report",
+        "Left out of the file, and its length isn't recorded",
+    ),
+    (
+        "Client",
+        "The Rust SDK in the bench process",
+        "The Java SDK, through the Iggy driver in the OMB workers",
+    ),
+];
+
+/// What an OMB result file doesn't record, and what that means for the pages. The setup file fills
+/// in the first four.
+const OMB_NOT_RECORDED: [(&str, &str); 6] = [
+    (
+        "The machines and the node count",
+        "Without a setup file, the run page has no Environment section, and the compare page \
+         can't check that two runs used the same machines.",
+    ),
+    (
+        "The Iggy version",
+        "Without a setup file, a run has no version, and its history is in time order.",
+    ),
+    (
+        "The OMB build",
+        "Without a setup file, runs of different driver code look the same.",
+    ),
+    (
+        "The start time",
+        "Without a setup file, the run time comes from the file name: the end of the run, in \
+         local time and without a time zone.",
+    ),
+    (
+        "The target rate",
+        "The pages can't tell when a run fell below its target rate. Put the rate in the \
+         workload name, so readers can see it.",
+    ),
+    (
+        "The subscriptions per topic",
+        "The consume rate can be a multiple of the publish rate, and the pages can't say why.",
+    ),
+];
+
+const OMB_SETUP: TextCard = TextCard {
+    title: "The setup file",
+    paragraphs: &[
+        "A setup.toml next to the result file adds what the result doesn't record: the start time \
+         of the run, the Iggy version, the server and client machines, the OMB build, and free \
+         properties such as kernel settings.",
+        "Every field is optional. The dashboard defines the format, so any tool that runs OMB can \
+         write the file.",
+    ],
+    command: None,
+};
+
 const PERCENT: f64 = 100.0;
 /// Thresholds are typed in the configuration file, so four decimals keep every value exact.
 const NUMBER_DECIMALS: usize = 4;
@@ -360,7 +560,19 @@ const FLAG_PREFIX: &str = "--";
 pub fn methodology() -> Html {
     let data = use_dashboard_data();
     let scroll_ref = use_node_ref();
-    let [quick_start, configure, metrics, noise, results] = &SECTIONS;
+    let [quick_start, configure, metrics, noise, results, omb] = &SECTIONS;
+    // A link such as `/methodology#omb` names a section. The page scrolls to it once the section
+    // exists, and again once the loaded data above it has its final height.
+    let fragment = use_location()
+        .map(|location| location.hash().to_owned())
+        .unwrap_or_default();
+    let loaded = matches!(
+        (&data.summaries, &data.config),
+        (Loadable::Ready(_), Loadable::Ready(_))
+    );
+    use_effect_with((fragment, loaded), |(fragment, _)| {
+        scroll_to_section(fragment);
+    });
 
     let content = html! {
         <>
@@ -368,9 +580,11 @@ pub fn methodology() -> Html {
                 breadcrumbs(&[Crumb::overview()], "Methodology"),
                 Some("Methodology"),
                 "How the benchmarks work",
-                "Every run on this dashboard comes from iggy-bench, a tool that sends and polls \
+                "Most runs on this dashboard come from iggy-bench, a tool that sends and polls \
                  messages on an Apache Iggy server and measures the result. This page shows how \
-                 to run it, what the numbers mean, and when a difference is a real change.",
+                 to run it, what the numbers mean, and when a difference is a real change. The \
+                 last section explains the OpenMessaging Benchmark runs, which have pages of \
+                 their own.",
                 Html::default(),
             ) }
             <SectionNav sections={&SECTIONS[..]} scroll_ref={scroll_ref.clone()} />
@@ -513,9 +727,168 @@ pub fn methodology() -> Html {
                     </article>
                 </div>
             </section>
+
+            <section id={omb.id} class="page-section page-container">
+                { section_head(
+                    omb.label,
+                    "Results from another tool",
+                    "The OMB tab shows Apache Iggy runs of the OpenMessaging Benchmark. OMB \
+                     measures in another way, so no page puts its numbers next to iggy-bench \
+                     numbers.",
+                ) }
+                <p class="section-text">
+                    {"The OpenMessaging Benchmark (OMB) is an open benchmark framework for \
+                      messaging systems. Its worker processes send and receive messages through a \
+                      driver for each system, and it writes the result of each run to one JSON \
+                      file. The upstream project has no driver for Iggy, so Iggy runs use the \
+                      fork at "}
+                    <a href={OMB_IGGY_FORK} target="_blank" rel="noopener noreferrer">
+                        { OMB_IGGY_FORK }
+                    </a>
+                    {", which adds one."}
+                </p>
+                <div class="card-grid">{ articles(&OMB_RUN) }</div>
+                <div class="card-columns">{ articles(&OMB_NUMBERS) }</div>
+                <div class="card prose-card">
+                    <h3>{"Badges"}</h3>
+                    <p>
+                        {"A badge warns that an OMB run didn't get the load it asked for. OMB \
+                          records the failed sends per second of each window. A file from an \
+                          older OMB doesn't record them, and its runs never get the badge."}
+                    </p>
+                    { omb_badge_list() }
+                </div>
+                <div class="card option-card">
+                    <h3>{"Why the numbers don't compare"}</h3>
+                    <p>{"The same messages on the same server give different numbers in the two \
+                         tools. Compare OMB runs with OMB runs, and iggy-bench runs with \
+                         iggy-bench runs."}</p>
+                    { omb_differences_table() }
+                </div>
+                <div class="card option-card">
+                    <h3>{"How comparable two OMB runs are"}</h3>
+                    <p>{"The compare page names one of these levels. Properties from setup.toml \
+                         don't change the level: the page names the ones that differ, and you \
+                         decide whether they matter. OMB runs have no noise rule yet, so the page \
+                         shows a change as a plain percent in gray and doesn't call it better or \
+                         worse."}</p>
+                    { omb_levels_table() }
+                </div>
+                <div class="card option-card">
+                    <h3>{"What an OMB result doesn't record"}</h3>
+                    <p>{"Each gap limits what the pages can show. The setup file in the next card \
+                         fills in the first four."}</p>
+                    { omb_not_recorded_table() }
+                </div>
+                <article class="card prose-card">{ card_body(&OMB_SETUP) }</article>
+            </section>
         </>
     };
     page_shell(&scroll_ref, content)
+}
+
+/// Scrolls to the section that `fragment`, such as `#omb`, names, if the page has it.
+fn scroll_to_section(fragment: &str) {
+    let Some(id) = fragment.strip_prefix('#').filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if let Some(section) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(id))
+    {
+        section.scroll_into_view();
+    }
+}
+
+fn omb_differences_table() -> Html {
+    html! {
+        <table class="omb-fact-table">
+            <thead>
+                <tr>
+                    <th scope="col">{"Topic"}</th>
+                    <th scope="col">{"iggy-bench"}</th>
+                    <th scope="col">{"OMB"}</th>
+                </tr>
+            </thead>
+            <tbody>
+                { for OMB_DIFFERENCES.iter().map(|(topic, iggy_bench, omb)| html! {
+                    <tr>
+                        <th scope="row">{ *topic }</th>
+                        <td data-label="iggy-bench">{ *iggy_bench }</td>
+                        <td data-label="OMB">{ *omb }</td>
+                    </tr>
+                }) }
+            </tbody>
+        </table>
+    }
+}
+
+fn omb_not_recorded_table() -> Html {
+    html! {
+        <table class="omb-fact-table">
+            <thead>
+                <tr>
+                    <th scope="col">{"Not recorded"}</th>
+                    <th scope="col">{"What it means for the pages"}</th>
+                </tr>
+            </thead>
+            <tbody>
+                { for OMB_NOT_RECORDED.iter().map(|(missing, effect)| html! {
+                    <tr>
+                        <th scope="row">{ *missing }</th>
+                        <td>{ *effect }</td>
+                    </tr>
+                }) }
+            </tbody>
+        </table>
+    }
+}
+
+fn omb_levels_table() -> Html {
+    html! {
+        <table class="omb-fact-table">
+            <thead>
+                <tr>
+                    <th scope="col">{"Level"}</th>
+                    <th scope="col">{"When"}</th>
+                    <th scope="col">{"What the compare page says"}</th>
+                </tr>
+            </thead>
+            <tbody>
+                { for omb_levels().into_iter().map(|(level, rule)| html! {
+                    <tr>
+                        <th scope="row">{ level.to_string() }</th>
+                        <td data-label="When">{ rule }</td>
+                        <td data-label="What the compare page says">{ level.explanation() }</td>
+                    </tr>
+                }) }
+            </tbody>
+        </table>
+    }
+}
+
+/// Each comparability level of two OMB runs with its rule, from the closest to the furthest. The
+/// rules compare only the values that both runs record, and the environment label doesn't count.
+fn omb_levels() -> [(OmbComparability, &'static str); 4] {
+    [
+        (
+            OmbComparability::LikeForLike,
+            "The same workload, and the same machines and OMB build in setup.toml.",
+        ),
+        (
+            OmbComparability::SetupUnknown,
+            "The same workload, but a run doesn't name its machines in setup.toml.",
+        ),
+        (
+            OmbComparability::SetupDiffers(Vec::new()),
+            "The same workload, but other machines or another OMB build in setup.toml.",
+        ),
+        (
+            OmbComparability::WorkloadDiffers(Vec::new()),
+            "Another workload: the name, message size, topics, partitions or actors per topic \
+             differ.",
+        ),
+    ]
 }
 
 fn articles(cards: &[TextCard]) -> Html {
@@ -620,14 +993,38 @@ fn spans(text: &str) -> Vec<Span<'_>> {
 fn badge_list(thresholds: &Thresholds) -> Html {
     html! {
         <dl class="badge-list">
-            { for badge_rules(thresholds).into_iter().map(|(badge, rule)| html! {
-                <div class="badge-rule">
-                    <dt><span class="badge">{ badge.to_string() }</span></dt>
-                    <dd>{ badge.explanation() }{" "}{ rule }</dd>
-                </div>
+            { for badge_rules(thresholds).into_iter().map(|(badge, rule)| {
+                badge_rule(badge.to_string(), badge.explanation(), &rule)
             }) }
         </dl>
     }
+}
+
+fn badge_rule(name: String, explanation: &str, rule: &str) -> Html {
+    html! {
+        <div class="badge-rule">
+            <dt><span class="badge">{ name }</span></dt>
+            <dd>{ explanation.to_owned() }{" "}{ rule.to_owned() }</dd>
+        </div>
+    }
+}
+
+fn omb_badge_list() -> Html {
+    html! {
+        <dl class="badge-list">
+            { for omb_badge_rules().into_iter().map(|(badge, rule)| {
+                badge_rule(badge.to_string(), badge.explanation(), rule)
+            }) }
+        </dl>
+    }
+}
+
+/// Each OMB badge with the rule that adds it.
+const fn omb_badge_rules() -> [(OmbBadge, &'static str); 1] {
+    [(
+        OmbBadge::PublishErrors,
+        "The dashboard adds it when a window of the run has a publish error rate above 0.",
+    )]
 }
 
 fn threshold_table(thresholds: &Thresholds) -> Html {
@@ -897,6 +1294,38 @@ mod tests {
                 total: 5,
             }
         );
+    }
+
+    #[test]
+    fn given_omb_levels_when_listed_should_go_from_closest_to_furthest() {
+        let levels: Vec<OmbComparability> =
+            omb_levels().into_iter().map(|(level, _)| level).collect();
+
+        assert!(
+            levels.windows(2).all(|pair| pair[0] < pair[1]),
+            "{levels:?}"
+        );
+        assert_eq!(levels.len(), 4);
+    }
+
+    #[test]
+    fn given_omb_numbers_when_listed_should_explain_backlog_and_the_errors_badge() {
+        let titles: Vec<&str> = OMB_NUMBERS.iter().map(|card| card.title).collect();
+
+        let [(badge, rule)] = omb_badge_rules();
+
+        assert!(titles.contains(&"Backlog"), "{titles:?}");
+        assert_eq!(badge, OmbBadge::PublishErrors);
+        assert!(rule.contains("publish error rate above 0"));
+    }
+
+    #[test]
+    fn given_sections_when_listed_should_end_with_omb_section_that_banner_links_to() {
+        assert_eq!(
+            SECTIONS.last().map(|section| section.id),
+            Some(OMB_SECTION_ID)
+        );
+        assert_eq!(OMB_SECTION_ID, "omb");
     }
 
     #[test]

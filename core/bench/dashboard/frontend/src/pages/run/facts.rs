@@ -34,6 +34,7 @@ use bench_report::server_stats::BenchmarkServerStats;
 use bench_report::transport::BenchmarkTransport;
 
 use super::change::metric_name;
+use crate::components::ladder::log_bar_pcts;
 use crate::components::run_labels::{
     CONDITION_SEPARATOR, DayLabel, MachineName, batch_size_text, data_volume_text, durability_text,
     memory_text, message_size_text, milliseconds, nodes_text, numeric_text, rate_limit_text,
@@ -68,9 +69,6 @@ pub const MIN_LABEL: &str = "Min";
 pub const MAX_LABEL: &str = "Max";
 pub const AVERAGE_LABEL: &str = "Average";
 pub const P9999_LABEL: &str = "P99.99";
-/// The ladder's shortest bar, so the smallest value stays visible.
-const MIN_BAR_PCT: f64 = 4.0;
-const FULL_BAR_PCT: f64 = 100.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fact {
@@ -486,22 +484,15 @@ pub fn ladder(group: &BenchmarkGroupMetricsSummary) -> Vec<LadderRow> {
         ])
         .filter(|&(_, value_ms, metric)| metric.is_some() || is_recorded(value_ms))
         .collect();
-    let positive = || rungs.iter().map(|rung| rung.1).filter(|value| *value > 0.0);
-    let lowest = positive().fold(f64::INFINITY, f64::min);
-    let span = (positive().fold(0.0, f64::max) / lowest).ln();
+    let bars = log_bar_pcts(&rungs.iter().map(|rung| rung.1).collect::<Vec<_>>());
     rungs
         .iter()
-        .map(|&(label, value_ms, metric)| LadderRow {
+        .zip(bars)
+        .map(|(&(label, value_ms, metric), bar_pct)| LadderRow {
             label,
             value_ms,
             metric,
-            bar_pct: if value_ms <= 0.0 {
-                MIN_BAR_PCT
-            } else if span > 0.0 {
-                MIN_BAR_PCT + (FULL_BAR_PCT - MIN_BAR_PCT) * (value_ms / lowest).ln() / span
-            } else {
-                FULL_BAR_PCT
-            },
+            bar_pct,
         })
         .collect()
 }
@@ -625,6 +616,7 @@ const fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::ladder::{FULL_BAR_PCT, MIN_BAR_PCT};
     use crate::test_support::{
         RELEASE, consumer, group_summary, params, producer, rate_limited, run, summarize,
     };
