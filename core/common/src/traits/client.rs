@@ -29,6 +29,7 @@ use std::time::Instant;
 /// It consists of multiple modules, each of which is responsible for a specific set of commands.
 /// Server operations require authentication, except ping and the login flows.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait Client:
     ClusterClient
     + SystemClient
