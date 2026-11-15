@@ -1,0 +1,4 @@
+[sinks]
+
+[sources]
+postgres = 0

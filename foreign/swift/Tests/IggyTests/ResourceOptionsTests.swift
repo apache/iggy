@@ -261,6 +261,10 @@ struct ResourceOptionsTests {
             #expect(topic.compressionAlgorithm.description == expected.compressionAlgorithm)
             #expect(try topic.messageExpiry.wireMicroseconds().map(String.init) == expected.messageExpiry)
             #expect(String(topic.maxTopicSize.wireValue) == expected.maxTopicSize)
+            #expect(try topic.segmentMaxAge.wireMicroseconds().map(String.init) == expected.options["segment_max_age"]?.value)
+            #expect(String(topic.tieredStorage) == expected.options["tiered_storage"]?.value)
+            #expect(try topic.localRetentionAge.wireMicroseconds().map(String.init) == expected.options["local_retention_age"]?.value)
+            #expect(String(topic.localRetentionSize.wireValue) == expected.options["local_retention_size"]?.value)
             #expect(neverReturned.isDisjoint(with: topic.options.keys))
         }
         for vector in fixture.userResponses {
@@ -300,7 +304,8 @@ struct ResourceOptionsTests {
         let topicCreate = TopicCreateOptions(
             partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .never, maxTopicSize: .bytes(1 << 30), segmentSizeBytes: 1 << 20,
             durability: .persisted, consumerOffsetDurability: .persisted, partitionResizePolicy: .fixed, messagesRequiredToSave: 10,
-            sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true, replicationFactor: 3)
+            sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true, replicationFactor: 3, segmentMaxAge: .after(.seconds(3_600)),
+            tieredStorage: false, localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(1 << 29))
         #expect(unsetFields(streamCreate, except: ["raw"]).isEmpty)
         #expect(unsetFields(topicCreate, except: ["raw"]).isEmpty)
         #expect(Set(try streamCreate.toResourceOptions().keys) == creatable("stream"))
@@ -308,7 +313,9 @@ struct ResourceOptionsTests {
         #expect(creatable("user").isEmpty, "a user create key needs a typed field on UserCreateOptions")
 
         let streamUpdate = StreamUpdateOptions(name: "renamed")
-        let topicUpdate = TopicUpdateOptions(name: "renamed", messageExpiry: .never, maxTopicSize: .bytes(1 << 30))
+        let topicUpdate = TopicUpdateOptions(
+            name: "renamed", messageExpiry: .never, maxTopicSize: .bytes(1 << 30), tieredStorage: true, localRetentionAge: .after(.seconds(1_800)),
+            localRetentionSize: .bytes(1 << 29))
         let userUpdate = UserUpdateOptions(username: "renamed", status: .inactive)
         let untyped: Set<String> = ["reset", "raw", "rawReset"]
         #expect(unsetFields(streamUpdate, except: untyped).isEmpty)
@@ -369,6 +376,16 @@ struct ResourceOptionsTests {
         #expect(throws: IggyError(.optionNotResettable)) { try UserUpdateOptions(username: "ab", reset: [.status]).toPatch() }
         #expect(throws: IggyError(.invalidUsername)) { try UserUpdateOptions(username: "ab").toPatch() }
         #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(name: "", reset: [.compressionAlgorithm]).toPatch() }
+        // An update only turns tiered storage on: a reset or `false` is refused as not updatable.
+        #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(reset: [.tieredStorage]).toPatch() }
+        #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(tieredStorage: false).toPatch() }
+        #expect(try TopicUpdateOptions(tieredStorage: true).toPatch().set[TopicOptionKey.tieredStorage.rawValue] == .explicit(.bool(true)))
+        // With a raw key or raw reset name the server decides, so `false` is sent and not refused here.
+        let rawSet = try TopicUpdateOptions(tieredStorage: false, raw: ["future_retention": "7days"]).toPatch()
+        #expect(rawSet.set[TopicOptionKey.tieredStorage.rawValue] == .explicit(.bool(false)))
+        let rawReset = try TopicUpdateOptions(tieredStorage: false, rawReset: ["future_retention"]).toPatch()
+        #expect(rawReset.set[TopicOptionKey.tieredStorage.rawValue] == .explicit(.bool(false)))
+        #expect(rawReset.reset == ["future_retention"])
     }
 
     /// The primary commits an `UpdateResource` under its scope's resolved

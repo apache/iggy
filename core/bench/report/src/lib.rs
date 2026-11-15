@@ -24,13 +24,14 @@ mod prints;
 use crate::report::BenchmarkReport;
 use actor_kind::ActorKind;
 use charming::Chart;
-use charming::datatype::DataPoint;
 use group_metrics_kind::GroupMetricsKind;
 use latency_distribution::LatencyDistribution;
 use plotting::chart::IggyChart;
 use plotting::chart_kind::ChartKind;
 
 pub use types::*;
+
+const LATENCY_AXIS_NAME: &str = "Latency [ms]";
 
 pub fn create_throughput_chart(
     report: &BenchmarkReport,
@@ -153,55 +154,67 @@ pub fn create_latency_distribution_chart(
     strip_title_and_subtext: bool,
 ) -> Chart {
     let title = report.title(ChartKind::LatencyDistribution);
+    let chart = IggyChart::new(&title, &report.subtext(), dark, strip_title_and_subtext);
+    let groups = report
+        .group_metrics
+        .iter()
+        .map(|metrics| (metrics.summary.kind, metrics.latency_distribution.as_ref()));
+    add_latency_distributions(chart, LATENCY_AXIS_NAME, groups).inner
+}
 
-    let mut chart = IggyChart::new(&title, &report.subtext(), dark, strip_title_and_subtext)
-        .with_y_axis("Density");
+/// Draws a histogram and its fitted log-normal curve per group, from the distributions alone, so a
+/// report without time series can draw them too. `groups` holds every group of the report in report
+/// order, including those without a distribution, because a group's position picks its colors.
+/// `x_axis_name` can be empty for a chart without room at the axis end.
+pub fn add_latency_distributions<'a>(
+    chart: IggyChart,
+    x_axis_name: &str,
+    groups: impl IntoIterator<Item = (GroupMetricsKind, Option<&'a LatencyDistribution>)>,
+) -> IggyChart {
+    let mut chart = chart.with_y_axis("Density");
 
     let group_colors = ["#5470C6", "#91CC75", "#EE6666", "#FAC858"];
     let pdf_colors = ["#FF4500", "#228B22", "#8B008B", "#FF8C00"];
-    let percentile_colors = ["#E63946", "#457B9D", "#2A9D8F", "#F4A261"];
 
     let mut has_data = false;
 
-    for (idx, metrics) in report
-        .group_metrics
-        .iter()
-        .filter(|m| m.summary.kind != GroupMetricsKind::ProducersAndConsumers)
+    for (idx, (kind, distribution)) in groups
+        .into_iter()
+        .filter(|(kind, _)| *kind != GroupMetricsKind::ProducersAndConsumers)
         .enumerate()
     {
-        let dist = match &metrics.latency_distribution {
-            Some(d) => d,
-            None => continue,
+        let Some(dist) = distribution else {
+            continue;
         };
 
         has_data = true;
-        let group_label = format!("{}s", metrics.summary.kind.actor());
+        let group_label = format!("{}s", kind.actor());
         let color_idx = idx % group_colors.len();
 
         chart = add_distribution_series(
             chart,
+            x_axis_name,
             dist,
             &group_label,
             group_colors[color_idx],
             pdf_colors[color_idx],
-            percentile_colors[color_idx],
         );
     }
 
     if !has_data {
-        chart = chart.with_category_x_axis("Latency [ms]", vec!["No data".to_owned()]);
+        chart = chart.with_category_x_axis(x_axis_name, vec!["No data".to_owned()]);
     }
 
-    chart.inner
+    chart
 }
 
 fn add_distribution_series(
     mut chart: IggyChart,
+    x_axis_name: &str,
     dist: &LatencyDistribution,
     group_label: &str,
     hist_color: &str,
     pdf_color: &str,
-    pct_color: &str,
 ) -> IggyChart {
     if dist.bins.is_empty() {
         return chart;
@@ -220,7 +233,7 @@ fn add_distribution_series(
         .map(|b| format_latency(b.edge_ms + bin_width / 2.0))
         .collect();
 
-    chart = chart.with_category_x_axis("Latency [ms]", categories);
+    chart = chart.with_category_x_axis(x_axis_name, categories);
 
     // Histogram bars
     let bar_data: Vec<f64> = dist.bins.iter().map(|b| b.density).collect();
@@ -244,55 +257,12 @@ fn add_distribution_series(
         })
         .collect();
 
-    chart = chart.add_smooth_line_series(
+    chart.add_smooth_line_series(
         &format!("{group_label} Log-Normal PDF"),
         pdf_data,
         pdf_color,
         2.5,
-    );
-
-    // Percentile scatter markers placed at closest bin
-    let pcts = [
-        ("P5", dist.percentiles.p05_ms),
-        ("P50", dist.percentiles.p50_ms),
-        ("P95", dist.percentiles.p95_ms),
-        ("P99", dist.percentiles.p99_ms),
-    ];
-
-    let scatter_data: Vec<DataPoint> = pcts
-        .iter()
-        .map(|(label, val)| {
-            let y = log_normal_pdf(*val, mu, sigma);
-            let bin_idx = find_closest_bin(&dist.bins, bin_width, *val);
-            DataPoint::from((vec![bin_idx as f64, y], format!("{label}={:.2}ms", val)))
-        })
-        .collect();
-
-    chart = chart.add_scatter_series(
-        &format!("{group_label} Percentiles"),
-        scatter_data,
-        12.0,
-        pct_color,
-    );
-
-    chart
-}
-
-fn find_closest_bin(
-    bins: &[crate::latency_distribution::HistogramBin],
-    bin_width: f64,
-    value: f64,
-) -> usize {
-    let half = bin_width / 2.0;
-    bins.iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let da = (a.edge_ms + half - value).abs();
-            let db = (b.edge_ms + half - value).abs();
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    )
 }
 
 fn format_latency(ms: f64) -> String {

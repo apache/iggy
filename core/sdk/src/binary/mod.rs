@@ -104,11 +104,7 @@ macro_rules! impl_binary_client {
                 context: iggy_common::PartitionContext,
             ) -> Result<bytes::Bytes, iggy_common::IggyError> {
                 self.driver
-                    .send_raw(
-                        code,
-                        payload,
-                        (context != iggy_common::PartitionContext::default()).then_some(context),
-                    )
+                    .send_raw(code, payload, context.non_zero())
                     .await
             }
 
@@ -150,6 +146,17 @@ macro_rules! impl_binary_client {
                 request: &iggy_binary_protocol::requests::messages::FetchMessagesRequest,
             ) -> Result<Vec<iggy_common::FetchedSection>, iggy_common::IggyError> {
                 self.driver.fetch_sections(request).await
+            }
+
+            async fn send_group_sync_with_commit(
+                &self,
+                payload: bytes::Bytes,
+            ) -> Result<(bytes::Bytes, u64), iggy_common::IggyError> {
+                self.driver.sync_group(payload).await
+            }
+
+            fn observe_metadata_commit(&self, commit: u64) {
+                self.driver.observe_metadata_commit(commit);
             }
 
             async fn send_poll_with_response_and_options(

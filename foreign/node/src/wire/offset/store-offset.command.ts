@@ -43,6 +43,9 @@ export type StoreOffset = {
    * context its cached route reports: after another client deletes and
    * recreates the partition, one store can fail with 87 (5009 for a group
    * consumer). The failed route is dropped and the next call routes again.
+   * A context that is all zero counts as none. A context of incarnation 0
+   * takes the incarnation of the route once and keeps its owner generation and
+   * metadata op.
    */
   context?: PartitionContext
 };

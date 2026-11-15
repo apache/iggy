@@ -138,6 +138,18 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 	if options.ReplicationFactor != nil {
 		typed = append(typed, iggcon.ReplicationFactorOption(*options.ReplicationFactor))
 	}
+	if options.SegmentMaxAge != nil && *options.SegmentMaxAge != iggcon.IggyExpiryServerDefault {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionSegmentMaxAge), uint64(*options.SegmentMaxAge)))
+	}
+	if options.TieredStorage != nil {
+		typed = append(typed, iggcon.TieredStorageOption(*options.TieredStorage))
+	}
+	if options.LocalRetentionAge != nil && *options.LocalRetentionAge != iggcon.IggyExpiryServerDefault {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionLocalRetentionAge), uint64(*options.LocalRetentionAge)))
+	}
+	if options.LocalRetentionSize != nil && *options.LocalRetentionSize != 0 {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionLocalRetentionSize), *options.LocalRetentionSize))
+	}
 	return typed, nil
 }
 
@@ -182,22 +194,26 @@ func (d *DeleteTopic) MarshalBinary() ([]byte, error) {
 // UpdateTopic patches a topic through the generic UpdateResource command.
 // Create-only settings, compression included, have no field here.
 type UpdateTopic struct {
-	StreamId      iggcon.Identifier
-	TopicId       iggcon.Identifier
-	Name          *string
-	MessageExpiry *iggcon.Duration
-	MaxTopicSize  *uint64
-	Reset         []iggcon.TopicOptionKey
-	RawReset      []string
-	Options       []iggcon.HeaderEntry
+	StreamId           iggcon.Identifier
+	TopicId            iggcon.Identifier
+	Name               *string
+	MessageExpiry      *iggcon.Duration
+	MaxTopicSize       *uint64
+	TieredStorage      *bool
+	LocalRetentionAge  *iggcon.Duration
+	LocalRetentionSize *uint64
+	Reset              []iggcon.TopicOptionKey
+	RawReset           []string
+	Options            []iggcon.HeaderEntry
 }
 
 func (u *UpdateTopic) Code() Code {
 	return UpdateResourceCode
 }
 
-// MarshalBinary encodes the patch. A zero expiry or size is the server-default
-// sentinel and changes nothing, Reset returns a key to its default.
+// MarshalBinary encodes the patch. A zero expiry, retention or size is the
+// server-default sentinel and changes nothing, Reset returns a key to its
+// default.
 func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	var typed []iggcon.HeaderEntry
 	if u.Name != nil {
@@ -208,6 +224,15 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	}
 	if u.MaxTopicSize != nil && *u.MaxTopicSize != 0 {
 		typed = append(typed, uint64Option(string(iggcon.TopicOptionMaxTopicSize), *u.MaxTopicSize))
+	}
+	if u.TieredStorage != nil {
+		typed = append(typed, iggcon.TieredStorageOption(*u.TieredStorage))
+	}
+	if u.LocalRetentionAge != nil && *u.LocalRetentionAge != iggcon.IggyExpiryServerDefault {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionLocalRetentionAge), uint64(*u.LocalRetentionAge)))
+	}
+	if u.LocalRetentionSize != nil && *u.LocalRetentionSize != 0 {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionLocalRetentionSize), *u.LocalRetentionSize))
 	}
 	reset := make([]string, 0, len(u.Reset))
 	for _, key := range u.Reset {

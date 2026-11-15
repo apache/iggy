@@ -140,6 +140,7 @@ impl PrincipalResolver for KnownUsers {
                 username: username.to_string(),
                 user: None,
                 permissions: *permissions,
+                topic_reads: Arc::default(),
                 permissions_known: true,
             })
             .ok_or(AuthError::Rejected)
@@ -179,6 +180,7 @@ impl PrincipalResolver for SlowUsers {
             username: username.to_string(),
             user: None,
             permissions: topic_reader(),
+            topic_reads: Arc::default(),
             permissions_known: true,
         })
     }
@@ -201,6 +203,7 @@ impl SaslAuthenticator for FixedCredentials {
                 username: credentials.username.clone(),
                 user: None,
                 permissions: topic_reader(),
+                topic_reads: Arc::default(),
                 permissions_known: true,
             })
         } else {

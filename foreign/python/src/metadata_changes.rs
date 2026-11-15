@@ -41,6 +41,7 @@ use pyo3_stub_gen::derive::{
 use std::str::FromStr;
 
 use crate::client::to_runtime_error;
+use crate::event_loop::attach_unless_exiting;
 use crate::options::options_by_provenance;
 use crate::permissions::Permissions;
 use crate::user::UserStatus;
@@ -1192,7 +1193,7 @@ impl TryFrom<RustMetadataChanges> for MetadataChanges {
     type Error = PyErr;
 
     fn try_from(changes: RustMetadataChanges) -> PyResult<Self> {
-        Python::attach(|py| {
+        attach_unless_exiting(|py| {
             let mut records = Vec::with_capacity(changes.records.len());
             for record in changes.records {
                 records.push(change_record(py, record)?);

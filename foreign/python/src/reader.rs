@@ -21,12 +21,11 @@ use iggy::prelude::PartitionReader as RustPartitionReader;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use tokio::sync::Mutex;
 
 use crate::client::{to_read_error, to_runtime_error};
-use crate::event_loop::on_event_loop;
+use crate::event_loop::{future_into_py, on_event_loop};
 use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 
 /// Reads the partitions of a topic in batches, with routing, prefetch and the position of each
@@ -45,12 +44,15 @@ use crate::receive_message::{Checkpoint, PolledBatch, PollingStrategy};
 ///   while `next()` waits and then fills its budget (one fetch per primary that may wait for
 ///   messages, the partitions with messages left behind spread over the other slots), a `seek()`
 ///   to an offset stores the offset before it, and `close()` moves the offset back to the last
-///   delivered message.
+///   delivered message. A crash, or a reader dropped without `close()`, loses the batches that
+///   the server stored before the application took them, up to the effective budget, which
+///   holds at least 32 batches.
 /// - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
 ///   (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
 ///   partition until `IggyClient.abandon_operation()` and `seek()`.
-/// - The calls on one reader run one at a time, so a call waits for a pending `next()`.
-///   `next()` is cancel safe: cancel it before `close()`.
+/// - The calls on one reader run one at a time, so each call waits for the pending ones, and
+///   `close()` waits for all of them. `next()` is cancel safe. Cancel a pending `next()` or
+///   `commit()` before `close()`.
 /// - Dropping the reader stops its tasks without waiting, and it moves no offset back.
 /// - `async for` reads its batches until `close()`, and `async with` closes it on exit.
 #[gen_stub_pyclass]
@@ -92,6 +94,13 @@ impl PartitionReader {
     /// Stores the offset of a checkpoint that this reader delivered, which covers every earlier
     /// message of its partition. A checkpoint of an older generation of its partition, or at or
     /// below the last commit of its generation, stores nothing.
+    ///
+    /// When the offset store gets `ConsumerGroupPartitionNotOwned` (5009) for a partition that
+    /// the reader still has, `commit()` reads the owner of the partition again. The server can
+    /// refuse that read for a short time, and `commit()` repeats it after each such refusal, with
+    /// no time limit. To bound `commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends
+    /// nothing more, but a write that it already sent can still take effect. `close()` waits for
+    /// a pending `commit()`, so cancel it before `close()`.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
     /// checkpoint that this reader did not deliver, the errors of the offset store, and
@@ -139,14 +148,18 @@ impl PartitionReader {
     ///
     /// With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
     /// it, under the history of a continuation or else of the last delivered message, so a
-    /// restart resumes at the new position. A failed store fails the seek and nothing moves.
-    /// Every other seek stores nothing. The new position waits for the end of the committing
-    /// read in flight, whose reply the new generation drops.
+    /// restart resumes at the new position. A seek to offset 0 or `PollingStrategy.First()`
+    /// deletes the stored offset under the same history when the server holds one, because the
+    /// commit of a read never moves the offset back. A seek to a timestamp first reads one
+    /// message at the timestamp without a commit, and then acts as a seek to the offset of that
+    /// message. Without such a message it stores nothing. A failed read, lookup, store or delete
+    /// fails the seek and nothing moves. Every other seek stores nothing. The new position waits
+    /// for the end of the committing read in flight, whose reply the new generation drops.
     ///
     /// Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
     /// and for a continuation of another partition, `PendingOperationError` with `OnRead` while
     /// a read of the partition has an unknown outcome (abandon its operation first), the errors
-    /// of the offset store with `OnRead`, and `RuntimeError` after `close()`.
+    /// of the read, lookup, store or delete with `OnRead`, and `RuntimeError` after `close()`.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn seek<'a>(
         &self,

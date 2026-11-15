@@ -34,8 +34,12 @@ internal enum OptionFlags : byte
     Critical = 16
 }
 
-/// <summary>One client-visible catalog key: its name, canonical kind and mutability.</summary>
-internal sealed record OptionDescriptor(string Name, HeaderKind Kind, OptionFlags Flags);
+/// <summary>
+///     One client-visible catalog key: its name, canonical kind and mutability. The flags byte reports an
+///     enable-only key as updatable and not resettable, so <paramref name="EnableOnly" /> carries what it leaves
+///     out: an update may only turn the key on.
+/// </summary>
+internal sealed record OptionDescriptor(string Name, HeaderKind Kind, OptionFlags Flags, bool EnableOnly = false);
 
 /// <summary>
 ///     The server's option catalog as a client sees it, keys in catalog order. Typed options take their key names
@@ -68,7 +72,11 @@ internal static class OptionKeys
         new("messages_required_to_save", HeaderKind.Uint32, OptionFlags.None),
         new("size_of_messages_required_to_save", HeaderKind.Uint64, OptionFlags.None),
         new("preallocate_segments", HeaderKind.Bool, OptionFlags.None),
-        new("replication_factor", HeaderKind.Uint32, OptionFlags.None)
+        new("replication_factor", HeaderKind.Uint32, OptionFlags.None),
+        new("segment_max_age", HeaderKind.Uint64, OptionFlags.Critical),
+        new("tiered_storage", HeaderKind.Bool, OptionFlags.Updatable | OptionFlags.Critical, true),
+        new("local_retention_age", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable),
+        new("local_retention_size", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable)
     ];
 
     private static readonly OptionDescriptor[] UserKeys =
@@ -117,6 +125,10 @@ internal static class OptionKeys
             TopicOptionKey.SizeOfMessagesRequiredToSave => "size_of_messages_required_to_save",
             TopicOptionKey.PreallocateSegments => "preallocate_segments",
             TopicOptionKey.ReplicationFactor => "replication_factor",
+            TopicOptionKey.SegmentMaxAge => "segment_max_age",
+            TopicOptionKey.TieredStorage => "tiered_storage",
+            TopicOptionKey.LocalRetentionAge => "local_retention_age",
+            TopicOptionKey.LocalRetentionSize => "local_retention_size",
             _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown topic option key")
         });
     }
@@ -202,12 +214,23 @@ internal static class OptionKeys
             throw VsrError.Exception(VsrError.OPTION_NOT_UPDATABLE, $"Option {createOnly.Name} is set only at creation.");
         }
 
+        if (resets.FirstOrDefault(key => key.EnableOnly) is { } enableOnlyReset)
+        {
+            throw VsrError.Exception(VsrError.OPTION_NOT_UPDATABLE, $"Option {enableOnlyReset.Name} cannot be turned off.");
+        }
+
         if (resets.FirstOrDefault(key => !key.Flags.HasFlag(OptionFlags.Resettable)) is { } fixedKey)
         {
             throw VsrError.Exception(VsrError.OPTION_NOT_RESETTABLE, $"Option {fixedKey.Name} has no default to reset to.");
         }
 
         ValidateColumns(scope, set);
+        if (keys.FirstOrDefault(key => key.EnableOnly && set.TryGetValue(key.Name, out var value)
+                                       && value.Kind == HeaderKind.Bool && !value.ToBool()) is { } turnedOff)
+        {
+            throw VsrError.Exception(VsrError.OPTION_NOT_UPDATABLE, $"Option {turnedOff.Name} cannot be turned off.");
+        }
+
         return new OptionsPatch(scope, set, names);
     }
 

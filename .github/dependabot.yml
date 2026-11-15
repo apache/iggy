@@ -262,7 +262,6 @@ updates:
     directories:
       - "/"
       - "/core/server"
-      - "/core/connectors/runtime"
       - "/core/ai/mcp"
       - "/core/bench/dashboard/server"
       - "/web"

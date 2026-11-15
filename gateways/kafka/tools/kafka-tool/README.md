@@ -33,6 +33,8 @@ This tool solves all three: generate the binary messages once, then `cat` them d
 
 This tool is built on the [`kafka-protocol`](https://crates.io/crates/kafka-protocol) Rust crate, which is itself **code-generated from Kafka's official JSON schema files**. This ensures byte-perfect correctness — the same schemas that generate Kafka's own Java serialization code generate the Rust structs used here.
 
+ApiVersions v5 is the exception. `kafka-protocol` 0.18 stops at v4, so the tool writes the v5 request (KIP-1242) itself. A v5 response has the fields of v4, so the tool decodes it as v4.
+
 ---
 
 ## Installation

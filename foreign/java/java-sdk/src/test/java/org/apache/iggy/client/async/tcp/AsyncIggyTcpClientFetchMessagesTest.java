@@ -96,6 +96,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * refusals mark moved, the fetches that the client never resends or cancels, and the reply that it reads.
  */
 class AsyncIggyTcpClientFetchMessagesTest {
+    /** The incarnation of every partition route of {@link #singleNode}. */
+    static final long SINGLE_NODE_INCARNATION = 1;
+
     private static final int POLL_DEFERRED_CODE = CommandCode.Messages.POLL_DEFERRED.getValue();
     private static final String DEFERRED_POLL_BODY = "0201040700000001040100000002066f72646572730103000000050000000000"
             + "000000640000000140420f00000000000100000000001000c0d8a70000000000";
@@ -1247,9 +1250,10 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 client.consumerOffsets()
                         .storeConsumerOffset(STREAM, TOPIC, 1L, GROUP, BigInteger.ONE, PartitionContext.EMPTY)
                         .join();
+                // The server refuses incarnation 0, so a store without a context names the incarnation of its route.
                 assertThat(stores)
                         .singleElement()
-                        .satisfies(store -> assertThat(store.incarnation()).isZero());
+                        .satisfies(store -> assertThat(store.incarnation()).isEqualTo(SINGLE_NODE_INCARNATION));
             } finally {
                 client.close().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             }
@@ -1853,7 +1857,9 @@ class AsyncIggyTcpClientFetchMessagesTest {
                 socket,
                 () -> singleNodeMetadata(socket.getLocalPort()),
                 request -> request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)
-                        ? Response.success(OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, socket.getLocalPort()))
+                        ? Response.success(
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(request, 1, 1, socket.getLocalPort(), SINGLE_NODE_INCARNATION))
                         : data.handle(request));
     }
 

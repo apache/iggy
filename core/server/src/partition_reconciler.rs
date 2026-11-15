@@ -181,6 +181,7 @@
 //! helping; consider a distinct "retry here shortly" code that keeps the route.
 //!
 
+use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
 };
@@ -210,7 +211,7 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
+    IggyPartition, Segment, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -343,6 +344,9 @@ pub struct ReconcilerCtx {
     repair_scrub: RefCell<Option<BTreeSet<IggyNamespace>>>,
     group_offset_cleanup: GroupOffsetCleanup,
     lifecycle_reports: LifecycleReports,
+    /// The incarnations whose delete this node saw commit as the metadata
+    /// primary, and whose objects wait for their delete.
+    incarnation_deletes: IncarnationDeletes,
 }
 
 impl ReconcilerCtx {
@@ -379,6 +383,7 @@ impl ReconcilerCtx {
             repair_scrub: RefCell::new(None),
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
+            incarnation_deletes: IncarnationDeletes::default(),
         }
     }
 
@@ -557,6 +562,7 @@ pub async fn run_reconciler(
         }
     }
 
+    ctx.incarnation_deletes.stop();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -643,6 +649,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         reconcile_stream_keys(ctx);
     }
     report_lifecycles(ctx).await;
+    ctx.incarnation_deletes
+        .pass(&ctx.shard, IggyTimestamp::now());
 
     if counters.total() > 0 {
         debug!(
@@ -688,6 +696,12 @@ async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
         partition_may_be_gone = changes
             .iter()
             .any(|change| change.kind == PartitionChangeKind::Removed);
+        // Only here: a pass that lost the feed tears down what it finds
+        // missing, and that proves no committed delete.
+        if partition_may_be_gone {
+            ctx.incarnation_deletes
+                .observe(&ctx.shard, &changes, IggyTimestamp::now());
+        }
         ctx.add_announced(
             changes
                 .iter()
@@ -993,6 +1007,7 @@ async fn reconcile_target(
             counters.rows_rewritten += 1;
             return Convergence::Pending;
         }
+        enable_committed_tiering(ctx, ns, epoch);
         return trim_to_watermark(ctx, ns, target.delete_watermark, counters);
     }
 
@@ -1997,9 +2012,31 @@ fn shards_table_has_epoch(ctx: &ReconcilerCtx, ns: IggyNamespace, epoch: u64) ->
     ctx.shard.shards_table().epoch_for(ns) == Some(epoch)
 }
 
+/// Start the chain file of a live owned partition whose topic turned tiered
+/// storage on. The partition's I/O lane does the work, and a partition that
+/// keeps a chain already is left alone, so every pass can ask.
+fn enable_committed_tiering(ctx: &ReconcilerCtx, ns: IggyNamespace, created_revision: u64) {
+    let tiered = ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        inner
+            .items
+            .get(ns.stream_id())
+            .and_then(|stream| stream.topics.get(ns.topic_id()))
+            .is_some_and(|topic| topic.resolved.tiered_storage)
+    });
+    if !tiered {
+        return;
+    }
+    if let Some(partition) = ctx.shard.plane.partitions().get_mut_by_ns(&ns)
+        && !partition.is_tiered()
+    {
+        partition.enable_tiering(partitions::object_prefix(ns, created_revision));
+    }
+}
+
 /// Enforce the committed `TruncatePartition` watermark of a live owned
 /// partition. A watermark whose enforcement is still incomplete (first local
-/// segment starts below it) is pending work: the pump may be blocked by a
+/// segment starts below it, or is a sealed segment that ends on it) is
+/// pending work: the pump may be blocked by a
 /// consumer barrier, by a rejoin whose offsets arrive via journal repair, or by
 /// the per-pass removal budget that keeps one trim from monopolising the pump,
 /// and no such unblocking commits anything, so the namespace stays in the work
@@ -2018,14 +2055,28 @@ fn trim_to_watermark(
         .plane
         .partitions()
         .get_by_ns(&ns)
-        .and_then(|partition| partition.log.segments().first())
-        .is_none_or(|first| first.start_offset >= watermark);
+        .is_none_or(|partition| !trim_is_owed(partition.log.segments(), watermark));
     if trimmed {
         return Convergence::Converged;
     }
     ctx.shard.request_truncate_partition(ns, watermark);
     counters.trims_pending += 1;
     Convergence::Pending
+}
+
+/// Whether the front of `segments` still holds an offset at or below
+/// `watermark` that a trim removes. The watermark is the last deleted offset,
+/// so a sealed segment whose only message sits on it starts at the watermark
+/// and is owed like one that starts below it. The active segment never goes.
+const fn trim_is_owed(segments: &[Segment], watermark: u64) -> bool {
+    let Some((first, later)) = segments.split_first() else {
+        return false;
+    };
+    first.start_offset < watermark
+        || (first.start_offset == watermark
+            && first.end_offset == watermark
+            && first.sealed
+            && !later.is_empty())
 }
 
 /// A report relays committed local evidence. Only the partition primary orders a fence.
@@ -2435,6 +2486,7 @@ mod tests {
     };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
+        UpdateTopicResolvedRequest,
     };
     use iggy_binary_protocol::{
         AckLevel, Command, ConsensusHeader, Operation, PrepareHeader, RepairRangeReplyHeader,
@@ -2442,9 +2494,13 @@ mod tests {
     };
     use iggy_common::wire_conversions::resource_options_to_wire;
     use iggy_common::{
-        Durability, HeaderKey, HeaderValue, OptionKey, OptionValue, OptionsProvenance,
-        ResourceOptions, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrapSet,
-        critical_keys_marker,
+        Durability, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, IggyTimestamp, OptionKey,
+        OptionValue, OptionsProvenance, ResourceOptions, ServerKeyContext, StreamEncryptionKey,
+        StreamKeyOrigin, WrapSet, critical_keys_marker,
+    };
+    use iggy_object_store::{
+        InlineTierExecutor, KeyLayout, MemoryStore, ObjectPrefix, ObjectStore, PutBody, PutOptions,
+        SegmentKey, SegmentObject,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -2457,19 +2513,21 @@ mod tests {
         RETIRED_PARTITION_OP, retired_member_op,
     };
     use metadata::stm::stream::{
-        PartitionChangeKind, RECENT_PARTITION_CHANGES_RETAINED, Streams, TruncatePartitionRequest,
+        PartitionChange, PartitionChangeKind, RECENT_PARTITION_CHANGES_RETAINED, Streams,
+        TruncatePartitionRequest,
     };
     use metadata::stm::user::Users;
     use partitions::{
-        IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairSession,
+        ExecutorDeleter, IggyPartition, IggyPartitions, PartitionPathLayout, PartitionsConfig,
+        RETIRED_OBJECT_GRACE, RepairSession, Segment, object_prefix,
     };
     use rand::prelude::{RngExt, SeedableRng, StdRng};
     use server_common::sharding::{IggyNamespace, ShardId};
-    use server_common::{Message, MessageBag};
+    use server_common::{Message, MessageBag, SegmentStorage};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::mem::size_of;
     use std::path::Path;
     use std::rc::Rc;
@@ -2979,13 +3037,42 @@ mod tests {
         mux: TestMux,
         key_context: Arc<ServerKeyContext>,
     ) -> Rc<TestShard> {
+        build_test_shard_with_metadata_replica(shard_id, config, mux, key_context, None)
+    }
+
+    /// [`build_test_shard`] on the metadata primary of a one-node cluster.
+    fn build_metadata_primary_shard(config: &ServerConfig, mux: TestMux) -> Rc<TestShard> {
+        build_test_shard_with_metadata_replica(0, config, mux, Arc::default(), Some((0, 1)))
+    }
+
+    /// [`build_test_shard_with_keys`] whose metadata plane holds the
+    /// consensus of `(replica, replica count)`, in the view replica 0 leads.
+    fn build_test_shard_with_metadata_replica(
+        shard_id: u16,
+        config: &ServerConfig,
+        mux: TestMux,
+        key_context: Arc<ServerKeyContext>,
+        metadata_replica: Option<(u8, u8)>,
+    ) -> Rc<TestShard> {
         let bus = Rc::new(IggyMessageBus::with_config(shard_id, config));
+        let metadata_consensus = metadata_replica.map(|(replica, replica_count)| {
+            let consensus = consensus::VsrConsensus::new(
+                CLUSTER_ID,
+                replica,
+                replica_count,
+                server_common::sharding::METADATA_GROUP,
+                Rc::clone(&bus),
+                consensus::LocalPipeline::new(),
+            );
+            consensus.init();
+            consensus
+        });
         let metadata: IggyMetadata<
             consensus::VsrConsensus<Rc<IggyMessageBus>>,
             journal::prepare_journal::PrepareJournal,
             IggySnapshot,
             _,
-        > = IggyMetadata::new(None, None, None, None, mux, None);
+        > = IggyMetadata::new(metadata_consensus, None, None, None, mux, None);
         let partitions = IggyPartitions::new(
             ShardId::new(shard_id),
             PartitionsConfig {
@@ -3227,6 +3314,104 @@ mod tests {
             partitions.len(),
             3,
             "second pass over an unchanged target must be a no-op"
+        );
+    }
+
+    /// The enable is a topic update, which no partition takes part in, so the
+    /// reconciler is what tells each replica's partitions to start their
+    /// chain files.
+    #[compio::test]
+    async fn given_a_live_partition_when_its_topic_enables_tiered_storage_should_ask_it_to_start_its_chain()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let partitions = shard.plane.partitions();
+        let pending = || partitions.with_partition(&ns, IggyPartition::pending_tiering);
+        assert_eq!(pending(), Some(None), "the topic is not tiered yet");
+
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(
+                &ResourceOptions::from([(
+                    HeaderKey::from(OptionKey::TieredStorage),
+                    OptionValue::explicit(HeaderValue::from(true)),
+                )]),
+                OptionsProvenance::All,
+            )
+            .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &enable))
+            .expect("UpdateTopic apply succeeds");
+        reconcile_pass(&ctx).await;
+
+        let created_revision = partitions
+            .with_partition(&ns, IggyPartition::created_revision)
+            .expect("the partition is live");
+        assert_eq!(
+            pending(),
+            Some(Some(partitions::object_prefix(ns, created_revision)))
+        );
+    }
+
+    /// A partition built on a topic that is tiered already starts its chain
+    /// file with its directory, without waiting for a later pass.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_its_partition_is_built_should_ask_it_to_start_its_chain() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        let request = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("topic-a").expect("test topic name fits WireName"),
+                options: resource_options_to_wire(
+                    &ResourceOptions::from([(
+                        HeaderKey::from(OptionKey::TieredStorage),
+                        OptionValue::explicit(HeaderValue::from(true)),
+                    )]),
+                    OptionsProvenance::All,
+                )
+                .expect("options fit the wire"),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![assignment(0, 1)],
+        };
+        mux.update(build_prepare(
+            2,
+            Operation::CreateTopicWithAssignments,
+            &request,
+        ))
+        .expect("CreateTopicWithAssignments apply succeeds");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_pass(&ctx).await;
+
+        let partitions = shard.plane.partitions();
+        let created_revision = partitions
+            .with_partition(&ns, IggyPartition::created_revision)
+            .expect("the partition is built");
+        assert_eq!(
+            partitions.with_partition(&ns, IggyPartition::pending_tiering),
+            Some(Some(partitions::object_prefix(ns, created_revision)))
         );
     }
 
@@ -4073,6 +4258,375 @@ mod tests {
         );
     }
 
+    type MemoryDeleter = ExecutorDeleter<InlineTierExecutor<MemoryStore>>;
+
+    fn object_layout() -> KeyLayout {
+        KeyLayout::new("iggy").unwrap()
+    }
+
+    /// Give `shard` a deleter over a memory store, and return it for the
+    /// test to reach the store.
+    fn install_memory_deleter(shard: &TestShard) -> Rc<MemoryDeleter> {
+        let deleter = Rc::new(ExecutorDeleter::new(
+            InlineTierExecutor::new(MemoryStore::new()),
+            object_layout(),
+        ));
+        shard.set_object_deleter(Some(
+            Rc::clone(&deleter) as Rc<dyn partitions::ObjectDeleter>
+        ));
+        deleter
+    }
+
+    /// The object prefix of the committed incarnation of `ns`.
+    fn committed_prefix(shard: &TestShard, ns: IggyNamespace) -> ObjectPrefix {
+        let created_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(ns)
+            .expect("committed namespace has an incarnation");
+        object_prefix(ns, created_revision)
+    }
+
+    /// Store both objects of one segment and the manifest of `prefix`, and
+    /// return their keys.
+    async fn store_incarnation(deleter: &MemoryDeleter, prefix: ObjectPrefix) -> Vec<String> {
+        let layout = object_layout();
+        let mut keys: Vec<String> = SegmentObject::ALL
+            .into_iter()
+            .map(|object| {
+                layout.segment_key(&SegmentKey {
+                    prefix,
+                    start_offset: 0,
+                    object,
+                })
+            })
+            .collect();
+        keys.push(layout.manifest_key(&prefix));
+        for key in &keys {
+            deleter
+                .executor()
+                .store()
+                .put(key, PutBody::from_bytes(vec![1]), &PutOptions::default())
+                .await
+                .unwrap();
+        }
+        keys.sort();
+        keys
+    }
+
+    fn stored_keys(deleter: &MemoryDeleter) -> Vec<String> {
+        deleter.executor().store().keys()
+    }
+
+    /// A moment by which everything queued so far has waited its grace
+    /// period.
+    fn past_the_grace_period() -> IggyTimestamp {
+        IggyTimestamp::from(
+            IggyTimestamp::now().as_micros()
+                + u64::try_from(RETIRED_OBJECT_GRACE.as_micros()).unwrap(),
+        )
+    }
+
+    /// Run the delete pass as of `now` and let its task finish.
+    async fn incarnation_delete_pass(ctx: &ReconcilerCtx, now: IggyTimestamp) {
+        ctx.incarnation_deletes.pass(&ctx.shard, now);
+        for _ in 0..16 {
+            super::yield_now().await;
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_completed_topic_delete_when_the_metadata_primary_reconciles_should_delete_the_objects_of_each_partition_after_the_grace_period()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-objects");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "deleted",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_topic(&mux, 3, 0, "kept", vec![assignment(0, 3)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let deleted = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)]
+            .map(|ns| committed_prefix(&shard, ns));
+        let kept = committed_prefix(&shard, IggyNamespace::new(0, 1, 0));
+        for prefix in deleted {
+            store_incarnation(&deleter, prefix).await;
+        }
+        let kept_keys = store_incarnation(&deleter, kept).await;
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 4, 0, 0);
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 2);
+        for prefix in deleted {
+            assert!(ctx.incarnation_deletes.is_queued(
+                IggyNamespace::new(0, 0, usize::try_from(prefix.partition_id).unwrap()),
+                prefix.created_revision
+            ));
+        }
+        // The pass of the reconciler ran inside the grace period.
+        incarnation_delete_pass(&ctx, IggyTimestamp::now()).await;
+        assert_eq!(stored_keys(&deleter).len(), 9);
+
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+
+        assert_eq!(stored_keys(&deleter), kept_keys);
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+        // A pass with nothing queued starts nothing.
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), kept_keys);
+    }
+
+    #[compio::test]
+    async fn given_a_completed_stream_delete_when_the_metadata_primary_reconciles_should_queue_every_partition_of_the_stream()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "deleted");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "first",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_topic(&mux, 3, 0, "second", vec![assignment(0, 3)]);
+        seed_stream(&mux, 4, "kept");
+        seed_topic(&mux, 5, 1, "third", vec![assignment(0, 4)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let deleted = [
+            IggyNamespace::new(0, 0, 0),
+            IggyNamespace::new(0, 0, 1),
+            IggyNamespace::new(0, 1, 0),
+        ]
+        .map(|ns| (ns, committed_prefix(&shard, ns)));
+        for (_, prefix) in deleted {
+            store_incarnation(&deleter, prefix).await;
+        }
+        let kept_keys = store_incarnation(
+            &deleter,
+            committed_prefix(&shard, IggyNamespace::new(1, 0, 0)),
+        )
+        .await;
+
+        seed_delete_stream(&shard.plane.metadata().mux_stm, 6, 0);
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 3);
+        for (ns, prefix) in deleted {
+            assert!(
+                ctx.incarnation_deletes
+                    .is_queued(ns, prefix.created_revision)
+            );
+        }
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), kept_keys);
+    }
+
+    #[compio::test]
+    async fn given_a_topic_recreated_into_the_same_ids_when_the_deleted_one_is_cleaned_should_keep_the_objects_of_the_new_incarnation()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-reuse");
+        seed_topic(&mux, 2, 0, "topic-reuse", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let old = committed_prefix(&shard, ns);
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-reuse",
+            vec![assignment(0, 1)],
+        );
+        let new = committed_prefix(&shard, ns);
+        assert_ne!(old.created_revision, new.created_revision);
+        store_incarnation(&deleter, old).await;
+        let new_keys = store_incarnation(&deleter, new).await;
+        reconcile_pass(&ctx).await;
+
+        assert!(ctx.incarnation_deletes.is_queued(ns, old.created_revision));
+        assert!(!ctx.incarnation_deletes.is_queued(ns, new.created_revision));
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), new_keys);
+    }
+
+    #[compio::test]
+    async fn given_a_queued_incarnation_that_committed_metadata_holds_when_the_delete_pass_runs_should_drop_it_and_keep_its_objects()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-live");
+        seed_topic(&mux, 2, 0, "topic-live", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let live = committed_prefix(&shard, ns);
+        let live_keys = store_incarnation(&deleter, live).await;
+
+        // A removal that names the incarnation metadata still holds, which
+        // no commit records.
+        ctx.incarnation_deletes.observe(
+            &shard,
+            &[PartitionChange {
+                namespace: ns,
+                created_revision: live.created_revision,
+                kind: PartitionChangeKind::Removed,
+            }],
+            IggyTimestamp::now(),
+        );
+        assert!(ctx.incarnation_deletes.is_queued(ns, live.created_revision));
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+
+        assert_eq!(stored_keys(&deleter), live_keys);
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+    }
+
+    #[compio::test]
+    async fn given_a_node_that_is_not_the_metadata_primary_when_a_topic_delete_completes_should_queue_nothing()
+     {
+        // A backup of the metadata group, and a shard without its consensus.
+        for metadata_replica in [Some((1, 3)), None] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let mux = TestMux::default();
+            seed_stream(&mux, 1, "stream-backup");
+            seed_topic(&mux, 2, 0, "topic-backup", vec![assignment(0, 1)]);
+            let shard = build_test_shard_with_metadata_replica(
+                0,
+                &config,
+                mux,
+                Arc::default(),
+                metadata_replica,
+            );
+            let deleter = install_memory_deleter(&shard);
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            reconcile_pass(&ctx).await;
+            let ns = IggyNamespace::new(0, 0, 0);
+            let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
+
+            seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+            reconcile_pass(&ctx).await;
+
+            assert!(!shard.plane.partitions().contains(&ns));
+            assert_eq!(ctx.incarnation_deletes.queued(), 0);
+            // Not even until the next pass, which would drop it.
+            ctx.incarnation_deletes.observe(
+                &shard,
+                &[PartitionChange {
+                    namespace: ns,
+                    created_revision: 1,
+                    kind: PartitionChangeKind::Removed,
+                }],
+                IggyTimestamp::now(),
+            );
+            assert_eq!(ctx.incarnation_deletes.queued(), 0);
+            incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+            assert_eq!(stored_keys(&deleter), stored);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_teardown_the_change_feed_did_not_announce_when_reconciling_should_queue_nothing()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-unannounced");
+        seed_topic(&mux, 2, 0, "topic-unannounced", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
+
+        // The pass finds the partition gone by walking the tree, as after a
+        // restart or a feed that overflowed, and tears the local copy down.
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        ctx.synced_revision.set(None);
+        reconcile_pass(&ctx).await;
+
+        assert!(!shard.plane.partitions().contains(&ns));
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+        assert_eq!(stored_keys(&deleter), stored);
+    }
+
+    #[compio::test]
+    async fn given_a_shard_without_an_object_deleter_when_a_topic_delete_completes_should_queue_nothing()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-no-deleter");
+        seed_topic(&mux, 2, 0, "topic-no-deleter", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+    }
+
+    #[compio::test]
+    async fn given_queued_incarnations_when_the_node_stops_being_the_metadata_primary_should_drop_them_and_delete_nothing()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-demoted");
+        seed_topic(&mux, 2, 0, "topic-demoted", vec![assignment(0, 1)]);
+        let shard = build_metadata_primary_shard(&config, mux);
+        let deleter = install_memory_deleter(&shard);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(0, 0, 0);
+        let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+        assert_eq!(ctx.incarnation_deletes.queued(), 1);
+
+        // The node leaves the normal view it led.
+        shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap()
+            .begin_view_probe();
+        incarnation_delete_pass(&ctx, past_the_grace_period()).await;
+
+        assert_eq!(ctx.incarnation_deletes.queued(), 0);
+        assert_eq!(stored_keys(&deleter), stored);
+    }
+
     /// A delete+recreate of the same (stream, topic, partition) tuple
     /// reuses the freed slab key, so the namespace is byte-identical but
     /// its committed `created_revision` is greater. The reconciler must
@@ -4791,6 +5345,318 @@ mod tests {
             assert_eq!(trims(), [(namespace, WATERMARK)]);
             assert!(ctx.pending.borrow().contains(&namespace));
         }
+    }
+
+    /// The watermark names the last deleted offset, so a sealed segment whose
+    /// only message sits on it starts at the watermark and is still owed.
+    #[compio::test]
+    async fn given_a_sealed_one_message_segment_at_the_watermark_when_reconciling_should_request_the_trim_until_it_is_gone()
+     {
+        const WATERMARK: u64 = 10;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "trim-stream");
+        seed_topic(&mux, 2, 0, "trim-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let trims = || {
+            let mut trims = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::TruncatePartition {
+                    namespace,
+                    up_to_offset,
+                }) = frame
+                {
+                    trims.push((namespace, up_to_offset));
+                }
+            }
+            trims
+        };
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            let first = &mut partition.log.segments_mut()[0];
+            first.start_offset = WATERMARK;
+            first.end_offset = WATERMARK;
+            first.sealed = true;
+            let max_size = first.max_size;
+            partition.log.add_persisted_segment(
+                Segment::new(WATERMARK + 1, max_size),
+                SegmentStorage::default(),
+                None,
+                None,
+            );
+        }
+        let stm = &shard.plane.metadata().mux_stm;
+        let created_revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        stm.update(build_prepare(
+            3,
+            Operation::TruncatePartition,
+            &TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: WATERMARK,
+                expected_history: Some(created_revision),
+            },
+        ))
+        .expect("TruncatePartition apply succeeds");
+
+        for _ in 0..2 {
+            reconcile_pass(&ctx).await;
+            assert_eq!(trims(), [(namespace, WATERMARK)]);
+            assert!(ctx.pending.borrow().contains(&namespace));
+        }
+
+        // What the trim leaves: the log starts right after the watermark.
+        shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .unwrap()
+            .log
+            .retire_front()
+            .expect("the sealed segment is retired");
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            trims(),
+            Vec::new(),
+            "a log that starts above the watermark is trimmed"
+        );
+        assert!(!ctx.pending.borrow().contains(&namespace));
+    }
+
+    /// A tiered topic gets no per-replica expiry. Its retention is a pass on
+    /// the partition primary, which needs the watermark already committed to
+    /// tell a new decision from the one it made on the last tick.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_cleaner_passes_should_stage_retention_with_the_committed_watermark()
+     {
+        const WATERMARK: u64 = 10;
+        const EXPIRY_MICROS: u64 = 60_000_000;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "retained-stream");
+        seed_topic(&mux, 2, 0, "retained-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let stm = &shard.plane.metadata().mux_stm;
+        let update_options = |op, options: &[(OptionKey, HeaderValue)]| {
+            let explicit: ResourceOptions = options
+                .iter()
+                .map(|(key, value)| (HeaderKey::from(*key), OptionValue::explicit(value.clone())))
+                .collect();
+            let update = UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: None,
+                explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                    .expect("options fit the wire"),
+                derived_options: WireOptions::empty(),
+            };
+            stm.update(build_prepare(op, Operation::UpdateTopicResolved, &update))
+                .expect("UpdateTopic apply succeeds");
+        };
+        // The retention passes the cleaner staged, and how many per-replica
+        // expiry passes went with them.
+        let staged = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut retention = Vec::new();
+            let mut expiry_passes = 0;
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::RetainPartition {
+                        namespace,
+                        created_revision,
+                        message_expiry,
+                        max_bytes,
+                        committed_up_to,
+                        ..
+                    }) => {
+                        assert_eq!(
+                            Some(created_revision),
+                            shard
+                                .plane
+                                .metadata()
+                                .mux_stm
+                                .streams()
+                                .created_revision_for_namespace(namespace),
+                            "the pass names the incarnation its policy was read for"
+                        );
+                        retention.push((namespace, message_expiry, max_bytes, committed_up_to));
+                    }
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::CleanPartition {
+                        ..
+                    }) => expiry_passes += 1,
+                    _ => {}
+                }
+            }
+            (retention, expiry_passes)
+        };
+        let tiered = (OptionKey::TieredStorage, HeaderValue::from(true));
+
+        update_options(3, std::slice::from_ref(&tiered));
+        assert_eq!(
+            staged(),
+            (Vec::new(), 0),
+            "a tiered topic without a retention policy stages no retention"
+        );
+        // Uploads do not depend on a retention policy.
+        crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+        let mut upload_passes = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
+                namespace,
+                created_revision,
+                resend_advance: true,
+                committed_up_to: Some(0),
+            }) = frame
+            {
+                assert_eq!(
+                    Some(created_revision),
+                    shard
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .created_revision_for_namespace(namespace),
+                    "the pass names the incarnation its watermark was read for"
+                );
+                upload_passes.push(namespace);
+            }
+        }
+        assert_eq!(upload_passes, [namespace]);
+
+        update_options(
+            4,
+            &[
+                tiered,
+                (OptionKey::MessageExpiry, HeaderValue::from(EXPIRY_MICROS)),
+            ],
+        );
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(EXPIRY_MICROS));
+        assert_eq!(staged(), (vec![(namespace, expiry, None, 0)], 0));
+
+        let created_revision = stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        stm.update(build_prepare(
+            5,
+            Operation::TruncatePartition,
+            &TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: 0,
+                up_to_offset: WATERMARK,
+                expected_history: Some(created_revision),
+            },
+        ))
+        .expect("TruncatePartition apply succeeds");
+        assert_eq!(staged(), (vec![(namespace, expiry, None, WATERMARK)], 0));
+        // The upload pass carries the watermark too: a primary holds back
+        // its uploads until it covers the trim point.
+        crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+        let mut upload_watermarks = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::UploadSegments {
+                committed_up_to,
+                ..
+            }) = frame
+            {
+                upload_watermarks.push(committed_up_to);
+            }
+        }
+        assert_eq!(upload_watermarks, [Some(WATERMARK)]);
+
+        // A size cap alone is a retention policy too.
+        update_options(
+            6,
+            &[
+                (OptionKey::TieredStorage, HeaderValue::from(true)),
+                (OptionKey::MessageExpiry, HeaderValue::from(0u64)),
+                (OptionKey::MaxTopicSize, HeaderValue::from(u64::MAX / 2)),
+            ],
+        );
+        let (retention, expiry_passes) = staged();
+        assert_eq!(expiry_passes, 0);
+        assert!(matches!(
+            retention[..],
+            [(staged_namespace, IggyExpiry::NeverExpire, Some(_), WATERMARK)]
+                if staged_namespace == namespace
+        ));
+    }
+
+    /// An evicted segment is read back from the store, so the cleaner stages
+    /// an eviction only while the node reads remote segments and passes the
+    /// store identity check.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_node_cannot_tier_topics_should_stage_no_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "evicted-stream");
+        seed_topic(&mux, 2, 0, "evicted-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let explicit: ResourceOptions = std::iter::once((
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(HeaderValue::from(true)),
+        ))
+        .collect();
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &enable))
+            .expect("UpdateTopic apply succeeds");
+        let evictions = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut evicted = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::EvictPartition {
+                    namespace,
+                    ..
+                }) = frame
+                {
+                    evicted.push(namespace);
+                }
+            }
+            evicted
+        };
+        let frontier = shard.plane.metadata().applied_frontier();
+
+        assert_eq!(evictions(), Vec::<IggyNamespace>::new());
+        frontier.set_store_identity_verified(true);
+        assert_eq!(evictions(), Vec::<IggyNamespace>::new());
+        frontier.set_tiered_storage_ready(true);
+        assert_eq!(evictions(), [namespace]);
+        frontier.set_store_identity_verified(false);
+        assert_eq!(evictions(), Vec::<IggyNamespace>::new());
     }
 
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this

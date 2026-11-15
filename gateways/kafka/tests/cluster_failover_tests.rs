@@ -100,7 +100,7 @@ use iggy_gateway_kafka::protocol::api::{
 use deployment::{Deployment, KAFKA_STREAM, NODES, TAIL_LINES, tail};
 use docker_clients::{Container, missing_prerequisite, run_to_end, skip};
 
-const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
+const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
 
 /// The topic of the load. Two partitions per node, so a stop of any node moves primaries.
@@ -128,10 +128,19 @@ const BURST_RECORDS: usize = 100_000;
 const BURST_PREFIX: &str = "1";
 const BURST_ACKS_BEFORE_CRASH: usize = 10_000;
 
-/// How long after a kill a producer may still take in an answer that the dead gateway sent before
-/// it died: one came 3 ms after. An acknowledgement later than that came through another gateway,
-/// and the first one there came 1.4 s or more after the kill.
-const LATE_ANSWER: Duration = Duration::from_millis(200);
+/// How often a crash test freezes the coordinator with SIGSTOP to catch it inside a Produce request
+/// of the burst, and how long the gateway runs between two tries. A random moment misses such a
+/// request in about one try of ten on 4 CPUs.
+const FREEZE_TRIES: usize = 20;
+const RUN_BETWEEN_FREEZES: Duration = Duration::from_millis(50);
+
+/// How long a freeze waits before it reads Iggy, so that the answers and the batches that the
+/// gateway sent before it arrive. An answer reached the producer 3 ms after a kill.
+const FREEZE_SETTLE: Duration = Duration::from_millis(200);
+
+/// How many records after the last acknowledged record of a partition a freeze reads to find one
+/// of the burst. A few records of the other producer can come first.
+const UNACKED_READ: u32 = 100;
 
 /// The idempotent Java producers. The first four settings are the defaults since Kafka 3.0, written
 /// out because `kafka-verifiable-producer.sh` sets `retries=0` before it reads this file. The
@@ -699,14 +708,17 @@ impl Run {
     }
 
     /// Kills the gateway that coordinates the group with SIGKILL, with its node for
-    /// [`Target::GatewayAndNode`], during a burst of Produce requests through it. Restarts what it
-    /// killed once another gateway took the groups over.
+    /// [`Target::GatewayAndNode`], during a burst of Produce requests through it. The kill comes
+    /// while the gateway is frozen inside a request that Iggy already wrote in part, see
+    /// [`Self::freeze_in_a_burst_write`]. Restarts what it killed once another gateway took the
+    /// groups over.
     ///
     /// Checks on the way that each client lost a connection to the gateway, so it was on the
     /// gateway at the crash, and that the burst sent requests again that were in flight at the
     /// crash. For [`Target::Gateway`], the producer must write on through another gateway within
     /// [`DATA_PATH_LIMIT`]. After the takeover, the coordinator must return every offset committed
-    /// so far. The burst must end with every record acknowledged.
+    /// so far. The burst must end with every record acknowledged, and each frozen one after the
+    /// kill at the offset where Iggy stored it.
     async fn crash_coordinator(&mut self, target: Target) -> Takeover {
         let node_id = self.coordinator().await;
         assert_eq!(
@@ -727,10 +739,15 @@ impl Run {
             }
             Target::GatewayAndNode => format!("gateway {node_id} and node {node}"),
         };
+        let (tries, frozen) = self.freeze_in_a_burst_write(&burst, node_id).await;
+        self.note(&format!(
+            "SIGSTOP to gateway {node_id} on try {tries}, while Iggy held records of the burst \
+             that the producer had no answer for, first ones by value as partition and offset: \
+             {frozen:?}"
+        ));
         self.note(&format!(
             "SIGKILL to {what}, during a burst of Produce requests through the coordinator"
         ));
-        let crash_started = unix_micros();
         let crashed_at = Instant::now();
         self.deployment.kill_gateway(node_id);
         let killed = unix_micros();
@@ -763,7 +780,7 @@ impl Run {
         if target == Target::GatewayAndNode {
             self.wait_primary_on(node).await;
         }
-        self.end_burst(burst, crash_started, killed).await;
+        self.end_burst(burst, &frozen, killed).await;
         self.wait_for_progress("the load after the crash").await;
         Takeover {
             after,
@@ -784,6 +801,70 @@ impl Run {
         )
         .await;
         burst
+    }
+
+    /// Freezes gateway `node_id` with SIGSTOP at a moment when Iggy holds records of `burst` that
+    /// the burst producer has no answer for, and leaves it frozen. Returns the try that caught such
+    /// a moment, and the first of those records in each partition, by value, as partition and
+    /// offset.
+    ///
+    /// The gateway serves one request of a connection at a time, and writes its partitions to Iggy
+    /// one after the other. A kill at a random moment can come before the first partition of the
+    /// request in service reaches Iggy, and then no resend of the burst can show that Iggy writes a
+    /// batch once. Fails the test after [`FREEZE_TRIES`] tries.
+    async fn freeze_in_a_burst_write(
+        &mut self,
+        burst: &Container,
+        node_id: u16,
+    ) -> (usize, BTreeMap<String, (i64, i64)>) {
+        for tries in 1..=FREEZE_TRIES {
+            self.deployment.pause_gateway(node_id);
+            tokio::time::sleep(FREEZE_SETTLE).await;
+            let unacked = self.unacked_burst_records(burst).await;
+            if !unacked.is_empty() {
+                return (tries, unacked);
+            }
+            self.deployment.resume_gateway(node_id);
+            tokio::time::sleep(RUN_BETWEEN_FREEZES).await;
+        }
+        panic!(
+            "in {FREEZE_TRIES} freezes of gateway {node_id}, Iggy never held a record of the burst \
+             that the producer had no answer for"
+        );
+    }
+
+    /// The first record of `burst` in each partition that Iggy stores after the last record of the
+    /// partition that the burst producer got acknowledged, by value, as partition and offset. Every
+    /// Produce request goes through one gateway, so while it is frozen, such a record is part of a
+    /// request that the gateway did not answer.
+    async fn unacked_burst_records(&self, burst: &Container) -> BTreeMap<String, (i64, i64)> {
+        let from: Vec<(u32, u64)> = burst
+            .with_stdout(last_acked)
+            .into_iter()
+            .filter_map(|(partition, offset)| {
+                let next = u64::try_from(offset).ok()?.checked_add(1)?;
+                Some((u32::try_from(partition).ok()?, next))
+            })
+            .collect();
+        let prefix = format!("{BURST_PREFIX}.");
+        let mut first: BTreeMap<u32, (u64, Bytes)> = BTreeMap::new();
+        for (partition, offset, payload) in self
+            .deployment
+            .payloads_from(KAFKA_STREAM, TOPIC, &from, UNACKED_READ)
+            .await
+            .unwrap_or_default()
+        {
+            if payload.starts_with(prefix.as_bytes()) {
+                first.entry(partition).or_insert((offset, payload));
+            }
+        }
+        first
+            .into_iter()
+            .filter_map(|(partition, (offset, payload))| {
+                let value = std::str::from_utf8(&payload).ok()?.to_owned();
+                Some((value, (i64::from(partition), i64::try_from(offset).ok()?)))
+            })
+            .collect()
     }
 
     /// Fails the test unless the burst sent a batch again that was in flight to gateway `node_id`
@@ -817,8 +898,13 @@ impl Run {
     }
 
     /// Waits until the burst producer ends, and fails the test unless it got every record
-    /// acknowledged and Iggy answered one of its resends with the first offset.
-    async fn end_burst(&mut self, mut burst: Container, crash_started: u64, killed: u64) {
+    /// acknowledged, and each record of `frozen` after the kill at the offset where Iggy stored it.
+    async fn end_burst(
+        &mut self,
+        mut burst: Container,
+        frozen: &BTreeMap<String, (i64, i64)>,
+        killed: u64,
+    ) {
         assert!(
             burst.wait_exit(RECOVERY).await,
             "the burst producer ends within {RECOVERY:?}"
@@ -835,62 +921,54 @@ impl Run {
             BURST_RECORDS,
             "the burst producer gets each record acknowledged"
         );
-        self.assert_resends_deduplicated(&burst, crash_started, killed)
-            .await;
+        self.assert_resends_deduplicated(&burst, frozen, killed);
         self.bursts.push(burst);
     }
 
-    /// Fails the test unless Iggy answered a resend of the burst with the first offset of its
-    /// batch: a record that the producer got acknowledged after the kill, at an offset that Iggy
-    /// stored before it. Only another gateway can answer after the kill, and it answers a resend
-    /// of a batch that Iggy holds with the first offset. A batch written twice gets a later offset.
-    /// `crash_started` and `killed` are in microseconds since the Unix epoch.
-    async fn assert_resends_deduplicated(
+    /// Fails the test unless the burst producer got each record of `frozen` acknowledged after the
+    /// kill, at the partition and offset where Iggy stored it before the crash. The gateway was
+    /// frozen inside the request that carried each one, so only a resend through another gateway
+    /// can answer it, and that gateway answers the resend of a batch that Iggy holds with the first
+    /// offset of the batch. A batch written twice gets a later offset. `killed` is in microseconds
+    /// since the Unix epoch.
+    fn assert_resends_deduplicated(
         &self,
         burst: &Container,
-        crash_started: u64,
+        frozen: &BTreeMap<String, (i64, i64)>,
         killed: u64,
     ) {
-        let later = killed.saturating_add(micros(LATE_ANSWER));
-        let (first_ack, first_later) = burst.with_stdout(|lines| {
-            (
-                first_ack_after(lines, killed),
-                first_acked_after(lines, later),
-            )
-        });
+        let (first_ack, answers) = burst
+            .with_stdout(|lines| (first_ack_after(lines, killed), acks_by_value(lines, frozen)));
         self.note(&format!(
             "the first acknowledgement of the burst after the kill came {:?} after it",
             first_ack.map(|at| Duration::from_micros(at.saturating_sub(killed)))
         ));
-        let mut deduplicated = Vec::new();
-        for (partition, offset) in first_later {
-            let (Ok(partition_id), Ok(position)) =
-                (u32::try_from(partition), u64::try_from(offset))
-            else {
-                continue;
-            };
-            let stored = wait_until(
-                RECOVERY,
-                PROBE_INTERVAL,
-                "the time Iggy stored a record",
-                || {
-                    self.deployment
-                        .stored_at(KAFKA_STREAM, TOPIC, partition_id, position)
-                },
-            )
-            .await;
-            if stored < crash_started {
-                deduplicated.push((partition, offset));
-            }
-        }
+        let deduplicated = frozen.iter().all(|(value, stored)| {
+            answers
+                .get(value)
+                .is_some_and(|&(at, acked)| at > killed && acked == *stored)
+        });
+        let answered: Vec<String> = frozen
+            .iter()
+            .map(|(value, stored)| match answers.get(value) {
+                Some(&(at, acked)) => format!(
+                    "{value} stored at {stored:?}, acknowledged at {acked:?} {} the kill",
+                    before_or_after(at, killed)
+                ),
+                None => format!("{value} stored at {stored:?}, never acknowledged"),
+            })
+            .collect();
         assert!(
-            !deduplicated.is_empty(),
-            "no resend of the burst came back at an offset that Iggy stored before the crash, so \
-             the crash tested no resend of a batch that Iggy wrote"
+            deduplicated,
+            "the burst producer must get each record that Iggy held without an answer at the crash \
+             acknowledged after the kill, at the partition and offset where Iggy stored it. A later \
+             offset is a batch written twice. By value, as partition and offset:\n{}",
+            answered.join("\n")
         );
         self.note(&format!(
-            "Iggy answered resends with the first offset of their batch, as partition and offset: \
-             {deduplicated:?}"
+            "Iggy answered the resends of the frozen records with the first offset of their batch, \
+             by value, as partition and offset: {}",
+            answered.join(", ")
         ));
     }
 
@@ -1312,17 +1390,48 @@ fn first_ack_after(lines: &[String], after: u64) -> Option<u64> {
         .min()
 }
 
-/// The lowest offset of each partition among the records of `lines` that the producer got
-/// acknowledged after `after`, in microseconds since the Unix epoch.
-fn first_acked_after(lines: &[String], after: u64) -> BTreeMap<i64, i64> {
-    let mut first: BTreeMap<i64, i64> = BTreeMap::new();
-    for (_, partition, offset) in acks(lines).filter(|(at, _, _)| *at > after) {
-        first
-            .entry(partition)
-            .and_modify(|lowest| *lowest = (*lowest).min(offset))
+/// When and where the producer of `lines` got each record of `values` acknowledged, by value, as
+/// the time it printed the acknowledgement, in microseconds since the Unix epoch, and partition
+/// and offset.
+fn acks_by_value(
+    lines: &[String],
+    values: &BTreeMap<String, (i64, i64)>,
+) -> BTreeMap<String, (u64, (i64, i64))> {
+    lines
+        .iter()
+        .filter(|line| line.contains(ACKED))
+        .filter_map(|line| {
+            let event = parse_event(line)?;
+            let value = event["value"].as_str()?;
+            if !values.contains_key(value) {
+                return None;
+            }
+            let at = event["timestamp"].as_u64()?.saturating_mul(1_000);
+            let acked = (event["partition"].as_i64()?, event["offset"].as_i64()?);
+            Some((value.to_owned(), (at, acked)))
+        })
+        .collect()
+}
+
+/// How long `at` came before or after `reference`, both in microseconds since the Unix epoch.
+fn before_or_after(at: u64, reference: u64) -> String {
+    if at > reference {
+        format!("{:?} after", Duration::from_micros(at - reference))
+    } else {
+        format!("{:?} before", Duration::from_micros(reference - at))
+    }
+}
+
+/// The highest offset of each partition among the records of `lines` that the producer got
+/// acknowledged.
+fn last_acked(lines: &[String]) -> BTreeMap<i64, i64> {
+    let mut last: BTreeMap<i64, i64> = BTreeMap::new();
+    for (_, partition, offset) in acks(lines) {
+        last.entry(partition)
+            .and_modify(|highest| *highest = (*highest).max(offset))
             .or_insert(offset);
     }
-    first
+    last
 }
 
 /// Each acknowledgement in `lines`, as the time the producer printed it, in microseconds since the

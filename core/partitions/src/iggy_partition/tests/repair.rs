@@ -610,6 +610,121 @@ async fn given_an_install_below_the_adopted_head_when_reopening_should_resume_th
     );
 }
 
+/// An install above the head of an adopted `StartView` holds every op that view
+/// announced. The replica leaves the install, and a restart after it, with its
+/// head at the checkpoint and nothing of the adopted log left to prove.
+#[compio::test]
+async fn given_an_install_above_the_adopted_head_when_reopening_should_keep_the_head_at_the_checkpoint()
+ {
+    const BACKUP: u8 = 1;
+    const ADOPTED: u32 = 2;
+    const HEAD: u64 = 1;
+    const INSTALLED: u64 = HEAD + 1;
+    let directory = tempfile::tempdir().unwrap();
+    let (config, mut partition) = replica_with_prepare_history(directory.path(), BACKUP).await;
+    let partition_dir = config.get_partition_path(1, 1, 0);
+    let store = Rc::new(PingPongSuperblock::open(&partition_dir).await.unwrap());
+    partition.set_superblock(store.clone(), None);
+    let checkpoint = checksummed_segment_prepare(INSTALLED, 0, 0, b"retained");
+    let mut announced = PrepareHeader {
+        op: HEAD,
+        request: HEAD,
+        timestamp: HEAD,
+        view: ADOPTED,
+        ..*checkpoint.header()
+    };
+    announced.checksum = announced.identity_checksum();
+    let start_view = Message::<iggy_binary_protocol::StartViewHeader>::new(size_of::<
+        iggy_binary_protocol::StartViewHeader,
+    >())
+    .transmute_header(|_, header: &mut iggy_binary_protocol::StartViewHeader| {
+        header.command = Command::StartView;
+        header.cluster = TEST_CLUSTER;
+        header.group = partition.namespace().inner();
+        header.view = ADOPTED;
+        header.replica = 2;
+        header.op = HEAD;
+        header.commit = HEAD - 1;
+        header.size = u32::try_from(size_of::<iggy_binary_protocol::StartViewHeader>()).unwrap();
+    });
+    partition.consensus().handle_start_view(
+        consensus::PlaneKind::Partitions,
+        start_view.header(),
+        bytemuck::bytes_of(&announced),
+    );
+    assert!(partition.consensus().view_log_unproven());
+    assert!(partition.persist_superblock_if_needed().await);
+
+    let body = checkpoint.as_slice()[size_of::<PrepareHeader>()..].to_vec();
+    let artifact = consensus::StateArtifact::for_bytes(
+        consensus::state_manifest::artifact_kind::SEGMENT_LOG,
+        0,
+        &body,
+    );
+    let staged = partition
+        .spill_transfer_segment(&artifact, body, None)
+        .await
+        .unwrap();
+    let offsets = crate::state_transfer::ConsumerOffsetsWire {
+        producers: Vec::new(),
+        dedup_capacity: consensus::CLIENTS_TABLE_MAX,
+        prepare_checksum: Some(checkpoint.header().checksum),
+        checkpoint_prepare: checkpoint.as_slice().to_vec(),
+        next_offset: 1,
+        ..Default::default()
+    };
+    partition.consensus().begin_state_transfer_await();
+    partition
+        .install_state_transfer(&repair_config(), INSTALLED, vec![staged], &offsets.encode())
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            partition.consensus().sequencer().current_sequence(),
+            partition.consensus().view_log_unproven(),
+            partition.consensus().view_log_is_pending(),
+        ),
+        (INSTALLED, false, false),
+        "the install at op {INSTALLED} left the view-{ADOPTED} log parked and unproven, with its \
+         head at op {HEAD} below the commit point"
+    );
+    let segment_size = partition.log.active_segment().max_size;
+    drop(partition);
+    drop(store);
+
+    let (store, latest) = PingPongSuperblock::open_with_latest(&partition_dir)
+        .await
+        .unwrap();
+    let journal::superblock::SuperblockContents::Present(bytes) = latest else {
+        panic!("adopted record must be durable");
+    };
+    let state = consensus::VsrState::try_from(bytes.as_slice()).unwrap();
+    let (mut reopened, _) = recording_partition_at(BACKUP, 3);
+    reopened.consensus.set_view(state.view);
+    reopened.consensus.set_log_view(state.log_view);
+    reopened
+        .consensus
+        .mark_superblock_durable(state.view, state.log_view);
+    reopened.set_superblock(Rc::new(store), Some(&state));
+    reopened.set_partition_dir(partition_dir);
+    reopened.log.active_segment_mut().max_size = segment_size;
+    reopened.open_persistence().await.unwrap();
+    assert!(
+        !reopened.requires_state_transfer(),
+        "the install certified the WAL below the log view {} that it persisted",
+        state.log_view
+    );
+    assert_eq!(
+        (
+            reopened.consensus().sequencer().current_sequence(),
+            reopened.consensus().view_log_unproven(),
+            reopened.consensus().view_log_is_pending(),
+        ),
+        (INSTALLED, false, false),
+        "the restart resumed the view-{ADOPTED} adoption below the installed checkpoint"
+    );
+}
+
 /// The WAL drops a divergent run before the journal does. The canonical
 /// tail cannot extend that WAL branch and exists only in the journal.
 /// A crash before refill leaves the committed prefix uncertified,

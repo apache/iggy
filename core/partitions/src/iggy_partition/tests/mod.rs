@@ -19,7 +19,7 @@ use super::*;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::offset_storage::{OffsetRecord, decode_offset_record, persist_offset};
-use crate::poll_plan::{DiskFault, DiskReadOutcome, SealedSegmentHandle};
+use crate::poll_plan::{DiskFault, DiskReadOutcome, SealedSegmentHandle, SegmentSource};
 use crate::{IggyIndexWriter, MessagesWriter};
 use bytes::{Bytes, BytesMut};
 use compio::io::AsyncWriteAtExt;
@@ -62,9 +62,29 @@ pub(super) fn checksummed_segment_prepare(
     offset: u64,
     payload: &[u8],
 ) -> Message<PrepareHeader> {
+    stamped_segment_prepare(op, parent, offset, payload, 0)
+}
+
+/// A one-message prepare the primary stamped at `timestamp`, which a backup
+/// requires to match the batch's base timestamp.
+pub(super) fn stamped_segment_prepare(
+    op: u64,
+    parent: u128,
+    offset: u64,
+    payload: &[u8],
+    timestamp: u64,
+) -> Message<PrepareHeader> {
     let namespace = IggyNamespace::new(1, 1, 0);
-    let body =
+    let mut body =
         build_segment_record_with_payload(namespace, offset, Bytes::copy_from_slice(payload));
+    if timestamp != 0 {
+        let mut header =
+            iggy_binary_protocol::batch::BatchHeader::decode(&body[..COMMAND_HEADER_SIZE])
+                .expect("segment record header");
+        header.base_timestamp = timestamp;
+        header.batch_checksum = header.checksum_for_blob(&body[COMMAND_HEADER_SIZE..]);
+        header.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
+    }
     let total = std::mem::size_of::<PrepareHeader>() + body.len();
     let mut prepare = Message::<PrepareHeader>::new(total);
     prepare.as_mut_slice()[std::mem::size_of::<PrepareHeader>()..].copy_from_slice(&body);
@@ -75,6 +95,7 @@ pub(super) fn checksummed_segment_prepare(
         header.group = namespace.inner();
         header.op = op;
         header.parent = parent;
+        header.timestamp = timestamp;
         header.client = 1;
         header.request = op;
         header.session = 1;
@@ -154,6 +175,16 @@ pub fn repair_config() -> PartitionsConfig {
         preallocate_segments: false,
         key_context: Arc::default(),
         path_layout: crate::PartitionPathLayout::default(),
+    }
+}
+
+/// [`repair_config`] with the partition files under `dir`.
+fn offsets_config(dir: &tempfile::TempDir) -> PartitionsConfig {
+    PartitionsConfig {
+        path_layout: crate::PartitionPathLayout {
+            streams_root: dir.path().to_string_lossy().into_owned(),
+        },
+        ..repair_config()
     }
 }
 
@@ -907,18 +938,23 @@ async fn replica_with_prepare_history(
     partition.set_partition_dir(partition_dir.clone());
     // Boot loads the offset directories that partition creation made.
     set_offset_dirs_under(&mut partition, std::path::Path::new(&partition_dir));
-    crate::partition_storage::configure_consumer_offsets_with_storage(
+    let namespace = IggyNamespace::new(1, 1, 0);
+    crate::partition_storage::recover_consumer_offsets_with_storage(
         &DiskStorage,
         &mut partition,
         &config,
-        IggyNamespace::new(1, 1, 0),
-        0,
+        namespace,
     )
     .await
     .unwrap();
     partition.log.retire_front().unwrap();
     partition.install_empty_segment(&config, 0).await.unwrap();
     partition.open_persistence().await.unwrap();
+    // After the WAL replay, as boot does. Before it, the clamp removes an offset
+    // below data that only the WAL holds.
+    crate::partition_storage::clamp_consumer_offsets(&partition, namespace)
+        .await
+        .unwrap();
     (config, partition)
 }
 
@@ -1296,10 +1332,11 @@ async fn install_offer_with_reuse(
         }
     }
     receiver
-        .queue_state_transfer_install(
+        .queue_state_transfer_install_with_chain(
             offer.commit_op,
             staged.into_iter().map(Option::unwrap).collect(),
             &offer.offsets.1,
+            offer.chain.as_ref().map(|chain| chain.1.as_slice()),
             0,
         )
         .unwrap();
@@ -1854,14 +1891,20 @@ async fn partition_with_pending_durable_ack() -> (
     (directory, partition, header)
 }
 
+mod age_roll;
+mod chain_transfer;
 mod consensus_tests;
 mod consumer_group_ownership;
 mod disk_poll;
 mod empty_offsets;
+mod eviction;
+mod floor_eviction;
+mod free_space;
 mod history;
 mod materialization;
 mod materialization_io;
 mod materialization_tail;
+mod object_delete;
 mod offset_barriers;
 mod offset_lifecycle;
 mod offset_recovery;
@@ -1870,14 +1913,19 @@ mod offset_reservations;
 mod offset_storage;
 mod offsets;
 mod persistence_checkpoint;
+mod remote_poll;
 mod repair;
 mod repair_floor;
 mod repair_protocol;
 mod retention;
+mod segment_chain;
+mod segment_upload;
 mod session_retirement;
 mod state_machines;
 mod state_transfer_offer;
 mod state_transfer_segments;
 mod superblock;
+mod tiering;
+mod total_retention;
 mod transfer_ownership;
 mod wal;

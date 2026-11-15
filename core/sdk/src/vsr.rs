@@ -103,8 +103,13 @@ pub(crate) fn observe_metadata_reply(watermark: &AtomicU64, header: &[u8; HEADER
     if operation == Operation::NonReplicated || operation.is_partition() {
         return;
     }
+    watermark.fetch_max(reply_commit(header), Ordering::Release);
+}
+
+/// The metadata commit that a reply names, read by wire offset like [`read_operation`].
+pub(crate) fn reply_commit(header_bytes: &[u8; HEADER_SIZE]) -> u64 {
     const COMMIT_OFFSET: usize = std::mem::offset_of!(ReplyHeader, commit);
-    watermark.fetch_max(read_u64_field(header, COMMIT_OFFSET), Ordering::Release);
+    read_u64_field(header_bytes, COMMIT_OFFSET)
 }
 
 /// The request a reply answers, read by wire offset like [`read_operation`].

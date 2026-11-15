@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::reader_builder::{DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES};
+use crate::clients::reader_builder::{
+    DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES, DEFAULT_PREFETCH_MESSAGES,
+};
 use crate::prelude::IggyConsumer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
@@ -38,7 +40,7 @@ pub struct IggyConsumerBuilder {
     polling_strategy: PollingStrategy,
     poll_options: PollOptions,
     prefetch_bytes: u32,
-    prefetch_messages: Option<u32>,
+    prefetch_messages: u32,
     create_consumer_group_if_not_exists: bool,
     encryptor: Option<Arc<EncryptorKind>>,
     polling_retry_interval: NonZeroIggyDuration,
@@ -67,7 +69,7 @@ impl IggyConsumerBuilder {
             polling_strategy: PollingStrategy::next(),
             poll_options: PollOptions::wait(DEFAULT_MAX_WAIT.into()),
             prefetch_bytes: DEFAULT_PREFETCH_BYTES,
-            prefetch_messages: None,
+            prefetch_messages: DEFAULT_PREFETCH_MESSAGES,
             create_consumer_group_if_not_exists: true,
             encryptor,
             polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
@@ -99,7 +101,8 @@ impl IggyConsumerBuilder {
 
     /// Sets the start of a partition without a position. Defaults to
     /// [`PollingStrategy::next()`]. `init()` refuses a continuation, because it belongs to one
-    /// partition.
+    /// partition. With [`CommitPolicy::OnRead`](iggy_common::CommitPolicy::OnRead), the start
+    /// applies only to a partition without a stored offset. A partition with one resumes after it.
     pub fn polling_strategy(self, polling_strategy: PollingStrategy) -> Self {
         Self {
             polling_strategy,
@@ -118,7 +121,9 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Caps encoded bytes reserved for in-flight and buffered replies. Default: 16 MiB.
+    /// The requested encoded bytes for in-flight and buffered replies. Default: 16 MiB. The
+    /// reader raises the effective budget to at least 32 full batches of `max_bytes`, 32 MiB with
+    /// the default poll options.
     pub fn prefetch_bytes(self, prefetch_bytes: u32) -> Self {
         Self {
             prefetch_bytes,
@@ -126,11 +131,11 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Caps messages reserved for in-flight and buffered replies. Default: 16,000, or the
-    /// `count` of the poll options when that is larger.
+    /// The requested messages for in-flight and buffered replies. Default: 16,000. The reader
+    /// raises the effective budget to at least 32 full batches of `count`.
     pub fn prefetch_messages(self, prefetch_messages: u32) -> Self {
         Self {
-            prefetch_messages: Some(prefetch_messages),
+            prefetch_messages,
             ..self
         }
     }

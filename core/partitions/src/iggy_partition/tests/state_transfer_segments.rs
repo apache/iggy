@@ -36,6 +36,7 @@ async fn referenced_prepare_reads_reject_batch_and_payload_corruption_without_bo
             .enable_segment_storage(
                 journal::partition_journal::SegmentPosition::default(),
                 1024 * 1024,
+                None,
             )
             .await
             .unwrap();

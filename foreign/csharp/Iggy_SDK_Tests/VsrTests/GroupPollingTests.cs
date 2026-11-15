@@ -160,6 +160,40 @@ public sealed class GroupPollingTests
         Assert.Equal(2, node.Requests(SyncGroupCode));
     }
 
+    /// <summary>A fully zero context names no owner, so a fence re-syncs and polls the new assignment.</summary>
+    [Fact]
+    public async Task given_a_fully_zero_caller_context_when_a_group_poll_is_fenced_should_resync_and_poll_the_new_assignment()
+    {
+        using var node = new MockNode();
+        var generation = 1ul;
+        node.Serve(request =>
+        {
+            switch (request.Code)
+            {
+                case SyncGroupCode:
+                    return Reply(OPERATION_NON_REPLICATED, AssignmentBody(generation, [(uint)generation]));
+                case PollMessagesCode when generation == 1:
+                    generation = 2;
+                    return Reply(request.Operation, [], VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED);
+                case PollMessagesCode:
+                    return Reply(request.Operation, EmptyBatchBody(2));
+                case GET_CLUSTER_METADATA_CODE:
+                    return StandaloneRoster(node.Port);
+                default:
+                    return Answer(request);
+            }
+        });
+        using var client = await ConnectAsync(node);
+
+        var polled = await client.PollMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(2), null,
+            Consumer.Group(3), PollingStrategy.Next().WithContext(default), 10, false,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(2u, polled.PartitionId);
+        Assert.Equal(2, node.Requests(SyncGroupCode));
+        Assert.Equal(2, node.Requests(PollMessagesCode));
+    }
+
     private static async Task<TcpMessageStream> ConnectAsync(MockNode node)
     {
         var configuration = new IggyClientConfigurator

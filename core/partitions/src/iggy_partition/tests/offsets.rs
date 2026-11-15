@@ -442,37 +442,187 @@ async fn given_an_external_group_offset_when_finding_the_retention_barrier_shoul
 #[compio::test]
 async fn given_offsets_past_the_partition_end_when_recovered_should_clamp_only_iggy_kinds() {
     let dir = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: dir.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
-    let namespace = IggyNamespace::new(1, 1, 0);
+    let config = offsets_config(&dir);
     let group_file = format!("{}/8", config.get_consumer_group_offsets_path(1, 1, 0));
     let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
     for path in [&group_file, &external_file] {
         persist_offset(path, 1_000, true).await.unwrap();
     }
-    let (mut partition, _) = recording_partition();
 
+    let partition = recover_offsets_at(&config, Some(10)).await.unwrap();
+
+    assert_eq!(partition.external_group_offset(9), Some(1_000));
+    assert_eq!(persisted_offset(&external_file), Some(1_000));
+    assert_eq!(group_offset(&partition, 8), Some(10));
+    assert_eq!(persisted_offset(&group_file), Some(10));
+}
+
+/// A stored offset says that message was consumed, so none fits a partition that holds
+/// nothing. A kept 0 makes `Next` start at 1 and skip the first message of the new history.
+#[compio::test]
+async fn given_stored_offsets_when_recovered_into_partition_that_holds_nothing_should_remove_them()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let config = offsets_config(&dir);
+    let consumer_file = format!("{}/7", config.get_consumer_offsets_path(1, 1, 0));
+    let group_file = format!("{}/8", config.get_consumer_group_offsets_path(1, 1, 0));
+    let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
+    persist_offset(&consumer_file, 7, true).await.unwrap();
+    persist_offset(&group_file, 0, true).await.unwrap();
+    persist_offset(&external_file, 7, true).await.unwrap();
+
+    let partition = recover_offsets_at(&config, None).await.unwrap();
+
+    assert_eq!(consumer_offset(&partition, 7), None);
+    assert_eq!(group_offset(&partition, 8), None);
+    for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+        assert_eq!(partition.durable_consumer_offset_count(kind), 0, "{kind}");
+    }
+    assert_eq!(persisted_offset(&consumer_file), None);
+    assert_eq!(persisted_offset(&group_file), None);
+    assert_eq!(partition.external_group_offset(9), Some(7));
+    assert_eq!(persisted_offset(&external_file), Some(7));
+}
+
+/// An auto-commit writes no file while its offset is at or below the value the file is known
+/// to hold. A clamp that leaves the old value in the file makes every later boot read it again.
+#[compio::test]
+async fn given_clamped_offset_when_auto_committed_and_recovered_again_should_keep_the_committed_value()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let config = offsets_config(&dir);
+    let consumer_file = format!("{}/7", config.get_consumer_offsets_path(1, 1, 0));
+    persist_offset(&consumer_file, 1_000, true).await.unwrap();
+    let partition = recover_offsets_at(&config, Some(10)).await.unwrap();
+    assert_eq!(consumer_offset(&partition, 7), Some(10));
+
+    // The partition takes messages 11 through 20, and a poll commits 15.
+    partition.offset.store(20, Ordering::Release);
+    partition.dirty_offset.store(20, Ordering::Relaxed);
+    let commit = PendingConsumerOffsetCommit::upsert_auto_commit(ConsumerKind::Consumer, 7, 15);
+    partition
+        .persist_consumer_offset_commit(commit)
+        .await
+        .unwrap();
+    partition.apply_consumer_offset_commit(commit);
+    assert_eq!(consumer_offset(&partition, 7), Some(15));
+    drop(partition);
+
+    let restarted = recover_offsets_at(&config, Some(2_000)).await.unwrap();
+
+    assert_eq!(consumer_offset(&restarted, 7), Some(15));
+    assert_eq!(persisted_offset(&consumer_file), Some(15));
+}
+
+/// A partition that serves after a clamp its file did not take reads the old value on the
+/// next boot, so the recovery has to fail.
+#[compio::test]
+async fn given_offset_file_that_cannot_be_rewritten_when_recovered_past_the_end_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = offsets_config(&dir);
+    let consumer_file = format!("{}/7", config.get_consumer_offsets_path(1, 1, 0));
+    persist_offset(&consumer_file, 1_000, true).await.unwrap();
+    // A directory where the replacement belongs fails the rewrite.
+    std::fs::create_dir(format!(
+        "{consumer_file}{}",
+        crate::offset_storage::OFFSET_REPLACEMENT_SUFFIX
+    ))
+    .unwrap();
+
+    let Err(error) = recover_offsets_at(&config, Some(10)).await else {
+        panic!("a clamp that cannot rewrite its file must fail the recovery");
+    };
+
+    assert!(
+        matches!(
+            &error,
+            crate::PartitionRecoveryError::ConsumerOffsetClamp { path, .. }
+                if *path == consumer_file
+        ),
+        "{error:?}"
+    );
+    assert_eq!(persisted_offset(&consumer_file), Some(1_000));
+}
+
+/// The clamp promises that each changed file and its directory are durable on return, so it
+/// fails for a changed file whose kind has no directory to sync.
+#[compio::test]
+async fn given_a_clamped_offset_of_a_kind_without_a_directory_when_clamping_should_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let consumer_file = dir.path().join("7").to_string_lossy().into_owned();
+    persist_offset(&consumer_file, 1_000, true).await.unwrap();
+    let (partition, _) = recording_partition();
+    partition.consumer_offsets.pin().insert(
+        7,
+        ConsumerOffset::new(ConsumerKind::Consumer, 7, 1_000, consumer_file.clone()),
+    );
+
+    let Err(error) =
+        crate::partition_storage::clamp_consumer_offsets(&partition, IggyNamespace::new(1, 1, 0))
+            .await
+    else {
+        panic!("a clamp that cannot sync the directory of a changed file must fail");
+    };
+
+    assert!(
+        matches!(
+            &error,
+            crate::PartitionRecoveryError::ConsumerOffsetClamp { path, .. }
+                if *path == consumer_file
+        ),
+        "{error:?}"
+    );
+}
+
+/// Recover the offsets under `config` into a new partition whose committed messages end at
+/// `last_offset`, or which holds nothing.
+async fn recover_offsets_at(
+    config: &PartitionsConfig,
+    last_offset: Option<u64>,
+) -> Result<IggyPartition<RecordingBus>, crate::PartitionRecoveryError> {
+    let (mut partition, _) = recording_partition();
+    if let Some(last_offset) = last_offset {
+        partition.set_offset_space_used(true);
+        partition.offset.store(last_offset, Ordering::Release);
+        partition.dirty_offset.store(last_offset, Ordering::Relaxed);
+    }
     crate::partition_storage::configure_consumer_offsets_with_storage(
         &DiskStorage,
         &mut partition,
-        &config,
-        namespace,
-        10,
+        config,
+        IggyNamespace::new(1, 1, 0),
     )
-    .await
-    .unwrap();
+    .await?;
+    Ok(partition)
+}
 
-    assert_eq!(partition.external_group_offset(9), Some(1_000));
-    let group = partition
+fn consumer_offset(partition: &IggyPartition<RecordingBus>, consumer_id: usize) -> Option<u64> {
+    partition
+        .consumer_offsets
+        .pin()
+        .get(&consumer_id)
+        .map(|offset| offset.offset.load(Ordering::Relaxed))
+}
+
+fn group_offset(partition: &IggyPartition<RecordingBus>, group_id: usize) -> Option<u64> {
+    partition
         .consumer_group_offsets
         .pin()
-        .get(&ConsumerGroupId(8))
-        .map(|offset| offset.offset.load(Ordering::Relaxed));
-    assert_eq!(group, Some(10));
+        .get(&ConsumerGroupId(group_id))
+        .map(|offset| offset.offset.load(Ordering::Relaxed))
+}
+
+/// The offset a consumer offset file holds, `None` when the file is absent.
+fn persisted_offset(path: &str) -> Option<u64> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("cannot read {path}: {error}"),
+    };
+    match decode_offset_record(&bytes) {
+        OffsetRecord::Value { offset, .. } => Some(offset),
+        record => panic!("{path} holds {record:?}"),
+    }
 }
 
 /// External group offsets can be stored and deleted on a partition that never took a

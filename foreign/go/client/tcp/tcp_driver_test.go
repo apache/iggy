@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -1047,4 +1048,55 @@ func TestDriverEndsARestartedReadWith58AfterItsContextEnds(t *testing.T) {
 	})
 
 	require.ErrorIs(t, client.Ping(ctx), ierror.ErrTransientNotAccepted)
+}
+
+// A send to replica 2 waits for its link. The test brings up the link to
+// replica 1 first, which wakes the send only to pause again, and then the
+// link to replica 2. Every pause is held, so only a link that comes up can
+// end one.
+func TestDriverARequestWaitingForItsReplicaGoesOutOnceItsLinkIsReady(t *testing.T) {
+	binds := make([]chan struct{}, 3)
+	release := make([]func(), len(binds))
+	for replica := 1; replica < len(binds); replica++ {
+		gate := make(chan struct{})
+		binds[replica], release[replica] = gate, sync.OnceFunc(func() { close(gate) })
+		t.Cleanup(release[replica])
+	}
+	servers := listenReplicas(t, len(binds), func(replica int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.BindSessionCode) && binds[replica] != nil:
+			<-binds[replica]
+		case read.code() == uint32(command.GetPartitionRouteCode):
+			return routeReply(t, read, 2)
+		case read.operation() == vsr.OperationSendMessages:
+			return replyFrame(read.operation(), zeroConfirmations())
+		}
+		return nil
+	})
+	client, pauses := connectReplicas(t, servers)
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	stream, topic, _ := groupConsumer(t)
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	sent := make(chan error, 1)
+	go func() {
+		_, err := client.SendMessages(ctx, stream, topic, iggcon.PartitionId(0), []iggcon.IggyMessage{message})
+		sent <- err
+	}()
+
+	for replica := 1; replica < len(binds); replica++ {
+		select {
+		case <-pauses:
+		case <-ctx.Done():
+			t.Fatalf("the send did not wait for its link before replica %d came up", replica)
+		}
+		release[replica]()
+	}
+
+	require.NoError(t, <-sent, "the send goes out once its link is ready, not when its backoff ends")
+	require.Len(t, requestsFor(servers[2].recorded(), vsr.OperationSendMessages), 1)
+	require.Empty(t, requestsFor(servers[1].recorded(), vsr.OperationSendMessages),
+		"a link to another replica only wakes the send")
+	require.Empty(t, pauses, "the send pauses once for each look that finds no link")
 }

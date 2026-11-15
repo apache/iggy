@@ -96,6 +96,8 @@ public final class BytesDeserializer {
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int READY_PARTITION_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
+    // A poll reply names its partition (u32), current offset (u64) and message count (u32) before its context.
+    private static final int POLL_REPLY_BYTES_BEFORE_CONTEXT = Integer.BYTES + Long.BYTES + Integer.BYTES;
     // A fetch names at most this many partitions, MAX_PARTITIONS_PER_REQUEST in core/binary_protocol/src/lib.rs.
     private static final int MAX_FETCH_SECTIONS = 1000;
     private static final int MIN_CLUSTER_NODE_BYTES = 19;
@@ -284,6 +286,14 @@ public final class BytesDeserializer {
         var context = readPartitionContext(response);
         return new PolledMessages(
                 partitionId, currentOffset, messagesCount, readMessages(response, messagesCount), context);
+    }
+
+    /**
+     * Reads only the context of a poll reply. It decodes no message, so a message that does not decode cannot fail it.
+     */
+    public static PartitionContext readPolledContext(ByteBuf response) {
+        response.skipBytes(POLL_REPLY_BYTES_BEFORE_CONTEXT);
+        return readPartitionContext(response);
     }
 
     /** Reads the batch records of a poll reply or of a fetch section, which must hold {@code count} messages. */
