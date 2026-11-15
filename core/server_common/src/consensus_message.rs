@@ -656,6 +656,8 @@ where
     }
 }
 
+// `from = false`: a generated `From<Message<H>>` would collide with the
+// `TryFrom<Message<T>>` impl below, which validates the frame.
 #[derive(Debug)]
 #[whichever::dispatch(from = false)]
 pub enum MessageBag {
@@ -702,6 +704,8 @@ pub enum MessageBag {
     ForwardCompletion(Message<ForwardCompletionHeader>),
 }
 
+// `whichever` writes the methods marked `#[dispatch]`: one `match` that makes
+// the same call on every variant's message.
 #[whichever::dispatch]
 impl MessageBag {
     /// Whether [`Self::routing`] sends frames of `command` to the metadata
