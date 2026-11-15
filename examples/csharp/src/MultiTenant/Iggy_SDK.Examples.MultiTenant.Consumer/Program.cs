@@ -27,7 +27,10 @@ var tenantsCount = MultiTenantHelpers.ReadPositiveInt("TENANTS_COUNT", 3);
 var tenantId = MultiTenantHelpers.ReadPositiveInt("TENANT_ID", 1);
 if (tenantId > tenantsCount)
 {
-    throw new FormatException($"TENANT_ID {tenantId} is above TENANTS_COUNT {tenantsCount}.");
+    throw new ArgumentOutOfRangeException(
+        "TENANT_ID",
+        $"TENANT_ID {tenantId} is above TENANTS_COUNT {tenantsCount}."
+    );
 }
 
 logger.LogInformation(
