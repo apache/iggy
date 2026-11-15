@@ -21,7 +21,6 @@ use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::SinglePortReserver;
 use crate::harness::traits::{IggyServerDependent, TestBinary};
-use assert_cmd::prelude::CommandCargoExt;
 use rmcp::{
     RoleClient, ServiceExt,
     model::{ClientCapabilities, ClientConfig, Implementation, InitializeRequestParams},
@@ -155,17 +154,13 @@ impl TestBinary for McpHandle {
         Self::with_server_id(config, context, 0)
     }
 
-    #[allow(deprecated)]
     fn start(&mut self) -> Result<(), TestBinaryError> {
         self.build_envs();
 
         let mut command = if let Some(ref path) = self.config.executable_path {
             Command::new(path)
         } else {
-            Command::cargo_bin("iggy-mcp").map_err(|e| TestBinaryError::ProcessSpawn {
-                binary: "iggy-mcp".to_string(),
-                source: std::io::Error::other(e.to_string()),
-            })?
+            common::cargo_bin_command("iggy-mcp")?
         };
 
         command.envs(&self.envs);

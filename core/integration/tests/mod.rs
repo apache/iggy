@@ -27,6 +27,7 @@ mod config_provider;
 mod connectors_harness;
 mod data_integrity;
 mod mcp;
+mod object_store;
 mod sdk;
 mod server;
 

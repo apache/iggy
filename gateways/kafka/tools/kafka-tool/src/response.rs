@@ -215,7 +215,9 @@ fn decode_body(
     let mut buf = Bytes::copy_from_slice(body);
     match api_key {
         18 => {
-            let resp = ApiVersionsResponse::decode(&mut buf, api_version)?;
+            // A v5 response has the fields of v4, and `kafka-protocol` 0.18 decodes up to v4.
+            let fields_version = if api_version == 5 { 4 } else { api_version };
+            let resp = ApiVersionsResponse::decode(&mut buf, fields_version)?;
             codes.push(resp.error_code);
             details.push(format!(
                 "top_level.error_code={} ({})",

@@ -246,9 +246,11 @@ class MessagesHttpClient implements MessagesClient {
                 : httpClient.prepareGetRequest(deferredPath, query);
     }
 
-    // Without the context the server would read a recreated partition instead of refusing the poll.
+    // Without the context the server would read a recreated partition instead of refusing the poll. A context that is
+    // all zero counts as no context.
     private static NameValuePair contextParameter(PollingStrategy strategy) {
         return strategy.context()
+                .filter(context -> !context.equals(PartitionContext.EMPTY))
                 .map(context -> new BasicNameValuePair(
                         "context", ObjectMapperFactory.getInstance().writeValueAsString(context)))
                 .orElse(null);

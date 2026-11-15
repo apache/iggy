@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use ::configs::ConfigurationError;
+use std::net::SocketAddr;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -23,10 +25,26 @@ pub enum McpRuntimeError {
     RuntimeCreation(#[source] std::io::Error),
     #[error("Failed to register shutdown signal: {0}")]
     SignalRegistration(#[source] std::io::Error),
+    #[error("Failed to load configuration: {0}")]
+    Configuration(#[source] ConfigurationError),
     #[error("Failed to create service")]
     FailedToCreateService,
     #[error("Failed to start HTTP server")]
     FailedToStartHttpServer,
+    #[error("Invalid HTTP address: {0}")]
+    InvalidHttpAddress(String),
+    #[error(
+        "HTTP address {0} accepts connections from other hosts, set http.auth_token or bind a loopback address"
+    )]
+    MissingHttpAuthToken(SocketAddr),
+    #[error("CORS allows every origin, set http.auth_token or list the allowed origins")]
+    UnrestrictedCorsWithoutAuthToken,
+    #[error("http.allowed_hosts cannot be empty")]
+    EmptyAllowedHosts,
+    #[error("Invalid CORS configuration: {0}")]
+    InvalidCorsConfiguration(String),
+    #[error("Failed to load the HTTP TLS certificate or key: {0}")]
+    HttpTls(#[source] std::io::Error),
     #[error("Iggy client error")]
     IggyClient(#[from] iggy::prelude::ClientError),
     #[error("Iggy error")]

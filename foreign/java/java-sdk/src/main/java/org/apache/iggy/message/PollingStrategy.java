@@ -83,7 +83,11 @@ public record PollingStrategy(
      * client sends this context with the poll and with every retry of it. If the partition
      * was deleted and recreated since, the server refuses the poll with error 87 instead of
      * reading the offset in the new partition. If a group consumer's partition changed
-     * owner, the server refuses it with error 5009.
+     * owner, the server refuses it with error 5009. Over TCP, a context with incarnation 0
+     * names no history. So the poll takes the incarnation of the partition route once, and
+     * keeps the owner and op of the context. A context that is all zero takes the whole
+     * context of the route. Over HTTP, a context that is all zero counts as no context,
+     * and any other context goes as it is.
      *
      * @param context the context of the poll the offset came from
      * @return a copy of this strategy that carries {@code context}

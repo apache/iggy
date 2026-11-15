@@ -191,6 +191,9 @@ class IggyErrorCodeTest {
         "85, REQUEST_TOO_OLD",
         "87, HISTORY_UNAVAILABLE",
         "88, LIFECYCLE_BUSY",
+        "89, NOT_PRIMARY",
+        "90, DEFERRED_POLL_CAPACITY_EXCEEDED",
+        "96, TIERED_READ_FAILED",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",

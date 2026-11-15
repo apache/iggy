@@ -24,7 +24,8 @@
 //! their replica forwards) delegate to `session_ops`, which owns that
 //! machinery. A backup relays partition completions to the metadata primary
 //! here, because only the primary proposes and it may hold no replica of the
-//! partition.
+//! partition. The retention decision of a tiered partition's primary takes the
+//! same relay, because that primary can sit on a metadata backup.
 
 use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::dispatch::session_ops::{
@@ -45,7 +46,7 @@ use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use metadata::stm::lifecycle::CompleteLifecycleRequest;
-use metadata::stm::stream::Streams;
+use metadata::stm::stream::{Streams, TruncatePartitionRequest};
 use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -98,6 +99,28 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             }
             shard::MetadataSubmit::ForwardedSegmentDelete(query) => {
                 super::segment_delete::answer(&shard, *query.header()).await;
+            }
+            shard::MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset,
+            } => {
+                if relay_retention_truncate(&shard, namespace, created_revision, up_to_offset)
+                    .await
+                {
+                    return;
+                }
+                let committed =
+                    commit_retention_truncate(&shard, namespace, created_revision, up_to_offset)
+                        .await;
+                if let Some(Err(error)) = committed {
+                    trace!(
+                        ?error,
+                        namespace_raw = namespace.inner(),
+                        up_to_offset,
+                        "retention truncation not committed; the next pass decides again"
+                    );
+                }
             }
 
             shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
@@ -352,6 +375,137 @@ where
     rx.recv().await.ok().flatten()
 }
 
+/// Commit the retention decision of a tiered partition's primary as a
+/// `TruncatePartition`, which every replica's reconciler then enforces.
+///
+/// `None` when nothing is proposed: the decision is of another incarnation,
+/// or the committed watermark already covers it. `Some(Ok(true))` when the
+/// truncation committed and applied.
+///
+/// Only the metadata primary proposes, so every other node gets `NotPrimary`
+/// here. A backup hands its decision to the primary with
+/// [`relay_retention_truncate`] instead, and the primary runs a relayed
+/// decision through this same function, so both origins pass the same checks
+/// against the committed state of the node that proposes.
+#[allow(clippy::future_not_send)]
+async fn commit_retention_truncate<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    up_to_offset: u64,
+) -> Option<Result<bool, MetadataSubmitError>>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let request = retention_truncate_request(
+        metadata.mux_stm.streams(),
+        namespace,
+        created_revision,
+        up_to_offset,
+    )?;
+    Some(
+        metadata
+            .submit_truncate_partition_in_process(&request)
+            .await,
+    )
+}
+
+/// The truncation that raises the committed watermark of `namespace` to
+/// `up_to_offset`. `None` when the partition is gone or is another
+/// incarnation than `created_revision`, and when the watermark is there
+/// already: the frame that carried the decision can be older than a commit.
+#[allow(clippy::cast_possible_truncation)]
+fn retention_truncate_request(
+    streams: &Streams,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    up_to_offset: u64,
+) -> Option<TruncatePartitionRequest> {
+    let committed_up_to = streams
+        .with_committed_partition(namespace, |partition| {
+            (partition.created_revision == created_revision)
+                .then_some(partition.deleted_up_to_offset)
+        })
+        .flatten()?;
+    (up_to_offset > committed_up_to).then(|| TruncatePartitionRequest {
+        stream_id: WireIdentifier::numeric(namespace.stream_id() as u32),
+        topic_id: WireIdentifier::numeric(namespace.topic_id() as u32),
+        partition_id: namespace.partition_id() as u32,
+        up_to_offset,
+        expected_history: Some(created_revision),
+    })
+}
+
+/// Relays the retention decision to the metadata primary when this node is a
+/// backup that serves its view. `true` for such a backup, relayed or not:
+/// only the primary proposes, and the next timed pass decides again, so a
+/// relay that cannot be sent is not kept. `false` in every other state, where
+/// the caller proposes in process: a primary commits, and a node in a view
+/// change refuses.
+///
+/// A decision that this node's committed state already rules out is not sent.
+/// The primary checks it again against its own state, which can be ahead.
+#[allow(clippy::future_not_send)]
+async fn relay_retention_truncate<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    up_to_offset: u64,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata = shard.plane.metadata();
+    let Some(consensus) = metadata.consensus.as_ref() else {
+        return false;
+    };
+    if !consensus.is_normal_backup() {
+        return false;
+    }
+    let Some(request) = retention_truncate_request(
+        metadata.mux_stm.streams(),
+        namespace,
+        created_revision,
+        up_to_offset,
+    ) else {
+        return true;
+    };
+    let view = consensus.view();
+    let message = relay_message(
+        consensus.cluster(),
+        view,
+        consensus.replica(),
+        Operation::TruncatePartition,
+        0,
+        &request.to_bytes(),
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_replica(
+            consensus.primary_index(view),
+            message.into_generic().into_frozen(),
+        )
+        .await
+    {
+        trace!(
+            ?error,
+            namespace_raw = namespace.inner(),
+            up_to_offset,
+            "retention truncation relay not sent; the next pass decides again"
+        );
+    }
+    true
+}
+
 /// The commit position a SUCCESSFULLY COMMITTED metadata reply carries, or
 /// `None` when the frame promises the caller nothing.
 ///
@@ -521,6 +675,10 @@ where
 /// dropped before it takes a prepare. A refusal while this primary catches up,
 /// or while the reporter's own batch is in its pipeline, also drops the frame,
 /// and the backup relays it again one relay interval later.
+///
+/// A relayed retention truncation is checked against the committed state of
+/// this node the way a local decision is, so a relay of another incarnation,
+/// or one that the watermark covers, takes no prepare either.
 #[allow(clippy::future_not_send)]
 async fn propose_relayed_completion<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -535,8 +693,29 @@ async fn propose_relayed_completion<B, MJ, S, SB>(
     let header = *message.header();
     let metadata = shard.plane.metadata();
     let streams = metadata.mux_stm.streams();
-    // `validate` admits only the two completion operations.
-    if header.operation == Operation::CompleteLifecycle {
+    // `validate` admits only the two completion operations and the truncation.
+    if header.operation == Operation::TruncatePartition {
+        let Some((namespace, created_revision, up_to_offset)) =
+            decode_relayed_truncation(message.body())
+        else {
+            trace!(
+                header.replica,
+                "dropping an undecodable relayed retention truncation"
+            );
+            return;
+        };
+        let committed =
+            commit_retention_truncate(shard, namespace, created_revision, up_to_offset).await;
+        if !matches!(committed, Some(Ok(true))) {
+            trace!(
+                ?committed,
+                header.replica,
+                namespace_raw = namespace.inner(),
+                up_to_offset,
+                "relayed retention truncation not committed"
+            );
+        }
+    } else if header.operation == Operation::CompleteLifecycle {
         let Ok(request) = CompleteLifecycleRequest::decode_from(message.body()) else {
             trace!(
                 header.replica,
@@ -595,7 +774,20 @@ fn decode_relayed_revocation(
     Some((request, namespace))
 }
 
-#[allow(clippy::cast_possible_truncation)]
+/// The partition, the incarnation and the offset of a relayed retention
+/// truncation. `None` when the body does not decode, names no partition by
+/// number, or names no incarnation: without one the truncation could not be
+/// bound to the partition the sender decided for.
+fn decode_relayed_truncation(body: &[u8]) -> Option<(IggyNamespace, u64, u64)> {
+    let request = TruncatePartitionRequest::decode_from(body).ok()?;
+    let namespace = IggyNamespace::try_new(
+        request.stream_id.as_u32()? as usize,
+        request.topic_id.as_u32()? as usize,
+        request.partition_id as usize,
+    )?;
+    Some((namespace, request.expected_history?, request.up_to_offset))
+}
+
 fn forward_completion_message(
     cluster: u128,
     view: u32,
@@ -607,6 +799,18 @@ fn forward_completion_message(
         CompletionKey::Lifecycle { reporter, .. } => (Operation::CompleteLifecycle, reporter),
         CompletionKey::Revocation { .. } => (Operation::CompleteConsumerGroupRevocation, 0),
     };
+    relay_message(cluster, view, replica, operation, reporter, body)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn relay_message(
+    cluster: u128,
+    view: u32,
+    replica: u8,
+    operation: Operation,
+    reporter: u16,
+    body: &[u8],
+) -> Message<ForwardCompletionHeader> {
     let size = HEADER_SIZE + body.len();
     let mut message = Message::<ForwardCompletionHeader>::new(size);
     message.as_mut_slice()[HEADER_SIZE..size].copy_from_slice(body);
@@ -626,8 +830,9 @@ fn forward_completion_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionKey, CompletionRelays, committed_reply_commit, forward_completion_message,
-        handle_metadata_submit,
+        CompletionKey, CompletionRelays, commit_retention_truncate, committed_reply_commit,
+        decode_relayed_truncation, forward_completion_message, handle_metadata_submit,
+        relay_message, retention_truncate_request,
     };
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
@@ -661,6 +866,7 @@ mod tests {
     use metadata::stm::lifecycle::{
         CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion,
     };
+    use metadata::stm::stream::TruncatePartitionRequest;
     use server_common::iobuf::Owned;
     use server_common::sharding::IggyNamespace;
     use server_common::{MESSAGE_ALIGN, Message};
@@ -1323,6 +1529,510 @@ mod tests {
         assert_eq!(consensus.pipeline_len(), 0);
         assert!(metadata.mux_stm.streams().lifecycle_pending(metadata_op));
         assert!(bus.sleeps.borrow().is_empty());
+    }
+
+    /// The committed truncation watermark of `namespace`, next to the
+    /// incarnation that holds it.
+    fn committed_truncation(shard: &TestShard, namespace: IggyNamespace) -> (u64, u64) {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .with_committed_partition(namespace, |partition| {
+                (partition.created_revision, partition.deleted_up_to_offset)
+            })
+            .expect("the partition is committed")
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_leads_metadata_should_commit_each_offset_once()
+     {
+        const SINGLE_REPLICA: u8 = 1;
+        const DECIDED: u64 = 9;
+        let directory = tempfile::tempdir().expect("create the metadata journal directory");
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, PRIMARY, SINGLE_REPLICA, FIRST_BOOT);
+        shard.plane.metadata_mut().journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .expect("open the metadata journal"),
+        );
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        let (created_revision, untrimmed) = committed_truncation(&shard, namespace);
+        assert_eq!(untrimmed, 0);
+        let consensus = shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus");
+        let before_commit = consensus.commit_min();
+
+        handle_metadata_submit(
+            Rc::clone(&shard),
+            shard::MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset: DECIDED,
+            },
+            &Rc::default(),
+            SESSION_TIMEOUT,
+            &relay_map(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while committed_truncation(&shard, namespace).1 != DECIDED {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the truncation did not commit"
+            );
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(consensus.commit_min(), before_commit + 1);
+
+        // What the watermark covers, and a decision read from another
+        // incarnation, propose nothing.
+        for (revision, up_to_offset) in [
+            (created_revision, DECIDED),
+            (created_revision, DECIDED - 1),
+            (created_revision + 1, DECIDED + 1),
+        ] {
+            assert_eq!(
+                commit_retention_truncate(&shard, namespace, revision, up_to_offset).await,
+                None
+            );
+        }
+        assert_eq!(consensus.commit_min(), before_commit + 1);
+        assert_eq!(committed_truncation(&shard, namespace).1, DECIDED);
+
+        assert_eq!(
+            commit_retention_truncate(&shard, namespace, created_revision, DECIDED + 1).await,
+            Some(Ok(true))
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, DECIDED + 1);
+        assert_eq!(consensus.commit_min(), before_commit + 2);
+
+        // A truncation that commits as a rejection is not reported as applied.
+        let other_incarnation = TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: 0,
+            up_to_offset: DECIDED + 2,
+            expected_history: Some(created_revision + 1),
+        };
+        assert_eq!(
+            shard
+                .plane
+                .metadata()
+                .submit_truncate_partition_in_process(&other_incarnation)
+                .await,
+            Ok(false)
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, DECIDED + 1);
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_building_its_truncation_should_bind_it_to_the_incarnation()
+     {
+        let bus = SpyBus::default();
+        let shard = test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT);
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        let request = retention_truncate_request(
+            shard.plane.metadata().mux_stm.streams(),
+            namespace,
+            created_revision,
+            9,
+        )
+        .expect("the watermark is below the decision");
+
+        assert_eq!(request.up_to_offset, 9);
+        assert_eq!(request.partition_id as usize, namespace.partition_id());
+        assert_eq!(
+            request.expected_history,
+            Some(created_revision),
+            "a partition recreated before the commit must not be truncated"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_full_primary_pipeline_when_a_retention_decision_arrives_should_refuse_it() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        let metadata = shard.plane.metadata();
+        let consensus = metadata
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus");
+        for up_to_offset in (1..).take(PIPELINE_PREPARE_QUEUE_MAX) {
+            assert!(
+                commit_retention_truncate(&shard, namespace, created_revision, up_to_offset)
+                    .now_or_never()
+                    .is_none(),
+                "the truncation stays in the pipeline without a journal or quorum"
+            );
+        }
+        assert!(consensus.pipeline_is_full());
+
+        assert_eq!(
+            commit_retention_truncate(&shard, namespace, created_revision, u64::MAX).await,
+            Some(Err(MetadataSubmitError::PipelineFull))
+        );
+        assert_eq!(consensus.pipeline_len(), PIPELINE_PREPARE_QUEUE_MAX);
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_is_a_metadata_backup_should_commit_nothing()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        assert_eq!(
+            commit_retention_truncate(&shard, namespace, created_revision, 9).await,
+            Some(Err(MetadataSubmitError::NotPrimary))
+        );
+
+        assert_eq!(committed_truncation(&shard, namespace).1, 0);
+        assert!(
+            bus.replica_sends.borrow().is_empty(),
+            "a refused proposal relays nothing, so a relayed decision takes one hop"
+        );
+    }
+
+    /// The body a backup relays for a retention decision.
+    fn retention_truncation(
+        namespace: IggyNamespace,
+        created_revision: u64,
+        up_to_offset: u64,
+    ) -> TruncatePartitionRequest {
+        TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(u32::try_from(namespace.stream_id()).unwrap()),
+            topic_id: WireIdentifier::numeric(u32::try_from(namespace.topic_id()).unwrap()),
+            partition_id: u32::try_from(namespace.partition_id()).unwrap(),
+            up_to_offset,
+            expected_history: Some(created_revision),
+        }
+    }
+
+    /// Hands shard 0 the retention decision of a partition primary on this
+    /// node, and lets the arm run to its first suspension.
+    async fn submit_retention_decision(
+        shard: &Rc<TestShard>,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        up_to_offset: u64,
+    ) {
+        handle_metadata_submit(
+            Rc::clone(shard),
+            shard::MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset,
+            },
+            &Rc::default(),
+            SESSION_TIMEOUT,
+            &relay_map(),
+        );
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Hands shard 0 the retention truncation that a backup relayed, and lets
+    /// the arm run to its first suspension.
+    async fn receive_retention_relay(shard: &Rc<TestShard>, request: &TruncatePartitionRequest) {
+        handle_metadata_submit(
+            Rc::clone(shard),
+            shard::MetadataSubmit::ForwardedCompletion(relay_message(
+                1,
+                0,
+                BACKUP,
+                Operation::TruncatePartition,
+                0,
+                &request.to_bytes(),
+            )),
+            &Rc::default(),
+            SESSION_TIMEOUT,
+            &relay_map(),
+        );
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Applies `request` to the committed state of `shard`, as replication
+    /// from the primary does.
+    fn apply_truncation(shard: &TestShard, request: &TruncatePartitionRequest) {
+        let applied = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::TruncatePartition,
+                0,
+                1,
+                &request.to_bytes(),
+            ))
+            .expect("the truncation applies");
+        assert_eq!(applied.code, 0);
+    }
+
+    /// How many of the frames this node sent to replicas are relays.
+    fn relays_sent(bus: &SpyBus) -> usize {
+        bus.replica_sends
+            .borrow()
+            .iter()
+            .filter(|(_, frame)| {
+                let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(frame.len());
+                owned.as_mut_slice().copy_from_slice(frame);
+                Message::<GenericHeader>::try_from(owned)
+                    .is_ok_and(|message| message.header().command == Command::ForwardCompletion)
+            })
+            .count()
+    }
+
+    fn pipeline_len(shard: &TestShard) -> usize {
+        shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus")
+            .pipeline_len()
+    }
+
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_is_a_metadata_backup_should_relay_it_to_the_primary()
+     {
+        const DECIDED: u64 = 9;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        submit_retention_decision(&shard, namespace, created_revision, DECIDED).await;
+
+        let relays = relays(&bus);
+        assert_eq!(relays.len(), 1, "one decision is one relay");
+        let (target, relay) = &relays[0];
+        assert_eq!(*target, PRIMARY, "a relay goes to the primary of the view");
+        assert_eq!(relay.header().operation, Operation::TruncatePartition);
+        assert_eq!(relay.header().reporter, 0);
+        assert_eq!(relay.header().replica, BACKUP);
+        assert_eq!(
+            relay.body(),
+            &retention_truncation(namespace, created_revision, DECIDED).to_bytes()[..],
+            "the body is the truncation bound to the incarnation"
+        );
+        assert_eq!(
+            decode_relayed_truncation(relay.body()),
+            Some((namespace, created_revision, DECIDED)),
+            "the primary reads back what the backup decided"
+        );
+        assert_eq!(pipeline_len(&shard), 0, "a backup proposes nothing");
+        assert_eq!(committed_truncation(&shard, namespace).1, 0);
+    }
+
+    /// The backup's committed state can only be behind the primary's, so what
+    /// it rules out the primary would drop too.
+    #[compio::test]
+    async fn given_a_ruled_out_retention_decision_when_this_node_is_a_metadata_backup_should_relay_nothing()
+     {
+        const COMMITTED: u64 = 9;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        apply_truncation(
+            &shard,
+            &retention_truncation(namespace, created_revision, COMMITTED),
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, COMMITTED);
+
+        for (revision, up_to_offset) in [
+            (created_revision, COMMITTED),
+            (created_revision, COMMITTED - 1),
+            (created_revision + 1, COMMITTED + 1),
+        ] {
+            submit_retention_decision(&shard, namespace, revision, up_to_offset).await;
+            assert!(
+                bus.replica_sends.borrow().is_empty(),
+                "offset {up_to_offset} of incarnation {revision} is not relayed"
+            );
+        }
+
+        submit_retention_decision(&shard, namespace, created_revision, COMMITTED + 1).await;
+        assert_eq!(
+            relays(&bus).len(),
+            1,
+            "a decision above the watermark relays"
+        );
+    }
+
+    /// The test shard has no journal, so the prepare stays in the pipeline.
+    #[compio::test]
+    async fn given_a_retention_decision_when_this_node_leads_metadata_should_propose_it_and_relay_nothing()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        submit_retention_decision(&shard, namespace, created_revision, 9).await;
+
+        assert_eq!(pipeline_len(&shard), 1, "the primary proposes in process");
+        assert_eq!(relays_sent(&bus), 0, "the primary has no one to relay to");
+    }
+
+    #[compio::test]
+    async fn given_a_relayed_retention_truncation_when_this_node_leads_metadata_should_commit_it() {
+        const SINGLE_REPLICA: u8 = 1;
+        const DECIDED: u64 = 9;
+        let directory = tempfile::tempdir().expect("create the metadata journal directory");
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, PRIMARY, SINGLE_REPLICA, FIRST_BOOT);
+        shard.plane.metadata_mut().journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .expect("open the metadata journal"),
+        );
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        let consensus = shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 holds the metadata consensus");
+        let before_commit = consensus.commit_min();
+
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(namespace, created_revision, DECIDED),
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while committed_truncation(&shard, namespace).1 != DECIDED {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relayed truncation did not commit"
+            );
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(consensus.commit_min(), before_commit + 1);
+        assert_eq!(relays_sent(&bus), 0, "a relay takes one hop");
+    }
+
+    /// A relay can be older than a commit, and slab ids are reused after a
+    /// delete, so the primary checks a relay against its own committed state.
+    /// The test shard has no journal, so a proposed relay stays in the pipeline.
+    #[compio::test]
+    async fn given_a_relayed_retention_truncation_when_the_committed_state_rules_it_out_should_propose_nothing()
+     {
+        const COMMITTED: u64 = 9;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, PRIMARY, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+        apply_truncation(
+            &shard,
+            &retention_truncation(namespace, created_revision, COMMITTED),
+        );
+
+        for (revision, up_to_offset) in [
+            (created_revision, COMMITTED),
+            (created_revision, COMMITTED - 1),
+            (created_revision + 1, COMMITTED + 1),
+        ] {
+            receive_retention_relay(
+                &shard,
+                &retention_truncation(namespace, revision, up_to_offset),
+            )
+            .await;
+            assert_eq!(
+                pipeline_len(&shard),
+                0,
+                "offset {up_to_offset} of incarnation {revision} takes no prepare"
+            );
+        }
+        let gone = IggyNamespace::new(0, 0, 1);
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(gone, created_revision, COMMITTED + 1),
+        )
+        .await;
+        assert_eq!(pipeline_len(&shard), 0, "an unknown partition takes none");
+
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(namespace, created_revision, COMMITTED + 1),
+        )
+        .await;
+        assert_eq!(
+            pipeline_len(&shard),
+            1,
+            "a relay above the watermark of the same incarnation is proposed"
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, COMMITTED);
+    }
+
+    #[compio::test]
+    async fn given_a_relayed_retention_truncation_when_receiver_is_a_backup_should_neither_propose_nor_relay_again()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
+        let namespace = create_one_partition(&shard);
+        let (created_revision, _) = committed_truncation(&shard, namespace);
+
+        receive_retention_relay(
+            &shard,
+            &retention_truncation(namespace, created_revision, 9),
+        )
+        .await;
+
+        assert_eq!(pipeline_len(&shard), 0, "only the primary proposes");
+        assert!(
+            bus.replica_sends.borrow().is_empty(),
+            "a relay received by a backup is dropped, not relayed again"
+        );
+        assert_eq!(committed_truncation(&shard, namespace).1, 0);
+    }
+
+    /// Both bodies have the size the frame admits for a truncation, or decode
+    /// as one, and neither names a partition incarnation by number.
+    #[test]
+    fn given_a_relayed_truncation_body_when_it_is_not_bound_to_a_numbered_incarnation_should_not_decode()
+     {
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let bound = retention_truncation(namespace, 7, 9);
+        assert_eq!(
+            decode_relayed_truncation(&bound.to_bytes()),
+            Some((namespace, 7, 9))
+        );
+
+        let unbound = TruncatePartitionRequest {
+            expected_history: None,
+            ..bound.clone()
+        };
+        assert_eq!(decode_relayed_truncation(&unbound.to_bytes()), None);
+
+        // A four-byte name encodes to the size of a numeric id.
+        let by_stream_name = TruncatePartitionRequest {
+            stream_id: WireIdentifier::named("abcd").expect("a short name"),
+            ..bound.clone()
+        };
+        assert_eq!(by_stream_name.to_bytes().len(), bound.to_bytes().len());
+        assert_eq!(decode_relayed_truncation(&by_stream_name.to_bytes()), None);
+        let by_topic_name = TruncatePartitionRequest {
+            topic_id: WireIdentifier::named("abcd").expect("a short name"),
+            ..bound
+        };
+        assert_eq!(decode_relayed_truncation(&by_topic_name.to_bytes()), None);
+        assert_eq!(decode_relayed_truncation(&[]), None);
     }
 
     #[compio::test]

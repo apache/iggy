@@ -33,6 +33,7 @@ use tokio::time::timeout;
 use crate::client::optional_unsigned;
 use crate::error::to_php_exception;
 use crate::message_iterator::MessageIterator;
+use crate::reader::block_on_write;
 use crate::receive_message::{Checkpoint, PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
 
@@ -99,11 +100,11 @@ impl IggyConsumer {
     /// and can fail once with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned
     /// (5009), after another client deleted and recreated the partition. The failed route is
     /// dropped, and the next call routes again.
+    ///
+    /// The call ends at a deadline 10 s after its start, as commit() does.
     pub fn store_offset(&self, offset: u64, partition_id: Option<u32>) -> PhpResult {
         let partition_id = self.partition_id_or_current_after_poll(partition_id)?;
-        runtime()
-            .block_on(self.state.store_offset(offset, partition_id))
-            .map_err(to_php_exception)
+        block_on_write(self.state.store_offset(offset, partition_id)).map_err(to_php_exception)
     }
 
     /// Stores the offset of a checkpoint that this consumer delivered, which covers every
@@ -115,10 +116,9 @@ impl IggyConsumer {
     /// recreated partition fails with HistoryUnavailable (87), and one from a previous owner
     /// fails with ConsumerGroupPartitionNotOwned (5009). A checkpoint that this consumer did not
     /// deliver, and every commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+    /// The call ends at a deadline 10 s after its start, as PartitionReader::commit() does.
     pub fn commit(&self, checkpoint: &Checkpoint) -> PhpResult {
-        runtime()
-            .block_on(self.state.commit(checkpoint.inner))
-            .map_err(to_php_exception)
+        block_on_write(self.state.commit(checkpoint.inner)).map_err(to_php_exception)
     }
 
     /// Counts a checkpoint that this consumer delivered under CommitPolicy::auto() and stores
@@ -132,8 +132,11 @@ impl IggyConsumer {
 
     /// Sets the next read position of a partition and drops the rest of its current batch. Under
     /// CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before it, so
-    /// a restart resumes at the new position, and a failed store fails the seek with its
-    /// exception and moves nothing. Every other seek stores nothing.
+    /// a restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+    /// deletes the stored offset, and a seek to a timestamp stores the offset before the first
+    /// message at the timestamp, if there is one. A failed read, lookup, store or delete fails
+    /// the seek with its exception and moves nothing. Every other seek stores nothing. The call
+    /// ends at a deadline 10 s after its start, as commit() does.
     ///
     /// It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
     /// after a message that does not decode: seek to the `skip` of its ReadException. A
@@ -142,9 +145,7 @@ impl IggyConsumer {
     /// an unknown outcome fails with PartitionLaneBlocked (14009): abandon its operation first.
     pub fn seek(&self, partition_id: u32, start: &PollingStrategy) -> PhpResult {
         let mut consumer = lock_consumer(&self.inner, "seek()")?;
-        runtime()
-            .block_on(consumer.seek(partition_id, start.into()))
-            .map_err(to_php_exception)
+        block_on_write(consumer.seek(partition_id, start.into())).map_err(to_php_exception)
     }
 
     /// Deletes the stored offset for the provided partition id.
@@ -154,11 +155,10 @@ impl IggyConsumer {
     /// The delete uses the context of its route. It can fail once with HistoryUnavailable
     /// (87), or ConsumerGroupPartitionNotOwned (5009), after another client deleted and
     /// recreated the partition. The failed route is dropped, and the next call routes again.
+    /// The call ends at a deadline 10 s after its start, as commit() does.
     pub fn delete_offset(&self, partition_id: Option<u32>) -> PhpResult {
         let partition_id = self.partition_id_or_current_after_poll(partition_id)?;
-        runtime()
-            .block_on(self.state.delete_offset(partition_id))
-            .map_err(to_php_exception)
+        block_on_write(self.state.delete_offset(partition_id)).map_err(to_php_exception)
     }
 
     /// Consumes messages with a PHP callback, and returns how many it consumed.

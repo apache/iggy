@@ -220,6 +220,12 @@ pub enum IggyError {
     /// counts per partition, so `Balanced` and a messages key cannot pick one.
     #[error("A producer batch must name its partition")]
     ProducerPartitionRequired = 95,
+    /// The object store refused a read of tiered data for a reason that a
+    /// retry does not change: rejected credentials, an archived or missing
+    /// object, a malformed response, or a bucket that another cluster owns.
+    /// Clients must not send the request again.
+    #[error("Tiered data cannot be read from the object store; a retry does not help")]
+    TieredReadFailed = 96,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]

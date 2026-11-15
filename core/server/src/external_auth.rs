@@ -73,6 +73,8 @@ impl Drop for CalloutGuard {
 fn build_http_client() -> Result<cyper::Client, String> {
     cyper::Client::builder()
         .redirect(cyper::redirect::Policy::none())
+        // The service's host is looked up off the shard thread.
+        .custom_resolver(iggy_object_store::ShardResolver::default())
         .build()
         .map_err(|e| format!("failed to build HTTP client (missing CA roots?): {e}"))
 }

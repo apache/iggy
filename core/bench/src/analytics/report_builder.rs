@@ -187,10 +187,10 @@ fn cluster_info_from_metadata(metadata: ClusterMetadata) -> Option<BenchmarkClus
     })
 }
 
-/// Trend/directory suffix that forks a cluster run away from the single-node
-/// run sharing the same benchmark params. Empty for single node so existing
-/// identifiers and directory names stay byte-identical.
-pub fn cluster_suffix(cluster: Option<&BenchmarkClusterInfo>) -> String {
+/// Trend suffix that forks a cluster run away from the single-node run sharing
+/// the same benchmark params. Empty for single node so existing identifiers
+/// stay byte-identical.
+fn cluster_suffix(cluster: Option<&BenchmarkClusterInfo>) -> String {
     cluster.map_or_else(String::new, |cluster| {
         format!("_cluster{}", cluster.nodes.len())
     })

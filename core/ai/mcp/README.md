@@ -30,13 +30,15 @@ ca_file = "core/certs/iggy_cert.pem"
 domain = "" # Optional domain for TLS connection
 
 [http] # Optional HTTP API configuration
-address = "127.0.0.1:8082"
+address = "127.0.0.1:8082" # A non-loopback address requires auth_token
 path = "/mcp"
+auth_token = "" # Bearer token MCP clients must send, a literal or file:/path/to/token
+allowed_hosts = ["localhost", "127.0.0.1", "::1"] # Host header names the server answers
 
 [http.cors] # Optional CORS configuration for HTTP API
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
-allowed_origins = ["*"]
+allowed_origins = [] # Browser origins such as "http://localhost:5173", "*" requires auth_token
 allowed_headers = ["content-type"]
 exposed_headers = [""]
 allow_credentials = false
@@ -52,6 +54,7 @@ create = true
 read = true
 update = true
 delete = true
+admin = false # Users, personal access tokens, permissions, passwords and snapshots
 ```
 
 The configuration file must use TOML. The default path is `core/ai/mcp/config.toml`, relative to the working directory; override it with `IGGY_MCP_CONFIG_PATH`. Embedded defaults are loaded first, then the file if present, then environment overrides such as `IGGY_MCP_IGGY_USERNAME` and `IGGY_MCP_HTTP_ADDRESS`. Nested settings also use underscores, for example `IGGY_MCP_IGGY_TLS_ENABLED`.
@@ -87,7 +90,17 @@ Set `command` to the absolute path of the built executable. This Claude Desktop 
 
 **Remember to use the appropriate Iggy account credentials for your environment** (e.g. create the user with read-only permissions to avoid modifying the data). On top of this, you can also configure the `permissions` for the MCP server to control which operations are allowed (this will be checked first, before forwarding the actual request to the Iggy server).
 
-The HTTP transport does not authenticate MCP clients. Anyone who can reach the HTTP address acts as the configured Iggy account. The default address (`127.0.0.1:8082` in `config.toml`, `localhost:8082` if unset) accepts local connections only; when you bind another address, keep it on a private network or put an authenticating proxy in front of it.
+## HTTP access
+
+Anyone who can call the HTTP transport acts as the configured Iggy account. The default address `127.0.0.1:8082` accepts local connections only.
+
+Set `http.auth_token` to require `Authorization: Bearer <token>` on every MCP request. It takes a literal token or a `file:` reference, read the same way as `iggy.token`. A request without exactly one matching header gets `401 Unauthorized`. The `/` and `/health` routes stay open for health checks. Use a long random token, and TLS when the server is reachable from other hosts.
+
+The server refuses to start without `http.auth_token` when it binds a non-loopback address such as `0.0.0.0:8082`, or when CORS allows every origin (`*`).
+
+`http.allowed_hosts` lists the `Host` header names the server answers, which keeps a web page from reaching a local server through DNS rebinding. The default accepts loopback names only, so add the host name remote clients use.
+
+A request whose `Origin` header is not listed in `http.cors.allowed_origins` gets `403 Forbidden`. With CORS disabled, every request that carries an `Origin` header is refused.
 
 ![MCP](../../../assets/iggy_mcp_server.png)
 
@@ -104,7 +117,18 @@ Each tool checks these MCP permissions before forwarding the request. The broker
 
 `poll_messages` additionally requires `update` when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false. For read-only polling, use `offset`, `first`, `last`, or `timestamp` with auto-commit disabled.
 
+The administration tools `get_personal_access_tokens`, `create_personal_access_token`, `delete_personal_access_token`, `get_users`, `get_user`, `create_user`, `update_user`, `delete_user`, `update_permissions`, `change_password` and `snapshot` also require `admin`, which is off by default. They let an agent mint credentials, lock out users or read server diagnostics, so enable `admin` only for a server whose agents administer Iggy.
+
+`send_messages` takes UTF-8 payloads, and `poll_messages` returns payloads base64 encoded. A batch with an invalid message, such as an empty payload, is refused and nothing is sent.
+
 ## Recovering uncertain writes
+
+Every error of a call that reached Iggy carries `data.outcome`. `uncertain` means
+the call was sent and may or may not have been applied. `blocked` means the call
+was not sent, because an earlier operation with an unknown outcome holds its
+lane. `failed` means nothing was applied. An `uncertain` error without
+`data.operation_id` cannot be settled with `resolve_operation`, so read the state
+the call changes before retrying it.
 
 Write errors can include `data.operation_id` as a decimal string. Keep this value
 exactly as returned. `resolve_operation` retries the retained original operation
@@ -133,6 +157,10 @@ cargo build --bin iggy-mcp --release --features iggy-mcp/systemd
 ```
 
 Readiness is sent after the HTTP listener starts or the stdio session initializes. The watchdog sends keep-alive notifications at half the interval supplied by systemd. SIGINT, SIGTERM, and stdio client disconnect trigger shutdown and a stopping notification.
+
+## Logging
+
+Both transports log at `INFO` unless `RUST_LOG` sets another level. The stdio transport writes logs to stderr. At `debug`, every request and reply is logged in full, so keep production at `INFO`.
 
 ## Telemetry
 

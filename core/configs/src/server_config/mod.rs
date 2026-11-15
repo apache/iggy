@@ -33,6 +33,7 @@ pub mod quic;
 pub mod server;
 pub mod sharding;
 pub mod tcp;
+pub mod tiered_storage;
 pub mod validators;
 pub mod websocket;
 

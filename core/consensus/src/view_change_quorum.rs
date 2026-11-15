@@ -243,7 +243,8 @@ pub fn dvc_quorum_array_empty() -> DvcQuorumArray {
 ///
 /// A real vote replaces the same sender's empty vote: the sender has since
 /// recovered a log to vote with, and keeping the empty one would hide it from a
-/// merge still waiting on that log.
+/// merge still waiting on that log. Inside one view change, only a state
+/// transfer install gives a partition replica that log.
 pub fn dvc_record(array: &mut DvcQuorumArray, dvc: StoredDvc) -> bool {
     let slot = &mut array[dvc.replica as usize];
     if slot

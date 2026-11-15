@@ -22,6 +22,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Tests.ClientTests;
 
@@ -35,6 +36,9 @@ public sealed class HttpCommittingPollTests
     private const string PollPath = "/streams/1/topics/2/messages";
 
     private const string TimedOut = """{"id":57,"code":"transient_not_committed","reason":"timed out"}""";
+
+    private const string TieredReadFailed =
+        """{"id":96,"code":"tiered_read_failed","reason":"object store refused the read","field":null}""";
 
     /// <summary>A reply with one message at offset 42.</summary>
     private const string Batch = """
@@ -102,6 +106,27 @@ public sealed class HttpCommittingPollTests
             recovery.AbandonOperationAsync(uncertain.OperationId.Value));
     }
 
+    /// <summary>
+    ///     Incarnation 0 names no partition, so the block of a committing poll under a fully zero context holds the
+    ///     same partition id of another topic no more than a block without a context does.
+    /// </summary>
+    [Fact]
+    public async Task given_a_committing_poll_of_a_fully_zero_context_with_an_unknown_outcome_when_polling_another_topic_should_go_on()
+    {
+        var server = new RoutedHandler(TimedOut);
+        var client = Client(server);
+        var token = TestContext.Current.CancellationToken;
+        var zero = PollingStrategy.Next().WithContext(default);
+
+        await Assert.ThrowsAsync<VsrFetchProgressUncertainException>(() =>
+            client.PollMessagesAsync(Stream, Topic, 1, Consumer.New(1), zero, 10, true, token));
+        var otherTopic = await client.PollMessagesAsync(Stream, Identifier.Numeric(3), 1, Consumer.New(1), zero, 10,
+            true, token);
+
+        Assert.Single(otherTopic.Messages);
+        Assert.Equal(2, server.Polls);
+    }
+
     [Fact]
     public async Task given_a_poll_without_auto_commit_when_the_server_times_out_should_send_it_again()
     {
@@ -110,6 +135,32 @@ public sealed class HttpCommittingPollTests
         var polled = await PollAsync(Client(server), false);
 
         Assert.Equal(42ul, Assert.Single(polled.Messages).Header.Offset);
+        Assert.Equal(2, server.Requests);
+    }
+
+    [Fact]
+    public async Task given_a_poll_without_auto_commit_when_the_tiered_read_fails_should_report_it_without_sending_again()
+    {
+        var server = new ScriptedHandler((HttpStatusCode.FailedDependency, TieredReadFailed), (HttpStatusCode.OK, Batch));
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(Client(server), false));
+
+        Assert.Equal((VsrError.TIERED_READ_FAILED, true), (error.StatusCode, error.FromServer));
+        Assert.Equal(1, server.Requests);
+    }
+
+    /// <summary>A refused read returns no messages, so the server stored nothing and the partition stays open.</summary>
+    [Fact]
+    public async Task given_a_committing_poll_when_the_tiered_read_fails_should_report_it_without_a_block()
+    {
+        var server = new ScriptedHandler((HttpStatusCode.FailedDependency, TieredReadFailed), (HttpStatusCode.OK, Batch));
+        var client = Client(server);
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client, true));
+        var polled = await PollAsync(client, true);
+
+        Assert.Equal((VsrError.TIERED_READ_FAILED, true), (error.StatusCode, error.FromServer));
+        Assert.Single(polled.Messages);
         Assert.Equal(2, server.Requests);
     }
 

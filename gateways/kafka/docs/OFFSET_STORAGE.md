@@ -167,6 +167,12 @@ log decides each offset:
 - Only the coordinator answers offset requests for a group, so a commit made through another
   gateway answers `NOT_COORDINATOR`, and the client asks the coordinator.
 
+A gateway that runs without the log stores its commits in Iggy only. Two cases do that:
+`IGGY_KAFKA_COORDINATOR_LOG=false`, and a gateway that falls back to running without the log. Once
+the log is on again, it answers the older offsets that it holds for those groups. It also counts
+their retention from its own older commit times. So a group without members can lose its newer
+offsets at the next check. Do not run gateways without the log on a stream whose log holds groups.
+
 Without the coordinator log, offsets are shared, since the key depends only on the Kafka group id.
 Membership is not. With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names one gateway for every group,
 so consumers and admin tools commit through that gateway. The cases below remain for gateways

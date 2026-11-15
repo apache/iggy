@@ -24,7 +24,6 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace};
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::driver::operation_deadline;
 
 const ORDERING: Ordering = Ordering::SeqCst;
 
@@ -40,8 +39,8 @@ pub(crate) struct Membership {
     joined: AtomicBool,
     /// Rises at each `forget`, so a join that a forget overtook does not count as joined.
     forgets: AtomicU64,
-    /// A create or a join whose outcome is unknown, resolved before the next join.
-    uncertain: Mutex<Option<u64>>,
+    /// Serializes the joins and the leave, so a leave never overtakes a join in flight.
+    turn: Mutex<()>,
 }
 
 impl Membership {
@@ -60,36 +59,22 @@ impl Membership {
             create,
             joined: AtomicBool::new(false),
             forgets: AtomicU64::new(0),
-            uncertain: Mutex::new(None),
+            turn: Mutex::new(()),
         }
     }
 
     /// Joins the group unless the member already joined in this session. A server treats a
-    /// second join from the same session as a no-op.
+    /// second join from the same session as a no-op. So a create or a join with an unknown
+    /// outcome is abandoned at once: the next join looks the group up and joins again, which
+    /// changes nothing when the lost one landed.
     pub(crate) async fn join(&self) -> Result<(), IggyError> {
         if self.joined.load(ORDERING) {
             return Ok(());
         }
         let forgets = self.forgets.load(ORDERING);
         let (stream_id, topic_id, group_id) = (&self.stream, &self.topic, &self.group);
-        let mut uncertain_operation = self.uncertain.lock().await;
+        let _turn = self.turn.lock().await;
         let client = self.client.read().await;
-        if let Some(op) = *uncertain_operation {
-            let result = client
-                .resolve_operation(op, operation_deadline().into_std())
-                .await;
-            if matches!(result, Err(IggyError::OperationUncertain(_))) {
-                return result;
-            }
-            *uncertain_operation = None;
-            match result {
-                Ok(())
-                | Err(IggyError::OperationNotRetained(_))
-                | Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        // A proved join can belong to an earlier session, so establish membership again.
         trace!("Validating consumer group: {group_id} for topic: {topic_id}, stream: {stream_id}");
         if client
             .get_consumer_group(stream_id, topic_id, group_id)
@@ -110,9 +95,7 @@ impl Membership {
             {
                 Ok(_) | Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => {}
                 Err(error) => {
-                    if let IggyError::OperationUncertain(op) = &error {
-                        *uncertain_operation = Some(*op);
-                    }
+                    abandon_uncertain(&client, &error).await;
                     error!(
                         "Failed to create consumer group {group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
                     );
@@ -126,9 +109,7 @@ impl Membership {
             .await
         {
             self.joined.store(false, ORDERING);
-            if let IggyError::OperationUncertain(op) = &error {
-                *uncertain_operation = Some(*op);
-            }
+            abandon_uncertain(&client, &error).await;
             error!(
                 "Failed to join consumer group: {group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
             );
@@ -150,23 +131,33 @@ impl Membership {
 
     /// Lets the server give the partitions to the other members at once, instead of after the
     /// connection times out. It leaves also when a reconnect forgot the join, because the
-    /// session that joined can still hold the member.
+    /// session that joined can still hold the member. It abandons a leave with an unknown
+    /// outcome, as a join does.
     pub(crate) async fn leave(&self) {
         self.joined.store(false, ORDERING);
         let (stream_id, topic_id, group_id) = (&self.stream, &self.topic, &self.group);
+        let _turn = self.turn.lock().await;
+        let client = self.client.read().await;
         trace!("Leaving consumer group: {group_id} for stream: {stream_id}, topic: {topic_id}");
-        if let Err(error) = self
-            .client
-            .read()
-            .await
+        if let Err(error) = client
             .leave_consumer_group(stream_id, topic_id, group_id)
             .await
         {
+            abandon_uncertain(&client, &error).await;
             // Expected for a member that the server already dropped, and for a deleted group.
             debug!(
                 "Failed to leave consumer group: {group_id} for stream: {stream_id}, topic: {topic_id}. {error}"
             );
         }
+    }
+}
+
+/// A group write with an unknown outcome blocks every later metadata write of the client,
+/// also those of the application, until someone resolves or abandons it.
+async fn abandon_uncertain(client: &ClientWrapper, error: &IggyError) {
+    if let IggyError::OperationUncertain(op) = error {
+        // An operation that the client no longer retains is already free.
+        let _ = client.abandon_operation(*op).await;
     }
 }
 

@@ -1,0 +1,1404 @@
+{
+  "uuid": "6b1e288a-9155-4da3-8d3f-ec4d929de3d3",
+  "timestamp": "2025-02-14T11:57:44.687635+00:00",
+  "server_stats": {
+    "process_id": 75828,
+    "cpu_usage": 398.13818,
+    "total_cpu_usage": 18.622252,
+    "memory_usage": 160882688,
+    "total_memory": 33547587584,
+    "available_memory": 20555239424,
+    "run_time": 8000000,
+    "start_time": 1739534256000000,
+    "read_bytes": 0,
+    "written_bytes": 8363757568,
+    "messages_size_bytes": 8360192000,
+    "streams_count": 8,
+    "topics_count": 8,
+    "partitions_count": 8,
+    "segments_count": 16,
+    "messages_count": 8000000,
+    "clients_count": 1,
+    "consumer_groups_count": 0,
+    "hostname": "atlas",
+    "os_name": "Pop!_OS",
+    "os_version": "Linux (Pop!_OS 22.04)",
+    "kernel_version": "6.9.3-76060903-generic",
+    "iggy_server_version": "0.4.201",
+    "iggy_server_semver": 4201,
+    "cache_metrics": {
+      "3000003-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      },
+      "3000006-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      },
+      "3000004-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      },
+      "3000005-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      },
+      "3000008-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      },
+      "3000001-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      },
+      "3000002-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      },
+      "3000007-1-1": {
+        "hits": 0,
+        "misses": 0,
+        "hit_ratio": 0.0
+      }
+    }
+  },
+  "hardware": {
+    "identifier": "atlas",
+    "cpu_name": "AMD Ryzen 9 5950X 16-Core Processor",
+    "cpu_cores": 32,
+    "total_memory_mb": 31993,
+    "os_name": "Pop!_OS",
+    "os_version": "6.9.3-76060903-generic"
+  },
+  "params": {
+    "benchmark_kind": "pinned_producer_and_consumer",
+    "transport": "tcp",
+    "server_address": "127.0.0.1:8090",
+    "remark": "no_cache",
+    "extra_info": "",
+    "gitref": "server-0.4.202",
+    "gitref_date": "2025-02-14T12:54:17+01:00",
+    "messages_per_batch": 1000,
+    "message_batches": 1000,
+    "message_size": 1000,
+    "producers": 8,
+    "consumers": 8,
+    "streams": 8,
+    "partitions": 1,
+    "consumer_groups": 0,
+    "rate_limit": null,
+    "pretty_name": "8 producers/8 consumers, 1000B msgs, 1000 msgs/batch (no_cache)",
+    "bench_command": "IGGY_SYSTEM_CACHE_ENABLED=false iggy-bench pinned-producer-and-consumer tcp output -o performance_results --remark 'no_cache'",
+    "params_identifier": "Pinned Producer And Consumer_TCP_no_cache_1000_1000_1000_8_8_8_1_0"
+  },
+  "group_metrics": [
+    {
+      "summary": {
+        "kind": "producers",
+        "total_throughput_megabytes_per_second": 1450.407,
+        "total_throughput_messages_per_second": 1416412.807,
+        "average_throughput_megabytes_per_second": 181.301,
+        "average_throughput_messages_per_second": 177051.601,
+        "average_p50_latency_ms": 5.589,
+        "average_p90_latency_ms": 6.271,
+        "average_p95_latency_ms": 6.493,
+        "average_p99_latency_ms": 6.922,
+        "average_p999_latency_ms": 7.211,
+        "average_p9999_latency_ms": 7.514,
+        "average_latency_ms": 5.647,
+        "average_median_latency_ms": 5.589
+      },
+      "avg_throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 546.43
+          },
+          {
+            "time_s": 0.01,
+            "value": 792.953
+          },
+          {
+            "time_s": 0.02,
+            "value": 922.55
+          }
+        ]
+      },
+      "avg_throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 546400.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 792950.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 922555.555
+          }
+        ]
+      },
+      "avg_latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 6.245
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.84
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.587
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "kind": "consumers",
+        "total_throughput_megabytes_per_second": 1479.091,
+        "total_throughput_messages_per_second": 1415398.043,
+        "average_throughput_megabytes_per_second": 184.886,
+        "average_throughput_messages_per_second": 176924.755,
+        "average_p50_latency_ms": 5.571,
+        "average_p90_latency_ms": 6.277,
+        "average_p95_latency_ms": 6.528,
+        "average_p99_latency_ms": 7.08,
+        "average_p999_latency_ms": 7.96,
+        "average_p9999_latency_ms": 18.233,
+        "average_latency_ms": 5.645,
+        "average_median_latency_ms": 5.571
+      },
+      "avg_throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 262.691
+          },
+          {
+            "time_s": 0.02,
+            "value": 661.806
+          },
+          {
+            "time_s": 0.03,
+            "value": 827.223
+          }
+        ]
+      },
+      "avg_throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 262600.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 661725.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 827183.334
+          }
+        ]
+      },
+      "avg_latency_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 17.106
+          },
+          {
+            "time_s": 0.02,
+            "value": 13.266
+          },
+          {
+            "time_s": 0.03,
+            "value": 10.85
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "kind": "producers_and_consumers",
+        "total_throughput_megabytes_per_second": 2929.498,
+        "total_throughput_messages_per_second": 2831810.85,
+        "average_throughput_megabytes_per_second": 183.094,
+        "average_throughput_messages_per_second": 176988.178,
+        "average_p50_latency_ms": 5.58,
+        "average_p90_latency_ms": 6.274,
+        "average_p95_latency_ms": 6.51,
+        "average_p99_latency_ms": 7.001,
+        "average_p999_latency_ms": 7.585,
+        "average_p9999_latency_ms": 12.873,
+        "average_latency_ms": 5.646,
+        "average_median_latency_ms": 5.58
+      },
+      "avg_throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 546.43
+          },
+          {
+            "time_s": 0.01,
+            "value": 924.298
+          },
+          {
+            "time_s": 0.02,
+            "value": 1363.754
+          }
+        ]
+      },
+      "avg_throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 546400.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 924250.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 1363705.555
+          }
+        ]
+      },
+      "avg_latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 6.245
+          },
+          {
+            "time_s": 0.01,
+            "value": 7.786
+          },
+          {
+            "time_s": 0.02,
+            "value": 7.608
+          }
+        ]
+      }
+    }
+  ],
+  "individual_metrics": [
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 1,
+        "total_time_secs": 5.649,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.26,
+        "throughput_messages_per_second": 177011.389,
+        "p50_latency_ms": 5.576,
+        "p90_latency_ms": 6.316,
+        "p95_latency_ms": 6.533,
+        "p99_latency_ms": 7.095,
+        "p999_latency_ms": 7.434,
+        "p9999_latency_ms": 7.635,
+        "avg_latency_ms": 5.648,
+        "median_latency_ms": 5.576
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 68.926
+          },
+          {
+            "time_s": 0.01,
+            "value": 117.488
+          },
+          {
+            "time_s": 0.02,
+            "value": 147.535
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 68900.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 117500.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 147533.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 5.204
+          },
+          {
+            "time_s": 0.01,
+            "value": 6.51
+          },
+          {
+            "time_s": 0.02,
+            "value": 4.61
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 2,
+        "total_time_secs": 5.645,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.385,
+        "throughput_messages_per_second": 177134.08,
+        "p50_latency_ms": 5.583,
+        "p90_latency_ms": 6.27,
+        "p95_latency_ms": 6.548,
+        "p99_latency_ms": 6.936,
+        "p999_latency_ms": 7.346,
+        "p9999_latency_ms": 7.459,
+        "avg_latency_ms": 5.644,
+        "median_latency_ms": 5.583
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 54.703
+          },
+          {
+            "time_s": 0.01,
+            "value": 128.531
+          },
+          {
+            "time_s": 0.02,
+            "value": 144.478
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 54700.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 128550.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 144466.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 6.691
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.438
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.169
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 3,
+        "total_time_secs": 5.645,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.412,
+        "throughput_messages_per_second": 177160.346,
+        "p50_latency_ms": 5.581,
+        "p90_latency_ms": 6.29,
+        "p95_latency_ms": 6.512,
+        "p99_latency_ms": 6.868,
+        "p999_latency_ms": 7.136,
+        "p9999_latency_ms": 7.434,
+        "avg_latency_ms": 5.644,
+        "median_latency_ms": 5.581
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 69.232
+          },
+          {
+            "time_s": 0.01,
+            "value": 136.662
+          },
+          {
+            "time_s": 0.02,
+            "value": 146.458
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 69200.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 136650.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 146466.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 5.955
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.401
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.408
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 4,
+        "total_time_secs": 5.644,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.437,
+        "throughput_messages_per_second": 177185.019,
+        "p50_latency_ms": 5.59,
+        "p90_latency_ms": 6.242,
+        "p95_latency_ms": 6.461,
+        "p99_latency_ms": 6.858,
+        "p999_latency_ms": 7.178,
+        "p9999_latency_ms": 7.399,
+        "avg_latency_ms": 5.643,
+        "median_latency_ms": 5.59
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 84.337
+          },
+          {
+            "time_s": 0.01,
+            "value": 145.142
+          },
+          {
+            "time_s": 0.02,
+            "value": 149.686
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 84300.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 145150.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 149700.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 5.172
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.356
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.569
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 5,
+        "total_time_secs": 5.65,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.236,
+        "throughput_messages_per_second": 176988.331,
+        "p50_latency_ms": 5.599,
+        "p90_latency_ms": 6.235,
+        "p95_latency_ms": 6.477,
+        "p99_latency_ms": 6.899,
+        "p999_latency_ms": 7.283,
+        "p9999_latency_ms": 7.989,
+        "avg_latency_ms": 5.649,
+        "median_latency_ms": 5.599
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 39.562
+          },
+          {
+            "time_s": 0.01,
+            "value": 114.254
+          },
+          {
+            "time_s": 0.02,
+            "value": 142.318
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 39600.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 114250.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 142333.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 8.067
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.254
+          },
+          {
+            "time_s": 0.02,
+            "value": 4.818
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 6,
+        "total_time_secs": 5.65,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.228,
+        "throughput_messages_per_second": 176980.688,
+        "p50_latency_ms": 5.6,
+        "p90_latency_ms": 6.256,
+        "p95_latency_ms": 6.47,
+        "p99_latency_ms": 6.862,
+        "p999_latency_ms": 7.216,
+        "p9999_latency_ms": 7.228,
+        "avg_latency_ms": 5.649,
+        "median_latency_ms": 5.6
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 61.867
+          },
+          {
+            "time_s": 0.01,
+            "value": 125.511
+          },
+          {
+            "time_s": 0.02,
+            "value": 147.116
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 61900.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 125500.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 147100.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 7.07
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.165
+          },
+          {
+            "time_s": 0.02,
+            "value": 4.954
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 7,
+        "total_time_secs": 5.65,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.237,
+        "throughput_messages_per_second": 176989.709,
+        "p50_latency_ms": 5.598,
+        "p90_latency_ms": 6.272,
+        "p95_latency_ms": 6.452,
+        "p99_latency_ms": 6.92,
+        "p999_latency_ms": 7.019,
+        "p9999_latency_ms": 7.045,
+        "avg_latency_ms": 5.649,
+        "median_latency_ms": 5.598
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 77.375
+          },
+          {
+            "time_s": 0.01,
+            "value": 132.402
+          },
+          {
+            "time_s": 0.02,
+            "value": 150.223
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 77400.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 132400.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 150233.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 6.305
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.152
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.065
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "producer",
+        "actor_id": 8,
+        "total_time_secs": 5.651,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1024000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 181.21,
+        "throughput_messages_per_second": 176963.243,
+        "p50_latency_ms": 5.586,
+        "p90_latency_ms": 6.288,
+        "p95_latency_ms": 6.489,
+        "p99_latency_ms": 6.936,
+        "p999_latency_ms": 7.076,
+        "p9999_latency_ms": 7.925,
+        "avg_latency_ms": 5.65,
+        "median_latency_ms": 5.586
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 90.428
+          },
+          {
+            "time_s": 0.01,
+            "value": 139.485
+          },
+          {
+            "time_s": 0.02,
+            "value": 153.931
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 90400.0
+          },
+          {
+            "time_s": 0.01,
+            "value": 139500.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 153933.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.0,
+            "value": 5.498
+          },
+          {
+            "time_s": 0.01,
+            "value": 5.209
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.06
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 1,
+        "total_time_secs": 5.653,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.85,
+        "throughput_messages_per_second": 176889.775,
+        "p50_latency_ms": 5.579,
+        "p90_latency_ms": 6.252,
+        "p95_latency_ms": 6.514,
+        "p99_latency_ms": 7.057,
+        "p999_latency_ms": 7.54,
+        "p9999_latency_ms": 15.512,
+        "avg_latency_ms": 5.646,
+        "median_latency_ms": 5.579
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 78.215
+          },
+          {
+            "time_s": 0.02,
+            "value": 128.469
+          },
+          {
+            "time_s": 0.03,
+            "value": 139.099
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 78200.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 128450.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 139100.0
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 16.398
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.173
+          },
+          {
+            "time_s": 0.03,
+            "value": 6.073
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 2,
+        "total_time_secs": 5.654,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.811,
+        "throughput_messages_per_second": 176852.861,
+        "p50_latency_ms": 5.575,
+        "p90_latency_ms": 6.266,
+        "p95_latency_ms": 6.526,
+        "p99_latency_ms": 7.053,
+        "p999_latency_ms": 7.45,
+        "p9999_latency_ms": 19.73,
+        "avg_latency_ms": 5.647,
+        "median_latency_ms": 5.575
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 153.512
+          },
+          {
+            "time_s": 0.03,
+            "value": 157.683
+          },
+          {
+            "time_s": 0.04,
+            "value": 162.133
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 153500.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 157700.0
+          },
+          {
+            "time_s": 0.04,
+            "value": 162133.333
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 13.446
+          },
+          {
+            "time_s": 0.03,
+            "value": 6.06
+          },
+          {
+            "time_s": 0.04,
+            "value": 6.254
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 3,
+        "total_time_secs": 5.653,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.846,
+        "throughput_messages_per_second": 176886.49,
+        "p50_latency_ms": 5.576,
+        "p90_latency_ms": 6.265,
+        "p95_latency_ms": 6.538,
+        "p99_latency_ms": 7.091,
+        "p999_latency_ms": 7.37,
+        "p9999_latency_ms": 19.816,
+        "avg_latency_ms": 5.646,
+        "median_latency_ms": 5.576
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 149.932
+          },
+          {
+            "time_s": 0.03,
+            "value": 156.724
+          },
+          {
+            "time_s": 0.04,
+            "value": 161.168
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 149900.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 156700.0
+          },
+          {
+            "time_s": 0.04,
+            "value": 161166.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 13.532
+          },
+          {
+            "time_s": 0.03,
+            "value": 6.033
+          },
+          {
+            "time_s": 0.04,
+            "value": 6.277
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 4,
+        "total_time_secs": 5.651,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.938,
+        "throughput_messages_per_second": 176973.704,
+        "p50_latency_ms": 5.579,
+        "p90_latency_ms": 6.283,
+        "p95_latency_ms": 6.546,
+        "p99_latency_ms": 7.087,
+        "p999_latency_ms": 7.473,
+        "p9999_latency_ms": 16.245,
+        "avg_latency_ms": 5.643,
+        "median_latency_ms": 5.579
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 65.243
+          },
+          {
+            "time_s": 0.02,
+            "value": 123.103
+          },
+          {
+            "time_s": 0.03,
+            "value": 136.655
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 65200.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 123100.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 136666.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 17.22
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.02
+          },
+          {
+            "time_s": 0.03,
+            "value": 6.044
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 5,
+        "total_time_secs": 5.65,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.949,
+        "throughput_messages_per_second": 176984.917,
+        "p50_latency_ms": 5.564,
+        "p90_latency_ms": 6.277,
+        "p95_latency_ms": 6.52,
+        "p99_latency_ms": 7.051,
+        "p999_latency_ms": 7.524,
+        "p9999_latency_ms": 16.359,
+        "avg_latency_ms": 5.643,
+        "median_latency_ms": 5.564
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 61.494
+          },
+          {
+            "time_s": 0.02,
+            "value": 121.088
+          },
+          {
+            "time_s": 0.03,
+            "value": 135.656
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 61500.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 121100.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 135666.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 17.341
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.078
+          },
+          {
+            "time_s": 0.03,
+            "value": 6.018
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 6,
+        "total_time_secs": 5.65,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.965,
+        "throughput_messages_per_second": 176999.671,
+        "p50_latency_ms": 5.568,
+        "p90_latency_ms": 6.289,
+        "p95_latency_ms": 6.507,
+        "p99_latency_ms": 7.076,
+        "p999_latency_ms": 7.504,
+        "p9999_latency_ms": 16.471,
+        "avg_latency_ms": 5.642,
+        "median_latency_ms": 5.568
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 57.739
+          },
+          {
+            "time_s": 0.02,
+            "value": 119.483
+          },
+          {
+            "time_s": 0.03,
+            "value": 134.579
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 57700.0
+          },
+          {
+            "time_s": 0.02,
+            "value": 119500.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 134566.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.01,
+            "value": 17.467
+          },
+          {
+            "time_s": 0.02,
+            "value": 5.101
+          },
+          {
+            "time_s": 0.03,
+            "value": 6.035
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 7,
+        "total_time_secs": 5.653,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.869,
+        "throughput_messages_per_second": 176908.52,
+        "p50_latency_ms": 5.561,
+        "p90_latency_ms": 6.277,
+        "p95_latency_ms": 6.535,
+        "p99_latency_ms": 7.109,
+        "p999_latency_ms": 7.593,
+        "p9999_latency_ms": 20.598,
+        "avg_latency_ms": 5.645,
+        "median_latency_ms": 5.561
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 135.131
+          },
+          {
+            "time_s": 0.03,
+            "value": 149.976
+          },
+          {
+            "time_s": 0.04,
+            "value": 156.374
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 135100.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 150000.0
+          },
+          {
+            "time_s": 0.04,
+            "value": 156366.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 13.947
+          },
+          {
+            "time_s": 0.03,
+            "value": 5.964
+          },
+          {
+            "time_s": 0.04,
+            "value": 6.188
+          }
+        ]
+      }
+    },
+    {
+      "summary": {
+        "benchmark_kind": "pinned_producer_and_consumer",
+        "actor_kind": "consumer",
+        "actor_id": 8,
+        "total_time_secs": 5.653,
+        "total_user_data_bytes": 1000000000,
+        "total_bytes": 1045000000,
+        "total_messages": 1000000,
+        "throughput_megabytes_per_second": 184.863,
+        "throughput_messages_per_second": 176902.104,
+        "p50_latency_ms": 5.568,
+        "p90_latency_ms": 6.31,
+        "p95_latency_ms": 6.537,
+        "p99_latency_ms": 7.114,
+        "p999_latency_ms": 11.225,
+        "p9999_latency_ms": 21.13,
+        "avg_latency_ms": 5.645,
+        "median_latency_ms": 5.568
+      },
+      "throughput_mb_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 130.202
+          },
+          {
+            "time_s": 0.03,
+            "value": 147.687
+          },
+          {
+            "time_s": 0.04,
+            "value": 155.162
+          }
+        ]
+      },
+      "throughput_msg_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 130200.0
+          },
+          {
+            "time_s": 0.03,
+            "value": 147700.0
+          },
+          {
+            "time_s": 0.04,
+            "value": 155166.667
+          }
+        ]
+      },
+      "latency_ts": {
+        "points": [
+          {
+            "time_s": 0.02,
+            "value": 14.1
+          },
+          {
+            "time_s": 0.03,
+            "value": 5.934
+          },
+          {
+            "time_s": 0.04,
+            "value": 6.162
+          }
+        ]
+      }
+    }
+  ]
+}

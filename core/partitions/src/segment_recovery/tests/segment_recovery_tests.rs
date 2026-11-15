@@ -24,11 +24,11 @@ use std::fs;
 use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 
-const STREAM_ID: usize = 1;
-const TOPIC_ID: usize = 1;
-const PARTITION_ID: usize = 1;
-const SEGMENT_MAX_SIZE: u64 = 16 * 1024 * 1024;
-const FIXTURE_TIMESTAMP: u64 = 1_700_000_000_000_000;
+pub(super) const STREAM_ID: usize = 1;
+pub(super) const TOPIC_ID: usize = 1;
+pub(super) const PARTITION_ID: usize = 1;
+pub(super) const SEGMENT_MAX_SIZE: u64 = 16 * 1024 * 1024;
+pub(super) const FIXTURE_TIMESTAMP: u64 = 1_700_000_000_000_000;
 const GARBAGE: [u8; 384] = [0xAB; 384];
 
 const HEADER_BATCH_LENGTH_OFFSET: usize = 32;
@@ -36,7 +36,7 @@ const HEADER_MESSAGE_COUNT_OFFSET: usize = 48;
 const HEADER_BASE_OFFSET_OFFSET: usize = 8;
 
 /// Same relative shape as the default server config, rooted at the tempdir.
-fn test_config(tmp: &TempDir) -> PartitionsConfig {
+pub(super) fn test_config(tmp: &TempDir) -> PartitionsConfig {
     PartitionsConfig {
         messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
         size_of_messages_required_to_save: IggyByteSize::from(
@@ -52,7 +52,7 @@ fn test_config(tmp: &TempDir) -> PartitionsConfig {
     }
 }
 
-fn prepare_partition_dir(config: &PartitionsConfig) -> String {
+pub(super) fn prepare_partition_dir(config: &PartitionsConfig) -> String {
     let partition_path = config.get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID);
     fs::create_dir_all(&partition_path).expect("create partition dir");
     partition_path
@@ -85,7 +85,7 @@ fn zero_padded_record(claimed_batch_length: u64, sequence: u32) -> Vec<u8> {
 
 /// One sparse index entry, mirroring the `IggyIndexWriter` layout the
 /// recovery reader expects.
-fn index_entry(offset: u64, position: u64) -> Vec<u8> {
+pub(super) fn index_entry(offset: u64, position: u64) -> Vec<u8> {
     let mut entry = Vec::new();
     entry.extend_from_slice(&offset.to_le_bytes());
     entry.extend_from_slice(&FIXTURE_TIMESTAMP.to_le_bytes());
@@ -95,7 +95,7 @@ fn index_entry(offset: u64, position: u64) -> Vec<u8> {
 
 /// Writes a segment's `.log` and `.index` fixtures and returns their
 /// paths as `(messages_path, index_path)`.
-fn write_segment(
+pub(super) fn write_segment(
     config: &PartitionsConfig,
     start_offset: u64,
     log: &[u8],
@@ -119,6 +119,7 @@ async fn recover(
         &PartitionStats::default(),
     )
     .await
+    .map(|recovered| recovered.segments)
 }
 
 async fn recover_under_fsync(
@@ -133,12 +134,13 @@ async fn recover_under_fsync(
         &PartitionStats::default(),
     )
     .await
+    .map(|recovered| recovered.segments)
 }
 
 /// One valid on-disk batch record: real message frames with their
 /// per-message checksums, and the server-owned header fields stamped the
 /// way persistence stamps them.
-fn encoded_batch(base_offset: u64, message_count: usize) -> Vec<u8> {
+pub(super) fn encoded_batch(base_offset: u64, message_count: usize) -> Vec<u8> {
     encoded_batch_with_payload(
         base_offset,
         message_count,
