@@ -61,6 +61,7 @@ Commands:
   consumer-offset  consumer offset operations [alias: o]
   message          message operations [alias: m]
   context          context operations [alias: ctx]
+  connector        connectors runtime operations [alias: conn]
   login            login to Iggy server [alias: li]
   logout           logout from Iggy server [alias: lo]
   session          login session operations [alias: sess]

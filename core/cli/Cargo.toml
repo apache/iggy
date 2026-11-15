@@ -68,6 +68,7 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 keyring-core = { workspace = true, optional = true }
 passterm = { workspace = true }
+reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -95,6 +96,7 @@ cfg_aliases = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

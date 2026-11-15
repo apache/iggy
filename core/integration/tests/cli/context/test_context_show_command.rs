@@ -96,6 +96,9 @@ pub async fn should_show_context_with_all_fields() {
             tcp_tls_enabled: Some(true),
             ..Default::default()
         },
+        connectors_api_url: None,
+        connectors_api_key: None,
+        connectors_tls_ca_file: None,
         extra: Default::default(),
     };
 

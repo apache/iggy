@@ -47,6 +47,15 @@ pub struct ContextConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_name: Option<String>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectors_api_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectors_api_key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectors_tls_ca_file: Option<String>,
+
     #[serde(flatten)]
     pub iggy: ArgsOptional,
 
