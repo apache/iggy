@@ -405,6 +405,17 @@ pub struct ShardMetrics {
     /// How late each consensus tick of the message pump ran after its timer
     /// was due: the time the shard's thread spent on other work first.
     pump_tick_lateness: Histogram,
+    /// Fresh objects this shard stored, the ones the store refused, and the
+    /// bytes of the stored ones.
+    fresh_uploads_total: Counter,
+    fresh_upload_failures_total: Counter,
+    fresh_upload_bytes_total: Counter,
+    /// The three parts of a send to a partition that places its batches:
+    /// the wait of its upload window, the upload of its fresh object, and
+    /// the commit of where its messages sit.
+    fresh_window_wait: Histogram,
+    fresh_upload: Histogram,
+    fresh_commit: Histogram,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -419,6 +430,8 @@ impl ShardMetrics {
     /// virtue of being constructed once per shard; the shard id does not
     /// appear in the label set (see [`FrameDropLabel`] doc).
     #[must_use]
+    // One line per metric, and nothing else.
+    #[allow(clippy::too_many_lines)]
     pub fn for_shard() -> Self {
         let frame_drops_total: Family<FrameDropLabel, Counter> = Family::default();
         let cached_counters = Arc::new(std::array::from_fn(|_| {
@@ -517,6 +530,12 @@ impl ShardMetrics {
             fetches: FetchMetrics::new(),
             readiness_push_to_fire: latency_histogram(),
             pump_tick_lateness: latency_histogram(),
+            fresh_uploads_total: Counter::default(),
+            fresh_upload_failures_total: Counter::default(),
+            fresh_upload_bytes_total: Counter::default(),
+            fresh_window_wait: latency_histogram(),
+            fresh_upload: latency_histogram(),
+            fresh_commit: latency_histogram(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
         }
@@ -535,6 +554,40 @@ impl ShardMetrics {
 
     pub(crate) fn record_readiness_push_to_fire(&self, elapsed: Duration) {
         self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
+    }
+
+    /// An upload window closed after `wait`, counted from its first send.
+    pub(crate) fn record_fresh_window_wait(&self, wait: Duration) {
+        self.fresh_window_wait.observe(wait.as_secs_f64());
+    }
+
+    /// The upload of a fresh object of `bytes` ended after `elapsed`, and
+    /// the store holds the object or not.
+    pub(crate) fn record_fresh_upload(&self, bytes: u64, elapsed: Duration, stored: bool) {
+        self.fresh_upload.observe(elapsed.as_secs_f64());
+        if stored {
+            self.fresh_uploads_total.inc();
+            self.fresh_upload_bytes_total.inc_by(bytes);
+        } else {
+            self.fresh_upload_failures_total.inc();
+        }
+    }
+
+    /// The histogram of the time from a stored object to the answer of each
+    /// send in it, for the task that waits for the answer.
+    pub(crate) fn fresh_commit_latency(&self) -> Histogram {
+        self.fresh_commit.clone()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_uploads_value(&self) -> (u64, u64, u64) {
+        (
+            self.fresh_uploads_total.get(),
+            self.fresh_upload_failures_total.get(),
+            self.fresh_upload_bytes_total.get(),
+        )
     }
 
     pub(crate) fn record_pump_tick_lateness(&self, lateness: Duration) {
@@ -1570,6 +1623,36 @@ impl ShardMetrics {
             "time from applying the pushed partition state that made a parked readiness wait \
              ready to the end of that wait",
             self.readiness_push_to_fire.clone(),
+        );
+        registry.register(
+            "fresh_uploads",
+            "fresh objects this shard stored for the partitions that place their batches",
+            self.fresh_uploads_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_failures",
+            "fresh objects the object store refused, whose sends were answered as not accepted",
+            self.fresh_upload_failures_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_bytes",
+            "bytes of the fresh objects this shard stored",
+            self.fresh_upload_bytes_total.clone(),
+        );
+        registry.register(
+            "fresh_window_wait_seconds",
+            "how long an upload window stayed open after its first send",
+            self.fresh_window_wait.clone(),
+        );
+        registry.register(
+            "fresh_upload_seconds",
+            "how long the upload of a fresh object took",
+            self.fresh_upload.clone(),
+        );
+        registry.register(
+            "fresh_commit_seconds",
+            "how long a send waited for its answer after its fresh object was stored",
+            self.fresh_commit.clone(),
         );
         registry.register(
             "pump_tick_lateness_seconds",
