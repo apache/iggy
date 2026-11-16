@@ -112,7 +112,7 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    /// `params` of a live 0.9.0 cloud-bench report, written before the options existed.
+    /// `params` of a real 0.9.0 report, written before the options existed.
     const PARAMS_BEFORE_OPTIONS: &str = r#"{
         "benchmark_kind": "balanced_producer",
         "transport": "tcp",

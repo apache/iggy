@@ -29,7 +29,7 @@
     "esbuild": "^0.28.2",
     "eslint": "^10.14.0",
     "eslint-config-prettier": "^10.1.8",
-    "eslint-plugin-svelte": "^3.23.1",
+    "eslint-plugin-svelte": "^3.24.0",
     "globals": "^17.14.0",
     "jwt-decode": "^4.0.0",
     "postcss": "^8.5.32",
@@ -43,7 +43,7 @@
     "tslib": "^2.9.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.72.1",
-    "vite": "^8.3.5",
+    "vite": "^8.3.6",
     "zod": "^4.6.7"
   },
   "dependencies": {

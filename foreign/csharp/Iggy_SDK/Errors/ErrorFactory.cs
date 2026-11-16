@@ -74,7 +74,8 @@ internal static class ErrorFactory
     internal static ErrorModel CannotSaveTimeIndexToSegment => new(54, "cannot_save_time_index_to_segment",
         "Failed to save time index to segment");
 
-    internal static ErrorModel TooBigMessagePayload => new(58, "too_big_message_payload", "Too big message payload");
+    internal static ErrorModel TransientNotAccepted =>
+        new(58, "transient_not_accepted", "Request transiently not accepted; retry, on any replica");
     internal static ErrorModel TooManyMessages => new(59, "too_many_messages", "Too many messages");
 
     internal static ErrorModel InvalidMessagePayloadLength =>

@@ -80,7 +80,7 @@ impl CliCommand for CreateTopicCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        client
+        let topic = client
             .create_topic(&self.stream_id, &self.name, &self.options)
             .await
             .with_context(|| {
@@ -91,8 +91,9 @@ impl CliCommand for CreateTopicCmd {
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Topic with name: {}, partitions count: {}, compression algorithm: {}, message expiry: {}, max topic size: {} created in stream with ID: {}",
+            "Topic with name: {}, ID: {}, partitions count: {}, compression algorithm: {}, message expiry: {}, max topic size: {} created in stream with ID: {}",
             self.name,
+            topic.id,
             self.partitions_count,
             self.compression_algorithm,
             self.message_expiry,

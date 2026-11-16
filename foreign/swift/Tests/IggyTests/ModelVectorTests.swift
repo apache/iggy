@@ -130,9 +130,12 @@ struct ModelVectorTests {
             partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .after(.seconds(604_800)),
             maxTopicSize: .bytes(1_073_741_824), segmentSizeBytes: 1_048_576, durability: .persisted,
             consumerOffsetDurability: .replicated, messagesRequiredToSave: 7, sizeOfMessagesRequiredToSaveBytes: 4096,
-            preallocateSegments: false, replicationFactor: 2)
+            preallocateSegments: false, replicationFactor: 2, segmentMaxAge: .after(.seconds(3_600)), tieredStorage: false,
+            localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(536_870_912))
         #expect(try create.encode() == golden.bytes("options.topic_create.full"))
-        let update = TopicUpdateOptions(messageExpiry: .never, maxTopicSize: .unlimited)
+        let update = TopicUpdateOptions(
+            messageExpiry: .never, maxTopicSize: .unlimited, tieredStorage: true, localRetentionAge: .after(.seconds(1_800)),
+            localRetentionSize: .bytes(536_870_912))
         #expect(try OptionsBlock.encode(update.toPatch().set) == golden.bytes("options.topic_update.full"))
         let raw = TopicCreateOptions(raw: ["durability": "persisted"])
         #expect(try raw.encode() == golden.bytes("options.topic_create.raw"))

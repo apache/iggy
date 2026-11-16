@@ -1768,7 +1768,7 @@ func (r *PartitionReader) handleRefusalLocked(p *partition, err error, now time.
 	}
 	p.lastingRefusals++
 	if errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrInvalidSizeBytes) ||
-		p.lastingRefusals >= lastingRefusalsBeforeStop {
+		errors.Is(err, ierror.ErrTieredReadFailed) || p.lastingRefusals >= lastingRefusalsBeforeStop {
 		if p.gapFrom != nil {
 			// Only a seek resumes the partition, and it drops the gap. So the gap
 			// ends here as at a leave: what was not read again is reported as

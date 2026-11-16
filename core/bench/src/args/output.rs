@@ -82,8 +82,8 @@ fn default_identifier() -> String {
     })
 }
 
-/// The EC2 instance type, spelled the way cloud-bench spells machine labels, so runs on one
-/// instance type share a label instead of carrying per-host names.
+/// The EC2 instance type as a machine label, so runs on one instance type share a label
+/// instead of carrying per-host names.
 fn ec2_identifier(dmi_dir: &Path) -> Option<String> {
     let vendor = fs::read_to_string(dmi_dir.join(DMI_SYS_VENDOR_FILE)).ok()?;
     if vendor.trim() != EC2_SYS_VENDOR {

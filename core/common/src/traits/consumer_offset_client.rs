@@ -38,6 +38,7 @@ use async_trait::async_trait;
 /// and every retry and replay names that history. HTTP has no route, so it sends such a context
 /// of [`Self::store_consumer_position`] as it is, and the server refuses it.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait ConsumerOffsetClient {
     /// Commit a checkpoint without substituting a newer incarnation or owner for the ones that
     /// it names. A binary client fills incarnation 0 from the route, see the trait docs.

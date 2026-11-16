@@ -63,6 +63,7 @@ use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::Operation;
+use iggy_object_store::s3::SharedCredentials;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
@@ -297,9 +298,14 @@ pub fn bootstrap(
     let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
     crate::external_auth::preflight(&config.external_auth)?;
+    crate::tiered_storage::preflight(&config.tiered_storage)?;
+    let tiered_credentials = crate::s3_credentials::credentials(&config.tiered_storage)?;
+    let object_store_answered =
+        crate::tiered_storage::probe(&config.tiered_storage, tiered_credentials.as_ref())?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
+    crate::sysinfo_probe::init_free_space_reserve(config.node.free_space_reserve.as_bytes_u64());
     // Before the shards, so the first count is there when a client connects.
     let sysinfo_print_interval = config.logging.sysinfo_print_interval.get_duration();
     crate::sysinfo_probe::start_system_stats_sampler(sysinfo_print_interval)
@@ -397,9 +403,17 @@ pub fn bootstrap(
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the
     // owning shard's bumps).
-    let shard_metrics_all: Vec<ShardMetrics> = (0..shards_count)
+    let mut shard_metrics_all: Vec<ShardMetrics> = (0..shards_count)
         .map(|_| ShardMetrics::for_shard())
         .collect();
+    // The object store gauges hold for the whole node. The boot probe and the
+    // store identity check of shard 0 set them.
+    if let Some((first, rest)) = shard_metrics_all.split_first_mut() {
+        first.set_object_store_unreachable(!object_store_answered);
+        for metrics in rest {
+            metrics.share_object_store_gauges(first);
+        }
+    }
     for (idx, assignment) in assignments.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let shard_id = idx as u16;
@@ -439,6 +453,7 @@ pub fn bootstrap(
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
+        let tiered_credentials_for_shard = tiered_credentials.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -461,6 +476,7 @@ pub fn bootstrap(
                     shard_metrics_for_shard,
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
+                    tiered_credentials_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -536,6 +552,7 @@ async fn shard_main(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
+    tiered_credentials: Option<SharedCredentials>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -998,6 +1015,14 @@ async fn shard_main(
         _ => None,
     };
 
+    let store_identity_stop = crate::tiered_storage::start(
+        &config.tiered_storage,
+        &bus,
+        &shard,
+        topology.self_replica_id,
+        tiered_credentials.as_ref(),
+    );
+
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
     // data-maintenance config.
@@ -1020,6 +1045,7 @@ async fn shard_main(
         pat_cleaner: pat_cleaner_stop,
         stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
+        store_identity: store_identity_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
     };

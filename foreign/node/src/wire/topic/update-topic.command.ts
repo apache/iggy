@@ -46,7 +46,28 @@ export type UpdateTopic = {
    * the server default.
    */
   maxTopicSize?: bigint,
-  /** Keys to reset to their defaults: `message_expiry` or `max_topic_size` */
+  /**
+   * Turns tiered storage on. `false` is refused before sending with error
+   * 4103, as is a reset of the key: the local segments tiering removed cannot
+   * come back.
+   */
+  tieredStorage?: boolean,
+  /**
+   * Local retention of a tiered topic in microseconds. `0n` is not "never": it
+   * omits the key, so the topic keeps whatever retention it currently has.
+   * Reset the key to return to the server default.
+   */
+  localRetentionAge?: bigint,
+  /**
+   * Local size cap of a tiered topic in bytes. `0n` is not "unlimited": it
+   * omits the key, so the topic keeps whatever cap it currently has. Reset the
+   * key to return to the server default.
+   */
+  localRetentionSize?: bigint,
+  /**
+   * Keys to reset to their defaults: `message_expiry`, `max_topic_size`,
+   * `local_retention_age` or `local_retention_size`
+   */
   reset?: TopicOptionKey[],
   /**
    * Reset names with no typed member, for a resettable key the server catalog
@@ -75,6 +96,9 @@ export const UPDATE_TOPIC = {
     name,
     messageExpiry = 0n,
     maxTopicSize = 0n,
+    tieredStorage,
+    localRetentionAge = 0n,
+    localRetentionSize = 0n,
     reset,
     rawReset,
     options: rawOptions
@@ -91,6 +115,21 @@ export const UPDATE_TOPIC = {
       options.push({
         key: 'max_topic_size',
         value: HeaderValue.Uint64(maxTopicSize)
+      });
+    if (tieredStorage !== undefined)
+      options.push({
+        key: 'tiered_storage',
+        value: HeaderValue.Bool(tieredStorage)
+      });
+    if (localRetentionAge !== 0n)
+      options.push({
+        key: 'local_retention_age',
+        value: HeaderValue.Uint64(localRetentionAge)
+      });
+    if (localRetentionSize !== 0n)
+      options.push({
+        key: 'local_retention_size',
+        value: HeaderValue.Uint64(localRetentionSize)
       });
 
     return UPDATE_RESOURCE.serialize({

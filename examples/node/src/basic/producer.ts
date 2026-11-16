@@ -18,7 +18,6 @@
 import { Client, Partitioning } from "apache-iggy";
 import debug from "debug";
 import {
-  PARTITION_COUNT,
   BATCHES_LIMIT,
   MESSAGES_PER_BATCH,
   initSystem,
@@ -107,7 +106,6 @@ async function cleanup(
     await client.topic.delete({
       streamId: streamId,
       topicId: topicId,
-      partitionsCount: PARTITION_COUNT,
     });
     log("Topic deleted successfully.");
   } catch (error) {

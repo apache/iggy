@@ -494,6 +494,22 @@ body.dark .footer {
     height: 16px;
 }
 
+/* The count after a divider, in the accent color, as the project website shows it. */
+.top-bar-github-stars {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding-left: 8px;
+    border-left: 1px solid var(--border);
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+}
+
+.top-bar-github .top-bar-github-stars svg {
+    width: 13px;
+    height: 13px;
+}
+
 .top-bar-icon:hover,
 .top-bar-github:hover {
     color: var(--accent);
@@ -617,6 +633,27 @@ body.dark .footer {
     letter-spacing: -0.03em;
 }
 
+.page-title-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 20px;
+}
+
+.page-title-tag {
+    padding: 5px 12px;
+    border: 1px solid var(--accent-dim);
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
 .page-lead {
     max-width: 680px;
     margin: 20px 0 0;
@@ -704,6 +741,19 @@ body.dark .footer {
     line-height: 1.65;
 }
 
+.section-text a {
+    color: var(--text);
+    font-weight: 600;
+    text-decoration: underline;
+    text-decoration-color: var(--accent-dim);
+    text-underline-offset: 3px;
+    transition: text-decoration-color 150ms;
+}
+
+.section-text a:hover {
+    text-decoration-color: var(--accent);
+}
+
 .card-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
@@ -731,6 +781,10 @@ body.dark .footer {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 14px;
+}
+
+.page-section > .card + .card {
+    margin-top: 16px;
 }
 
 .card h3 {
@@ -2436,8 +2490,8 @@ body.dark .family-end-to-end { --family: #b69cff; }
 }
 
 .compare-baseline {
-    border: 1px solid var(--run-color);
-    color: var(--run-color);
+    border: 1px solid var(--series-color);
+    color: var(--series-color);
 }
 
 .compare-runs {
@@ -2449,7 +2503,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
 .compare-run {
     display: flex;
     flex-direction: column;
-    border-top: 3px solid var(--run-color);
+    border-top: 3px solid var(--series-color);
 }
 
 .compare-run-top {
@@ -2459,13 +2513,13 @@ body.dark .family-end-to-end { --family: #b69cff; }
     gap: 8px;
 }
 
-.compare-swatch {
+.series-swatch {
     display: inline-block;
     flex: none;
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--run-color);
+    background: var(--series-color);
 }
 
 .compare-run-title {
@@ -2541,7 +2595,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
     letter-spacing: 0;
 }
 
-.compare-run-head .compare-swatch {
+.compare-run-head .series-swatch {
     margin-right: 6px;
 }
 
@@ -2597,22 +2651,23 @@ body.dark .family-end-to-end { --family: #b69cff; }
     background: var(--grid-line);
 }
 
-/* The chart takes most of the row, and each run's numbers sit in a narrow card beside it. */
-.compare-throughput {
+/* The throughput chart of a run page or a compare page takes most of the row, and the rates of
+   each line sit in a narrow card beside it. */
+.chart-with-card {
     display: grid;
     grid-template-columns: minmax(0, 3fr) minmax(240px, 1fr);
     gap: 16px;
 }
 
-.compare-throughput-runs {
+.rates-list {
     margin: 0;
     padding: 0;
     list-style: none;
 }
 
-/* Each run takes two columns: its name and value on the left, its change and message rate on the
-   right, so the values of all runs line up down the card. */
-.compare-throughput-run {
+/* Each line of the chart takes two columns: its name and rate on the left, its change and message
+   rate on the right, so the rates of all lines line up down the card. */
+.rates-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: baseline;
@@ -2621,12 +2676,12 @@ body.dark .family-end-to-end { --family: #b69cff; }
     border-top: 1px solid var(--border);
 }
 
-.compare-throughput-run:first-child {
+.rates-row:first-child {
     padding-top: 6px;
     border-top: 0;
 }
 
-.compare-throughput-name {
+.rates-name {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -2636,17 +2691,17 @@ body.dark .family-end-to-end { --family: #b69cff; }
     font-weight: 600;
 }
 
-.compare-throughput-run-name {
+.rates-label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.compare-throughput-change {
+.rates-change {
     justify-self: end;
 }
 
-.compare-throughput-baseline {
+.rates-baseline {
     color: var(--muted);
     font-size: 11px;
     font-weight: 650;
@@ -2654,7 +2709,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
     text-transform: uppercase;
 }
 
-.compare-throughput-rate {
+.rates-value {
     color: var(--text);
     font-size: 24px;
     font-variant-numeric: tabular-nums;
@@ -2663,7 +2718,7 @@ body.dark .family-end-to-end { --family: #b69cff; }
     white-space: nowrap;
 }
 
-.compare-throughput-messages {
+.rates-messages {
     justify-self: end;
     color: var(--muted);
     font-size: 12px;
@@ -2671,8 +2726,8 @@ body.dark .family-end-to-end { --family: #b69cff; }
     white-space: nowrap;
 }
 
-/* The bar's length is the run's throughput against the fastest run. */
-.compare-throughput-bar {
+/* The bar's length is the line's rate against the fastest line in the card. */
+.rates-bar {
     grid-column: 1 / -1;
     height: 4px;
     margin-top: 6px;
@@ -2681,16 +2736,16 @@ body.dark .family-end-to-end { --family: #b69cff; }
     background: var(--border);
 }
 
-.compare-throughput-bar > span {
+.rates-bar > span {
     display: block;
     height: 100%;
     border-radius: inherit;
-    background: var(--run-color);
+    background: var(--series-color);
 }
 
 /* Below this width the chart would get too narrow, so the card goes under it. */
 @media (max-width: 900px) {
-    .compare-throughput {
+    .chart-with-card {
         grid-template-columns: minmax(0, 1fr);
     }
 }
@@ -2783,13 +2838,13 @@ body.dark .family-end-to-end { --family: #b69cff; }
 
     /* Only a runs compare cell has a run color. Its swatch and run name are ordered first, ahead of
        the cell's value. */
-    .run-table td[style*="--run-color"]::before {
+    .run-table td[style*="--series-color"]::before {
         content: "";
         order: -2;
         width: 10px;
         height: 10px;
         border-radius: 50%;
-        background: var(--run-color);
+        background: var(--series-color);
     }
 
     .run-table td::after {
@@ -3016,7 +3071,8 @@ body.dark .family-end-to-end { --family: #b69cff; }
 
     .top-bar-nav::-webkit-scrollbar { display: none; }
 
-    .top-bar-github { width: 36px; padding: 0; }
+    /* 36px wide with the mark alone, as the theme button. */
+    .top-bar-github { padding: 0 9px; }
     .top-bar-github-label { display: none; }
 
     .page-head { padding: 24px 0 40px; }
@@ -3024,6 +3080,11 @@ body.dark .family-end-to-end { --family: #b69cff; }
     .page-section { padding-top: 56px; }
     .card { padding: 18px; }
     .badge-rule { grid-template-columns: 1fr; gap: 6px; }
+}
+
+/* The brand and the badge with its count need about 380px, so a narrower phone shows the mark alone. */
+@media (max-width: 379px) {
+    .top-bar-github-stars { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3044,4 +3105,325 @@ body.dark .family-end-to-end { --family: #b69cff; }
     .compare-tray {
         animation: none;
     }
+}
+
+/* Framework marks. Each framework has its own color, so a page and a screenshot of it tell which
+   tool measured the numbers. The OMB color stays apart from the accent and from the colors of a
+   better or worse change. */
+:root {
+    --iggy-bench: #9a4f00;
+    --omb: #0f766e;
+    --omb-soft: rgba(20, 184, 166, 0.12);
+    --omb-dim: rgba(15, 118, 110, 0.35);
+}
+
+body.dark {
+    --iggy-bench: #ffab4a;
+    --omb: #2dd4bf;
+    --omb-soft: rgba(45, 212, 191, 0.12);
+    --omb-dim: rgba(45, 212, 191, 0.4);
+}
+
+/* The first two line colors of the ECharts theme, so a card can mark the line it describes. */
+:root {
+    --series-1: #5470c6;
+    --series-2: #91cc75;
+}
+
+body.dark {
+    --series-1: #4992ff;
+    --series-2: #7cffb2;
+}
+
+.framework-chip {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    padding: 2px 9px;
+    border: 1px solid var(--framework-dim);
+    border-radius: 999px;
+    background: var(--framework-soft);
+    color: var(--framework);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    line-height: 1.5;
+    white-space: nowrap;
+    cursor: help;
+}
+
+.framework-iggy-bench {
+    --framework: var(--iggy-bench);
+    --framework-soft: var(--accent-soft);
+    --framework-dim: var(--accent-dim);
+}
+
+.framework-omb {
+    --framework: var(--omb);
+    --framework-soft: var(--omb-soft);
+    --framework-dim: var(--omb-dim);
+}
+
+.omb-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 16px;
+    max-width: 760px;
+    margin: 24px 0 0;
+    padding: 14px 18px;
+    box-sizing: border-box;
+    border: 1px solid var(--omb-dim);
+    border-left: 4px solid var(--omb);
+    border-radius: 12px;
+    background: var(--omb-soft);
+}
+
+.omb-banner-text {
+    flex: 1 1 360px;
+    min-width: 0;
+    margin: 0;
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.55;
+}
+
+.omb-banner-link {
+    color: var(--omb);
+    font-size: 13.5px;
+    font-weight: 650;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    white-space: nowrap;
+}
+
+.omb-banner-link:hover {
+    text-decoration-thickness: 2px;
+}
+
+.omb-driver {
+    padding: 2px 8px;
+    border: 1px solid var(--omb-dim);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+/* The Methodology tables about OMB: a topic per row, then text in each cell. */
+.omb-fact-table {
+    width: calc(100% + 24px);
+    margin: 16px -12px 0;
+    border-collapse: collapse;
+    font-size: 14px;
+    line-height: 1.55;
+}
+
+.omb-fact-table th,
+.omb-fact-table td {
+    padding: 12px;
+    border-top: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+}
+
+.omb-fact-table thead th {
+    padding-top: 0;
+    padding-bottom: 10px;
+    border-top: 0;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.omb-fact-table tbody th {
+    width: 24%;
+    color: var(--text);
+    font-weight: 600;
+}
+
+.omb-fact-table td {
+    color: var(--muted);
+}
+
+/* On a phone, each row is a block: its topic, then each cell under its column name. */
+@media (max-width: 720px) {
+    .omb-banner {
+        padding: 12px 14px;
+    }
+
+    .omb-banner-text {
+        flex-basis: 100%;
+        font-size: 13.5px;
+    }
+
+    .omb-fact-table,
+    .omb-fact-table tbody,
+    .omb-fact-table tr,
+    .omb-fact-table th,
+    .omb-fact-table td {
+        display: block;
+        width: auto;
+    }
+
+    .omb-fact-table thead {
+        display: none;
+    }
+
+    .omb-fact-table tbody tr {
+        padding: 10px 0;
+        border-top: 1px solid var(--border);
+    }
+
+    .omb-fact-table tbody th,
+    .omb-fact-table td {
+        padding: 2px 12px;
+        border: 0;
+    }
+
+    .omb-fact-table td[data-label]::before {
+        content: attr(data-label);
+        display: block;
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+}
+
+/* OMB run list */
+/* The Explore table with seven columns: the workload, the setup, the version, three numbers and
+   the date. Two classes, so these win over the Explore grid, and the phone rule below repeats the
+   card grid for the same reason. */
+.omb-runs-table .explore-head,
+.omb-runs-table .explore-row {
+    grid-template-columns:
+        minmax(0, 2.3fr) minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, 0.9fr)
+        minmax(0, 0.9fr) minmax(0, 0.95fr) minmax(0, 0.8fr);
+}
+
+.omb-runs-date {
+    color: var(--muted);
+}
+
+.omb-runs-missing {
+    color: var(--muted);
+    font-weight: 500;
+}
+
+@media (max-width: 720px) {
+    .omb-runs-table .explore-row {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+/* OMB run page */
+/* The source of the run time, after the time itself, and the estimated start of a run whose file
+   only gives its end. */
+.omb-run-time-source {
+    color: var(--muted);
+}
+
+.omb-run-estimate {
+    font-style: italic;
+    cursor: help;
+}
+
+/* The latency charts over the run, one below the other at full width, as on the compare page. */
+.omb-run-charts {
+    display: grid;
+    gap: 16px;
+}
+
+/* The publish and end-to-end ladders, one below the other, so each keeps the width of the
+   iggy-bench ladder. */
+.omb-run-ladders {
+    display: grid;
+    gap: 16px;
+}
+
+.omb-run-related-actions {
+    margin: 16px 0 0;
+}
+
+/* What OMB leaves out of every result, as a plain list in its card. */
+.omb-run-unrecorded {
+    margin: 0;
+    padding-left: 18px;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.omb-run-unrecorded li + li {
+    margin-top: 6px;
+}
+
+/* OMB compare page */
+/* An unknown setup is no difference that the page knows of, so it stays gray, apart from the
+   accent of a setup that differs. */
+.omb-compare-level-unknown {
+    --level-color: var(--muted);
+    --level-soft: var(--grid-line);
+}
+
+.omb-compare-time-source {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* The nines axis has eight labels, which crowd on a half-width card, so each curve takes the
+   full width as on the run page. */
+.omb-compare-curves {
+    display: grid;
+    gap: 16px;
+}
+
+.omb-compare-environment {
+    margin-top: 4px;
+}
+
+/* A number that a run didn't measure reads as a note, not as a value. It stays on one line, so
+   its row keeps the height of the rows with numbers. */
+.omb-missing {
+    color: var(--muted);
+    font-style: italic;
+    white-space: nowrap;
+}
+
+/* The consume rate takes a line of its own under the publish rates, with its change at the end. */
+.omb-compare-consume {
+    display: flex;
+    flex-wrap: wrap;
+    grid-column: 1 / -1;
+    justify-content: space-between;
+    align-items: center;
+    gap: 4px 8px;
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.omb-compare-notes {
+    margin-top: 6px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.omb-compare-notes p {
+    margin: 0;
+}
+
+.omb-compare-notes p + p {
+    margin-top: 4px;
 }

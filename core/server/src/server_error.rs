@@ -62,6 +62,8 @@ pub enum ServerError {
         #[source]
         source: Box<iggy_common::IggyError>,
     },
+    #[error("cannot register the partition state machines")]
+    PartitionStateMachines(#[source] partitions::state_machine::RegistrationError),
     #[error("failed to load server config")]
     Config(#[source] configs::ConfigurationError),
     #[error("failed to allocate shards from sharding.cpu_allocation")]
@@ -434,6 +436,46 @@ pub enum ServerError {
     ListConfigEnvVars(#[source] std::io::Error),
     #[error("failed to build the external auth HTTP client: {reason}")]
     ExternalAuthClient { reason: String },
+    #[error("tiered storage cannot start: {reason}")]
+    TieredStorage { reason: String },
+    #[error("tiered storage cannot start: tiered_storage.path {path:?} cannot be read")]
+    TieredStoragePath {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "tiered storage cannot start: tiered_storage.prefix {prefix:?} is not a usable key prefix"
+    )]
+    TieredStoragePrefix {
+        prefix: String,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
+    #[error("tiered storage cannot start: the object store refused the boot probe of {key:?}")]
+    TieredStorageProbe {
+        key: String,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
+    #[error("tiered storage cannot start: no runtime for the boot probe")]
+    TieredStorageProbeRuntime {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "tiered storage cannot start: the {source_name} of the s3 backend handed out no credentials"
+    )]
+    TieredStorageCredentials {
+        source_name: &'static str,
+        #[source]
+        source: iggy_object_store::s3::credentials::CredentialError,
+    },
+    #[error("tiered storage cannot start: the credentials refresher of the s3 backend")]
+    TieredStorageCredentialsThread {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

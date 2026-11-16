@@ -16,20 +16,29 @@
 // under the License.
 
 use crate::components::footer::render_github_icon;
+use crate::pages::compare::runs::opens_elsewhere;
 use crate::router::AppRoute;
+use bench_dashboard_shared::github::GithubStars;
 use yew::prelude::*;
-use yew_router::prelude::{Link, use_route};
+use yew_router::Routable;
+use yew_router::prelude::{Link, use_navigator, use_route};
 
 const GITHUB_URL: &str = "https://github.com/apache/iggy";
+const GITHUB_LABEL: &str = "Apache Iggy on GitHub";
+const STAR_POINTS: &str = "12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 \
+                           2 9.27 8.91 8.26 12 2";
+const OMB_TAB_LABEL: &str = "OMB";
+const OMB_TAB_TITLE: &str = "OpenMessaging Benchmark";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NavTab {
     Overview,
     Explore,
+    Omb,
     Methodology,
 }
 
-/// The bar on top of every page: brand, main navigation, theme and GitHub.
+/// The bar on top of every page: brand, main navigation, GitHub with the star count, and theme.
 #[function_component(TopBar)]
 pub fn top_bar() -> Html {
     let route = use_route::<AppRoute>();
@@ -41,6 +50,22 @@ pub fn top_bar() -> Html {
         |tab: NavTab| classes!("top-bar-tab", (active == Some(tab)).then_some("active"));
 
     let on_theme_click = Callback::from(move |_| toggle_theme.emit(()));
+    // A `Link` takes no title, and the short tab label needs the full name on hover.
+    let navigator = use_navigator();
+    let open_omb = Callback::from(move |event: MouseEvent| {
+        if let Some(navigator) = navigator.as_ref().filter(|_| !opens_elsewhere(&event)) {
+            event.prevent_default();
+            navigator.push(&AppRoute::OmbRuns);
+        }
+    });
+
+    let stars = use_context::<GithubStars>()
+        .and_then(|github| github.stars)
+        .map(star_count_text);
+    let github_label = stars.as_ref().map_or_else(
+        || GITHUB_LABEL.to_owned(),
+        |stars| format!("{GITHUB_LABEL}, {stars} stars"),
+    );
 
     let theme_title = if is_dark {
         "Switch to light theme"
@@ -68,11 +93,36 @@ pub fn top_bar() -> Html {
                     <Link<AppRoute> to={AppRoute::Explore} classes={tab_class(NavTab::Explore)}>
                         {"Explore"}
                     </Link<AppRoute>>
+                    <a
+                        href={AppRoute::OmbRuns.to_path()}
+                        class={tab_class(NavTab::Omb)}
+                        title={OMB_TAB_TITLE}
+                        onclick={open_omb}
+                    >
+                        { OMB_TAB_LABEL }
+                    </a>
                     <Link<AppRoute> to={AppRoute::Methodology} classes={tab_class(NavTab::Methodology)}>
                         {"Methodology"}
                     </Link<AppRoute>>
                 </nav>
                 <div class="top-bar-actions">
+                    <a
+                        class="top-bar-github"
+                        href={GITHUB_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        aria-label={github_label}
+                    >
+                        { render_github_icon() }
+                        if let Some(stars) = stars {
+                            <span class="top-bar-github-stars">
+                                { render_star_icon() }
+                                { stars }
+                            </span>
+                        } else {
+                            <span class="top-bar-github-label">{"GitHub"}</span>
+                        }
+                    </a>
                     <button
                         type="button"
                         class="top-bar-icon"
@@ -82,16 +132,6 @@ pub fn top_bar() -> Html {
                     >
                         { render_theme_icon(is_dark) }
                     </button>
-                    <a
-                        class="top-bar-github"
-                        href={GITHUB_URL}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        aria-label="Apache Iggy on GitHub"
-                    >
-                        { render_github_icon() }
-                        <span class="top-bar-github-label">{"GitHub"}</span>
-                    </a>
                 </div>
             </div>
         </header>
@@ -100,17 +140,38 @@ pub fn top_bar() -> Html {
 
 impl NavTab {
     /// The run and compare views belong to Explore. The releases compare opens from the
-    /// Overview, so it belongs there.
+    /// Overview, so it belongs there. Every OMB page belongs to the OMB tab, so the two
+    /// frameworks never share a tab.
     const fn of(route: &AppRoute) -> Option<Self> {
         match route {
             AppRoute::Home | AppRoute::CompareReleases => Some(Self::Overview),
             AppRoute::Explore
-            | AppRoute::Benchmark { .. }
+            | AppRoute::Run { .. }
+            | AppRoute::OldRun { .. }
             | AppRoute::Compare
             | AppRoute::ComparePair { .. } => Some(Self::Explore),
+            AppRoute::OmbRuns | AppRoute::OmbRun { .. } | AppRoute::OmbCompare => Some(Self::Omb),
             AppRoute::Methodology => Some(Self::Methodology),
             AppRoute::NotFound => None,
         }
+    }
+}
+
+/// The count as GitHub writes it: thousands with one decimal, for example 5.1K.
+fn star_count_text(stars: u32) -> String {
+    if stars >= 1000 {
+        format!("{:.1}K", f64::from(stars) / 1000.0)
+    } else {
+        stars.to_string()
+    }
+}
+
+fn render_star_icon() -> Html {
+    html! {
+        <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24"
+             fill="currentColor" aria-hidden="true">
+            <polygon points={STAR_POINTS} />
+        </svg>
     }
 }
 
@@ -148,7 +209,7 @@ mod tests {
 
     #[test]
     fn given_explore_run_or_compare_route_when_tab_picked_should_choose_explore() {
-        let run = AppRoute::Benchmark {
+        let run = AppRoute::Run {
             uuid: "run".to_owned(),
         };
         let old_compare_link = AppRoute::ComparePair {
@@ -174,5 +235,26 @@ mod tests {
             Some(NavTab::Methodology)
         );
         assert_eq!(NavTab::of(&AppRoute::NotFound), None);
+    }
+
+    #[test]
+    fn given_star_counts_when_written_should_shorten_thousands() {
+        let texts: Vec<_> = [7, 999, 1000, 5123, 5150, 12_480]
+            .into_iter()
+            .map(star_count_text)
+            .collect();
+
+        assert_eq!(texts, ["7", "999", "1.0K", "5.1K", "5.2K", "12.5K"]);
+    }
+
+    #[test]
+    fn given_omb_routes_when_tab_picked_should_choose_omb() {
+        let run = AppRoute::OmbRun {
+            id: "3f2a9c1b0eb36c51".to_owned(),
+        };
+
+        assert_eq!(NavTab::of(&AppRoute::OmbRuns), Some(NavTab::Omb));
+        assert_eq!(NavTab::of(&run), Some(NavTab::Omb));
+        assert_eq!(NavTab::of(&AppRoute::OmbCompare), Some(NavTab::Omb));
     }
 }

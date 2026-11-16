@@ -53,6 +53,26 @@ pub struct IggyService {
     permissions: Permissions,
 }
 
+/// Whether a failed call may have changed state, so an agent knows if it can retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Outcome {
+    /// Refused or failed before anything was applied.
+    Failed,
+    /// Sent with an unknown outcome, so it may or may not have been applied.
+    Uncertain,
+    /// Not sent, because an earlier operation with an unknown outcome blocks it.
+    Blocked,
+}
+
+/// The `data` of a tool error.
+#[derive(Debug, Serialize)]
+struct ToolErrorData {
+    outcome: Outcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
+}
+
 #[tool_router]
 impl IggyService {
     pub fn new(client: Arc<IggyClient>, consumer: Arc<Consumer>, permissions: Permissions) -> Self {
@@ -117,7 +137,7 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Delete stream")]
+    #[tool(description = "Delete a stream with all of its topics and messages")]
     pub async fn delete_stream(
         &self,
         Parameters(DeleteStream { stream_id }): Parameters<DeleteStream>,
@@ -154,45 +174,15 @@ impl IggyService {
     #[tool(description = "Create topic")]
     pub async fn create_topic(
         &self,
-        Parameters(CreateTopic {
-            stream_id,
-            name,
-            partitions_count,
-            compression_algorithm,
-            message_expiry,
-            max_size,
-            options,
-        }): Parameters<CreateTopic>,
+        Parameters(create): Parameters<CreateTopic>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
-        let compression_algorithm = compression_algorithm
-            .and_then(|ca| ca.parse().ok())
-            .unwrap_or_default();
-        let message_expiry = message_expiry
-            .and_then(|me| me.parse().ok())
-            .unwrap_or_default();
-        let max_size = max_size.and_then(|ms| ms.parse().ok()).unwrap_or_default();
+        let stream_id = id(&create.stream_id)?;
+        let name = create.name.clone();
+        let create_options = TopicCreateOptions::try_from(create)?;
         request(
             self.client
-                .create_topic(
-                    &id(&stream_id)?,
-                    &name,
-                    &TopicCreateOptions {
-                        partitions_count: Some(partitions_count),
-                        compression_algorithm: (compression_algorithm
-                            != CompressionAlgorithm::default())
-                        .then_some(compression_algorithm),
-                        message_expiry: (message_expiry != IggyExpiry::ServerDefault)
-                            .then_some(message_expiry),
-                        max_topic_size: (max_size != MaxTopicSize::ServerDefault)
-                            .then_some(max_size),
-                        // Raw keys ride as strings and are parsed server-side by
-                        // the same rules a config value goes through, so a key
-                        // added after this build shipped is still reachable.
-                        raw: options,
-                        ..TopicCreateOptions::default()
-                    },
-                )
+                .create_topic(&stream_id, &name, &create_options)
                 .await,
         )
     }
@@ -213,7 +203,7 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Delete topic")]
+    #[tool(description = "Delete a topic with all of its partitions and messages")]
     pub async fn delete_topic(
         &self,
         Parameters(DeleteTopic {
@@ -246,7 +236,9 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Delete partitions")]
+    #[tool(
+        description = "Delete the last partitions_count partitions of a topic with their messages"
+    )]
     pub async fn delete_partitions(
         &self,
         Parameters(DeletePartitions {
@@ -263,7 +255,9 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Delete segments")]
+    #[tool(
+        description = "Delete the oldest segments_count sealed segments of a partition with their messages. The active segment is kept."
+    )]
     pub async fn delete_segments(
         &self,
         Parameters(DeleteSegments {
@@ -287,7 +281,7 @@ impl IggyService {
     }
 
     #[tool(
-        description = "Poll messages. Requires read permission; auto_commit=true or strategy=next also requires update permission because it stores the consumer offset."
+        description = "Poll messages. Requires read permission, and auto_commit=true or strategy=next also requires update permission because it stores the consumer offset. Payloads in the reply are base64 encoded."
     )]
     pub async fn poll_messages(
         &self,
@@ -383,19 +377,20 @@ impl IggyService {
 
         let mut messages = messages
             .into_iter()
-            .flat_map(|message| {
-                if let Some(id) = message.id {
-                    return IggyMessage::builder()
-                        .id(id)
-                        .payload(message.payload.into())
-                        .build();
-                }
-
+            .enumerate()
+            .map(|(index, message)| {
                 IggyMessage::builder()
+                    .maybe_id(message.id)
                     .payload(message.payload.into())
                     .build()
+                    .map_err(|error| {
+                        ErrorData::invalid_request(
+                            format!("messages[{index}] is invalid, so nothing was sent. {error}"),
+                            None,
+                        )
+                    })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
 
         request(
             self.client
@@ -472,12 +467,15 @@ impl IggyService {
         request(self.client.get_clients().await)
     }
 
-    #[tool(description = "Snapshot")]
+    #[tool(
+        description = "Collect a server diagnostics snapshot, returned as the bytes of a compressed archive. Requires the admin permission."
+    )]
     pub async fn snapshot(
         &self,
         Parameters(Snapshot { compression, types }): Parameters<Snapshot>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
+        self.permissions.ensure_admin()?;
         let compression = compression.and_then(|c| c.parse().ok()).unwrap_or_default();
         let mut types = types
             .into_iter()
@@ -626,13 +624,16 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Get personal access tokens")]
+    #[tool(description = "Get personal access tokens. Requires the admin permission.")]
     pub async fn get_personal_access_tokens(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
+        self.permissions.ensure_admin()?;
         request(self.client.get_personal_access_tokens().await)
     }
 
-    #[tool(description = "Create personal access token")]
+    #[tool(
+        description = "Create a personal access token for the connected Iggy user. The reply holds the token itself. Requires the admin permission."
+    )]
     pub async fn create_personal_access_token(
         &self,
         Parameters(CreatePersonalAccessToken { name, expiry }): Parameters<
@@ -640,6 +641,7 @@ impl IggyService {
         >,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
+        self.permissions.ensure_admin()?;
         let expiry = expiry
             .map(|expiry| parsed(&expiry, "personal access token expiry"))
             .transpose()?
@@ -651,31 +653,34 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Delete personal access token")]
+    #[tool(description = "Delete personal access token. Requires the admin permission.")]
     pub async fn delete_personal_access_token(
         &self,
         Parameters(DeletePersonalAccessToken { name }): Parameters<DeletePersonalAccessToken>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_delete()?;
+        self.permissions.ensure_admin()?;
         request(self.client.delete_personal_access_token(&name).await)
     }
 
-    #[tool(description = "Get users")]
+    #[tool(description = "Get users. Requires the admin permission.")]
     pub async fn get_users(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
+        self.permissions.ensure_admin()?;
         request(self.client.get_users().await)
     }
 
-    #[tool(description = "Get user")]
+    #[tool(description = "Get user. Requires the admin permission.")]
     pub async fn get_user(
         &self,
         Parameters(GetUser { user_id }): Parameters<GetUser>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
+        self.permissions.ensure_admin()?;
         request(self.client.get_user(&id(&user_id)?).await)
     }
 
-    #[tool(description = "Create user")]
+    #[tool(description = "Create user. Requires the admin permission.")]
     pub async fn create_user(
         &self,
         Parameters(CreateUser {
@@ -686,7 +691,8 @@ impl IggyService {
         }): Parameters<CreateUser>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
-        let status = if active.unwrap_or_default() {
+        self.permissions.ensure_admin()?;
+        let status = if active.unwrap_or(true) {
             UserStatus::Active
         } else {
             UserStatus::Inactive
@@ -705,12 +711,13 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Update user")]
+    #[tool(description = "Update user. Requires the admin permission.")]
     pub async fn update_user(
         &self,
         Parameters(update): Parameters<UpdateUser>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
+        self.permissions.ensure_admin()?;
         let user_id = id(&update.user_id)?;
         request(
             self.client
@@ -719,16 +726,19 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Delete user")]
+    #[tool(description = "Delete user. Requires the admin permission.")]
     pub async fn delete_user(
         &self,
         Parameters(DeleteUser { user_id }): Parameters<DeleteUser>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_delete()?;
+        self.permissions.ensure_admin()?;
         request(self.client.delete_user(&id(&user_id)?).await)
     }
 
-    #[tool(description = "Update permissions")]
+    #[tool(
+        description = "Replace every permission of a user. A flag left out becomes false, and leaving permissions out removes all of them. Requires the admin permission."
+    )]
     pub async fn update_permissions(
         &self,
         Parameters(UpdatePermissions {
@@ -737,6 +747,7 @@ impl IggyService {
         }): Parameters<UpdatePermissions>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
+        self.permissions.ensure_admin()?;
         let permissions = permissions.map(|p| p.into());
         request(
             self.client
@@ -745,7 +756,7 @@ impl IggyService {
         )
     }
 
-    #[tool(description = "Change password")]
+    #[tool(description = "Change password. Requires the admin permission.")]
     pub async fn change_password(
         &self,
         Parameters(ChangePassword {
@@ -755,6 +766,7 @@ impl IggyService {
         }): Parameters<ChangePassword>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
+        self.permissions.ensure_admin()?;
         request(
             self.client
                 .change_password(&id(&user_id)?, &current_password, &new_password)
@@ -771,6 +783,19 @@ impl ServerHandler for IggyService {
     }
 }
 
+impl From<&IggyError> for Outcome {
+    fn from(error: &IggyError) -> Self {
+        match error {
+            IggyError::OperationUncertain(_)
+            | IggyError::FetchProgressUncertain(_)
+            | IggyError::TransientNotCommitted
+            | IggyError::RequestTooOld => Self::Uncertain,
+            IggyError::LaneBlocked(_) | IggyError::PartitionLaneBlocked(_, _) => Self::Blocked,
+            _ => Self::Failed,
+        }
+    }
+}
+
 impl From<UpdateStream> for StreamUpdateOptions {
     fn from(update: UpdateStream) -> Self {
         let (reset, raw_reset) = split_reset(update.reset);
@@ -780,6 +805,37 @@ impl From<UpdateStream> for StreamUpdateOptions {
             raw_reset,
             ..StreamUpdateOptions::default()
         }
+    }
+}
+
+impl TryFrom<CreateTopic> for TopicCreateOptions {
+    type Error = ErrorData;
+
+    fn try_from(create: CreateTopic) -> Result<Self, Self::Error> {
+        let compression_algorithm = create
+            .compression_algorithm
+            .map(|value| parsed::<CompressionAlgorithm>(&value, "compression algorithm"))
+            .transpose()?;
+        let message_expiry = create
+            .message_expiry
+            .map(|value| parsed::<IggyExpiry>(&value, "message expiry"))
+            .transpose()?;
+        let max_topic_size = create
+            .max_size
+            .map(|value| parsed::<MaxTopicSize>(&value, "maximum size"))
+            .transpose()?;
+        Ok(TopicCreateOptions {
+            partitions_count: Some(create.partitions_count),
+            compression_algorithm: compression_algorithm
+                .filter(|algorithm| *algorithm != CompressionAlgorithm::default()),
+            message_expiry: message_expiry.filter(|expiry| *expiry != IggyExpiry::ServerDefault),
+            max_topic_size: max_topic_size.filter(|size| *size != MaxTopicSize::ServerDefault),
+            // Raw keys ride as strings and are parsed server-side by the same
+            // rules a config value goes through, so a key added after this
+            // build shipped is still reachable.
+            raw: create.options,
+            ..TopicCreateOptions::default()
+        })
     }
 }
 
@@ -798,6 +854,9 @@ impl TryFrom<UpdateTopic> for TopicUpdateOptions {
                 .max_size
                 .map(|value| parsed(&value, "maximum size"))
                 .transpose()?,
+            tiered_storage: None,
+            local_retention_age: None,
+            local_retention_size: None,
             reset,
             raw_reset,
             raw: update.options,
@@ -862,11 +921,20 @@ fn id(id: &str) -> Result<Identifier, ErrorData> {
 }
 
 fn request(result: Result<impl Sized + Serialize, IggyError>) -> Result<CallToolResult, ErrorData> {
-    let result = result.map_err(|e| {
-        let data = e
-            .operation_id()
-            .map(|op| serde_json::json!({ "operation_id": op.to_string() }));
-        let message = format!("There was an error when invoking the method. {e}");
+    let result = result.map_err(|error| {
+        let message = match recovery(&error) {
+            Some(recovery) => {
+                format!("There was an error when invoking the method. {error}. {recovery}")
+            }
+            None => format!("There was an error when invoking the method. {error}"),
+        };
+        let data = serde_json::to_value(ToolErrorData {
+            outcome: Outcome::from(&error),
+            operation_id: error
+                .operation_id()
+                .map(|operation_id| operation_id.to_string()),
+        })
+        .ok();
         error!(message);
         ErrorData::invalid_request(message, data)
     })?;
@@ -878,6 +946,28 @@ fn request(result: Result<impl Sized + Serialize, IggyError>) -> Result<CallTool
     })?;
 
     Ok(CallToolResult::success(vec![content]))
+}
+
+/// What an agent has to do before it retries a call that ended with `error`.
+fn recovery(error: &IggyError) -> Option<String> {
+    match error {
+        IggyError::OperationUncertain(operation_id) => Some(format!(
+            "The write may or may not have been applied. Call resolve_operation with operation_id {operation_id} to settle it before retrying."
+        )),
+        IggyError::FetchProgressUncertain(operation_id) => Some(format!(
+            "The poll may or may not have stored the consumer offset. Call abandon_operation with operation_id {operation_id} before polling this partition again."
+        )),
+        IggyError::TransientNotCommitted | IggyError::RequestTooOld => Some(
+            "The call may or may not have been applied. Read the state it changes before retrying."
+                .to_owned(),
+        ),
+        IggyError::LaneBlocked(operation_id) | IggyError::PartitionLaneBlocked(_, operation_id) => {
+            Some(format!(
+                "This call was not sent. Settle operation {operation_id} with resolve_operation or abandon_operation first."
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn operation_id_value(value: &str) -> Result<u64, ErrorData> {
@@ -905,6 +995,91 @@ mod tests {
             let data = result.data.unwrap();
             let operation = data["operation_id"].as_str().unwrap();
             assert_eq!(operation_id_value(operation).unwrap(), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn given_write_errors_when_reporting_should_say_whether_the_write_may_have_applied() {
+        for (error, outcome, guidance) in [
+            (
+                IggyError::OperationUncertain(7),
+                "uncertain",
+                "may or may not have been applied",
+            ),
+            (
+                IggyError::FetchProgressUncertain(7),
+                "uncertain",
+                "abandon_operation",
+            ),
+            (
+                IggyError::TransientNotCommitted,
+                "uncertain",
+                "may or may not have been applied",
+            ),
+            (
+                IggyError::RequestTooOld,
+                "uncertain",
+                "may or may not have been applied",
+            ),
+            (IggyError::LaneBlocked(7), "blocked", "was not sent"),
+            (
+                IggyError::PartitionLaneBlocked(0, 7),
+                "blocked",
+                "was not sent",
+            ),
+            (IggyError::InvalidCommand, "failed", "There was an error"),
+        ] {
+            let reported = request(Err::<(), _>(error)).unwrap_err();
+
+            assert_eq!(
+                reported.data.as_ref().map(|data| data["outcome"].clone()),
+                Some(serde_json::Value::from(outcome)),
+                "{}",
+                reported.message
+            );
+            assert!(
+                reported.message.contains(guidance),
+                "{} must say {guidance}",
+                reported.message
+            );
+        }
+    }
+
+    #[test]
+    fn given_create_topic_values_when_converting_should_parse_them_into_typed_options() {
+        let create: CreateTopic = serde_json::from_str(
+            r#"{"stream_id":"orders","name":"events","partitions_count":2,"compression_algorithm":"gzip","message_expiry":"7days","max_size":"15GB","options":{"future_key":"1"}}"#,
+        )
+        .expect("valid create_topic body");
+
+        let options = TopicCreateOptions::try_from(create).expect("valid values convert");
+
+        assert_eq!(
+            options,
+            TopicCreateOptions {
+                partitions_count: Some(2),
+                compression_algorithm: Some(CompressionAlgorithm::Gzip),
+                message_expiry: Some("7days".parse().expect("valid expiry")),
+                max_topic_size: Some("15GB".parse().expect("valid size")),
+                raw: BTreeMap::from([("future_key".to_owned(), "1".to_owned())]),
+                ..TopicCreateOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn given_unparsable_create_topic_value_when_converting_should_refuse() {
+        for field in [
+            r#""compression_algorithm":"zstd""#,
+            r#""message_expiry":"soon""#,
+            r#""max_size":"big""#,
+        ] {
+            let create: CreateTopic = serde_json::from_str(&format!(
+                r#"{{"stream_id":"orders","name":"events","partitions_count":1,{field}}}"#
+            ))
+            .expect("valid create_topic body");
+
+            assert!(TopicCreateOptions::try_from(create).is_err(), "{field}");
         }
     }
 

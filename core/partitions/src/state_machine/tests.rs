@@ -49,7 +49,7 @@ fn with_counter(partition: IggyPartition<IggyMessageBus>) -> Box<IggyPartition<I
     partition
 }
 
-fn head(partition: &IggyPartition<IggyMessageBus>) -> u64 {
+pub fn head(partition: &IggyPartition<IggyMessageBus>) -> u64 {
     partition.consensus().sequencer().current_sequence()
 }
 
@@ -82,7 +82,7 @@ async fn send(partition: &mut IggyPartition<IggyMessageBus>, offset: u64, client
     Box::pin(partition.on_request(send, None)).await;
 }
 
-async fn commit_all(partition: &mut IggyPartition<IggyMessageBus>) {
+pub async fn commit_all(partition: &mut IggyPartition<IggyMessageBus>) {
     let config = repair_config();
     partition.consensus().advance_commit_max(head(partition));
     for _ in 0..4 {
@@ -93,7 +93,7 @@ async fn commit_all(partition: &mut IggyPartition<IggyMessageBus>) {
 }
 
 /// The status a refused request gets back.
-async fn refusal(
+pub async fn refusal(
     partition: &mut IggyPartition<IggyMessageBus>,
     request: server_common::Message<RoutedRequestHeader>,
 ) -> u32 {
@@ -313,6 +313,10 @@ impl PartitionStateMachine for OversizedMachine {
         out.resize(out.len() + SNAPSHOT_BYTES_MAX, 0);
     }
 
+    fn holds_state(&self) -> bool {
+        true
+    }
+
     fn restore(&mut self, _: &[u8]) -> Result<(), MachineRestoreError> {
         Ok(())
     }
@@ -350,7 +354,7 @@ async fn given_machines_past_the_snapshot_bound_when_capturing_should_refuse_che
     ));
 }
 
-fn partition_path(directory: &tempfile::TempDir) -> String {
+pub fn partition_path(directory: &tempfile::TempDir) -> String {
     let path = directory.path().join("partition");
     std::fs::create_dir_all(path.join("prepares-0")).unwrap();
     path.to_string_lossy().into_owned()

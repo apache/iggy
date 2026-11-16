@@ -84,7 +84,10 @@ class MessagesHttpDeferredTest {
             "{\"id\":90,\"code\":\"deferred_poll_capacity_exceeded\",\"reason\":\"at capacity\"}";
     private static final String NOT_COMMITTED =
             "{\"id\":57,\"code\":\"transient_not_committed\",\"reason\":\"unknown outcome\"}";
+    private static final String TIERED_READ_FAILED =
+            "{\"id\":96,\"code\":\"tiered_read_failed\",\"reason\":\"object store refused\",\"field\":null}";
     private static final int SERVICE_UNAVAILABLE = 503;
+    private static final int FAILED_DEPENDENCY = 424;
     private static final int TRANSIENT_NOT_COMMITTED = 57;
     private static final int DEFERRED_CONNECTION_LIMIT = 64;
     private static final Duration STALL = Duration.ofMinutes(1);
@@ -625,6 +628,38 @@ class MessagesHttpDeferredTest {
             long firstWait = Long.parseLong(peer.queries.get(0).get("wait_us"));
             long lastWait = Long.parseLong(peer.queries.get(2).get("wait_us"));
             assertThat(lastWait).isLessThan(firstWait);
+        }
+    }
+
+    /** The object store failed for good, so the poll is not sent again. */
+    @Test
+    void shouldReportATieredReadFailureWithoutSendingThePollAgain() throws Exception {
+        var peer = new FakePeer(exchange -> respond(exchange, FAILED_DEPENDENCY, TIERED_READ_FAILED));
+        try (var server = peer.start();
+                var client = client(peer)) {
+
+            assertThatThrownBy(() -> poll(client, Consumer.of(3L), DeferredPollOptions.defaults()))
+                    .isInstanceOf(IggyServerException.class)
+                    .extracting(error -> ((IggyServerException) error).getErrorCode())
+                    .isEqualTo(IggyErrorCode.TIERED_READ_FAILED);
+            assertThat(peer.queries).hasSize(1);
+        }
+    }
+
+    /** A refused read returns no messages, so a committing poll stored nothing and leaves its partition open. */
+    @Test
+    void shouldReportATieredReadFailureOfACommittingPollWithoutABlock() throws Exception {
+        var peer = new FakePeer(exchange -> respond(exchange, FAILED_DEPENDENCY, TIERED_READ_FAILED));
+        try (var server = peer.start();
+                var client = client(peer)) {
+
+            for (int poll = 0; poll < 2; poll++) {
+                assertThatThrownBy(() -> committingPoll(client))
+                        .isInstanceOf(IggyServerException.class)
+                        .extracting(error -> ((IggyServerException) error).getErrorCode())
+                        .isEqualTo(IggyErrorCode.TIERED_READ_FAILED);
+            }
+            assertThat(peer.queries).hasSize(2);
         }
     }
 
