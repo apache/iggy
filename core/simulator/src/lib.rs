@@ -2322,6 +2322,9 @@ mod slow_replica_tests;
 mod stale_prepare_commit_tests;
 
 #[cfg(test)]
+mod placed_batches_tests;
+
+#[cfg(test)]
 mod replication_flow_tests;
 
 #[cfg(test)]
