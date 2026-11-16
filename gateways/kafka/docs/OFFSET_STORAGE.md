@@ -97,6 +97,7 @@ leaves it behind.
 | --- | --- |
 | Keys per partition, per kind | 4096, at most 262144: `partition.consumer_offsets_max` |
 | Past the limit | `TooManyConsumerOffsets` (3024). Sent as `UNKNOWN_SERVER_ERROR`, logged at `error!` |
+| A new key while the Iggy data volume is at `disk.usage_limit_percent` | `DiskUsageLimitReached` (4109). Sent as `POLICY_VIOLATION` (44). Keys that exist stay writable |
 
 DeleteGroups (42) deletes the `kafka.cg.<group>` group on every Kafka topic, and its keys go with
 it. OffsetDelete (47) deletes single keys

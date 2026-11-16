@@ -5520,9 +5520,10 @@ where
         &self.consumer_offset_capacities[kind.index()]
     }
 
-    /// New messages, and offset keys that would create a file, wait for space
-    /// a sample sees freed. Everything that frees space or rewrites in place
-    /// passes, and so does an offset store whose key is not known yet.
+    /// While the disk is over its usage limit, refuses new messages and offset
+    /// keys that would create a file, until a sample sees space freed.
+    /// Everything that frees space or rewrites in place passes, and so does an
+    /// offset store whose key is not known yet.
     fn disk_admission(
         &self,
         operation: Operation,

@@ -1074,6 +1074,9 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
   through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
 - A create past the node's partition cap (`PartitionsLimitReached`, 2022) → `POLICY_VIOLATION`
   (44). See `metadata.partitions_max` below
+- A write refused while the Iggy data volume is over its usage limit (`DiskUsageLimitReached`,
+  4109) → `POLICY_VIOLATION` (44), for produce, offset commits and creates alike. See
+  `disk.usage_limit_percent` below
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
 
 Fetch folds these into the codes a consumer handles: 7 → 6, 17 → 3, and any other code → -1.
@@ -1098,11 +1101,12 @@ an operator has to.
 | ------- | --------- | ------- |
 | Consumer offset keys per partition, per consumer kind | 4096, ceiling 262144 | `partition.consumer_offsets_max` |
 | Partitions of one node, all streams and topics | 0, no cap | `metadata.partitions_max` |
+| Used space of the Iggy data volume | 90% | `disk.usage_limit_percent` |
 | One user header name, and one header value | 255 bytes | fixed, `user_headers.rs` |
 | All user headers of one message | 100 KB | fixed, `MAX_USER_HEADERS_SIZE` |
 | Message payload | 64 MB | fixed, `MAX_PAYLOAD_SIZE` |
 
-Only the first two are configurable. A Kafka consumer group commits one offset key per partition
+Only the first three are configurable. A Kafka consumer group commits one offset key per partition
 it holds, so `partition.consumer_offsets_max` is what bounds the number of groups that can commit
 against one partition. Passing it returns `TooManyConsumerOffsets` (3024), which reaches the
 client as `UNKNOWN_SERVER_ERROR` because Kafka has no code for the condition. The gateway logs
@@ -1114,6 +1118,12 @@ cap counts committed partitions only, so creates that run at the same time can g
 `CreatePartitions` on a topic created with a fixed partition count (`PartitionResizeDisabled`,
 2023) reaches the client as `POLICY_VIOLATION` too, `validate_only` included. Topics the gateway
 creates are resizable.
+
+While the Iggy data volume is at or above `disk.usage_limit_percent`, Iggy refuses new messages,
+new consumer offset keys, new topics and new partitions with `DiskUsageLimitReached` (4109),
+which reaches the client as `POLICY_VIOLATION` (44). Kafka clients do not retry that code, and
+only space freed on the Iggy node lifts the limit. Commits to offset keys that exist stay
+writable.
 
 The other three decide when a Kafka record goes into the envelope instead of being stored
 natively. See [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) and

@@ -291,6 +291,7 @@ impl IggyBridge {
     /// [`BridgeError::Iggy`] with `TopicIdNotFound` (2010) or `StreamIdNotFound` (1009) if the
     /// mapped topic or stream does not exist, `TooManyPartitions` above Iggy's per-call cap of
     /// 1000, `PartitionsLimitReached` when the node is at `metadata.partitions_max`,
+    /// `DiskUsageLimitReached` when the Iggy data volume is at `disk.usage_limit_percent`,
     /// `PartitionResizeDisabled` for a topic created with a fixed partition count, or for
     /// connectivity/auth failures.
     pub async fn create_kafka_partitions(

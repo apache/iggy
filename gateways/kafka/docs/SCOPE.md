@@ -367,15 +367,15 @@ below it are still open for the issues that build on top of it.
     unchanged one `REQUEST_TIMED_OUT` (7) with "timed out waiting for Iggy; no partitions were
     added", anything else the same verdict as after any other write.
   - Only refusals that prove nothing changed (a missing stream or topic, `Unauthorized`,
-    `TooManyPartitions`, `PartitionsLimitReached`, `PartitionResizeDisabled`,
-    `PartitionIdSpaceExhausted`, `TransientNotAccepted`, an invalid name or count) answer at
-    once. Every other write error (a bridge timeout, `TransientNotCommitted`, a dropped
-    connection, anything unexpected) has an unknown outcome and keeps the lock while the count
-    is re-read, until 20 s after the write started, so the next request sees it if it
-    committed. The client gets retriable `REQUEST_TIMED_OUT` (7) with "timed out waiting for
-    Iggy; the partitions may have been added". A write still uncommitted after that can commit
-    later, and a retry that read the old count adds again. A count that moved to anything else
-    also ends the wait, and this write may still land on top of it.
+    `TooManyPartitions`, `PartitionsLimitReached`, `DiskUsageLimitReached`,
+    `PartitionResizeDisabled`, `PartitionIdSpaceExhausted`, `TransientNotAccepted`, an invalid
+    name or count) answer at once. Every other write error (a bridge timeout,
+    `TransientNotCommitted`, a dropped connection, anything unexpected) has an unknown outcome and
+    keeps the lock while the count is re-read, until 20 s after the write started, so the next
+    request sees it if it committed. The client gets retriable `REQUEST_TIMED_OUT` (7) with "timed
+    out waiting for Iggy; the partitions may have been added". A write still uncommitted after
+    that can commit later, and a retry that read the old count adds again. A count that moved to
+    anything else also ends the wait, and this write may still land on top of it.
   - The write never starts past the request's deadline, so the lock is held at most 50 s after
     the request that took it arrived (30 s request ceiling plus 20 s). `CreateTopics`,
     `DeleteTopics` and other `CreatePartitions` on this gateway wait behind it up to their own
@@ -395,7 +395,8 @@ below it are still open for the issues that build on top of it.
   - More than 1000 partitions added to one topic in one request answers `INVALID_REQUEST` (42)
     locally, the same code Iggy's own `TooManyPartitions` maps to, so `validate_only` sees it
     too. A topic created with a fixed partition count (`PartitionResizeDisabled`), a node at
-    `metadata.partitions_max` (`PartitionsLimitReached`) and a topic with no partition ids left
+    `metadata.partitions_max` (`PartitionsLimitReached`), a data volume at
+    `disk.usage_limit_percent` (`DiskUsageLimitReached`) and a topic with no partition ids left
     (`PartitionIdSpaceExhausted`) all answer `POLICY_VIOLATION` (44).
   - The 1000 cap is per topic, so one request can add up to 100 topics x 1000 partitions. Iggy's
     `metadata.partitions_max` defaults to 0 (unlimited, `core/server/config.toml`). Set it

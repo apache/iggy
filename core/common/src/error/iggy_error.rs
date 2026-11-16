@@ -541,9 +541,10 @@ pub enum IggyError {
     UnsupportedCriticalOption(String) = 4107,
     #[error("Cannot modify root user")]
     CannotModifyRootUser = 4108,
-    /// The data volume is at or above `[disk] usage_limit_percent`, so the
-    /// partition primary refuses new messages and new consumer offset keys.
-    /// Retrying does not help until space is freed.
+    /// The data volume is at or above `[disk] usage_limit_percent`. The
+    /// partition primary refuses new messages and new consumer offset keys, and
+    /// the metadata primary refuses new topics and partitions. Retrying does not
+    /// help until space is freed.
     #[error("Disk usage limit reached, free space or raise [disk] usage_limit_percent")]
     DiskUsageLimitReached = 4109,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
