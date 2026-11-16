@@ -804,3 +804,168 @@ async fn given_sends_to_two_placing_partitions_in_one_window_when_it_closes_shou
     assert_eq!(uploader.store().keys().len(), 1);
     assert_eq!(owner.metrics().fresh_uploads_value().0, 1);
 }
+
+/// The owner of [`swept_owner`] as the first of two shards. The second one
+/// is the test: it reads what the first asks it, and answers by hand.
+#[allow(clippy::future_not_send)]
+async fn first_of_two_shards(
+    directory: &Path,
+) -> (
+    IoTestShard,
+    super::object_deletes::Shared,
+    Receiver<ShardFrame>,
+) {
+    let (mut owner, executor) = Box::pin(swept_owner(directory)).await;
+    let (second, asked, _replies) = crate::shard_channel(1, 8, 1);
+    owner.senders.push(second);
+    (owner, executor, asked)
+}
+
+/// The sweep that the first shard asked the second about.
+fn asked_sweep(asked: &Receiver<ShardFrame>) -> Option<u64> {
+    match asked.try_recv().ok()? {
+        ShardFrame::Lifecycle(LifecycleFrame::ReportFreshObjects { sweep }) => Some(sweep),
+        _ => None,
+    }
+}
+
+/// Start a sweep at `now`, and return its number once the second shard was
+/// asked.
+#[allow(clippy::future_not_send)]
+async fn sweep_asking_the_second_shard(
+    owner: &IoTestShard,
+    asked: &Receiver<ShardFrame>,
+    now: IggyTimestamp,
+) -> u64 {
+    owner.request_sweep_fresh_objects(now);
+    until(owner, |_| !asked.is_empty()).await;
+    asked_sweep(asked).expect("the first shard asks the second")
+}
+
+/// Answer the first shard as its second shard.
+fn answer_as_second_shard(owner: &IoTestShard, sweep: u64, in_use: Option<&[u128]>) {
+    let report = Box::new(crate::FreshObjectsReport {
+        sweep,
+        shard: 1,
+        in_use: in_use.map(|objects| objects.iter().copied().collect()),
+    });
+    owner.senders[0]
+        .try_send(ShardFrame::lifecycle(LifecycleFrame::FreshObjectsReported(
+            report,
+        )))
+        .unwrap();
+}
+
+/// A fresh object of this replica that no partition of the first shard
+/// names, as a shard of an earlier life left it.
+#[allow(clippy::future_not_send)]
+async fn store_unnamed_object(owner: &IoTestShard, store: &MemoryStore) -> u128 {
+    use iggy_object_store::{PutBody, PutOptions};
+
+    let replica = owner.partition_consensus.self_replica_id;
+    let object = FreshObjectId::new(replica, 1, 1, 0).unwrap().get();
+    store
+        .put(
+            &layout().fresh_key(object),
+            PutBody::from_bytes(bytes::Bytes::from_static(b"IGGYFRS1 of another shard")),
+            &PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    object
+}
+
+/// The first shard holds none of the partitions of the other shards. An
+/// object stays until every shard answered, and for as long as one of them
+/// names it.
+#[compio::test]
+async fn given_two_shards_when_the_other_one_names_an_object_should_keep_it_until_it_does_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor, asked) = Box::pin(first_of_two_shards(directory.path())).await;
+    let store = executor.0.store();
+    let object = Box::pin(store_unnamed_object(&owner, store)).await;
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        // The second shard has not answered: past the grace, nothing goes.
+        let unanswered = sweep_asking_the_second_shard(&owner, &asked, now).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(owner.fresh_sweeps_settled(), 0);
+        answer_as_second_shard(&owner, unanswered, Some(&[object]));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 1).await;
+
+        // It names the object in every sweep, however late.
+        let late = past_grace(past_grace(now));
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, late).await;
+        answer_as_second_shard(&owner, sweep, Some(&[object]));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 2).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fresh_objects(store), vec![object]);
+
+        // It stops naming it: the grace starts then.
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, late).await;
+        answer_as_second_shard(&owner, sweep, Some(&[]));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 3).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fresh_objects(store), vec![object]);
+
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, past_grace(late)).await;
+        answer_as_second_shard(&owner, sweep, Some(&[]));
+        until(&owner, |_| fresh_objects(store).is_empty()).await;
+    })
+    .await;
+}
+
+/// A shard with a placing partition outside normal status answers that it
+/// cannot tell. The sweep then deletes nothing, whatever the others say,
+/// and the object's grace does not run.
+#[compio::test]
+async fn given_a_shard_that_cannot_tell_when_a_sweep_runs_past_the_grace_should_delete_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor, asked) = Box::pin(first_of_two_shards(directory.path())).await;
+    let store = executor.0.store();
+    let object = Box::pin(store_unnamed_object(&owner, store)).await;
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        for at in [now, past_grace(now), past_grace(past_grace(now))] {
+            let sweep = sweep_asking_the_second_shard(&owner, &asked, at).await;
+            answer_as_second_shard(&owner, sweep, None);
+            // The answer ends the sweep, so the next one starts at once.
+            compio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(owner.fresh_sweeps_settled(), 0);
+        assert_eq!(fresh_objects(store), vec![object]);
+
+        // Once it can tell, the grace starts from that sweep.
+        let able = past_grace(past_grace(now));
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, able).await;
+        answer_as_second_shard(&owner, sweep, Some(&[]));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 1).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fresh_objects(store), vec![object]);
+    })
+    .await;
+}
+
+/// An answer to a sweep that a later one replaced says nothing about the
+/// objects the later one listed.
+#[compio::test]
+async fn given_an_answer_to_an_earlier_sweep_when_it_arrives_should_change_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor, asked) = Box::pin(first_of_two_shards(directory.path())).await;
+    let store = executor.0.store();
+    let object = Box::pin(store_unnamed_object(&owner, store)).await;
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, now).await;
+        answer_as_second_shard(&owner, sweep + 7, Some(&[]));
+        answer_as_second_shard(&owner, sweep.wrapping_sub(1), Some(&[]));
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(owner.fresh_sweeps_settled(), 0);
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![object]);
+}

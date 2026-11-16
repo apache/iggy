@@ -162,8 +162,9 @@ impl<E: TierExecutor> FreshObjectSweeper for ExecutorFreshSweeper<E> {
 /// List the fresh objects under `layout` that `replica` wrote, oldest first,
 /// at most [`FRESH_OBJECTS_PER_SWEEP`] of them.
 ///
-/// A key under the prefix that names no fresh object is skipped: this build
-/// did not write it and does not delete it.
+/// The listing asks for the replica's own prefix. A key under it that names
+/// no fresh object of the replica is skipped: this build did not write it
+/// and does not delete it.
 ///
 /// # Errors
 /// Returns the error of the store call that failed.
@@ -172,7 +173,7 @@ pub async fn list_fresh_objects<S: ObjectStore>(
     layout: &KeyLayout,
     replica: u8,
 ) -> Result<FreshListing, ObjectStoreError> {
-    let prefix = layout.fresh_prefix();
+    let prefix = layout.fresh_replica_prefix(replica);
     let mut listing = FreshListing::default();
     let mut continuation: Option<String> = None;
     loop {
@@ -367,7 +368,7 @@ mod tests {
         store_object(store, &layout().fresh_key(id(REPLICA, 2)), b"second").await;
         store_object(store, &layout().fresh_key(id(REPLICA, 1)), b"first").await;
         store_object(store, &layout().fresh_key(id(2, 1)), b"another replica").await;
-        store_object(store, "iggy/meta/fresh/not-an-id", b"another writer").await;
+        store_object(store, "iggy/meta/fresh/01/not-an-id", b"another writer").await;
 
         let listed = sweeper
             .list(REPLICA, TierScope::new().token())
