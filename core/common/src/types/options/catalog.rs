@@ -21,10 +21,10 @@ use super::{
     DEFAULT_LOCAL_RETENTION_AGE, DEFAULT_LOCAL_RETENTION_SIZE, DEFAULT_MAX_TOPIC_SIZE,
     DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE, DEFAULT_PREALLOCATE_SEGMENTS,
     DEFAULT_SEGMENT_MAX_AGE, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    DEFAULT_TIERED_STORAGE, Durability, MAX_MESSAGES_REQUIRED_TO_SAVE,
+    DEFAULT_TIERED_STORAGE, Durability, GeoMode, MAX_MESSAGES_REQUIRED_TO_SAVE,
     MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     MAX_TOPIC_SEGMENT_SIZE, MIN_SEGMENT_MAX_AGE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
-    PartitionResizePolicy, ResourceOptions, erase_options,
+    PartitionResizePolicy, ResourceOptions, TopicType, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -69,7 +69,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 24] = [
+pub static CATALOG: [OptionDescriptor; 26] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -447,6 +447,41 @@ pub static CATALOG: [OptionDescriptor; 24] = [
         critical: false,
         description: || {
             "Topic-wide cap on the uploaded segments a tiered topic keeps on local disk, split              across all partitions, in bytes or a byte-size string (e.g. 10 GiB), or              unlimited. A value above a finite max_topic_size is refused. No effect without              tiered_storage"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::TopicType,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::Const(|| TopicType::default().encode()),
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would serve a geo topic as a normal one.
+        critical: true,
+        description: || {
+            "normal or geo, fixed at creation. A geo topic's messages also become readable in \
+             the other datacenters through the object store, and its geo_mode says how they \
+             get there. Not available yet: geo is refused"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::GeoMode,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would write a geo topic's batches the other
+        // way from its peers.
+        critical: true,
+        description: || {
+            "How a geo topic writes its messages: geo uploads a batch to the object store \
+             before it commits, geo_tiered replicates it first and uploads sealed segments \
+             later. Only on a geo topic, where it defaults to geo"
                 .to_owned()
         },
     },
@@ -922,6 +957,8 @@ pub fn canonical_value(
         OptionKey::PreallocateSegments | OptionKey::TieredStorage => {
             bool::decode(key, entry)?.encode()?
         }
+        OptionKey::TopicType => TopicType::decode(key, entry)?.encode()?,
+        OptionKey::GeoMode => GeoMode::decode(key, entry)?.encode()?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }
@@ -1297,6 +1334,8 @@ mod tests {
                 topic_option_keys::LOCAL_RETENTION_SIZE,
                 OptionKey::LocalRetentionSize,
             ),
+            (topic_option_keys::TOPIC_TYPE, OptionKey::TopicType),
+            (topic_option_keys::GEO_MODE, OptionKey::GeoMode),
         ] {
             assert_eq!(constant, key.to_string());
         }
@@ -1371,6 +1410,92 @@ mod tests {
             descriptor.flags(),
             OPTION_FLAG_UPDATABLE | OPTION_FLAG_CRITICAL
         );
+    }
+
+    #[test]
+    fn given_topic_type_and_geo_mode_when_admitted_should_store_canonical_names() {
+        for (key, sent, stored) in [
+            (OptionKey::TopicType, "normal", "normal"),
+            (OptionKey::TopicType, "GEO", "geo"),
+            (OptionKey::GeoMode, "geo", "geo"),
+            (OptionKey::GeoMode, "Geo_Tiered", "geo_tiered"),
+        ] {
+            let admitted = admit(
+                OptionsScope::Topic,
+                OptionOperation::Create,
+                &block(&[(key, HeaderValue::try_from(sent).unwrap())]),
+                &[],
+                &OptionAdmissionContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                admitted.explicit.get(&HeaderKey::from(key)),
+                Some(&OptionValue::explicit(
+                    HeaderValue::try_from(stored).unwrap()
+                ))
+            );
+        }
+        for (key, sent) in [
+            (
+                OptionKey::TopicType,
+                HeaderValue::try_from("tiered").unwrap(),
+            ),
+            (OptionKey::TopicType, HeaderValue::from(true)),
+            (OptionKey::GeoMode, HeaderValue::try_from("local").unwrap()),
+            (OptionKey::GeoMode, HeaderValue::from(1u8)),
+        ] {
+            assert_eq!(
+                canonical_value(key, &entry(key, &sent)),
+                Err(IggyError::InvalidOptionValue(key.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn given_topic_type_and_geo_mode_when_updated_should_refuse_both() {
+        for (key, value) in [(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")] {
+            let descriptor = key.descriptor();
+            assert!(!descriptor.is_updatable());
+            assert!(!descriptor.is_resettable());
+            assert_eq!(descriptor.flags(), OPTION_FLAG_CRITICAL);
+            assert_eq!(
+                admit(
+                    OptionsScope::Topic,
+                    OptionOperation::Update,
+                    &block(&[(key, HeaderValue::try_from(value).unwrap())]),
+                    &[],
+                    &OptionAdmissionContext::default(),
+                ),
+                Err(IggyError::OptionNotUpdatable(key.to_string()))
+            );
+            assert_eq!(
+                admit(
+                    OptionsScope::Topic,
+                    OptionOperation::Update,
+                    &WireOptions::empty(),
+                    &[key.to_string()],
+                    &OptionAdmissionContext::default(),
+                ),
+                Err(IggyError::OptionNotUpdatable(key.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn given_topic_type_when_deriving_defaults_should_store_normal_and_no_geo_mode() {
+        let derived = derived_defaults(OptionsScope::Topic, &ResourceOptions::new()).unwrap();
+        assert_eq!(
+            derived.get(&HeaderKey::from(OptionKey::TopicType)),
+            Some(&OptionValue::derived(
+                HeaderValue::try_from("normal").unwrap()
+            ))
+        );
+        assert!(!derived.contains_key(&HeaderKey::from(OptionKey::GeoMode)));
+        for scope in [OptionsScope::Stream, OptionsScope::User] {
+            for key in [OptionKey::TopicType, OptionKey::GeoMode] {
+                assert!(!key.descriptor().applies_to(scope));
+            }
+        }
     }
 
     #[test]

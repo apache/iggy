@@ -82,6 +82,8 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.TopicOptionTieredStorage), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, enableOnly: true},
 	{key: string(iggcon.TopicOptionLocalRetentionAge), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, resettable: true},
 	{key: string(iggcon.TopicOptionLocalRetentionSize), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, resettable: true},
+	{key: string(iggcon.TopicOptionTopicType), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
+	{key: string(iggcon.TopicOptionGeoMode), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: "critical_keys", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream, iggcon.OptionsScopeTopic, iggcon.OptionsScopeUser}, readOnly: true},
 }
 

@@ -61,8 +61,9 @@ use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
     OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
-    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_local_retention,
-    validate_preallocated_topic_bytes, validate_segment_max_age, validate_topic_segment_size,
+    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_geo_mode,
+    validate_local_retention, validate_preallocated_topic_bytes, validate_segment_max_age,
+    validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -403,9 +404,11 @@ where
                     );
                     return Err(IggyError::InvalidReplicationFactor);
                 }
-                // No ruling on `tiered_storage` here: whether the cluster can
-                // tier is known to the metadata primary alone, and it checks
-                // every request it prepares.
+                validate_geo_mode(&admitted.explicit)?;
+                // No ruling on `tiered_storage` or a geo `topic_type` here:
+                // whether the cluster can tier or hold a geo topic is known to
+                // the metadata primary alone, and it checks every request it
+                // prepares.
                 let mut stored = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
                 stored.extend(admitted.explicit);
                 validate_local_retention(&stored)?;
@@ -701,9 +704,9 @@ mod tests {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
-        HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue, OptionsUpdate,
-        ServerKeyContext, StreamCreateOptions, StreamEncryptionKey, StreamKeyOrigin,
-        TopicUpdateOptions, UserUpdateOptions, stream_wrap_set, text,
+        GeoMode, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue,
+        OptionsUpdate, ServerKeyContext, StreamCreateOptions, StreamEncryptionKey, StreamKeyOrigin,
+        TopicType, TopicUpdateOptions, UserUpdateOptions, stream_wrap_set, text,
     };
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::stm::StateMachine as _;
@@ -960,6 +963,103 @@ mod tests {
         .map(|_| ());
         assert_eq!(tcp, Err(expected.clone()), "binary chain");
         assert_eq!(http, Err(expected), "HTTP chain");
+    }
+
+    fn create_topic_body(name: &str, options: &TopicCreateOptions) -> Bytes {
+        CreateTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            partitions_count: 1,
+            name: WireName::new(name).unwrap(),
+            options: options.to_wire().unwrap(),
+        }
+        .to_bytes()
+    }
+
+    /// The edge cannot tell whether the cluster can hold a geo topic, so a
+    /// geo create passes both chains and the metadata primary refuses it, as
+    /// a reply that leaves the session in place.
+    #[compio::test]
+    async fn given_a_geo_topic_when_created_should_pass_either_chain_and_be_refused_by_the_primary()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let sessions = root_sessions(&shard, 1);
+
+        for geo_mode in [None, Some(GeoMode::Geo), Some(GeoMode::GeoTiered)] {
+            let body = create_topic_body(
+                "geo",
+                &TopicCreateOptions {
+                    topic_type: Some(TopicType::Geo),
+                    geo_mode,
+                    ..TopicCreateOptions::default()
+                },
+            );
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            );
+            assert!(tcp.is_ok(), "binary chain, {geo_mode:?}");
+            let (admitted, _) = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            )
+            .unwrap_or_else(|error| panic!("HTTP chain, {geo_mode:?}: {error}"));
+
+            let reply = shard
+                .plane
+                .metadata()
+                .submit_request_in_process(admitted)
+                .await
+                .expect("the primary answers");
+            assert_eq!(reply.header().command, Command::Reply, "{geo_mode:?}");
+            assert_eq!(
+                iggy_binary_protocol::result_code(reply.body()),
+                Some(IggyError::FeatureUnavailable.as_code()),
+                "{geo_mode:?}"
+            );
+        }
+    }
+
+    /// The primary would evict a client over this refusal, so the edge must
+    /// answer it.
+    #[test]
+    fn given_a_geo_mode_on_a_normal_topic_when_created_should_refuse_it_on_either_chain() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let sessions = root_sessions(&shard, 1);
+        let expected = IggyError::InvalidOptionValue(OptionKey::GeoMode.to_string());
+
+        for topic_type in [None, Some(TopicType::Normal)] {
+            let body = create_topic_body(
+                "normal",
+                &TopicCreateOptions {
+                    topic_type,
+                    geo_mode: Some(GeoMode::Geo),
+                    ..TopicCreateOptions::default()
+                },
+            );
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            )
+            .map(|_| ());
+            assert_eq!(tcp, Err(expected.clone()), "binary chain, {topic_type:?}");
+            assert_eq!(http, Err(expected.clone()), "HTTP chain, {topic_type:?}");
+        }
     }
 
     /// The edge rules on the request alone, so a patch that turns tiered

@@ -80,9 +80,9 @@ use iggy_common::{
     HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
-    TopicResolvedOptions, UserId, admit, admit_tiered_storage, critical_keys_marker,
-    derived_defaults, stream_wrap_set, topic_option_keys, validate_local_retention,
-    validate_segment_max_age, validate_topic_segment_size,
+    TopicResolvedOptions, UserId, admit, admit_geo_topic, admit_tiered_storage,
+    critical_keys_marker, derived_defaults, stream_wrap_set, topic_option_keys, validate_geo_mode,
+    validate_local_retention, validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
@@ -5210,6 +5210,8 @@ where
                     ));
                 }
                 validate_segment_max_age(resolved.runtime)?;
+                validate_geo_mode(&admitted.explicit)?;
+                admit_geo_topic(&admitted.explicit)?;
                 admit_tiered_storage(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 validate_local_retention(&stored)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
@@ -6164,10 +6166,10 @@ mod tests {
     };
     use iggy_common::MetadataChangeGroup;
     use iggy_common::{
-        HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage, OptionValueCodec,
-        ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, TopicUpdateOptions, UserStatus,
-        UserUpdateOptions, WrapSet, critical_keys_marker, descriptors_for, stream_wrap_set,
-        variadic,
+        GeoMode, HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage,
+        OptionValueCodec, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, TopicType,
+        TopicUpdateOptions, UserStatus, UserUpdateOptions, WrapSet, critical_keys_marker,
+        descriptors_for, stream_wrap_set, variadic,
     };
     use journal::prepare_journal::{DEFAULT_SLOT_COUNT, PrepareJournal};
     use journal::superblock::SuperblockContents;
@@ -8168,6 +8170,68 @@ mod tests {
             b"tiered_storage"
         );
         assert!(!TopicResolvedOptions::from(&explicit).tiered_storage);
+    }
+
+    #[test]
+    fn given_a_topic_type_when_preparing_create_topic_should_refuse_geo_and_a_mode_on_normal() {
+        let typed = |topic_type: Option<TopicType>, geo_mode: Option<GeoMode>| {
+            iggy_common::TopicCreateOptions {
+                topic_type,
+                geo_mode,
+                ..Default::default()
+            }
+        };
+        for cluster_ready in [false, true] {
+            let plane = metadata_plane();
+            plane.observe_tiered_storage_readiness(cluster_ready);
+            for geo_mode in [None, Some(GeoMode::Geo), Some(GeoMode::GeoTiered)] {
+                assert_eq!(
+                    prepare_topic_on(&plane, &typed(Some(TopicType::Geo), geo_mode)).err(),
+                    Some(IggyError::FeatureUnavailable),
+                    "ready {cluster_ready}, mode {geo_mode:?}"
+                );
+            }
+        }
+        for topic_type in [None, Some(TopicType::Normal)] {
+            for geo_mode in [GeoMode::Geo, GeoMode::GeoTiered] {
+                assert_eq!(
+                    prepare_topic_with(&typed(topic_type, Some(geo_mode))).err(),
+                    Some(IggyError::InvalidOptionValue("geo_mode".to_owned())),
+                    "{topic_type:?} with {geo_mode}"
+                );
+            }
+        }
+
+        let persisted =
+            prepare_topic_with(&typed(None, None)).expect("a default topic is admitted");
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        let derived = resource_options_from_wire(&persisted.derived_options, false)
+            .expect("derived block decodes");
+        assert!(!explicit.contains_key(&HeaderKey::from(OptionKey::TopicType)));
+        assert!(!explicit.contains_key(&HeaderKey::from(OptionKey::CriticalKeys)));
+        assert_eq!(
+            derived[&HeaderKey::from(OptionKey::TopicType)]
+                .value
+                .as_bytes(),
+            b"normal"
+        );
+        assert!(!derived.contains_key(&HeaderKey::from(OptionKey::GeoMode)));
+        let mut stored = derived;
+        stored.extend(explicit);
+        let resolved = TopicResolvedOptions::from(&stored);
+        assert_eq!(resolved.topic_type, TopicType::Normal);
+        assert_eq!(resolved.geo_mode, None);
+
+        let stated = prepare_topic_with(&typed(Some(TopicType::Normal), None))
+            .expect("a topic that states it is normal is admitted");
+        assert_eq!(
+            resource_options_from_wire(&stated.request.options, true)
+                .expect("explicit block decodes")[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"topic_type"
+        );
     }
 
     #[test]

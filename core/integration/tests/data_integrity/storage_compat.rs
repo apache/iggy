@@ -1547,6 +1547,8 @@ async fn assert_topic_recovered(
         local_retention_size: seed
             .local_retention_size
             .and(recovered.local_retention_size),
+        topic_type: seed.topic_type.and(recovered.topic_type),
+        geo_mode: seed.geo_mode.and(recovered.geo_mode),
         raw: BTreeMap::new(),
     };
     assert_eq!(

@@ -724,6 +724,10 @@ mod ffi {
         local_retention_size: String,
         has_partition_resize_policy: bool,
         partition_resize_policy: String,
+        has_topic_type: bool,
+        topic_type: String,
+        has_geo_mode: bool,
+        geo_mode: String,
         raw_options: Vec<HeaderEntry>,
     }
 

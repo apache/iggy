@@ -74,7 +74,7 @@ use receive_message::{
     Checkpoint, PartitionContext, PolledMessages, PollingStrategy, ReceiveMessage,
 };
 use resource_options::{
-    OptionKey, PartitionResizePolicy, StreamOptions, TopicOptions, UserOptions,
+    GeoMode, OptionKey, PartitionResizePolicy, StreamOptions, TopicOptions, TopicType, UserOptions,
     encryption_key_fingerprint,
 };
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
@@ -138,6 +138,8 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TopicOptions>()?;
     m.add_class::<UserOptions>()?;
     m.add_class::<PartitionResizePolicy>()?;
+    m.add_class::<TopicType>()?;
+    m.add_class::<GeoMode>()?;
     m.add_function(wrap_pyfunction!(encryption_key_fingerprint, m)?)?;
     m.add_class::<Partitioning>()?;
     m.add_class::<Partition>()?;

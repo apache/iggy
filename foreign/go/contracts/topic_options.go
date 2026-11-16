@@ -47,6 +47,8 @@ const (
 	TopicOptionTieredStorage                TopicOptionKey = "tiered_storage"
 	TopicOptionLocalRetentionAge            TopicOptionKey = "local_retention_age"
 	TopicOptionLocalRetentionSize           TopicOptionKey = "local_retention_size"
+	TopicOptionTopicType                    TopicOptionKey = "topic_type"
+	TopicOptionGeoMode                      TopicOptionKey = "geo_mode"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -99,6 +101,10 @@ type TopicOptions struct {
 	// unlimited. Zero leaves it derived. The server refuses a value above a
 	// finite MaxTopicSize.
 	LocalRetentionSize *uint64
+	// TopicType, normal when nil. See TopicTypeOption.
+	TopicType *TopicType
+	// GeoMode, see GeoModeOption. A geo topic resolves nil to GeoModeGeo.
+	GeoMode *GeoMode
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -211,6 +217,40 @@ func ReplicationFactorOption(nodes uint32) HeaderEntry {
 // refuses true with FeatureUnavailable, on create and on update.
 func TieredStorageOption(enabled bool) HeaderEntry {
 	return boolOption(TopicOptionTieredStorage, enabled)
+}
+
+// TopicType says what a topic is. It is fixed at create and never changes.
+type TopicType string
+
+const (
+	// TopicTypeNormal keeps the topic's messages in this cluster.
+	TopicTypeNormal TopicType = "normal"
+	// TopicTypeGeo also makes the topic's messages readable in the other
+	// datacenters, through the object store.
+	TopicTypeGeo TopicType = "geo"
+)
+
+// TopicTypeOption fixes the type at create. The server does not offer geo
+// topics yet and refuses TopicTypeGeo with FeatureUnavailable.
+func TopicTypeOption(value TopicType) HeaderEntry {
+	return stringOption(TopicOptionTopicType, string(value))
+}
+
+// GeoMode says how a geo topic writes its messages.
+type GeoMode string
+
+const (
+	// GeoModeGeo uploads a batch to the object store before it commits.
+	GeoModeGeo GeoMode = "geo"
+	// GeoModeGeoTiered replicates a batch first and uploads sealed segments
+	// later.
+	GeoModeGeoTiered GeoMode = "geo_tiered"
+)
+
+// GeoModeOption fixes a geo topic's mode at create. A normal topic takes no
+// mode, so the server refuses one there with InvalidOptionValue.
+func GeoModeOption(value GeoMode) HeaderEntry {
+	return stringOption(TopicOptionGeoMode, string(value))
 }
 
 func stringOption(key TopicOptionKey, value string) HeaderEntry {

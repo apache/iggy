@@ -68,6 +68,8 @@ final class ResourceOptionsTest extends TestCase
         'segment_max_age' => 'segment_max_age_micros',
         'local_retention_age' => 'local_retention_age_micros',
     ];
+    // Only a geo topic has a mode, so a normal topic reads none.
+    private const GEO_TOPIC_KEYS = ['geo_mode'];
 
     private array $createdStreams = [];
 
@@ -330,10 +332,12 @@ final class ResourceOptionsTest extends TestCase
             Durability::from($input['durability']),
             Durability::from($input['consumer_offset_durability']),
             partition_resize_policy: 'fixed',
+            topic_type: 'normal',
         );
 
         $expected = self::phpOptions($vector['wire_options']);
         $expected['partition_resize_policy'] = 'fixed';
+        $expected['topic_type'] = 'normal';
         ksort($expected);
         $topic = $client->getTopic($stream->id, $topicName);
         assert_not_null($topic);
@@ -602,7 +606,7 @@ final class ResourceOptionsTest extends TestCase
         assert_same($explicit, self::sorted($topic->options));
         $mapKeys = [];
         foreach (self::catalogRows('topic') as $key => $row) {
-            if ($row['storage'] === 'map') {
+            if ($row['storage'] === 'map' && !in_array($key, self::GEO_TOPIC_KEYS, true)) {
                 $mapKeys[] = $key;
             }
         }

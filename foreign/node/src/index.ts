@@ -41,6 +41,8 @@ export {
   CompressionAlgorithm,
   Durability,
   PartitionResizePolicy,
+  TopicType,
+  GeoMode,
   EncryptionKeySource,
   OptionsScope,
   StreamOptionKey,

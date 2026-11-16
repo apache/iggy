@@ -43,6 +43,7 @@ __all__ = [
     "ConsumerGroupMember",
     "ConsumerOffsetInfo",
     "DirectProducerConfig",
+    "GeoMode",
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
@@ -128,6 +129,7 @@ __all__ = [
     "TopicDetails",
     "TopicOptions",
     "TopicPermissions",
+    "TopicType",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
@@ -647,6 +649,21 @@ class DirectProducerConfig:
         Constructs direct-producer batching and pacing configuration.
         """
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class GeoMode:
+    r"""
+    How a geo topic writes its messages, fixed at creation.
+    """
+
+    Geo: typing.ClassVar[GeoMode]
+    r"""
+    A batch goes to the object store before it commits.
+    """
+    GeoTiered: typing.ClassVar[GeoMode]
+    r"""
+    A batch is replicated first, and sealed segments are uploaded later.
+    """
 
 @typing.final
 class GlobalPermissions:
@@ -3796,6 +3813,14 @@ class OptionKey:
     Cap on the uploaded segments a tiered topic keeps on local disk,
     resettable to unlimited.
     """
+    TopicType: typing.ClassVar[OptionKey]
+    r"""
+    Topic type, normal or geo, fixed at creation.
+    """
+    GeoMode: typing.ClassVar[OptionKey]
+    r"""
+    How a geo topic writes its messages, fixed at creation.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -5521,6 +5546,8 @@ class TopicOptions:
         tiered_storage: builtins.bool | None = None,
         local_retention_age: IggyExpiry | None = None,
         local_retention_size: MaxTopicSize | None = None,
+        topic_type: TopicType | None = None,
+        geo_mode: GeoMode | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
@@ -5576,6 +5603,14 @@ class TopicOptions:
                 unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
                 same as `None`. The server refuses a size above a finite
                 `max_topic_size`.
+            topic_type: `TopicType.Geo` also makes the topic's messages
+                readable in the other datacenters, through the object store.
+                `None` creates a normal topic. The server refuses
+                `TopicType.Geo` with `FeatureUnavailable` until it serves geo
+                topics.
+            geo_mode: How a geo topic writes its messages, as `GeoMode | None`.
+                `None` resolves to `GeoMode.Geo` on a geo topic. The server
+                refuses any mode on a normal topic.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
@@ -5643,6 +5678,22 @@ class TopicPermissions:
                 its consumer offsets.
             send_messages: Allow sending messages to the topic.
         """
+
+@typing.final
+class TopicType:
+    r"""
+    What a topic is, fixed at creation.
+    """
+
+    Normal: typing.ClassVar[TopicType]
+    r"""
+    Its messages stay in this cluster.
+    """
+    Geo: typing.ClassVar[TopicType]
+    r"""
+    Its messages also become readable in the other datacenters, through
+    the object store.
+    """
 
 @typing.final
 class UserHeaders(dict):

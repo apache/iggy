@@ -565,4 +565,22 @@ struct TopicOptionsTests {
         #expect(explicit.localRetentionAge == .after(.seconds(1_800)))
         #expect(explicit.localRetentionSize == .bytes(1 << 20))
     }
+
+    /// The type and mode travel as the server's canonical names. Both are
+    /// fixed at create, so an update refuses a reset before anything is sent.
+    @Test func topicTypeAndGeoModeAreCreateOnly() throws {
+        let typeKey = TopicOptionKey.topicType.rawValue
+        let modeKey = TopicOptionKey.geoMode.rawValue
+        let defaults = try TopicCreateOptions().toResourceOptions()
+        #expect(defaults[typeKey] == nil)
+        #expect(defaults[modeKey] == nil)
+        let geo = try TopicCreateOptions(topicType: .geo, geoMode: .geoTiered).toResourceOptions()
+        #expect(geo[typeKey] == .explicit("geo"))
+        #expect(geo[modeKey] == .explicit("geo_tiered"))
+        #expect(try TopicCreateOptions(topicType: .normal).toResourceOptions()[typeKey] == .explicit("normal"))
+        #expect(try TopicCreateOptions(topicType: .geo, geoMode: .geo).toResourceOptions()[modeKey] == .explicit("geo"))
+        for key in [TopicOptionKey.topicType, .geoMode] {
+            #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
 }

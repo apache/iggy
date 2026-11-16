@@ -60,6 +60,7 @@ from apache_iggy import (
     Topic,
     TopicDetails,
     TopicOptions,
+    TopicType,
     UserInfo,
     UserInfoDetails,
     UserOptions,
@@ -258,7 +259,7 @@ class TestTopicOptions:
     """Typed topic create options and generic topic updates."""
 
     @pytest.mark.asyncio
-    async def test_given_keyword_topic_options_when_creating_should_preserve_all_fifteen_settings(  # noqa: E501
+    async def test_given_keyword_topic_options_when_creating_should_preserve_all_sixteen_settings(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Every known create setting has a typed field and reads back explicit."""
@@ -290,6 +291,9 @@ class TestTopicOptions:
                     duration=timedelta(minutes=30)
                 ),
                 local_retention_size=MaxTopicSize.Custom(bytes=GIB // 2),
+                # A geo topic is refused until the server serves geo topics,
+                # and a normal topic refuses any geo_mode.
+                topic_type=TopicType.Normal,
             ),
         )
 
@@ -312,6 +316,7 @@ class TestTopicOptions:
             "tiered_storage": False,
             "local_retention_age": MICROS_PER_HOUR // 2,
             "local_retention_size": GIB // 2,
+            "topic_type": "normal",
         }
         assert topic.derived_options.to_scalar_dict() == {}
         assert topic.compression_algorithm == "gzip"

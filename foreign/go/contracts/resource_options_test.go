@@ -491,6 +491,8 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.TopicOptionTieredStorage),
 			string(iggcon.TopicOptionLocalRetentionAge),
 			string(iggcon.TopicOptionLocalRetentionSize),
+			string(iggcon.TopicOptionTopicType),
+			string(iggcon.TopicOptionGeoMode),
 		},
 		"user": {
 			string(iggcon.UserOptionUsername),
@@ -571,6 +573,8 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"tiered_storage":                    {create: "TieredStorage", update: "TieredStorage"},
 			"local_retention_age":               {create: "LocalRetentionAge", update: "LocalRetentionAge", reset: string(iggcon.TopicOptionLocalRetentionAge)},
 			"local_retention_size":              {create: "LocalRetentionSize", update: "LocalRetentionSize", reset: string(iggcon.TopicOptionLocalRetentionSize)},
+			"topic_type":                        {create: "TopicType"},
+			"geo_mode":                          {create: "GeoMode"},
 		},
 		"user": {
 			"username": {update: "Username"},

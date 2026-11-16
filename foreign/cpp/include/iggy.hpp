@@ -3008,6 +3008,42 @@ constexpr std::string_view to_string(const PartitionResizePolicy policy) {
 }
 
 /**
+ * @brief What a topic is, fixed at creation.
+ */
+enum class TopicType : std::uint8_t {
+    Normal,  ///< Its messages stay in this cluster.
+    Geo,     ///< Its messages also become readable in the other datacenters.
+};
+
+constexpr std::string_view to_string(const TopicType topic_type) {
+    switch (topic_type) {
+        case TopicType::Normal:
+            return "normal";
+        case TopicType::Geo:
+            return "geo";
+    }
+    throw std::invalid_argument("Unknown topic type");
+}
+
+/**
+ * @brief How a geo topic writes its messages, fixed at creation.
+ */
+enum class GeoMode : std::uint8_t {
+    Geo,        ///< A batch goes to the object store before it commits.
+    GeoTiered,  ///< A batch is replicated first, and sealed segments are uploaded later.
+};
+
+constexpr std::string_view to_string(const GeoMode geo_mode) {
+    switch (geo_mode) {
+        case GeoMode::Geo:
+            return "geo";
+        case GeoMode::GeoTiered:
+            return "geo_tiered";
+    }
+    throw std::invalid_argument("Unknown geo mode");
+}
+
+/**
  * @brief Option keys of the stream scope, in catalog order.
  *
  * Name is updatable. EncryptionKey is a create-only secret. The fingerprint
@@ -3062,6 +3098,8 @@ enum class TopicOptionKey : std::uint8_t {
     TieredStorage,
     LocalRetentionAge,
     LocalRetentionSize,
+    TopicType,
+    GeoMode,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3098,6 +3136,10 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "local_retention_age";
         case TopicOptionKey::LocalRetentionSize:
             return "local_retention_size";
+        case TopicOptionKey::TopicType:
+            return "topic_type";
+        case TopicOptionKey::GeoMode:
+            return "geo_mode";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3480,6 +3522,45 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns what the topic is.
+     * @return Configured type, or `std::nullopt` to use the server default
+     *         (`normal`).
+     */
+    [[nodiscard]] std::optional<::iggy::TopicType> TopicType() const noexcept { return topic_type_; }
+
+    /**
+     * @brief Sets what the topic is.
+     * @param topic_type TopicType::Geo also makes the topic's messages
+     *        readable in the other datacenters, through the object store.
+     * @return Reference to this options object.
+     * @note The server refuses TopicType::Geo with FeatureUnavailable until it
+     *       serves geo topics.
+     */
+    TopicCreateOptions &SetTopicType(::iggy::TopicType topic_type) noexcept {
+        topic_type_ = topic_type;
+        return *this;
+    }
+
+    /**
+     * @brief Returns how a geo topic writes its messages.
+     * @return Configured mode, or `std::nullopt` to use `geo` on a geo topic.
+     */
+    [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
+
+    /**
+     * @brief Sets how a geo topic writes its messages.
+     * @param geo_mode GeoMode::Geo uploads a batch to the object store before
+     *        it commits. GeoMode::GeoTiered replicates it first and uploads
+     *        sealed segments later.
+     * @return Reference to this options object.
+     * @note The server refuses any mode on a normal topic.
+     */
+    TopicCreateOptions &SetGeoMode(::iggy::GeoMode geo_mode) noexcept {
+        geo_mode_ = geo_mode;
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3535,6 +3616,8 @@ class TopicCreateOptions final {
     std::optional<bool> tiered_storage_;
     std::optional<::iggy::Expiry> local_retention_age_;
     std::optional<::iggy::MaxTopicSize> local_retention_size_;
+    std::optional<::iggy::TopicType> topic_type_;
+    std::optional<::iggy::GeoMode> geo_mode_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;

@@ -62,6 +62,8 @@ pub enum OptionKey {
     TieredStorage,
     LocalRetentionAge,
     LocalRetentionSize,
+    TopicType,
+    GeoMode,
     CriticalKeys,
 }
 

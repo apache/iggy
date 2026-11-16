@@ -49,7 +49,9 @@ public enum TopicOptionKey implements OptionKey {
     SEGMENT_MAX_AGE("segment_max_age", FLAG_CRITICAL),
     TIERED_STORAGE("tiered_storage", FLAG_UPDATABLE | FLAG_CRITICAL),
     LOCAL_RETENTION_AGE("local_retention_age", FLAG_UPDATABLE | FLAG_RESETTABLE),
-    LOCAL_RETENTION_SIZE("local_retention_size", FLAG_UPDATABLE | FLAG_RESETTABLE);
+    LOCAL_RETENTION_SIZE("local_retention_size", FLAG_UPDATABLE | FLAG_RESETTABLE),
+    TOPIC_TYPE("topic_type", FLAG_CRITICAL),
+    GEO_MODE("geo_mode", FLAG_CRITICAL);
 
     private final String value;
     private final int flags;

@@ -494,6 +494,48 @@ func TestUpdateTopic_TieredStorageCannotBeTurnedOffOrReset(t *testing.T) {
 	}
 }
 
+func TestCreateTopic_TopicTypeAndGeoModeFieldsRideTheBlockAsStrings(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	geoOptions := func(options iggcon.TopicOptions) map[string]iggcon.HeaderValue {
+		t.Helper()
+		command := CreateTopic{StreamId: streamId, Name: "topic", Options: options}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		entries, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		byKey := make(map[string]iggcon.HeaderValue, len(entries))
+		for _, entry := range entries {
+			byKey[string(entry.Key.Value)] = entry.Value
+		}
+		return byKey
+	}
+
+	topicType := iggcon.TopicTypeGeo
+	geoMode := iggcon.GeoModeGeoTiered
+	options := geoOptions(iggcon.TopicOptions{TopicType: &topicType, GeoMode: &geoMode})
+	if value := options[string(iggcon.TopicOptionTopicType)]; value.Kind != iggcon.String || string(value.Value) != "geo" {
+		t.Errorf("topic_type = %+v, want String %q", value, "geo")
+	}
+	if value := options[string(iggcon.TopicOptionGeoMode)]; value.Kind != iggcon.String || string(value.Value) != "geo_tiered" {
+		t.Errorf("geo_mode = %+v, want String %q", value, "geo_tiered")
+	}
+
+	options = geoOptions(iggcon.TopicOptions{})
+	for _, key := range []iggcon.TopicOptionKey{iggcon.TopicOptionTopicType, iggcon.TopicOptionGeoMode} {
+		if value, sent := options[string(key)]; sent {
+			t.Errorf("a nil field must leave %s to the server, got %+v", key, value)
+		}
+	}
+}
+
 func TestCreateTopic_NonStringOptionKeyIsRejected(t *testing.T) {
 	streamId, err := iggcon.NewIdentifier(uint32(1))
 	if err != nil {

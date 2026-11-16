@@ -56,8 +56,10 @@
 mod catalog;
 mod codec;
 mod durability;
+mod geo_mode;
 mod key;
 mod partition_resize_policy;
+mod topic_type;
 
 pub use catalog::{
     AdmittedOptions, CATALOG, OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE,
@@ -69,8 +71,10 @@ pub use catalog::{
 };
 pub use codec::OptionValueCodec;
 pub use durability::Durability;
+pub use geo_mode::GeoMode;
 pub use key::OptionKey;
 pub use partition_resize_policy::PartitionResizePolicy;
+pub use topic_type::TopicType;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
@@ -355,6 +359,12 @@ pub mod topic_option_keys {
     /// Topic-wide cap on the uploaded segments a tiered topic keeps on local
     /// disk. At most a finite `max_topic_size`.
     pub const LOCAL_RETENTION_SIZE: &str = "local_retention_size";
+    /// `normal` or `geo`, as a `String`, create-only. See
+    /// [`super::TopicType`].
+    pub const TOPIC_TYPE: &str = "topic_type";
+    /// `geo` or `geo_tiered`, as a `String`, create-only and only on a geo
+    /// topic. See [`super::GeoMode`].
+    pub const GEO_MODE: &str = "geo_mode";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -533,6 +543,40 @@ pub fn admit_tiered_storage(
     if !cluster_ready
         && TopicCreateOptions::from_resource_options(explicit).tiered_storage == Some(true)
     {
+        return Err(IggyError::FeatureUnavailable);
+    }
+    Ok(())
+}
+
+/// Refuse a mode on a normal topic: only a geo topic has one.
+///
+/// `explicit` holds the keys the request sets.
+///
+/// # Errors
+///
+/// `InvalidOptionValue` naming `geo_mode` when `explicit` sets a mode and
+/// does not make the topic geo.
+pub fn validate_geo_mode(explicit: &ResourceOptions) -> Result<(), IggyError> {
+    let parsed = TopicCreateOptions::from_resource_options(explicit);
+    if parsed.geo_mode.is_some() && parsed.topic_type != Some(TopicType::Geo) {
+        return Err(IggyError::InvalidOptionValue(
+            topic_option_keys::GEO_MODE.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Admit a request that creates a geo topic. No cluster can hold one yet.
+///
+/// `explicit` holds the keys the request sets. The metadata primary rules
+/// here, as it does on tiered storage, so the refusal reaches the client as a
+/// reply.
+///
+/// # Errors
+///
+/// `FeatureUnavailable` when `explicit` asks for a geo topic.
+pub fn admit_geo_topic(explicit: &ResourceOptions) -> Result<(), IggyError> {
+    if TopicCreateOptions::from_resource_options(explicit).topic_type == Some(TopicType::Geo) {
         return Err(IggyError::FeatureUnavailable);
     }
     Ok(())
@@ -881,6 +925,9 @@ pub struct TopicResolvedOptions {
     pub local_retention_age: IggyExpiry,
     /// Never above `max_topic_size`, as `local_retention_age` is bounded.
     pub local_retention_size: MaxTopicSize,
+    pub topic_type: TopicType,
+    /// `Some` exactly when `topic_type` is geo.
+    pub geo_mode: Option<GeoMode>,
     /// The partition-facing knobs, with the shard-default semantics of
     /// [`TopicRuntimeOptions`].
     pub runtime: TopicRuntimeOptions,
@@ -1170,6 +1217,7 @@ impl From<&ResourceOptions> for TopicResolvedOptions {
         let local_retention_size = parsed
             .local_retention_size
             .unwrap_or_else(|| MaxTopicSize::from(DEFAULT_LOCAL_RETENTION_SIZE));
+        let topic_type = parsed.topic_type.unwrap_or_default();
         Self {
             compression_algorithm: parsed.compression_algorithm.unwrap_or_default(),
             message_expiry,
@@ -1187,6 +1235,13 @@ impl From<&ResourceOptions> for TopicResolvedOptions {
                 max_topic_size
             } else {
                 local_retention_size
+            },
+            topic_type,
+            // Admission refuses a mode on a normal topic, so a stored one is
+            // ignored rather than trusted.
+            geo_mode: match topic_type {
+                TopicType::Geo => Some(parsed.geo_mode.unwrap_or_default()),
+                TopicType::Normal => None,
             },
             runtime: TopicRuntimeOptions::from(&parsed),
         }
@@ -1425,6 +1480,11 @@ pub struct TopicCreateOptions {
     /// Topic-wide cap on the uploaded segments a tiered topic keeps on local
     /// disk. `None` resolves to unlimited, or to a finite `max_topic_size`.
     pub local_retention_size: Option<MaxTopicSize>,
+    /// Fixed at creation. `None` resolves to [`TopicType::Normal`].
+    pub topic_type: Option<TopicType>,
+    /// How a geo topic writes its messages. `None` resolves to
+    /// [`GeoMode::Geo`] on a geo topic, and a normal topic refuses any mode.
+    pub geo_mode: Option<GeoMode>,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
     /// server catalog after this build shipped. Outbound only: a typed field
@@ -1560,6 +1620,8 @@ impl TopicCreateOptions {
                 let size = MaxTopicSize::decode(option, entry)?;
                 self.local_retention_size = (size != MaxTopicSize::ServerDefault).then_some(size);
             }
+            OptionKey::TopicType => self.topic_type = Some(TopicType::decode(option, entry)?),
+            OptionKey::GeoMode => self.geo_mode = Some(GeoMode::decode(option, entry)?),
             OptionKey::Name
             | OptionKey::Username
             | OptionKey::Status
@@ -1608,6 +1670,8 @@ impl TopicCreateOptions {
             tiered_storage: self.tiered_storage.or(defaults.tiered_storage),
             local_retention_age: self.local_retention_age.or(defaults.local_retention_age),
             local_retention_size: self.local_retention_size.or(defaults.local_retention_size),
+            topic_type: self.topic_type.or(defaults.topic_type),
+            geo_mode: self.geo_mode.or(defaults.geo_mode),
             raw: BTreeMap::new(),
         }
     }
@@ -1745,6 +1809,18 @@ impl TopicCreateOptions {
             options.insert(
                 HeaderKey::from(OptionKey::LocalRetentionSize),
                 OptionValue::explicit(HeaderValue::from(u64::from(local_retention_size))),
+            );
+        }
+        if let Some(topic_type) = self.topic_type {
+            options.insert(
+                HeaderKey::from(OptionKey::TopicType),
+                OptionValue::explicit(topic_type.encode()?),
+            );
+        }
+        if let Some(geo_mode) = self.geo_mode {
+            options.insert(
+                HeaderKey::from(OptionKey::GeoMode),
+                OptionValue::explicit(geo_mode.encode()?),
             );
         }
         Ok(options)
@@ -1934,10 +2010,18 @@ mod tests {
                 && descriptor.visibility == OptionVisibility::Public
         }) {
             let key = HeaderKey::from(descriptor.key);
-            // A server setting decides the replication factor's default, so the
-            // catalog derives none and admission stores the resolved value.
+            // A server setting decides the replication factor's default, and
+            // only a geo topic has a mode, so the catalog derives neither and
+            // admission stores the resolved value.
             let Some(default) = descriptor.default_value().expect("default encodes") else {
-                assert_eq!(descriptor.key, OptionKey::ReplicationFactor);
+                assert!(
+                    matches!(
+                        descriptor.key,
+                        OptionKey::ReplicationFactor | OptionKey::GeoMode
+                    ),
+                    "{} has no default",
+                    descriptor.key
+                );
                 assert!(!derived.contains_key(&key));
                 continue;
             };
@@ -1976,6 +2060,8 @@ mod tests {
                     resolved.runtime.durability,
                     resolved.runtime.consumer_offset_durability,
                     resolved.runtime.effective_segment_size(),
+                    resolved.topic_type,
+                    resolved.geo_mode,
                 ),
                 (
                     unset.compression_algorithm,
@@ -1985,6 +2071,8 @@ mod tests {
                     unset.runtime.durability,
                     unset.runtime.consumer_offset_durability,
                     unset.runtime.effective_segment_size(),
+                    unset.topic_type,
+                    unset.geo_mode,
                 ),
                 "reads resolve an absent {} to its catalog default",
                 descriptor.key
@@ -2161,6 +2249,8 @@ mod tests {
             tiered_storage: Some(true),
             local_retention_age: Some(IggyExpiry::from(1_800_000_000u64)),
             local_retention_size: Some(MaxTopicSize::from(1_000_000_000u64)),
+            topic_type: Some(TopicType::Geo),
+            geo_mode: Some(GeoMode::GeoTiered),
             partitions_count: None,
             consumer_offset_durability: Durability::Replicated,
             partition_resize_policy: Some(PartitionResizePolicy::Fixed),
@@ -2168,6 +2258,101 @@ mod tests {
         };
         let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         assert_eq!(parsed, options);
+    }
+
+    fn explicit_options(entries: &[(OptionKey, &str)]) -> ResourceOptions {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    HeaderKey::from(*key),
+                    OptionValue::explicit(HeaderValue::try_from(*value).unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn given_a_create_when_validating_its_geo_mode_should_refuse_a_mode_on_a_normal_topic() {
+        for admitted in [
+            explicit_options(&[]),
+            explicit_options(&[(OptionKey::TopicType, "normal")]),
+            explicit_options(&[(OptionKey::TopicType, "geo")]),
+            explicit_options(&[(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")]),
+            explicit_options(&[
+                (OptionKey::TopicType, "geo"),
+                (OptionKey::GeoMode, "geo_tiered"),
+            ]),
+        ] {
+            assert_eq!(validate_geo_mode(&admitted), Ok(()));
+        }
+        for mode in ["geo", "geo_tiered"] {
+            for refused in [
+                explicit_options(&[(OptionKey::GeoMode, mode)]),
+                explicit_options(&[(OptionKey::TopicType, "normal"), (OptionKey::GeoMode, mode)]),
+            ] {
+                assert_eq!(
+                    validate_geo_mode(&refused),
+                    Err(IggyError::InvalidOptionValue(
+                        topic_option_keys::GEO_MODE.to_owned()
+                    ))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_create_when_admitting_a_geo_topic_should_refuse_it_as_unavailable() {
+        for normal in [
+            explicit_options(&[]),
+            explicit_options(&[(OptionKey::TopicType, "normal")]),
+        ] {
+            assert_eq!(admit_geo_topic(&normal), Ok(()));
+        }
+        for geo in [
+            explicit_options(&[(OptionKey::TopicType, "geo")]),
+            explicit_options(&[(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")]),
+            explicit_options(&[
+                (OptionKey::TopicType, "geo"),
+                (OptionKey::GeoMode, "geo_tiered"),
+            ]),
+        ] {
+            assert_eq!(admit_geo_topic(&geo), Err(IggyError::FeatureUnavailable));
+        }
+    }
+
+    #[test]
+    fn given_stored_type_and_mode_when_resolving_should_give_a_mode_only_to_a_geo_topic() {
+        let stored = |entries: &[(OptionKey, &str)]| -> TopicResolvedOptions {
+            let options: ResourceOptions = entries
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        HeaderKey::from(*key),
+                        OptionValue::derived(HeaderValue::try_from(*value).unwrap()),
+                    )
+                })
+                .collect();
+            TopicResolvedOptions::from(&options)
+        };
+
+        let legacy = stored(&[]);
+        assert_eq!(legacy.topic_type, TopicType::Normal);
+        assert_eq!(legacy.geo_mode, None);
+        let normal = stored(&[
+            (OptionKey::TopicType, "normal"),
+            (OptionKey::GeoMode, "geo"),
+        ]);
+        assert_eq!(normal.topic_type, TopicType::Normal);
+        assert_eq!(normal.geo_mode, None);
+        let geo = stored(&[(OptionKey::TopicType, "geo")]);
+        assert_eq!(geo.topic_type, TopicType::Geo);
+        assert_eq!(geo.geo_mode, Some(GeoMode::Geo));
+        let geo_tiered = stored(&[
+            (OptionKey::TopicType, "geo"),
+            (OptionKey::GeoMode, "geo_tiered"),
+        ]);
+        assert_eq!(geo_tiered.geo_mode, Some(GeoMode::GeoTiered));
     }
 
     #[test]

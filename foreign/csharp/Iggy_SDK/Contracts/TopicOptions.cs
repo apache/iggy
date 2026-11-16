@@ -139,6 +139,24 @@ public sealed class TopicOptions
     public ulong? LocalRetentionSize { get; init; }
 
     /// <summary>
+    ///     Whether the topic is normal or geo. The server default is normal. Fixed at creation.
+    /// </summary>
+    /// <remarks>
+    ///     Not available yet: the server refuses <see cref="Enums.TopicType.Geo" /> with <c>feature_unavailable</c>.
+    /// </remarks>
+    public TopicType? TopicType { get; init; }
+
+    /// <summary>
+    ///     How a geo topic writes its messages. A geo topic created without one uses
+    ///     <see cref="Enums.GeoMode.Geo" />. Fixed at creation.
+    /// </summary>
+    /// <remarks>
+    ///     Only a geo topic takes a mode: the server refuses one on a normal topic with error code 4042,
+    ///     <c>invalid_option_value</c>.
+    /// </remarks>
+    public GeoMode? GeoMode { get; init; }
+
+    /// <summary>
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
     ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
     ///     durability is kept unless the matching property asks for persisted durability.
@@ -236,6 +254,26 @@ public sealed class TopicOptions
         if (LocalRetentionSize is { } localRetentionSize and not 0)
         {
             options[Name(TopicOptionKey.LocalRetentionSize)] = HeaderValue.FromUInt64(localRetentionSize);
+        }
+
+        if (TopicType is { } topicType)
+        {
+            options[Name(TopicOptionKey.TopicType)] = HeaderValue.FromString(topicType switch
+            {
+                Enums.TopicType.Normal => "normal",
+                Enums.TopicType.Geo => "geo",
+                _ => throw new ArgumentOutOfRangeException(nameof(TopicType), topicType, "Unknown topic type")
+            });
+        }
+
+        if (GeoMode is { } geoMode)
+        {
+            options[Name(TopicOptionKey.GeoMode)] = HeaderValue.FromString(geoMode switch
+            {
+                Enums.GeoMode.Geo => "geo",
+                Enums.GeoMode.GeoTiered => "geo_tiered",
+                _ => throw new ArgumentOutOfRangeException(nameof(GeoMode), geoMode, "Unknown geo mode")
+            });
         }
 
         return options;

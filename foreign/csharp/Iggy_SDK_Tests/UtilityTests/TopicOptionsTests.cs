@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.Tests.UtilityTests;
@@ -36,10 +37,12 @@ public sealed class TopicOptionsTests
             SegmentMaxAge = TimeSpan.FromHours(1),
             TieredStorage = false,
             LocalRetentionAge = TimeSpan.FromHours(6),
-            LocalRetentionSize = 536870912
+            LocalRetentionSize = 536870912,
+            TopicType = TopicType.Geo,
+            GeoMode = GeoMode.GeoTiered
         }.ToDictionary();
 
-        Assert.Equal(11, options.Count);
+        Assert.Equal(13, options.Count);
 
         Assert.Equal(HeaderKind.Uint64, options["segment_size"].Kind);
         Assert.Equal(134217728UL, options["segment_size"].ToUInt64());
@@ -70,6 +73,24 @@ public sealed class TopicOptionsTests
 
         Assert.Equal(HeaderKind.Uint64, options["local_retention_size"].Kind);
         Assert.Equal(536870912UL, options["local_retention_size"].ToUInt64());
+
+        Assert.Equal(HeaderKind.String, options["topic_type"].Kind);
+        Assert.Equal("geo", options["topic_type"].ToString());
+
+        Assert.Equal(HeaderKind.String, options["geo_mode"].Kind);
+        Assert.Equal("geo_tiered", options["geo_mode"].ToString());
+    }
+
+    [Theory]
+    [InlineData(TopicType.Normal, GeoMode.Geo, "normal", "geo")]
+    [InlineData(TopicType.Geo, GeoMode.GeoTiered, "geo", "geo_tiered")]
+    public void ToDictionary_WritesTopicTypeAndGeoModeUnderTheirCanonicalNames(TopicType topicType, GeoMode geoMode,
+        string topicTypeName, string geoModeName)
+    {
+        var options = new TopicOptions { TopicType = topicType, GeoMode = geoMode }.ToDictionary();
+
+        Assert.Equal(topicTypeName, options["topic_type"].ToString());
+        Assert.Equal(geoModeName, options["geo_mode"].ToString());
     }
 
     [Fact]

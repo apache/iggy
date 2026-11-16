@@ -26,8 +26,8 @@ use bytes::Bytes;
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, CommitAfter as RustCommitAfter, CommitEvery as RustCommitEvery,
     CommitPolicy as RustCommitPolicy, CompressionAlgorithm as RustCompressionAlgorithm,
-    ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
-    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize,
+    ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability,
+    GeoMode as RustGeoMode, IdKind, Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize,
     IggyDuration as RustIggyDuration, IggyExpiry as RustIggyExpiry, IggyMessage as RustIggyMessage,
     MaxTopicSize as RustMaxTopicSize, NonZeroIggyDuration as RustNonZeroIggyDuration, OptionKey,
     OptionSpec as RustOptionSpec, Partition as RustPartition,
@@ -40,8 +40,9 @@ use iggy::prelude::{
     StreamEncryptionSource as RustStreamEncryptionSource,
     StreamUpdateOptions as RustStreamUpdateOptions, Topic as RustTopic,
     TopicCreateOptions as RustTopicCreateOptions, TopicDetails as RustTopicDetails,
-    TopicUpdateOptions as RustTopicUpdateOptions, UserCreateOptions as RustUserCreateOptions,
-    UserUpdateOptions as RustUserUpdateOptions, Validatable,
+    TopicType as RustTopicType, TopicUpdateOptions as RustTopicUpdateOptions,
+    UserCreateOptions as RustUserCreateOptions, UserUpdateOptions as RustUserUpdateOptions,
+    Validatable,
 };
 use iggy_binary_protocol::WireUserHeaders;
 use iggy_binary_protocol::primitives::metadata_changes::{
@@ -749,6 +750,23 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
         } else {
             None
         };
+        let topic_type = if options.has_topic_type {
+            Some(
+                RustTopicType::from_str(&options.topic_type).map_err(|error| {
+                    format!("invalid topic type '{}': {error}", options.topic_type)
+                })?,
+            )
+        } else {
+            None
+        };
+        let geo_mode = if options.has_geo_mode {
+            Some(
+                RustGeoMode::from_str(&options.geo_mode)
+                    .map_err(|error| format!("invalid geo mode '{}': {error}", options.geo_mode))?,
+            )
+        } else {
+            None
+        };
         let mut raw = ffi_options_to_raw(options.raw_options)?;
         if options.has_durability {
             raw.remove("durability");
@@ -799,6 +817,8 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             tiered_storage: options.has_tiered_storage.then_some(options.tiered_storage),
             local_retention_age,
             local_retention_size,
+            topic_type,
+            geo_mode,
             raw,
         })
     }

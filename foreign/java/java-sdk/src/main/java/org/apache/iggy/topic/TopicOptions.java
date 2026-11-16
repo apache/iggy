@@ -222,6 +222,24 @@ public final class TopicOptions {
             return setUnlessZero(TopicOptionKey.LOCAL_RETENTION_SIZE, bytes);
         }
 
+        /**
+         * Normal or geo, fixed at create. Left unset, the topic is normal.
+         *
+         * <p>Not available yet: the server refuses {@link TopicType#GEO} with {@code FEATURE_UNAVAILABLE}.
+         */
+        public Builder topicType(TopicType type) {
+            return set(TopicOptionKey.TOPIC_TYPE, HeaderValue.fromString(type.value()));
+        }
+
+        /**
+         * How a geo topic writes its messages, fixed at create. Left unset, a geo topic uses {@link GeoMode#GEO}.
+         *
+         * <p>A normal topic has no mode, so the server refuses one there with {@code INVALID_OPTION_VALUE}.
+         */
+        public Builder geoMode(GeoMode mode) {
+            return set(TopicOptionKey.GEO_MODE, HeaderValue.fromString(mode.value()));
+        }
+
         /** An option this build has no setter for. A typed setter wins on collision. */
         public Builder raw(String key, HeaderValue value) {
             raw.put(key, value);

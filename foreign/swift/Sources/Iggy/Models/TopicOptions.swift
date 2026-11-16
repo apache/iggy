@@ -40,6 +40,8 @@ public enum TopicOptionKey: String, Sendable, Hashable, CaseIterable {
     case localRetentionAge = "local_retention_age"
     /// Updatable and resettable to unlimited.
     case localRetentionSize = "local_retention_size"
+    case topicType = "topic_type"
+    case geoMode = "geo_mode"
 }
 
 /// How far a write has to get before the server completes it.
@@ -62,6 +64,23 @@ public enum PartitionResizePolicy: String, Sendable, Hashable, CaseIterable {
     /// The partition set is fixed at create: the server refuses later
     /// partition creation and deletion on the topic.
     case fixed
+}
+
+/// What a topic is, fixed at create.
+public enum TopicType: String, Sendable, Hashable, CaseIterable {
+    /// Its messages stay in this cluster.
+    case normal
+    /// Its messages also become readable in the other datacenters, through
+    /// the object store. Its ``GeoMode`` says how they get there.
+    case geo
+}
+
+/// How a geo topic writes its messages. Only a geo topic has a mode.
+public enum GeoMode: String, Sendable, Hashable, CaseIterable {
+    /// A batch goes to the object store before it commits.
+    case geo
+    /// A batch is replicated first, and its sealed segment is uploaded later.
+    case geoTiered = "geo_tiered"
 }
 
 /// Options of a topic being created. Every knob is optional; an absent key
@@ -122,6 +141,14 @@ public struct TopicCreateOptions: Sendable, Hashable {
     ///
     /// The server refuses a size above a finite `maxTopicSize`.
     public var localRetentionSize: MaxTopicSize?
+    /// Nil leaves the server's default, ``TopicType/normal``.
+    ///
+    /// The server refuses ``TopicType/geo`` with
+    /// ``IggyErrorCode/featureUnavailable`` until it serves geo topics.
+    public var topicType: TopicType?
+    /// Nil gives a geo topic ``GeoMode/geo``. The server refuses any mode on
+    /// a normal topic with ``IggyErrorCode/invalidOptionValue``.
+    public var geoMode: GeoMode?
     public var raw: [String: String]
 
     public init(
@@ -130,7 +157,7 @@ public struct TopicCreateOptions: Sendable, Hashable {
         consumerOffsetDurability: Durability = .replicated, partitionResizePolicy: PartitionResizePolicy? = nil, messagesRequiredToSave: UInt32? = nil,
         sizeOfMessagesRequiredToSaveBytes: UInt64? = nil, preallocateSegments: Bool? = nil, replicationFactor: UInt32? = nil,
         segmentMaxAge: IggyExpiry? = nil, tieredStorage: Bool? = nil, localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil,
-        raw: [String: String] = [:]
+        topicType: TopicType? = nil, geoMode: GeoMode? = nil, raw: [String: String] = [:]
     ) {
         self.partitionsCount = partitionsCount
         self.compressionAlgorithm = compressionAlgorithm
@@ -148,6 +175,8 @@ public struct TopicCreateOptions: Sendable, Hashable {
         self.tieredStorage = tieredStorage
         self.localRetentionAge = localRetentionAge
         self.localRetentionSize = localRetentionSize
+        self.topicType = topicType
+        self.geoMode = geoMode
         self.raw = raw
     }
 
@@ -210,6 +239,12 @@ public struct TopicCreateOptions: Sendable, Hashable {
         }
         if let localRetentionSize {
             options[TopicOptionKey.localRetentionSize.rawValue] = .explicit(.uint64(localRetentionSize.wireValue))
+        }
+        if let topicType {
+            options[TopicOptionKey.topicType.rawValue] = .explicit(try .string(topicType.rawValue))
+        }
+        if let geoMode {
+            options[TopicOptionKey.geoMode.rawValue] = .explicit(try .string(geoMode.rawValue))
         }
         return options
     }
@@ -320,7 +355,7 @@ extension TopicOptionKey: CatalogOptionKey {
         switch self {
         case .name: .updatable
         case .messageExpiry, .maxTopicSize, .localRetentionAge, .localRetentionSize: [.updatable, .resettable]
-        case .segmentMaxAge: .critical
+        case .segmentMaxAge, .topicType, .geoMode: .critical
         case .tieredStorage: [.updatable, .critical]
         default: []
         }
