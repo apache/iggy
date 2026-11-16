@@ -199,7 +199,7 @@ Examples:
  iggy stream get 1
  iggy stream get test
 
-{USAGE_PREFIX} stream get <STREAM_ID>
+{USAGE_PREFIX} stream get [OPTIONS] <STREAM_ID>
 
 Arguments:
   <STREAM_ID>
@@ -208,6 +208,12 @@ Arguments:
           Stream ID can be specified as a stream name or ID
 
 Options:
+  -o, --output <OUTPUT>
+          Output format (table or json)
+{CLAP_INDENT}
+          [default: table]
+          [possible values: table, json]
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -227,13 +233,14 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Get details of a single stream with given ID
 
-{USAGE_PREFIX} stream get <STREAM_ID>
+{USAGE_PREFIX} stream get [OPTIONS] <STREAM_ID>
 
 Arguments:
   <STREAM_ID>  Stream ID to get
 
 Options:
-  -h, --help  Print help (see more with '--help')
+  -o, --output <OUTPUT>  Output format (table or json) [default: table] [possible values: table, json]
+  -h, --help             Print help (see more with '--help')
 "#,
             ),
         ))

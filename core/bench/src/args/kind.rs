@@ -28,7 +28,7 @@ use crate::args::kinds::pinned::producer::PinnedProducerArgs;
 use crate::args::kinds::pinned::producer_and_consumer::PinnedProducerAndConsumerArgs;
 use bench_report::benchmark_kind::BenchmarkKind;
 use clap::Subcommand;
-use iggy::prelude::IggyByteSize;
+use iggy::prelude::{IggyByteSize, IggyExpiry};
 
 #[derive(Subcommand, Debug)]
 pub enum BenchmarkKindCommand {
@@ -148,6 +148,10 @@ impl BenchmarkKindProps for BenchmarkKindCommand {
         self.inner().max_topic_size()
     }
 
+    fn message_expiry(&self) -> IggyExpiry {
+        self.inner().message_expiry()
+    }
+
     fn read_amplification(&self) -> Option<f32> {
         self.inner().read_amplification()
     }
@@ -171,5 +175,27 @@ impl BenchmarkKindProps for BenchmarkKindCommand {
 
     fn validate(&self) {
         self.inner().validate();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::common::IggyBenchArgs;
+    use clap::Parser;
+
+    #[test]
+    fn given_message_expiry_when_read_through_kind_command_should_return_kind_value() {
+        let args = IggyBenchArgs::try_parse_from([
+            "iggy-bench",
+            "pinned-producer",
+            "--message-expiry",
+            "1h",
+            "tcp",
+        ])
+        .expect("the arguments parse");
+
+        let expected: IggyExpiry = "1h".parse().expect("the expiry parses");
+        assert_eq!(args.benchmark_kind.message_expiry(), expected);
     }
 }
