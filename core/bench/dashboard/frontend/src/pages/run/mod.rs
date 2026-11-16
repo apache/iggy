@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One run's page at `/benchmarks/{uuid}`. It shows exactly the run in the URL: the summary comes
+//! One run's page at `/runs/{uuid}`. It shows exactly the run in the URL: the summary comes
 //! from the loaded list by uuid and the report from the server by uuid, so no other run with the
 //! same parameters can take its place.
 
@@ -30,17 +30,20 @@ use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::delta::Metric;
 use bench_dashboard_shared::identity::KindFamily;
+use bench_dashboard_shared::metrics::GroupMetrics;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use bench_dashboard_shared::summary::BenchmarkSummary;
+use bench_report::group_metrics_kind::GroupMetricsKind;
 use uuid::Uuid;
 use yew::prelude::*;
 use yew_router::prelude::Link;
 
 use self::advanced::Advanced;
 use self::change::{
-    Change, Headline, HistoryLine, change, headlines, metric_name, regression_text,
+    Change, Headline, HistoryLine, change, headlines, metric_name, metric_value_text,
+    regression_text,
 };
-use self::chart::{LATENCY_CHART_NOTE, SeriesChart};
+use self::chart::{LATENCY_CHART_NOTE, SERIES_COLOR_VARS, SeriesChart};
 use self::facts::{
     Command, Fact, FactGroup, NO_OPTIONS_NOTE, bench_host, conditions, environment, ladder,
     ladder_side, option_groups, parameters, topic_note,
@@ -48,15 +51,18 @@ use self::facts::{
 use self::history::{History, history_view};
 use self::related::{RelatedGroup, related_runs, related_view};
 use crate::api::{artifacts_url, fetch_benchmark_by_uuid, report_url};
+use crate::components::chart::series_color;
 use crate::components::command_block::CommandBlock;
 use crate::components::embed_code::{EmbedCode, MeasurementType};
-use crate::components::headline::{change_chip, headline_card, metric_hint};
+use crate::components::framework::{Framework, framework_chip};
+use crate::components::headline::{change_chip, compact_change_chip, headline_card, metric_hint};
+use crate::components::ladder::{Rung, percentile_ladder};
 use crate::components::page::{
     Crumb, breadcrumbs, data_status, loadable, page_head, page_shell, section_head,
 };
 use crate::components::run_labels::{
-    DayLabel, END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, RELEASE_LABEL, messages_text,
-    milliseconds, short_id, version_tag, version_tag_view,
+    DayLabel, END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, messages_text, milliseconds,
+    short_id, version_detail, version_tag, version_tag_view,
 };
 use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;
@@ -70,13 +76,25 @@ const REBUILT_NOTE: &str = "The report predates the recorded command line, so th
                             the bench rebuilt from the parameters. It may differ from the command \
                             that actually ran.";
 const NO_COMMAND_NOTE: &str = "The report doesn't record a command.";
-const PERFORMANCE: NavSection = NavSection {
-    id: "performance",
-    label: "Performance",
-};
+const LATENCY_NOTE: &str = "One line per actor group. The bench samples the run in 10 ms windows by \
+                            default, and a group's line is a moving average over them.";
+const THROUGHPUT_NOTE: &str = "One line per actor group, a moving average over the 10 ms sampling \
+                               windows of the bench. The card next to the chart gives each group's \
+                               rates over the whole run.";
+const RATES_TITLE: &str = "Over the whole run";
+const RATE_HINT: &str = "The group's user data over the run time of its slowest actor.";
+const MESSAGES_HINT: &str = "The group's messages over the run time of its slowest actor.";
 const LATENCY: NavSection = NavSection {
     id: "latency",
     label: "Latency",
+};
+const PERCENTILES: NavSection = NavSection {
+    id: "percentiles",
+    label: "Percentiles",
+};
+const THROUGHPUT: NavSection = NavSection {
+    id: "throughput",
+    label: "Throughput",
 };
 const HISTORY: NavSection = NavSection {
     id: "history",
@@ -102,9 +120,10 @@ const ADVANCED: NavSection = NavSection {
     id: "advanced",
     label: "Advanced",
 };
-static RATE_LIMITED_SECTIONS: [NavSection; 8] = [
-    PERFORMANCE,
+static RATE_LIMITED_SECTIONS: [NavSection; 9] = [
     LATENCY,
+    PERCENTILES,
+    THROUGHPUT,
     HISTORY,
     RELATED,
     CONFIGURATION,
@@ -112,9 +131,9 @@ static RATE_LIMITED_SECTIONS: [NavSection; 8] = [
     ARTIFACTS,
     ADVANCED,
 ];
-/// A run without a rate limit measures throughput only, so it has no latency section.
+/// A run without a rate limit measures throughput only, so it has no latency sections.
 static UNCAPPED_SECTIONS: [NavSection; 7] = [
-    PERFORMANCE,
+    THROUGHPUT,
     HISTORY,
     RELATED,
     CONFIGURATION,
@@ -189,6 +208,16 @@ struct RunView {
     regression: Option<String>,
     history: History,
     related: Vec<RelatedGroup>,
+}
+
+/// One row of the rates card next to the throughput chart.
+#[derive(Debug, PartialEq)]
+struct GroupRate<'a> {
+    group: &'a GroupMetrics,
+    /// The headline's change, on the main group only.
+    change: Option<&'a Change>,
+    /// The group's rate against the fastest group, for the length of its bar.
+    share_pct: f64,
 }
 
 impl Lookup {
@@ -298,25 +327,34 @@ fn found_view(
             { headline_strip(view) }
             <SectionNav {sections} scroll_ref={scroll_ref.clone()} />
 
-            <section id={PERFORMANCE.id} class="page-section page-container">
-                { section_head(
-                    PERFORMANCE.label,
-                    "Over the run",
-                    "One line per actor group. The bench samples the run in 10 ms windows by \
-                     default, and a group's line is a moving average over them.",
-                ) }
-                <div class="run-charts">
-                    if view.rate_limited() {
-                        <article class="card run-chart-card">
-                            <h3>{"Average latency"}</h3>
-                            <SeriesChart
-                                uuid={run.uuid}
-                                metric={SeriesMetric::Latency}
-                                scope={SeriesScope::Group}
-                            />
-                            <p class="card-note">{ LATENCY_CHART_NOTE }</p>
-                        </article>
-                    }
+            if view.rate_limited() {
+                <section id={LATENCY.id} class="page-section page-container">
+                    { section_head(LATENCY.label, "Every window", LATENCY_NOTE) }
+                    <article class="card run-chart-card">
+                        <h3>{"Average latency"}</h3>
+                        <SeriesChart
+                            uuid={run.uuid}
+                            metric={SeriesMetric::Latency}
+                            scope={SeriesScope::Group}
+                        />
+                        <p class="card-note">{ LATENCY_CHART_NOTE }</p>
+                    </article>
+                </section>
+
+                <section id={PERCENTILES.id} class="page-section page-container">
+                    { section_head(
+                        PERCENTILES.label,
+                        "Every percentile",
+                        "On a log scale, so the median and the tail fit in one view. A group's \
+                         value is the mean of its actors' percentiles.",
+                    ) }
+                    { with_report(&|report| latency_card(view, report)) }
+                </section>
+            }
+
+            <section id={THROUGHPUT.id} class="page-section page-container">
+                { section_head(THROUGHPUT.label, "Start to finish", THROUGHPUT_NOTE) }
+                <div class="chart-with-card">
                     <article class="card run-chart-card">
                         <h3>{"Throughput"}</h3>
                         <SeriesChart
@@ -325,20 +363,9 @@ fn found_view(
                             scope={SeriesScope::Group}
                         />
                     </article>
+                    { rates_card(view) }
                 </div>
             </section>
-
-            if view.rate_limited() {
-                <section id={LATENCY.id} class="page-section page-container">
-                    { section_head(
-                        LATENCY.label,
-                        "Every percentile",
-                        "On a log scale, so the median and the tail fit in one view. A group's \
-                         value is the mean of its actors' percentiles.",
-                    ) }
-                    { with_report(&|report| latency_card(view, report)) }
-                </section>
-            }
 
             <section id={HISTORY.id} class="page-section page-container">
                 { section_head(
@@ -402,7 +429,7 @@ fn found_view(
             <section id={ADVANCED.id} class="page-section page-container">
                 { section_head(
                     ADVANCED.label,
-                    "For engineers",
+                    "Additional insights",
                     "Every actor over time, the latency distribution with its tail, and the server \
                      stats. The actor charts load when you open them.",
                 ) }
@@ -423,11 +450,7 @@ fn head(view: &RunView) -> Html {
         ..Crumb::new(run.kind_family.to_string(), AppRoute::Explore)
     };
     let short_id = short_id(&run.uuid);
-    let detail = match (&run.commit, run.release) {
-        (Some(commit), _) => Some(format!("commit {commit}")),
-        (None, true) => Some(RELEASE_LABEL.to_owned()),
-        (None, false) => None,
-    };
+    let detail = version_detail(run.commit.as_deref(), run.release);
     let start = run
         .version_order
         .timestamp_us
@@ -436,6 +459,7 @@ fn head(view: &RunView) -> Html {
         <>
             { breadcrumbs(&[Crumb::new("Explore", AppRoute::Explore), family], &short_id) }
             <p class="run-meta">
+                { framework_chip(Framework::IggyBench) }
                 { version_tag_view(&version_tag(run), run.release) }
                 if let Some(detail) = detail {
                     <span>{ detail }</span>
@@ -513,34 +537,94 @@ fn latency_card(view: &RunView, report: &BenchmarkReportLight) -> Html {
                 .map(|(_, change)| change)
         })
     };
-    let plain = view.ladder_changes.is_empty();
+    let rungs: Vec<Rung> = ladder(&group.summary)
+        .into_iter()
+        .map(|row| Rung {
+            label: row.label,
+            hint: row.metric.map(metric_hint),
+            value: milliseconds(row.value_ms),
+            bar_pct: row.bar_pct,
+            key: row.metric == Some(Metric::P99),
+            change: change_of(row.metric).map(change_chip).unwrap_or_default(),
+        })
+        .collect();
     html! {
         <article class="card run-ladder-card">
             <h3>{ kind.to_string() }</h3>
-            <ol class={classes!("run-ladder", plain.then_some("run-ladder-plain"))}>
-                { for ladder(&group.summary).into_iter().map(|row| html! {
-                    <li class={classes!(
-                        "run-ladder-row",
-                        (row.metric == Some(Metric::P99)).then_some("run-ladder-key"),
-                    )}>
-                        <span class="run-ladder-label" title={row.metric.map(metric_hint)}>
-                            { row.label }
-                        </span>
-                        <span class="run-ladder-track" aria-hidden="true">
-                            <i style={format!("width: {:.1}%", row.bar_pct)}></i>
-                        </span>
-                        <strong>{ milliseconds(row.value_ms) }</strong>
-                        <span class="run-ladder-change">
-                            if let Some(change) = change_of(row.metric) {
-                                { change_chip(change) }
-                            }
-                        </span>
-                    </li>
-                }) }
-            </ol>
+            { percentile_ladder(&rungs, !view.ladder_changes.is_empty()) }
             { fact_list(&ladder_side(&group.summary)) }
         </article>
     }
+}
+
+/// The groups of the throughput chart in its line colors, with the change of the main group from
+/// the headline.
+fn rates_card(view: &RunView) -> Html {
+    let items = group_rates(&view.run, &view.headlines)
+        .into_iter()
+        .zip(SERIES_COLOR_VARS)
+        .map(|(rate, color)| {
+            let group = rate.group;
+            html! {
+                <li class="rates-row" style={series_color(color)}>
+                    <span class="rates-name">
+                        <span class="series-swatch" aria-hidden="true"></span>
+                        <span class="rates-label">{ group.kind.to_string() }</span>
+                    </span>
+                    <span class="rates-change">
+                        if let Some(change) = rate.change {
+                            { compact_change_chip(change) }
+                        }
+                    </span>
+                    <strong class="rates-value" title={RATE_HINT}>
+                        { metric_value_text(Metric::Throughput, group.throughput_megabytes_per_second) }
+                    </strong>
+                    <span class="rates-messages" title={MESSAGES_HINT}>
+                        { messages_text(group.throughput_messages_per_second) }
+                    </span>
+                    <span class="rates-bar" aria-hidden="true">
+                        <span style={format!("width: {:.1}%", rate.share_pct)}></span>
+                    </span>
+                </li>
+            }
+        });
+    html! {
+        <article class="card rates-card">
+            <h3>{ RATES_TITLE }</h3>
+            <ul class="rates-list">{ for items }</ul>
+        </article>
+    }
+}
+
+/// The groups that the throughput chart draws, in its order. Like the chart, it leaves out the
+/// combined group of producers and consumers.
+fn group_rates<'a>(run: &'a BenchmarkSummary, headlines: &'a [Headline]) -> Vec<GroupRate<'a>> {
+    let groups: Vec<&GroupMetrics> = run
+        .groups
+        .iter()
+        .filter(|group| group.kind != GroupMetricsKind::ProducersAndConsumers)
+        .collect();
+    let fastest = groups
+        .iter()
+        .map(|group| group.throughput_megabytes_per_second)
+        .fold(0.0, f64::max);
+    let primary = run.kind_family.primary_group();
+    let change = headlines
+        .iter()
+        .find(|headline| headline.metric == Metric::Throughput)
+        .and_then(|headline| headline.change.as_ref());
+    groups
+        .into_iter()
+        .map(|group| GroupRate {
+            group,
+            change: change.filter(|_| group.kind == primary),
+            share_pct: if fastest > 0.0 {
+                group.throughput_megabytes_per_second / fastest * 100.0
+            } else {
+                0.0
+            },
+        })
+        .collect()
 }
 
 fn configuration(run: &BenchmarkSummary, report: &BenchmarkReportLight) -> Html {
@@ -666,5 +750,81 @@ fn fact_list(facts: &[Fact]) -> Html {
                 </div>
             }) }
         </dl>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bench_report::benchmark_kind::BenchmarkKind;
+
+    use super::*;
+    use crate::test_support::{
+        CANDIDATE, MACHINE, RELEASE, THRESHOLDS, params, rate_limited, run, with_numbers,
+    };
+
+    /// A producer and consumer run whose report holds both groups and their combination.
+    fn producer_and_consumer(id: u128, gitref: &str, producers: f64) -> BenchmarkSummary {
+        let workload = rate_limited(params(BenchmarkKind::PinnedProducerAndConsumer, 1, 1));
+        let mut summary = with_numbers(run(id, workload, MACHINE, gitref), producers, 2.0);
+        let main = summary.groups[0].clone();
+        summary.groups.extend([
+            GroupMetrics {
+                kind: GroupMetricsKind::Consumers,
+                throughput_megabytes_per_second: producers / 2.0,
+                ..main.clone()
+            },
+            GroupMetrics {
+                kind: GroupMetricsKind::ProducersAndConsumers,
+                throughput_megabytes_per_second: producers * 1.5,
+                ..main
+            },
+        ]);
+        summary
+    }
+
+    #[test]
+    fn given_run_with_combined_group_when_rated_should_give_chart_groups_with_main_change() {
+        let runs = vec![
+            producer_and_consumer(1, RELEASE, 500.0),
+            producer_and_consumer(2, CANDIDATE, 600.0),
+        ];
+        let current = &runs[1];
+        let line = HistoryLine::of(current, &runs);
+        let headlines = headlines(current, line.step(current).as_ref(), &THRESHOLDS);
+
+        let rates = group_rates(current, &headlines);
+
+        let shown: Vec<_> = rates
+            .iter()
+            .map(|rate| {
+                (
+                    rate.group.kind,
+                    rate.share_pct,
+                    rate.change.map(Change::text),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    GroupMetricsKind::Producers,
+                    100.0,
+                    Some("+20.0% vs 0.9.0".to_owned())
+                ),
+                (GroupMetricsKind::Consumers, 50.0, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn given_first_run_of_its_line_when_rated_should_give_no_change() {
+        let current = producer_and_consumer(1, RELEASE, 500.0);
+        let headlines = headlines(&current, None, &THRESHOLDS);
+
+        let rates = group_rates(&current, &headlines);
+
+        assert!(rates.iter().all(|rate| rate.change.is_none()));
+        assert_eq!(rates.len(), 2);
     }
 }

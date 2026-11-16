@@ -58,8 +58,7 @@ pub struct GroupMetrics {
     pub p95_latency_ms: f64,
     pub p99_latency_ms: f64,
     pub p999_latency_ms: f64,
-    /// (max - min) / mean of the actor run times. Actors without a run time are left out, as in
-    /// the cloud-bench suite summary.
+    /// (max - min) / mean of the actor run times. Actors without a run time are left out.
     pub time_spread_pct: f64,
 }
 

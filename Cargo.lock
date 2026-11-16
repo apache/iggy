@@ -1113,12 +1113,14 @@ name = "bench-dashboard-shared"
 version = "0.1.0"
 dependencies = [
  "bench-report",
+ "blake3",
  "chrono",
  "human-repr",
  "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "toml 1.1.8+spec-1.1.0",
  "uuid",
 ]
 
@@ -5683,6 +5685,7 @@ dependencies = [
  "tracing",
  "trait-variant",
  "webpki-roots 1.0.11",
+ "whichever",
 ]
 
 [[package]]
@@ -5727,8 +5730,11 @@ dependencies = [
  "bench-dashboard-shared",
  "bench-report",
  "charming",
+ "chrono",
  "clap",
+ "nix",
  "notify",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "tempfile",
@@ -5919,6 +5925,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "whichever",
  "xaes-256-gcm",
 ]
 
@@ -12086,6 +12093,26 @@ dependencies = [
  "home",
  "rustix 0.38.44",
  "winsafe",
+]
+
+[[package]]
+name = "whichever"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68887c9512981e597d730f1d95b2eb6abdd53385e4e76c35a95e7121e16232b0"
+dependencies = [
+ "whichever-macros",
+]
+
+[[package]]
+name = "whichever-macros"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb15ad553239d9fdefac12e31e16c7682dc62a2106ba035aec69c5dd15835a7b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
