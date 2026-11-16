@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.reader;
 
 import org.apache.iggy.client.async.reader.PartitionReaderTestAccess;
+import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.message.PollOptions;
 import org.apache.iggy.message.PolledMessages;
 import org.junit.jupiter.api.Test;
@@ -30,8 +31,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
-/** The blocking reader keeps a batch that its caller stopped waiting for. */
+/** The blocking reader keeps a batch that its caller stopped waiting for, and never waits on a closed reader. */
 class PartitionReaderTest {
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
 
@@ -73,5 +76,41 @@ class PartitionReaderTest {
 
             assertThat(reader.next().messages()).hasSize(1);
         }
+    }
+
+    /** An interrupt of the close cancels it, so a refusal of its owner read that stays transient holds it no longer. */
+    @Test
+    void shouldEndTheCloseThatItsThreadInterruptsUnderALastingTransientRefusal() throws Exception {
+        var access = PartitionReaderTestAccess.memberWithANewOwner();
+        PartitionReader reader = PartitionReader.of(access.reader());
+        CompletableFuture<RuntimeException> closed = new CompletableFuture<>();
+        Thread caller = new Thread(() -> {
+            try {
+                reader.close();
+                closed.complete(null);
+            } catch (RuntimeException error) {
+                closed.complete(error);
+            }
+        });
+        caller.start();
+        var ownerRead = access.nextRead();
+        caller.interrupt();
+        assertThat(closed.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)).isInstanceOf(IggyClientException.class);
+        access.refuseTransiently(ownerRead);
+
+        assertThat(access.readsNothingForTwoRetryIntervals()).isTrue();
+    }
+
+    @Test
+    void shouldFailEachCallAfterTheCloseAtOnce() throws Exception {
+        var access = PartitionReaderTestAccess.standalone(PollOptions.waitFor(Duration.ofSeconds(1)), 1L);
+        PartitionReader reader = PartitionReader.of(access.reader());
+        reader.close();
+
+        assertThatThrownBy(() -> access.reader().next().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyClientException.class);
+        assertThatThrownBy(() -> reader.next(TIMEOUT)).isInstanceOf(IggyClientException.class);
+        assertTimeoutPreemptively(
+                TIMEOUT, () -> assertThatThrownBy(reader::next).isInstanceOf(IggyClientException.class));
     }
 }

@@ -40,3 +40,6 @@ kafka-protocol = { workspace = true, features = ["client"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

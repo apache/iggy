@@ -26,6 +26,21 @@ if [ ! -d "$RESULTS_DIR" ]; then
     echo "Set RESULTS_DIR=/path/to/performance_results or run benchmarks with \`output\` subcommand first."
     exit 1
 fi
+# The server runs from another directory, so a relative RESULTS_DIR must be resolved here.
+RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd)"
+SERVER_ARGS=(--results-dir "$RESULTS_DIR")
+
+# OpenMessaging Benchmark (OMB) results are optional and have no default directory.
+OMB_RESULTS_DIR="${OMB_RESULTS_DIR:-}"
+if [ -n "$OMB_RESULTS_DIR" ]; then
+    if [ ! -d "$OMB_RESULTS_DIR" ]; then
+        echo "Error: OMB results directory does not exist: $OMB_RESULTS_DIR"
+        echo "Set OMB_RESULTS_DIR to a directory with one OMB run per subdirectory, or leave it unset."
+        exit 1
+    fi
+    OMB_RESULTS_DIR="$(cd "$OMB_RESULTS_DIR" && pwd)"
+    SERVER_ARGS+=(--omb-results-dir "$OMB_RESULTS_DIR")
+fi
 
 # Check if trunk is installed
 if ! command -v trunk &>/dev/null; then
@@ -55,9 +70,10 @@ if [ $# -gt 0 ]; then
     fi
 fi
 
-# Start server in background
-echo "Starting server (results: $RESULTS_DIR)..."
-cargo run --bin iggy-bench-dashboard-server -- --results-dir "$RESULTS_DIR" &
+# Start server in background. It serves frontend/dist (with /vendor) relative to its working
+# directory. exec keeps the job PID on the server process.
+echo "Starting server (results: $RESULTS_DIR, OMB results: ${OMB_RESULTS_DIR:-not set})..."
+(cd core/bench/dashboard && exec cargo run -p iggy-bench-dashboard-server -- "${SERVER_ARGS[@]}") &
 
 # Wait a bit for server to start
 sleep 1

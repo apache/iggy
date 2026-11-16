@@ -19,6 +19,7 @@ use super::builder::TestHarnessBuilder;
 use crate::harness::config::{ClientConfig, JWKS_ISSUER_USERNAME, JwksConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
+use crate::harness::floci::{self, FlociBucket};
 use crate::harness::handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
     ServerLogs,
@@ -37,6 +38,9 @@ use tracing::warn;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The setting that picks the tiered storage backend of a test server.
+const TIERED_STORAGE_BACKEND: &str = "IGGY_TIERED_STORAGE_BACKEND";
+
 /// Collected logs from all binaries in the harness.
 #[derive(Debug)]
 pub struct TestLogs {
@@ -53,6 +57,7 @@ pub struct TestHarness {
     pub(super) primary_client_config: Option<ClientConfig>,
     pub(super) jwks_config: Option<JwksConfig>,
     pub(super) jwks_server: Option<MockServer>,
+    pub(super) floci_bucket: Option<FlociBucket>,
     pub(super) started: bool,
     pub(super) peer_relays: Option<PeerRelays>,
 }
@@ -153,6 +158,24 @@ impl TestHarness {
             }
 
             self.jwks_server = Some(mock_server);
+        }
+
+        // Every node of a cluster reaches the same store, so they share one
+        // bucket. A value that the test set stays.
+        if self.servers.iter().any(|server| {
+            server
+                .env(TIERED_STORAGE_BACKEND)
+                .is_some_and(|backend| backend.eq_ignore_ascii_case("s3"))
+        }) {
+            let bucket = floci::new_bucket().await?;
+            for server in &mut self.servers {
+                for (key, value) in bucket.server_envs() {
+                    if server.env(key).is_none() {
+                        server.add_env(key, value);
+                    }
+                }
+            }
+            self.floci_bucket = Some(bucket);
         }
 
         // Cluster startup can hit a transient replica-handshake blip that
@@ -634,6 +657,12 @@ impl TestHarness {
                 message: "peer links are not relayed; build the harness with peer_relays()"
                     .to_string(),
             })
+    }
+
+    /// The Floci bucket that the harness made for a server with the `s3`
+    /// tiered storage backend, `None` for any other server.
+    pub fn tiered_storage_bucket(&self) -> Option<&FlociBucket> {
+        self.floci_bucket.as_ref()
     }
 
     /// Number of requests the trusted-issuer JWKS mock has served, or 0 when no

@@ -358,6 +358,11 @@ impl SessionOwner {
         crate::vsr::observe_metadata_reply(&self.metadata_watermark, header);
     }
 
+    /// Raises the watermark to the commit of a read whose answer the session acts on.
+    pub(crate) fn observe_metadata_commit(&self, commit: u64) {
+        self.metadata_watermark.fetch_max(commit, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn remember(&self, credentials: Credentials, user_id: u32) {
         self.sign_in().remembered = Some(RememberedSignIn {

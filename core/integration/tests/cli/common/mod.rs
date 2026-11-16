@@ -17,6 +17,7 @@
 
 pub(crate) mod command;
 pub(crate) mod help;
+pub(crate) mod json_output;
 pub(crate) mod keyring;
 pub(crate) use crate::cli::common::command::IggyCmdCommand;
 pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX};
@@ -24,17 +25,32 @@ pub(crate) use crate::cli::common::keyring::clear_session_entry;
 #[cfg(not(any(target_os = "macos", target_env = "musl")))]
 pub(crate) use crate::cli::common::keyring::ensure_keyring_store;
 use assert_cmd::assert::{Assert, OutputAssertExt};
-use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use integration::harness::{
     ServerHandle, TestBinary, TestHarness, TestHarnessBuilder, TestServerConfig,
-    backup_commit_budget,
+    backup_commit_budget, cargo_bin_path,
 };
 use std::fmt::{Display, Formatter, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+/// The ID that the command printed right after `prefix`, as in "... and ID: 3 created".
+pub(crate) fn printed_id(command_state: &Assert, prefix: &str) -> u32 {
+    let stdout = std::str::from_utf8(&command_state.get_output().stdout)
+        .expect("CLI output should be UTF-8");
+    stdout
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(prefix)?;
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        })
+        .expect("CLI should print the ID")
+}
 
 pub(crate) enum TestIdentifier {
     Numeric,
@@ -217,8 +233,7 @@ impl IggyCmdTest {
         // Prepare iggy server state before test
         test_case.prepare_server_state(&client).await;
         // Get iggy tool
-        #[allow(deprecated)]
-        let mut command = Command::cargo_bin("iggy").unwrap();
+        let mut command = Command::new(cargo_bin_path("iggy").unwrap());
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
         // Clear any IGGY_TOKEN inherited from the test process before the
@@ -288,8 +303,7 @@ impl IggyCmdTest {
 
     pub(crate) async fn execute_test_for_help_command(&mut self, test_case: TestHelpCmd) {
         // Get iggy tool
-        #[allow(deprecated)]
-        let mut command = Command::cargo_bin("iggy").unwrap();
+        let mut command = Command::new(cargo_bin_path("iggy").unwrap());
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
         // Clear any IGGY_TOKEN inherited from the test process before the

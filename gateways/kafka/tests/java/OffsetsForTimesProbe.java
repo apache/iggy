@@ -27,7 +27,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 
 /**
- * Kafka 3.9 consumer probe for {@code KafkaConsumer.offsetsForTimes}, which plain consumers and
+ * Kafka 4 consumer probe for {@code KafkaConsumer.offsetsForTimes}, which plain consumers and
  * Kafka Streams seek by time with. Flink, Spark and {@code --by-duration} resets go through
  * {@code AdminClient.listOffsets} instead. Prints one {@code time=<ms> offset=<offset|null>} line
  * per time.

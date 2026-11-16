@@ -181,7 +181,9 @@ public class IggyConsumerBuilder
     /// <summary>
     ///     Configures the consumer builder with a specified polling strategy.
     ///     A polling strategy defines the starting point for message consumption.
-    ///     After first poll, poll strategy is updated to the next message offset.
+    ///     After first poll, poll strategy is updated to the next message offset. With
+    ///     <see cref="CommitPolicy.OnRead" />, the strategy applies only to a partition without a stored offset. A
+    ///     partition with one resumes after it.
     /// </summary>
     /// <param name="pollingStrategy">A strategy that defines how and from where messages are polled.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>

@@ -19,10 +19,12 @@ package command
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 func TestPersonalAccessTokenCommandsMarshalBinary(t *testing.T) {
@@ -31,6 +33,7 @@ func TestPersonalAccessTokenCommandsMarshalBinary(t *testing.T) {
 		request Command
 		code    Code
 		want    []byte
+		wantErr error
 	}{
 		{
 			name:    "server default expiry",
@@ -92,14 +95,41 @@ func TestPersonalAccessTokenCommandsMarshalBinary(t *testing.T) {
 			code:    43,
 			want:    append([]byte{255}, bytes.Repeat([]byte{'t'}, 255)...),
 		},
+		{
+			name:    "create token with empty name",
+			request: &CreatePersonalAccessToken{Name: ""},
+			code:    42,
+			wantErr: ierror.ErrInvalidPersonalAccessTokenName,
+		},
+		{
+			name:    "create token with 256-byte name",
+			request: &CreatePersonalAccessToken{Name: strings.Repeat("t", 256)},
+			code:    42,
+			wantErr: ierror.ErrInvalidPersonalAccessTokenName,
+		},
+		{
+			name:    "delete token with empty name",
+			request: &DeletePersonalAccessToken{Name: ""},
+			code:    43,
+			wantErr: ierror.ErrInvalidPersonalAccessTokenName,
+		},
+		{
+			name:    "delete token with 256-byte name",
+			request: &DeletePersonalAccessToken{Name: strings.Repeat("t", 256)},
+			code:    43,
+			wantErr: ierror.ErrInvalidPersonalAccessTokenName,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := test.request.Code(); got != test.code {
 				t.Fatalf("command code = %d, want %d", got, test.code)
 			}
 			got, err := test.request.MarshalBinary()
-			if err != nil {
-				t.Fatal(err)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+			if got != nil && test.wantErr != nil {
+				t.Fatalf("command body = %x, want nil", got)
 			}
 			if !bytes.Equal(got, test.want) {
 				t.Fatalf("command body = %x, want %x", got, test.want)

@@ -38,10 +38,6 @@ inputs:
     description: "Dry run mode"
     required: false
     default: "false"
-  libc:
-    description: "Libc to use (glibc/musl)"
-    required: false
-    default: "musl"
   platform:
     description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
     required: false
@@ -318,7 +314,6 @@ runs:
         args="VERSION=${{ inputs.version }}
         BUILD_DATE=${{ github.event.repository.updated_at }}
         RUST_VERSION=${{ env.RUST_VERSION }}
-        LIBC=${{ inputs.libc }}
         IGGY_CI_BUILD=true"
         {
           echo "all<<__EOF__"

@@ -25,6 +25,7 @@ use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::requests::messages::{FetchMessagesRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
@@ -135,9 +136,14 @@ pub fn with_binary_deadline<F: Future>(
 
 #[doc(hidden)]
 pub fn binary_operation_deadline() -> Instant {
-    OPERATION_DEADLINE
-        .try_with(|deadline| *deadline)
-        .unwrap_or_else(|_| Instant::now() + BINARY_OPERATION_TIMEOUT)
+    binary_deadline_in_force().unwrap_or_else(|| Instant::now() + BINARY_OPERATION_TIMEOUT)
+}
+
+/// The deadline of the [`with_binary_deadline`] scope that the caller runs in. A task that the
+/// caller spawns runs outside that scope.
+#[doc(hidden)]
+pub fn binary_deadline_in_force() -> Option<Instant> {
+    OPERATION_DEADLINE.try_with(|deadline| *deadline).ok()
 }
 
 #[async_trait]
@@ -286,6 +292,24 @@ pub trait BinaryTransport {
     ) -> Result<Vec<crate::FetchedSection>, IggyError> {
         crate::FetchedSection::from_reply(&self.send_fetch_with_response(request).await?)
     }
+
+    /// The reply body of a `SyncConsumerGroup` with the metadata commit at
+    /// which the answering replica read the assignment. A transport that does
+    /// not know that commit names 0.
+    #[doc(hidden)]
+    async fn send_group_sync_with_commit(&self, payload: Bytes) -> Result<(Bytes, u64), IggyError> {
+        Ok((
+            self.send_raw_with_response(SYNC_CONSUMER_GROUP_CODE, payload)
+                .await?,
+            0,
+        ))
+    }
+
+    /// Raises the metadata watermark of the session to `commit`, so its later
+    /// requests wait for a replica that applied it. A transport without a
+    /// watermark ignores it.
+    #[doc(hidden)]
+    fn observe_metadata_commit(&self, _commit: u64) {}
 
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 

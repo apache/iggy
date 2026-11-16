@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Builds cross-platform binaries and connector plugins, then publishes
+# Builds cross-platform binaries, then publishes
 # them as a rolling "edge" GitHub pre-release updated on every master push.
 
 name: Edge release
@@ -84,7 +84,7 @@ jobs:
           make_latest: false
           files: artifacts/*.tar.gz
           body: |
-            Rolling edge build of Apache Iggy binaries and connector plugins.
+            Rolling edge build of Apache Iggy binaries.
 
             **This release is automatically updated on every push to master.**
 
@@ -92,20 +92,6 @@ jobs:
             - `iggy-server` - The server binary
             - `iggy` - The command-line interface
             - `iggy-bench` - The benchmarking tool
-            - `iggy-connectors` - The connectors runtime
-
-            ## Connector plugins included (.so)
-            - `iggy_connector_elasticsearch_sink`
-            - `iggy_connector_elasticsearch_source`
-            - `iggy_connector_iceberg_sink`
-            - `iggy_connector_postgres_sink`
-            - `iggy_connector_postgres_source`
-            - `iggy_connector_quickwit_sink`
-            - `iggy_connector_random_source`
-            - `iggy_connector_s3_sink`
-            - `iggy_connector_stdout_sink`
-            - `iggy_connector_surrealdb_sink`
-            - `iggy_connector_rabbitmq_sink`
 
             ## Downloads
 
@@ -114,10 +100,6 @@ jobs:
             - `iggy-x86_64-unknown-linux-musl-edge.tar.gz` - Linux x86_64 (musl, static)
             - `iggy-aarch64-unknown-linux-gnu-edge.tar.gz` - Linux ARM64 (glibc)
             - `iggy-aarch64-unknown-linux-musl-edge.tar.gz` - Linux ARM64 (musl, static)
-
-            ### Connector plugins
-            - `iggy-connectors-x86_64-unknown-linux-gnu-edge.tar.gz` - Linux x86_64 (glibc)
-            - `iggy-connectors-aarch64-unknown-linux-gnu-edge.tar.gz` - Linux ARM64 (glibc)
 
             ## Build info
             - Server version: ${{ steps.meta.outputs.server_version }}

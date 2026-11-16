@@ -368,6 +368,7 @@ pub struct ShardMetrics {
     partitions_under_replicated: Gauge,
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
+    partition_segment_upload_lag_seconds: Gauge,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -395,6 +396,16 @@ pub struct ShardMetrics {
     client_requests: ClientRequestMetrics,
     fetches: FetchMetrics,
     readiness_push_to_fire: Histogram,
+    /// How late each consensus tick of the message pump ran after its timer
+    /// was due: the time the shard's thread spent on other work first.
+    pump_tick_lateness: Histogram,
+    /// 1 while this node passes the store identity check of tiered storage.
+    /// Both object store gauges hold for the whole node, so every shard
+    /// exports the same ones, see [`Self::share_object_store_gauges`].
+    object_store_identity_verified: Gauge,
+    /// 1 while the object store did not answer the last read of its identity
+    /// object: the boot probe, then each identity check.
+    object_store_unreachable: Gauge,
 }
 
 impl ShardMetrics {
@@ -465,6 +476,7 @@ impl ShardMetrics {
             partitions_under_replicated: Gauge::default(),
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
+            partition_segment_upload_lag_seconds: Gauge::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -492,6 +504,9 @@ impl ShardMetrics {
             client_requests: ClientRequestMetrics::new(),
             fetches: FetchMetrics::new(),
             readiness_push_to_fire: latency_histogram(),
+            pump_tick_lateness: latency_histogram(),
+            object_store_identity_verified: Gauge::default(),
+            object_store_unreachable: Gauge::default(),
         }
     }
 
@@ -508,6 +523,39 @@ impl ShardMetrics {
 
     pub(crate) fn record_readiness_push_to_fire(&self, elapsed: Duration) {
         self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
+    }
+
+    pub(crate) fn record_pump_tick_lateness(&self, lateness: Duration) {
+        self.pump_tick_lateness.observe(lateness.as_secs_f64());
+    }
+
+    /// Set `object_store_identity_verified`, for every shard that shares it.
+    pub fn set_object_store_identity_verified(&self, verified: bool) {
+        self.object_store_identity_verified.set(i64::from(verified));
+    }
+
+    /// Set `object_store_unreachable`, for every shard that shares it.
+    pub fn set_object_store_unreachable(&self, unreachable: bool) {
+        self.object_store_unreachable.set(i64::from(unreachable));
+    }
+
+    /// Export the object store gauges of `node` from this shard as well.
+    /// Only the boot probe and the store identity check of shard 0 set them.
+    pub fn share_object_store_gauges(&mut self, node: &Self) {
+        self.object_store_identity_verified = node.object_store_identity_verified.clone();
+        self.object_store_unreachable = node.object_store_unreachable.clone();
+    }
+
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn object_store_identity_verified_value(&self) -> bool {
+        self.object_store_identity_verified.get() != 0
+    }
+
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn object_store_unreachable_value(&self) -> bool {
+        self.object_store_unreachable.get() != 0
     }
 
     pub fn record_persistence(&self, metrics: &partitions::PersistenceMetrics) {
@@ -887,6 +935,21 @@ impl ShardMetrics {
     pub fn set_partitions_owing_retirement(&self, owing: usize) {
         self.partitions_owing_retirement
             .set(i64::try_from(owing).unwrap_or(i64::MAX));
+    }
+
+    /// Republished by every timed upload pass: the age of the oldest sealed
+    /// segment that waits for its upload, over the tiered partitions this
+    /// shard leads. Zero when none waits.
+    pub fn set_segment_upload_lag(&self, lag: Duration) {
+        self.partition_segment_upload_lag_seconds
+            .set(i64::try_from(lag.as_secs()).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn segment_upload_lag_seconds_value(&self) -> i64 {
+        self.partition_segment_upload_lag_seconds.get()
     }
 
     pub fn record_retirement_debt_paid(&self) {
@@ -1285,6 +1348,12 @@ impl ShardMetrics {
             self.partitions_owing_retirement.clone(),
         );
         registry.register(
+            "partition_segment_upload_lag_seconds",
+            "age of the oldest sealed segment that waits for its upload to the object store, \
+             over the tiered partitions this shard leads",
+            self.partition_segment_upload_lag_seconds.clone(),
+        );
+        registry.register(
             "retirement_debts_paid",
             "retirement debts this node paid as a partition primary",
             self.retirement_debts_paid_total.clone(),
@@ -1410,6 +1479,21 @@ impl ShardMetrics {
             "time from applying the pushed partition state that made a parked readiness wait \
              ready to the end of that wait",
             self.readiness_push_to_fire.clone(),
+        );
+        registry.register(
+            "pump_tick_lateness_seconds",
+            "how late each consensus tick of the message pump ran after its timer was due",
+            self.pump_tick_lateness.clone(),
+        );
+        registry.register(
+            "object_store_identity_verified",
+            "1 while this node passes the store identity check of tiered storage, so it runs uploads and object deletes",
+            self.object_store_identity_verified.clone(),
+        );
+        registry.register(
+            "object_store_unreachable",
+            "1 while the object store did not answer the last read of its identity object, at boot or in the check every minute",
+            self.object_store_unreachable.clone(),
         );
     }
 
@@ -1821,6 +1905,70 @@ mod tests {
             ],
             "a command without requests stays out of the scrape",
         );
+    }
+
+    #[test]
+    fn object_store_gauges_follow_their_last_setting() {
+        let metrics = ShardMetrics::for_shard();
+        let series = |name: &str| {
+            metrics
+                .scrape()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .map(str::to_owned)
+        };
+
+        assert_eq!(
+            series("object_store_identity_verified").as_deref(),
+            Some("object_store_identity_verified 0")
+        );
+        assert_eq!(
+            series("object_store_unreachable").as_deref(),
+            Some("object_store_unreachable 0")
+        );
+        metrics.set_object_store_identity_verified(true);
+        metrics.set_object_store_unreachable(true);
+        assert_eq!(
+            series("object_store_identity_verified").as_deref(),
+            Some("object_store_identity_verified 1")
+        );
+        assert_eq!(
+            series("object_store_unreachable").as_deref(),
+            Some("object_store_unreachable 1")
+        );
+        metrics.set_object_store_unreachable(false);
+        assert_eq!(
+            series("object_store_unreachable").as_deref(),
+            Some("object_store_unreachable 0")
+        );
+    }
+
+    #[test]
+    fn shared_object_store_gauges_show_the_settings_of_shard_0_on_every_shard() {
+        let shard_0 = ShardMetrics::for_shard();
+        let mut shard_1 = ShardMetrics::for_shard();
+        shard_1.share_object_store_gauges(&shard_0);
+
+        shard_0.set_object_store_identity_verified(true);
+        shard_0.set_object_store_unreachable(true);
+
+        assert!(shard_1.object_store_identity_verified_value());
+        assert!(shard_1.object_store_unreachable_value());
+        let scrape = shard_1.scrape();
+        assert!(
+            scrape
+                .lines()
+                .any(|line| line == "object_store_identity_verified 1")
+        );
+        assert!(
+            scrape
+                .lines()
+                .any(|line| line == "object_store_unreachable 1")
+        );
+        shard_0.set_object_store_identity_verified(false);
+        shard_0.set_object_store_unreachable(false);
+        assert!(!shard_1.object_store_identity_verified_value());
+        assert!(!shard_1.object_store_unreachable_value());
     }
 
     #[test]

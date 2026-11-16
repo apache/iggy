@@ -793,11 +793,16 @@ struct DeferredRequestTests {
 
     /// A fetch goes over a data connection with what is left of its options.
     /// Each target carries its own fence, from the context of its start point
-    /// or the incarnation of its route, so the header carries none.
-    @Test func aFetchFencesEachTargetAndCarriesNoHeaderContext() async throws {
+    /// or the incarnation of its route. The header names only the metadata
+    /// watermark of the session, which is older than the route here.
+    @Test func aFetchFencesEachTargetAndCarriesTheMetadataWatermark() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
+        let commit: UInt64 = 5
         await server.respond { request in
+            if request.operation == .deleteStream {
+                return .committed([], commit: commit)
+            }
             guard request.code == CommandCode.fetchMessages.rawValue else {
                 return FakeVSRServer.defaultReply(request, address: server.address)
             }
@@ -805,6 +810,8 @@ struct DeferredRequestTests {
                 FakeVSRServer.fetchedBody([.init(partitionID: 2, offsets: [5, 6]), .init(partitionID: 1, status: IggyErrorCode.notPrimary.rawValue)]))
         }
         let client = try await signedInClient(server)
+        try await client.deleteStream(1)
+        #expect(await client.core.metadataWatermark == commit)
         let carried = PartitionContext(incarnation: 4, ownerGeneration: 2, metadataOp: 1)
         let unfenced = PartitionContext(incarnation: 0, ownerGeneration: 6, metadataOp: 0)
         let options = DeferredPollOptions(maxWait: .milliseconds(500), minCount: 2, maxBytes: 4096, requestTimeout: .seconds(3))
@@ -820,7 +827,7 @@ struct DeferredRequestTests {
         #expect(sections[1].error == IggyError(.notPrimary))
 
         let request = try #require(await requests(server, .fetchMessages).first)
-        #expect(request.context == .empty)
+        #expect(request.context == PartitionContext(incarnation: 0, ownerGeneration: 0, metadataOp: commit))
         #expect(request.operation == .nonReplicated)
         let fetch = try request.fetch
         let route = FakeVSRServer.routeContext
@@ -839,6 +846,37 @@ struct DeferredRequestTests {
         let login = try #require(await server.requests.first)
         #expect(request.connection != login.connection)
         #expect(await requests(server, .bindSession).map(\.connection) == [request.connection])
+        await client.shutdown()
+    }
+
+    /// A sync reply names the commit its node read the assignment at, which
+    /// covers the handovers that installed the owners. A sync that finds a new
+    /// assignment raises the watermark of the next fetch to that commit. One
+    /// that finds the same assignment again raises nothing, even at a newer
+    /// commit.
+    @Test func aSyncRaisesTheFetchWatermarkOnlyWhenTheAssignmentChanges() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        // Both stay below the op of the route, so a raise shows in the header instead of refusing the route.
+        let commits: [UInt64] = [5, 8]
+        let syncs = Locked(0)
+        await server.respond { request in
+            guard request.code == CommandCode.syncConsumerGroup.rawValue else {
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+            let sync = syncs.withLock { count in
+                count += 1
+                return count
+            }
+            return .committed(FakeVSRServer.assignmentBody(generation: 1, partitions: [1]), commit: commits[min(sync, commits.count) - 1])
+        }
+        let client = try await signedInClient(server)
+        for _ in commits {
+            try await client.syncGroupAssignment(streamID: 1, topicID: 2, groupID: 3, lineage: nil)
+            _ = try await client.fetchMessages(streamID: 1, topicID: 2, targets: [(1, .offset(0))], consumer: .group(3), count: 1, autoCommit: false)
+        }
+        #expect(await requests(server, .syncConsumerGroup).count == commits.count)
+        #expect(await requests(server, .fetchMessages).map(\.context.metadataOp) == [commits[0], commits[0]])
         await client.shutdown()
     }
 

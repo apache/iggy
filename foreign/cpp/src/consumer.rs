@@ -26,6 +26,7 @@ use iggy::prelude::{
 use crate::{
     RUNTIME, ffi,
     messages::{Checkpoint, Continuation},
+    reader::block_on_write,
 };
 
 const CLOSED: &str = "the consumer is closed";
@@ -87,8 +88,7 @@ impl Consumer {
         let consumer = consumer
             .as_ref()
             .ok_or_else(|| format!("Could not commit checkpoint: {CLOSED}"))?;
-        RUNTIME
-            .block_on(consumer.commit(checkpoint.0))
+        block_on_write(consumer.commit(checkpoint.0))
             .inspect_err(|error| error_info.record(error))
             .map_err(|error| format!("Could not commit checkpoint: {error}"))
     }
@@ -141,8 +141,7 @@ impl Consumer {
         let consumer = consumer
             .as_mut()
             .ok_or_else(|| format!("Could not seek partition {partition_id}: {CLOSED}"))?;
-        RUNTIME
-            .block_on(consumer.seek(partition_id, start))
+        block_on_write(consumer.seek(partition_id, start))
             .inspect_err(|error| error_info.record(error))
             .map_err(|error| format!("Could not seek partition {partition_id}: {error}"))
     }

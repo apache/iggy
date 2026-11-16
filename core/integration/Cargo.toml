@@ -22,29 +22,32 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# `rust-s3`'s lib target is `s3`, so machete greps for `rust_s3`, never finds
-# it, and reports the crate unused. It is used (`use s3::{Bucket, Region}` in
-# the connector S3 fixture); removing it breaks the whole test build.
 [package.metadata.cargo-machete]
-ignored = ["cfg_aliases", "rust-s3"]
+ignored = ["cfg_aliases"]
 
 [features]
 default = ["login-session"]
-login-session = ["dep:zbus-secret-service-keyring-store"]
+# Gates only the keyring backend of the CLI login tests. Its store is a
+# dev-dependency, and a dev-dependency cannot be optional.
+login-session = []
 
 [dependencies]
-assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+compio = { workspace = true }
 configs = { workspace = true }
 # Decodes a metadata replica's durable `VsrState` off disk in the superblock
 # recovery test.
 consensus = { workspace = true }
+# statvfs of the data volume, as the server's disk usage sampler reads it.
+fs2 = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+# The S3 provider, which creates the buckets of the Floci fixture.
+iggy_object_store = { workspace = true }
 # Locates and decodes the on-disk superblock slot files in the recovery test
 # (`SLOT_FILE_NAMES`, `decode_slots`).
 journal = { workspace = true }
@@ -59,64 +62,47 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["full", "test-util"] }
+# Starts Floci, the S3 store of the tests that run tiered storage on s3.
+testcontainers = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-zbus-secret-service-keyring-store = { workspace = true, optional = true }
-
 [build-dependencies]
 cfg_aliases = { workspace = true }
 
 [dev-dependencies]
-apache-avro = { workspace = true }
-arrow = { workspace = true }
+assert_cmd = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
-compio = { workspace = true }
 configs_derive = { workspace = true }
 ctor = { workspace = true }
-deltalake = { workspace = true }
 dtor = { workspace = true }
 figment = { workspace = true }
 hex = { workspace = true }
 humantime = { workspace = true }
 iggy-cli = { workspace = true }
-iggy_connector_doris_sink = { workspace = true }
-iggy_connector_sdk = { workspace = true, features = ["api"] }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
-lapin = { workspace = true }
-mongodb = { workspace = true }
-parquet = { workspace = true }
-pgwire = { workspace = true }
 predicates = { workspace = true }
-reqwest-middleware = { workspace = true }
-reqwest-retry = { workspace = true }
 ring = { workspace = true }
-rumqttc-v4 = { workspace = true }
-rumqttc-v5 = { workspace = true }
-rust-s3 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serial_test = { workspace = true }
-sqlparser = { workspace = true }
-sqlx = { workspace = true }
+server_common = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
-tokio-postgres = { workspace = true }
 twox-hash = { workspace = true }
-url = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dev-dependencies]
+zbus-secret-service-keyring-store = { workspace = true }
 
 [lints]
 workspace = true

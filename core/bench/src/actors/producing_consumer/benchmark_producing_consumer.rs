@@ -38,7 +38,7 @@ use bench_report::{
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep_until};
 use tracing::info;
 
 pub struct BenchmarkProducingConsumer<P, C>
@@ -119,7 +119,11 @@ where
                 if let Some(batch) = self.producer.produce_batch(&mut batch_generator).await? {
                     user_data_bytes += batch.user_data_bytes;
                 }
-                if let Some(batch) = self.consumer.consume_batch().await? {
+                if let Some(batch) = self
+                    .consumer
+                    .consume_batch_until(sleep_until(warmup_end))
+                    .await?
+                {
                     user_data_bytes += batch.user_data_bytes;
                 }
                 if let Some(limiter) = &mut rate_limiter {
@@ -189,7 +193,10 @@ where
 
             if is_consumer
                 && !self.poll_finish_condition.is_done()
-                && let Some(batch) = self.consumer.consume_batch().await?
+                && let Some(batch) = self
+                    .consumer
+                    .consume_batch_until(self.poll_finish_condition.wait_until_done())
+                    .await?
             {
                 uncharged_bytes += batch.user_data_bytes;
                 recv_user_bytes += batch.user_data_bytes;
@@ -490,5 +497,117 @@ where
         ]);
 
         println!("\n{table}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::actors::fakes::{FakeConsumer, FakeProducer};
+    use crate::args::common::IggyBenchArgs;
+    use crate::utils::finish_condition::BenchmarkFinishConditionMode;
+
+    // Sends and polls each get half of the total, and each fake batch carries 32 bytes.
+    const ONE_BATCH_EACH: &str = "64B";
+    const TWO_BATCHES_EACH: &str = "128B";
+    const NO_WARMUP: &str = "0s";
+    const LONG_WARMUP: &str = "1s";
+    const STREAM_ID: &str = "bench-stream-1";
+    const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn given_blocked_poll_when_warming_up_should_end_warmup_at_deadline() {
+        let args = bench_args(ONE_BATCH_EACH, LONG_WARMUP);
+        let actor = producing_consumer(&args);
+        let send_finish_condition = actor.send_finish_condition.clone();
+        let deadline = args.warmup_time().get_duration() + TIMER_RESOLUTION;
+
+        // After the warmup, the actor sends its one batch and then waits in its poll.
+        let run = timeout(deadline, actor.run()).await;
+
+        assert!(run.is_err());
+        assert!(
+            send_finish_condition.is_done(),
+            "the warmup must end at its deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_blocked_poll_when_another_member_reaches_poll_total_should_keep_sending() {
+        let args = bench_args(TWO_BATCHES_EACH, NO_WARMUP);
+        let actor = producing_consumer(&args);
+        let send_finish_condition = actor.send_finish_condition.clone();
+        let poll_finish_condition = actor.poll_finish_condition.clone();
+        let run = tokio::spawn(actor.run());
+        // Paused time moves only when every task waits, so the actor is in its poll by then.
+        sleep(TIMER_RESOLUTION).await;
+
+        poll_finish_condition.account_and_check(poll_finish_condition.total());
+
+        let run = timeout(TIMER_RESOLUTION, run)
+            .await
+            .expect("the actor must stop polling when another member reaches the poll total");
+        assert!(run.unwrap().is_ok());
+        assert!(
+            send_finish_condition.is_done(),
+            "the actor must keep sending after the poll total"
+        );
+    }
+
+    fn bench_args(total_data: &str, warmup_time: &str) -> IggyBenchArgs {
+        IggyBenchArgs::parse_from([
+            "iggy-bench",
+            "--total-data",
+            total_data,
+            "--messages-per-batch",
+            "1",
+            "--message-size",
+            "32",
+            "--warmup-time",
+            warmup_time,
+            "end-to-end-producing-consumer-group",
+            "tcp",
+        ])
+    }
+
+    fn producing_consumer(
+        args: &IggyBenchArgs,
+    ) -> BenchmarkProducingConsumer<FakeProducer, FakeConsumer> {
+        BenchmarkProducingConsumer::new(
+            FakeProducer,
+            FakeConsumer {
+                resets: Arc::default(),
+                blocked: true,
+            },
+            args.kind(),
+            BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::SharedHalf),
+            BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::SharedHalf),
+            args.sampling_time(),
+            args.moving_average_window(),
+            None,
+            BenchmarkProducerConfig {
+                producer_id: 1,
+                stream_id: STREAM_ID.to_owned(),
+                partitions: 1,
+                messages_per_batch: args.messages_per_batch(),
+                message_size: args.message_size(),
+                warmup_time: args.warmup_time(),
+                pretty: false,
+            },
+            BenchmarkConsumerConfig {
+                consumer_id: 1,
+                consumer_group_id: Some(1),
+                stream_id: STREAM_ID.to_owned(),
+                messages_per_batch: args.messages_per_batch(),
+                warmup_time: args.warmup_time(),
+                polling_kind: PollingKind::Next,
+                poll_options: args.poll_options(),
+                origin_timestamp_latency_calculation: true,
+                pretty: false,
+            },
+        )
     }
 }

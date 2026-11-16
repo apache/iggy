@@ -22,7 +22,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::*;
-use integration::harness::wait_for_topic_messages_count;
+use integration::harness::{cargo_bin_path, wait_for_topic_messages_count};
 use predicates::str::{contains, diff};
 use serial_test::parallel;
 use std::collections::BTreeMap;
@@ -485,8 +485,7 @@ fn given_invalid_message_key_when_sending_should_reject_before_connecting() {
     let oversized_unicode_key = "é".repeat(usize::from(u8::MAX) / "é".len() + 1);
 
     for key in ["", oversized_key.as_str(), oversized_unicode_key.as_str()] {
-        #[allow(deprecated)]
-        let mut command = assert_cmd::Command::cargo_bin("iggy").unwrap();
+        let mut command = assert_cmd::Command::new(cargo_bin_path("iggy").unwrap());
         command
             .env("IGGY_HOME", cli_home.path())
             .args([

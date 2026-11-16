@@ -20,6 +20,10 @@
 use iggy_common::SemanticVersion;
 #[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
 use mimalloc::MiMalloc;
+// `--all-features` leaves the allocator off, and cargo then reports the crate
+// as an unused dependency.
+#[cfg(all(feature = "mimalloc", feature = "disable-mimalloc"))]
+use mimalloc as _;
 
 // Both features are checked because `--all-features` turns on `mimalloc` and
 // `disable-mimalloc` at once, while `--no-default-features` drops the crate.
@@ -64,15 +68,19 @@ pub(crate) mod wire;
 pub(crate) mod http;
 
 // background: per-shard maintenance loops.
+pub(crate) mod incarnation_deletes;
 pub(crate) mod partition_reconciler;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
     reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
 pub(crate) mod personal_access_token_cleaner;
+pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;
+pub(crate) mod store_identity;
 pub(crate) mod sysinfo_printer;
+pub(crate) mod tiered_storage;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;

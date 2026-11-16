@@ -246,17 +246,23 @@ fn frame_request(
 }
 
 // ── Payload builders ──────────────────────────────────────────────────────────
+
+const CLIENT_SOFTWARE_NAME: &str = "kafka-message-gen";
+const CLIENT_SOFTWARE_VERSION: &str = "0.1.0";
+
 // Build the API-specific encoded body for a given api_key and version.
 // All required fields contain realistic non-zero values.
 // Returns raw bytes WITHOUT the framing header.
 fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
     let mut buf = BytesMut::new();
     match api_key {
+        // `kafka-protocol` 0.18 encodes `ApiVersions` only up to v4.
+        18 if version == 5 => put_api_versions_v5(&mut buf),
         18 => {
             let mut r = ApiVersionsRequest::default();
             if version >= 3 {
-                r.client_software_name = StrBytes::from_static_str("kafka-message-gen");
-                r.client_software_version = StrBytes::from_static_str("0.1.0");
+                r.client_software_name = StrBytes::from_static_str(CLIENT_SOFTWARE_NAME);
+                r.client_software_version = StrBytes::from_static_str(CLIENT_SOFTWARE_VERSION);
             }
             r.encode(&mut buf, version).context("ApiVersions")?;
         }
@@ -641,6 +647,28 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
     Ok(buf.freeze())
 }
 
+/// `ApiVersions` v5 adds the `ClusterId` and `NodeId` of the broker that the client means to reach
+/// (KIP-1242). A client sends a null `ClusterId` and `NodeId` -1 to a bootstrap server, and so
+/// does this request.
+fn put_api_versions_v5(buf: &mut BytesMut) {
+    put_compact_string(buf, CLIENT_SOFTWARE_NAME);
+    put_compact_string(buf, CLIENT_SOFTWARE_VERSION);
+    buf.put_u8(0); // null ClusterId
+    buf.put_i32(-1); // NodeId
+    buf.put_u8(0); // no tagged fields
+}
+
+/// A compact string: the byte length plus one as an unsigned varint, then the bytes.
+fn put_compact_string(buf: &mut BytesMut, value: &str) {
+    let mut len = value.len() + 1;
+    while len >= 0x80 {
+        buf.put_u8((len & 0x7F) as u8 | 0x80);
+        len >>= 7;
+    }
+    buf.put_u8(len as u8);
+    buf.put_slice(value.as_bytes());
+}
+
 // Build a complete framed Kafka request message ready for TCP transmission.
 fn build_framed(api_key: i16, version: i16, corr: i32) -> Result<Bytes> {
     let payload = build_payload(api_key, version)?;
@@ -990,5 +1018,40 @@ mod tests {
                 "v{version}"
             );
         }
+    }
+
+    /// `kafka-protocol` cannot encode v5, so its v4 body is the reference: v5 puts a null
+    /// `ClusterId` and `NodeId` -1 before the tagged fields.
+    #[test]
+    fn given_api_versions_v5_should_add_a_null_cluster_id_and_node_id_to_the_v4_body() {
+        let v4 = build_payload(18, 4).expect("ApiVersions v4 builds");
+        let v5 = build_payload(18, 5).expect("ApiVersions v5 builds");
+
+        let (fields, tagged_fields) = v4.split_at(v4.len() - 1);
+        let mut expected = fields.to_vec();
+        expected.push(0);
+        expected.extend_from_slice(&(-1_i32).to_be_bytes());
+        expected.extend_from_slice(tagged_fields);
+        assert_eq!(v5.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn given_an_api_versions_v5_response_should_decode_the_v4_fields() {
+        let mut payload = BytesMut::new();
+        payload.put_i32(7); // correlation id, in a v0 response header
+        payload.put_i16(0); // error code
+        payload.put_u8(2); // a compact array of one api key
+        payload.put_i16(18); // ApiVersions, versions 0 to 5
+        payload.put_i16(0);
+        payload.put_i16(5);
+        payload.put_u8(0); // no tagged fields
+        payload.put_i32(0); // throttle time
+        payload.put_u8(0); // no tagged fields
+
+        let summary = response::analyze_response(18, 5, 7, &payload);
+
+        assert!(summary.correlation_match);
+        assert_eq!(summary.decode_note, None);
+        assert_eq!(summary.primary_error_code, 0);
     }
 }

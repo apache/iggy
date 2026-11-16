@@ -24,9 +24,10 @@ mod cli;
 mod cluster;
 mod config_env_listing;
 mod config_provider;
-mod connectors;
+mod connectors_harness;
 mod data_integrity;
 mod mcp;
+mod object_store;
 mod sdk;
 mod server;
 

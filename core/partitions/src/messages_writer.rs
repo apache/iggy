@@ -23,6 +23,7 @@ use iggy_common::{IggyByteSize, IggyError};
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::preallocate_file;
 use server_common::iobuf::{Frozen, IOV_MAX};
+use server_common::{DISK_USAGE, unreserved_bytes};
 use std::{
     path::Path,
     rc::Rc,
@@ -36,6 +37,10 @@ pub struct MessagesWriter {
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
+    /// End of the space `new` reserved, 0 without preallocation or when the
+    /// reservation took no effect. Writes below it fill blocks the reservation
+    /// already charged.
+    reserved_end: u64,
 }
 
 impl MessagesWriter {
@@ -63,9 +68,10 @@ impl MessagesWriter {
             .note_descriptor_exhaustion(|| format!("opening {file_path}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        if let Some(preallocate_size) = preallocate_size {
-            preallocate_file(&file, Path::new(file_path), preallocate_size.as_bytes_u64()).await;
-        }
+        let reserved_end = match preallocate_size {
+            Some(size) => preallocate_file(&file, Path::new(file_path), size.as_bytes_u64()).await,
+            None => 0,
+        };
 
         if file_exists {
             file.sync_all()
@@ -100,6 +106,7 @@ impl MessagesWriter {
             file,
             messages_size_bytes,
             fsync,
+            reserved_end,
         })
     }
 
@@ -129,7 +136,14 @@ impl MessagesWriter {
             return Ok(IggyByteSize::from(0));
         }
 
-        write_frozen_chunked(&self.file, &self.file_path, position, buffers).await?;
+        write_frozen_chunked(
+            &self.file,
+            &self.file_path,
+            position,
+            self.reserved_end,
+            buffers,
+        )
+        .await?;
 
         if self.fsync && completes_save {
             self.fsync().await?;
@@ -181,12 +195,14 @@ async fn write_frozen_chunked<const ALIGN: usize>(
     file: &File,
     file_path: &str,
     mut position: u64,
+    reserved_end: u64,
     buffers: &[Frozen<ALIGN>],
 ) -> Result<(), IggyError> {
     for chunk in buffers.chunks(IOV_MAX) {
         let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
         let chunk_vec: Vec<_> = chunk.to_vec();
-
+        let end = position + chunk_size as u64;
+        let _charge = DISK_USAGE.charge(unreserved_bytes(position, end, reserved_end));
         let (result, _) = (&*file)
             .write_vectored_all_at(chunk_vec, position)
             .await
@@ -202,7 +218,7 @@ async fn write_frozen_chunked<const ALIGN: usize>(
             IggyError::CannotWriteToFile
         })?;
 
-        position += chunk_size as u64;
+        position = end;
     }
 
     Ok(())
