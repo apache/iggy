@@ -214,11 +214,15 @@ function cleanup_server_state() {
     rm -f "${EXAMPLES_LOG_FILE}" "${EXAMPLES_PID_FILE}"
 }
 
+# Both servers run without the shipped disk usage limit unless the caller sets
+# it, because a nearly full machine would refuse every write at the limit.
+
 # Start the plain (non-TLS) iggy server in background.
 # Usage: start_plain_server [extra_args...]
 function start_plain_server() {
     echo "Starting server from ${SERVER_BIN}..."
     IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+        IGGY_DISK_USAGE_LIMIT_ENABLED="${IGGY_DISK_USAGE_LIMIT_ENABLED:-false}" \
         ${SERVER_BIN} "$@" &>"${EXAMPLES_LOG_FILE}" &
     echo $! >"${EXAMPLES_PID_FILE}"
 }
@@ -228,6 +232,7 @@ function start_plain_server() {
 function start_tls_server() {
     echo "Starting TLS server from ${SERVER_BIN}..."
     IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+        IGGY_DISK_USAGE_LIMIT_ENABLED="${IGGY_DISK_USAGE_LIMIT_ENABLED:-false}" \
         IGGY_TCP_TLS_ENABLED=true \
         IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
         IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \

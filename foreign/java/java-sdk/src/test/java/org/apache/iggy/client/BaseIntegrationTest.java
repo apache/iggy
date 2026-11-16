@@ -87,6 +87,8 @@ public abstract class BaseIntegrationTest {
                     .withExposedPorts(HTTP_PORT, TCP_PORT)
                     .withEnv("IGGY_ROOT_USERNAME", "iggy")
                     .withEnv("IGGY_ROOT_PASSWORD", "iggy")
+                    // A nearly full machine would refuse every write at the shipped disk usage limit.
+                    .withEnv("IGGY_DISK_USAGE_LIMIT_ENABLED", "false")
                     .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:" + TCP_PORT)
                     .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:" + HTTP_PORT)
                     .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", LOCALHOST_IP)

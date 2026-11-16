@@ -76,6 +76,8 @@ def tls_container():
         .with_exposed_ports(CONTAINER_TCP_PORT)
         .with_env("IGGY_ROOT_USERNAME", "iggy")
         .with_env("IGGY_ROOT_PASSWORD", "iggy")
+        # A nearly full machine would refuse every write at the disk usage limit.
+        .with_env("IGGY_DISK_USAGE_LIMIT_ENABLED", "false")
         .with_env("IGGY_TCP_TLS_ENABLED", "true")
         .with_env("IGGY_TCP_TLS_CERT_FILE", "/app/certs/iggy_cert.pem")
         .with_env("IGGY_TCP_TLS_KEY_FILE", "/app/certs/iggy_key.pem")

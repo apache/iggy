@@ -223,6 +223,8 @@ class IggyPinotIntegrationTest {
                 .withExposedPorts(IGGY_HTTP_PORT, IGGY_TCP_PORT)
                 .withEnv("IGGY_ROOT_USERNAME", "iggy")
                 .withEnv("IGGY_ROOT_PASSWORD", "iggy")
+                // A nearly full machine would refuse every write at the shipped disk usage limit.
+                .withEnv("IGGY_DISK_USAGE_LIMIT_ENABLED", "false")
                 .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:" + IGGY_TCP_PORT)
                 .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:" + IGGY_HTTP_PORT)
                 .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", IGGY_NETWORK_ALIAS)

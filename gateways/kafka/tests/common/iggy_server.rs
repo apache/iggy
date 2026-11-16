@@ -341,6 +341,9 @@ impl TestServer {
             // the server refuses to boot. The password is the one the bridge logs in with.
             .env("IGGY_ROOT_USERNAME", "iggy")
             .env("IGGY_ROOT_PASSWORD", password)
+            // A nearly full test machine would refuse every write at the shipped disk usage
+            // limit. Placed before `envs`, so a test can still turn it on.
+            .env("IGGY_DISK_USAGE_LIMIT_ENABLED", "false")
             .envs(env.iter().copied());
         if let Some((cert_file, key_file)) = tls {
             // `self_signed` is off explicitly: left on, the server would still load an existing
@@ -599,6 +602,7 @@ impl TestCluster {
             .env("IGGY_SHARDING_CPU_ALLOCATION", "2")
             .env("IGGY_ROOT_USERNAME", "iggy")
             .env("IGGY_ROOT_PASSWORD", "iggy")
+            .env("IGGY_DISK_USAGE_LIMIT_ENABLED", "false")
             .env("IGGY_CLUSTER_ENABLED", "true")
             .env("IGGY_CLUSTER_NAME", "kafka-gateway-test");
         for (peer, peer_node) in self.nodes.iter().enumerate() {

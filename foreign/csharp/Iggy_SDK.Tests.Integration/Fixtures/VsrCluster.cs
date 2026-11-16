@@ -227,6 +227,8 @@ internal sealed class VsrCluster : IAsyncDisposable
             .WithName($"iggy-vsr-{_name}-{node}-{_idSuffix}")
             .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
             .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
+            // A nearly full machine would refuse every write at the shipped disk usage limit.
+            .WithEnvironment("IGGY_DISK_USAGE_LIMIT_ENABLED", "false")
             .WithEnvironment("IGGY_PATH", $"local_data_vsr_{node}")
             .WithEnvironment("IGGY_TCP_ADDRESS", $"0.0.0.0:{ports.Tcp}")
             .WithEnvironment("IGGY_HTTP_ADDRESS", $"0.0.0.0:{ports.Http}")
