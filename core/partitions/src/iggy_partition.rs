@@ -5543,6 +5543,18 @@ where
         }
     }
 
+    /// Whether `message` sends again a batch of an idempotent producer that
+    /// already committed. It adds no data, so the disk usage limit lets it
+    /// through, and [`Self::admit_producer_batch`] answers it with the reply
+    /// that proves the first copy committed. Checked only while the limit
+    /// refuses, since it reads the batches in flight.
+    fn resends_committed_batch(&self, message: &Message<RoutedRequestHeader>) -> bool {
+        matches!(
+            self.check_producer_batch(message),
+            Ok(ProducerAdmission::Duplicate { .. })
+        )
+    }
+
     /// A key counts as held once it is durable, or once an admitted store for
     /// it is in flight, since that store already allocates its file.
     fn holds_consumer_offset_key(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
@@ -8219,7 +8231,8 @@ where
             if let Err(error) = self.disk_admission(
                 message.header().operation,
                 consumer_offset.map(|(kind, consumer_id, _, _)| (kind, consumer_id)),
-            ) {
+            ) && !self.resends_committed_batch(&message)
+            {
                 Self::send_partition_deny_or_log(
                     consensus,
                     message.header(),
@@ -8574,7 +8587,9 @@ where
                 continue;
             }
             // Offset keys are checked below, once the request is parsed.
-            if let Err(error) = self.disk_admission(header.operation, None) {
+            if let Err(error) = self.disk_admission(header.operation, None)
+                && !self.resends_committed_batch(&request.message)
+            {
                 if self
                     .deny_queued_request(
                         &header,

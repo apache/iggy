@@ -243,3 +243,116 @@ async fn given_a_full_disk_when_a_poll_auto_commits_a_new_key_should_refuse_it()
     assert!(matches!(admitted, Err(IggyError::DiskUsageLimitReached)));
     assert_eq!(partition.consensus.pipeline_len(), 0);
 }
+
+/// A send of one message stamped by `producer`, as an idempotent producer
+/// sends it.
+fn producer_send(
+    namespace: IggyNamespace,
+    client_id: u128,
+    producer: BatchProducer,
+) -> Message<RoutedRequestHeader> {
+    let mut batch = IggyMessages::with_capacity(1);
+    batch.push(IggyMessage {
+        header: IggyMessageHeader {
+            payload_length: 8,
+            ..Default::default()
+        },
+        payload: Bytes::from_static(b"abcdefgh"),
+        user_headers: None,
+    });
+    let mut owned =
+        SendMessagesOwned::from_messages(namespace, &batch).expect("build send_messages batch");
+    owned.header.producer = Some(producer);
+    owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+    let mut send = send_request_for_client(namespace, client_id);
+    let body = &mut send.as_mut_slice()[size_of::<RoutedRequestHeader>()..];
+    owned.header.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
+    body[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
+    send
+}
+
+/// Records that the batch of `producer` with one message committed at
+/// `base_offset`, as the apply of its send does.
+fn record_committed_batch(
+    partition: &mut IggyPartition<RecordingBus>,
+    producer: BatchProducer,
+    base_offset: u64,
+) {
+    partition.producers.record(&StampedBatch {
+        producer,
+        message_count: 1,
+        base_offset,
+        timestamp: 1,
+    });
+}
+
+/// A committed batch takes no new space when its producer sends it again, so
+/// the full disk lets it through to the reply that proves the first copy
+/// committed. The next batch of that producer is new data and is refused.
+#[compio::test]
+async fn given_a_full_disk_when_a_producer_resends_a_committed_batch_should_answer_it_committed() {
+    const BASE_OFFSET: u64 = 7;
+    let (mut partition, replies) = recording_partition_at(0, 3);
+    let namespace = partition.namespace();
+    let committed = BatchProducer::new(1, 0, 0).unwrap();
+    record_committed_batch(&mut partition, committed, BASE_OFFSET);
+    partition.set_disk_usage(disk_at_limit());
+
+    partition
+        .on_request(producer_send(namespace, 1, committed), None)
+        .await;
+    partition
+        .on_request(
+            producer_send(namespace, 2, BatchProducer::new(1, 0, 1).unwrap()),
+            None,
+        )
+        .await;
+
+    assert_eq!(partition.consensus.pipeline_len(), 0);
+    let duplicate = replies
+        .borrow()
+        .iter()
+        .find_map(|(_, frame)| {
+            let header = *bytemuck::checked::try_from_bytes::<ReplyHeader>(
+                &frame.as_slice()[..size_of::<ReplyHeader>()],
+            )
+            .ok()?;
+            (header.client == 1).then_some(header)
+        })
+        .expect("the resend gets a reply");
+    assert_eq!(duplicate.status, 0, "the resend must not be refused");
+    assert_eq!(duplicate.reserved[0], ReplyHeader::COMMITTED_RESULT);
+    assert_eq!(
+        reply_status(&replies, 2, 1),
+        Some(IggyError::DiskUsageLimitReached.as_code()),
+        "the next batch adds data, so the full disk refuses it"
+    );
+}
+
+#[compio::test]
+async fn given_a_full_disk_when_a_queued_resend_of_a_committed_batch_is_promoted_should_answer_it_committed()
+ {
+    let (mut partition, _) = recording_partition_at(0, 3);
+    let namespace = partition.namespace();
+    let committed = BatchProducer::new(1, 0, 0).unwrap();
+    record_committed_batch(&mut partition, committed, 7);
+    let head = partition.consensus.sequencer().current_sequence();
+    let (sender, receiver) = consensus::oneshot_channel();
+    assert!(
+        partition
+            .consensus
+            .push_queued_request(consensus::RequestEntry::with_sender(
+                producer_send(namespace, 1, committed),
+                Some(sender),
+            ))
+            .is_ok()
+    );
+    partition.set_disk_usage(disk_at_limit());
+
+    partition.drain_request_queue_into_prepares(1).await;
+
+    assert_eq!(partition.consensus.sequencer().current_sequence(), head);
+    let reply = receiver.await.unwrap();
+    assert_eq!(reply.header().status, 0, "the resend must not be refused");
+    assert_eq!(reply.header().reserved[0], ReplyHeader::COMMITTED_RESULT);
+}
