@@ -96,8 +96,8 @@ use server_common::{
     Message, SegmentStorage,
     iobuf::Frozen,
     send_messages::{
-        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_slice,
-        decode_prepare_slice_trusted, stamp_prepare_for_persistence,
+        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_batch,
+        decode_prepare_batch_trusted, decode_prepare_slice_trusted, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
 };
@@ -241,6 +241,11 @@ where
     /// `PartitionsConfig` value (simulator and tests build partitions with
     /// no resolved options at all).
     pub(crate) runtime_options: TopicRuntimeOptions,
+    /// Whether this partition places its batches: a message prepare carries
+    /// the batch header and where the messages sit in the object store, not
+    /// the messages. Set before the partition takes its first prepare and
+    /// never changed after, since its segments hold one kind only.
+    places_batches: bool,
     /// The at-rest encryptor of this partition's stream incarnation, `None`
     /// for a plaintext stream. Set before the partition becomes servable and
     /// never swapped, so a poll answered after the stream id is reused still
@@ -1049,6 +1054,7 @@ where
             partition_dir: None,
             segment_names_dirty: Cell::new(true),
             runtime_options: TopicRuntimeOptions::default(),
+            places_batches: false,
             encryptor: None,
             persistence: None,
             pending_retry_checkpoint: None,
@@ -1896,11 +1902,15 @@ where
                 },
                 first_timestamp: segment.start_timestamp,
             };
-            persistence.enable_segment_storage(
-                initial,
+            let (max_size, max_age) = (
                 segment.max_size.as_bytes_u64(),
                 self.effective_segment_max_age(),
             );
+            if self.places_batches {
+                persistence.enable_placed_segment_storage(initial, max_size, max_age);
+            } else {
+                persistence.enable_segment_storage(initial, max_size, max_age);
+            }
             if persistence.start() {
                 self.consensus
                     .message_bus()
@@ -3974,6 +3984,36 @@ where
     pub fn set_runtime_options(&mut self, runtime_options: TopicRuntimeOptions) {
         self.runtime_options = runtime_options;
         self.refresh_recovered_log_complete();
+    }
+
+    /// Make this a partition that places its batches. Call it before the
+    /// partition opens its WAL and takes its first prepare.
+    ///
+    /// Nothing in the server calls it yet: the topic type that selects it
+    /// does not exist.
+    pub const fn set_places_batches(&mut self, places_batches: bool) {
+        self.places_batches = places_batches;
+    }
+
+    /// Whether this partition places its batches, see
+    /// [`Self::set_places_batches`].
+    #[must_use]
+    pub const fn places_batches(&self) -> bool {
+        self.places_batches
+    }
+
+    /// The batch header of a message prepare this replica did not stamp,
+    /// checked in full. The prepare must carry what this partition's segments
+    /// hold: the whole batch, or a placed one.
+    fn decode_received_batch(
+        &self,
+        message: &Message<PrepareHeader>,
+    ) -> Result<BatchHeader, IggyError> {
+        let batch = decode_prepare_batch(message.as_slice())?;
+        if batch.placement.is_some() != self.places_batches {
+            return Err(IggyError::CannotAppendMessage);
+        }
+        Ok(batch.header)
     }
 
     /// A replica whose materialization is missing lost the prepares it
@@ -6342,6 +6382,9 @@ where
         // the persisted `base_timestamp` (and the `batch_checksum` derived from
         // it) byte-identical across replicas. A local `now()` diverges per node.
         let batch_timestamp = header.timestamp;
+        if prepare_is_placed(&message) != self.places_batches {
+            return Err(IggyError::CannotAppendMessage);
+        }
         let (message, batch, batch_messages_count) =
             stamp_prepare_for_persistence(message, dirty_offset, batch_timestamp)
                 .map_err(|_| IggyError::CannotAppendMessage)?;
@@ -9959,7 +10002,7 @@ where
         if header.operation != Operation::SendMessages {
             return Err(IggyError::CannotAppendMessage);
         }
-        let validated = decode_prepare_slice(message.as_slice())?.header;
+        let validated = self.decode_received_batch(&message)?;
         if validated.message_count == 0 {
             return Err(IggyError::InvalidCommand);
         }
@@ -10009,8 +10052,9 @@ where
             return Err(IggyError::CannotAppendMessage);
         }
 
-        let batch_messages_size =
-            u64::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
+        // What the segment holds of the batch: all of it, or the placed batch
+        // that stands in for it.
+        let batch_messages_size = prepare_body_length(&message);
         let last_dirty_offset = batch
             .base_offset
             .checked_add(u64::from(batch_messages_count) - 1)
@@ -10503,9 +10547,9 @@ where
             if peek_operation(entry) != Operation::SendMessages {
                 continue;
             }
-            let batch = decode_prepare_slice_trusted(entry.as_slice())
+            let batch = decode_prepare_batch_trusted(entry.as_slice())
                 .map_err(|_| IggyError::InvalidCommand)?;
-            if batch.message_count() == 0 {
+            if batch.header.message_count == 0 {
                 continue;
             }
             if ops.contains(&peek_op(entry)) {
@@ -10516,14 +10560,14 @@ where
                 &mut retained_info,
                 batch.header.base_offset,
                 batch.header.base_timestamp,
-                batch.header.total_size() as u64,
-                batch.message_count(),
+                batch.body_length,
+                batch.header.message_count,
             );
             retained_next_offset = retained_next_offset.max(
                 batch
                     .header
                     .base_offset
-                    .saturating_add(u64::from(batch.message_count())),
+                    .saturating_add(u64::from(batch.header.message_count)),
             );
         }
 
@@ -12456,13 +12500,15 @@ where
         // Trusted (no batch-hash): the entry was read back from this replica's
         // own journal, where it was stamped/validated at append; only header
         // stats are needed, so re-hashing the ~1 MiB blob is redundant.
-        let batch = decode_prepare_slice_trusted(entry.as_slice())
+        let batch = decode_prepare_batch_trusted(entry.as_slice())
             .map_err(|_| IggyError::InvalidCommand)?;
-        let message_count = batch.message_count();
+        let message_count = batch.header.message_count;
         if message_count == 0 {
             return Ok(None);
         }
 
+        // The size is the batch's own, also when only a placed batch stands
+        // in for it here: it is what the partition's messages weigh.
         Ok(Some(CommittedBatchStats {
             base_offset: batch.header.base_offset,
             message_count,
@@ -15290,6 +15336,26 @@ where
             .journal()
             .inner
             .lowest_resident_send_in(from..=commit_to_op)?;
+        if self.places_batches {
+            // A placed batch's own checksum covers its header, so its check
+            // does here what the batch checksum does for a whole batch.
+            let batch = decode_prepare_batch(entry.as_slice())
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = self.namespace().inner(),
+                        op,
+                        %error,
+                        "resident placed batch fails its checks; the window has no anchor"
+                    );
+                })
+                .ok()?;
+            return Some(RepairAnchor {
+                op,
+                base_offset: batch.header.base_offset,
+            });
+        }
         // The batch checksum covers `base_offset` and hashes only each frame's
         // stored checksum, so a corrupt header still yields no anchor and the
         // floor is refused, without hashing every message body.
@@ -15354,7 +15420,7 @@ where
         if !self.prepare_history_available(message.header()) {
             return Err(IggyError::HistoryUnavailable);
         }
-        let batch = decode_prepare_slice(message.as_slice())?.header;
+        let batch = self.decode_received_batch(&message)?;
         self.append_canonical_send_messages(message, batch).await?;
         Ok(())
     }
@@ -15371,7 +15437,7 @@ where
         let (base_offset, base_timestamp, total_size, message_count) = (
             batch.base_offset,
             batch.base_timestamp,
-            batch.total_size() as u64,
+            prepare_body_length(&message),
             batch.message_count,
         );
         if message_count == 0 {
@@ -15609,6 +15675,20 @@ fn upsert_offset_max<K>(
 /// `PrepareHeader`, so reading the tag is a cheap cast, not a full batch decode;
 /// it tells a committed consumer-offset op (no segment bytes) apart from a
 /// `SendMessages` batch without relying on a decode failure to do so.
+/// Whether a message prepare carries a placed batch.
+fn prepare_is_placed(message: &Message<PrepareHeader>) -> bool {
+    message
+        .as_slice()
+        .get(std::mem::size_of::<PrepareHeader>()..)
+        .is_some_and(iggy_binary_protocol::placement::is_placed)
+}
+
+/// Bytes of a message prepare that its segment holds: the whole batch, or the
+/// placed batch that stands in for it.
+fn prepare_body_length(message: &Message<PrepareHeader>) -> u64 {
+    u64::from(message.header().size).saturating_sub(std::mem::size_of::<PrepareHeader>() as u64)
+}
+
 pub fn peek_operation(entry: &Frozen<4096>) -> Operation {
     bytemuck::checked::try_from_bytes::<PrepareHeader>(
         &entry[..std::mem::size_of::<PrepareHeader>()],
@@ -15634,9 +15714,9 @@ pub fn materialization_batch_meta(
     if peek_operation(entry) != Operation::SendMessages {
         return Ok(None);
     }
-    let batch = decode_prepare_slice_trusted(entry.as_slice())
+    let batch = decode_prepare_batch_trusted(entry.as_slice())
         .map_err(|_| IggyError::CannotSaveMessagesToSegment)?;
-    let message_count = batch.message_count();
+    let message_count = batch.header.message_count;
     if message_count == 0 {
         return Ok(None);
     }
@@ -15651,7 +15731,7 @@ pub fn materialization_batch_meta(
     Ok(Some(RetainedBatchMeta {
         base_offset: batch.header.base_offset,
         base_timestamp: batch.header.base_timestamp,
-        total_size: batch.header.total_size() as u64,
+        total_size: batch.body_length,
         message_count,
     }))
 }

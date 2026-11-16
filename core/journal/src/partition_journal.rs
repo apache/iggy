@@ -1382,9 +1382,14 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Err(invalid("referenced segment prepare checksum mismatch"));
         }
         if reference.is_some() && header.checksum_body == 0 {
-            // Partition prepares delegate body integrity to the canonical batch.
-            decode_prepare_slice(message.as_slice())
-                .map_err(|_| invalid("referenced segment message checksum mismatch"))?;
+            // Partition prepares delegate body integrity to the canonical
+            // batch, or to the placed batch that stands in for it.
+            if segments::is_placed(message.as_slice()) {
+                segments::decode_batch(message.as_slice())?;
+            } else {
+                decode_prepare_slice(message.as_slice())
+                    .map_err(|_| invalid("referenced segment message checksum mismatch"))?;
+            }
         }
         Ok((header, length, message, reference))
     }
@@ -1765,11 +1770,9 @@ impl JournalState {
         bytes[98] = u8::from(self.certified_log_view.is_some());
         bytes[120..124].copy_from_slice(&self.certified_log_view.unwrap_or(0).to_le_bytes());
         // Bytes 104..120 are reserved and stay zero.
-        bytes[segments::SEGMENT_STATE_FLAG] = match self.segment_storage {
-            None => segments::SEGMENTS_ABSENT,
-            Some(segments) if segments.max_age.is_none() => segments::SEGMENTS_BY_SIZE,
-            Some(_) => segments::SEGMENTS_BY_SIZE_AND_AGE,
-        };
+        bytes[segments::SEGMENT_STATE_FLAG] = self
+            .segment_storage
+            .map_or(segments::SEGMENTS_ABSENT, |segments| segments.flag());
         if let Some(segments) = self.segment_storage {
             segments.encode(
                 &mut bytes[segments::SEGMENT_STATE_OFFSET
@@ -1822,11 +1825,17 @@ impl JournalState {
             segment_storage: match bytes[segments::SEGMENT_STATE_FLAG] {
                 segments::SEGMENTS_ABSENT => None,
                 segments::SEGMENTS_BY_SIZE if segment_references => {
-                    Some(SegmentState::decode(segment_state, None)?)
+                    Some(SegmentState::decode(segment_state, None, false)?)
                 }
-                segments::SEGMENTS_BY_SIZE_AND_AGE if segment_references => {
-                    Some(SegmentState::decode(segment_state, Some(segment_age))?)
+                segments::SEGMENTS_BY_SIZE_AND_AGE if segment_references => Some(
+                    SegmentState::decode(segment_state, Some(segment_age), false)?,
+                ),
+                segments::PLACED_SEGMENTS_BY_SIZE if segment_references => {
+                    Some(SegmentState::decode(segment_state, None, true)?)
                 }
+                segments::PLACED_SEGMENTS_BY_SIZE_AND_AGE if segment_references => Some(
+                    SegmentState::decode(segment_state, Some(segment_age), true)?,
+                ),
                 _ => return Err(invalid("invalid segment storage flag")),
             },
             group: read_u64(16)?,
@@ -2047,6 +2056,7 @@ mod tests {
     use compio::io::AsyncWriteAtExt;
     use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::batch::BatchHeader;
+    use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch, Placement};
     use std::cell::RefCell;
     use std::rc::Rc;
     use tempfile::tempdir;
@@ -4659,6 +4669,156 @@ mod tests {
 
     fn prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
         sized_prepare(op, parent, size_of::<PrepareHeader>() + 16)
+    }
+
+    /// A message prepare whose batch of `count` messages from `offset` is
+    /// placed in the object store, as a partition that places its batches
+    /// replicates it: a zero body checksum and the placed batch as the body.
+    fn placed_prepare(op: u64, parent: u128, offset: u64, count: u32) -> Message<PrepareHeader> {
+        let blob = vec![u8::try_from(op).unwrap(); 4096];
+        let mut batch = BatchHeader::new(42, 0, (BATCH_HEADER_SIZE + blob.len()) as u64, count);
+        batch.base_offset = offset;
+        batch.base_timestamp = 1_000 + op;
+        let placed = PlacedBatch::new(batch, Placement::of(u128::from(op), op * 4096, &blob));
+        let template = sized_prepare(op, parent, size_of::<PrepareHeader>() + PLACED_BATCH_SIZE);
+        let mut bytes = Owned::copy_from_slice(template.as_slice());
+        placed.encode_into(&mut bytes.as_mut_slice()[size_of::<PrepareHeader>()..]);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut bytes.as_mut_slice()[..size_of::<PrepareHeader>()],
+        );
+        header.checksum_body = 0;
+        header.checksum = header.identity_checksum();
+        Message::try_from(bytes).unwrap()
+    }
+
+    async fn placed_journal(partition: &Path) -> PartitionPrepareJournal {
+        let mut journal = PartitionPrepareJournal::open(&partition.join("prepares-7"), 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_placed_segment_storage(SegmentPosition::default(), PLACED_SEGMENT_BYTES, None)
+            .await
+            .unwrap();
+        journal
+    }
+
+    /// Room for three placed batches, so the fourth starts a segment.
+    const PLACED_SEGMENT_BYTES: u64 = 3 * PLACED_BATCH_SIZE as u64;
+
+    #[compio::test]
+    async fn given_placed_segments_when_appending_should_write_each_placed_batch_and_roll_by_its_own_size()
+     {
+        let partition = tempdir().unwrap();
+        let mut journal = placed_journal(partition.path()).await;
+        let mut parent = 0;
+        let mut prepares = Vec::new();
+        for op in 1..=4 {
+            // Two messages a batch, so offsets run ahead of ops.
+            let prepare = placed_prepare(op, parent, (op - 1) * 2, 2);
+            parent = prepare.header().checksum;
+            journal.append(prepare.clone().into_frozen()).await.unwrap();
+            prepares.push(prepare);
+        }
+
+        assert_eq!(journal.segments_placed(), Some(true));
+        assert_eq!(segment_starts(&journal), [0, 6]);
+        assert_eq!(
+            std::fs::metadata(partition.path().join("00000000000000000000.log"))
+                .unwrap()
+                .len(),
+            PLACED_SEGMENT_BYTES
+        );
+        let references: Vec<_> = journal
+            .written_segment_references(0)
+            .map(|(_, reference)| (reference.position, reference.length))
+            .collect();
+        let placed = PLACED_BATCH_SIZE as u64;
+        assert_eq!(
+            references,
+            [
+                (0, placed),
+                (placed, placed),
+                (2 * placed, placed),
+                (0, placed)
+            ]
+        );
+        for (recovered, appended) in journal.prepares().await.unwrap().iter().zip(&prepares) {
+            assert_eq!(recovered.as_slice(), appended.as_slice());
+        }
+    }
+
+    #[compio::test]
+    async fn given_placed_segments_when_reopened_should_keep_the_layout_and_the_prepares() {
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = placed_journal(partition.path()).await;
+        let first = placed_prepare(1, 0, 0, 2);
+        let second = placed_prepare(2, first.header().checksum, 2, 1);
+        journal.append(first.clone().into_frozen()).await.unwrap();
+        journal.append(second.clone().into_frozen()).await.unwrap();
+        drop(journal);
+
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+
+        assert_eq!(journal.segments_placed(), Some(true));
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), second.as_slice());
+        let third = placed_prepare(3, second.header().checksum, 3, 1);
+        journal.append(third.into_frozen()).await.unwrap();
+        // The layout is durable, so the other one is refused.
+        assert!(
+            journal
+                .enable_segment_storage(SegmentPosition::default(), PLACED_SEGMENT_BYTES, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_prepare_of_the_other_kind_when_appending_should_refuse_it() {
+        let partition = tempdir().unwrap();
+        let mut placed = placed_journal(partition.path()).await;
+        let whole = segment_prepare(1, 0, 0, BATCH_HEADER_SIZE + 64);
+
+        assert!(placed.append(whole.into_frozen()).await.is_err());
+
+        let partition = tempdir().unwrap();
+        let mut batches =
+            PartitionPrepareJournal::open(&partition.path().join("prepares-7"), 42, 7)
+                .await
+                .unwrap();
+        batches
+            .enable_segment_storage(SegmentPosition::default(), 1024 * 1024, None)
+            .await
+            .unwrap();
+        assert_eq!(batches.segments_placed(), Some(false));
+
+        assert!(
+            batches
+                .append(placed_prepare(1, 0, 0, 1).into_frozen())
+                .await
+                .is_err()
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_damaged_placed_batch_in_its_segment_when_reading_it_back_should_refuse_it() {
+        let partition = tempdir().unwrap();
+        let mut journal = placed_journal(partition.path()).await;
+        journal
+            .append(placed_prepare(1, 0, 0, 1).into_frozen())
+            .await
+            .unwrap();
+        let segment = partition.path().join("00000000000000000000.log");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        // Inside the placement: the position of the blob in its object.
+        bytes[BATCH_HEADER_SIZE + 16] ^= 1;
+        std::fs::write(&segment, bytes).unwrap();
+
+        assert!(journal.prepares().await.is_err());
     }
 
     fn sized_prepare(op: u64, parent: u128, length: usize) -> Message<PrepareHeader> {

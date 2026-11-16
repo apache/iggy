@@ -67,7 +67,7 @@ use message_bus::MessageBus;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::run_blocking;
 use server_common::iobuf::Owned;
-use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
+use server_common::send_messages::{decode_batch_slice, decode_prepare_batch};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
 use server_common::{DISK_USAGE, Message};
@@ -4762,7 +4762,7 @@ where
                         )))
                 || (header.operation == Operation::SendMessages
                     && header.checksum_body == 0
-                    && decode_prepare_slice(prepare.as_slice()).is_err())
+                    && decode_prepare_batch(prepare.as_slice()).is_err())
             {
                 return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum.into());
             }

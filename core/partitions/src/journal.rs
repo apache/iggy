@@ -24,7 +24,8 @@ use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, IOV_MAX, Owned},
     send_messages::{
-        self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice, decode_prepare_slice_trusted,
+        self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_batch, decode_prepare_batch_trusted,
+        decode_prepare_slice_trusted,
     },
 };
 use std::io;
@@ -71,12 +72,12 @@ impl RetainedBatchMeta {
         if header.operation != Operation::SendMessages {
             return None;
         }
-        let batch = decode_prepare_slice_trusted(entry.as_slice()).ok()?;
-        let message_count = batch.message_count();
-        (message_count != 0).then(|| Self {
+        let batch = decode_prepare_batch_trusted(entry.as_slice()).ok()?;
+        let message_count = batch.header.message_count;
+        (message_count != 0).then_some(Self {
             base_offset: batch.header.base_offset,
             base_timestamp: batch.header.base_timestamp,
-            total_size: batch.header.total_size() as u64,
+            total_size: batch.body_length,
             message_count,
         })
     }
@@ -144,13 +145,13 @@ impl EvictedHeader {
 
     /// `prepare`, read back for this entry, if its body is the released one.
     fn verified(&self, prepare: Owned<4096>) -> io::Result<JournalBuffer> {
-        let batch = decode_prepare_slice(prepare.as_slice()).map_err(|error| {
+        let batch = decode_prepare_batch(prepare.as_slice()).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the body read back fails its checks: {error}"),
             )
         })?;
-        if batch.header.batch_checksum != self.batch_checksum {
+        if batch.body_checksum != self.batch_checksum {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "another batch sits at the evicted body position",
@@ -475,11 +476,11 @@ impl RingEntry {
         if header.operation != Operation::SendMessages {
             return None;
         }
-        let batch = decode_prepare_slice_trusted(self.prepare.as_slice()).ok()?;
+        let batch = decode_prepare_batch_trusted(self.prepare.as_slice()).ok()?;
         Some(EvictedHeader {
             header,
             body,
-            batch_checksum: batch.header.batch_checksum,
+            batch_checksum: batch.body_checksum,
         })
     }
 }
