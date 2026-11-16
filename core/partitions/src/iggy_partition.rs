@@ -11037,6 +11037,12 @@ where
             let mut backing = 0_usize;
             let mut file_position = position;
             for entry in entries {
+                // A committed roll is a physical boundary, not just another
+                // control entry. Stop the current write before it so the next
+                // drive pass can rotate the active segment at this operation.
+                if peek_operation(entry) == Operation::RollSegment {
+                    break;
+                }
                 let Some(meta) = materialization_batch_meta(entry, persisted_end)? else {
                     chunk.end_entry += 1;
                     continue;

@@ -1077,7 +1077,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// full. `lost_publication` extends the walk past that prefix through
     /// [`Self::recover_unpublished_tail`].
     async fn recover_entries(&mut self, lost_publication: bool) -> io::Result<()> {
-        let state = self.state;
+        let mut state = self.state;
         let mut position = 0;
         let mut previous = state.checkpoint;
         let mut checksum = state.checkpoint_checksum;
@@ -1086,17 +1086,30 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             let (header, length, prepare, reference) =
                 self.read_record(position, state.length).await?;
             let checkpoint_prepare = position == 0 && state.checkpoint_prepare;
-            let (next_offset, segment_first_timestamp) = match (state.segment_storage, reference) {
-                (Some(segments), Some(reference)) => (
-                    Some(segments::batch_next_offset(prepare.as_slice())?),
-                    segments.recovered_first_timestamp(
-                        reference,
-                        prepare.as_slice(),
-                        checkpoint_prepare,
-                        &mut previous_segment,
-                    )?,
-                ),
-                _ => (None, 0),
+            let (next_offset, segment_first_timestamp) = if let Some(segments) =
+                &mut state.segment_storage
+            {
+                if header.operation == Operation::RollSegment {
+                    let (reserved, next_offset) = segments.reserve(&header, prepare.as_slice())?;
+                    if reserved.is_some() {
+                        return Err(invalid("roll operation has a segment body"));
+                    }
+                    (next_offset, 0)
+                } else if let Some(reference) = reference {
+                    (
+                        Some(segments::batch_next_offset(prepare.as_slice())?),
+                        segments.recovered_first_timestamp(
+                            reference,
+                            prepare.as_slice(),
+                            checkpoint_prepare,
+                            &mut previous_segment,
+                        )?,
+                    )
+                } else {
+                    (None, 0)
+                }
+            } else {
+                (None, 0)
             };
             self.recovered_prepares.push(prepare);
             if checkpoint_prepare {
@@ -1613,7 +1626,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     &payload[..size_of::<PrepareHeader>()],
                 )
                 .map_err(|_| invalid("invalid prepare during segment migration"))?;
-                if header.operation == Operation::SendMessages
+                if header.operation == Operation::RollSegment {
+                    let (reserved, roll_next_offset) = segments.reserve(header, payload)?;
+                    if reserved.is_some() {
+                        return Err(invalid("roll operation has a segment body"));
+                    }
+                    next_offset = roll_next_offset;
+                } else if header.operation == Operation::SendMessages
                     && segments::decode_batch(payload)?.base_offset
                         >= segments.tail.position.next_offset
                 {
