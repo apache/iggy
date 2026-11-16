@@ -26,7 +26,7 @@ use nix::sys::resource::{Resource, getrlimit};
 use server_common::{DISK_USAGE, VolumeSample};
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System as SysinfoSystem;
@@ -93,6 +93,10 @@ static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// The `[disk]` section, captured once at bootstrap. Unset, the samples carry
 /// no limit.
 static DISK_CONFIG: OnceLock<DiskConfig> = OnceLock::new();
+
+/// Warns once that a volume without a size, such as ramfs, gets no disk usage
+/// limit, since the samples repeat every second.
+static SIZELESS_VOLUME_WARNING: Once = Once::new();
 
 static PUBLISHED_STATS: LazyLock<ArcSwap<SystemStats>> =
     LazyLock::new(|| ArcSwap::from_pointee(SystemStats::default()));
@@ -199,9 +203,17 @@ impl SystemStats {
                 // What df calls the size: the space a writer without root can
                 // fill, which a volume resize or another ZFS dataset can move.
                 let usable_bytes = used_bytes.saturating_add(stats.available_space());
-                let limit_bytes = DISK_CONFIG
-                    .get()
-                    .and_then(|disk| disk.usage_limit_bytes(usable_bytes));
+                let limit_bytes = DISK_CONFIG.get().and_then(|disk| {
+                    if disk.usage_limit_enabled && usable_bytes == 0 {
+                        SIZELESS_VOLUME_WARNING.call_once(|| {
+                            warn!(
+                                "the volume holding the data directory reports no size, so the \
+                                 disk usage limit does not apply to it"
+                            );
+                        });
+                    }
+                    disk.usage_limit_bytes(usable_bytes)
+                });
                 Some((
                     stats,
                     VolumeSample {

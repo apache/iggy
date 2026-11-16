@@ -37,13 +37,15 @@ pub struct DiskConfig {
 
 impl DiskConfig {
     /// Used bytes at which new data is refused on a volume of `usable_bytes`,
-    /// or `None` while the limit is disabled.
+    /// or `None` while the limit is disabled or the volume reports no size.
+    /// A volume such as ramfs reports no blocks, and `df` shows no Use% for
+    /// it. A limit of 0 bytes would refuse every write on it.
     #[must_use]
     pub fn usage_limit_bytes(&self, usable_bytes: u64) -> Option<u64> {
         // Validation keeps the percent within (0, 100], so the result never
         // exceeds `usable_bytes`. The cast truncates, which errs towards a
         // fuller disk.
-        self.usage_limit_enabled
+        (self.usage_limit_enabled && usable_bytes > 0)
             .then(|| (usable_bytes as f64 * self.usage_limit_percent / 100.0) as u64)
     }
 }
@@ -145,6 +147,12 @@ mod tests {
             limited_at(100.0).usage_limit_bytes(u64::MAX),
             Some(u64::MAX)
         );
+    }
+
+    #[test]
+    fn usage_limit_bytes_is_none_for_a_volume_without_size() {
+        assert_eq!(limited_at(90.0).usage_limit_bytes(0), None);
+        assert_eq!(limited_at(100.0).usage_limit_bytes(0), None);
     }
 
     #[test]

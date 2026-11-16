@@ -48,7 +48,8 @@ usage_limit_enabled = true
 # server running without root runs out of space. The space above the limit
 # absorbs writes admitted before it was reached, so keep enough of it for a
 # few seconds of ingest. Fractions are allowed. Must be > 0 and <= 100. To turn
-# the limit off, set 'usage_limit_enabled' to false.
+# the limit off, set 'usage_limit_enabled' to false. A volume that reports no
+# size, such as ramfs, has no limit.
 usage_limit_percent = 90.0
 
 # HTTP server configuration
