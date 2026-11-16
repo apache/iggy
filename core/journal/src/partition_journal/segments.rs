@@ -953,6 +953,18 @@ impl SegmentState {
         header: &PrepareHeader,
         prepare: &[u8],
     ) -> io::Result<(Option<SegmentReference>, Option<u64>)> {
+        if header.operation == Operation::RollSegment {
+            let next_offset = self.tail.position.next_offset;
+            if self.tail.position.length > 0 {
+                self.tail = self.allocate(SegmentPosition {
+                    start_offset: next_offset,
+                    length: 0,
+                    next_offset,
+                    first_timestamp: 0,
+                })?;
+            }
+            return Ok((None, Some(next_offset)));
+        }
         if header.operation != Operation::SendMessages {
             return Ok((None, None));
         }

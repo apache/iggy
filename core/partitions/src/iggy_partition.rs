@@ -10817,6 +10817,24 @@ where
             return Ok(MaterializationStep::Pending);
         }
         let segment = self.log.active_segment();
+        let roll_requested = self.log.journal().inner.with_entries(|entries| {
+            entries
+                .get(pending.next_entry)
+                .is_some_and(|entry| peek_operation(entry) == Operation::RollSegment)
+        });
+        if roll_requested {
+            let next_offset = segment
+                .end_offset
+                .checked_add(1)
+                .ok_or(IggyError::CannotWriteToFile)?;
+            let pending = self
+                .materialization
+                .as_mut()
+                .expect("materialization exists");
+            pending.next_entry += 1;
+            pending.phase = MaterializationPhase::Rotate(next_offset);
+            return Ok(MaterializationStep::Ready);
+        }
         if segment.size.as_bytes_u64() >= segment.max_size.as_bytes_u64()
             || self.next_batch_rolls_by_age(pending.next_entry, pending.prefix_len)?
         {
@@ -13114,6 +13132,8 @@ where
             self.log
                 .segments()
                 .iter()
+                .rev()
+                .skip(1)
                 .map(|segment| segment.size.as_bytes_u64())
                 .sum::<u64>()
                 > limit
