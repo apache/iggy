@@ -396,7 +396,10 @@ fn given_a_network_that_drops_and_repeats_packets_when_sends_are_placed_should_c
             committed.push(index);
         }
     }
-    assert!(!committed.is_empty());
+    assert!(
+        committed.len() > SENDS / 2,
+        "most sends commit on a lossy network: {committed:?}"
+    );
     let last = commits(&sim).into_iter().flatten().max().unwrap();
     settle_at(&mut sim, last);
 
