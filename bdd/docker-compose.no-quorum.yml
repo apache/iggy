@@ -67,6 +67,8 @@ services:
       RUST_LOG: info
       IGGY_ROOT_USERNAME: iggy
       IGGY_ROOT_PASSWORD: iggy
+      # A nearly full runner would refuse every write at the shipped disk usage limit.
+      IGGY_DISK_USAGE_LIMIT_ENABLED: "false"
       IGGY_CLUSTER_ENABLED: "true"
       IGGY_CLUSTER_NAME: no-quorum-cluster
       IGGY_CLUSTER_NODES_0_NAME: no-quorum-node

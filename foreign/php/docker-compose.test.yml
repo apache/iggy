@@ -36,6 +36,8 @@ services:
       - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      # A nearly full machine would refuse every write at the shipped disk usage limit.
+      - IGGY_DISK_USAGE_LIMIT_ENABLED=false
       - IGGY_ENCRYPTION_ENABLED=true
       - IGGY_ENCRYPTION_KEY=/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=
     networks:

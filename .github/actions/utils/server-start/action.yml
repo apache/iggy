@@ -124,6 +124,9 @@ runs:
         export IGGY_HTTP_ADDRESS="${{ inputs.http_address }}"
         export IGGY_ROOT_USERNAME="iggy"
         export IGGY_ROOT_PASSWORD="iggy"
+        # A nearly full runner would refuse every write at the shipped disk usage limit, so
+        # tests run without it unless the job sets it, as in the Rust test harness.
+        export IGGY_DISK_USAGE_LIMIT_ENABLED="${IGGY_DISK_USAGE_LIMIT_ENABLED:-false}"
         if [[ -n "${{ inputs.encryption-key }}" ]]; then
           export IGGY_ENCRYPTION_KEY="${{ inputs.encryption-key }}"
         fi
