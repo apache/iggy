@@ -34,20 +34,23 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use futures::FutureExt;
 use iggy_binary_protocol::{GenericHeader, ReplyHeader, RoutedRequestHeader};
-use iggy_common::PollingStrategy;
+use iggy_common::{IggyTimestamp, PollingStrategy};
 use iggy_object_store::{
-    InlineTierExecutor, KeyLayout, MemoryStore, TierExecutor, TierJobHandle, TierJobRequest,
+    FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore, PutBody, PutOptions,
+    TierExecutor, TierJobHandle, TierJobRequest,
 };
 use partitions::{
-    ExecutorFreshUploader, ExecutorObjects, PollingArgs, PollingConsumer, RemoteSegments,
+    ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorObjects, FRESH_OBJECT_GRACE, PollingArgs,
+    PollingConsumer, RemoteSegments,
 };
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
 use crate::Simulator;
 use crate::client::SimClient;
-use crate::packet::PacketSimulatorOptions;
+use crate::packet::{Packet, PacketSimulatorOptions, ProcessId};
 
 const REPLICAS: u8 = 3;
 /// Leads view 0.
@@ -79,8 +82,10 @@ fn layout() -> KeyLayout {
     KeyLayout::new("simulated").expect("a valid root")
 }
 
+/// A partition that the second shard owns on a replica of two shards, so a
+/// scenario with two shards has work on both.
 fn namespace() -> IggyNamespace {
-    IggyNamespace::new(1, 1, 0)
+    IggyNamespace::new(1, 1, 1)
 }
 
 /// Three replicas whose partition [`namespace`] places its batches, with one
@@ -96,12 +101,25 @@ fn placing_cluster(seed: u64) -> (Simulator, SimClient, Shared) {
 
 /// [`placing_cluster`] on a network of the caller's choice.
 fn placing_cluster_on(network: PacketSimulatorOptions) -> (Simulator, SimClient, Shared) {
+    placing_cluster_of(1, network)
+}
+
+/// [`placing_cluster_on`] with `shards` shards on each replica.
+fn placing_cluster_of(
+    shards: u16,
+    network: PacketSimulatorOptions,
+) -> (Simulator, SimClient, Shared) {
     server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
         enabled: false,
         size: iggy_common::IggyByteSize::from(0u64),
         bucket_capacity: 1,
     });
-    let mut sim = Simulator::new(usize::from(REPLICAS), std::iter::once(CLIENT_ID), network);
+    let mut sim = Simulator::with_shards(
+        usize::from(REPLICAS),
+        shards,
+        std::iter::once(CLIENT_ID),
+        network,
+    );
     sim.init_partition(namespace());
     let client = SimClient::new(CLIENT_ID);
     sim.register_client_with_primary(&client);
@@ -109,6 +127,10 @@ fn placing_cluster_on(network: PacketSimulatorOptions) -> (Simulator, SimClient,
     for replica in &sim.replicas {
         for shard in &replica.shards {
             shard.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+                store.clone(),
+                layout(),
+            ))));
+            shard.set_fresh_sweeper(Some(Rc::new(ExecutorFreshSweeper::new(
                 store.clone(),
                 layout(),
             ))));
@@ -418,4 +440,172 @@ fn given_a_network_that_drops_and_repeats_packets_when_sends_are_placed_should_c
     for replica in 0..REPLICAS {
         assert_eq!(polled(&mut sim, replica), from_leader, "replica {replica}");
     }
+}
+
+/// Ticks a sweep gets to list, hear from every shard, and delete.
+const SWEEP_TICKS: usize = 50;
+
+/// The ids of the fresh objects in the store, ascending.
+fn fresh_objects(store: &Shared) -> Vec<u128> {
+    let mut objects: Vec<_> = store
+        .0
+        .store()
+        .keys()
+        .iter()
+        .filter_map(|key| layout().parse_fresh_key(key))
+        .collect();
+    objects.sort_unstable();
+    objects
+}
+
+/// Store a fresh object under an id of `replica` that no placed batch
+/// names, as a shard of an earlier life of that replica left it.
+fn store_unnamed_object(store: &Shared, replica: u8) -> u128 {
+    let object = FreshObjectId::new(replica, 0, 1, 0)
+        .expect("a valid id")
+        .get();
+    store
+        .0
+        .store()
+        .put(
+            &layout().fresh_key(object),
+            PutBody::from_bytes(Bytes::from_static(b"IGGYFRS1 never committed")),
+            &PutOptions::default(),
+        )
+        .now_or_never()
+        .expect("a memory store answers at once")
+        .expect("the store takes the object");
+    object
+}
+
+/// Run a sweep of `replica`'s fresh objects at `now`, and return whether
+/// every shard of the replica answered it.
+fn sweep(sim: &mut Simulator, replica: u8, now: IggyTimestamp) -> bool {
+    let first = Rc::clone(&sim.replicas[usize::from(replica)].shards[0]);
+    let settled = first.fresh_sweeps_settled();
+    first.request_sweep_fresh_objects(now);
+    let mut answered = false;
+    for _ in 0..SWEEP_TICKS {
+        sim.step();
+        answered |= first.fresh_sweeps_settled() > settled;
+    }
+    answered
+}
+
+/// A time one grace period and a second after `now`.
+fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
+    let grace = u64::try_from(FRESH_OBJECT_GRACE.as_micros()).expect("the grace fits");
+    IggyTimestamp::from(now.as_micros() + grace + 1_000_000)
+}
+
+/// The first shard of a replica sweeps for all of them. The partition here
+/// is on the second shard, so what keeps its objects is that shard's
+/// answer, and what lets the unnamed object go is that both answered.
+#[test]
+fn given_a_partition_on_the_second_shard_when_the_first_sweeps_should_keep_what_it_names() {
+    const SENDS: usize = 3;
+    let (mut sim, client, store) = placing_cluster_of(
+        2,
+        PacketSimulatorOptions {
+            node_count: REPLICAS,
+            client_count: 1,
+            seed: 0x5357_4550,
+            ..PacketSimulatorOptions::default()
+        },
+    );
+    let replica = &sim.replicas[usize::from(PRIMARY)];
+    assert!(
+        !Rc::ptr_eq(replica.partition_shard(namespace()), &replica.shards[0]),
+        "the partition is not on the shard that sweeps"
+    );
+    for index in 0..SENDS {
+        let answer = submit_send(&mut sim, &client, PRIMARY, &payload(index));
+        assert!(wait_for(&mut sim, &answer) && sent_was_committed(&answer));
+    }
+    settle_at(&mut sim, SENDS as u64 - 1);
+    let named = fresh_objects(&store);
+    let unnamed = store_unnamed_object(&store, PRIMARY);
+    let other_replica = store_unnamed_object(&store, PRIMARY + 1);
+    let now = IggyTimestamp::from(1_700_000_000_000_000);
+
+    assert!(sweep(&mut sim, PRIMARY, now));
+    assert!(fresh_objects(&store).contains(&unnamed), "the grace runs");
+    assert!(sweep(&mut sim, PRIMARY, past_grace(now)));
+
+    let left = fresh_objects(&store);
+    assert!(!left.contains(&unnamed));
+    assert!(
+        left.contains(&other_replica),
+        "another replica judges its own"
+    );
+    for object in &named {
+        assert!(left.contains(object), "a placed batch names {object:032x}");
+    }
+    assert_eq!(left.len(), named.len() + 1);
+    let served = polled(&mut sim, PRIMARY);
+    for index in 0..SENDS {
+        assert_eq!(holds(&served, &payload(index)), 1, "send {index}");
+    }
+}
+
+/// A replica that lost its primary and cannot elect another does not know
+/// what its group holds. Its sweep deletes nothing, however long an object
+/// went unnamed, and the same sweep deleted such an object while the
+/// partition was in normal status.
+#[test]
+fn given_a_replica_in_a_view_change_when_it_sweeps_should_delete_nothing() {
+    const BACKUP: u8 = 1;
+    const OTHER_BACKUP: u8 = 2;
+    let (mut sim, client, store) = placing_cluster_of(
+        2,
+        PacketSimulatorOptions {
+            node_count: REPLICAS,
+            client_count: 1,
+            seed: 0x5649_4557,
+            ..PacketSimulatorOptions::default()
+        },
+    );
+    let answer = submit_send(&mut sim, &client, PRIMARY, &payload(0));
+    assert!(wait_for(&mut sim, &answer) && sent_was_committed(&answer));
+    settle_at(&mut sim, 0);
+    let now = IggyTimestamp::from(1_700_000_000_000_000);
+
+    let swept = store_unnamed_object(&store, BACKUP);
+    assert!(sweep(&mut sim, BACKUP, now));
+    assert!(sweep(&mut sim, BACKUP, past_grace(now)));
+    assert!(!fresh_objects(&store).contains(&swept));
+
+    // The other backup stays up, so this one starts a view change. It
+    // cannot end it: once it left normal status, nothing passes between
+    // the two.
+    sim.replica_crash(PRIMARY);
+    let in_normal_status = |sim: &Simulator| {
+        sim.replicas[usize::from(BACKUP)]
+            .partition_shard(namespace())
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .is_some_and(|partition| partition.consensus().is_normal())
+    };
+    for _ in 0..SETTLE_TICKS {
+        if !in_normal_status(&sim) {
+            break;
+        }
+        sim.step();
+    }
+    assert!(!in_normal_status(&sim), "the backup misses its primary");
+    for (from, to) in [(BACKUP, OTHER_BACKUP), (OTHER_BACKUP, BACKUP)] {
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) =
+            Some(|_: &Packet| true);
+    }
+
+    let kept = store_unnamed_object(&store, BACKUP);
+    let later = past_grace(now);
+    assert!(!sweep(&mut sim, BACKUP, later));
+    assert!(!sweep(&mut sim, BACKUP, past_grace(later)));
+    assert!(!sweep(&mut sim, BACKUP, past_grace(past_grace(later))));
+
+    assert!(!in_normal_status(&sim));
+    assert!(fresh_objects(&store).contains(&kept));
 }
