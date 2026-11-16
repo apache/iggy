@@ -1672,3 +1672,23 @@ async fn given_a_stored_segment_without_its_command_when_primacy_moves_and_retur
     assert_eq!(partition.long_term_floor(), Some(2));
     assert_eq!(long_term_logs(&store), 1);
 }
+
+/// Primacy moved while the messages of a send were on their way to the
+/// store. The object is stored, and the replica that stored it no longer
+/// leads: it prepares nothing for the request, so nothing commits where
+/// those messages sit and the producer sends them again to the primary.
+#[compio::test]
+async fn given_a_replica_that_lost_primacy_when_a_placed_request_arrives_should_admit_nothing() {
+    let config = repair_config();
+    let (_directory, mut partition) = Box::pin(placing_partition()).await;
+    let placed = placed_client_request(&partition, 1, 2);
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(!partition.consensus.is_primary());
+
+    Box::pin(partition.on_placed_request(placed, None)).await;
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+    assert_eq!(partition.log.active_segment().current_position, 0);
+}
