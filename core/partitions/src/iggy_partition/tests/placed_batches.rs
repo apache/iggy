@@ -712,3 +712,40 @@ async fn given_a_restarted_backup_with_a_wal_when_more_placed_batches_commit_sho
     assert_eq!(partition.consensus().commit_min(), 5);
     assert_eq!(stored_offsets(&directory), [0, 1, 2, 3, 4]);
 }
+
+/// A view change discards the placed batches that did not commit. Their
+/// offsets go back to the batches the new view replicates in their place.
+#[compio::test]
+async fn given_uncommitted_placed_batches_when_a_view_change_discards_them_should_take_the_replacements_at_their_offsets()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(placing_backup_with_wal(root.path())).await;
+    let directory = config.get_partition_path(1, 1, 0);
+    let committed = Box::pin(replicate_placed(&mut partition, &config, 0..=0, 0)).await;
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    let mut parent = committed;
+    for offset in 1..=2 {
+        let prepare = placed_segment_prepare(offset + 1, parent, offset);
+        parent = prepare.header().checksum;
+        let writer = hold_wal_writer(&persistence);
+        Box::pin(partition.on_replicate(prepare)).await;
+        writer.await;
+    }
+    assert_eq!(partition.dirty_offset.load(Ordering::Relaxed), 2);
+    assert_eq!(partition.offset.load(Ordering::Acquire), 0);
+
+    Box::pin(partition.truncate_uncommitted_from(2))
+        .await
+        .unwrap();
+
+    assert_eq!(partition.dirty_offset.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        partition.log.active_segment().current_position,
+        PLACED_BATCH_SIZE as u64
+    );
+    Box::pin(replicate_placed(&mut partition, &config, 1..=1, committed)).await;
+    assert!(partition.fatal().is_none());
+    assert_eq!(partition.consensus().commit_min(), 2);
+    assert_eq!(partition.offset.load(Ordering::Acquire), 1);
+    assert_eq!(stored_offsets(&directory), [0, 1]);
+}

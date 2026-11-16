@@ -4821,6 +4821,46 @@ mod tests {
         assert!(journal.prepares().await.is_err());
     }
 
+    /// A view change discards what did not commit. The bytes a discarded
+    /// placed batch wrote into its segment go with it, and the batches that
+    /// replace it take its offsets.
+    #[compio::test]
+    async fn given_uncommitted_placed_batches_when_truncated_should_cut_them_from_the_segment_and_take_replacements()
+     {
+        let partition = tempdir().unwrap();
+        let segment = partition.path().join("00000000000000000000.log");
+        let mut journal = placed_journal(partition.path()).await;
+        let first = placed_prepare(1, 0, 0, 1);
+        let second = placed_prepare(2, first.header().checksum, 1, 1);
+        let third = placed_prepare(3, second.header().checksum, 2, 1);
+        for prepare in [&first, &second, &third] {
+            journal.append(prepare.clone().into_frozen()).await.unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&segment).unwrap().len(),
+            PLACED_SEGMENT_BYTES
+        );
+
+        journal.truncate_from(2).await.unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&segment).unwrap().len(),
+            PLACED_BATCH_SIZE as u64
+        );
+        // Two messages in the replacement, so it is another batch at offset 1.
+        let replacement = placed_prepare(2, first.header().checksum, 1, 2);
+        journal
+            .append(replacement.clone().into_frozen())
+            .await
+            .unwrap();
+        let recovered = journal.prepares().await.unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_slice(), first.as_slice());
+        assert_eq!(recovered[1].as_slice(), replacement.as_slice());
+        let next = placed_prepare(3, replacement.header().checksum, 3, 1);
+        journal.append(next.into_frozen()).await.unwrap();
+    }
+
     fn sized_prepare(op: u64, parent: u128, length: usize) -> Message<PrepareHeader> {
         let mut buffer = Owned::<4096>::zeroed(length);
         buffer.as_mut_slice()[size_of::<PrepareHeader>()..].fill(u8::try_from(op).unwrap());
