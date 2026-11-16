@@ -1324,6 +1324,10 @@ pub struct TopicRuntimeOptions {
     pub segment_max_age: Option<IggyExpiry>,
     /// Whether each partition of the topic keeps a chain file.
     pub tiered_storage: bool,
+    /// Whether each partition of the topic places its batches: it replicates
+    /// and keeps where the messages of a batch sit in the object store, not
+    /// the messages. No topic option sets it yet.
+    pub places_batches: bool,
 }
 
 impl TopicRuntimeOptions {
@@ -1366,6 +1370,7 @@ impl From<&TopicCreateOptions> for TopicRuntimeOptions {
             preallocate_segments: parsed.preallocate_segments,
             segment_max_age: parsed.segment_max_age,
             tiered_storage: parsed.tiered_storage == Some(true),
+            places_batches: false,
         }
     }
 }

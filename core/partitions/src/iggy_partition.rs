@@ -241,11 +241,6 @@ where
     /// `PartitionsConfig` value (simulator and tests build partitions with
     /// no resolved options at all).
     pub(crate) runtime_options: TopicRuntimeOptions,
-    /// Whether this partition places its batches: a message prepare carries
-    /// the batch header and where the messages sit in the object store, not
-    /// the messages. Set before the partition takes its first prepare and
-    /// never changed after, since its segments hold one kind only.
-    places_batches: bool,
     /// The at-rest encryptor of this partition's stream incarnation, `None`
     /// for a plaintext stream. Set before the partition becomes servable and
     /// never swapped, so a poll answered after the stream id is reused still
@@ -1054,7 +1049,6 @@ where
             partition_dir: None,
             segment_names_dirty: Cell::new(true),
             runtime_options: TopicRuntimeOptions::default(),
-            places_batches: false,
             encryptor: None,
             persistence: None,
             pending_retry_checkpoint: None,
@@ -1906,7 +1900,7 @@ where
                 segment.max_size.as_bytes_u64(),
                 self.effective_segment_max_age(),
             );
-            if self.places_batches {
+            if self.places_batches() {
                 persistence.enable_placed_segment_storage(initial, max_size, max_age);
             } else {
                 persistence.enable_segment_storage(initial, max_size, max_age);
@@ -3986,20 +3980,19 @@ where
         self.refresh_recovered_log_complete();
     }
 
-    /// Make this a partition that places its batches. Call it before the
-    /// partition opens its WAL and takes its first prepare.
-    ///
-    /// Nothing in the server calls it yet: the topic type that selects it
-    /// does not exist.
+    /// Make this a partition that places its batches, as the topic's runtime
+    /// options do. Call it before the partition opens its WAL and takes its
+    /// first prepare: its segments hold one kind of batch for good.
     pub const fn set_places_batches(&mut self, places_batches: bool) {
-        self.places_batches = places_batches;
+        self.runtime_options.places_batches = places_batches;
     }
 
-    /// Whether this partition places its batches, see
-    /// [`Self::set_places_batches`].
+    /// Whether this partition places its batches: a message prepare carries
+    /// the batch header and where the messages sit in the object store, not
+    /// the messages.
     #[must_use]
     pub const fn places_batches(&self) -> bool {
-        self.places_batches
+        self.runtime_options.places_batches
     }
 
     /// The batch header of a message prepare this replica did not stamp,
@@ -4010,7 +4003,7 @@ where
         message: &Message<PrepareHeader>,
     ) -> Result<BatchHeader, IggyError> {
         let batch = decode_prepare_batch(message.as_slice())?;
-        if batch.placement.is_some() != self.places_batches {
+        if batch.placement.is_some() != self.places_batches() {
             return Err(IggyError::CannotAppendMessage);
         }
         Ok(batch.header)
@@ -4607,6 +4600,12 @@ where
         // node's metadata can still list the partition after the fence.
         if self.history_deleted() {
             return Err(IggyError::HistoryUnavailable);
+        }
+        // The read found placed batches, whose messages are in the object
+        // store. Nothing fetches them yet, so no poll is answered as though
+        // the partition were empty.
+        if self.places_batches() {
+            return Err(IggyError::FeatureUnavailable);
         }
         // A view change rebuilds the install latch and barrier from the log,
         // so the owner checks below must run after it.
@@ -6382,7 +6381,7 @@ where
         // the persisted `base_timestamp` (and the `batch_checksum` derived from
         // it) byte-identical across replicas. A local `now()` diverges per node.
         let batch_timestamp = header.timestamp;
-        if prepare_is_placed(&message) != self.places_batches {
+        if prepare_is_placed(&message) != self.places_batches() {
             return Err(IggyError::CannotAppendMessage);
         }
         let (message, batch, batch_messages_count) =
@@ -15336,7 +15335,7 @@ where
             .journal()
             .inner
             .lowest_resident_send_in(from..=commit_to_op)?;
-        if self.places_batches {
+        if self.places_batches() {
             // A placed batch's own checksum covers its header, so its check
             // does here what the batch checksum does for a whole batch.
             let batch = decode_prepare_batch(entry.as_slice())

@@ -137,7 +137,7 @@ pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
 pub use segment::{Segment, SegmentLocation};
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,
-    load_persisted_segments, load_persisted_segments_with_checkpoint,
+    load_persisted_segments, load_persisted_segments_with_checkpoint, load_placed_segments,
 };
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};

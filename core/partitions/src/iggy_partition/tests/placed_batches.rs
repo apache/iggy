@@ -215,3 +215,246 @@ async fn given_a_segment_that_fits_two_placed_batches_when_a_third_commits_shoul
         .collect();
     assert_eq!(stored, [2, 2, 1]);
 }
+
+/// A placing partition under `root`, where boot recovery finds its files,
+/// with segments that fit two placed batches and `count` batches committed.
+async fn placing_partition_on_disk(
+    root: &Path,
+    count: u64,
+) -> (PartitionsConfig, IggyPartition<IggyMessageBus>) {
+    let mut config = repair_config();
+    config.path_layout.streams_root = root.to_string_lossy().into_owned();
+    let directory = config.get_partition_path(1, 1, 0);
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut partition = test_partition_with_replicas(3);
+    partition.set_places_batches(true);
+    partition.set_partition_dir(directory);
+    partition.log.retire_front().unwrap();
+    partition.install_empty_segment(&config, 0).await.unwrap();
+    partition.runtime_options.segment_size = Some(placed_segment_size());
+    partition.log.active_segment_mut().max_size = placed_segment_size();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    let (records, _) = placed_records(count);
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
+    (config, partition)
+}
+
+fn placed_segment_size() -> IggyByteSize {
+    IggyByteSize::from(2 * PLACED_BATCH_SIZE as u64)
+}
+
+async fn recover(
+    config: &PartitionsConfig,
+) -> Result<crate::RecoveredLog, crate::PartitionRecoveryError> {
+    crate::load_placed_segments(
+        config,
+        IggyNamespace::new(1, 1, 0),
+        placed_segment_size(),
+        &PartitionStats::default(),
+        None,
+    )
+    .await
+}
+
+/// `(start offset, end offset, size)` of each recovered segment.
+fn bounds(recovered: &crate::RecoveredLog) -> Vec<(u64, u64, u64)> {
+    recovered
+        .segments
+        .iter()
+        .map(|recovered| {
+            let segment = &recovered.segment;
+            (
+                segment.start_offset,
+                segment.end_offset,
+                segment.size.as_bytes_u64(),
+            )
+        })
+        .collect()
+}
+
+fn log_path(config: &PartitionsConfig, start_offset: u64) -> std::path::PathBuf {
+    Path::new(&config.get_partition_path(1, 1, 0)).join(format!("{start_offset:020}.log"))
+}
+
+#[compio::test]
+async fn given_segments_of_placed_batches_when_booting_should_recover_their_bounds() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 5)).await;
+    drop(partition);
+    let placed = PLACED_BATCH_SIZE as u64;
+
+    let recovered = Box::pin(recover(&config)).await.unwrap();
+
+    assert_eq!(
+        bounds(&recovered),
+        [(0, 1, 2 * placed), (2, 3, 2 * placed), (4, 4, placed)]
+    );
+    let last = &recovered.segments[2].segment;
+    assert!(!last.sealed);
+    // `journal_send_record` stamps each prepare with its op.
+    assert_eq!(last.start_timestamp, 5);
+    assert_eq!(recovered.segments[0].segment.start_timestamp, 1);
+    assert_eq!(recovered.segments[0].segment.end_timestamp, 2);
+}
+
+/// A segment of whole batches is not what this recovery reads, and it must
+/// not take one for a segment that merely lost its tail.
+#[compio::test]
+async fn given_a_segment_of_whole_batches_when_recovering_placed_batches_should_recover_nothing_from_it()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 1)).await;
+    drop(partition);
+    let whole = build_segment_record(IggyNamespace::new(1, 1, 0), 0);
+    std::fs::write(log_path(&config, 0), whole).unwrap();
+
+    let recovered = Box::pin(recover(&config)).await.unwrap();
+
+    assert_eq!(bounds(&recovered), [(0, 0, 0)]);
+}
+
+#[compio::test]
+async fn given_a_torn_last_placed_batch_when_booting_should_recover_the_batches_before_it() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 3)).await;
+    drop(partition);
+    // The last segment holds one placed batch. A crash cut the next one.
+    let path = log_path(&config, 2);
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), PLACED_BATCH_SIZE);
+    let (torn, _) = placed_record(3);
+    bytes.extend_from_slice(&torn[..PLACED_BATCH_SIZE - 7]);
+    std::fs::write(&path, &bytes).unwrap();
+    let placed = PLACED_BATCH_SIZE as u64;
+
+    let recovered = Box::pin(recover(&config)).await.unwrap();
+
+    assert_eq!(bounds(&recovered), [(0, 1, 2 * placed), (2, 2, placed)]);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        placed,
+        "the torn tail is cut off"
+    );
+}
+
+/// The batch after the damaged one was appended later, so cutting the
+/// segment at the damage would erase it.
+#[compio::test]
+async fn given_a_damaged_placed_batch_before_an_intact_one_when_booting_should_refuse_the_partition()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (mut config, partition) = Box::pin(placing_partition_on_disk(root.path(), 0)).await;
+    drop(partition);
+    // One segment that holds three placed batches, the middle one damaged.
+    config.segment_size = IggyByteSize::from(4 * PLACED_BATCH_SIZE as u64);
+    let mut bytes = Vec::new();
+    for offset in 0..3 {
+        let (record, _) = placed_record(offset);
+        let mut placed = PlacedBatch::decode(&record).unwrap();
+        placed.header.base_offset = offset;
+        placed.header.base_timestamp = 1 + offset;
+        let mut stamped = vec![0; PLACED_BATCH_SIZE];
+        placed.encode_into(&mut stamped);
+        bytes.extend_from_slice(&stamped);
+    }
+    bytes[PLACED_BATCH_SIZE + COMMAND_HEADER_SIZE + 16] ^= 1;
+    std::fs::write(log_path(&config, 0), &bytes).unwrap();
+
+    let recovered = Box::pin(recover(&config)).await;
+
+    assert!(matches!(
+        recovered,
+        Err(crate::PartitionRecoveryError::Refused {
+            reason: crate::PartitionRecoveryRefusal::InteriorDamage { .. },
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(log_path(&config, 0)).unwrap(), bytes);
+}
+
+#[compio::test]
+async fn given_a_placed_batch_at_another_offset_when_booting_should_refuse_the_partition() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 0)).await;
+    drop(partition);
+    let (record, _) = placed_record(0);
+    let mut placed = PlacedBatch::decode(&record).unwrap();
+    placed.header.base_offset = 9;
+    let mut stamped = vec![0; PLACED_BATCH_SIZE];
+    placed.encode_into(&mut stamped);
+    std::fs::write(log_path(&config, 0), &stamped).unwrap();
+
+    let recovered = Box::pin(recover(&config)).await;
+
+    assert!(matches!(
+        recovered,
+        Err(crate::PartitionRecoveryError::Refused {
+            reason: crate::PartitionRecoveryRefusal::OffsetDiscontinuity { .. },
+            ..
+        })
+    ));
+}
+
+#[compio::test]
+async fn given_a_rebooted_placing_partition_when_more_placed_batches_commit_should_continue_its_offsets()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 3)).await;
+    drop(partition);
+    let directory = config.get_partition_path(1, 1, 0);
+    let recovered = Box::pin(recover(&config)).await.unwrap();
+    let mut partition = test_partition_with_replicas(3);
+    partition.set_places_batches(true);
+    partition.set_partition_dir(directory.clone());
+    partition.runtime_options.segment_size = Some(placed_segment_size());
+    partition.log.retire_front().unwrap();
+    crate::partition_storage::hydrate_partition_log(&mut partition, &directory, 1, 1, 0, recovered)
+        .await
+        .unwrap();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    // The server restores the offsets from the recovered segments.
+    let recovered_end = partition.log.active_segment().end_offset;
+    assert_eq!(recovered_end, 2);
+    partition.offset.store(recovered_end, Ordering::Release);
+    partition
+        .dirty_offset
+        .store(recovered_end, Ordering::Relaxed);
+    partition.set_offset_space_used(true);
+
+    // The test partition keeps no WAL, so its ops start over. The offsets
+    // are what the segments carry across the reboot.
+    let (records, _) = placed_records(2);
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
+
+    assert_eq!(partition.offset.load(Ordering::Acquire), 4);
+    let stored: Vec<_> = segment_file_bytes(Path::new(&directory))
+        .iter()
+        .flat_map(|bytes| placed_batches_in(bytes))
+        .map(|placed| placed.header.base_offset)
+        .collect();
+    assert_eq!(stored, [0, 1, 2, 3, 4]);
+}
+
+/// Reading through a placement comes later. Until then a poll says so, and
+/// does not answer as though the partition held nothing.
+#[compio::test]
+async fn given_a_placing_partition_when_a_poll_completes_should_refuse_it_as_unavailable() {
+    let (_directory, mut partition) = Box::pin(placing_partition()).await;
+    let (records, _) = placed_records(1);
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
+
+    let completed = partition.complete_poll(poll_read_result(
+        &partition,
+        PollingConsumer::Consumer(7, 0),
+        false,
+        None,
+    ));
+
+    assert!(matches!(completed, Err(IggyError::FeatureUnavailable)));
+}

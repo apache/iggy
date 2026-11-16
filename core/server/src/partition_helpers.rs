@@ -51,7 +51,8 @@ use partitions::{
     IggyPartition, IggyPartitions, PartitionPersistence, PartitionRecoveryError,
     PartitionRecoveryRefusal, PartitionsConfig, RecoveredLog, clamp_consumer_offsets,
     create_partition_file_hierarchy, ensure_initial_segment, hydrate_partition_log,
-    load_persisted_segments, load_persisted_segments_with_checkpoint, recover_consumer_offsets,
+    load_persisted_segments, load_persisted_segments_with_checkpoint, load_placed_segments,
+    recover_consumer_offsets,
 };
 use server_common::fatal::is_descriptor_exhaustion;
 use server_common::fs_utils::run_blocking;
@@ -927,7 +928,16 @@ async fn recover_partition_segments(
     let partition_id = namespace.partition_id();
     let segment_size = runtime_options.effective_segment_size();
     let persisted = runtime_options.durability.is_persisted();
-    let recovered = if checkpoint.is_some() {
+    let recovered = if runtime_options.places_batches {
+        load_placed_segments(
+            partitions_config,
+            namespace,
+            segment_size,
+            stats,
+            checkpoint,
+        )
+        .await
+    } else if checkpoint.is_some() {
         load_persisted_segments_with_checkpoint(
             partitions_config,
             namespace,
