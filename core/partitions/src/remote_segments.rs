@@ -266,6 +266,24 @@ impl RemoteSegments {
         Ok(object.bytes)
     }
 
+    /// The bytes at `range` of the segment object `key`, cut at the end of
+    /// the object.
+    ///
+    /// An error the store may not repeat is retryable. Anything else is not:
+    /// a missing object or a refusal.
+    pub(crate) async fn read_segment_object(
+        &self,
+        key: &SegmentKey,
+        range: Range<u64>,
+    ) -> Result<Bytes, DiskFault> {
+        let key = self.layout.segment_key(key);
+        self.objects
+            .get_range(&key, range)
+            .await
+            .map(|object| object.bytes)
+            .map_err(|error| fault(&key, &error))
+    }
+
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
     /// of the segment.
     ///

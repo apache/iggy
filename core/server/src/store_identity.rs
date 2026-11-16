@@ -55,7 +55,9 @@ use journal::superblock::SuperblockStore;
 use metadata::AppliedFrontier;
 use metadata::change_log::ChangeLog;
 use metadata::impls::metadata::StreamsFrontend;
-use partitions::{FreshObjectUploader, ManifestPublisher, ObjectDeleter, SegmentUploader};
+use partitions::{
+    FreshObjectUploader, LongTermWriter, ManifestPublisher, ObjectDeleter, SegmentUploader,
+};
 use shard::Receiver;
 use shard::metrics::ShardMetrics;
 use tracing::{debug, error, info, warn};
@@ -119,14 +121,15 @@ enum Verdict {
 }
 
 /// What a shard writes to the object store with: its segment uploader, its
-/// object deleter, its manifest publisher and the uploader of its fresh
-/// objects. The shard holds them only while its node passes the store
-/// identity check.
+/// object deleter, its manifest publisher, the uploader of its fresh objects
+/// and the writer of its long-term segments. The shard holds them only while
+/// its node passes the store identity check.
 pub struct TierHandlers {
     uploader: Rc<dyn SegmentUploader>,
     deleter: Rc<dyn ObjectDeleter>,
     publisher: Rc<dyn ManifestPublisher>,
     fresh_uploader: Rc<dyn FreshObjectUploader>,
+    long_term_writer: Rc<dyn LongTermWriter>,
     held: bool,
 }
 
@@ -352,12 +355,14 @@ impl TierHandlers {
         deleter: Rc<dyn ObjectDeleter>,
         publisher: Rc<dyn ManifestPublisher>,
         fresh_uploader: Rc<dyn FreshObjectUploader>,
+        long_term_writer: Rc<dyn LongTermWriter>,
     ) -> Self {
         Self {
             uploader,
             deleter,
             publisher,
             fresh_uploader,
+            long_term_writer,
             held: false,
         }
     }
@@ -376,6 +381,7 @@ impl TierHandlers {
         shard.set_object_deleter(verified.then(|| Rc::clone(&self.deleter)));
         shard.set_manifest_publisher(verified.then(|| Rc::clone(&self.publisher)));
         shard.set_fresh_uploader(verified.then(|| Rc::clone(&self.fresh_uploader)));
+        shard.set_long_term_writer(verified.then(|| Rc::clone(&self.long_term_writer)));
         self.held = verified;
     }
 }
@@ -392,7 +398,8 @@ mod tests {
         ObjectRange, PutBody, PutOptions,
     };
     use partitions::{
-        ExecutorDeleter, ExecutorFreshUploader, ExecutorManifestPublisher, ExecutorUploader,
+        ExecutorDeleter, ExecutorFreshUploader, ExecutorLongTermWriter, ExecutorManifestPublisher,
+        ExecutorUploader,
     };
 
     use super::*;
@@ -577,6 +584,10 @@ mod tests {
                 InlineTierExecutor::new(MemoryStore::new()),
                 layout(),
             )),
+            Rc::new(ExecutorLongTermWriter::new(
+                InlineTierExecutor::new(MemoryStore::new()),
+                layout(),
+            )),
         );
         let held = |handlers: &mut TierHandlers, verified| {
             handlers.sync(&shard, verified);
@@ -585,14 +596,21 @@ mod tests {
                 shard.object_deleter().is_some(),
                 shard.manifest_publisher().is_some(),
                 shard.fresh_uploader().is_some(),
+                shard.long_term_writer().is_some(),
             )
         };
 
-        assert_eq!(held(&mut handlers, false), (false, false, false, false));
-        assert_eq!(held(&mut handlers, true), (true, true, true, true));
-        assert_eq!(held(&mut handlers, true), (true, true, true, true));
-        assert_eq!(held(&mut handlers, false), (false, false, false, false));
-        assert_eq!(held(&mut handlers, true), (true, true, true, true));
+        assert_eq!(
+            held(&mut handlers, false),
+            (false, false, false, false, false)
+        );
+        assert_eq!(held(&mut handlers, true), (true, true, true, true, true));
+        assert_eq!(held(&mut handlers, true), (true, true, true, true, true));
+        assert_eq!(
+            held(&mut handlers, false),
+            (false, false, false, false, false)
+        );
+        assert_eq!(held(&mut handlers, true), (true, true, true, true, true));
     }
 
     #[test]

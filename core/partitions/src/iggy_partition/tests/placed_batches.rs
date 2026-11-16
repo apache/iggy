@@ -876,6 +876,11 @@ const FRESH_OBJECT: u128 = 0x51;
 /// The same batches for two partitions: as whole records, and as placed
 /// records whose blobs sit back to back in one fresh object.
 fn whole_and_placed(count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
+    whole_and_placed_in(FRESH_OBJECT, count)
+}
+
+/// [`whole_and_placed`] with the blobs in the fresh object `object_id`.
+fn whole_and_placed_in(object_id: u128, count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
     let whole = segment_records(count);
     let mut object = iggy_object_store::FreshObject::new();
     let placed = whole
@@ -884,7 +889,7 @@ fn whole_and_placed(count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
             let mut header = BatchHeader::decode(record).unwrap();
             header.batch_checksum = 0;
             let blob = &record[COMMAND_HEADER_SIZE..];
-            let placement = Placement::of(FRESH_OBJECT, object.push(blob), blob);
+            let placement = Placement::of(object_id, object.push(blob), blob);
             let mut placed = vec![0; PLACED_BATCH_SIZE];
             PlacedBatch::new(header, placement).encode_into(&mut placed);
             placed
@@ -1314,4 +1319,75 @@ async fn given_a_segment_another_primary_stored_when_rewriting_past_its_end_shou
     assert_eq!((first.start_offset, first.end_offset), (0, 1));
     assert_eq!((second.start_offset, second.end_offset), (2, 3));
     assert_eq!(partition.long_term_floor(), Some(3));
+}
+
+/// The offsets at or below the long-term floor come from the long-term
+/// segment and the ones above it from the placed batches, in one poll. The
+/// fresh object of the rewritten batches is gone, so nothing below the
+/// floor can have come from it.
+#[compio::test]
+async fn given_a_long_term_floor_inside_the_log_when_polling_across_it_should_return_every_batch_once()
+ {
+    use iggy_object_store::ObjectStore;
+    const SECOND_OBJECT: u128 = 0x52;
+    let (first_whole, first_placed, first_object) = whole_and_placed(3);
+    let (second_whole, second_placed, second_object) = whole_and_placed_in(SECOND_OBJECT, 2);
+    let whole: Vec<_> = first_whole.into_iter().chain(second_whole).collect();
+    let expected = Box::pin(polls_of_whole_batches(&whole)).await;
+    let store = Box::pin(store_with(first_object)).await;
+    let layout = super::remote_poll::layout();
+    store
+        .put(
+            &layout.fresh_key(SECOND_OBJECT),
+            iggy_object_store::PutBody::from_bytes(second_object),
+            &iggy_object_store::PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&first_placed, &store)).await;
+    let rewritten = Box::pin(rewrite_pass(&mut partition, &writer(&store), 100))
+        .await
+        .unwrap();
+    assert_eq!(rewritten.end_offset, 2);
+    Box::pin(commit_records(&mut partition, 4, &second_placed)).await;
+    let deleted = store
+        .delete(&[layout.fresh_key(FRESH_OBJECT)])
+        .await
+        .unwrap();
+    assert!(deleted.failed.is_empty());
+    // What the rewrite read stays in memory, and must not be what answers.
+    super::remote_poll::attach(
+        &mut partition,
+        Rc::clone(&store) as Rc<dyn crate::RemoteObjects>,
+    );
+
+    let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
+
+    assert_eq!(polled, expected);
+}
+
+/// A reader of the bucket finds the partition's segments in its manifest.
+#[compio::test]
+async fn given_a_published_long_term_segment_when_building_the_manifest_should_list_it() {
+    let (_whole, placed, object) = whole_and_placed(3);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
+    let now = IggyTimestamp::now();
+    let empty = partition.manifest(now).unwrap();
+    assert_eq!((empty.floor, empty.segments.len()), (None, 0));
+    let segment = Box::pin(rewrite_pass(&mut partition, &writer(&store), 100))
+        .await
+        .unwrap();
+
+    let manifest = partition.manifest(now).unwrap();
+
+    assert_eq!(
+        manifest.prefix,
+        crate::object_prefix(IggyNamespace::new(1, 1, 0), 0)
+    );
+    assert_eq!(manifest.floor, Some(2));
+    assert_eq!(manifest.trim_point, None);
+    assert_eq!(manifest.segments, [segment]);
+    let (_, published, _) = partition.begin_manifest_publish(now).unwrap();
+    assert_eq!(published, manifest);
 }

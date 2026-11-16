@@ -187,6 +187,9 @@ where
     /// that goes back.
     #[must_use]
     pub fn manifest(&self, now: IggyTimestamp) -> Option<PartitionManifest> {
+        if self.places_batches() {
+            return Some(self.long_term_manifest(now));
+        }
         let chain = self.segment_chain.as_ref()?;
         let trim_point = self.chain_trim_point();
         let segments: Vec<ManifestSegment> =
@@ -205,6 +208,26 @@ where
         })
     }
 
+    /// The manifest of a partition that places its batches: its long-term
+    /// log. Every segment of the log was stored before its command was sent,
+    /// so the manifest names no object that is not there.
+    fn long_term_manifest(&self, now: IggyTimestamp) -> PartitionManifest {
+        PartitionManifest {
+            prefix: crate::object_prefix(self.namespace(), self.created_revision()),
+            published_at: now.as_micros(),
+            floor: self.long_term_floor(),
+            trim_point: None,
+            segments: self.long_term_segments().to_vec(),
+        }
+    }
+
+    /// Whether this replica is the one that publishes the partition's
+    /// manifest: the settled primary of a tiered partition, or of one that
+    /// places its batches.
+    fn publishes_manifest(&self) -> bool {
+        self.deletes_objects() || (self.places_batches() && self.state_machines_current())
+    }
+
     /// Start the publish of this partition's manifest, when this replica is
     /// the primary, none is in flight, and the manifest differs from the
     /// one this view last stored or is due again. The caller runs it under
@@ -217,7 +240,7 @@ where
         &mut self,
         now: IggyTimestamp,
     ) -> Option<(u64, PartitionManifest, TierScopeToken)> {
-        if !self.deletes_objects() {
+        if !self.publishes_manifest() {
             self.manifest_publishes = ManifestPublishes::default();
             return None;
         }
@@ -257,7 +280,8 @@ where
         if !awaited {
             return;
         }
-        if !self.deletes_objects() || self.manifest_publishes.view != Some(self.consensus().view())
+        if !self.publishes_manifest()
+            || self.manifest_publishes.view != Some(self.consensus().view())
         {
             self.manifest_publishes = ManifestPublishes::default();
             return;

@@ -91,6 +91,7 @@ async fn placing_owner(directory: &Path) -> IoTestShard {
         ..Default::default()
     });
     attach_segment_files(partition, directory, false).await;
+    partition.register_builtin_state_machines().unwrap();
     owner
 }
 
@@ -282,4 +283,71 @@ async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_witho
 
     assert_eq!(polled.message_count(), 2);
     assert_eq!(polled.last_matching_offset(), Some(1));
+}
+
+/// The whole write path on one shard: a producer's sends are stored and
+/// committed as placed batches, the rewrite pass stores them again as a
+/// long-term segment, and the partition's long-term log names it.
+#[compio::test]
+async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish_a_long_term_segment()
+ {
+    use super::object_deletes::Shared;
+    use iggy_object_store::{SegmentKey, SegmentObject};
+    use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let partitions = owner.plane.partitions();
+    partitions.set_remote_segments(Rc::new(RemoteSegments::new(
+        Rc::new(ExecutorObjects::new(executor.clone())),
+        layout(),
+    )));
+    let revision = partitions
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let floor = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+    };
+
+    pumped(&owner, async {
+        let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        assert_eq!(floor(&owner), None);
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| floor(owner) == Some(1)).await;
+    })
+    .await;
+
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    let segments = partition.long_term_segments();
+    assert_eq!(segments.len(), 1);
+    assert_eq!((segments[0].start_offset, segments[0].end_offset), (0, 1));
+    assert_eq!(partition.unpublished_segment(), None);
+    let store = executor.0.store();
+    let log_key = layout().segment_key(&SegmentKey {
+        prefix: partitions::object_prefix(namespace(), revision),
+        start_offset: 0,
+        object: SegmentObject::Log,
+    });
+    assert_eq!(store.head(&log_key).await.unwrap().size, segments[0].size);
+    assert_eq!(
+        store.keys().len(),
+        3,
+        "the fresh object, the log and its index"
+    );
 }

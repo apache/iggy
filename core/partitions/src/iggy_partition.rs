@@ -6204,7 +6204,7 @@ where
                 commit_offset,
                 context,
                 tier: PollTier::Placed {
-                    placed: self.placed_read_plan(),
+                    placed: self.placed_read_plan(Some(query)),
                     query,
                 },
             };
@@ -6318,7 +6318,28 @@ where
     /// What a poll of this partition reads when it places its batches: its
     /// segments that hold a batch, and the placed batches still in its
     /// journal. Taken under the partition borrow, so the read runs without.
-    pub(crate) fn placed_read_plan(&self) -> crate::placed_read::PlacedReadPlan {
+    ///
+    /// `query` is the poll the plan is for, and picks the long-term segments
+    /// it carries. A read that starts above the long-term floor passes none.
+    pub(crate) fn placed_read_plan(
+        &self,
+        query: Option<MessageLookup>,
+    ) -> crate::placed_read::PlacedReadPlan {
+        let long_term = self.long_term_segments();
+        let first = match query {
+            Some(MessageLookup::Offset { offset, .. }) => {
+                long_term.partition_point(|segment| segment.end_offset < offset)
+            }
+            Some(MessageLookup::Timestamp { timestamp, .. }) => {
+                long_term.partition_point(|segment| segment.max_timestamp < timestamp)
+            }
+            None => long_term.len(),
+        };
+        let long_term = long_term[first..]
+            .iter()
+            .take(crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL)
+            .copied()
+            .collect();
         let segments = self
             .log
             .segments()
@@ -6339,6 +6360,8 @@ where
             resident: self.log.journal().inner.resident_message_entries(),
             remote: self.remote_segments.clone(),
             deadline: None,
+            prefix: crate::object_prefix(self.namespace(), self.created_revision()),
+            long_term,
         }
     }
 

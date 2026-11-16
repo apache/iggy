@@ -26,6 +26,7 @@ mod fresh_writes;
 pub use fresh_writes::{
     FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_WINDOW, FinishedFreshUpload, PlacedSend,
 };
+mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
 mod poll;
@@ -1252,6 +1253,30 @@ pub enum LifecycleFrame {
     /// The result of the upload of a fresh object, sent by the task that ran
     /// it, with the sends that wait for the object.
     FreshUploadFinished(Box<FinishedFreshUpload>),
+    /// Per-shard pass over a partition that places its batches: rewrite its
+    /// committed batches above the long-term floor into a segment, when this
+    /// replica is the primary and no rewrite is in flight, or send the
+    /// command of a stored segment again. Does nothing on a shard without a
+    /// writer.
+    RewriteSegments {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+    },
+    /// The result of a rewrite that a [`Self::RewriteSegments`] pass
+    /// started, sent by the task that ran it.
+    SegmentRewriteFinished(Box<FinishedSegmentRewrite>),
+}
+
+/// What the task rewriting a segment hands back to the pump.
+pub struct FinishedSegmentRewrite {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the rewrite. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the rewrite.
+    pub id: u64,
+    pub outcome: partitions::RewriteOutcome,
 }
 
 /// What the task publishing a manifest hands back to the pump.
@@ -2087,6 +2112,15 @@ where
     /// batches.
     fresh_writes: fresh_writes::FreshWrites,
 
+    /// Late-bound writer of long-term segments. `None` on a shard without an
+    /// object store, where every rewrite pass is a no-op.
+    long_term_writer: RefCell<Option<Rc<dyn partitions::LongTermWriter>>>,
+
+    /// Results of rewrites whose frame the inbox refused. The partition
+    /// counts such a rewrite as in flight until it sees the result, so the
+    /// next rewrite pass takes them from here.
+    undelivered_segment_rewrites: Rc<RefCell<Vec<FinishedSegmentRewrite>>>,
+
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
     /// number only tells two advances apart in a prepare.
@@ -2433,6 +2467,8 @@ where
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3403,6 +3439,8 @@ where
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),

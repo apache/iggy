@@ -1257,6 +1257,15 @@ where
             LifecycleFrame::FreshUploadFinished(finished) => {
                 self.on_fresh_upload_finished(*finished).await;
             }
+            LifecycleFrame::RewriteSegments {
+                namespace,
+                created_revision,
+            } => {
+                self.on_rewrite_segments(namespace, created_revision).await;
+            }
+            LifecycleFrame::SegmentRewriteFinished(finished) => {
+                self.on_segment_rewrite_finished(*finished).await;
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,

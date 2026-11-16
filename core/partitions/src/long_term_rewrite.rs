@@ -427,7 +427,7 @@ where
             up_to,
             ends_at_up_to,
             partition_dir,
-            read: self.placed_read_plan(),
+            read: self.placed_read_plan(None),
         };
         Some((id, rewrite, token))
     }
