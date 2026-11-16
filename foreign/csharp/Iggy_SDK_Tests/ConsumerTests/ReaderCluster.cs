@@ -51,8 +51,6 @@ internal readonly record struct ReceivedPoll(uint PartitionId, MessagePolling Ki
 /// </summary>
 internal sealed class ReaderCluster : IDisposable
 {
-    internal Func<ulong, byte[]>? FetchRecords { get; init; }
-
     private const int PartitionsCount = 4;
 
     /// <summary>The context of every route and every read.</summary>
@@ -102,6 +100,11 @@ internal sealed class ReaderCluster : IDisposable
     }
 
     internal ulong Limit { get; set; } = 2;
+
+    /// <summary>
+    ///     Custom records for fetches only. Must return <see cref="GOLDEN_BATCH_MESSAGES" /> messages from the given offset.
+    /// </summary>
+    internal Func<ulong, byte[]>? FetchRecords { get; init; }
 
     /// <summary>
     ///     The owner generation of every partition. A read or an offset write that names another one is refused as not

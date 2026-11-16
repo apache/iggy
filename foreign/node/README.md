@@ -391,6 +391,12 @@ try {
   (`prefetchBytes`, `prefetchMessages`). Each effective budget holds at least
   32 full batches, and larger configured budgets still apply. A budget that is
   NaN, infinite or negative is refused with error 3 before anything is sent.
+  The byte budget counts message frame headers, payloads and encoded user
+  headers. It is not a limit on retained memory: payload views keep whole
+  reply buffers alive, including the uncounted 256-byte batch header per
+  record. With one small message per record, retained buffers can occupy
+  several times the byte budget. Decoded objects and in-flight reads also
+  use memory outside this count.
   Without options a read waits up to 5 s. After a refused read, a lost read or
   a failed refresh it waits `retryInterval`, 1 s by default. While a refresh
   of the group assignment fails or gets no answer, the reader reads on under

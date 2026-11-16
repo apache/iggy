@@ -102,7 +102,11 @@ export type PartitionReaderRequest = {
   options?: Partial<PollOptions>,
   /**
    * Requested read-ahead bytes, 16 MiB by default, raised to hold at least 32
-   * full batches. With `CommitPolicy.OnRead` the server stores the offset of
+   * full batches. Counts message frame headers, payloads and encoded user
+   * headers, not total retained memory. Payload views retain whole replies,
+   * including the uncounted 256-byte batch header per record. Small records
+   * can therefore retain several times this budget.
+   * With `CommitPolicy.OnRead` the server stores the offset of
    * each read before the application takes its batch. A crash, or a reader
    * that stops without `close()`, loses the batches that the reader held: up
    * to the effective budget, which holds at least 32 batches.

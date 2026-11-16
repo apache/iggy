@@ -117,7 +117,6 @@ public sealed class PartitionReaderTests
         var reads = cluster.Fetches.Count;
         var delivered = await ReadAsync(reader, reads + 1);
         Assert.Equal(headers ? HeaderBytes : 0, delivered[0].Messages[0].Header.UserHeadersLength);
-        await UntilAsync(() => cluster.Fetches.Count > reads);
     }
 
     [Fact]

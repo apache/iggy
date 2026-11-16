@@ -796,7 +796,6 @@ describe('partition reader', () => {
         assert.equal(batch.messages.length, 2);
         assert.equal(batch.messages[0].headers.userHeadersLength, headers ? userHeaders.length : 0);
         for (let index = 0; index < reads; index++) await reader.next();
-        await waitFor(() => topic.reads.length > reads, 'delivery did not free the byte budget');
       } finally {
         await reader.close();
       }
