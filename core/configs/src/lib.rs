@@ -30,6 +30,6 @@ pub use configs_impl::{
     TypedEnvProvider, expand_env_templates, parse_env_value_to_json, print_env_var_names,
 };
 pub use server_config::{
-    cluster, external_auth, message_bus, metadata, partition, quic, server, sharding, tcp,
+    cluster, external_auth, geo, message_bus, metadata, partition, quic, server, sharding, tcp,
     tiered_storage, websocket,
 };

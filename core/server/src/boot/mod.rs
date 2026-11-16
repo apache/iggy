@@ -75,6 +75,7 @@ use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+use shard::peers::SharedPeerStatus;
 use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
@@ -302,6 +303,8 @@ pub fn bootstrap(
     let tiered_credentials = crate::s3_credentials::credentials(&config.tiered_storage)?;
     let object_store_answered =
         crate::tiered_storage::probe(&config.tiered_storage, tiered_credentials.as_ref())?;
+    crate::geo_peers::preflight(&config.geo)?;
+    let geo_peer_statuses = crate::geo_peers::statuses(&config.geo);
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -454,6 +457,7 @@ pub fn bootstrap(
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
         let tiered_credentials_for_shard = tiered_credentials.clone();
+        let geo_peer_statuses_for_shard = geo_peer_statuses.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -477,6 +481,7 @@ pub fn bootstrap(
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
                     tiered_credentials_for_shard,
+                    geo_peer_statuses_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -553,6 +558,7 @@ async fn shard_main(
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
     tiered_credentials: Option<SharedCredentials>,
+    geo_peer_statuses: Vec<SharedPeerStatus>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -1022,6 +1028,13 @@ async fn shard_main(
         topology.self_replica_id,
         tiered_credentials.as_ref(),
     );
+    let geo_peers_stop = crate::geo_peers::start(
+        &config.geo,
+        &config.tiered_storage,
+        &bus,
+        &shard,
+        &geo_peer_statuses,
+    );
 
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
@@ -1046,6 +1059,7 @@ async fn shard_main(
         stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
         store_identity: store_identity_stop,
+        geo_peers: geo_peers_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
     };

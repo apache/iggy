@@ -569,6 +569,66 @@ node passes its check. Until a topic is tiered, replica 0 also claims again
 after any check that did not pass, so if its `fs` mount drops, it claims the
 empty mount point.
 
+### Geo peers
+
+The `[geo]` section of `config.toml` names this cluster among the datacenters
+and lists its peers: the other clusters whose stores it reads.
+`origin` is the name of this cluster. Shadow stream names and the objects that
+this cluster publishes for its peers carry it. An origin name holds 1 to 32
+lowercase letters, digits and `-`. It starts with a letter and does not end
+with `-`. A cluster with peers needs an origin.
+
+Each `[[geo.peers]]` table gives the peer's `origin` and the keys of the peer's
+`[tiered_storage]` store: `backend`, `prefix`, `path` for `fs`, and `bucket`,
+`region`, `endpoint` and `url_style` for `s3`. An `s3` peer needs the static
+keys `access_key_id` and `secret_access_key`. The printed configuration never
+shows them. A cluster reads at most 16 peers.
+
+The server never writes to a peer's store. Each shard reads a peer through a
+store that refuses every put, conditional create and delete before the request
+leaves the node. Read-only credentials are therefore enough. Each shard runs
+one tier service per peer, with the timeouts and job caps of
+`[tiered_storage]`. A slow peer takes no job slot of this cluster's store or of
+another peer.
+
+When the node starts, shard 0 reads each peer's store identity object,
+`<prefix>/meta/identity`. After that it reads the object every minute. While the node
+reads nothing from the peer, or the peer's store does not answer, it reads the
+object every 5 seconds. The node remembers the first cluster that the object
+names. It keeps that cluster in memory only, so after a restart it reads the
+object again.
+
+Only a configuration that can never work stops the boot, for example a prefix
+that is not a usable key prefix. A peer whose store does not answer never stops
+the boot and never delays local traffic.
+
+Each shard exports two gauges for its node per peer, labelled with the peer's
+`origin`:
+
+- `geo_peer_identity_verified` is 1 while the node reads the peer. It is 0
+  until a check reads the peer's identity object, and while the object is
+  missing, refused or changed.
+- `geo_peer_unreachable` is 1 while the peer's store does not answer the check.
+  A node that verified the peer keeps reading what the store returns.
+
+A node logs that the identity object of a geo peer no longer names the cluster
+that it read first. From then on, the node reads nothing from the peer until it
+restarts. This happens when:
+
+- The peer's metadata was rebuilt, which gives the peer a new `cluster_uid`.
+  Its stream, topic and partition ids start again, so the objects under its
+  prefix belong to another history.
+- The peer's entry in this file now points at the store of another cluster.
+  Correct the entry.
+- The object holds bytes that no cluster wrote. The peer's operator puts the
+  object back, as the tiered storage section describes.
+
+Before you restart the node, find out which cluster owns the peer's prefix now.
+After the restart, the node remembers the cluster that it finds then.
+
+A node also reads nothing from a peer whose identity object names this cluster.
+Then the peer's store and prefix are this cluster's own.
+
 ## Resource options
 
 Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.

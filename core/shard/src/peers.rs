@@ -1,0 +1,562 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The stores of the geo peers of a node: the other clusters whose buckets
+//! it reads.
+//!
+//! Every shard holds one [`PeerStore`] per peer, each with a tier service of
+//! its own over a [`ReadOnlyStore`]. A slow peer therefore never takes the
+//! job slots of this cluster's store or of another peer, and no write
+//! reaches a peer, whatever job runs on its service.
+//!
+//! What the node knows about a peer's identity is one [`SharedPeerStatus`]
+//! for the whole node. Shard 0 reads the peer's store identity object at
+//! boot and on a timer, and every shard sees the result. The node remembers
+//! the cluster that the first claim of another cluster names. A later check
+//! that finds another claim latches the peer as changed, and the node reads
+//! nothing from it again while it runs.
+
+#![allow(
+    clippy::future_not_send,
+    reason = "every peer store runs on the shard that owns it and never crosses threads"
+)]
+
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use iggy_object_store::{KeyLayout, ReadOnlyStore};
+use journal::superblock::SuperblockStore;
+use message_bus::MessageBus;
+
+use crate::IggyShard;
+use crate::shards_table::ShardsTable;
+use crate::tier_service::{TierService, TierServiceConfig};
+
+/// The tier service of one peer on one shard.
+pub type PeerService<B> = TierService<ReadOnlyStore, B>;
+
+/// What the identity checks of one peer's store found so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PeerIdentity {
+    /// No check read a claim of another cluster yet. The store did not
+    /// answer, refused the read, holds no identity object, holds bytes that
+    /// no cluster wrote, or names this cluster.
+    #[default]
+    Unverified,
+    /// The root belongs to `cluster_uid`, which the first claim that a check
+    /// read names, and the last check that got an answer read it again.
+    Verified { cluster_uid: u128 },
+    /// An earlier check verified `cluster_uid`, but the last answer was no
+    /// identity object or a refusal. The node reads nothing until a check
+    /// finds `cluster_uid` again.
+    Unconfirmed { cluster_uid: u128 },
+    /// A check found a claim other than `cluster_uid`: another cluster's,
+    /// this cluster's own, or, as `None`, bytes that no cluster wrote. The
+    /// peer counts as another origin, and the node reads nothing from it
+    /// until it restarts.
+    Changed {
+        cluster_uid: u128,
+        found: Option<u128>,
+    },
+}
+
+/// What one read of a peer's store identity object found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRead {
+    /// The object names the cluster with this id.
+    Found(u128),
+    /// The object names this cluster, so the peer's root is this cluster's
+    /// own.
+    OwnCluster(u128),
+    /// The object holds bytes that no cluster wrote.
+    Invalid,
+    /// No object is under the identity key.
+    Missing,
+    /// The store did not answer, or failed in a way that a retry can get
+    /// past.
+    Unreachable,
+    /// The store refused the read in a way that only an operator can fix,
+    /// such as rejected credentials or a missing bucket.
+    Refused,
+}
+
+/// What the node knows about a peer: its identity, and whether its store
+/// answered the last check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerStatus {
+    pub identity: PeerIdentity,
+    /// The last check got no answer. A verified peer stays verified through
+    /// an outage, and the node still reads what the store returns.
+    pub unreachable: bool,
+}
+
+/// The status of one peer, shared by every shard of the node. Shard 0 sets
+/// it after each check, and every shard reads it.
+#[derive(Debug, Clone, Default)]
+pub struct SharedPeerStatus {
+    status: Arc<Mutex<PeerStatus>>,
+}
+
+/// One peer on one shard: its origin name, the layout of its root, its tier
+/// service, and what the node knows about its identity.
+pub struct PeerStore<B> {
+    origin: String,
+    layout: KeyLayout,
+    service: PeerService<B>,
+    status: SharedPeerStatus,
+}
+
+/// The peers of one shard, in the order of the configuration.
+pub struct PeerStores<B> {
+    peers: Vec<PeerStore<B>>,
+}
+
+impl PeerIdentity {
+    /// The identity after a check that found `read`.
+    #[must_use]
+    pub const fn after(self, read: PeerRead) -> Self {
+        match (self, read) {
+            // Only an operator ends a change, and an outage changes nothing.
+            (Self::Changed { .. }, _) | (_, PeerRead::Unreachable) => self,
+            (Self::Unverified, PeerRead::Found(cluster_uid)) => Self::Verified { cluster_uid },
+            (
+                Self::Unverified,
+                PeerRead::OwnCluster(_) | PeerRead::Invalid | PeerRead::Missing | PeerRead::Refused,
+            ) => Self::Unverified,
+            (
+                Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
+                PeerRead::Found(found),
+            ) if found == cluster_uid => Self::Verified { cluster_uid },
+            (
+                Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
+                PeerRead::Found(found) | PeerRead::OwnCluster(found),
+            ) => Self::Changed {
+                cluster_uid,
+                found: Some(found),
+            },
+            (
+                Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
+                PeerRead::Invalid,
+            ) => Self::Changed {
+                cluster_uid,
+                found: None,
+            },
+            (
+                Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
+                PeerRead::Missing | PeerRead::Refused,
+            ) => Self::Unconfirmed { cluster_uid },
+        }
+    }
+
+    /// The cluster that owns the peer's root while the node reads it, and
+    /// `None` while it reads nothing from the peer.
+    #[must_use]
+    pub const fn readable(&self) -> Option<u128> {
+        match self {
+            Self::Verified { cluster_uid } => Some(*cluster_uid),
+            Self::Unverified | Self::Unconfirmed { .. } | Self::Changed { .. } => None,
+        }
+    }
+}
+
+impl PeerStatus {
+    /// The status after a check that found `read`.
+    #[must_use]
+    pub const fn after(self, read: PeerRead) -> Self {
+        Self {
+            identity: self.identity.after(read),
+            unreachable: matches!(read, PeerRead::Unreachable),
+        }
+    }
+}
+
+impl SharedPeerStatus {
+    #[must_use]
+    pub fn get(&self) -> PeerStatus {
+        // A status is two plain values that a panic cannot leave half set.
+        *self.status.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set(&self, status: PeerStatus) {
+        *self.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
+    }
+}
+
+impl<B> PeerStore<B>
+where
+    B: MessageBus + Clone + 'static,
+{
+    /// The peer `origin`, whose objects are under `layout` in `store`. Its
+    /// jobs run on a tier service of their own, with the caps and timeouts
+    /// of `config`.
+    #[must_use]
+    pub fn new(
+        origin: String,
+        layout: KeyLayout,
+        store: ReadOnlyStore,
+        bus: B,
+        config: &TierServiceConfig,
+        status: SharedPeerStatus,
+    ) -> Self {
+        Self {
+            origin,
+            layout,
+            service: TierService::new(store, bus, config),
+            status,
+        }
+    }
+}
+
+impl<B> PeerStore<B> {
+    /// The peer's origin name, as the configuration gives it.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The layout of the peer's root, under its prefix.
+    #[must_use]
+    pub const fn layout(&self) -> &KeyLayout {
+        &self.layout
+    }
+
+    #[must_use]
+    pub fn status(&self) -> PeerStatus {
+        self.status.get()
+    }
+
+    /// The verified cluster of the peer, see [`PeerIdentity::readable`].
+    #[must_use]
+    pub fn cluster_uid(&self) -> Option<u128> {
+        self.status().identity.readable()
+    }
+
+    /// The tier service over the peer's store, while the node reads the peer.
+    ///
+    /// Take it for each job. A clone kept across jobs keeps reading a peer
+    /// whose identity changed, and a job in flight ends on the service that
+    /// started it.
+    #[must_use]
+    pub fn service(&self) -> Option<&PeerService<B>> {
+        self.cluster_uid().map(|_| &self.service)
+    }
+}
+
+impl<B> Default for PeerStores<B> {
+    fn default() -> Self {
+        Self { peers: Vec::new() }
+    }
+}
+
+impl<B> PeerStores<B> {
+    #[must_use]
+    pub const fn new(peers: Vec<PeerStore<B>>) -> Self {
+        Self { peers }
+    }
+
+    /// The peer with the origin name `origin`.
+    #[must_use]
+    pub fn get(&self, origin: &str) -> Option<&PeerStore<B>> {
+        self.peers.iter().find(|peer| peer.origin == origin)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PeerStore<B>> {
+        self.peers.iter()
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+}
+
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
+where
+    B: MessageBus + 'static,
+    T: ShardsTable,
+    SB: SuperblockStore,
+{
+    /// Give this shard the stores of its geo peers, in place of the ones it
+    /// had. A job in flight ends on the service that started it.
+    pub fn set_peer_stores(&self, stores: PeerStores<B>) {
+        *self.peer_stores.borrow_mut() = Rc::new(stores);
+    }
+
+    /// The stores of this shard's geo peers, empty on a node without peers.
+    #[must_use]
+    pub fn peer_stores(&self) -> Rc<PeerStores<B>> {
+        Rc::clone(&self.peer_stores.borrow())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use futures::FutureExt;
+    use iggy_object_store::{
+        IdentityRead, ListRequest, MemoryStore, ObjectStore, ObjectStoreError, PutBody, PutOptions,
+        RecordingStore, StoreIdentity, TierExecutor, TierJobClass, TierJobRequest, TierScope,
+    };
+    use message_bus::IggyMessageBus;
+
+    use super::*;
+
+    const PEER: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
+    const OTHER: u128 = 7;
+    const OWN: u128 = 9;
+
+    type Bus = Rc<IggyMessageBus>;
+
+    #[test]
+    fn given_each_read_when_moving_the_identity_should_learn_once_and_latch_a_change() {
+        let unverified = PeerIdentity::Unverified;
+        let verified = PeerIdentity::Verified { cluster_uid: PEER };
+        let unconfirmed = PeerIdentity::Unconfirmed { cluster_uid: PEER };
+        let changed = |found| PeerIdentity::Changed {
+            cluster_uid: PEER,
+            found,
+        };
+        // (row, identity before, read, identity after)
+        for (row, before, read, after) in [
+            ("first claim", unverified, PeerRead::Found(PEER), verified),
+            (
+                "own claim is never learned",
+                unverified,
+                PeerRead::OwnCluster(OWN),
+                unverified,
+            ),
+            ("no claim yet", unverified, PeerRead::Missing, unverified),
+            ("garbage first", unverified, PeerRead::Invalid, unverified),
+            ("refused first", unverified, PeerRead::Refused, unverified),
+            (
+                "outage first",
+                unverified,
+                PeerRead::Unreachable,
+                unverified,
+            ),
+            ("same claim", verified, PeerRead::Found(PEER), verified),
+            ("outage keeps", verified, PeerRead::Unreachable, verified),
+            ("claim gone", verified, PeerRead::Missing, unconfirmed),
+            ("refused later", verified, PeerRead::Refused, unconfirmed),
+            ("claim back", unconfirmed, PeerRead::Found(PEER), verified),
+            ("still gone", unconfirmed, PeerRead::Missing, unconfirmed),
+            (
+                "outage while gone",
+                unconfirmed,
+                PeerRead::Unreachable,
+                unconfirmed,
+            ),
+            (
+                "another cluster",
+                verified,
+                PeerRead::Found(OTHER),
+                changed(Some(OTHER)),
+            ),
+            (
+                "another cluster while gone",
+                unconfirmed,
+                PeerRead::Found(OTHER),
+                changed(Some(OTHER)),
+            ),
+            (
+                "this cluster",
+                verified,
+                PeerRead::OwnCluster(OWN),
+                changed(Some(OWN)),
+            ),
+            ("garbage later", verified, PeerRead::Invalid, changed(None)),
+            (
+                "a change holds",
+                changed(Some(OTHER)),
+                PeerRead::Found(PEER),
+                changed(Some(OTHER)),
+            ),
+            (
+                "a change holds through an outage",
+                changed(None),
+                PeerRead::Unreachable,
+                changed(None),
+            ),
+        ] {
+            assert_eq!(before.after(read), after, "{row}");
+        }
+    }
+
+    #[test]
+    fn given_each_identity_when_asking_should_read_only_a_verified_peer() {
+        assert_eq!(
+            PeerIdentity::Verified { cluster_uid: PEER }.readable(),
+            Some(PEER)
+        );
+        for identity in [
+            PeerIdentity::Unverified,
+            PeerIdentity::Unconfirmed { cluster_uid: PEER },
+            PeerIdentity::Changed {
+                cluster_uid: PEER,
+                found: Some(OTHER),
+            },
+        ] {
+            assert_eq!(identity.readable(), None, "{identity:?}");
+        }
+    }
+
+    #[test]
+    fn given_reads_when_moving_the_status_should_flag_only_the_last_outage() {
+        let status = PeerStatus::default()
+            .after(PeerRead::Found(PEER))
+            .after(PeerRead::Unreachable);
+
+        assert_eq!(
+            status,
+            PeerStatus {
+                identity: PeerIdentity::Verified { cluster_uid: PEER },
+                unreachable: true,
+            },
+            "a verified peer stays readable through an outage"
+        );
+        assert!(!status.after(PeerRead::Found(PEER)).unreachable);
+    }
+
+    fn peer(origin: &str, provider: RecordingStore<MemoryStore>) -> PeerStore<Bus> {
+        PeerStore::new(
+            origin.to_owned(),
+            KeyLayout::new("iggy").unwrap(),
+            ReadOnlyStore::new(provider),
+            Rc::new(IggyMessageBus::new(0)),
+            &TierServiceConfig::default(),
+            SharedPeerStatus::default(),
+        )
+    }
+
+    fn claimed(cluster_uid: u128) -> MemoryStore {
+        let store = MemoryStore::new();
+        let layout = KeyLayout::new("iggy").unwrap();
+        assert!(
+            StoreIdentity { cluster_uid }
+                .claim(&store, &layout)
+                .now_or_never()
+                .unwrap()
+                .unwrap()
+        );
+        store
+    }
+
+    #[test]
+    fn given_two_peers_when_their_identities_move_should_hand_out_each_service_only_while_verified()
+    {
+        let stores = PeerStores::new(vec![
+            peer("dc-b", RecordingStore::new(MemoryStore::new())),
+            peer("dc-c", RecordingStore::new(MemoryStore::new())),
+        ]);
+        let dc_b = stores.get("dc-b").unwrap();
+        let dc_c = stores.get("dc-c").unwrap();
+
+        assert_eq!(stores.len(), 2);
+        assert!(stores.get("dc-a").is_none());
+        assert!(dc_b.service().is_none() && dc_c.service().is_none());
+
+        dc_b.status
+            .set(PeerStatus::default().after(PeerRead::Found(PEER)));
+        assert_eq!(dc_b.cluster_uid(), Some(PEER));
+        assert!(dc_b.service().is_some());
+        assert!(dc_c.service().is_none(), "each peer has its own status");
+
+        dc_b.status.set(dc_b.status().after(PeerRead::Found(OTHER)));
+        assert_eq!(dc_b.cluster_uid(), None);
+        assert!(dc_b.service().is_none());
+        assert_eq!(
+            dc_b.status().identity,
+            PeerIdentity::Changed {
+                cluster_uid: PEER,
+                found: Some(OTHER),
+            }
+        );
+    }
+
+    /// Jobs on a peer's service get a store that refuses writes, so a job
+    /// that tries every call reaches the peer with its reads alone.
+    #[compio::test]
+    async fn given_jobs_that_try_every_call_when_running_on_a_peer_should_reach_it_with_reads_only()
+    {
+        let provider = RecordingStore::new(claimed(PEER));
+        let calls = provider.calls();
+        let peer = peer("dc-b", provider);
+        peer.status
+            .set(PeerStatus::default().after(PeerRead::Found(PEER)));
+        let scope = TierScope::new();
+        let refusals = Rc::new(RefCell::new(Vec::new()));
+        let identity_key = peer.layout().identity_key();
+
+        for class in TierJobClass::ALL {
+            let refusals = Rc::clone(&refusals);
+            let key = identity_key.clone();
+            let layout = peer.layout().clone();
+            let read = peer
+                .service()
+                .unwrap()
+                .submit(
+                    TierJobRequest::new(class, scope.token()),
+                    move |store| async move {
+                        let put = store
+                            .put(&key, PutBody::from_bytes("x"), &PutOptions::default())
+                            .await;
+                        let create = StoreIdentity { cluster_uid: OWN }
+                            .claim(store.as_ref(), &layout)
+                            .await;
+                        let delete = store.delete(std::slice::from_ref(&key)).await;
+                        for refused in [put.err(), create.err(), delete.err()] {
+                            refusals.borrow_mut().push(refused);
+                        }
+                        let listed = store.list(&ListRequest::new("iggy/")).await;
+                        assert!(listed.is_ok());
+                        assert!(store.head(&key).await.is_ok());
+                        StoreIdentity::read(store.as_ref(), &layout).await
+                    },
+                )
+                .await;
+
+            assert!(
+                matches!(read, Ok(Ok(IdentityRead::Found(found))) if found.cluster_uid == PEER),
+                "{class:?}: {read:?}"
+            );
+        }
+
+        assert_eq!(
+            refusals.borrow().len(),
+            3 * TierJobClass::ALL.len(),
+            "every put, conditional create and delete failed"
+        );
+        assert!(
+            refusals
+                .borrow()
+                .iter()
+                .all(|refused| matches!(refused, Some(ObjectStoreError::ReadOnly { .. })))
+        );
+        assert_eq!(calls.mutations(), Vec::new());
+        assert_eq!(
+            calls.all().len(),
+            3 * TierJobClass::ALL.len(),
+            "a list, a head and a ranged get per job"
+        );
+    }
+}

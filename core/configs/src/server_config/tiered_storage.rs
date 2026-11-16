@@ -303,13 +303,11 @@ impl Display for TierJobsConfig {
 
 impl Validatable<ConfigurationError> for TieredStorageConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        let refuse = |reason: &str| {
-            eprintln!("{COMPONENT} tiered_storage.{reason}");
-            Err(ConfigurationError::InvalidConfigurationValue)
-        };
         match self.backend {
             // Nothing else is read without a store, so values that a file
-            // left from an earlier setup cannot fail the boot.
+            // left from an earlier setup cannot fail the boot. The tier
+            // services of geo peers check the tuning on their own, see
+            // `Self::validate_tuning`.
             TieredStorageBackend::None => return Ok(()),
             TieredStorageBackend::Fs if self.path.trim().is_empty() => {
                 return refuse("path must be set for the fs backend");
@@ -328,6 +326,20 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
         if self.prefix.is_empty() {
             return refuse("prefix must not be empty");
         }
+        self.validate_tuning()
+    }
+}
+
+impl TieredStorageConfig {
+    /// Checks the job caps, timeouts and retries. The tier services of geo
+    /// peers take them too, so they must hold even without a backend of this
+    /// cluster's own.
+    ///
+    /// # Errors
+    /// [`ConfigurationError::InvalidConfigurationValue`] for a cap of zero, a
+    /// duration outside its bounds, no attempt, or a backoff cap below its
+    /// start.
+    pub fn validate_tuning(&self) -> Result<(), ConfigurationError> {
         let jobs = &self.jobs;
         let counts = [
             ("demand_fetches", jobs.demand_fetches),
@@ -371,6 +383,11 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
         }
         Ok(())
     }
+}
+
+fn refuse(reason: &str) -> Result<(), ConfigurationError> {
+    eprintln!("{COMPONENT} tiered_storage.{reason}");
+    Err(ConfigurationError::InvalidConfigurationValue)
 }
 
 fn default_prefix() -> String {
@@ -461,6 +478,18 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+    }
+
+    /// Geo peers take the tuning even when this cluster has no store.
+    #[test]
+    fn given_no_backend_when_validating_the_tuning_should_still_refuse_a_bad_value() {
+        let config = TieredStorageConfig {
+            max_attempts: 0,
+            ..TieredStorageConfig::default()
+        };
+
+        assert!(config.validate_tuning().is_err());
+        assert!(TieredStorageConfig::default().validate_tuning().is_ok());
     }
 
     #[test]
