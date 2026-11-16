@@ -558,3 +558,157 @@ async fn given_a_damaged_placed_batch_in_a_transferred_segment_when_spilling_sho
         Err(crate::state_transfer::SpillError::Walk(_))
     ));
 }
+
+/// A prepare a primary replicates for a one-message batch it placed in the
+/// object store, chained to `parent`.
+fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
+    let whole = checksummed_segment_prepare(op, parent, offset, b"payload");
+    let header_size = size_of::<PrepareHeader>();
+    let batch = BatchHeader::decode(&whole.as_slice()[header_size..]).unwrap();
+    let blob = &whole.as_slice()[header_size + COMMAND_HEADER_SIZE..];
+    let placed = PlacedBatch::new(batch, Placement::of(7, op * 4096, blob));
+    let total = header_size + PLACED_BATCH_SIZE;
+    let mut prepare = Message::<PrepareHeader>::new(total);
+    placed.encode_into(&mut prepare.as_mut_slice()[header_size..]);
+    let template = *whole.header();
+    prepare.transmute_header(|_, header: &mut PrepareHeader| {
+        *header = template;
+        header.size = u32::try_from(total).unwrap();
+        header.checksum = header.identity_checksum();
+    })
+}
+
+/// Room for two placed batches in a segment.
+const PLACED_PER_SEGMENT: u64 = 2;
+
+/// A backup that places its batches, with a prepare WAL under `root`.
+async fn placing_backup_with_wal(root: &Path) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
+    let mut config = repair_config();
+    config.path_layout.streams_root = root.to_string_lossy().into_owned();
+    let directory = config.get_partition_path(1, 1, 0);
+    std::fs::create_dir_all(&directory).unwrap();
+    let (mut partition, _) = recording_partition_at(1, 3);
+    partition.set_places_batches(true);
+    partition.set_partition_dir(directory);
+    partition.runtime_options.durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.segment_size = Some(placed_segment_size());
+    partition.log.active_segment_mut().max_size = placed_segment_size();
+    partition.open_persistence().await.unwrap();
+    partition.log.retire_front().unwrap();
+    partition.install_empty_segment(&config, 0).await.unwrap();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    (config, partition)
+}
+
+/// Replicate and commit one placed batch per offset, each as op
+/// `offset + 1`. Returns the checksum the next prepare chains to.
+async fn replicate_placed(
+    partition: &mut IggyPartition<RecordingBus>,
+    config: &PartitionsConfig,
+    offsets: std::ops::RangeInclusive<u64>,
+    mut parent: u128,
+) -> u128 {
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    for offset in offsets {
+        let op = offset + 1;
+        let prepare = placed_segment_prepare(op, parent, offset);
+        parent = prepare.header().checksum;
+        let writer = hold_wal_writer(&persistence);
+        Box::pin(partition.on_replicate(prepare)).await;
+        writer.await;
+        Box::pin(commit_on_heartbeat(partition, config, op)).await;
+        Box::pin(settle_partition_io(partition, config)).await;
+    }
+    parent
+}
+
+fn stored_offsets(directory: &str) -> Vec<u64> {
+    segment_file_bytes(Path::new(directory))
+        .iter()
+        .flat_map(|bytes| placed_batches_in(bytes))
+        .map(|placed| placed.header.base_offset)
+        .collect()
+}
+
+/// With a WAL the WAL writes the placed batch into the segment, and the
+/// partition checks what it wrote before it counts the batch as stored.
+#[compio::test]
+async fn given_a_backup_with_a_wal_when_placed_batches_commit_should_hold_them_in_its_segments() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(placing_backup_with_wal(root.path())).await;
+    let directory = config.get_partition_path(1, 1, 0);
+
+    Box::pin(replicate_placed(&mut partition, &config, 0..=2, 0)).await;
+
+    assert!(partition.fatal().is_none());
+    assert_eq!(partition.consensus().commit_min(), 3);
+    assert_eq!(partition.offset.load(Ordering::Acquire), 2);
+    assert_eq!(stored_offsets(&directory), [0, 1, 2]);
+    let segments: Vec<_> = partition
+        .log
+        .segments()
+        .iter()
+        .map(|segment| (segment.start_offset, segment.size.as_bytes_u64()))
+        .collect();
+    let placed = PLACED_BATCH_SIZE as u64;
+    assert_eq!(segments, [(0, PLACED_PER_SEGMENT * placed), (2, placed)]);
+}
+
+/// The server's order at boot: the WAL is read first, and recovery cuts the
+/// segments back to its checkpoint before the WAL replays what follows.
+#[compio::test]
+async fn given_a_restarted_backup_with_a_wal_when_more_placed_batches_commit_should_continue_from_what_it_held()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(placing_backup_with_wal(root.path())).await;
+    let directory = config.get_partition_path(1, 1, 0);
+    let parent = Box::pin(replicate_placed(&mut partition, &config, 0..=2, 0)).await;
+    hold_wal_writer(partition.persistence.as_ref().unwrap()).await;
+    drop(partition);
+
+    let wal = Path::new(&directory).join("prepares-0");
+    let recovered_wal = PartitionPersistence::open(&wal, IggyNamespace::new(1, 1, 0).inner(), 0)
+        .await
+        .unwrap();
+    let recovered = crate::load_placed_segments(
+        &config,
+        IggyNamespace::new(1, 1, 0),
+        placed_segment_size(),
+        &PartitionStats::default(),
+        recovered_wal.0.segment_checkpoint(),
+    )
+    .await
+    .unwrap();
+    let (mut partition, _) = recording_partition_at(1, 3);
+    partition.set_places_batches(true);
+    partition.set_partition_dir(directory.clone());
+    partition.runtime_options.durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Replicated;
+    partition.runtime_options.segment_size = Some(placed_segment_size());
+    partition.log.retire_front().unwrap();
+    crate::partition_storage::hydrate_partition_log(&mut partition, &directory, 1, 1, 0, recovered)
+        .await
+        .unwrap();
+    partition
+        .open_persistence_with_recovered(
+            journal::partition_journal::PARTITION_WAL_BYTES_MAX,
+            std::time::Duration::ZERO,
+            Some(recovered_wal),
+        )
+        .await
+        .unwrap();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+
+    Box::pin(replicate_placed(&mut partition, &config, 3..=4, parent)).await;
+
+    assert!(partition.fatal().is_none());
+    assert_eq!(partition.consensus().commit_min(), 5);
+    assert_eq!(stored_offsets(&directory), [0, 1, 2, 3, 4]);
+}
