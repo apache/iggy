@@ -599,8 +599,9 @@ mod tests {
     }
 
     /// A 503 refuses a poll before the server takes it, and the server sends a 404 only before
-    /// the read. Another 4xx proves the outcome when binary takes its error as proof too, also
-    /// when the client returns it as `HttpResponseError`. None of them leaves a block.
+    /// the read. Another 4xx, or a 507 at the disk usage limit, proves the outcome when binary
+    /// takes its error as proof too, also when the client returns it as `HttpResponseError`.
+    /// None of them leaves a block.
     /// `HistoryUnavailable` after the read means that the history the poll read is gone. A
     /// non-admission refusal is sent again within the request timeout.
     #[tokio::test]
@@ -611,6 +612,7 @@ mod tests {
             Reply::empty(503),
             Reply::error(400, &IggyError::HistoryUnavailable),
             Reply::error(400, &IggyError::InvalidOffset(START)),
+            Reply::error(507, &IggyError::DiskUsageLimitReached),
             Reply::empty(404),
             Reply::polled(),
         ])
@@ -621,6 +623,7 @@ mod tests {
         let refused = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let history_gone = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let invalid_offset = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
+        let full_disk = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let not_found = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
         let next = poll(&client, &PollingStrategy::next(), CommitPolicy::OnRead).await;
 
@@ -634,12 +637,13 @@ mod tests {
             matches!(invalid_offset, Err(IggyError::HttpResponseError(400, _))),
             "{invalid_offset:?}"
         );
+        assert_eq!(full_disk.map(drop), Err(IggyError::DiskUsageLimitReached));
         assert!(
             matches!(not_found, Err(IggyError::ResourceNotFound(_))),
             "{not_found:?}"
         );
         next.unwrap();
-        assert_eq!(server.requests().len(), 7);
+        assert_eq!(server.requests().len(), 8);
     }
 
     /// The server returns a first message above `max_bytes` alone in the reply, so it refuses a
@@ -1020,6 +1024,26 @@ mod tests {
         assert_eq!(requests[2].context(), Some(CURRENT));
         first.unwrap();
         second.unwrap();
+    }
+
+    /// The server stores nothing for a send refused at the disk usage limit, so the refusal is
+    /// definitive and the client does not send it again.
+    #[tokio::test]
+    async fn given_a_full_disk_when_sending_should_return_the_refusal_without_resend() {
+        let server = ScriptedServer::start(vec![
+            Reply::topic(&[(PARTITION_ID, CURRENT)]),
+            Reply::error(507, &IggyError::DiskUsageLimitReached),
+        ])
+        .await;
+        let client = server.client();
+
+        let refused = send(&client, &Partitioning::partition_id(PARTITION_ID)).await;
+
+        assert!(
+            matches!(refused, Err(IggyError::DiskUsageLimitReached)),
+            "{refused:?}"
+        );
+        assert_eq!(lines(&server.requests()), [TOPIC_LINE, SEND_LINE]);
     }
 
     #[tokio::test]

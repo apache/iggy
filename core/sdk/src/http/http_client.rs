@@ -274,8 +274,8 @@ impl HttpClient {
     /// server fails with [`IggyError::FetchProgressUncertain`] unless its answer proves the
     /// outcome, and a caller that drops it after the send gets the same block: the partition
     /// stays blocked until `abandon_operation`. A failure after the connect proves the outcome
-    /// only as a 503 or a 404, or as another 4xx whose error id [`fetch_error_is_uncertain`]
-    /// takes as proof, as on binary.
+    /// only as a 503 or a 404, or as another 4xx or a 507 whose error id
+    /// [`fetch_error_is_uncertain`] takes as proof, as on binary.
     pub(super) async fn get_deferred_poll(
         &self,
         path: &str,
@@ -428,12 +428,13 @@ impl HttpClient {
             let reason = String::from_utf8_lossy(&body).into_owned();
             // A 503 refuses a poll before the server takes it, and the server sends a 404 only
             // before the read or for a partition that its owner does not have. The server
-            // checks a poll again after the read, so another 4xx proves the outcome only with
-            // an error that binary also takes as proof.
+            // checks a poll again after the read, so another 4xx, or a 507 at the disk usage
+            // limit, proves the outcome only with an error that binary also takes as proof.
             let proved = matches!(
                 status,
                 StatusCode::SERVICE_UNAVAILABLE | StatusCode::NOT_FOUND
-            ) || (status.is_client_error()
+            ) || ((status.is_client_error()
+                || status == StatusCode::INSUFFICIENT_STORAGE)
                 && error_id(&reason)
                     .is_some_and(|id| !fetch_error_is_uncertain(&IggyError::from_code(id))));
             let error = Self::response_error(status, reason);
@@ -814,7 +815,8 @@ impl Drop for PollAttempt<'_> {
     }
 }
 
-/// Resends what the default strategy calls transient, but never a write that may have committed.
+/// Resends what the default strategy calls transient, but never a write that may have committed,
+/// and never a request refused at the disk usage limit.
 struct SafeResends {
     may_commit: bool,
     outcome_unknown: Arc<AtomicBool>,
@@ -822,6 +824,14 @@ struct SafeResends {
 
 impl RetryableStrategy for SafeResends {
     fn handle(&self, result: &Result<Response, reqwest_middleware::Error>) -> Option<Retryable> {
+        // The server stored nothing, but only space that a sample sees freed lifts the limit,
+        // so a resend cannot succeed. The default strategy retries every 5xx.
+        if result
+            .as_ref()
+            .is_ok_and(|response| response.status() == StatusCode::INSUFFICIENT_STORAGE)
+        {
+            return Some(Retryable::Fatal);
+        }
         if self.may_commit && may_have_committed(result) {
             self.outcome_unknown.store(true, Ordering::Relaxed);
             return Some(Retryable::Fatal);
@@ -831,13 +841,17 @@ impl RetryableStrategy for SafeResends {
 }
 
 /// HTTP has no request dedup, so a resend is a new request that can apply a write twice. A 503
-/// refuses a request before the server takes it, and a request that was never built or never
-/// connected was never sent.
+/// refuses a request before the server takes it, a 507 refuses a write at the disk usage limit
+/// before it stores anything, and a request that was never built or never connected was never
+/// sent.
 fn may_have_committed(result: &Result<Response, reqwest_middleware::Error>) -> bool {
     match result {
         Ok(response) => {
             response.status().is_server_error()
-                && response.status() != StatusCode::SERVICE_UNAVAILABLE
+                && !matches!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE | StatusCode::INSUFFICIENT_STORAGE
+                )
         }
         Err(reqwest_middleware::Error::Reqwest(error)) => {
             !error.is_builder() && !error.is_connect()
@@ -857,8 +871,9 @@ fn deferred_reply_limit(max_bytes: u32) -> usize {
 /// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
 /// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried,
 /// non-admission and capacity refusals permit a retry without risking duplicate progress, a
-/// poll refused for its byte limit returns `InvalidSizeBytes`, and a topic refused for a factor
-/// above the node count returns `InvalidReplicationFactor`, as over the binary transports.
+/// poll refused for its byte limit returns `InvalidSizeBytes`, a topic refused for a factor
+/// above the node count returns `InvalidReplicationFactor`, and a write refused at the disk usage
+/// limit returns `DiskUsageLimitReached`, as over the binary transports.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     let id = error_id(body)?;
     [
@@ -869,6 +884,7 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::DeferredPollCapacityExceeded,
         IggyError::InvalidSizeBytes,
         IggyError::InvalidReplicationFactor,
+        IggyError::DiskUsageLimitReached,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -891,7 +907,9 @@ fn error_id(body: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
-    use crate::prelude::{Identifier, StreamClient, TopicClient, TopicCreateOptions};
+    use crate::prelude::{
+        Identifier, PartitionClient, StreamClient, TopicClient, TopicCreateOptions,
+    };
     use std::iter;
 
     /// The number of `LifecycleBusy` refusals scripted for a request retried until the deadline,
@@ -1065,6 +1083,7 @@ mod tests {
             IggyError::DeferredPollCapacityExceeded,
             IggyError::InvalidSizeBytes,
             IggyError::InvalidReplicationFactor,
+            IggyError::DiskUsageLimitReached,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));
@@ -1072,6 +1091,37 @@ mod tests {
         for body in ["", "unavailable", r#"{"id":500}"#, r#"{"id":"87"}"#] {
             assert_eq!(typed_refusal(body), None);
         }
+    }
+
+    /// A 507 refuses a write at the disk usage limit before the server stores anything, and only
+    /// freed space lifts the limit. So the client passes the server's `DiskUsageLimitReached` to
+    /// the caller after one request, and does not send it again.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_full_disk_when_writing_should_return_the_refusal_without_resend() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(507, &IggyError::DiskUsageLimitReached),
+            Reply::error(507, &IggyError::DiskUsageLimitReached),
+        ])
+        .await;
+        let client = server.client();
+
+        let created = client
+            .create_topic(&stream_id(), "topic", &TopicCreateOptions::default())
+            .await;
+        assert!(
+            matches!(created, Err(IggyError::DiskUsageLimitReached)),
+            "{created:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+
+        let added = client
+            .create_partitions(&stream_id(), &stream_id(), 1)
+            .await;
+        assert!(
+            matches!(added, Err(IggyError::DiskUsageLimitReached)),
+            "{added:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[tokio::test]
