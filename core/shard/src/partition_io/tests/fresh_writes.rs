@@ -351,3 +351,69 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
         "the fresh object, the log and its index"
     );
 }
+
+/// The segment cleaner stages only the first pass over a partition. The
+/// sends that commit after it are rewritten when the partition's wait is
+/// over, which the pump's tick finds.
+#[compio::test]
+async fn given_a_partition_that_had_a_rewrite_pass_when_more_sends_commit_should_rewrite_them_from_the_tick()
+ {
+    use super::object_deletes::Shared;
+    use crate::rewrite_pacing::{REWRITE_INTERVAL_MAX, REWRITE_INTERVAL_START};
+    use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let partitions = owner.plane.partitions();
+    partitions.set_remote_segments(Rc::new(RemoteSegments::new(
+        Rc::new(ExecutorObjects::new(executor.clone())),
+        layout(),
+    )));
+    let revision = partitions
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let key = (namespace(), revision);
+    let floor = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+    };
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| floor(owner) == Some(0)).await;
+        let wait = owner.rewrite_pacing.borrow().interval(&key).unwrap();
+        assert!(
+            wait > REWRITE_INTERVAL_START && wait <= REWRITE_INTERVAL_MAX,
+            "a small segment lengthens the wait: {wait:?}"
+        );
+
+        let _second = submit_send(&owner, 2, 100);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        until(&owner, |owner| floor(owner) == Some(1)).await;
+        until(&owner, |owner| {
+            owner.metrics().long_term_rewrite_lag_value() == 0
+        })
+        .await;
+    })
+    .await;
+
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    assert_eq!(partition.long_term_segments().len(), 2);
+    assert_eq!(partition.long_term_lag(), 0);
+}

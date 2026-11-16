@@ -430,6 +430,7 @@ where
                         break;
                     }
                     self.tick_fresh_writes().await;
+                    self.tick_long_term_rewrites().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -667,6 +668,7 @@ where
                     self.tick_metadata().await;
                     let _ = self.tick_partitions(&mut namespace_scratch).await;
                     self.tick_fresh_writes().await;
+                    self.tick_long_term_rewrites().await;
                     tick.set(rearm());
                 }
                 completion = self.partition_io.recv().fuse() => {

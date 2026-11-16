@@ -369,6 +369,7 @@ pub struct ShardMetrics {
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
     partition_segment_upload_lag_seconds: Gauge,
+    partition_long_term_rewrite_lag_messages: Gauge,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -477,6 +478,7 @@ impl ShardMetrics {
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
             partition_segment_upload_lag_seconds: Gauge::default(),
+            partition_long_term_rewrite_lag_messages: Gauge::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -952,6 +954,21 @@ impl ShardMetrics {
         self.partition_segment_upload_lag_seconds.get()
     }
 
+    /// Republished by the pump's tick: the most messages one partition this
+    /// shard leads committed that no long-term segment holds yet, as the
+    /// partition's last rewrite pass found. Zero when none waits.
+    pub fn set_long_term_rewrite_lag(&self, messages: u64) {
+        self.partition_long_term_rewrite_lag_messages
+            .set(i64::try_from(messages).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_rewrite_lag_value(&self) -> i64 {
+        self.partition_long_term_rewrite_lag_messages.get()
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1352,6 +1369,12 @@ impl ShardMetrics {
             "age of the oldest sealed segment that waits for its upload to the object store, \
              over the tiered partitions this shard leads",
             self.partition_segment_upload_lag_seconds.clone(),
+        );
+        registry.register(
+            "partition_long_term_rewrite_lag_messages",
+            "most messages one partition this shard leads committed that no long-term \
+             segment holds yet, over the partitions that place their batches",
+            self.partition_long_term_rewrite_lag_messages.clone(),
         );
         registry.register(
             "retirement_debts_paid",

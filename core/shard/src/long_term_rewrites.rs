@@ -24,10 +24,15 @@
 //! segment to the partition's long-term log through the partition-submit
 //! path every other request takes.
 //!
+//! The segment cleaner stages the first pass over a partition. From then on
+//! the pump's tick starts each pass when the partition's wait is over, and
+//! the wait follows how full the stored segments come out.
+//!
 //! A segment is stored before its command commits. A pass that finds such
 //! a segment sends its command again and starts no rewrite, so a command
 //! that was refused or lost costs a pass and nothing else.
 
+use crate::rewrite_pacing::RewriteResult;
 use crate::shards_table::ShardsTable;
 use crate::{
     FinishedSegmentRewrite, IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel,
@@ -38,7 +43,7 @@ use iggy_object_store::ManifestSegment;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::LongTermWriter;
+use partitions::{LONG_TERM_SEGMENT_BYTES, LongTermWriter};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
@@ -63,9 +68,10 @@ where
         self.long_term_writer.borrow().clone()
     }
 
-    /// Stage a rewrite pass for `namespace` on this shard's pump, for the
-    /// incarnation `created_revision`. A refused frame is picked up by the
-    /// timer's next tick.
+    /// Stage the first rewrite pass for `namespace` on this shard's pump,
+    /// for the incarnation `created_revision`. The pump's tick starts the
+    /// passes that follow, so this does nothing for a partition that had
+    /// one. A refused frame is picked up by the timer's next tick.
     pub fn request_rewrite_segments(&self, namespace: IggyNamespace, created_revision: u64) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
@@ -76,8 +82,8 @@ where
         }));
     }
 
-    /// Run a rewrite pass over `namespace` on the pump. Does nothing on a
-    /// shard without a writer.
+    /// The pass the segment cleaner staged: the first one over `namespace`.
+    /// A partition that had a pass starts the next one from the tick.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_rewrite_segments(&self, namespace: IggyNamespace, created_revision: u64)
     where
@@ -86,31 +92,90 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        let Some(writer) = self.long_term_writer.borrow().clone() else {
+        if self
+            .rewrite_pacing
+            .borrow()
+            .paces(&(namespace, created_revision))
+        {
             return;
-        };
-        // Every pass settles all of them, whatever partition it is for, so a
-        // result is not left waiting for a pass over a deleted partition.
+        }
+        self.run_rewrite_pass(namespace, created_revision).await;
+    }
+
+    /// The pump's tick: settle the rewrites whose frame the inbox refused,
+    /// start the passes that are due, and report how far the rewrites are
+    /// behind.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn tick_long_term_rewrites(&self)
+    where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
         let undelivered = std::mem::take(&mut *self.undelivered_segment_rewrites.borrow_mut());
         for finished in undelivered {
             self.settle_segment_rewrite(finished).await;
         }
+        let due = self
+            .rewrite_pacing
+            .borrow_mut()
+            .take_due(self.bus.monotonic_micros());
+        for (namespace, created_revision) in due {
+            self.run_rewrite_pass(namespace, created_revision).await;
+        }
+        self.metrics
+            .set_long_term_rewrite_lag(self.rewrite_pacing.borrow().worst_lag());
+    }
 
+    /// Run a rewrite pass over `namespace` on the pump, and set when its
+    /// next one is due. A shard without a writer, and a partition that is
+    /// gone, drop out of the passes the tick starts.
+    #[allow(clippy::future_not_send)]
+    async fn run_rewrite_pass(&self, namespace: IggyNamespace, created_revision: u64)
+    where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        let key = (namespace, created_revision);
+        let Some(writer) = self.long_term_writer.borrow().clone() else {
+            self.rewrite_pacing.borrow_mut().forget(&key);
+            return;
+        };
         // Looked up first: a rewrite that cannot report back is not started.
         let Some(sender) = self.senders.get(self.id as usize).cloned() else {
             return;
         };
+        let now = self.bus.monotonic_micros();
         let started = {
             // The rewrite reads the messages of the batches from the store.
-            let Some(partition) = self.plane.partitions().get_mut_with_remote(&namespace) else {
+            let partition = self
+                .plane
+                .partitions()
+                .get_mut_with_remote(&namespace)
+                .filter(|partition| partition.created_revision() == created_revision);
+            let Some(partition) = partition else {
+                self.rewrite_pacing.borrow_mut().forget(&key);
                 return;
             };
-            if partition.created_revision() != created_revision {
-                return;
-            }
-            partition
+            let lag = partition.long_term_lag();
+            let started = partition
                 .unpublished_segment()
-                .map_or_else(|| Ok(partition.begin_segment_rewrite()), Err)
+                .map_or_else(|| Ok(partition.begin_segment_rewrite()), Err);
+            let mut pacing = self.rewrite_pacing.borrow_mut();
+            match &started {
+                Ok(Some(_)) => pacing.started(key, lag),
+                // Its result sets when the next pass is due.
+                Ok(None) if partition.segment_rewrite_running() => pacing.started(key, lag),
+                Ok(None) => pacing.settle(key, RewriteResult::Idle, now),
+                Err(_) => {
+                    pacing.set_lag(key, lag);
+                    pacing.settle(key, RewriteResult::Unchanged, now);
+                }
+            }
+            started
         };
         let (id, rewrite, scope) = match started {
             Err(stored) => {
@@ -152,35 +217,43 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        let (namespace, created_revision) = (finished.namespace, finished.created_revision);
-        if self.settle_segment_rewrite(finished).await {
-            // A backlog drains without waiting for the timer. A failure
-            // waits for it, so a store that refuses is not asked in a loop.
-            self.request_rewrite_segments(namespace, created_revision);
-        }
+        self.settle_segment_rewrite(finished).await;
     }
 
-    /// Hand `finished` to the partition that started it, and commit the
-    /// segment it stored. Returns whether it stored one.
+    /// Hand `finished` to the partition that started it, commit the segment
+    /// it stored, and set when the partition's next pass is due. A segment
+    /// that came out nearly full has a backlog behind it, which drains
+    /// without a wait. A failure waits, so a store that refuses is not
+    /// asked in a loop.
     #[allow(clippy::future_not_send)]
-    async fn settle_segment_rewrite(&self, finished: FinishedSegmentRewrite) -> bool
+    async fn settle_segment_rewrite(&self, finished: FinishedSegmentRewrite)
     where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        let stored = self
+        let key = (finished.namespace, finished.created_revision);
+        let Some(partition) = self
             .plane
             .partitions()
             .get_mut_by_ns(&finished.namespace)
             .filter(|partition| partition.created_revision() == finished.created_revision)
-            .and_then(|partition| partition.finish_segment_rewrite(finished.id, finished.outcome));
-        let Some(stored) = stored else {
-            return false;
+        else {
+            self.rewrite_pacing.borrow_mut().forget(&key);
+            return;
         };
-        self.publish_segment(finished.namespace, &stored).await;
-        true
+        let stored = partition.finish_segment_rewrite(finished.id, finished.outcome);
+        let result = stored.map_or(RewriteResult::Unchanged, |stored| RewriteResult::Stored {
+            bytes: stored.size,
+            target: LONG_TERM_SEGMENT_BYTES as u64,
+        });
+        self.rewrite_pacing
+            .borrow_mut()
+            .settle(key, result, self.bus.monotonic_micros());
+        if let Some(stored) = stored {
+            self.publish_segment(finished.namespace, &stored).await;
+        }
     }
 
     /// Commit `segment` to the long-term log of `namespace` the way a client
