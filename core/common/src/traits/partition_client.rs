@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Identifier, IggyError};
+use crate::{Identifier, IggyError, Page, PageQuery, Partition};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the partition module.
@@ -56,4 +56,15 @@ pub trait PartitionClient {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError>;
+    /// One page of the partitions of a topic, in id order. Read the next page
+    /// with [`PageQuery::next`] until the page has no `next`. Partition ids
+    /// follow creation, so `PageOrder::Created` walks in id order too.
+    ///
+    /// Authentication is required, and the permission to read the topic.
+    async fn get_partitions_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &PageQuery,
+    ) -> Result<Page<Partition>, IggyError>;
 }

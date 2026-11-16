@@ -221,7 +221,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
             };
             let op = install_group_owner(&mut partition, &config, installation).await;
             assert!(group.complete_revocation(0, &installation, op));
-            topic.consumer_groups.insert(group_id, group);
+            topic.consumer_groups.insert(group_id, Box::new(group));
         }
         stream.topics.insert(topic);
         inner.items.insert(stream);
@@ -927,7 +927,7 @@ impl BoundPoll {
             let mut topic = self.topic.clone();
             topic
                 .consumer_groups
-                .insert(BOUND_GROUP, self.group.clone());
+                .insert(BOUND_GROUP, Box::new(self.group.clone()));
             stream.topics.insert(topic);
             let mut inner = StreamsInner::default();
             inner.items.insert(stream);
@@ -1264,7 +1264,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
             group.rebalance_members(&topic.partitions, 11, 2);
             assert!(group.assignments[&1].pending.is_some());
         }
-        topic.consumer_groups.insert(GROUP, group);
+        topic.consumer_groups.insert(GROUP, Box::new(group));
         stream.topics.insert(topic);
         inner.items.insert(stream);
         let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));

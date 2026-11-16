@@ -20,9 +20,26 @@ package tcp
 import (
 	"context"
 
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
+
+func (c *IggyTcpClient) GetPartitionsPage(
+	ctx context.Context,
+	streamId, topicId iggcon.Identifier,
+	query iggcon.PageQuery,
+) (*iggcon.Page[iggcon.PartitionContract], error) {
+	buffer, err := c.do(ctx, &command.GetPartitions{
+		StreamId: streamId,
+		TopicId:  topicId,
+		Query:    query,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return binaryserialization.DeserializePartitionsPage(buffer)
+}
 
 func (c *IggyTcpClient) CreatePartitions(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
 	_, err := c.do(ctx, &command.CreatePartitions{
