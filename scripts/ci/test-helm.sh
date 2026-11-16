@@ -897,9 +897,6 @@ server:
       value: "0.0.0.0:8092"
     - name: IGGY_SHARDING_CPU_ALLOCATION
       value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
-    # The pinned server reads the name from before the config was flattened.
-    - name: IGGY_SYSTEM_SHARDING_CPU_ALLOCATION
-      value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
 ui:
   image:
     tag: "${ui_image_tag}"
