@@ -10796,6 +10796,7 @@ where
         journal.committed_prefix_len(self.consensus.commit_min(), through)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn drive_materialization(&mut self) -> Result<MaterializationStep, IggyError> {
         let pending = self
             .materialization
