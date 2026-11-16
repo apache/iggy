@@ -1334,6 +1334,7 @@ mod tests {
         journal.restore_checkpoint_prepare(
             op,
             server_common::iobuf::Owned::copy_from_slice(&entry).into(),
+            None,
         );
     }
 

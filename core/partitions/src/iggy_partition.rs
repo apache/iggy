@@ -439,6 +439,8 @@ where
     /// Offsets the append fence claims per superblock write; installed by boot
     /// from `PartitionsConfig`.
     offset_reservation_lease: u64,
+    /// When this partition comes due for a WAL checkpoint.
+    checkpoint_policy: CheckpointPolicy,
     /// In-flight state transfer session. Boxed for the same reason as `repair`.
     transfer: Option<Box<PartitionTransferSession>>,
     /// Consecutive transfer stall rounds WITHIN one recovery attempt. NOT in the
@@ -941,6 +943,21 @@ struct PendingWireActions {
     actions: Vec<consensus::VsrAction>,
 }
 
+/// What a partition did with a flush that the shard budget asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliefFlush {
+    /// It deferred a flush through its commit point, which the I/O lane
+    /// starts on its next turn.
+    Asked,
+    /// A flush deferred earlier still waits.
+    Pending,
+    /// It cannot flush now: a view change, a commit, a materialization or a
+    /// transition runs, or the WAL lags the commit point.
+    Blocked,
+    /// No flush frees its committed resident messages.
+    Never,
+}
+
 enum PendingCheckpoint {
     /// The receipt table at the checkpoint op. Commits keep advancing while the
     /// checkpoint runs, so it is captured before any other phase.
@@ -961,6 +978,9 @@ enum PendingCheckpoint {
 enum PartitionShutdownPhase {
     DrainAccepted,
     Flush,
+    /// Waits until the checkpoint starts or the shard ends the hold. A
+    /// started checkpoint finishes in the drain of the writers.
+    CheckpointHold,
     DrainWriters,
     Collapse,
     Complete,
@@ -1210,6 +1230,7 @@ where
             durable_offset_frontier: Cell::new(0),
             durable_offset_reserved: Cell::new(0),
             offset_reservation_lease: u64::from(crate::DEFAULT_OFFSET_RESERVATION_LEASE),
+            checkpoint_policy: CheckpointPolicy::default(),
             transfer: None,
             transfer_attempts: 0,
             repair_attempts: 0,
@@ -2069,10 +2090,13 @@ where
         for message in prepares {
             let header = *message.header();
             if header.op == checkpoint {
-                self.log
-                    .journal()
-                    .inner
-                    .restore_checkpoint_prepare(checkpoint, message.into_frozen());
+                self.log.journal().inner.restore_checkpoint_prepare(
+                    checkpoint,
+                    message.into_frozen(),
+                    persistence
+                        .segment_reference(checkpoint)
+                        .map(BodyPosition::from),
+                );
                 continue;
             }
             if header.operation == Operation::SendMessages {
@@ -2224,10 +2248,14 @@ where
     ///
     /// Receipts are captured at `commit_min`, so the checkpoint covers exactly
     /// that op, and only once the WAL holds it.
+    ///
+    /// In a graceful stop, one starts only while the stop holds the
+    /// partition for it: past the hold the exit can cut it.
     fn persistence_checkpoint_through(&self) -> Option<u64> {
         let persistence = self.persistence.as_ref()?;
         let through_op = self.consensus.commit_min();
         (self.fatal.is_none()
+            && (self.maintenance.shutdown.is_none() || self.holds_shutdown_for_checkpoint())
             && self.maintenance.checkpoint.is_none()
             && !self.checkpoint_waits_for_commit()
             && !self.checkpoint_waits_for_advances()
@@ -2237,19 +2265,24 @@ where
         .then_some(through_op)
     }
 
-    pub async fn checkpoint_persistence(&mut self, config: &PartitionsConfig) {
+    /// Starts a checkpoint if one is due. Returns why it started.
+    pub async fn checkpoint_persistence(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Option<CheckpointTrigger> {
         let (Some(through_op), Some(persistence)) = (
             self.persistence_checkpoint_through(),
             self.persistence.clone(),
         ) else {
-            return;
+            return None;
         };
         if self.has_io_dispatcher() {
-            match self.encode_retry_checkpoint(through_op) {
+            return match self.encode_retry_checkpoint(through_op) {
                 Ok(receipts) => {
                     self.maintenance.checkpoint =
                         Some(PendingCheckpoint::Receipts(through_op, receipts));
                     self.notify_io();
+                    Some(self.settle_checkpoint_start(through_op))
                 }
                 Err(error) => {
                     error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
@@ -2258,13 +2291,13 @@ where
                         op: through_op,
                         operation: None,
                     });
+                    None
                 }
-            }
-            return;
+            };
         }
         match self.commit_messages_inner(config, true, through_op).await {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return None,
             Err(error) => {
                 error!(%error, namespace_raw = self.namespace().inner(), "partition checkpoint failed");
                 self.fatal = Some(FatalCommit {
@@ -2272,7 +2305,7 @@ where
                     op: through_op,
                     operation: None,
                 });
-                return;
+                return None;
             }
         }
         let mut barriers = Vec::new();
@@ -2284,7 +2317,7 @@ where
                     op: through_op,
                     operation: None,
                 });
-                return;
+                return None;
             }
             // [`IggyIndexWriter::fsync`] used the original descriptor above.
             // The marker tells [`PartitionPersistence::checkpoint_files`] not
@@ -2298,13 +2331,14 @@ where
                 op: through_op,
                 operation: None,
             });
-            return;
+            return None;
         }
         // Receipt publication already syncs the file and its directory.
         let (files, directories) = self.persistence_checkpoint_files(config);
         persistence.checkpoint_files(through_op, files, directories, barriers);
         self.pending_retry_checkpoint = Some(through_op);
         self.start_persistence();
+        Some(self.settle_checkpoint_start(through_op))
     }
 
     /// Queue original-writer syncs before the install backup is published.
@@ -7648,7 +7682,8 @@ where
             && matches!(
                 self.maintenance.shutdown,
                 Some(
-                    PartitionShutdownPhase::DrainWriters
+                    PartitionShutdownPhase::CheckpointHold
+                        | PartitionShutdownPhase::DrainWriters
                         | PartitionShutdownPhase::Collapse
                         | PartitionShutdownPhase::Complete
                 )
@@ -7673,6 +7708,17 @@ where
             Some(PartitionShutdownPhase::Flush)
                 if self.maintenance.flush_through.is_none() && self.materialization.is_none() =>
             {
+                self.maintenance.shutdown = Some(if self.holds_shutdown_for_checkpoint() {
+                    PartitionShutdownPhase::CheckpointHold
+                } else {
+                    PartitionShutdownPhase::DrainWriters
+                });
+                crate::PartitionIoStep::Progress
+            }
+            Some(PartitionShutdownPhase::CheckpointHold) => {
+                if self.holds_shutdown_for_checkpoint() {
+                    return crate::PartitionIoStep::Pending;
+                }
                 self.maintenance.shutdown = Some(PartitionShutdownPhase::DrainWriters);
                 crate::PartitionIoStep::Progress
             }
@@ -10191,6 +10237,9 @@ where
     async fn journal_append(&self, entry: Frozen<4096>) -> Result<(), IggyError> {
         let appended = self.log.journal().inner.append(entry).await;
         self.consensus.note_journal_mutation();
+        if appended.is_ok() {
+            self.stamp_checkpoint_op();
+        }
         appended.map_err(|_| IggyError::CannotAppendMessage)
     }
 
@@ -12334,6 +12383,7 @@ where
                 return None;
             }
             self.consensus.advance_commit_min(header.op);
+            self.log.journal().inner.mark_committed(header.op);
             // A lifecycle completion counts only once the reporter commits the
             // fence locally, so the backups must not wait for the heartbeat.
             // Data commits are too frequent to announce one by one.
@@ -12381,20 +12431,76 @@ where
     /// retention caps with nothing checkpointed to drop, ask for the
     /// checkpoint.
     fn release_checkpointed_commands(&self) {
-        let commit_min = self.consensus.commit_min();
-        let checkpoint_op = self
-            .persistence
-            .as_ref()
-            .map_or(commit_min, |persistence| persistence.checkpoint_op())
-            .min(commit_min);
         let over = self
             .log
             .journal()
             .inner
-            .release_checkpointed_commands(checkpoint_op);
+            .release_checkpointed_commands(self.command_release_op());
         if over && let Some(persistence) = &self.persistence {
             persistence.request_checkpoint();
         }
+    }
+
+    /// The highest op whose commands may leave memory: the WAL checkpoint,
+    /// which drops them too, and never past the commit point.
+    fn command_release_op(&self) -> u64 {
+        let commit_min = self.consensus.commit_min();
+        self.persistence
+            .as_ref()
+            .map_or(commit_min, |persistence| persistence.checkpoint_op())
+            .min(commit_min)
+    }
+
+    /// Releases checkpointed commands for `excess` bytes of the shard budget,
+    /// past the retention caps. Returns how many went, and whether committed
+    /// commands wait above the checkpoint, which only a checkpoint lets go.
+    ///
+    /// Keeps the command at the commit point: a view change reads its header
+    /// from memory, and a transfer donor sends its prepare.
+    pub(crate) fn release_commands_for(&self, excess: usize) -> (usize, bool) {
+        let journal = &self.log.journal().inner;
+        let below_commit = self.consensus.commit_min().saturating_sub(1);
+        let released =
+            journal.release_commands_for(self.command_release_op().min(below_commit), excess);
+        let wants_checkpoint = !self.is_shutting_down()
+            && self.persistence.as_ref().is_some_and(|persistence| {
+                journal.commands_in(persistence.checkpoint_op() + 1..=below_commit) > 0
+            });
+        (released, wants_checkpoint)
+    }
+
+    /// Defers a flush through the commit point for the shard budget, only
+    /// when the I/O lane starts it on its next turn. A deferred flush that
+    /// the lane cannot start keeps the history busy, which blocks a transfer.
+    pub(crate) fn ask_relief_flush(&mut self) -> ReliefFlush {
+        if self.fatal.is_some()
+            || self.materialization_missing
+            || self.persistence.is_none()
+            || self.is_shutting_down()
+            || self.io_active.is_retiring()
+        {
+            return ReliefFlush::Never;
+        }
+        if self.maintenance.flush_through.is_some() {
+            return ReliefFlush::Pending;
+        }
+        let commit_min = self.consensus.commit_min();
+        if self.consensus.status() != consensus::Status::Normal
+            || self.pending_commit.is_some()
+            || self.materialization.is_some()
+            || self.transition.is_some()
+            || self.flushable_through(commit_min) < commit_min
+        {
+            return ReliefFlush::Blocked;
+        }
+        // Committed resident messages with no prefix to flush sit above a
+        // hole, which repair or a state transfer closes.
+        if self.materializable_prefix_len(commit_min) == 0 {
+            return ReliefFlush::Never;
+        }
+        self.defer_flush(commit_min);
+        self.notify_io();
+        ReliefFlush::Asked
     }
 
     /// Every replica retains the committed result, so a promoted primary answers
@@ -16357,6 +16463,10 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
         .last()
 }
 
+mod checkpoint_policy;
 mod quiet;
 #[cfg(test)]
 pub mod tests;
+
+use checkpoint_policy::CheckpointPolicy;
+pub use checkpoint_policy::{CheckpointDelays, CheckpointTrigger};

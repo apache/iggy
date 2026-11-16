@@ -2070,6 +2070,9 @@ where
     /// metadata commit announces.
     reconcile_needed: RefCell<BTreeSet<IggyNamespace>>,
     shutting_down: Cell<bool>,
+    /// How long a graceful stop waits for the checkpoints it serves to
+    /// start. Zero serves none.
+    stop_checkpoint_window: Cell<Duration>,
 
     /// Partition-plane frames that arrived before this shard's reconciler
     /// materialised the namespace (post-`CreateTopic` convergence window).
@@ -2423,6 +2426,7 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
+            stop_checkpoint_window: Cell::new(Duration::ZERO),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
@@ -2501,6 +2505,13 @@ where
     /// Bound running file jobs in pump ticks. Zero disables the deadline.
     pub fn set_partition_io_timeout(&self, timeout: Duration) {
         self.partition_io.set_timeout(timeout);
+    }
+
+    /// Set how long a graceful stop waits for the checkpoints it serves to
+    /// start. It must leave the rest of the shard drain budget for the
+    /// checkpoints and the drain of the writers.
+    pub fn set_stop_checkpoint_window(&self, window: Duration) {
+        self.stop_checkpoint_window.set(window);
     }
 
     /// Override the serving-side resident payload budget from configuration.
@@ -3395,6 +3406,7 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
+            stop_checkpoint_window: Cell::new(Duration::ZERO),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
@@ -9908,6 +9920,13 @@ where
                 });
             partitions.settle(namespace, quiet_until);
         }
+        // The stop plans its checkpoints once, when it begins.
+        if !self.shutting_down.get() {
+            partitions.queue_reload_checkpoints();
+        }
+        if let Some(bytes_max) = partitions.wal_reload_bytes_max() {
+            self.metrics.set_wal_reload_budget(bytes_max);
+        }
         self.metrics.set_partition_levels(&partitions.gauge_sums());
         self.check_sleeping_partitions();
     }
@@ -9920,10 +9939,18 @@ where
         partition: &IggyPartition<B, SB>,
         sent: SentReport,
     ) -> Option<u64> {
-        let quiet_until = partition.quiet_until()?;
+        let partitions = self.plane.partitions();
+        // The checkpoint deadline only moves later without an op, and an op
+        // reaches the partition through an accessor that wakes it.
+        let quiet_until = partition.quiet_until().map(|quiet_until| {
+            partitions
+                .checkpoint_delays()
+                .and_then(|delays| partition.checkpoint_deadline(delays))
+                .map_or(quiet_until, |deadline| quiet_until.min(deadline))
+        })?;
         // The sweep reads the fault of a tombstoned partition, and a queued
         // report waits for its batch.
-        if sent.queued || self.plane.partitions().is_tombstoned(&namespace) {
+        if sent.queued || partitions.is_tombstoned(&namespace) {
             return None;
         }
         // The in-sync nodes of the report then change with no frame.
@@ -10043,6 +10070,8 @@ where
         // `process_loopback` does) so no partitions-plane borrow is held
         // across the tick `.await`. The table walks in slot order, but the
         // sweep cursor resumes by namespace order, so the snapshot is sorted.
+        // Ahead of the snapshot, so a requested partition starts this tick.
+        partitions.request_queued_checkpoints(PARTITION_WALKS_PER_TICK_MAX);
         partitions.due_namespaces(self.ticks(), namespace_scratch);
         namespace_scratch.sort_unstable();
         self.metrics
@@ -10091,6 +10120,13 @@ where
                         * u64::from(STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE),
                 );
                 partition.drive_persistence().await;
+                // The stop plans its checkpoints once, when it begins.
+                if !self.shutting_down.get()
+                    && let Some(delays) = partitions.checkpoint_delays()
+                    && let Some(trigger) = partition.take_due_checkpoint(self.ticks(), delays)
+                {
+                    partitions.enqueue_checkpoint(*namespace, trigger);
+                }
                 let consensus = partition.consensus();
                 untrusted_logs += usize::from(consensus.has_untrusted_log());
                 view_changes_inflight += usize::from(consensus.view_change_in_flight());
@@ -10114,6 +10150,10 @@ where
         }
         self.drive_replication(namespace_scratch).await;
         self.metrics.record_persistence(&persistence_metrics);
+        self.metrics.set_checkpoint_queue(
+            partitions.checkpoint_queue_len(),
+            partitions.queued_checkpoints_in_flight(),
+        );
         self.partition_io.record_metrics(&self.metrics);
         self.metrics
             .record_replica_reads(&self.bus.take_replica_read_stats());
@@ -10280,7 +10320,11 @@ where
                 if partition.needs_persistence_checkpoint() {
                     if walks < PARTITION_WALKS_PER_TICK_MAX {
                         walks += 1;
-                        partition.checkpoint_persistence(partitions.config()).await;
+                        if let Some(trigger) =
+                            partition.checkpoint_persistence(partitions.config()).await
+                        {
+                            self.metrics.record_checkpoint_start(trigger);
+                        }
                     } else {
                         walk_cursor.get_or_insert(namespace);
                     }
@@ -17117,6 +17161,7 @@ mod installed_transfer_dvc_tests {
         partition.log.journal().inner.restore_checkpoint_prepare(
             transfer,
             Owned::<MESSAGE_ALIGN>::copy_from_slice(checkpoint.as_slice()).into(),
+            None,
         );
         partition.consensus().note_journal_mutation();
         partition

@@ -248,6 +248,18 @@ impl Default for PartitionConfig {
                 .journal_memory_node_bytes_max
                 .parse()
                 .expect("embedded node-wide repair ring budget is valid"),
+            checkpoint_idle_delay: partition
+                .checkpoint_idle_delay
+                .parse()
+                .expect("embedded checkpoint idle delay is valid"),
+            checkpoint_max_delay: partition
+                .checkpoint_max_delay
+                .parse()
+                .expect("embedded checkpoint max delay is valid"),
+            wal_reload_node_bytes_max: partition
+                .wal_reload_node_bytes_max
+                .parse()
+                .expect("embedded node-wide WAL reload budget is valid"),
             transfer_served_cache_bytes_max: partition
                 .transfer_served_cache_bytes_max
                 .parse()

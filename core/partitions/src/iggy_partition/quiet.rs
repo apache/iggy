@@ -70,10 +70,15 @@ where
             .persistence
             .as_ref()
             .map_or((0, 0), |persistence| persistence.disk_and_retained_bytes());
+        let wal_reload_bytes = self
+            .persistence
+            .as_ref()
+            .map_or(0, |persistence| persistence.reload_bytes());
         let (repair_ring_entries, repair_ring_bytes) = self.repair_ring_occupancy();
         GaugeShare {
             wal_disk_bytes,
             wal_retained_bytes,
+            wal_reload_bytes,
             repair_ring_entries,
             repair_ring_bytes,
         }

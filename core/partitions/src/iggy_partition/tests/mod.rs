@@ -74,7 +74,25 @@ pub(super) fn stamped_segment_prepare(
     payload: &[u8],
     timestamp: u64,
 ) -> Message<PrepareHeader> {
-    let namespace = IggyNamespace::new(1, 1, 0);
+    stamped_segment_prepare_in(
+        IggyNamespace::new(1, 1, 0),
+        op,
+        parent,
+        offset,
+        payload,
+        timestamp,
+    )
+}
+
+/// [`stamped_segment_prepare`] for the partition of `namespace`.
+fn stamped_segment_prepare_in(
+    namespace: IggyNamespace,
+    op: u64,
+    parent: u128,
+    offset: u64,
+    payload: &[u8],
+    timestamp: u64,
+) -> Message<PrepareHeader> {
     let mut body =
         build_segment_record_with_payload(namespace, offset, Bytes::copy_from_slice(payload));
     if timestamp != 0 {
@@ -936,14 +954,24 @@ async fn replica_with_prepare_history(
     root: &std::path::Path,
     replica: u8,
 ) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
+    replica_with_prepare_history_in(root, replica, 0).await
+}
+
+/// [`replica_with_prepare_history`] for partition `partition_id` of stream 1,
+/// topic 1.
+async fn replica_with_prepare_history_in(
+    root: &std::path::Path,
+    replica: u8,
+    partition_id: usize,
+) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
     let mut config = repair_config();
     config.path_layout.streams_root = root.to_string_lossy().into_owned();
-    let partition_dir = config.get_partition_path(1, 1, 0);
-    let (mut partition, _) = recording_partition_at(replica, 3);
+    let partition_dir = config.get_partition_path(1, 1, partition_id);
+    let namespace = IggyNamespace::new(1, 1, partition_id);
+    let (mut partition, _) = recording_partition_in(namespace, replica, 3, LocalPipeline::new());
     partition.set_partition_dir(partition_dir.clone());
     // Boot loads the offset directories that partition creation made.
     set_offset_dirs_under(&mut partition, std::path::Path::new(&partition_dir));
-    let namespace = IggyNamespace::new(1, 1, 0);
     crate::partition_storage::recover_consumer_offsets_with_storage(
         &DiskStorage,
         &mut partition,
@@ -1461,7 +1489,20 @@ fn recording_partition_with_pipeline(
     replica_count: u8,
     pipeline: LocalPipeline,
 ) -> (IggyPartition<RecordingBus>, SentFrames) {
-    let namespace = IggyNamespace::new(1, 1, 0);
+    recording_partition_in(
+        IggyNamespace::new(1, 1, 0),
+        replica,
+        replica_count,
+        pipeline,
+    )
+}
+
+fn recording_partition_in(
+    namespace: IggyNamespace,
+    replica: u8,
+    replica_count: u8,
+    pipeline: LocalPipeline,
+) -> (IggyPartition<RecordingBus>, SentFrames) {
     let bus = RecordingBus::default();
     let sent_to_clients = bus.sent_to_clients.clone();
     let consensus = VsrConsensus::new(
@@ -1896,8 +1937,96 @@ async fn partition_with_pending_durable_ack() -> (
     (directory, partition, header)
 }
 
+/// Moves the checkpoint of `partition` onto the shard I/O lane, where it
+/// runs one phase per lane turn.
+fn dispatch_io(partition: &IggyPartition<RecordingBus>) {
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+}
+
+/// Starts the checkpoint that is due, as the shard tick does, and runs it to
+/// its end.
+async fn run_checkpoint(
+    partition: &mut IggyPartition<RecordingBus>,
+    config: &PartitionsConfig,
+) -> Option<CheckpointTrigger> {
+    assert!(partition.needs_persistence_checkpoint());
+    let trigger = partition.checkpoint_persistence(config).await;
+    finish_checkpoint(partition, config).await;
+    trigger
+}
+
+async fn finish_checkpoint(partition: &mut IggyPartition<RecordingBus>, config: &PartitionsConfig) {
+    const ROUNDS_MAX: usize = 8;
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    for _ in 0..ROUNDS_MAX {
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+        partition.drive_persistence().await;
+        Box::pin(settle_partition_io(partition, config)).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        if partition.maintenance.checkpoint.is_none() && !partition.persistence_checkpoint_pending()
+        {
+            return;
+        }
+    }
+    panic!("the checkpoint did not end in {ROUNDS_MAX} rounds");
+}
+
+/// Replicates a one-message send at `op` and lets the WAL write it. Returns
+/// its checksum, the parent of the next op.
+async fn replicate_send(
+    partition: &mut IggyPartition<RecordingBus>,
+    op: u64,
+    parent: u128,
+) -> u128 {
+    let prepare =
+        stamped_segment_prepare_in(partition.namespace(), op, parent, op - 1, b"payload", 0);
+    let checksum = prepare.header().checksum;
+    let writer = hold_wal_writer(partition.persistence.as_ref().unwrap());
+    Box::pin(partition.on_replicate(prepare)).await;
+    writer.await;
+    checksum
+}
+
+/// A backup on disk at `directory` with a counter machine owning
+/// [`COMMAND_KIND`], its sends and offsets under `durability`.
+async fn backup_with_counter(
+    config: &PartitionsConfig,
+    directory: &std::path::Path,
+    durability: iggy_common::Durability,
+) -> Box<IggyPartition<RecordingBus>> {
+    const BACKUP: u8 = 2;
+    let (backup, _) = recording_partition_at(BACKUP, 3);
+    let mut backup = Box::new(backup);
+    backup.runtime_options.durability = durability;
+    backup.runtime_options.consumer_offset_durability = durability;
+    backup
+        .register_state_machine(Box::new(
+            crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
+        ))
+        .unwrap();
+    backup.set_partition_dir(directory.to_string_lossy().into_owned());
+    set_offset_dirs_under(&mut backup, directory);
+    Box::pin(backup.open_persistence()).await.unwrap();
+    backup.log.retire_front().unwrap();
+    Box::pin(backup.install_empty_segment(config, 0))
+        .await
+        .unwrap();
+    backup.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    backup
+}
+
 mod age_roll;
 mod chain_transfer;
+mod checkpoint_policy;
 mod consensus_tests;
 mod consumer_group_ownership;
 mod disk_poll;
@@ -1906,6 +2035,7 @@ mod eviction;
 mod floor_eviction;
 mod free_space;
 mod history;
+mod journal_budget;
 mod materialization;
 mod materialization_io;
 mod materialization_tail;
@@ -1919,6 +2049,7 @@ mod offset_storage;
 mod offsets;
 mod persistence_checkpoint;
 mod quiet;
+mod reload_budget;
 mod remote_poll;
 mod repair;
 mod repair_floor;
