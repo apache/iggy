@@ -1,0 +1,112 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# The full Kafka client compatibility matrix (#4531).
+#
+# The pre-merge job runs the smoke clients on every pull request. This job runs
+# the frameworks and tools too (Vector, Fluent Bit, RisingWave, Flink, Kafka
+# Connect with Debezium), each against the gateway and against Apache Kafka, and
+# writes one table to the job summary and the `client-matrix` artifact. A
+# difference fails the job unless `tests/clients/allowed_differences.toml`
+# declares it with the issue that owns it, so a red cell always names the issue
+# that blocks that client.
+
+name: Kafka client matrix nightly
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: kafka-client-matrix-nightly
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: client-matrix-nightly
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
+        with:
+          install-nextest: true
+          install-system-dependencies: true
+          shared-key: dev
+
+      # The Java probe is compiled on the host against the kafka-clients jar of
+      # the image it runs in.
+      - name: Setup Java
+        uses: ./.github/actions/utils/setup-java
+        with:
+          gradle-cache-disabled: "true"
+
+      - name: Build iggy-server
+        run: cargo build --locked --bin iggy-server
+        shell: bash
+
+      # The suites run their containers with `--pull never`, so every image has
+      # to be here first. Read the tags out of the suites so a bump in a test
+      # cannot desync from the pull.
+      - name: Pull client images
+        run: |
+          grep -rhoP '^pub const [A-Z0-9_]+_IMAGE: &str = "\K[^"]+' \
+            gateways/kafka/tests/client_matrix_tests.rs \
+            gateways/kafka/tests/common/oracle.rs | sort -u |
+          while read -r image; do
+            timeout 300 docker pull -q "$image" \
+              || { echo "::error::docker pull $image failed"; exit 1; }
+          done
+        shell: bash
+
+      - name: Run the full matrix
+        env:
+          KAFKA_CLIENT_MATRIX_FULL: "1"
+          KAFKA_CLIENT_MATRIX_DIR: ${{ runner.temp }}/client-matrix
+          KAFKA_E2E_REQUIRED: "1"
+        run: |
+          mkdir -p "$KAFKA_CLIENT_MATRIX_DIR"
+          cargo nextest run -p iggy-gateway-kafka --test client_matrix_tests --no-fail-fast
+        shell: bash
+
+      - name: Publish the matrix
+        if: always() && !cancelled()
+        env:
+          KAFKA_CLIENT_MATRIX_DIR: ${{ runner.temp }}/client-matrix
+        run: |
+          for report in "$KAFKA_CLIENT_MATRIX_DIR"/*.md; do
+            [ -f "$report" ] || continue
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          done
+        shell: bash
+
+      - name: Upload the matrix
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: client-matrix-${{ github.run_id }}
+          path: ${{ runner.temp }}/client-matrix
+          if-no-files-found: ignore
+          retention-days: 30
