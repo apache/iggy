@@ -155,6 +155,14 @@ impl RemoteRange {
 /// has just put there.
 pub const FRESH_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Bytes between two blobs of one fresh object that a read fetches along
+/// with them. A request to the store costs more than these bytes do.
+pub const FRESH_READ_GAP_BYTES: u64 = 256 * 1024;
+
+/// The most bytes one read of a fresh object asks for when it covers the
+/// blobs of several batches. A single blob is read whatever its size.
+pub const FRESH_READ_BYTES_MAX: u64 = 8 * 1024 * 1024;
+
 /// The bytes of fresh objects that this shard stored or fetched, oldest
 /// first. Losing any of it loses nothing: a read that misses goes to the
 /// store.
@@ -282,6 +290,46 @@ impl RemoteSegments {
             .await
             .map(|object| object.bytes)
             .map_err(|error| fault(&key, &error))
+    }
+
+    /// Fetch the blobs at `ranges` of the fresh object `object_id` that this
+    /// shard does not hold, so that [`Self::read_fresh`] finds them in
+    /// memory. Blobs that sit within [`FRESH_READ_GAP_BYTES`] of each other
+    /// come in one read of at most [`FRESH_READ_BYTES_MAX`], so a poll of
+    /// many batches of one object asks the store once and not once a batch.
+    ///
+    /// # Errors
+    /// As [`Self::read_fresh`].
+    pub(crate) async fn fetch_fresh(
+        &self,
+        object_id: u128,
+        ranges: &[Range<u64>],
+    ) -> Result<(), DiskFault> {
+        let mut missing: Vec<Range<u64>> = {
+            let cache = self.fresh.borrow();
+            ranges
+                .iter()
+                .filter(|range| range.start < range.end && cache.get(object_id, range).is_none())
+                .cloned()
+                .collect()
+        };
+        missing.sort_unstable_by_key(|range| range.start);
+        let mut reads: Vec<Range<u64>> = Vec::new();
+        for range in missing {
+            match reads.last_mut() {
+                Some(read)
+                    if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
+                        && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
+                {
+                    read.end = read.end.max(range.end);
+                }
+                _ => reads.push(range),
+            }
+        }
+        for read in reads {
+            self.read_fresh(object_id, read).await?;
+        }
+        Ok(())
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
@@ -1064,6 +1112,110 @@ mod tests {
 
         assert_eq!(remote.read_fresh(7, 2..6).await.unwrap(), "2345");
         assert_eq!(remote.read_fresh(7, 0..2).await, Err(DiskFault::Tiered));
+    }
+
+    /// One object, and the ranges it was asked for.
+    struct Asked {
+        object: Bytes,
+        ranges: RefCell<Vec<Range<u64>>>,
+    }
+
+    impl Asked {
+        fn holding(len: usize) -> Rc<Self> {
+            let object: Vec<u8> = (0..len)
+                .map(|byte| u8::try_from(byte % 251).unwrap())
+                .collect();
+            Rc::new(Self {
+                object: Bytes::from(object),
+                ranges: RefCell::default(),
+            })
+        }
+    }
+
+    impl RemoteObjects for Asked {
+        fn get_range<'a>(
+            &'a self,
+            _key: &'a str,
+            range: Range<u64>,
+        ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+            self.ranges.borrow_mut().push(range.clone());
+            let end = usize::try_from(range.end).unwrap().min(self.object.len());
+            let object = ObjectRange {
+                bytes: self
+                    .object
+                    .slice(usize::try_from(range.start).unwrap()..end),
+                etag: String::new(),
+                size: self.object.len() as u64,
+            };
+            async move { Ok(object) }.boxed_local()
+        }
+    }
+
+    #[compio::test]
+    async fn given_blobs_close_together_when_fetching_them_should_ask_the_store_once() {
+        let store = Asked::holding(4096);
+        let remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
+        let blobs = [100..200, 200..300, 1000..1100];
+
+        remote.fetch_fresh(7, &blobs).await.unwrap();
+
+        assert_eq!(store.ranges.borrow().len(), 1);
+        assert_eq!(store.ranges.borrow()[0], 100..1100);
+        for blob in blobs {
+            let expected = store
+                .object
+                .slice(usize::try_from(blob.start).unwrap()..usize::try_from(blob.end).unwrap());
+            assert_eq!(remote.read_fresh(7, blob).await.unwrap(), expected);
+        }
+        assert_eq!(
+            store.ranges.borrow().len(),
+            1,
+            "every blob came from memory"
+        );
+    }
+
+    #[compio::test]
+    async fn given_blobs_far_apart_or_too_many_bytes_when_fetching_should_ask_for_each_run() {
+        let gap = FRESH_READ_GAP_BYTES;
+        let far = 100 + gap + 1;
+        let store = Asked::holding(usize::try_from(far + FRESH_READ_BYTES_MAX + 200).unwrap());
+        let remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
+        // The third blob would make the second read longer than a read may be.
+        let third = far + FRESH_READ_BYTES_MAX;
+        let blobs = [third..third + 100, 0..100, far..far + 100];
+
+        remote.fetch_fresh(7, &blobs).await.unwrap();
+
+        assert_eq!(
+            *store.ranges.borrow(),
+            [0..100, far..far + 100, third..third + 100]
+        );
+    }
+
+    #[compio::test]
+    async fn given_blobs_this_shard_holds_when_fetching_should_ask_only_for_the_others() {
+        let store = Asked::holding(4096);
+        let remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
+        remote.read_fresh(7, 100..200).await.unwrap();
+
+        remote
+            .fetch_fresh(7, &[100..200, 200..300, 150..150])
+            .await
+            .unwrap();
+        remote.fetch_fresh(7, &[100..200, 200..300]).await.unwrap();
+
+        assert_eq!(*store.ranges.borrow(), [100..200, 200..300]);
+    }
+
+    #[compio::test]
+    async fn given_an_object_shorter_than_its_blobs_when_fetching_should_fail_the_read() {
+        let store = Asked::holding(250);
+        let remote = RemoteSegments::new(store, KeyLayout::new("iggy").unwrap());
+
+        assert_eq!(
+            remote.fetch_fresh(7, &[100..200, 200..300]).await,
+            Err(DiskFault::Tiered)
+        );
     }
 
     /// A store that never answers.

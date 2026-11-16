@@ -125,6 +125,7 @@ impl PlacedReadPlan {
                 wanted.take(PlacedBatch::new(batch.header, placement), &mut placed);
             }
         }
+        self.fetch_blobs(&placed).await?;
         batches.reserve(placed.len());
         for placed in &placed {
             batches.push(self.assemble(placed).await?);
@@ -221,6 +222,32 @@ impl PlacedReadPlan {
                 }
                 index += batches;
             }
+        }
+        Ok(())
+    }
+
+    /// Fetch the blobs of `placed` object by object, so the batches that
+    /// follow each other in one fresh object cost one read of the store and
+    /// not one each. A batch alone in its object is left to
+    /// [`Self::assemble`], which reads it the same way.
+    async fn fetch_blobs(&self, placed: &[PlacedBatch]) -> Result<(), DiskFault> {
+        let Some(remote) = self.remote.as_deref() else {
+            return Ok(());
+        };
+        let same_object = |one: &PlacedBatch, other: &PlacedBatch| {
+            one.placement.object_id == other.placement.object_id
+        };
+        for run in placed.chunk_by(same_object).filter(|run| run.len() > 1) {
+            let blobs: Vec<_> = run
+                .iter()
+                .filter_map(|placed| {
+                    let placement = placed.placement;
+                    let end = placement.position.checked_add(placement.length)?;
+                    Some(placement.position..end)
+                })
+                .collect();
+            self.wait(remote.fetch_fresh(run[0].placement.object_id, &blobs))
+                .await?;
         }
         Ok(())
     }

@@ -1391,3 +1391,46 @@ async fn given_a_published_long_term_segment_when_building_the_manifest_should_l
     let (_, published, _) = partition.begin_manifest_publish(now).unwrap();
     assert_eq!(published, manifest);
 }
+
+/// Reads `store`, and counts the reads.
+struct CountedStore {
+    store: Rc<iggy_object_store::MemoryStore>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl crate::RemoteObjects for CountedStore {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::LocalBoxFuture<
+        'a,
+        Result<iggy_object_store::ObjectRange, iggy_object_store::ObjectStoreError>,
+    > {
+        self.reads.set(self.reads.get() + 1);
+        crate::RemoteObjects::get_range(&*self.store, key, range)
+    }
+}
+
+/// The batches of one poll sit back to back in one fresh object, so the
+/// poll asks the store once for all of them and not once a batch.
+#[compio::test]
+async fn given_batches_of_one_fresh_object_when_polling_them_should_ask_the_store_once() {
+    let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let expected = Box::pin(polls_of_whole_batches(&whole)).await;
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    let counted = Rc::new(CountedStore {
+        store: Box::pin(store_with(object)).await,
+        reads: std::cell::Cell::new(0),
+    });
+    super::remote_poll::attach(
+        &mut partition,
+        Rc::clone(&counted) as Rc<dyn crate::RemoteObjects>,
+    );
+
+    let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
+
+    assert_eq!(polled, expected);
+    const { assert!(RECEIVER_OPS > 2, "the poll reads several batches") };
+    assert_eq!(counted.reads.get(), 1);
+}
