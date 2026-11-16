@@ -193,7 +193,8 @@ public final class TopicOptions {
          * Move sealed segments to the object store and keep only the local retention on disk. An update can
          * turn it on later and never off, because the removed local segments cannot come back.
          *
-         * <p>Not available yet: the server refuses {@code true} with {@code FEATURE_UNAVAILABLE}.
+         * <p>Needs an object store on every node of the cluster: while one is not ready, the server refuses
+         * {@code true} with {@code FEATURE_UNAVAILABLE}.
          */
         public Builder tieredStorage(boolean enabled) {
             return set(TopicOptionKey.TIERED_STORAGE, HeaderValue.fromBool(enabled));
