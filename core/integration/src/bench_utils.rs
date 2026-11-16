@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::harness::get_test_directory;
-use assert_cmd::prelude::CommandCargoExt;
+use crate::harness::{cargo_bin_path, get_test_directory};
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use std::{
@@ -46,8 +45,7 @@ pub fn run_bench_and_wait_for_finish(
     bench: &str,
     amount_of_data_to_process: IggyByteSize,
 ) {
-    #[allow(deprecated)]
-    let mut command = Command::cargo_bin("iggy-bench").unwrap();
+    let mut command = Command::new(cargo_bin_path("iggy-bench").unwrap());
 
     let mut stderr_file_path = None;
     let mut stdout_file_path = None;

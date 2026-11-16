@@ -51,6 +51,7 @@ internal static class VsrError
     internal const int LIFECYCLE_BUSY = 88;
     internal const int NOT_PRIMARY = 89;
     internal const int DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
+    internal const int TIERED_READ_FAILED = 96;
     internal const int EMPTY_RESPONSE = 304;
     internal const int STREAM_ID_NOT_FOUND = 1009;
     internal const int STREAM_NAME_NOT_FOUND = 1010;

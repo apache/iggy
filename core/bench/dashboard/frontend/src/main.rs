@@ -33,10 +33,17 @@ use pages::compare::{ComparePage, RunList};
 use pages::explore::Explore;
 use pages::methodology::Methodology;
 use pages::not_found::NotFound;
+use pages::omb::compare::OmbComparePage;
+use pages::omb::list::OmbRunsPage;
+use pages::omb::run::OmbRunPage;
 use pages::overview::Overview;
 use pages::run::RunPage;
-use router::AppRoute;
-use state::{data::DataProvider, selection::SelectionProvider};
+use router::{AppRoute, Moved};
+use state::data::DataProvider;
+use state::github::GithubStarsProvider;
+use state::omb::OmbDataProvider;
+use state::selection::{OmbSelectionProvider, SelectionProvider};
+use uuid::Uuid;
 use yew::prelude::*;
 use yew_router::{BrowserRouter, Switch};
 
@@ -45,11 +52,17 @@ pub fn app() -> Html {
     html! {
         <BrowserRouter>
             <ThemeProvider>
-                <DataProvider>
-                    <SelectionProvider>
-                        <Switch<AppRoute> render={switch} />
-                    </SelectionProvider>
-                </DataProvider>
+                <GithubStarsProvider>
+                    <DataProvider>
+                        <OmbDataProvider>
+                            <SelectionProvider>
+                                <OmbSelectionProvider>
+                                    <Switch<AppRoute> render={switch} />
+                                </OmbSelectionProvider>
+                            </SelectionProvider>
+                        </OmbDataProvider>
+                    </DataProvider>
+                </GithubStarsProvider>
             </ThemeProvider>
         </BrowserRouter>
     }
@@ -61,14 +74,22 @@ fn switch(routes: AppRoute) -> Html {
         AppRoute::Compare => html! { <ComparePage /> },
         AppRoute::CompareReleases => html! { <ReleasesPage /> },
         AppRoute::ComparePair { left, right } => html! {
-            <ComparePage alias={RunList::from_iter([left.as_str(), right.as_str()])} />
+            <ComparePage alias={RunList::<Uuid>::from_iter([left.as_str(), right.as_str()])} />
         },
         // Keyed by the uuid, so another run's page starts with fresh state.
-        AppRoute::Benchmark { uuid } => {
+        AppRoute::Run { uuid } => {
             let key = uuid.clone();
             html! { <RunPage {key} {uuid} /> }
         }
+        AppRoute::OldRun { uuid } => html! { <Moved to={AppRoute::Run { uuid }} /> },
         AppRoute::Explore => html! { <Explore /> },
+        AppRoute::OmbRuns => html! { <OmbRunsPage /> },
+        // Keyed by the id, so another run's page starts with fresh state.
+        AppRoute::OmbRun { id } => {
+            let key = id.clone();
+            html! { <OmbRunPage {key} {id} /> }
+        }
+        AppRoute::OmbCompare => html! { <OmbComparePage /> },
         AppRoute::Methodology => html! { <Methodology /> },
         AppRoute::NotFound => html! { <NotFound /> },
     }

@@ -29,7 +29,10 @@ use crate::offset_storage::{
     delete_persisted_offset_with_storage, persist_emptied_marker_with_storage,
     persist_offset_with_storage,
 };
-use crate::segment_recovery::{PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment};
+use crate::segment_chain::ChainError;
+use crate::segment_recovery::{
+    PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,
+};
 use crate::state_transfer::OFFSET_PERSIST_CONCURRENCY;
 use crate::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig, Segment};
 use compio::fs::create_dir_all;
@@ -809,7 +812,7 @@ pub async fn hydrate_partition_log<B: MessageBus>(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-    recovered_segments: Vec<RecoveredSegment>,
+    recovered: RecoveredLog,
 ) -> Result<(), PartitionRecoveryError> {
     // The partition's own resolved knobs, not the shard-wide config: a topic
     // created with `persisted` or a per-topic `segment_size` must get them
@@ -821,11 +824,7 @@ pub async fn hydrate_partition_log<B: MessageBus>(
     let preallocate_segments = runtime
         .preallocate_segments
         .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS);
-    for RecoveredSegment { segment, storage } in recovered_segments {
-        partition
-            .log
-            .add_persisted_segment(segment, storage, None, None);
-    }
+    add_recovered_log(partition, partition_dir, recovered)?;
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
         let storage = &partition.log.storages()[active_index];
@@ -911,6 +910,44 @@ pub async fn hydrate_partition_log<B: MessageBus>(
     }
 
     Ok(())
+}
+
+/// Add the recovered segments, and keep the chain boot recovered beside them,
+/// refusing one that names another partition or incarnation.
+fn add_recovered_log<B: MessageBus>(
+    partition: &mut IggyPartition<B>,
+    partition_dir: &str,
+    recovered: RecoveredLog,
+) -> Result<(), PartitionRecoveryError> {
+    for RecoveredSegment { segment, storage } in recovered.segments {
+        partition
+            .log
+            .add_persisted_segment(segment, storage, None, None);
+    }
+    let Some(chain) = &recovered.chain else {
+        return Ok(());
+    };
+    let namespace = partition.namespace();
+    let (stream_id, topic_id, partition_id) = (
+        namespace.stream_id(),
+        namespace.topic_id(),
+        namespace.partition_id(),
+    );
+    partition
+        .adopt_segment_chain(chain)
+        .map_err(|error| match error {
+            ChainError::Prefix { recorded } => PartitionRecoveryError::Refused {
+                dir: PathBuf::from(partition_dir),
+                stream_id,
+                topic_id,
+                partition_id,
+                reason: PartitionRecoveryRefusal::ForeignChain { recorded },
+            },
+            other => {
+                error!(stream_id, topic_id, partition_id, error = %other, "failed to keep the recovered segment chain");
+                IggyError::CannotReadPartitions.into()
+            }
+        })
 }
 
 async fn load_partition_consumer_offsets<S: DurableStorage>(

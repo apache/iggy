@@ -63,7 +63,7 @@ pub fn embed_code(props: &EmbedCodeProps) -> Html {
         "{base_url}/embed/{uuid}?type={chart_type}&theme={theme}",
         uuid = props.uuid,
     );
-    let benchmark_url = format!("{base_url}/benchmarks/{uuid}", uuid = props.uuid);
+    let benchmark_url = format!("{base_url}/runs/{uuid}", uuid = props.uuid);
     let png_url = format!(
         "{base_url}/embed/{uuid}/chart.png?type={chart_type}&theme={theme}&width=1600&height=1200&legend=true",
         uuid = props.uuid,

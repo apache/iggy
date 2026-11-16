@@ -20,8 +20,6 @@ use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use assert_cmd::prelude::CommandCargoExt;
-
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, IggyMessage, MessageClient, Partitioning, Permissions,
@@ -30,7 +28,7 @@ use iggy_common::{
     UserClient, UserCreateOptions, UserInfo, UserInfoDetails, UserStatus,
 };
 use integration::{
-    harness::{McpClient, McpConfig, TestHarness, seeds},
+    harness::{McpClient, McpConfig, TestHarness, cargo_bin_path, seeds},
     iggy_harness,
 };
 use reqwest::{
@@ -145,9 +143,8 @@ fn initialize_request() -> serde_json::Value {
     })
 }
 
-#[allow(deprecated)]
 fn stdio_mcp(address: SocketAddr, username: &str, password: &str) -> tokio::process::Command {
-    let mut command = Command::cargo_bin("iggy-mcp").expect("MCP binary required");
+    let mut command = Command::new(cargo_bin_path("iggy-mcp").expect("MCP binary required"));
     command
         .env("IGGY_MCP_TRANSPORT", "stdio")
         .env("IGGY_MCP_IGGY_ADDRESS", address.to_string())
@@ -1233,7 +1230,6 @@ async fn should_accept_only_configured_host_names() {
 }
 
 #[iggy_harness]
-#[allow(deprecated)]
 async fn should_refuse_to_start_with_an_unsafe_or_invalid_http_configuration(
     harness: &TestHarness,
 ) {
@@ -1256,7 +1252,7 @@ async fn should_refuse_to_start_with_an_unsafe_or_invalid_http_configuration(
         ],
         vec![("IGGY_MCP_PERMISSIONS_READ", "sometimes")],
     ] {
-        let mut command = Command::cargo_bin("iggy-mcp").expect("MCP binary required");
+        let mut command = Command::new(cargo_bin_path("iggy-mcp").expect("MCP binary required"));
         command
             .env("IGGY_MCP_TRANSPORT", "http")
             .env("IGGY_MCP_HTTP_ADDRESS", "127.0.0.1:0")

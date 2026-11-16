@@ -40,7 +40,7 @@ See [metadata freshness and counters](../../core/server/README.md#metadata-fresh
 
 ## Resource options
 
-Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog.
+Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog. A topic update can change `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize`, reset each of them, and turn `TieredStorage` on, never off.
 
 ```cpp
 const std::string key_base64 = LoadStreamKey();

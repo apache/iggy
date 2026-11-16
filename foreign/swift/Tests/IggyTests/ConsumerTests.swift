@@ -1067,6 +1067,37 @@ struct ConsumerTests {
         await server.stop()
     }
 
+    /// A stop during the gap read leaves the partition to a seek, which
+    /// drops the gap and the batch held behind it, and a seek to `next` reads
+    /// after both. So the stop reports the range once and delivers that
+    /// batch before its own error.
+    @Test func aStopDuringAGapReadReportsTheRangeAndDeliversTheHeldBatchFirst() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 6])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.pollMessagesDeferred.rawValue, !polledStrategy(request).autoCommit else {
+                return nil
+            }
+            return .status(IggyErrorCode.tieredReadFailed.rawValue)
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+        #expect(try await batches(reader, 1) == [[0, 1]])
+        topic.loseReplies(1)
+
+        let lost = try #require(await readError(reader), "the gap that the stop gave up was not reported")
+        #expect(lost.partitionID == 1 && lost.error.code == .fetchProgressUncertain)
+        #expect(lost.lost == 2...3)
+        #expect(try await batches(reader, 1) == [[4, 5]])
+        let stop = try #require(await readError(reader), "the stop was not reported")
+        #expect(stop.partitionID == 1 && stop.error.code == .tieredReadFailed)
+        #expect(stop.stopsPartition)
+        #expect(await requests(server, .pollMessagesDeferred).count == 1)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
     /// A gap read that the history answers from inside the gap finds the
     /// start of the gap gone, as after retention. The reader reports that
     /// start once, then delivers the rest of the gap and the batch after it.
@@ -3980,6 +4011,76 @@ struct ConsumerTests {
         }
 
         #expect(reported.sorted() == [1, 2])
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// Tiered data that the object store refuses for good stops its
+    /// partition at the first refusal: the read is not sent again after the
+    /// retry interval.
+    @Test func aReadRefusedWithTieredReadFailedStopsItsPartitionWithoutARetry() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2])
+        await serve(server, topic: topic) { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .fetchMessages:
+                guard let fetch = try? request.fetch else {
+                    return nil
+                }
+                return .ok(
+                    FakeVSRServer.fetchedBody(
+                        fetch.targets.map { FakeVSRServer.FetchedSection(partitionID: $0.partitionID, status: IggyErrorCode.tieredReadFailed.rawValue) }))
+            case .pollMessagesDeferred:
+                return .status(IggyErrorCode.tieredReadFailed.rawValue)
+            default:
+                return nil
+            }
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, start: .first)
+
+        let error = await readError(reader)
+
+        #expect(error?.partitionID == 1 && error?.error.code == .tieredReadFailed)
+        #expect(error?.stopsPartition == true)
+        // Several retry intervals of the reader pass.
+        try await Task.sleep(for: .milliseconds(400))
+        let reads = await requests(server, .fetchMessages).count + requests(server, .pollMessagesDeferred).count
+        #expect(reads == 1)
+        try await reader.close()
+        await client.shutdown()
+        await server.stop()
+    }
+
+    /// With `onRead` a partition that reads at `next` reads a baseline
+    /// before its first committing read. A baseline that the object store
+    /// refuses for good stops the partition, so a later `next()` sends no
+    /// baseline read again until a seek.
+    @Test func aBaselineReadRefusedWithTieredReadFailedIsNotSentAgainByALaterNext() async throws {
+        let server = try await FakeVSRServer.started()
+        let topic = FakeTopic(ends: [1: 2])
+        await serve(server, topic: topic) { request in
+            guard request.code == CommandCode.fetchMessages.rawValue, let fetch = try? request.fetch else {
+                return nil
+            }
+            return .ok(
+                FakeVSRServer.fetchedBody(
+                    fetch.targets.map { FakeVSRServer.FetchedSection(partitionID: $0.partitionID, status: IggyErrorCode.tieredReadFailed.rawValue) }))
+        }
+        let client = try await signedInClient(server)
+        let reader = try await standalone(client, commit: .onRead)
+
+        let error = await readError(reader)
+        #expect(error?.partitionID == 1 && error?.error.code == .tieredReadFailed)
+        #expect(error?.stopsPartition == true)
+        let later = Task { try? await reader.next() }
+        // Several retry intervals of the reader pass.
+        try await Task.sleep(for: .milliseconds(400))
+
+        #expect(await requests(server, .fetchMessages).count == 1)
+        later.cancel()
+        _ = await later.value
         try await reader.close()
         await client.shutdown()
         await server.stop()

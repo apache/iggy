@@ -192,14 +192,15 @@ pub fn change(
         &step.head,
     )?;
     let percent = percent_change(delta.base.median, delta.head.median);
+    let value = |value| metric_value_text(metric, value);
     Some(Change {
         verdict: delta.verdict,
         percent,
         versus: step.previous.to_owned(),
         ranges: format!(
             "{}. {}.",
-            range_text(step.previous, step.base.len(), &delta.base, metric),
-            range_text(&run.version, step.head.len(), &delta.head, metric)
+            range_text(step.previous, step.base.len(), &delta.base, value),
+            range_text(&run.version, step.head.len(), &delta.head, value)
         ),
     })
 }
@@ -260,8 +261,14 @@ pub fn percent_text(percent: f64) -> String {
     format!("{percent:+.1}%")
 }
 
-fn range_text(version: &str, runs: usize, range: &ValueRange, metric: Metric) -> String {
-    let value = |value| metric_value_text(metric, value);
+/// The runs of one version and their range, for example `0.9.0: 3 runs, 1.20 ms to 1.31 ms, median
+/// 1.27 ms`. `value` writes a value in its unit.
+pub fn range_text(
+    version: &str,
+    runs: usize,
+    range: &ValueRange,
+    value: impl Fn(f64) -> String,
+) -> String {
     if runs == 1 {
         return format!("{version}: 1 run, {}", value(range.median));
     }

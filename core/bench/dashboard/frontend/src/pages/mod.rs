@@ -19,5 +19,6 @@ pub mod compare;
 pub mod explore;
 pub mod methodology;
 pub mod not_found;
+pub mod omb;
 pub mod overview;
 pub mod run;

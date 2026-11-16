@@ -63,7 +63,11 @@ final class ResourceOptionsTest extends TestCase
     private const IN_SYNC_WAIT_SECONDS = 15.0;
     private const STREAM_DERIVED_KEYS = ['encryption_kek_fingerprint', 'encryption_key_fingerprint', 'encryption_key_source'];
     // Create and update arguments named after the unit they take rather than the option key.
-    private const PARAMETER_NAMES = ['message_expiry' => 'message_expiry_micros'];
+    private const PARAMETER_NAMES = [
+        'message_expiry' => 'message_expiry_micros',
+        'segment_max_age' => 'segment_max_age_micros',
+        'local_retention_age' => 'local_retention_age_micros',
+    ];
 
     private array $createdStreams = [];
 
@@ -542,10 +546,10 @@ final class ResourceOptionsTest extends TestCase
             Assert::assertContains('raw_reset', $updateParameters, "$scope update raw_reset");
             foreach ($rows as $key => $row) {
                 $parameter = self::PARAMETER_NAMES[$key] ?? $key;
-                if ($row['storage'] === 'map' && in_array($row['mutability'], ['create_only', 'updatable'], true)) {
+                if ($row['storage'] === 'map' && in_array($row['mutability'], ['create_only', 'updatable', 'enable_only'], true)) {
                     Assert::assertContains($parameter, $createParameters, "$scope create $key");
                 }
-                if ($row['mutability'] === 'updatable') {
+                if (in_array($row['mutability'], ['updatable', 'enable_only'], true)) {
                     Assert::assertContains($parameter, $updateParameters, "$scope update $key");
                 }
                 if ($row['mutability'] === 'read_only') {

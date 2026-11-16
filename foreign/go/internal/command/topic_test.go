@@ -323,6 +323,177 @@ func TestCreateTopic_ReplicationFactorFieldRidesTheBlockAsUint32(t *testing.T) {
 	}
 }
 
+func TestCreateTopic_SegmentMaxAgeFieldRidesTheBlockAsUint64(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	segmentOptions := func(age iggcon.Duration) []iggcon.HeaderEntry {
+		t.Helper()
+		command := CreateTopic{
+			StreamId: streamId,
+			Name:     "topic",
+			Options:  iggcon.TopicOptions{SegmentMaxAge: &age},
+		}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		options, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		var entries []iggcon.HeaderEntry
+		for _, entry := range options {
+			if string(entry.Key.Value) == string(iggcon.TopicOptionSegmentMaxAge) {
+				entries = append(entries, entry)
+			}
+		}
+		return entries
+	}
+
+	entries := segmentOptions(iggcon.Duration(3_600_000_000))
+	if len(entries) != 1 {
+		t.Fatalf("segment_max_age entries = %v, want exactly one", entries)
+	}
+	if entries[0].Value.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(entries[0].Value.Value) != 3_600_000_000 {
+		t.Errorf("segment_max_age = %+v, want Uint64 3600000000", entries[0].Value)
+	}
+	if entries := segmentOptions(iggcon.IggyExpiryServerDefault); len(entries) != 0 {
+		t.Errorf("the server-default sentinel must leave segment_max_age derived, got %v", entries)
+	}
+}
+
+func TestCreateTopic_TieringFieldsRideTheBlock(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	tieringOptions := func(options iggcon.TopicOptions) map[string]iggcon.HeaderValue {
+		t.Helper()
+		command := CreateTopic{StreamId: streamId, Name: "topic", Options: options}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		entries, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		byKey := make(map[string]iggcon.HeaderValue, len(entries))
+		for _, entry := range entries {
+			byKey[string(entry.Key.Value)] = entry.Value
+		}
+		return byKey
+	}
+
+	tieredStorage := false
+	localRetentionAge := iggcon.Duration(21_600_000_000)
+	localRetentionSize := uint64(10 << 30)
+	options := tieringOptions(iggcon.TopicOptions{
+		TieredStorage:      &tieredStorage,
+		LocalRetentionAge:  &localRetentionAge,
+		LocalRetentionSize: &localRetentionSize,
+	})
+	if value := options[string(iggcon.TopicOptionTieredStorage)]; value.Kind != iggcon.Bool || !bytes.Equal(value.Value, []byte{0}) {
+		t.Errorf("tiered_storage = %+v, want Bool false", value)
+	}
+	if value := options[string(iggcon.TopicOptionLocalRetentionAge)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 21_600_000_000 {
+		t.Errorf("local_retention_age = %+v, want Uint64 21600000000", value)
+	}
+	if value := options[string(iggcon.TopicOptionLocalRetentionSize)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 10<<30 {
+		t.Errorf("local_retention_size = %+v, want Uint64 %d", value, 10<<30)
+	}
+
+	serverDefaultAge := iggcon.IggyExpiryServerDefault
+	serverDefaultSize := uint64(0)
+	options = tieringOptions(iggcon.TopicOptions{
+		LocalRetentionAge:  &serverDefaultAge,
+		LocalRetentionSize: &serverDefaultSize,
+	})
+	for _, key := range []iggcon.TopicOptionKey{
+		iggcon.TopicOptionTieredStorage,
+		iggcon.TopicOptionLocalRetentionAge,
+		iggcon.TopicOptionLocalRetentionSize,
+	} {
+		if value, sent := options[string(key)]; sent {
+			t.Errorf("the server-default sentinel must leave %s derived, got %+v", key, value)
+		}
+	}
+}
+
+func TestUpdateTopic_TieringFieldsRideTheBlock(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	topicId, _ := iggcon.NewIdentifier(uint32(2))
+	const prefixSize = 1 + (2 + 4) + (2 + 4) + 1
+	tieredStorage := true
+	localRetentionAge := iggcon.Duration(21_600_000_000)
+	localRetentionSize := uint64(10 << 30)
+	request := UpdateTopic{
+		StreamId:           streamId,
+		TopicId:            topicId,
+		TieredStorage:      &tieredStorage,
+		LocalRetentionAge:  &localRetentionAge,
+		LocalRetentionSize: &localRetentionSize,
+	}
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("failed to serialize UpdateTopic: %v", err)
+	}
+	entries, err := iggcon.DeserializeHeaders(serialized[prefixSize:])
+	if err != nil {
+		t.Fatalf("options block is not valid TLV: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("entries = %v, want the three tiering keys", entries)
+	}
+	byKey := make(map[string]iggcon.HeaderValue, len(entries))
+	for _, entry := range entries {
+		byKey[string(entry.Key.Value)] = entry.Value
+	}
+	if value := byKey[string(iggcon.TopicOptionTieredStorage)]; value.Kind != iggcon.Bool || !bytes.Equal(value.Value, []byte{1}) {
+		t.Errorf("tiered_storage = %+v, want Bool true", value)
+	}
+	if value := byKey[string(iggcon.TopicOptionLocalRetentionAge)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 21_600_000_000 {
+		t.Errorf("local_retention_age = %+v, want Uint64 21600000000", value)
+	}
+	if value := byKey[string(iggcon.TopicOptionLocalRetentionSize)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 10<<30 {
+		t.Errorf("local_retention_size = %+v, want Uint64 %d", value, 10<<30)
+	}
+
+	reset := UpdateTopic{
+		StreamId: streamId,
+		TopicId:  topicId,
+		Reset:    []iggcon.TopicOptionKey{iggcon.TopicOptionLocalRetentionAge, iggcon.TopicOptionLocalRetentionSize},
+	}
+	if _, err := reset.MarshalBinary(); err != nil {
+		t.Errorf("resetting the local retention keys must be accepted, got %v", err)
+	}
+}
+
+func TestUpdateTopic_TieredStorageCannotBeTurnedOffOrReset(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	topicId, _ := iggcon.NewIdentifier(uint32(2))
+	tieredStorage := false
+	requests := map[string]UpdateTopic{
+		"off":   {StreamId: streamId, TopicId: topicId, TieredStorage: &tieredStorage},
+		"reset": {StreamId: streamId, TopicId: topicId, Reset: []iggcon.TopicOptionKey{iggcon.TopicOptionTieredStorage}},
+	}
+	for name, request := range requests {
+		_, err := request.MarshalBinary()
+		var refused ierror.OptionNotUpdatable
+		if !errors.As(err, &refused) || refused.Key != string(iggcon.TopicOptionTieredStorage) {
+			t.Errorf("%s: error = %v, want OptionNotUpdatable for tiered_storage", name, err)
+		}
+	}
+}
+
 func TestCreateTopic_NonStringOptionKeyIsRejected(t *testing.T) {
 	streamId, err := iggcon.NewIdentifier(uint32(1))
 	if err != nil {

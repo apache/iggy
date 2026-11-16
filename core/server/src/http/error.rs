@@ -85,6 +85,10 @@ impl IntoResponse for CustomError {
                     // the op twice: 504, the unknown outcome, never a
                     // retryable 503.
                     IggyError::TransientNotCommitted => StatusCode::GATEWAY_TIMEOUT,
+                    // The object store failed for good, not the caller. A 5xx
+                    // would make HTTP clients resend a read that no resend
+                    // changes, so this is a 4xx that names the dependency.
+                    IggyError::TieredReadFailed => StatusCode::FAILED_DEPENDENCY,
                     IggyError::TransientNotAccepted
                     | IggyError::DeferredPollCapacityExceeded
                     | IggyError::NotPrimary => StatusCode::SERVICE_UNAVAILABLE,
@@ -893,6 +897,17 @@ mod tests {
             IggyError::DeferredPollCapacityExceeded.as_code()
         );
         assert_eq!(error["code"], "deferred_poll_capacity_exceeded");
+    }
+
+    #[tokio::test]
+    async fn tiered_read_failed_renders_424_without_retry_after() {
+        let response = CustomError::from(IggyError::TieredReadFailed).into_response();
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], IggyError::TieredReadFailed.as_code());
+        assert_eq!(error["code"], "tiered_read_failed");
     }
 
     #[test]

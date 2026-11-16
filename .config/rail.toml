@@ -16,7 +16,7 @@
 # under the License.
 
 # Tests launch these artifacts at run time, an edge Cargo cannot record:
-# `integration` spawns binaries through `Command::cargo_bin`, and the Kafka
+# `integration` spawns binaries through `cargo_bin_path`, and the Kafka
 # gateway suites spawn `iggy-server`.
 [plan.work.runtime-artifacts]
 scope = "cargo"
