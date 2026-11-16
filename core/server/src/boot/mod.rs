@@ -1232,12 +1232,12 @@ async fn shard_main(
 /// Every shard sheds its repair rings against an equal share of the node
 /// budget, so the shard count decides what the budget is worth.
 fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
-    let share = config.evicted_ring_shard_bytes_max(total_shards);
+    let share = config.journal_memory_shard_bytes_max(total_shards);
     let ring = config.evicted_ring_bytes_max.as_bytes_u64();
     if share == 0 {
         error!(
-            "partition.evicted_ring_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
-            config.evicted_ring_node_bytes_max
+            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
+            config.journal_memory_node_bytes_max
         );
         return Err(ServerError::Config(
             configs::ConfigurationError::InvalidConfigurationValue,
@@ -1245,12 +1245,12 @@ fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Resul
     }
     if share < ring {
         warn!(
-            "each of {total_shards} shards gets {share} bytes of partition.evicted_ring_node_bytes_max, \
+            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
              less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
         );
     } else {
         info!(
-            "each of {total_shards} shards gets {share} bytes of partition.evicted_ring_node_bytes_max"
+            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max"
         );
     }
     Ok(())
@@ -1426,7 +1426,7 @@ mod tests {
     fn given_a_ring_budget_below_one_byte_per_shard_when_booting_should_refuse() {
         const SHARDS: u16 = 32;
         let config = |bytes: u64| PartitionConfig {
-            evicted_ring_node_bytes_max: iggy_common::IggyByteSize::from(bytes),
+            journal_memory_node_bytes_max: iggy_common::IggyByteSize::from(bytes),
             ..PartitionConfig::default()
         };
         assert!(check_repair_ring_share(&config(u64::from(SHARDS) - 1), SHARDS).is_err());

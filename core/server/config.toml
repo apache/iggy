@@ -1157,7 +1157,7 @@ evicted_ring_capacity = 65536
 # be > 0 and <= "256 MiB". The ops whose batches left memory take up to
 # 4.5 MiB more. Allocation capacity, alignment and index overhead are
 # additional memory, especially for small offset commits.
-# evicted_ring_node_bytes_max bounds the sum across all partitions.
+# journal_memory_node_bytes_max bounds the sum across all partitions.
 # partition_repair_ring_bytes reports these bytes plus 288 bytes for each
 # released op, summed across a shard's partitions, not their allocated memory
 # or RSS.
@@ -1180,7 +1180,7 @@ evicted_ring_bytes_max = "64 MiB"
 # partition_repair_ring_budget_bytes, partition_repair_ring_charged_bytes and
 # partition_repair_ring_floor_bytes report the share of a shard, what its
 # rings charge to it, and what their newest entries take of it.
-evicted_ring_node_bytes_max = "4 GiB"
+journal_memory_node_bytes_max = "4 GiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core

@@ -193,8 +193,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
     .with_repair_memory(repair_memory)
     .with_repair_rings(Rc::new(RepairRingBudget::new(
         // A share past the address space bounds nothing, as `usize::MAX` does.
-        usize::try_from(config.partition.evicted_ring_shard_bytes_max(total_shards))
-            .unwrap_or(usize::MAX),
+        usize::try_from(
+            config
+                .partition
+                .journal_memory_shard_bytes_max(total_shards),
+        )
+        .unwrap_or(usize::MAX),
     )));
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 

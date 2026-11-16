@@ -16,7 +16,7 @@
 // under the License.
 
 //! The repair ring budget of a running server. Boot splits
-//! `partition.evicted_ring_node_bytes_max` across the shards, and the tick of
+//! `partition.journal_memory_node_bytes_max` across the shards, and the tick of
 //! every shard sheds against its share and reports it.
 
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ async fn given_a_node_ring_budget_when_the_shards_tick_should_report_an_equal_sh
         .server(
             TestServerConfig::builder()
                 .extra_envs(HashMap::from([(
-                    "IGGY_PARTITION_EVICTED_RING_NODE_BYTES_MAX".to_string(),
+                    "IGGY_PARTITION_JOURNAL_MEMORY_NODE_BYTES_MAX".to_string(),
                     NODE_BUDGET.to_string(),
                 )]))
                 .build(),

@@ -301,7 +301,7 @@ where
                 budget_bytes = usage.budget_bytes,
                 "the newest entry of every repair ring takes more than the repair ring budget of the shard: \
                  the rings hold that entry only, and a lagging replica catches up by state transfer. \
-                 Raise partition.evicted_ring_node_bytes_max"
+                 Raise partition.journal_memory_node_bytes_max"
             );
         } else {
             info!(

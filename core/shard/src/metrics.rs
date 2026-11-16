@@ -695,7 +695,7 @@ impl ShardMetrics {
         );
         registry.register(
             "partition_repair_ring_budget_bytes",
-            "this shard's share of partition.evicted_ring_node_bytes_max",
+            "this shard's share of partition.journal_memory_node_bytes_max",
             self.partition_repair_ring_budget_bytes.clone(),
         );
         registry.register(
