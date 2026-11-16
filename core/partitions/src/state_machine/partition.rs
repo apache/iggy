@@ -33,6 +33,7 @@ use super::{
     state_machine_pipeline_slots,
 };
 use crate::IggyPartition;
+use crate::long_term::LongTermLog;
 use crate::tiered_floor::TieredFloor;
 use crate::types::FatalCommit;
 
@@ -68,7 +69,8 @@ where
     /// Returns an error when called twice, or after the partition restored or
     /// applied an op.
     pub fn register_builtin_state_machines(&mut self) -> Result<(), RegistrationError> {
-        self.register_state_machine(Box::new(TieredFloor::default()))
+        self.register_state_machine(Box::new(TieredFloor::default()))?;
+        self.register_state_machine(Box::new(LongTermLog::default()))
     }
 
     #[must_use]

@@ -69,6 +69,12 @@ pub use segment_upload::{
     ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
     UploadError, UploadOutcome, upload_segment,
 };
+pub mod long_term;
+mod long_term_rewrite;
+pub use long_term_rewrite::{
+    ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError, RewriteOutcome,
+    SegmentRewrite,
+};
 mod segment_recovery;
 pub mod state_machine;
 pub mod state_transfer;

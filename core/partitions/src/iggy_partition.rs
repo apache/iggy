@@ -215,6 +215,9 @@ where
     /// What this replica publishes of the partition's manifest while it is
     /// the primary.
     pub(crate) manifest_publishes: crate::manifest_publish::ManifestPublishes,
+    /// The rewrite of this partition's placed batches into long-term
+    /// segments, while this replica is the primary.
+    pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1038,6 +1041,7 @@ where
             object_deletes: ObjectDeletes::default(),
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
+            long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -3222,6 +3226,12 @@ where
         self.offset_space.append_live = true;
         self.offset_space.committed_seeded = true;
         self.publish_poll_visibility();
+    }
+
+    /// Whether a message of this partition ever committed, so its commit
+    /// offset names a message and is not an untouched zero.
+    pub(crate) const fn holds_committed_messages(&self) -> bool {
+        self.offset_space.committed_seeded
     }
 
     /// Whether this partition ever stamped an offset, i.e. whether its offset
@@ -6308,7 +6318,7 @@ where
     /// What a poll of this partition reads when it places its batches: its
     /// segments that hold a batch, and the placed batches still in its
     /// journal. Taken under the partition borrow, so the read runs without.
-    fn placed_read_plan(&self) -> crate::placed_read::PlacedReadPlan {
+    pub(crate) fn placed_read_plan(&self) -> crate::placed_read::PlacedReadPlan {
         let segments = self
             .log
             .segments()
@@ -7719,7 +7729,7 @@ where
         }
     }
 
-    fn partition_dir(&self) -> Option<String> {
+    pub(crate) fn partition_dir(&self) -> Option<String> {
         if self.partition_dir.is_some() {
             return self.partition_dir.clone();
         }
