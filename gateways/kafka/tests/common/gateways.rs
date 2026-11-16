@@ -380,8 +380,7 @@ pub async fn try_fetch(addr: SocketAddr, group: &str) -> Option<(i16, i64, Strin
         partition
             .metadata
             .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default(),
+            .map_or_default(ToString::to_string),
     ))
 }
 

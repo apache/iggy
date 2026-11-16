@@ -1738,8 +1738,7 @@ pub(in crate::http) async fn send_messages(
                 // An unreadable confirmation still answers 201: the batch committed,
                 // only its offsets did not survive the reply.
                 let confirmations = send_confirmations(&reply, &header)
-                    .map(SendMessagesConfirmations::from)
-                    .unwrap_or_default();
+                    .map_or_default(SendMessagesConfirmations::from);
                 Ok::<_, PartitionWriteError>(
                     (StatusCode::CREATED, durability, Json(confirmations)).into_response(),
                 )
@@ -2275,6 +2274,13 @@ pub(in crate::http) async fn delete_pat(
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(in crate::http) async fn delete_pat_named_login(
+    state: State<HttpState>,
+    identity: Authenticated,
+) -> Result<StatusCode, WriteError> {
+    delete_pat(state, identity, Path("login".to_owned())).await
 }
 
 /// Mint a token only while the account verified by login or named by the

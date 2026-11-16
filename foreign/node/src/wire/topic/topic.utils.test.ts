@@ -115,6 +115,10 @@ describe('deserializeBaseTopic', () => {
     assert.equal(topic.compressionAlgorithm, 1);
     assert.equal(topic.messageExpiry, 0xffff_ffff_ffff_ffffn);
     assert.equal(topic.maxTopicSize, 0xffff_ffff_ffff_ffffn);
+    assert.equal(topic.segmentMaxAge, 0xffff_ffff_ffff_ffffn);
+    assert.equal(topic.tieredStorage, false);
+    assert.equal(topic.localRetentionAge, 86_400_000_000n);
+    assert.equal(topic.localRetentionSize, 0xffff_ffff_ffff_ffffn);
   });
 });
 

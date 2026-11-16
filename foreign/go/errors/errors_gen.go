@@ -775,6 +775,17 @@ func (e DeferredPollCapacityExceeded) Is(target error) bool {
 	return ok
 }
 
+type TieredReadFailed struct{}
+
+func (e TieredReadFailed) Error() string {
+	return "tiered data cannot be read from the object store; a retry does not help"
+}
+func (e TieredReadFailed) Code() Code { return 96 }
+func (e TieredReadFailed) Is(target error) bool {
+	_, ok := target.(TieredReadFailed)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2983,6 +2994,7 @@ var (
 	ErrLifecycleBusy                              = LifecycleBusy{}
 	ErrNotPrimary                                 = NotPrimary{}
 	ErrDeferredPollCapacityExceeded               = DeferredPollCapacityExceeded{}
+	ErrTieredReadFailed                           = TieredReadFailed{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -3249,6 +3261,7 @@ const (
 	LifecycleBusyCode                              Code = 88
 	NotPrimaryCode                                 Code = 89
 	DeferredPollCapacityExceededCode               Code = 90
+	TieredReadFailedCode                           Code = 96
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3587,6 +3600,8 @@ func (c Code) String() string {
 		return "NotPrimary"
 	case DeferredPollCapacityExceededCode:
 		return "DeferredPollCapacityExceeded"
+	case TieredReadFailedCode:
+		return "TieredReadFailed"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -4116,6 +4131,8 @@ func FromCode(code Code) IggyError {
 		return ErrNotPrimary
 	case DeferredPollCapacityExceededCode:
 		return ErrDeferredPollCapacityExceeded
+	case TieredReadFailedCode:
+		return ErrTieredReadFailed
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:

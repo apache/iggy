@@ -273,7 +273,8 @@ func fetchRefusedBeforeAdmission(err error, section bool) bool {
 	}
 	switch coded.Code() {
 	case ierror.TransientNotAcceptedCode, ierror.InvalidSizeBytesCode, ierror.HistoryUnavailableCode, ierror.NotPrimaryCode,
-		ierror.PartitionNotFoundCode, ierror.TooManyConsumerOffsetsCode, ierror.ConsumerGroupPartitionNotOwnedCode:
+		ierror.PartitionNotFoundCode, ierror.TooManyConsumerOffsetsCode, ierror.ConsumerGroupPartitionNotOwnedCode,
+		ierror.TieredReadFailedCode:
 		return true
 	case ierror.FeatureUnavailableCode, ierror.InvalidIdentifierCode, ierror.DeferredPollCapacityExceededCode,
 		ierror.StreamIdNotFoundCode, ierror.StreamNameNotFoundCode, ierror.TopicIdNotFoundCode, ierror.TopicNameNotFoundCode,

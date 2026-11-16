@@ -244,16 +244,15 @@ impl UsersInner {
         &self,
         user_id: UserId,
     ) -> Vec<(Arc<str>, Option<IggyTimestamp>)> {
-        let mut tokens: Vec<_> = self
-            .personal_access_tokens
-            .get(&user_id)
-            .map(|user_tokens| {
-                user_tokens
-                    .values()
-                    .map(|pat| (Arc::clone(&pat.name), pat.expiry_at))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut tokens: Vec<_> =
+            self.personal_access_tokens
+                .get(&user_id)
+                .map_or_default(|user_tokens| {
+                    user_tokens
+                        .values()
+                        .map(|pat| (Arc::clone(&pat.name), pat.expiry_at))
+                        .collect()
+                });
         tokens.sort_by(|(left, _), (right, _)| left.cmp(right));
         tokens
     }

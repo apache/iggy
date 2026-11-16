@@ -114,11 +114,13 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "SnapshotCompression",
     "Stats",
     "Stream",
     "StreamDetails",
     "StreamOptions",
     "StreamPermissions",
+    "SystemSnapshotType",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
@@ -1241,6 +1243,36 @@ class IggyClient:
                 authenticated, the user lacks the permission, or the request
                 fails.
         """
+    def snapshot(
+        self,
+        snapshot_compression: SnapshotCompression,
+        snapshot_types: typing.Sequence[SystemSnapshotType],
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+
+        Requires an authenticated session whose user holds the `manage_servers`
+        global permission.
+
+        Args:
+            snapshot_compression: Archive compression method as a
+                `SnapshotCompression` enum.
+            snapshot_types: Data to include in the snapshot as a list of
+                `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+                combined with any other snapshot type.
+
+        Returns:
+            An awaitable that resolves to the ZIP archive `bytes`.
+
+        Raises:
+            TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+                or `snapshot_types` contains elements other than `SystemSnapshotType`.
+            ValueError: If `snapshot_types` is empty.
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, the user lacks the permission, `SystemSnapshotType.All` is
+                combined with another snapshot type, the 30-second binary
+                operation deadline expires, or the request fails.
+        """
     def describe_options(
         self, scope: builtins.str
     ) -> collections.abc.Awaitable[list[OptionSpec]]:
@@ -1701,6 +1733,9 @@ class IggyClient:
         reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
         raw_reset: builtins.list[builtins.str] | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1721,19 +1756,34 @@ class IggyClient:
                 nothing either, reset `OptionKey.MaxTopicSize` to return to the
                 default.
             reset: Keys to return to their defaults as `list[OptionKey] | None`:
-                `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+                `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+                `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so an updatable server key can be set from this build.
                 A create-only key is refused by name.
             raw_reset: Additional reset names as `list[str] | None`, sent
                 verbatim so a key newer than this build can be reset. The
                 server decides them.
+            tiered_storage: `True` turns tiered storage on, unchanged when
+                `None`. The server refuses `False`, an update never turns it
+                off, and refuses `True` with `FeatureUnavailable` until it
+                tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, unchanged when
+                `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+                reset `OptionKey.LocalRetentionAge` to return to the default.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+                nothing either, reset `OptionKey.LocalRetentionSize` to return
+                to the default.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `local_retention_age` or `local_retention_size` is out of range.
             OptionError: A `RuntimeError` carrying the error `code` and
                 `kind` when the client or the server refuses an option.
             RuntimeError: Before anything is sent, if the update changes
@@ -3728,6 +3778,24 @@ class OptionKey:
     Fingerprints of the server keys wrapping the stream's key, computed by
     the server.
     """
+    SegmentMaxAge: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment age roll, fixed at creation.
+    """
+    TieredStorage: typing.ClassVar[OptionKey]
+    r"""
+    Topic tiered storage. An update only turns it on.
+    """
+    LocalRetentionAge: typing.ClassVar[OptionKey]
+    r"""
+    Time a tiered topic keeps an uploaded segment on local disk,
+    resettable to one day.
+    """
+    LocalRetentionSize: typing.ClassVar[OptionKey]
+    r"""
+    Cap on the uploaded segments a tiered topic keeps on local disk,
+    resettable to unlimited.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -4476,14 +4544,18 @@ class ReadError(IggyError):
     def is_lasting_refusal(self) -> builtins.bool:
         r"""
         Whether the reader stopped the partition after six refusals in a row that a retry does
-        not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+        not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+        of the partition reads it again.
         """
     @property
     def lost(self) -> tuple[builtins.int, builtins.int] | None:
         r"""
         For messages that a lost read committed and that the reader could not read again: their
         first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
-        (14010). `None` for every other error.
+        (14010). `None` for every other error. This error stops nothing and needs no `seek()`.
+        A batch that the reader holds after the range comes next, and a `seek()` before the
+        application takes it drops it. If the reader stopped the partition, the error that
+        stopped it comes after that batch.
         """
     @property
     def error(self) -> IggyError:
@@ -4496,8 +4568,7 @@ class ReadError(IggyError):
         r"""
         For a message that does not decode: the continuation after it. The messages before it
         arrive in a batch before this error, and the reader reads the message again until
-        `seek()` to this continuation skips it. For a lost range: the continuation after the
-        last offset of `lost`. `None` for every other error.
+        `seek()` to this continuation skips it. `None` for every other error.
         """
     @property
     def record(self) -> bytes | None: ...
@@ -4630,6 +4701,33 @@ class SendMessagesResponse:
         topic's policy: quorum commit, plus stable storage and crash-safe retry
         receipts for persisted topics.
         """
+
+@typing.final
+class SnapshotCompression:
+    r"""
+    Compression method for server snapshots.
+    """
+
+    Stored: typing.ClassVar[SnapshotCompression]
+    r"""
+    Store the file as is without compression.
+    """
+    Deflated: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using Deflate.
+    """
+    Bzip2: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using BZIP2.
+    """
+    Zstd: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using ZStandard.
+    """
+    Xz: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using XZ.
+    """
 
 @typing.final
 class Stats:
@@ -5087,6 +5185,41 @@ class StreamPermissions:
         """
 
 @typing.final
+class SystemSnapshotType:
+    r"""
+    Type of system data to include in a snapshot.
+    """
+
+    FilesystemOverview: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Overview of the filesystem.
+    """
+    ProcessList: typing.ClassVar[SystemSnapshotType]
+    r"""
+    List of currently running processes.
+    """
+    ResourceUsage: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Resource usage statistics of the system.
+    """
+    Test: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Test snapshot type for development purposes.
+    """
+    ServerLogs: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server logs.
+    """
+    ServerConfig: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server configuration.
+    """
+    All: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Everything.
+    """
+
+@typing.final
 class TcpConfig:
     r"""
     Configuration for the TCP transport, accepted by `IggyClient(...)`.
@@ -5384,14 +5517,19 @@ class TopicOptions:
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
         replication_factor: builtins.int | None = None,
+        segment_max_age: IggyExpiry | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
         Constructs topic create options.
 
         Every setting left as `None` resolves against the server default at
-        admission. Only `message_expiry`, `max_topic_size` and the name can
-        change after creation, through `update_topic`.
+        admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
+        `local_retention_age`, `local_retention_size` and the name can change
+        after creation, through `update_topic`.
 
         Args:
             partitions_count: Number of partitions as `int`, at most 1000.
@@ -5421,12 +5559,31 @@ class TopicOptions:
                 accepting writes while either node is down. The server rejects
                 an out-of-range value with an `OptionError` of kind
                 `invalid_replication_factor`.
+            segment_max_age: Age past a segment's first batch at which a batch
+                starts the next segment, as `IggyExpiry | None`, at least 10
+                minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+                which rolls segments by size alone. The server refuses a
+                duration together with `preallocate_segments=True`.
+            tiered_storage: Move sealed segments to the object store as
+                `bool | None`. `None` leaves it off. The server refuses `True`
+                with `FeatureUnavailable` until it tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, one day when
+                `None`. `IggyExpiry.ServerDefault()` is the same as `None`.
+                The server refuses an age above a finite `message_expiry`.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
+                same as `None`. The server refuses a size above a finite
+                `max_topic_size`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `segment_max_age`, `local_retention_age` or
+                `local_retention_size` is out of range.
             RuntimeError: If `compression_algorithm` names no known algorithm.
             TypeError: If a durability is not a `Durability`.
         """

@@ -25,6 +25,18 @@ watch = ["src", "assets"]
 [serve]
 port = 8060
 
+# trunk serve hosts the dev page, and these proxies give it the API on its own origin, the way the
+# dashboard server does in production. 8061 is the default port of the server that
+# scripts/dashboard/run_dev.sh starts.
+[[proxies]]
+backend = "http://127.0.0.1:8061/api/"
+
+[[proxies]]
+backend = "http://127.0.0.1:8061/embed/"
+
+[[proxies]]
+backend = "http://127.0.0.1:8061/health"
+
 [[hooks]]
 stage = "pre_build"
-command = "scripts/select_index.sh"
+command = "scripts/copy_echarts.sh"

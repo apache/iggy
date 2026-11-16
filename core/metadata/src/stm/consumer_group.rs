@@ -748,10 +748,9 @@ impl StateHandler for JoinConsumerGroupRequest {
                 .topic_key(stream_id, topic_id)
                 .zip(u32::try_from(group_id).ok())
                 .zip(u32::try_from(member_key).ok())
-                .map(|((topic, group_id), member_id)| {
+                .map_or_default(|((topic, group_id), member_id)| {
                     installed_partition_changes(topic, group_id, member_id, &before, &after)
                 })
-                .unwrap_or_default()
                 .into_iter()
                 .map(|body| {
                     AppliedChange::new(
@@ -1193,8 +1192,7 @@ impl StateHandler for RefreshConsumerGroupSessionRequest {
                     let after = group
                         .members
                         .get(member_id)
-                        .map(|member| member.partitions.clone())
-                        .unwrap_or_default();
+                        .map_or_default(|member| member.partitions.clone());
                     handovers.push((stream_id, topic_id, group_id, member_id, before, after));
                 }
             }

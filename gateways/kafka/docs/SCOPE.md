@@ -205,8 +205,9 @@ Three things enforce that, in the order a client meets them:
    records. Under `acks=0` there is no response to carry 35, so the connection is closed
    instead, the same way a Kafka broker answers an `acks=0` produce error.
 
-An idempotent (non-transactional) producer is unaffected: it gets a producer id and works
-untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
+An idempotent (non-transactional) producer is unaffected: it gets a producer id, and each of its
+batches lands once unless `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`. See
+[`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 ### DeleteRecords is not advertised ([#3547](https://github.com/apache/iggy/issues/3547))
 

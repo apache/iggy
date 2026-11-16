@@ -30,7 +30,9 @@ Commands:
 
 Notes:
   - validate requires helm.
-  - smoke requires helm, kubectl, and curl, plus an existing cluster with Gateway API CRDs and Envoy Gateway installed.
+  - smoke requires helm, kubectl, curl, docker, and kind, plus the kind cluster HELM_SMOKE_KIND_NAME with Gateway API CRDs and Envoy Gateway installed (scripts/ci/setup-helm-smoke-cluster.sh).
+  - smoke builds the Kafka gateway image from this checkout and loads it into kind. Set HELM_SMOKE_KAFKA_GATEWAY_IMAGE=name:tag to load that local image instead.
+  - the gateways get their own Iggy server, apache/iggy:HELM_SMOKE_KAFKA_GATEWAY_IGGY_TAG (default 0.10.0), since the iggy chart's server can lag the gateway's SDK.
   - pass --cleanup with smoke to remove the Helm smoke namespace after a successful run.
   - cleanup-smoke requires kubectl and optionally helm.
   - collect-smoke-diagnostics is best-effort and does not fail on missing resources.
@@ -41,6 +43,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 CHART_DIR="${CHART_DIR:-helm/charts/iggy}"
+KAFKA_GATEWAY_CHART_DIR="${KAFKA_GATEWAY_CHART_DIR:-helm/charts/iggy-kafka-gateway}"
 HELM_RENDER_DIR="${HELM_RENDER_DIR:-/tmp/helm-render}"
 HELM_SMOKE_NAMESPACE="${HELM_SMOKE_NAMESPACE:-iggy-smoke}"
 HELM_SMOKE_RELEASE="${HELM_SMOKE_RELEASE:-iggy-smoke}"
@@ -53,6 +56,15 @@ HELM_SMOKE_GATEWAY_NAME="${HELM_SMOKE_GATEWAY_NAME:-iggy-smoke-gateway}"
 HELM_SMOKE_GATEWAY_PF_PORT="${HELM_SMOKE_GATEWAY_PF_PORT:-8080}"
 HELM_SMOKE_KIND_NAME="${HELM_SMOKE_KIND_NAME:-iggy-helm-smoke}"
 HELM_SMOKE_SERVER_CPU_ALLOCATION="${HELM_SMOKE_SERVER_CPU_ALLOCATION:-1}"
+# Named after the chart, so its Service links would match the gateway's IGGY_KAFKA_ env prefix.
+HELM_SMOKE_KAFKA_GATEWAY_RELEASE="${HELM_SMOKE_KAFKA_GATEWAY_RELEASE:-iggy-kafka-gateway}"
+HELM_SMOKE_KAFKA_GATEWAY_IMAGE="${HELM_SMOKE_KAFKA_GATEWAY_IMAGE:-}"
+# Two or more run the coordinator log.
+HELM_SMOKE_KAFKA_GATEWAY_REPLICAS="${HELM_SMOKE_KAFKA_GATEWAY_REPLICAS:-2}"
+HELM_SMOKE_KAFKA_GATEWAY_PF_PORT="${HELM_SMOKE_KAFKA_GATEWAY_PF_PORT:-19096}"
+HELM_SMOKE_KAFKA_GATEWAY_IGGY_RELEASE="${HELM_SMOKE_KAFKA_GATEWAY_IGGY_RELEASE:-${HELM_SMOKE_RELEASE}-kafka}"
+# Must speak the protocol of the SDK in this checkout.
+HELM_SMOKE_KAFKA_GATEWAY_IGGY_TAG="${HELM_SMOKE_KAFKA_GATEWAY_IGGY_TAG:-0.10.0}"
 # A well-formed 32-byte AES-256-GCM key, base64 encoded. Render-only: it never
 # reaches a running server.
 HELM_TEST_ENCRYPTION_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
@@ -450,6 +462,127 @@ validate() {
   validate_yamllint
   validate_helmfmt
   validate_helm_docs
+
+  validate_kafka_gateway
+}
+
+validate_kafka_gateway() {
+  local chart="$KAFKA_GATEWAY_CHART_DIR"
+  local render="$HELM_RENDER_DIR/kafka-gateway"
+  local required=(--set iggy.address=iggy.default.svc.cluster.local:8090 --set iggy.password=secret)
+  local headless="kafka-iggy-kafka-gateway-headless.default.svc.cluster.local"
+  local own_headless="iggy-kafka-gateway-headless.default.svc.cluster.local"
+  local app_version
+  local monitor_port
+  local service_target
+  mkdir -p "$render"
+
+  echo "Validating the Kafka gateway chart..."
+  helm lint --strict "$chart" "${required[@]}"
+
+  app_version="$(CHART_DIR="$chart" extract_chart_field appVersion)"
+  case "$app_version" in
+    edge|latest)
+      echo "Error: the Kafka gateway chart appVersion must pin a build, not '${app_version}'" >&2
+      exit 1
+      ;;
+  esac
+
+  helm template kafka "$chart" "${required[@]}" > "$render/default.yaml"
+  test "$(grep -c '^kind: StatefulSet$' "$render/default.yaml")" -eq 1
+  test "$(grep -c '^kind: Service$' "$render/default.yaml")" -eq 2
+  test "$(grep -c '^kind: Secret$' "$render/default.yaml")" -eq 1
+  test "$(grep -c '^kind: PodDisruptionBudget$' "$render/default.yaml")" -eq 1
+  grep -q "image: \"apache/iggy-kafka-gateway:${app_version}\"" "$render/default.yaml"
+  grep -q 'imagePullPolicy: IfNotPresent' "$render/default.yaml"
+  grep -q "value: \"1@kafka-iggy-kafka-gateway-0.${headless}:9093,2@kafka-iggy-kafka-gateway-1.${headless}:9093,3@kafka-iggy-kafka-gateway-2.${headless}:9093\"" "$render/default.yaml"
+  grep -A1 'name: IGGY_KAFKA_COORDINATOR_LOG$' "$render/default.yaml" | grep -q 'value: "true"'
+  grep -q '^  unhealthyPodEvictionPolicy: AlwaysAllow$' "$render/default.yaml"
+  grep -q '^      enableServiceLinks: false$' "$render/default.yaml"
+  grep -q 'publishNotReadyAddresses: true' "$render/default.yaml"
+  grep -q 'path: /ready' "$render/default.yaml"
+  grep -q 'path: /live' "$render/default.yaml"
+  grep -q 'runAsNonRoot: true' "$render/default.yaml"
+  grep -q 'readOnlyRootFilesystem: true' "$render/default.yaml"
+  if grep -q 'IGGY_KAFKA_IGGY_STREAM' "$render/default.yaml"; then
+    echo "Error: an empty iggy.stream must keep the gateway's default stream" >&2
+    exit 1
+  fi
+
+  # A release named after the chart gets a Service whose links match the gateway's env prefix.
+  helm template iggy-kafka-gateway "$chart" "${required[@]}" \
+    --set iggy.stream=orders \
+    > "$render/chart-named-release.yaml"
+  grep -q '^      enableServiceLinks: false$' "$render/chart-named-release.yaml"
+  grep -q "value: \"1@iggy-kafka-gateway-0.${own_headless}:9093,2@iggy-kafka-gateway-1.${own_headless}:9093,3@iggy-kafka-gateway-2.${own_headless}:9093\"" "$render/chart-named-release.yaml"
+  grep -A1 'name: IGGY_KAFKA_IGGY_STREAM$' "$render/chart-named-release.yaml" | grep -q 'value: "orders"'
+
+  helm template kafka "$chart" "${required[@]}" \
+    --set replicaCount=1 \
+    --set serviceMonitor.enabled=true \
+    --set kafka.sasl.enabled=true \
+    --set iggy.tls.enabled=true \
+    --set iggy.tls.caSecret=iggy-ca \
+    --set 'extraEnv[0].name=IGGY_KAFKA_FETCH_SLOTS,extraEnv[0].value=8' \
+    > "$render/all-features.yaml"
+  grep -q '^kind: ServiceMonitor$' "$render/all-features.yaml"
+  grep -q "value: \"1@kafka-iggy-kafka-gateway-0.${headless}:9093\"" "$render/all-features.yaml"
+  grep -q 'name: IGGY_KAFKA_SASL_ENABLED' "$render/all-features.yaml"
+  grep -q 'name: IGGY_KAFKA_IGGY_TLS_CA_FILE' "$render/all-features.yaml"
+  grep -q 'secretName: iggy-ca' "$render/all-features.yaml"
+  grep -q 'name: IGGY_KAFKA_FETCH_SLOTS' "$render/all-features.yaml"
+  if grep -q 'IGGY_KAFKA_COORDINATOR_LOG' "$render/all-features.yaml"; then
+    echo "Error: a single gateway must keep the gateway's default coordinator log mode" >&2
+    exit 1
+  fi
+
+  # The ServiceMonitor must scrape the Service port that leads to the container's http.port.
+  helm template kafka "$chart" "${required[@]}" \
+    --set serviceMonitor.enabled=true \
+    --set http.port=9196 \
+    > "$render/service-monitor.yaml"
+  monitor_port="$(awk '/^kind: ServiceMonitor$/ { sm = 1 } sm && /^    - port: / { print $3; exit }' "$render/service-monitor.yaml")"
+  service_target="$(
+    awk -v port="$monitor_port" '
+      /^kind: / { service = ($2 == "Service") }
+      service && /^    - name: / { name = $3 }
+      service && /^      port: / { number = $2 }
+      service && /^      targetPort: / && name == port { print number, $2; exit }
+    ' "$render/service-monitor.yaml"
+  )"
+  test -n "$monitor_port"
+  test "${service_target%% *}" = "9196"
+  awk -v target="${service_target##* }" '
+    /^            - name: / { name = $3 }
+    /^              containerPort: / && name == target { print $2 }
+  ' "$render/service-monitor.yaml" | grep -qx 9196
+
+  helm template kafka "$chart" \
+    --set iggy.address=iggy.default.svc.cluster.local:8090 \
+    --set iggy.existingSecret.name=iggy-credentials \
+    > "$render/existing-secret.yaml"
+  if grep -q '^kind: Secret$' "$render/existing-secret.yaml"; then
+    echo "Error: the Kafka gateway chart created a Secret beside iggy.existingSecret.name" >&2
+    exit 1
+  fi
+  grep -q 'name: iggy-credentials' "$render/existing-secret.yaml"
+
+  CHART_DIR="$chart" assert_render_rejected "a gateway without an Iggy address" \
+    --set iggy.password=secret
+  CHART_DIR="$chart" assert_render_rejected "a gateway without Iggy credentials" \
+    --set iggy.address=iggy.default.svc.cluster.local:8090
+  CHART_DIR="$chart" assert_render_rejected "no gateway" "${required[@]}" --set replicaCount=0
+  CHART_DIR="$chart" assert_render_rejected "one port for Kafka and HTTP" "${required[@]}" \
+    --set http.port=9093
+  for env_name in IGGY_KAFKA_ADVERTISED_HOST IGGY_KAFKA_COORDINATOR_LOG IGGY_KAFKA_LISTENERS \
+    IGGY_KAFKA_ADVERTISED_LISTENERS IGGY_KAFKA_TLS_CERT_FILE; do
+    CHART_DIR="$chart" assert_render_rejected "extraEnv with ${env_name}" "${required[@]}" \
+      --set "extraEnv[0].name=${env_name},extraEnv[0].value=x"
+  done
+
+  CHART_DIR="$chart" validate_yamllint
+  CHART_DIR="$chart" validate_helmfmt
+  CHART_DIR="$chart" validate_helm_docs
 }
 
 # Assert that `helm template` refuses a values combination the chart guards
@@ -469,12 +602,15 @@ assert_render_rejected() {
 HELM_SMOKE_GW_PF_PID=""
 # Temp values file that may need cleanup if smoke() aborts mid-flight.
 HELM_SMOKE_VALUES_FILE=""
+# PID of the kubectl port-forward to a Kafka gateway pod.
+HELM_SMOKE_KAFKA_GATEWAY_PF_PID=""
 
 cleanup_smoke_state() {
   if [ -n "${HELM_SMOKE_GW_PF_PID:-}" ]; then
     kill "$HELM_SMOKE_GW_PF_PID" 2>/dev/null || true
     HELM_SMOKE_GW_PF_PID=""
   fi
+  stop_kafka_gateway_port_forward
   if [ -n "${HELM_SMOKE_VALUES_FILE:-}" ]; then
     rm -f "$HELM_SMOKE_VALUES_FILE"
     HELM_SMOKE_VALUES_FILE=""
@@ -543,11 +679,144 @@ start_gateway_port_forward() {
   fi
 }
 
+# The published gateway images lag the chart, so the smoke runs one built from this checkout.
+load_kafka_gateway_image() {
+  if [ -z "$HELM_SMOKE_KAFKA_GATEWAY_IMAGE" ]; then
+    HELM_SMOKE_KAFKA_GATEWAY_IMAGE="iggy-kafka-gateway:helm-smoke"
+    echo "Building ${HELM_SMOKE_KAFKA_GATEWAY_IMAGE}..."
+    docker build -f gateways/kafka/Dockerfile -t "$HELM_SMOKE_KAFKA_GATEWAY_IMAGE" .
+  fi
+  case "${HELM_SMOKE_KAFKA_GATEWAY_IMAGE##*:}" in
+    "$HELM_SMOKE_KAFKA_GATEWAY_IMAGE"|*/*)
+      echo "Error: HELM_SMOKE_KAFKA_GATEWAY_IMAGE must be name:tag" >&2
+      exit 1
+      ;;
+  esac
+  kind load docker-image "$HELM_SMOKE_KAFKA_GATEWAY_IMAGE" --name "$HELM_SMOKE_KIND_NAME"
+}
+
+start_kafka_gateway_port_forward() {
+  local pod="$1"
+  local _
+
+  kubectl port-forward "pod/${pod}" "${HELM_SMOKE_KAFKA_GATEWAY_PF_PORT}:http" \
+    --namespace "$HELM_SMOKE_NAMESPACE" \
+    >/dev/null 2>&1 &
+  HELM_SMOKE_KAFKA_GATEWAY_PF_PID=$!
+
+  for _ in $(seq 1 15); do
+    if curl -s --connect-timeout 1 --max-time 2 \
+        -o /dev/null "http://127.0.0.1:${HELM_SMOKE_KAFKA_GATEWAY_PF_PORT}/live" 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "$HELM_SMOKE_KAFKA_GATEWAY_PF_PID" 2>/dev/null; then
+      echo "Error: port-forward to ${pod} exited unexpectedly" >&2
+      HELM_SMOKE_KAFKA_GATEWAY_PF_PID=""
+      return 1
+    fi
+    sleep 1
+  done
+
+  echo "Error: port-forward to ${pod} did not become ready within 45 s" >&2
+  return 1
+}
+
+# Waits for the exit, so the next port-forward can bind the same local port.
+stop_kafka_gateway_port_forward() {
+  if [ -n "${HELM_SMOKE_KAFKA_GATEWAY_PF_PID:-}" ]; then
+    kill "$HELM_SMOKE_KAFKA_GATEWAY_PF_PID" 2>/dev/null || true
+    wait "$HELM_SMOKE_KAFKA_GATEWAY_PF_PID" 2>/dev/null || true
+    HELM_SMOKE_KAFKA_GATEWAY_PF_PID=""
+  fi
+}
+
+# Runs the gateways against their own Iggy release, signed in as its root user.
+smoke_kafka_gateway() {
+  local release="$HELM_SMOKE_KAFKA_GATEWAY_RELEASE"
+  local iggy_release="$HELM_SMOKE_KAFKA_GATEWAY_IGGY_RELEASE"
+  local image="$HELM_SMOKE_KAFKA_GATEWAY_IMAGE"
+  local base_url="http://127.0.0.1:${HELM_SMOKE_KAFKA_GATEWAY_PF_PORT}"
+  local pods
+  local pod
+  local ready_status
+  local _
+
+  HELM_SMOKE_VALUES_FILE="$(mktemp "${TMPDIR:-/tmp}/iggy-helm-smoke-kafka-values.XXXXXX.yaml")"
+  cat > "$HELM_SMOKE_VALUES_FILE" <<EOF
+server:
+  image:
+    tag: "${HELM_SMOKE_KAFKA_GATEWAY_IGGY_TAG}"
+  env:
+    - name: IGGY_HTTP_ADDRESS
+      value: "0.0.0.0:3000"
+    - name: IGGY_TCP_ADDRESS
+      value: "0.0.0.0:8090"
+    - name: IGGY_SHARDING_CPU_ALLOCATION
+      value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
+ui:
+  enabled: false
+EOF
+  helm upgrade --install "$iggy_release" "$CHART_DIR" \
+    --atomic \
+    --namespace "$HELM_SMOKE_NAMESPACE" \
+    --wait \
+    --timeout "$HELM_SMOKE_TIMEOUT" \
+    -f "$HELM_SMOKE_VALUES_FILE"
+  rm -f "$HELM_SMOKE_VALUES_FILE"
+  HELM_SMOKE_VALUES_FILE=""
+
+  # No --atomic: a rollback would delete the pods whose logs the diagnostics need.
+  helm upgrade --install "$release" "$KAFKA_GATEWAY_CHART_DIR" \
+    --namespace "$HELM_SMOKE_NAMESPACE" \
+    --wait \
+    --timeout "$HELM_SMOKE_TIMEOUT" \
+    --set replicaCount="$HELM_SMOKE_KAFKA_GATEWAY_REPLICAS" \
+    --set image.repository="${image%:*}" \
+    --set-string image.tag="${image##*:}" \
+    --set image.pullPolicy=Never \
+    --set iggy.address="${iggy_release}.${HELM_SMOKE_NAMESPACE}.svc.cluster.local:8090" \
+    --set iggy.existingSecret.name="${iggy_release}-root-credentials"
+
+  kubectl -n "$HELM_SMOKE_NAMESPACE" get statefulset,pods,svc,pdb \
+    -l "app.kubernetes.io/instance=${release}" > "$HELM_SMOKE_REPORT_DIR/kafka-gateway-resources.txt"
+
+  pods="$(kubectl -n "$HELM_SMOKE_NAMESPACE" get pods \
+    -l "app.kubernetes.io/instance=${release}" -o jsonpath='{.items[*].metadata.name}')"
+  test "$(wc -w <<< "$pods")" -eq "$HELM_SMOKE_KAFKA_GATEWAY_REPLICAS"
+
+  for pod in $pods; do
+    start_kafka_gateway_port_forward "$pod"
+
+    for _ in $(seq 1 15); do
+      ready_status="$(
+        curl -sS -o "$HELM_SMOKE_REPORT_DIR/${pod}-ready.txt" -w '%{http_code}' \
+          "${base_url}/ready" || true
+      )"
+      if [ "$ready_status" = "200" ]; then
+        break
+      fi
+      sleep 2
+    done
+    test "$ready_status" = "200"
+
+    curl -sSf -o "$HELM_SMOKE_REPORT_DIR/${pod}-metrics.txt" "${base_url}/metrics"
+    grep -qE '^iggy_kafka_gateway_ready 1( |$)' "$HELM_SMOKE_REPORT_DIR/${pod}-metrics.txt"
+    if [ "$HELM_SMOKE_KAFKA_GATEWAY_REPLICAS" -gt 1 ]; then
+      grep -q '^iggy_kafka_gateway_coordinator_partitions_served ' \
+        "$HELM_SMOKE_REPORT_DIR/${pod}-metrics.txt"
+    fi
+
+    stop_kafka_gateway_port_forward
+  done
+}
+
 smoke() {
   local cleanup_after_success="$1"
   require_command helm
   require_command kubectl
   require_command curl
+  require_command docker
+  require_command kind
 
   local ui_image_tag
   local server_ping_status
@@ -577,6 +846,8 @@ EOF
     fi
   fi
 
+  load_kafka_gateway_image
+
   ui_image_tag="$(extract_values_tag ui)"
 
   echo "$ui_image_tag" > "$HELM_SMOKE_REPORT_DIR/ui-image-tag.txt"
@@ -597,6 +868,9 @@ server:
     - name: IGGY_WEBSOCKET_ADDRESS
       value: "0.0.0.0:8092"
     - name: IGGY_SHARDING_CPU_ALLOCATION
+      value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
+    # The pinned server reads the name from before the config was flattened.
+    - name: IGGY_SYSTEM_SHARDING_CPU_ALLOCATION
       value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
 ui:
   image:
@@ -701,6 +975,8 @@ EOF
 
   test "$ui_healthz_status" = "200"
 
+  smoke_kafka_gateway
+
   if [ "$cleanup_after_success" = true ]; then
     cleanup_smoke
   fi
@@ -710,6 +986,8 @@ cleanup_smoke() {
   require_command kubectl
 
   if command -v helm >/dev/null 2>&1; then
+    helm uninstall "$HELM_SMOKE_KAFKA_GATEWAY_RELEASE" -n "$HELM_SMOKE_NAMESPACE" >/dev/null 2>&1 || true
+    helm uninstall "$HELM_SMOKE_KAFKA_GATEWAY_IGGY_RELEASE" -n "$HELM_SMOKE_NAMESPACE" >/dev/null 2>&1 || true
     helm uninstall "$HELM_SMOKE_RELEASE" -n "$HELM_SMOKE_NAMESPACE" >/dev/null 2>&1 || true
   fi
 
@@ -732,6 +1010,10 @@ collect_smoke_diagnostics() {
   kubectl -n "$HELM_SMOKE_NAMESPACE" logs "deployment/$HELM_SMOKE_RELEASE" --all-containers=true > "$HELM_SMOKE_REPORT_DIR/server.log" 2>&1 || true
   kubectl -n "$HELM_SMOKE_NAMESPACE" logs "deployment/${HELM_SMOKE_RELEASE}-ui" --all-containers=true > "$HELM_SMOKE_REPORT_DIR/ui.log" 2>&1 || true
   kubectl -n "$HELM_SMOKE_GATEWAY_NAMESPACE" logs deployment/envoy-gateway --all-containers=true > "$HELM_SMOKE_REPORT_DIR/envoy-gateway.log" 2>&1 || true
+  kubectl -n "$HELM_SMOKE_NAMESPACE" logs "deployment/${HELM_SMOKE_KAFKA_GATEWAY_IGGY_RELEASE}" --all-containers=true > "$HELM_SMOKE_REPORT_DIR/kafka-gateway-iggy.log" 2>&1 || true
+  kubectl -n "$HELM_SMOKE_NAMESPACE" describe statefulset -l "app.kubernetes.io/instance=${HELM_SMOKE_KAFKA_GATEWAY_RELEASE}" > "$HELM_SMOKE_REPORT_DIR/describe-kafka-gateway.txt" 2>&1 || true
+  kubectl -n "$HELM_SMOKE_NAMESPACE" logs -l "app.kubernetes.io/instance=${HELM_SMOKE_KAFKA_GATEWAY_RELEASE}" --all-containers=true --prefix --tail=-1 > "$HELM_SMOKE_REPORT_DIR/kafka-gateway.log" 2>&1 || true
+  kubectl -n "$HELM_SMOKE_NAMESPACE" logs -l "app.kubernetes.io/instance=${HELM_SMOKE_KAFKA_GATEWAY_RELEASE}" --all-containers=true --prefix --tail=-1 --previous > "$HELM_SMOKE_REPORT_DIR/kafka-gateway-previous.log" 2>&1 || true
 
   if command -v kind >/dev/null 2>&1; then
     kind export logs "$HELM_SMOKE_REPORT_DIR/kind-logs" --name "$HELM_SMOKE_KIND_NAME" >/dev/null 2>&1 || true

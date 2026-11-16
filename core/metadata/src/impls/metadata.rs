@@ -42,7 +42,7 @@ use consensus::{
     VsrConsensus, ack_preflight, ack_quorum_reached, apply_preflight_consensus_plane,
     build_eviction_message, build_reply_message, build_reply_message_with,
     build_result_rejection_reply, emit_sim_event, fatal, fence_old_prepare_by_commit,
-    is_caught_up_primary, is_caught_up_primary_except_barrier,
+    is_caught_up_primary, is_caught_up_primary_except_barrier, is_settled_primary,
     panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
     register_preflight, replicate_preflight, replicate_prepare, request_preflight,
     send_eviction_to_client, send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
@@ -80,8 +80,9 @@ use iggy_common::{
     HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
-    TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, stream_wrap_set,
-    topic_option_keys, validate_topic_segment_size,
+    TopicResolvedOptions, UserId, admit, admit_tiered_storage, critical_keys_marker,
+    derived_defaults, stream_wrap_set, topic_option_keys, validate_local_retention,
+    validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
@@ -1295,6 +1296,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// `[cluster] default_replication_factor`, `None` for every node. See
     /// [`Self::default_replication_factor`].
     default_replication_factor: Cell<Option<u8>>,
+    /// The metadata view in which shard 0 last found every member able to
+    /// tier topics. See [`Self::observe_tiered_storage_readiness`].
+    tiered_storage_ready_view: Cell<Option<u32>>,
     /// Highest metadata op whose apply has been PUBLISHED on this node, plus
     /// the reads parked on it. Shared by every shard; see
     /// [`AppliedFrontier`] for the ordering and the wake contract.
@@ -1372,6 +1376,7 @@ where
             partitions_max: Cell::new(0),
             max_tokens_per_user: Cell::new(0),
             default_replication_factor: Cell::new(None),
+            tiered_storage_ready_view: Cell::new(None),
             applied_frontier: Arc::default(),
             stream_key_context: Arc::default(),
             change_log: Rc::new(MetadataChangeLog::new(ChangeLogCapacities::default())),
@@ -3522,6 +3527,15 @@ where
         self.consensus.as_ref().is_some_and(is_caught_up_primary)
     }
 
+    /// `true` when this node is the primary of the metadata consensus group
+    /// in a normal view, however far it is from applying what is committed.
+    /// Enough for maintenance that acts only on state already applied here,
+    /// and that a commit still to apply must not pause.
+    #[must_use]
+    pub fn is_settled_primary(&self) -> bool {
+        self.consensus.as_ref().is_some_and(is_settled_primary)
+    }
+
     /// Replicate initial root creation with a precomputed password hash.
     ///
     /// # Errors
@@ -3693,6 +3707,61 @@ where
         );
         match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
+        }
+    }
+
+    /// Submit a replicated `TruncatePartition` originated by the server (the
+    /// retention of a tiered topic, decided by the partition primary), not by
+    /// a client `DeleteSegments`.
+    ///
+    /// Same in-process path as the PAT cleaner's delete: the reserved
+    /// internal client `0`, no request preflight, no receipt. The watermark
+    /// only rises, so a re-proposal on the next tick is harmless. `Ok(true)`
+    /// when the truncation committed and applied, `Ok(false)` when it
+    /// committed as a rejection.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
+    /// `PipelineFull` under pipeline pressure, `Canceled` if the prepare is
+    /// dropped before commit.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_truncate_partition_in_process(
+        &self,
+        request: &TruncatePartitionRequest,
+    ) -> Result<bool, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::TruncatePartition,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(iggy_binary_protocol::result_code(reply.body()) == Some(0)),
             Err(Canceled) => Err(MetadataSubmitError::Canceled),
         }
     }
@@ -4688,6 +4757,28 @@ where
         }
     }
 
+    /// Whether every member of the cluster can tier topics, as the metadata
+    /// primary's probes last found. The verdict holds only within the metadata
+    /// view that observed it, so one from before a view change admits nothing.
+    /// `false` clears it when the coordinator loses authority.
+    pub fn observe_tiered_storage_readiness(&self, cluster_ready: bool) {
+        self.tiered_storage_ready_view.set(
+            self.consensus
+                .as_ref()
+                .filter(|_| cluster_ready)
+                .map(VsrConsensus::view),
+        );
+    }
+
+    /// Whether a request may turn tiered storage on: the last verdict was that
+    /// every member is ready, and it was reached in the current metadata view.
+    #[must_use]
+    pub fn tiered_storage_cluster_ready(&self) -> bool {
+        self.consensus
+            .as_ref()
+            .is_some_and(|consensus| self.tiered_storage_ready_view.get() == Some(consensus.view()))
+    }
+
     /// Suggest one count-balancing move only after normal failover has settled.
     /// `after` rotates candidates so a recovering target cannot starve other groups.
     pub fn primary_rebalance_candidate(
@@ -5061,13 +5152,27 @@ where
                 // concrete values and every replica commits the same state
                 // whatever its build. Resolved defaults ride a separate derived
                 // block, preserving per-key provenance for `GetTopic`.
-                let admitted = admit(
+                let mut admitted = admit(
                     OptionsScope::Topic,
                     OptionOperation::Create,
                     &request.options,
                     &[],
                     &OptionAdmissionContext::default(),
                 )?;
+                // A node that does not understand a critical key must refuse
+                // the topic rather than serve it without that key's effect.
+                let critical: Vec<OptionKey> = admitted
+                    .explicit
+                    .keys()
+                    .filter_map(|key| OptionKey::try_from(key).ok())
+                    .filter(|key| key.descriptor().critical)
+                    .collect();
+                if !critical.is_empty() {
+                    admitted.explicit.insert(
+                        HeaderKey::from(OptionKey::CriticalKeys),
+                        OptionValue::explicit(critical_keys_marker(&critical)?),
+                    );
+                }
                 // Re-encode the admitted block rather than forwarding the
                 // client's bytes. Admission drops a zero sentinel, so the
                 // resolved value goes in the derived block, but apply merges
@@ -5104,6 +5209,9 @@ where
                         topic_option_keys::MAX_TOPIC_SIZE.to_string(),
                     ));
                 }
+                validate_segment_max_age(resolved.runtime)?;
+                admit_tiered_storage(&admitted.explicit, self.tiered_storage_cluster_ready())?;
+                validate_local_retention(&stored)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
                 let mut counts = self.placement_counts()?;
                 let partitions = self
@@ -5208,7 +5316,8 @@ where
             Operation::UpdateResource => {
                 let request = UpdateResourceRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                let (operation, body) = resolve_update_resource(&request)?;
+                let (operation, body) =
+                    resolve_update_resource(&request, self.tiered_storage_cluster_ready())?;
                 Ok(build_prepare_message(consensus, &header, operation, &body))
             }
             _ => Ok(message.project(consensus)),
@@ -5655,6 +5764,7 @@ fn resolve_replication_factor(
 /// the patched map is checked at apply, against committed state.
 fn resolve_update_resource(
     request: &UpdateResourceRequest,
+    tiered_storage_cluster_ready: bool,
 ) -> Result<(Operation, Bytes), IggyError> {
     let scope = OptionsScope::from_code(request.target.scope_code())?;
     let reset: Vec<String> = request
@@ -5680,6 +5790,9 @@ fn resolve_update_resource(
         .find(|key| key.descriptor().visibility == OptionVisibility::Secret)
     {
         return Err(IggyError::OptionNotUpdatable(secret.to_string()));
+    }
+    if scope == OptionsScope::Topic {
+        admit_tiered_storage(&admitted.explicit, tiered_storage_cluster_ready)?;
     }
     let critical: Vec<OptionKey> = set_keys
         .into_iter()
@@ -5967,6 +6080,7 @@ const fn is_admission_refusal(error: &IggyError) -> bool {
     matches!(
         error,
         IggyError::TransientNotAccepted
+            | IggyError::FeatureUnavailable
             | IggyError::PartitionsLimitReached
             | IggyError::PersonalAccessTokensLimitReached(..)
     )
@@ -6120,7 +6234,7 @@ mod tests {
             options: patch.set,
         };
 
-        let (operation, body) = resolve_update_resource(&request).unwrap();
+        let (operation, body) = resolve_update_resource(&request, false).unwrap();
 
         assert_eq!(operation, Operation::UpdateTopicResolved);
         let resolved = UpdateTopicResolvedRequest::decode_from(&body).unwrap();
@@ -6175,7 +6289,7 @@ mod tests {
             options: patch.set,
         };
 
-        let (_, body) = resolve_update_resource(&request).unwrap();
+        let (_, body) = resolve_update_resource(&request, false).unwrap();
 
         let resolved = UpdateTopicResolvedRequest::decode_from(&body).unwrap();
         assert_eq!(resolved.name, Some(WireName::new("renamed").unwrap()));
@@ -6221,7 +6335,9 @@ mod tests {
                 options: patch.set,
             };
             assert_eq!(
-                resolve_update_resource(&request).unwrap_err().as_code(),
+                resolve_update_resource(&request, false)
+                    .unwrap_err()
+                    .as_code(),
                 expected.as_code()
             );
         }
@@ -6244,7 +6360,7 @@ mod tests {
             options: patch.set,
         };
 
-        let (operation, body) = resolve_update_resource(&request).unwrap();
+        let (operation, body) = resolve_update_resource(&request, false).unwrap();
 
         assert_eq!(operation, Operation::UpdateUserResolved);
         assert_eq!(
@@ -7177,11 +7293,29 @@ mod tests {
         name: &str,
         partitions_count: u32,
     ) -> Message<RoutedRequestHeader> {
+        create_topic_request_with_options(
+            client,
+            wire_user_id,
+            stream_id,
+            name,
+            partitions_count,
+            WireOptions::empty(),
+        )
+    }
+
+    fn create_topic_request_with_options(
+        client: u128,
+        wire_user_id: u32,
+        stream_id: WireIdentifier,
+        name: &str,
+        partitions_count: u32,
+        options: WireOptions,
+    ) -> Message<RoutedRequestHeader> {
         let body = CreateTopicRequest {
             stream_id,
             partitions_count,
             name: WireName::new(name).unwrap(),
-            options: WireOptions::empty(),
+            options,
         }
         .to_bytes();
         let header_size = size_of::<RoutedRequestHeader>();
@@ -7204,6 +7338,26 @@ mod tests {
                 ..Default::default()
             };
         }
+        message
+    }
+
+    fn update_resource_request(client: u128, body: &[u8]) -> Message<RoutedRequestHeader> {
+        let header_size = size_of::<RoutedRequestHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<RoutedRequestHeader>::new(total);
+        let slice = message.as_mut_slice();
+        slice[header_size..total].copy_from_slice(body);
+        *bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]) =
+            RoutedRequestHeader {
+                command: Command::Request,
+                operation: Operation::UpdateResource,
+                size: u32::try_from(total).unwrap(),
+                client,
+                session: 1,
+                request: 1,
+                group: server_common::sharding::METADATA_GROUP,
+                ..Default::default()
+            };
         message
     }
 
@@ -7852,6 +8006,334 @@ mod tests {
             persisted.partitions.len(),
             1,
             "absent partitions_count defaults to one partition"
+        );
+    }
+
+    fn prepare_topic_with(
+        options: &iggy_common::TopicCreateOptions,
+    ) -> Result<PersistedCreateTopicRequest, IggyError> {
+        prepare_topic_on(&metadata_plane(), options)
+    }
+
+    fn prepare_topic_on(
+        plane: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+        options: &iggy_common::TopicCreateOptions,
+    ) -> Result<PersistedCreateTopicRequest, IggyError> {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .expect("register commits");
+        let prepare = plane.prepare_request(create_topic_request_with_options(
+            CLIENT,
+            ACTING_USER,
+            WireIdentifier::numeric(0),
+            "t",
+            1,
+            options.to_wire().expect("options encode"),
+        ))?;
+        let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
+        Ok(PersistedCreateTopicRequest::decode_from(body)
+            .expect("create topic with assignments prepare must decode"))
+    }
+
+    const HOUR_MICROS: u64 = 3_600_000_000;
+
+    #[test]
+    fn given_an_explicit_critical_key_when_preparing_create_topic_should_record_the_marker() {
+        let persisted = prepare_topic_with(&iggy_common::TopicCreateOptions {
+            segment_max_age: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+            ..Default::default()
+        })
+        .expect("an hour-long age roll is admitted");
+
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        assert_eq!(
+            explicit[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"segment_max_age"
+        );
+        let stored = TopicResolvedOptions::from(&explicit);
+        assert_eq!(
+            stored.runtime.effective_segment_max_age(),
+            Some(HOUR_MICROS)
+        );
+
+        let unmarked = prepare_topic_with(&iggy_common::TopicCreateOptions::default())
+            .expect("a keyless topic is admitted");
+        assert!(
+            !resource_options_from_wire(&unmarked.request.options, true)
+                .expect("explicit block decodes")
+                .contains_key(&HeaderKey::from(OptionKey::CriticalKeys)),
+            "a topic setting no critical key carries no marker"
+        );
+    }
+
+    #[test]
+    fn given_an_age_roll_with_preallocated_segments_when_preparing_should_refuse_it() {
+        let refused = prepare_topic_with(&iggy_common::TopicCreateOptions {
+            segment_max_age: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+            preallocate_segments: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            refused.err(),
+            Some(IggyError::InvalidOptionValue("segment_max_age".to_owned()))
+        );
+
+        assert!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                segment_max_age: Some(iggy_common::IggyExpiry::NeverExpire),
+                preallocate_segments: Some(true),
+                ..Default::default()
+            })
+            .is_ok(),
+            "preallocation with segments rolled by size alone stays admitted"
+        );
+    }
+
+    #[test]
+    fn given_an_age_roll_below_ten_minutes_when_preparing_should_refuse_it() {
+        let nine_minutes = iggy_common::MIN_SEGMENT_MAX_AGE - 60_000_000;
+        assert_eq!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                segment_max_age: Some(iggy_common::IggyExpiry::from(nine_minutes)),
+                ..Default::default()
+            })
+            .err(),
+            Some(IggyError::InvalidOptionValue("segment_max_age".to_owned()))
+        );
+        assert!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                segment_max_age: Some(iggy_common::IggyExpiry::from(
+                    iggy_common::MIN_SEGMENT_MAX_AGE
+                )),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_tiered_storage_when_preparing_create_topic_should_admit_on_only_in_a_ready_cluster() {
+        let tiered = |enabled: Option<bool>| iggy_common::TopicCreateOptions {
+            tiered_storage: enabled,
+            ..Default::default()
+        };
+        for cluster_ready in [false, true] {
+            let prepare = |enabled: Option<bool>| {
+                let plane = metadata_plane();
+                plane.observe_tiered_storage_readiness(cluster_ready);
+                prepare_topic_on(&plane, &tiered(enabled))
+            };
+            match prepare(Some(true)) {
+                Ok(persisted) => {
+                    assert!(cluster_ready, "an unready cluster admitted a tiered topic");
+                    let explicit = resource_options_from_wire(&persisted.request.options, true)
+                        .expect("explicit block decodes");
+                    assert!(TopicResolvedOptions::from(&explicit).tiered_storage);
+                }
+                Err(error) => {
+                    assert!(!cluster_ready, "a ready cluster refused a tiered topic");
+                    assert_eq!(error, IggyError::FeatureUnavailable);
+                }
+            }
+            assert!(prepare(Some(false)).is_ok(), "ready {cluster_ready}");
+            assert!(prepare(None).is_ok(), "ready {cluster_ready}");
+        }
+        assert_eq!(
+            prepare_topic_with(&tiered(Some(true))).err(),
+            Some(IggyError::FeatureUnavailable),
+            "a primary that was told nothing refuses"
+        );
+
+        let persisted = prepare_topic_with(&tiered(Some(false)))
+            .expect("a topic that states it is not tiered is admitted");
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        assert_eq!(
+            explicit[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"tiered_storage"
+        );
+        assert!(!TopicResolvedOptions::from(&explicit).tiered_storage);
+    }
+
+    #[test]
+    fn given_local_retention_above_the_topic_retention_when_preparing_create_topic_should_refuse_it()
+     {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                message_expiry: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+                local_retention_age: Some(iggy_common::IggyExpiry::from(2 * HOUR_MICROS)),
+                ..Default::default()
+            })
+            .err(),
+            Some(IggyError::InvalidOptionValue(
+                "local_retention_age".to_owned()
+            ))
+        );
+        assert_eq!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                max_topic_size: Some(iggy_common::MaxTopicSize::from(2 * GIB)),
+                local_retention_size: Some(iggy_common::MaxTopicSize::from(4 * GIB)),
+                ..Default::default()
+            })
+            .err(),
+            Some(IggyError::InvalidOptionValue(
+                "local_retention_size".to_owned()
+            ))
+        );
+
+        let persisted = prepare_topic_with(&iggy_common::TopicCreateOptions {
+            message_expiry: Some(iggy_common::IggyExpiry::from(2 * HOUR_MICROS)),
+            local_retention_age: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+            max_topic_size: Some(iggy_common::MaxTopicSize::from(4 * GIB)),
+            local_retention_size: Some(iggy_common::MaxTopicSize::from(2 * GIB)),
+            ..Default::default()
+        })
+        .expect("a local retention within the topic retention is admitted");
+        let stored = TopicResolvedOptions::from(
+            &resource_options_from_wire(&persisted.request.options, true)
+                .expect("explicit block decodes"),
+        );
+        assert_eq!(
+            stored.local_retention_age,
+            iggy_common::IggyExpiry::from(HOUR_MICROS)
+        );
+        assert_eq!(
+            stored.local_retention_size,
+            iggy_common::MaxTopicSize::from(2 * GIB)
+        );
+
+        // The one-day default is above this expiry and yields to it.
+        assert!(
+            prepare_topic_with(&iggy_common::TopicCreateOptions {
+                message_expiry: Some(iggy_common::IggyExpiry::from(HOUR_MICROS)),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_tiered_storage_when_resolving_a_topic_update_should_admit_on_only_in_a_ready_cluster()
+    {
+        let update = |set: &[(OptionKey, &str)], cluster_ready: bool| {
+            let patch = TopicUpdateOptions {
+                raw: set
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), (*value).to_owned()))
+                    .collect(),
+                ..TopicUpdateOptions::default()
+            }
+            .to_patch()
+            .unwrap();
+            resolve_update_resource(
+                &UpdateResourceRequest {
+                    target: ResourceTarget::Topic {
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                    },
+                    reset: patch.reset,
+                    options: patch.set,
+                },
+                cluster_ready,
+            )
+            .map(|(operation, _)| operation)
+        };
+        let enable = [(OptionKey::TieredStorage, "true")];
+
+        assert_eq!(update(&enable, false), Err(IggyError::FeatureUnavailable));
+        assert_eq!(update(&enable, true), Ok(Operation::UpdateTopicResolved));
+        for cluster_ready in [false, true] {
+            assert_eq!(
+                update(&[(OptionKey::TieredStorage, "false")], cluster_ready),
+                Err(IggyError::OptionNotUpdatable("tiered_storage".to_owned())),
+                "ready {cluster_ready}"
+            );
+            assert_eq!(
+                update(&[(OptionKey::MessageExpiry, "1h")], cluster_ready),
+                Ok(Operation::UpdateTopicResolved),
+                "ready {cluster_ready}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_tiered_storage_patch_when_the_primary_prepares_it_should_follow_the_cluster_verdict()
+    {
+        const CLIENT: u128 = 1;
+        let enable = || {
+            let patch = TopicUpdateOptions {
+                raw: BTreeMap::from([(OptionKey::TieredStorage.to_string(), "true".to_owned())]),
+                ..TopicUpdateOptions::default()
+            }
+            .to_patch()
+            .unwrap();
+            update_resource_request(
+                CLIENT,
+                &UpdateResourceRequest {
+                    target: ResourceTarget::Topic {
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                    },
+                    reset: patch.reset,
+                    options: patch.set,
+                }
+                .to_bytes(),
+            )
+        };
+        let plane = metadata_plane();
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(CLIENT, 7, [0x5a; 32], register_reply(CLIENT, 10))
+            .expect("register commits");
+
+        let refused = plane.prepare_request(enable()).err();
+        assert_eq!(refused, Some(IggyError::FeatureUnavailable));
+        assert!(
+            refused.as_ref().is_some_and(is_admission_refusal),
+            "the client gets the refusal as a reply and keeps its session"
+        );
+        plane.observe_tiered_storage_readiness(true);
+        assert_eq!(
+            plane
+                .prepare_request(enable())
+                .map(|prepare| prepare.header().operation),
+            Ok(Operation::UpdateTopicResolved)
+        );
+        plane.observe_tiered_storage_readiness(false);
+        assert_eq!(
+            plane.prepare_request(enable()).err(),
+            Some(IggyError::FeatureUnavailable)
+        );
+    }
+
+    #[test]
+    fn given_a_cluster_verdict_when_the_metadata_view_changes_should_stop_admitting() {
+        let mut metadata = placement_metadata();
+        assert!(!metadata.tiered_storage_cluster_ready());
+        metadata.observe_tiered_storage_readiness(true);
+        assert!(metadata.tiered_storage_cluster_ready());
+
+        metadata.consensus.as_mut().unwrap().set_view(1);
+        assert!(
+            !metadata.tiered_storage_cluster_ready(),
+            "a verdict from the previous view admits nothing"
         );
     }
 

@@ -105,7 +105,7 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
 
   const host = addressMatch[1] ?? addressMatch[2];
   const port = Number(addressMatch[3]);
-  if (port > 65535)
+  if (port > 65535 || port == 0)
     throw new TypeError('invalid connection string');
 
   const options: ParsedConnectionOptions = serverAndOptions.length === 2

@@ -24,7 +24,13 @@ use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMod
 use journal::partition_journal::FRONTIER_FILE_NAME;
 use server_common::fatal::NoteDescriptorExhaustion;
 
+use crate::segment_chain::CHAIN_FILE;
 use crate::{CREATED_REVISION_FILE, FILE_SYNC_CONCURRENCY};
+
+/// The most a file copy holds in memory at once. The install's backup phase
+/// charges it, so a chain that grew with the partition costs the same as a
+/// new one.
+pub(crate) const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 const BACKUP: &str = ".install-backup";
 const BUILDING: &str = ".install-building";
@@ -154,11 +160,12 @@ async fn link_tree<S: DurableStorage>(
             if entry.directory {
                 storage.create_directories(&destination).await?;
                 pending.push((source.join(&name), destination));
-            } else if name == FRONTIER_FILE_NAME {
+            } else if name == FRONTIER_FILE_NAME || name == CHAIN_FILE {
                 // The partition WAL publishes its frontier by overwriting one of
-                // two slots in place, so a hard link would not freeze it: the
-                // WAL reset this snapshot exists to roll back would rewrite the
-                // snapshot's own bytes. Two blocks, copied once per install.
+                // two slots in place, and a chain append overwrites a torn tail
+                // in place, so a hard link would not freeze either: a write
+                // after the snapshot would rewrite the snapshot's own bytes.
+                // Copied once per install.
                 copy_file(&source.join(&name), &destination, storage).await?;
             } else {
                 // Transfer unlinks or atomically replaces these frozen files.
@@ -199,11 +206,22 @@ async fn copy_file<S: DurableStorage>(
     storage: &S,
 ) -> io::Result<()> {
     let original = storage.open(source, OpenMode::Read).await?;
-    let length = usize::try_from(original.length().await?)
-        .map_err(|_| io::Error::other("partition WAL frontier is too large to copy"))?;
-    let bytes = original.read(0, length).await?;
     let mut copy = storage.open(destination, OpenMode::Create).await?;
-    copy.write(0, bytes).await?;
+    copy_bounded(&original, &mut copy).await
+}
+
+/// Copy `original` into `copy` and sync it, holding no more than
+/// [`COPY_BUFFER_BYTES`] of it at a time.
+async fn copy_bounded<F: DurableFile>(original: &F, copy: &mut F) -> io::Result<()> {
+    let length = original.length().await?;
+    let mut copied = 0;
+    while copied < length {
+        let chunk = usize::try_from(length - copied)
+            .map_or(COPY_BUFFER_BYTES, |left| left.min(COPY_BUFFER_BYTES));
+        let bytes = original.read(copied, chunk).await?;
+        copy.write(copied, bytes).await?;
+        copied += chunk as u64;
+    }
     copy.sync().await
 }
 
@@ -218,6 +236,9 @@ fn is_scratch(name: &str) -> bool {
 mod tests {
     use super::*;
     use compio::fs::File;
+    use std::cell::Cell;
+    use std::os::unix::fs::FileExt;
+    use std::rc::Rc;
 
     #[compio::test]
     async fn interrupted_install_restores_segments_offsets_and_wal_together() {
@@ -260,6 +281,89 @@ mod tests {
         assert!(!root.join("99.log").exists());
         assert!(!root.join("0.index.staging").exists());
         recover(root).await.unwrap();
+    }
+
+    /// An append rewrites the chain in place, which a hard link would not
+    /// freeze.
+    #[compio::test]
+    async fn given_a_chain_written_in_place_after_begin_when_recovering_should_restore_its_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join(CHAIN_FILE), b"chain before").unwrap();
+        begin(root, &BTreeSet::new()).await.unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(CHAIN_FILE))
+            .unwrap()
+            .write_all_at(b"CHAIN", 0)
+            .unwrap();
+
+        recover(root).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join(CHAIN_FILE)).unwrap(),
+            b"chain before"
+        );
+    }
+
+    /// A [`File`] that records the longest range read from it.
+    struct MeteredFile {
+        file: File,
+        longest_read: Rc<Cell<usize>>,
+    }
+
+    impl DurableFile for MeteredFile {
+        async fn read(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+            self.longest_read.set(self.longest_read.get().max(length));
+            self.file.read(offset, length).await
+        }
+
+        async fn write(&mut self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
+            self.file.write(offset, bytes).await
+        }
+
+        async fn length(&self) -> io::Result<u64> {
+            self.file.length().await
+        }
+
+        async fn truncate(&self, length: u64) -> io::Result<()> {
+            self.file.truncate(length).await
+        }
+
+        async fn sync(&self) -> io::Result<()> {
+            self.file.sync().await
+        }
+    }
+
+    /// The chain grows with the partition, and the backup phase charges one
+    /// buffer for copying it.
+    #[compio::test]
+    async fn given_a_file_longer_than_the_copy_buffer_when_copied_should_never_hold_more_than_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        let bytes: Vec<u8> = (0..=250)
+            .cycle()
+            .take(COPY_BUFFER_BYTES * 2 + COPY_BUFFER_BYTES / 2)
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let longest_read = Rc::new(Cell::new(0));
+        let original = MeteredFile {
+            file: DiskStorage.open(&source, OpenMode::Read).await.unwrap(),
+            longest_read: Rc::clone(&longest_read),
+        };
+        let mut copy = MeteredFile {
+            file: DiskStorage
+                .open(&destination, OpenMode::Create)
+                .await
+                .unwrap(),
+            longest_read: Rc::clone(&longest_read),
+        };
+
+        copy_bounded(&original, &mut copy).await.unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+        assert_eq!(longest_read.get(), COPY_BUFFER_BYTES);
     }
 
     #[compio::test]

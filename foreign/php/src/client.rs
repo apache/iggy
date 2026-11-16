@@ -310,6 +310,19 @@ impl IggyClient {
     /// every node unless an operator set a number. A write commits on a quorum of these nodes, so
     /// 2 keeps two copies but stops accepting writes while either node is down. The server
     /// rejects an out-of-range value with `InvalidReplicationFactor`.
+    ///
+    /// `segment_max_age_micros` starts a new segment once a batch arrives this long after the
+    /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
+    /// segments by size alone. The server refuses a duration together with
+    /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+    /// keep their meaning, and so do the three options below.
+    ///
+    /// `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
+    /// server refuses true with `Feature is unavailable` until it tiers topics.
+    /// `local_retention_age_micros` is how long a tiered topic keeps an uploaded segment on local
+    /// disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
+    /// there, unlimited when null. The server refuses an age above a finite message expiry and a
+    /// size above a finite `max_topic_size`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -328,6 +341,10 @@ impl IggyClient {
         partition_resize_policy: Option<String>,
         replication_factor: Option<&Zval>,
         raw: Option<BTreeMap<String, String>>,
+        segment_max_age_micros: Option<&Zval>,
+        tiered_storage: Option<bool>,
+        local_retention_age_micros: Option<&Zval>,
+        local_retention_size: Option<&Zval>,
     ) -> PhpResult {
         let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
@@ -340,6 +357,11 @@ impl IggyClient {
         )?;
         let replication_factor =
             optional_unsigned::<u32>(replication_factor, "replication_factor")?;
+        let segment_max_age_micros =
+            optional_u64(segment_max_age_micros, "segment_max_age_micros")?;
+        let local_retention_age_micros =
+            optional_u64(local_retention_age_micros, "local_retention_age_micros")?;
+        let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?;
         let compression_algorithm = match compression_algorithm {
             Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
             None => CompressionAlgorithm::default(),
@@ -353,6 +375,12 @@ impl IggyClient {
             })?;
         let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+        let segment_max_age =
+            segment_max_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+        let local_retention_age =
+            local_retention_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+        let local_retention_size =
+            local_retention_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
 
@@ -373,6 +401,13 @@ impl IggyClient {
                 .map(IggyByteSize::from),
             preallocate_segments,
             replication_factor,
+            segment_max_age: (segment_max_age != IggyExpiry::ServerDefault)
+                .then_some(segment_max_age),
+            tiered_storage,
+            local_retention_age: (local_retention_age != IggyExpiry::ServerDefault)
+                .then_some(local_retention_age),
+            local_retention_size: (local_retention_size != MaxTopicSize::ServerDefault)
+                .then_some(local_retention_size),
             raw: raw.unwrap_or_default(),
         };
 
@@ -393,6 +428,12 @@ impl IggyClient {
     /// default. `raw` and `raw_reset` reach keys this build does not know, and the server
     /// decides whether each one may be set or reset. `raw` is marked
     /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
+    ///
+    /// `tiered_storage` set to true turns tiered storage on. The server refuses false, an update
+    /// never turns it off, and refuses true with `Feature is unavailable` until it tiers topics.
+    /// `local_retention_age_micros` and `local_retention_size` change how long and how much a
+    /// tiered topic keeps on local disk after upload, with the same int or decimal string values
+    /// and the same refusal of 0 as the expiry and the size cap.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(reset = Vec::<TopicOptionKey>::new()))]
     pub fn update_topic(
@@ -405,12 +446,24 @@ impl IggyClient {
         reset: Vec<TopicOptionKey>,
         raw: Option<BTreeMap<String, String>>,
         raw_reset: Option<Vec<String>>,
+        tiered_storage: Option<bool>,
+        local_retention_age_micros: Option<&Zval>,
+        local_retention_size: Option<&Zval>,
     ) -> PhpResult {
         let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
             .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
             .transpose()?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?
             .map(|bytes| positive_update(bytes, "max_topic_size").map(MaxTopicSize::from))
+            .transpose()?;
+        let local_retention_age =
+            optional_u64(local_retention_age_micros, "local_retention_age_micros")?
+                .map(|micros| {
+                    positive_update(micros, "local_retention_age_micros").map(IggyExpiry::from)
+                })
+                .transpose()?;
+        let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?
+            .map(|bytes| positive_update(bytes, "local_retention_size").map(MaxTopicSize::from))
             .transpose()?;
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
@@ -419,6 +472,9 @@ impl IggyClient {
             name,
             message_expiry,
             max_topic_size,
+            tiered_storage,
+            local_retention_age,
+            local_retention_size,
             reset,
             raw_reset,
             raw: raw.unwrap_or_default(),
