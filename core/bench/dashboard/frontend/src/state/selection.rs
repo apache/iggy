@@ -16,44 +16,54 @@
 // under the License.
 
 //! The runs the reader picks to compare. The pick lives in a context for the page session, not in
-//! the URL or in storage, so a reload empties it.
+//! the URL or in storage, so a reload empties it. iggy-bench runs and OMB runs have their own id
+//! types, so each framework has its own selection, and a run of one never enters the other's.
 
 use std::rc::Rc;
 
+use bench_dashboard_shared::omb::id::OmbRunId;
 use uuid::Uuid;
 use yew::prelude::*;
 
 /// The compare page shows at most this many runs, so a selection can't hold more.
 pub const MAX_COMPARED_RUNS: usize = 3;
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Selection {
+#[derive(Debug, Clone, PartialEq)]
+pub struct Selection<Id> {
     /// In pick order, without repeats.
-    runs: Vec<Uuid>,
+    runs: Vec<Id>,
 }
 
-pub enum SelectionAction {
+pub enum SelectionAction<Id> {
     /// Adds the run, or drops it if the selection already has it. A full selection doesn't take
     /// another run.
-    Toggle(Uuid),
+    Toggle(Id),
     /// Takes over a compare page's runs, so the reader can add one more.
-    Replace(Vec<Uuid>),
+    Replace(Vec<Id>),
     Clear,
 }
 
-pub type SelectionHandle = UseReducerHandle<Selection>;
+/// The selection of the runs with ids of type `Id`. The type picks the context, so the iggy-bench
+/// and the OMB selections never meet.
+pub type SelectionHandle<Id> = UseReducerHandle<Selection<Id>>;
 
 #[derive(Properties, PartialEq)]
 pub struct SelectionProviderProps {
     pub children: Html,
 }
 
-impl Selection {
-    pub fn runs(&self) -> &[Uuid] {
+impl<Id> Default for Selection<Id> {
+    fn default() -> Self {
+        Self { runs: Vec::new() }
+    }
+}
+
+impl<Id: Copy + PartialEq> Selection<Id> {
+    pub fn runs(&self) -> &[Id] {
         &self.runs
     }
 
-    pub fn contains(&self, run: Uuid) -> bool {
+    pub fn contains(&self, run: Id) -> bool {
         self.runs.contains(&run)
     }
 
@@ -62,8 +72,8 @@ impl Selection {
     }
 }
 
-impl Reducible for Selection {
-    type Action = SelectionAction;
+impl<Id: Copy + PartialEq> Reducible for Selection<Id> {
+    type Action = SelectionAction<Id>;
 
     fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
         let runs = match action {
@@ -76,7 +86,7 @@ impl Reducible for Selection {
             SelectionAction::Toggle(_) if self.is_full() => return self,
             SelectionAction::Toggle(run) => self.runs.iter().copied().chain([run]).collect(),
             SelectionAction::Replace(runs) => {
-                let mut unique: Vec<Uuid> = Vec::with_capacity(MAX_COMPARED_RUNS);
+                let mut unique: Vec<Id> = Vec::with_capacity(MAX_COMPARED_RUNS);
                 for run in runs {
                     if unique.len() < MAX_COMPARED_RUNS && !unique.contains(&run) {
                         unique.push(run);
@@ -90,34 +100,53 @@ impl Reducible for Selection {
     }
 }
 
+/// The selection of iggy-bench runs.
 #[function_component(SelectionProvider)]
 pub fn selection_provider(props: &SelectionProviderProps) -> Html {
-    let selection = use_reducer_eq(Selection::default);
+    let selection = use_reducer_eq(Selection::<Uuid>::default);
     html! {
-        <ContextProvider<SelectionHandle> context={selection}>
+        <ContextProvider<SelectionHandle<Uuid>> context={selection}>
             { props.children.clone() }
-        </ContextProvider<SelectionHandle>>
+        </ContextProvider<SelectionHandle<Uuid>>>
     }
 }
 
-/// `None` outside the provider, where a page has no selection to offer.
+/// The selection of OMB runs, apart from the iggy-bench one.
+#[function_component(OmbSelectionProvider)]
+pub fn omb_selection_provider(props: &SelectionProviderProps) -> Html {
+    let selection = use_reducer_eq(Selection::<OmbRunId>::default);
+    html! {
+        <ContextProvider<SelectionHandle<OmbRunId>> context={selection}>
+            { props.children.clone() }
+        </ContextProvider<SelectionHandle<OmbRunId>>>
+    }
+}
+
+/// The iggy-bench selection. `None` outside the provider, where a page has no selection to offer.
 #[hook]
-pub fn use_selection() -> Option<SelectionHandle> {
-    use_context::<SelectionHandle>()
+pub fn use_selection() -> Option<SelectionHandle<Uuid>> {
+    use_context::<SelectionHandle<Uuid>>()
+}
+
+/// The OMB selection. `None` outside the provider, where a page has no selection to offer.
+#[hook]
+pub fn use_omb_selection() -> Option<SelectionHandle<OmbRunId>> {
+    use_context::<SelectionHandle<OmbRunId>>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{OMB_ALL, OMB_EDGE8_DEFAULT, OMB_RC1_DEFAULT, OMB_RC1_PERSISTED};
 
     fn run(id: u128) -> Uuid {
         Uuid::from_u128(id)
     }
 
-    fn after(
-        selection: Selection,
-        actions: impl IntoIterator<Item = SelectionAction>,
-    ) -> Selection {
+    fn after<Id: Copy + PartialEq>(
+        selection: Selection<Id>,
+        actions: impl IntoIterator<Item = SelectionAction<Id>>,
+    ) -> Selection<Id> {
         let reduced = actions
             .into_iter()
             .fold(Rc::new(selection), |selection, action| {
@@ -170,5 +199,43 @@ mod tests {
 
         assert_eq!(selection.runs(), [run(5), run(6), run(7)]);
         assert!(after(selection, [SelectionAction::Clear]).runs().is_empty());
+    }
+
+    #[test]
+    fn given_omb_fixture_picks_when_toggled_should_keep_pick_order_and_drop_a_second_toggle() {
+        let (rc1, persisted, edge8) = (
+            OMB_RC1_DEFAULT.id(),
+            OMB_RC1_PERSISTED.id(),
+            OMB_EDGE8_DEFAULT.id(),
+        );
+
+        let selection = after(
+            Selection::default(),
+            [
+                SelectionAction::Toggle(persisted),
+                SelectionAction::Toggle(rc1),
+                SelectionAction::Toggle(edge8),
+                SelectionAction::Toggle(persisted),
+            ],
+        );
+
+        assert_eq!(selection.runs(), [rc1, edge8]);
+        assert!(!selection.contains(persisted));
+    }
+
+    #[test]
+    fn given_every_omb_fixture_when_replaced_should_keep_first_three_without_repeats() {
+        let ids: Vec<OmbRunId> = OMB_ALL.iter().map(|fixture| fixture.id()).collect();
+        let repeated = ids.iter().copied().chain(ids.iter().copied()).collect();
+
+        let selection = after(Selection::default(), [SelectionAction::Replace(repeated)]);
+
+        assert!(selection.is_full());
+        assert_eq!(selection.runs(), &ids[..MAX_COMPARED_RUNS]);
+        let full = after(
+            selection.clone(),
+            [SelectionAction::Toggle(ids[MAX_COMPARED_RUNS])],
+        );
+        assert_eq!(full, selection);
     }
 }

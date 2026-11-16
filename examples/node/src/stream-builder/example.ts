@@ -113,7 +113,6 @@ async function cleanup(client: Client, stream: any, topic: any) {
     await client.topic.delete({
       streamId: stream.id,
       topicId: topic.id,
-      partitionsCount: 1,
     });
     log('Topic deleted');
   } catch (error) {

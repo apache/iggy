@@ -19,7 +19,6 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
-import { uint32ToBuf } from '../number.utils.js';
 
 /**
  * Parameters for the delete topic command.
@@ -28,9 +27,7 @@ export type DeleteTopic = {
   /** Stream identifier (ID or name) */
   streamId: Id,
   /** Topic identifier (ID or name) */
-  topicId: Id,
-  /** Number of partitions in the topic */
-  partitionsCount: number
+  topicId: Id
 }
 
 /**
@@ -40,11 +37,10 @@ export type DeleteTopic = {
 export const DELETE_TOPIC = {
   code: COMMAND_CODE.DeleteTopic,
 
-  serialize: ({streamId, topicId, partitionsCount}: DeleteTopic) => {
+  serialize: ({streamId, topicId}: DeleteTopic) => {
     return Buffer.concat([
       serializeIdentifier(streamId),
-      serializeIdentifier(topicId),
-      uint32ToBuf(partitionsCount)
+      serializeIdentifier(topicId)
     ]);
   },
 

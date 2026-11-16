@@ -55,6 +55,14 @@ describe('parseConnectionString', () => {
     );
   });
 
+  it('accepts the lowest and highest valid ports', () => {
+    for (const port of [1, 65535])
+      assert.equal(
+        parseConnectionString(`iggy://iggy:secret@localhost:${port}`).options.port,
+        port
+      );
+  });
+
   it('maps tls options to the TLS transport', () => {
     assert.deepEqual(
       parseConnectionString(
@@ -229,7 +237,8 @@ describe('parseConnectionString', () => {
       'iggy://iggy:secret@localhost',
       'iggy://iggy:secret@:8090',
       'iggy://iggy:secret@localhost:port',
-      'iggy://iggy:secret@localhost:70000',
+      'iggy://iggy:secret@localhost:65536',
+      'iggy://iggy:secret@localhost:0',
       'iggy://iggy:secret@localhost:8090?unknown=value',
       'iggy://iggy:secret@localhost:8090?tls=maybe',
       'iggy://iggy:secret@localhost:8090?reconnection_retries=three',

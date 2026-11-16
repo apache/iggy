@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer group module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait ConsumerGroupClient {
     /// Get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.
     ///

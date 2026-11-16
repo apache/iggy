@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Net;
 using Apache.Iggy;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
+using Microsoft.Extensions.Logging;
 
 namespace Iggy_SDK.Examples.Shared;
 
@@ -71,5 +73,38 @@ public static class ExampleHelpers
             {
             }
         }
+    }
+
+    public static string GetTcpServerAddr(string[] args, ILogger logger)
+    {
+        var defaultServerAddr = "127.0.0.1:8090";
+        if (args.Length == 0)
+        {
+            return defaultServerAddr;
+        }
+
+        var argumentName = args[0];
+        if (argumentName != "--tcp-server-address")
+        {
+            throw new FormatException(
+                $"Invalid argument {argumentName}! Usage: --tcp-server-address <server-address>"
+            );
+        }
+
+        if (args.Length < 2)
+        {
+            throw new FormatException("Missing server address! Usage: --tcp-server-address <server-address>");
+        }
+
+        var tcpServerAddr = args[1];
+        if (!IPEndPoint.TryParse(tcpServerAddr, out _))
+        {
+            throw new FormatException(
+                $"Invalid server address {tcpServerAddr}! Usage: --tcp-server-address <server-address>"
+            );
+        }
+
+        logger.LogInformation("Using server address: {TcpServerAddr}", tcpServerAddr);
+        return tcpServerAddr;
     }
 }

@@ -303,6 +303,7 @@ web-sys = { version = "0.3", features = [
     "DomRect",
 ] }
 webpki-roots = "1.0.11"
+whichever = { version = "0.7.3", default-features = false }
 windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
 x509-parser = "0.18.1"
