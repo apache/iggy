@@ -61,9 +61,28 @@ impl FreshObjectId {
         ))
     }
 
+    /// The id that [`Self::get`] returned as `id`.
+    #[must_use]
+    pub const fn from_raw(id: u128) -> Self {
+        Self(id)
+    }
+
     #[must_use]
     pub const fn get(self) -> u128 {
         self.0
+    }
+
+    /// The replica that wrote the object.
+    #[must_use]
+    pub const fn replica(self) -> u8 {
+        self.0.to_le_bytes()[7]
+    }
+
+    /// The shard that wrote the object.
+    #[must_use]
+    pub const fn shard(self) -> u16 {
+        let bytes = self.0.to_le_bytes();
+        u16::from_le_bytes([bytes[5], bytes[6]])
     }
 }
 
@@ -123,6 +142,17 @@ pub fn is_fresh_object(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_an_id_when_reading_its_writer_should_return_the_replica_and_the_shard() {
+        let id = FreshObjectId::new(0xab, 0xcdef, u64::MAX, FreshObjectId::SEQUENCE_MAX).unwrap();
+
+        assert_eq!(id.replica(), 0xab);
+        assert_eq!(id.shard(), 0xcdef);
+        assert_eq!(FreshObjectId::from_raw(id.get()), id);
+        let lowest = FreshObjectId::new(1, 2, 0, 0).unwrap();
+        assert_eq!((lowest.replica(), lowest.shard()), (1, 2));
+    }
 
     #[test]
     fn given_blobs_when_pushing_should_return_where_each_one_starts() {
