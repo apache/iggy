@@ -27,6 +27,7 @@ use crate::journal::{
     MessageLookup, SPARSE_CHUNK_PIN_DIVISOR, push_selected_batch_fragments, select_batch_slice,
     unpin_sparse_source,
 };
+use crate::placed_read::PlacedReadPlan;
 use crate::remote_segments::{IndexFetch, IndexFetchFence, RemoteRange, RemoteSegments};
 use crate::{Fragment, PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
@@ -551,14 +552,20 @@ impl PollPlan {
     /// Resident reads execute and complete synchronously on the owner.
     #[must_use]
     pub const fn needs_off_pump_io(&self) -> bool {
-        matches!(self.tier, PollTier::Disk { .. })
+        matches!(self.tier, PollTier::Disk { .. } | PollTier::Placed { .. })
     }
 
     /// Whether the snapshot names a segment in the object store, so the read
     /// can wait on the store.
     #[must_use]
     pub fn reads_remote(&self) -> bool {
-        matches!(&self.tier, PollTier::Disk { disk, .. } if disk.reads_remote())
+        match &self.tier {
+            PollTier::Disk { disk, .. } => disk.reads_remote(),
+            // The messages of a placed batch are in the object store, unless
+            // this shard still holds them in memory.
+            PollTier::Placed { .. } => true,
+            PollTier::Empty | PollTier::Resident { .. } => false,
+        }
     }
 
     /// Stop waiting for the object store at `deadline`. The read then returns
@@ -567,6 +574,9 @@ impl PollPlan {
     pub const fn with_deadline(mut self, deadline: Instant) -> Self {
         if let PollTier::Disk { disk, .. } = &mut self.tier {
             disk.deadline = Some(deadline);
+        }
+        if let PollTier::Placed { placed, .. } = &mut self.tier {
+            placed.deadline = Some(deadline);
         }
         self
     }
@@ -606,6 +616,18 @@ impl PollPlan {
                 last_matching_offset,
                 message_count,
             } => (fragments, last_matching_offset, message_count),
+            PollTier::Placed { placed, query } => {
+                match placed.read(query, max_selected_bytes).await {
+                    Ok(batches) => crate::journal::select_resident(&batches, query)
+                        .unwrap_or_else(|| (PollFragments::new(), None, 0)),
+                    // Fail closed, as a disk read does: an answer without
+                    // the batch that failed would skip its messages.
+                    Err(fault) => {
+                        read_error = Some(fault.error());
+                        (PollFragments::new(), None, 0)
+                    }
+                }
+            }
             PollTier::Disk {
                 disk,
                 query,
@@ -697,8 +719,8 @@ impl PollPlan {
                 last_matching_offset,
                 message_count,
             } => (fragments, last_matching_offset, message_count),
-            PollTier::Disk { .. } => {
-                unreachable!("execute_resident on Disk tier; needs_off_pump_io guards this")
+            PollTier::Disk { .. } | PollTier::Placed { .. } => {
+                unreachable!("execute_resident on a tier that reads; needs_off_pump_io guards this")
             }
         };
         PollReadResult {
@@ -726,6 +748,12 @@ pub enum PollTier {
         /// Resident journal tail snapshot for the straddle continuation,
         /// captured at plan time so the splice runs off the partition borrow.
         resident_tail: ResidentTailSnapshot,
+    },
+    /// The poll of a partition that places its batches: its segments and its
+    /// journal hold where the messages sit in the object store.
+    Placed {
+        placed: PlacedReadPlan,
+        query: MessageLookup,
     },
 }
 

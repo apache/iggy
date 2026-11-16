@@ -4602,12 +4602,6 @@ where
         if self.history_deleted() {
             return Err(IggyError::HistoryUnavailable);
         }
-        // The read found placed batches, whose messages are in the object
-        // store. Nothing fetches them yet, so no poll is answered as though
-        // the partition were empty.
-        if self.places_batches() {
-            return Err(IggyError::FeatureUnavailable);
-        }
         // A view change rebuilds the install latch and barrier from the log,
         // so the owner checks below must run after it.
         self.resynchronize_consumer_offset_reservations();
@@ -6195,6 +6189,17 @@ where
             }
         }
 
+        if self.places_batches() {
+            return PollPlan {
+                commit_offset,
+                context,
+                tier: PollTier::Placed {
+                    placed: self.placed_read_plan(),
+                    query,
+                },
+            };
+        }
+
         let serve_journal_first = match query {
             MessageLookup::Offset { offset, .. } => self
                 .log
@@ -6298,6 +6303,33 @@ where
     /// borrow.
     pub(crate) fn journal_get_sync(&self, query: &MessageLookup) -> Option<PollQueryResult<4096>> {
         self.log.journal().inner.get_sync(query)
+    }
+
+    /// What a poll of this partition reads when it places its batches: its
+    /// segments that hold a batch, and the placed batches still in its
+    /// journal. Taken under the partition borrow, so the read runs without.
+    fn placed_read_plan(&self) -> crate::placed_read::PlacedReadPlan {
+        let segments = self
+            .log
+            .segments()
+            .iter()
+            .filter(|segment| {
+                segment.location == SegmentLocation::Local && segment.size.as_bytes_u64() > 0
+            })
+            .map(|segment| crate::placed_read::PlacedSegment {
+                start_offset: segment.start_offset,
+                end_offset: segment.end_offset,
+                max_timestamp: segment.max_timestamp,
+                size: segment.size.as_bytes_u64(),
+            })
+            .collect();
+        crate::placed_read::PlacedReadPlan {
+            partition_dir: self.partition_dir_resolution(),
+            segments,
+            resident: self.log.journal().inner.resident_message_entries(),
+            remote: self.remote_segments.clone(),
+            deadline: None,
+        }
     }
 
     /// Snapshot the resident journal tail (oldest resident offset + op-ascending

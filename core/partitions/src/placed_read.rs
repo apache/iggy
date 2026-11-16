@@ -1,0 +1,311 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Polls of a partition that places its batches.
+//!
+//! Such a partition holds placed batches: in its segments once they commit,
+//! and in its journal before that. A poll finds the placed batches of the
+//! offsets it asks for, fetches the messages of each from the fresh object
+//! its placement names, and puts the batch back together. The selection of
+//! messages then runs over those batches as it does over the journal of any
+//! other partition.
+//!
+//! A segment of placed batches needs no index to seek in: its batches have
+//! one size and ascend by offset and by timestamp, so the walk finds its
+//! start by halving.
+
+use std::rc::Rc;
+use std::time::Instant;
+
+use compio::fs::File;
+use compio::io::AsyncReadAtExt;
+use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
+use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
+use iggy_binary_protocol::{Command, Operation, PrepareHeader};
+use server_common::iobuf::{Frozen, Owned};
+use server_common::send_messages::decode_prepare_batch_trusted;
+
+use crate::RemoteSegments;
+use crate::journal::MessageLookup;
+use crate::poll_plan::{DiskFault, PartitionDirResolution};
+
+const PREPARE_HEADER_SIZE: usize = size_of::<PrepareHeader>();
+
+/// Placed batches one read of a segment asks the disk for.
+const PLACED_PER_READ: u64 = 256;
+
+/// A local segment of placed batches as a poll plan snapshots it.
+#[derive(Debug, Clone, Copy)]
+pub struct PlacedSegment {
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub max_timestamp: u64,
+    /// Bytes the partition counts as stored, all of them committed.
+    pub size: u64,
+}
+
+/// What a poll of a placing partition reads, captured under the partition
+/// borrow so the read runs without it.
+pub struct PlacedReadPlan {
+    pub(crate) partition_dir: PartitionDirResolution,
+    /// Segments that hold a batch, in offset order.
+    pub(crate) segments: Vec<PlacedSegment>,
+    /// The journal's message entries, op-ascending: the placed batches that
+    /// no segment holds yet.
+    pub(crate) resident: Vec<Frozen<4096>>,
+    pub(crate) remote: Option<Rc<RemoteSegments>>,
+    pub(crate) deadline: Option<Instant>,
+}
+
+impl PlacedReadPlan {
+    /// The batches that answer `query`, each put back together as the
+    /// prepare a partition of whole batches would hold, in offset order.
+    ///
+    /// Reads stop once the batches hold the messages the query counts, or
+    /// `max_bytes` of them, whichever comes first. The batch that holds the
+    /// first match is read whatever its size.
+    pub(crate) async fn read(
+        &self,
+        query: MessageLookup,
+        max_bytes: usize,
+    ) -> Result<Vec<Frozen<4096>>, DiskFault> {
+        let mut wanted = Wanted::new(query, max_bytes);
+        let mut placed = Vec::new();
+        self.collect_from_segments(&mut wanted, &mut placed).await?;
+        for entry in &self.resident {
+            if wanted.is_full() {
+                break;
+            }
+            let Ok(batch) = decode_prepare_batch_trusted(entry.as_slice()) else {
+                continue;
+            };
+            if let Some(placement) = batch.placement {
+                wanted.take(PlacedBatch::new(batch.header, placement), &mut placed);
+            }
+        }
+        let mut batches = Vec::with_capacity(placed.len());
+        for placed in &placed {
+            batches.push(self.assemble(placed).await?);
+        }
+        Ok(batches)
+    }
+
+    async fn collect_from_segments(
+        &self,
+        wanted: &mut Wanted,
+        placed: &mut Vec<PlacedBatch>,
+    ) -> Result<(), DiskFault> {
+        let directory = match &self.partition_dir {
+            PartitionDirResolution::Resolved(directory) => directory,
+            PartitionDirResolution::NoFiles => return Ok(()),
+            PartitionDirResolution::Unresolvable => return Err(DiskFault::Retryable),
+        };
+        for segment in &self.segments {
+            if wanted.is_full() {
+                break;
+            }
+            if !wanted.may_start_in(segment) {
+                continue;
+            }
+            let path = format!("{directory}/{:0>20}.log", segment.start_offset);
+            let file = File::open(&path).await.map_err(|_| DiskFault::Retryable)?;
+            let count = segment.size / PLACED_BATCH_SIZE as u64;
+            let mut index = wanted.first_index(&file, count).await?;
+            while index < count && !wanted.is_full() {
+                let batches = PLACED_PER_READ.min(count - index);
+                for batch in read_placed(&file, index, batches).await? {
+                    wanted.take(batch, placed);
+                }
+                index += batches;
+            }
+        }
+        Ok(())
+    }
+
+    /// The whole batch of `placed`: its header with the batch checksum it
+    /// has over its messages, and the messages its placement names.
+    async fn assemble(&self, placed: &PlacedBatch) -> Result<Frozen<4096>, DiskFault> {
+        // A shard that has not connected its store yet cannot read the
+        // messages now, and can once it has.
+        let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
+        let placement = placed.placement;
+        let end = placement
+            .position
+            .checked_add(placement.length)
+            .ok_or(DiskFault::Unreadable)?;
+        let fetch = remote.read_fresh(placement.object_id, placement.position..end);
+        let now = Instant::now();
+        let blob = match self.deadline {
+            None => fetch.await,
+            Some(deadline) if deadline <= now => return Err(DiskFault::Retryable),
+            Some(deadline) => compio::time::timeout(deadline - now, fetch)
+                .await
+                .unwrap_or(Err(DiskFault::Retryable)),
+        }?;
+        if !placement.matches(&blob) {
+            return Err(DiskFault::Tiered);
+        }
+        let total = PREPARE_HEADER_SIZE + BATCH_HEADER_SIZE + blob.len();
+        let mut prepare = Owned::<4096>::zeroed(total);
+        let bytes = prepare.as_mut_slice();
+        let mut header = placed.header;
+        header.batch_checksum = header.checksum_for_blob(&blob);
+        header
+            .encode_into(&mut bytes[PREPARE_HEADER_SIZE..PREPARE_HEADER_SIZE + BATCH_HEADER_SIZE]);
+        bytes[PREPARE_HEADER_SIZE + BATCH_HEADER_SIZE..].copy_from_slice(&blob);
+        let prepare_header =
+            bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut bytes[..PREPARE_HEADER_SIZE]);
+        prepare_header.command = Command::Prepare;
+        prepare_header.operation = Operation::SendMessages;
+        prepare_header.size = u32::try_from(total).map_err(|_| DiskFault::Unreadable)?;
+        Ok(prepare.into())
+    }
+}
+
+/// What a poll still needs: where its first message is, and how many
+/// messages and bytes it may take.
+struct Wanted {
+    query: MessageLookup,
+    /// The offset after the last batch taken, so a batch that both a segment
+    /// and the journal hold is taken once.
+    next_offset: u64,
+    messages: u64,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl Wanted {
+    const fn new(query: MessageLookup, max_bytes: usize) -> Self {
+        Self {
+            query,
+            next_offset: 0,
+            messages: 0,
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.messages >= u64::from(self.query.count())
+            || (self.messages > 0 && self.bytes >= self.max_bytes)
+    }
+
+    /// Whether the first message of the poll can be in `segment` or before
+    /// it, so the walk has to look into it.
+    const fn may_start_in(&self, segment: &PlacedSegment) -> bool {
+        match self.query {
+            MessageLookup::Offset {
+                offset, ceiling, ..
+            } => segment.end_offset >= offset && segment.start_offset <= ceiling,
+            MessageLookup::Timestamp {
+                timestamp, ceiling, ..
+            } => segment.max_timestamp >= timestamp && segment.start_offset <= ceiling,
+        }
+    }
+
+    /// Whether `batch` holds a message at or after the poll's start.
+    const fn reaches(&self, batch: &PlacedBatch) -> bool {
+        let header = &batch.header;
+        match self.query {
+            MessageLookup::Offset { offset, .. } => {
+                header.base_offset + header.message_count as u64 > offset
+            }
+            // A batch's messages are stamped from its base on, so one stamped
+            // before the poll's start can still hold a message after it.
+            MessageLookup::Timestamp { .. } => true,
+        }
+    }
+
+    /// Take `batch` when the poll has not passed it and may still use it.
+    fn take(&mut self, batch: PlacedBatch, placed: &mut Vec<PlacedBatch>) {
+        let header = batch.header;
+        if self.is_full()
+            || header.base_offset < self.next_offset
+            || header.base_offset > self.query.ceiling()
+            || !self.reaches(&batch)
+        {
+            return;
+        }
+        self.next_offset = header.base_offset + u64::from(header.message_count);
+        self.messages += self.counted_messages(&batch);
+        self.bytes = self
+            .bytes
+            .saturating_add(usize::try_from(header.batch_length).unwrap_or(usize::MAX));
+        placed.push(batch);
+    }
+
+    /// Messages of `batch` that an offset poll counts: those from its start
+    /// on. A timestamp poll cannot tell before it reads them, so it counts
+    /// none of a batch stamped before its start.
+    fn counted_messages(&self, batch: &PlacedBatch) -> u64 {
+        let header = &batch.header;
+        match self.query {
+            MessageLookup::Offset { offset, .. } => {
+                let end = header.base_offset + u64::from(header.message_count);
+                end - offset.max(header.base_offset)
+            }
+            MessageLookup::Timestamp { timestamp, .. } if header.base_timestamp >= timestamp => {
+                u64::from(header.message_count)
+            }
+            MessageLookup::Timestamp { .. } => 0,
+        }
+    }
+
+    /// The index of the first of `count` placed batches in `file` that the
+    /// walk reads: the last one that starts at or before the poll's start.
+    async fn first_index(&self, file: &File, count: u64) -> Result<u64, DiskFault> {
+        let (mut low, mut high) = (0, count);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let Some(batch) = read_placed(file, middle, 1).await?.pop() else {
+                return Err(DiskFault::Unreadable);
+            };
+            let before = match self.query {
+                MessageLookup::Offset { offset, .. } => batch.header.base_offset <= offset,
+                MessageLookup::Timestamp { timestamp, .. } => {
+                    batch.header.base_timestamp < timestamp
+                }
+            };
+            if before {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low.saturating_sub(1))
+    }
+}
+
+/// `count` placed batches of `file`, from the `index`-th one on. Each one
+/// passes its own checksum, or the read fails.
+async fn read_placed(file: &File, index: u64, count: u64) -> Result<Vec<PlacedBatch>, DiskFault> {
+    let len = usize::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(PLACED_BATCH_SIZE))
+        .ok_or(DiskFault::Unreadable)?;
+    let position = index
+        .checked_mul(PLACED_BATCH_SIZE as u64)
+        .ok_or(DiskFault::Unreadable)?;
+    let compio::BufResult(read, bytes) = file.read_exact_at(vec![0; len], position).await;
+    read.map_err(|_| DiskFault::Retryable)?;
+    bytes
+        .as_chunks::<PLACED_BATCH_SIZE>()
+        .0
+        .iter()
+        .map(|placed| PlacedBatch::decode(placed).map_err(|_| DiskFault::Unreadable))
+        .collect()
+}

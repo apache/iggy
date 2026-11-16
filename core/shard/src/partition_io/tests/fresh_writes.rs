@@ -244,3 +244,42 @@ async fn given_sends_in_two_windows_when_both_close_should_store_two_objects_and
         "the later window got the later id, and committed second"
     );
 }
+
+/// The shard holds the messages it has just stored, so a consumer at the
+/// tail is served without a read of the store. The store the polls would
+/// read here is empty, so only those kept bytes can answer.
+#[compio::test]
+async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_without_reading_the_store()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(partitions::RemoteSegments::new(
+            Rc::new(MemoryStore::new()),
+            layout(),
+        )));
+    pumped(&owner, async {
+        let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+    })
+    .await;
+
+    let plan = owner
+        .plane
+        .partitions()
+        .build_poll_snapshot(
+            &namespace(),
+            partitions::PollingConsumer::Consumer(1, 0),
+            &partitions::PollingArgs::new(iggy_common::PollingStrategy::offset(0), 10, false),
+        )
+        .unwrap();
+    assert!(plan.needs_off_pump_io());
+    let polled = plan.execute().await.checked().unwrap();
+
+    assert_eq!(polled.message_count(), 2);
+    assert_eq!(polled.last_matching_offset(), Some(1));
+}

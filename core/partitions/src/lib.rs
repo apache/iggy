@@ -43,7 +43,9 @@ pub use persistence::{
 };
 pub use repair_memory::RepairMemoryBudget;
 mod remote_segments;
-pub use remote_segments::{ExecutorObjects, RemoteObjects, RemoteRange, RemoteSegments};
+pub use remote_segments::{
+    ExecutorObjects, FRESH_CACHE_BYTES, RemoteObjects, RemoteRange, RemoteSegments,
+};
 mod object_delete;
 mod segment;
 pub mod segment_anchor;
@@ -58,6 +60,7 @@ pub use object_delete::{
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
 mod manifest_publish;
+mod placed_read;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
 };

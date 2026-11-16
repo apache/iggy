@@ -39,6 +39,7 @@
 
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, RestorableMetadataStm, Sender, ShardFrame};
+use bytes::Bytes;
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader, RoutedRequestHeader};
 use iggy_common::{IggyError, IggyTimestamp};
@@ -80,6 +81,10 @@ pub struct PlacedSend {
 
 /// What the task uploading a fresh object hands back to the pump.
 pub struct FinishedFreshUpload {
+    pub object_id: FreshObjectId,
+    /// The object's bytes, which the shard keeps for its polls once the
+    /// store holds them.
+    pub bytes: Bytes,
     pub sends: Vec<PlacedSend>,
     pub outcome: FreshUploadOutcome,
 }
@@ -278,9 +283,12 @@ where
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
         self.bus.spawn(async move {
+            let bytes = object.into_bytes();
             let finished = Box::new(FinishedFreshUpload {
+                object_id: id,
+                bytes: bytes.clone(),
                 sends,
-                outcome: uploader.upload(id, object.into_bytes(), scope).await,
+                outcome: uploader.upload(id, bytes, scope).await,
             });
             let frame = ShardFrame::lifecycle(LifecycleFrame::FreshUploadFinished(finished));
             // The producers of the window wait for this result, so a refused
@@ -336,6 +344,11 @@ where
             }
             Err(_) => false,
         };
+        // A consumer at the tail polls these batches next, and this shard
+        // holds their messages already.
+        if stored && let Some(remote) = self.plane.partitions().remote_segments() {
+            remote.cache_fresh_object(finished.object_id.get(), finished.bytes);
+        }
         for PlacedSend { request, reply } in finished.sends {
             if !stored {
                 Self::answer_partition_submit_deny(

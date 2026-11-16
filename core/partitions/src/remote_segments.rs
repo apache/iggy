@@ -28,10 +28,12 @@
 //! service, see [`ExecutorObjects`].
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use compio::io::AsyncWriteAtExt;
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -146,12 +148,66 @@ impl RemoteRange {
     }
 }
 
+/// Bytes of fresh objects a shard keeps in memory for its polls.
+///
+/// A consumer at the tail reads what a producer sent a moment ago. Without
+/// the cache, each such poll would fetch from the store the bytes this node
+/// has just put there.
+pub const FRESH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bytes of fresh objects that this shard stored or fetched, oldest
+/// first. Losing any of it loses nothing: a read that misses goes to the
+/// store.
+struct FreshCache {
+    /// A whole object, or the range of one that starts at a position.
+    entries: VecDeque<(u128, u64, Bytes)>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl FreshCache {
+    const fn new(budget: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    /// Keep `bytes`, which sit at `position` of the object `object_id`, and
+    /// drop the oldest entries past the budget. Bytes larger than the budget
+    /// are not kept.
+    fn insert(&mut self, object_id: u128, position: u64, bytes: Bytes) {
+        if bytes.len() > self.budget {
+            return;
+        }
+        self.bytes += bytes.len();
+        self.entries.push_back((object_id, position, bytes));
+        while self.bytes > self.budget {
+            let Some((_, _, dropped)) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= dropped.len();
+        }
+    }
+
+    /// `range` of the object `object_id`, when one entry holds all of it.
+    fn get(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
+        self.entries.iter().rev().find_map(|(id, position, bytes)| {
+            let start = usize::try_from(range.start.checked_sub(*position)?).ok()?;
+            let end = usize::try_from(range.end.checked_sub(*position)?).ok()?;
+            (*id == object_id && end <= bytes.len()).then(|| bytes.slice(start..end))
+        })
+    }
+}
+
 /// Where the shard reads remote segments from.
 pub struct RemoteSegments {
     objects: Rc<dyn RemoteObjects>,
     layout: KeyLayout,
     /// See [`INDEX_GET_TIMEOUT`].
     pub(crate) index_get_timeout: Duration,
+    fresh: RefCell<FreshCache>,
 }
 
 impl RemoteSegments {
@@ -161,7 +217,53 @@ impl RemoteSegments {
             objects,
             layout,
             index_get_timeout: INDEX_GET_TIMEOUT,
+            fresh: RefCell::new(FreshCache::new(FRESH_CACHE_BYTES)),
         }
+    }
+
+    /// Keep the bytes of the fresh object `object_id`, which this shard has
+    /// just stored, so that polls of its batches need no fetch.
+    pub fn cache_fresh_object(&self, object_id: u128, bytes: Bytes) {
+        self.fresh.borrow_mut().insert(object_id, 0, bytes);
+    }
+
+    /// The bytes at `range` of the fresh object `object_id`: the blob of one
+    /// batch, from memory when this shard holds them and from the store
+    /// otherwise.
+    ///
+    /// An error the store may not repeat is retryable. Anything else is not:
+    /// a missing object, a refusal, or fewer bytes than the range.
+    pub(crate) async fn read_fresh(
+        &self,
+        object_id: u128,
+        range: Range<u64>,
+    ) -> Result<Bytes, DiskFault> {
+        let cached = self.fresh.borrow().get(object_id, &range);
+        if let Some(bytes) = cached {
+            return Ok(bytes);
+        }
+        let key = self.layout.fresh_key(object_id);
+        let object = self
+            .objects
+            .get_range(&key, range.clone())
+            .await
+            .map_err(|error| fault(&key, &error))?;
+        if object.bytes.len() as u64 != range.end - range.start {
+            error!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                key,
+                start = range.start,
+                end = range.end,
+                returned = object.bytes.len(),
+                "poll of a placed batch: the fresh object is shorter than its placement"
+            );
+            return Err(DiskFault::Tiered);
+        }
+        self.fresh
+            .borrow_mut()
+            .insert(object_id, range.start, object.bytes.clone());
+        Ok(object.bytes)
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
@@ -888,6 +990,62 @@ mod tests {
         assert_eq!(read.bytes.as_ref(), b"2345");
         assert_eq!(read.size, 10);
         assert!(matches!(missing, Err(ObjectStoreError::NotFound { .. })));
+    }
+
+    #[test]
+    fn given_a_cached_object_when_asking_for_ranges_should_answer_only_what_one_entry_holds() {
+        let mut cache = FreshCache::new(64);
+        cache.insert(7, 0, Bytes::from_static(b"0123456789"));
+        cache.insert(7, 100, Bytes::from_static(b"abcde"));
+
+        assert_eq!(cache.get(7, &(2..6)).unwrap(), "2345");
+        assert_eq!(cache.get(7, &(0..10)).unwrap(), "0123456789");
+        assert_eq!(cache.get(7, &(101..104)).unwrap(), "bcd");
+        // Past the entry, before it, between two, and of another object.
+        assert_eq!(cache.get(7, &(8..11)), None);
+        assert_eq!(cache.get(7, &(99..102)), None);
+        assert_eq!(cache.get(7, &(10..100)), None);
+        assert_eq!(cache.get(8, &(2..6)), None);
+    }
+
+    #[test]
+    fn given_more_bytes_than_the_budget_when_inserting_should_drop_the_oldest_entries() {
+        let mut cache = FreshCache::new(10);
+        cache.insert(1, 0, Bytes::from_static(b"aaaa"));
+        cache.insert(2, 0, Bytes::from_static(b"bbbb"));
+        cache.insert(3, 0, Bytes::from_static(b"cccc"));
+
+        assert_eq!(cache.get(1, &(0..4)), None);
+        assert_eq!(cache.get(2, &(0..4)).unwrap(), "bbbb");
+        assert_eq!(cache.get(3, &(0..4)).unwrap(), "cccc");
+        assert_eq!(cache.bytes, 8);
+
+        // Larger than the whole budget: not kept, and nothing is dropped for it.
+        cache.insert(4, 0, Bytes::from_static(b"dddddddddddd"));
+        assert_eq!(cache.get(4, &(0..12)), None);
+        assert_eq!(cache.bytes, 8);
+    }
+
+    #[compio::test]
+    async fn given_a_fresh_range_read_once_when_reading_it_again_should_not_ask_the_store() {
+        let store = Rc::new(MemoryStore::new());
+        let layout = KeyLayout::new("iggy").unwrap();
+        store
+            .put(
+                &layout.fresh_key(7),
+                PutBody::from_bytes(Bytes::from_static(b"0123456789")),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let remote = RemoteSegments::new(store.clone(), layout.clone());
+
+        assert_eq!(remote.read_fresh(7, 2..6).await.unwrap(), "2345");
+        let deleted = store.delete(&[layout.fresh_key(7)]).await.unwrap();
+        assert!(deleted.failed.is_empty());
+
+        assert_eq!(remote.read_fresh(7, 2..6).await.unwrap(), "2345");
+        assert_eq!(remote.read_fresh(7, 0..2).await, Err(DiskFault::Tiered));
     }
 
     /// A store that never answers.
