@@ -369,6 +369,7 @@ pub struct ShardMetrics {
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
     partition_segment_upload_lag_seconds: Gauge,
+    partition_long_term_rewrite_lag_messages: Gauge,
     fresh_objects: Gauge,
     fresh_object_bytes: Gauge,
     fresh_object_oldest_age_seconds: Gauge,
@@ -482,6 +483,7 @@ impl ShardMetrics {
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
             partition_segment_upload_lag_seconds: Gauge::default(),
+            partition_long_term_rewrite_lag_messages: Gauge::default(),
             fresh_objects: Gauge::default(),
             fresh_object_bytes: Gauge::default(),
             fresh_object_oldest_age_seconds: Gauge::default(),
@@ -994,6 +996,21 @@ impl ShardMetrics {
         self.fresh_objects_deleted_total.get()
     }
 
+    /// Republished by the pump's tick: the most messages one partition this
+    /// shard leads committed that no long-term segment holds yet, as the
+    /// partition's last rewrite pass found. Zero when none waits.
+    pub fn set_long_term_rewrite_lag(&self, messages: u64) {
+        self.partition_long_term_rewrite_lag_messages
+            .set(i64::try_from(messages).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_rewrite_lag_value(&self) -> i64 {
+        self.partition_long_term_rewrite_lag_messages.get()
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1420,6 +1437,12 @@ impl ShardMetrics {
             "fresh_objects_deleted",
             "fresh objects this replica deleted",
             self.fresh_objects_deleted_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_rewrite_lag_messages",
+            "most messages one partition this shard leads committed that no long-term \
+             segment holds yet, over the partitions that place their batches",
+            self.partition_long_term_rewrite_lag_messages.clone(),
         );
         registry.register(
             "retirement_debts_paid",

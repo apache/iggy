@@ -500,6 +500,31 @@ where
         })
     }
 
+    /// Whether a rewrite this partition started has yet to hand its result
+    /// back.
+    #[must_use]
+    pub const fn segment_rewrite_running(&self) -> bool {
+        self.long_term_rewrites.running.is_some()
+    }
+
+    /// Messages this partition committed that no long-term segment holds.
+    /// Zero on a replica that is not the primary of a partition that places
+    /// its batches: the primary is the one that rewrites them.
+    #[must_use]
+    pub fn long_term_lag(&self) -> u64 {
+        if !self.places_batches()
+            || !self.consensus().is_primary()
+            || !self.holds_committed_messages()
+        {
+            return 0;
+        }
+        let committed = self.offsets().commit_offset.saturating_add(1);
+        let rewritten = self
+            .long_term_floor()
+            .map_or(0, |floor| floor.saturating_add(1));
+        committed.saturating_sub(rewritten)
+    }
+
     /// The rewrite state of the current view. What an earlier view left is
     /// dropped, and its rewrite cancelled.
     fn long_term_rewrites_of_this_view(&mut self) -> &mut LongTermRewrites {
