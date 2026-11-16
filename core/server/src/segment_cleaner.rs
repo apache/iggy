@@ -195,7 +195,9 @@ pub fn stage_owned_partitions(
             should_roll_active_segment(shard, namespace, now, message_expiry, max_bytes)
         {
             let metadata_op = shard.plane.metadata().applied_frontier().get();
-            let request = roll_segment_request(namespace, metadata_op, incarnation, now.into());
+            // Keep retries for the same metadata frontier idempotent while the
+            // replicated command is waiting to commit.
+            let request = roll_segment_request(namespace, metadata_op, incarnation, metadata_op);
             let _ = shard.partition_submit(namespace, request);
         }
         shard.request_clean_partition(namespace, now, message_expiry, max_bytes);
