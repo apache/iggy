@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::error::ObjectStoreError;
+use crate::fresh::FreshObjectId;
 use crate::store::{MAX_KEY_LEN, MAX_KEY_SEGMENTS, validate_key};
 
 const META: &str = "meta";
@@ -24,6 +25,8 @@ const IDENTITY: &str = "identity";
 const FRESH: &str = "fresh";
 /// Hexadecimal digits of a fresh object's id.
 const FRESH_ID_DIGITS: usize = 32;
+/// Hexadecimal digits of the replica in a fresh object's key.
+const FRESH_REPLICA_DIGITS: usize = 2;
 /// Decimal digits of `u64::MAX`: the most that an id takes, and the width of
 /// a zero-padded offset.
 const U64_DIGITS: usize = 20;
@@ -193,13 +196,24 @@ impl KeyLayout {
     /// Fresh objects live under `meta`, which no other root can continue
     /// with. No id of a stream is `fresh`, so no manifest key is under
     /// [`Self::fresh_prefix`].
+    ///
+    /// The key names the replica that wrote the object before the id, which
+    /// names it again. So one listing returns the objects of one replica,
+    /// which is what the replica that deletes them asks for.
     #[must_use]
     pub fn fresh_key(&self, object_id: u128) -> String {
         format!(
             "{}{object_id:0width$x}",
-            self.fresh_prefix(),
+            self.fresh_replica_prefix(FreshObjectId::from_raw(object_id).replica()),
             width = FRESH_ID_DIGITS
         )
+    }
+
+    /// The listing prefix of the fresh objects that `replica` wrote, with a
+    /// trailing `/`.
+    #[must_use]
+    pub fn fresh_replica_prefix(&self, replica: u8) -> String {
+        format!("{}{replica:02x}/", self.fresh_prefix())
     }
 
     /// The listing prefix of every fresh object of the root, with a trailing
@@ -214,11 +228,13 @@ impl KeyLayout {
     /// a key that [`Self::fresh_key`] builds again byte for byte parses.
     #[must_use]
     pub fn parse_fresh_key(&self, key: &str) -> Option<u128> {
-        let id = key.strip_prefix(self.fresh_prefix().as_str())?;
+        let name = key.strip_prefix(self.fresh_prefix().as_str())?;
+        let id = name.get(FRESH_REPLICA_DIGITS + 1..)?;
         let lowercase_hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
-        (id.len() == FRESH_ID_DIGITS && id.bytes().all(lowercase_hex))
+        let id = (id.len() == FRESH_ID_DIGITS && id.bytes().all(lowercase_hex))
             .then(|| u128::from_str_radix(id, 16).ok())
-            .flatten()
+            .flatten()?;
+        (self.fresh_key(id) == key).then_some(id)
     }
 
     /// The segment object that a listed key names, or `None` when this layout
@@ -332,9 +348,15 @@ mod tests {
 
         assert_eq!(
             key,
-            "tenant/iggy/meta/fresh/0000000000000000000000000000001f"
+            "tenant/iggy/meta/fresh/00/0000000000000000000000000000001f"
         );
         assert!(key.starts_with(&layout.fresh_prefix()));
+        let written_by_ten = FreshObjectId::new(10, 2, 3, 4).unwrap().get();
+        let key_of_ten = layout.fresh_key(written_by_ten);
+        assert!(key_of_ten.starts_with("tenant/iggy/meta/fresh/0a/"));
+        assert!(key_of_ten.starts_with(&layout.fresh_replica_prefix(10)));
+        assert!(!key_of_ten.starts_with(&layout.fresh_replica_prefix(1)));
+        assert_eq!(layout.parse_fresh_key(&key_of_ten), Some(written_by_ten));
         assert!(validate_key(&key).is_ok());
         assert_eq!(layout.parse_fresh_key(&key), Some(0x1f));
         assert_eq!(
@@ -353,10 +375,14 @@ mod tests {
             layout.identity_key(),
             layout.manifest_key(&PREFIX),
             other_root.fresh_key(1),
-            "tenant/iggy/meta/fresh/1f".to_owned(),
-            "tenant/iggy/meta/fresh/0000000000000000000000000000001F".to_owned(),
-            "tenant/iggy/meta/fresh/0000000000000000000000000000001f/x".to_owned(),
-            "tenant/iggy/meta/fresh/+000000000000000000000000000001f".to_owned(),
+            "tenant/iggy/meta/fresh/00/1f".to_owned(),
+            "tenant/iggy/meta/fresh/0000000000000000000000000000001f".to_owned(),
+            "tenant/iggy/meta/fresh/00/0000000000000000000000000000001F".to_owned(),
+            "tenant/iggy/meta/fresh/00/0000000000000000000000000000001f/x".to_owned(),
+            "tenant/iggy/meta/fresh/00/+000000000000000000000000000001f".to_owned(),
+            // The id says replica 0 wrote it.
+            "tenant/iggy/meta/fresh/01/0000000000000000000000000000001f".to_owned(),
+            "tenant/iggy/meta/fresh/0A/0000000000000000000000000000001f".to_owned(),
         ] {
             assert_eq!(layout.parse_fresh_key(&key), None, "{key}");
         }
