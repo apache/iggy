@@ -38,6 +38,10 @@ use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::metadata_changes::{MetadataChangeGroup, MetadataChangeStart, MetadataChanges};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
+use crate::page::{
+    ConsumerGroupsPage, PageOrder, PartitionsPage, StreamsPage, TopicsPage, UsersPage,
+    named_page_query, page_query,
+};
 use crate::pending_poll::PendingPoll;
 use crate::poll_options::PollOptions;
 use crate::reader::PartitionReader;
@@ -284,6 +288,10 @@ impl IggyClient {
     }
 
     /// Gets a stream by id or name.
+    ///
+    /// Over TCP, QUIC and WebSocket, a stream with too many topics for one reply throws
+    /// ReplyTooLarge (97), and the connection stays usable. getTopicsPage() reads its topics
+    /// page by page.
     pub fn get_stream(&self, stream_id: PhpIdentifier) -> PhpResult<Option<StreamDetails>> {
         let stream_id: Identifier = stream_id.try_into()?;
         let inner = self.inner.clone();
@@ -545,6 +553,10 @@ impl IggyClient {
     }
 
     /// Gets a topic by stream and topic id/name.
+    ///
+    /// Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
+    /// ReplyTooLarge (97), and the connection stays usable. getPartitionsPage() reads its
+    /// partitions page by page.
     pub fn get_topic(
         &self,
         stream_id: PhpIdentifier,
@@ -559,6 +571,140 @@ impl IggyClient {
                 .get_topic(&stream_id, &topic_id)
                 .await
                 .map(|topic| topic.map(TopicDetails::from))
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the streams.
+    ///
+    /// `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
+    /// 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
+    /// page. `name` keeps the streams whose name holds the text, case-sensitive, and is 1 to
+    /// 255 bytes. A query outside these ranges, or a cursor text that the client cannot read,
+    /// throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor
+    /// that does not fit the query with the same error, which HTTP reports as code 300. A
+    /// `limit` that is not an integer, or that does not fit an unsigned 32-bit integer, throws
+    /// `IggyException` with code 0 from the argument check.
+    #[php(defaults(descending = false))]
+    pub fn get_streams_page(
+        &self,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<StreamsPage> {
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_streams_page(&query)
+                .await
+                .map(StreamsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the topics of a stream. A missing stream gives an empty page without
+    /// `next`. The other arguments are those of getStreamsPage().
+    #[php(defaults(descending = false))]
+    pub fn get_topics_page(
+        &self,
+        stream_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<TopicsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_topics_page(&stream_id, &query)
+                .await
+                .map(TopicsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the partitions of a topic. Partition ids follow creation, so both
+    /// orders walk by id. The other arguments are those of getStreamsPage() except `name`,
+    /// because a partition has no name.
+    #[php(defaults(descending = false))]
+    pub fn get_partitions_page(
+        &self,
+        stream_id: PhpIdentifier,
+        topic_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+    ) -> PhpResult<PartitionsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
+        let query = page_query(order, descending, limit, cursor)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_partitions_page(&stream_id, &topic_id, &query)
+                .await
+                .map(PartitionsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the consumer groups of a topic. Group ids follow creation, so both
+    /// orders walk by id. The other arguments are those of getStreamsPage().
+    #[allow(clippy::too_many_arguments)]
+    #[php(defaults(descending = false))]
+    pub fn get_consumer_groups_page(
+        &self,
+        stream_id: PhpIdentifier,
+        topic_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<ConsumerGroupsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_consumer_groups_page(&stream_id, &topic_id, &query)
+                .await
+                .map(ConsumerGroupsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the users, and `name` matches the username. The other arguments are
+    /// those of getStreamsPage().
+    #[php(defaults(descending = false))]
+    pub fn get_users_page(
+        &self,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<UsersPage> {
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_users_page(&query)
+                .await
+                .map(UsersPage::from)
                 .map_err(to_php_exception)
         })
     }

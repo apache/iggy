@@ -220,10 +220,13 @@ public sealed class HttpTopicOptionsTests
 
         internal string RequestPath { get; private set; } = string.Empty;
 
+        internal string RequestQuery { get; private set; } = string.Empty;
+
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
             CancellationToken ct)
         {
             RequestPath = request.RequestUri?.AbsolutePath ?? string.Empty;
+            RequestQuery = request.RequestUri?.Query ?? string.Empty;
             if (request.Content is not null)
             {
                 RequestBody = await request.Content.ReadAsStringAsync(ct);

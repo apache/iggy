@@ -130,22 +130,3 @@ export const deserializeUser = (p: Buffer, pos = 0): User => {
 
   return { ...data, permissions };
 };
-
-
-/**
- * Deserializes multiple base users from a buffer.
- *
- * @param p - Buffer containing serialized users data
- * @param pos - Starting position in the buffer
- * @returns Array of deserialized base users
- */
-export const deserializeUsers = (p: Buffer, pos = 0): BaseUser[] => {
-  const users = [];
-  const end = p.length;
-  while (pos < end) {
-    const { bytesRead, data } = deserializeBaseUser(p, pos);
-    users.push(data);
-    pos += bytesRead;
-  }
-  return users;
-};

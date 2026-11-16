@@ -31,12 +31,14 @@ use consensus::MetadataHandle;
 use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PARTITIONS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
+use iggy_binary_protocol::requests::partitions::GetPartitionsRequest;
 use iggy_binary_protocol::requests::streams::GetStreamRequest;
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::GetUserRequest;
@@ -360,6 +362,14 @@ where
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_topic,
         ),
+        // A partitions page shows what GetTopic shows about each partition.
+        GET_PARTITIONS_CODE => gate_topic_scoped::<GetPartitionsRequest, _, _, _, _>(
+            shard,
+            user_id,
+            body,
+            |request| (&request.stream_id, &request.topic_id),
+            Permissioner::get_topic,
+        ),
         GET_CONSUMER_GROUP_CODE => gate_topic_scoped::<GetConsumerGroupRequest, _, _, _, _>(
             shard,
             user_id,
@@ -591,6 +601,7 @@ mod tests {
             (GET_STREAMS_CODE, unauthenticated, allow),
             (GET_TOPIC_CODE, allow, allow),
             (GET_TOPICS_CODE, allow, allow),
+            (GET_PARTITIONS_CODE, allow, allow),
             (GET_CONSUMER_GROUP_CODE, allow, allow),
             (GET_CONSUMER_GROUPS_CODE, allow, allow),
             (SYNC_CONSUMER_GROUP_CODE, invalid_command, invalid_command),

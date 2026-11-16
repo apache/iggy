@@ -27,12 +27,13 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicOptions;
 import org.apache.iggy.topic.TopicUpdate;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -87,21 +88,13 @@ public class TopicsTcpClient implements TopicsClient {
 
     @Override
     public CompletableFuture<List<Topic>> getTopics(StreamId streamId) {
-        var payload = toBytes(streamId);
+        return PageReads.readWholeList(
+                connectionSupplier, CommandCode.Topic.GET_ALL, BytesDeserializer::readTopic, streamId);
+    }
 
-        return AsyncTcpConnection.mapResponse(
-                connection().send(CommandCode.Topic.GET_ALL.getValue(), payload), response -> {
-                    try {
-                        var topicsCount = response.readUnsignedIntLE();
-                        List<Topic> topics = new ArrayList<>(Math.toIntExact(topicsCount));
-                        for (long i = 0; i < topicsCount; i++) {
-                            topics.add(BytesDeserializer.readTopic(response));
-                        }
-                        return topics;
-                    } finally {
-                        response.release();
-                    }
-                });
+    @Override
+    public CompletableFuture<Page<Topic>> getTopicsPage(StreamId streamId, NamedPageQuery query) {
+        return PageReads.read(connection(), CommandCode.Topic.GET_ALL, query, BytesDeserializer::readTopic, streamId);
     }
 
     @Override
