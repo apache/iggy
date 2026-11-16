@@ -54,7 +54,7 @@ use server_common::send_messages::{
 use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a window stays open after its first send.
 pub const FRESH_WINDOW: Duration = Duration::from_millis(50);
@@ -82,6 +82,10 @@ pub struct PlacedSend {
 pub struct FinishedFreshUpload {
     pub sends: Vec<PlacedSend>,
     pub outcome: FreshUploadOutcome,
+    /// Bytes of the object.
+    pub size: u64,
+    /// The bus's monotonic clock when the upload started.
+    pub started_at: u64,
 }
 
 /// The sends that wait for one fresh object.
@@ -273,14 +277,22 @@ where
         let scope = self.fresh_writes.scope.token();
         let undelivered = Rc::clone(&self.fresh_writes.undelivered);
         let Window {
-            id, object, sends, ..
+            id,
+            object,
+            sends,
+            opened_at,
         } = window;
+        self.metrics
+            .record_fresh_window_wait(Duration::from_micros(now.saturating_sub(opened_at)));
+        let size = object.len();
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
         self.bus.spawn(async move {
             let finished = Box::new(FinishedFreshUpload {
                 sends,
                 outcome: uploader.upload(id, object.into_bytes(), scope).await,
+                size,
+                started_at: now,
             });
             let frame = ShardFrame::lifecycle(LifecycleFrame::FreshUploadFinished(finished));
             // The producers of the window wait for this result, so a refused
@@ -336,6 +348,15 @@ where
             }
             Err(_) => false,
         };
+        self.metrics.record_fresh_upload(
+            finished.size,
+            Duration::from_micros(
+                self.bus
+                    .monotonic_micros()
+                    .saturating_sub(finished.started_at),
+            ),
+            stored,
+        );
         for PlacedSend { request, reply } in finished.sends {
             if !stored {
                 Self::answer_partition_submit_deny(
@@ -352,8 +373,11 @@ where
                 .await;
             // Awaited off the pump, as for any other submit: the commit that
             // fires the receiver needs the pump to keep draining acks.
+            let commit_latency = self.metrics.fresh_commit_latency();
+            let handed_at = Instant::now();
             self.bus.spawn(async move {
                 let committed = receiver.await.ok().map(Message::into_generic);
+                commit_latency.observe(handed_at.elapsed().as_secs_f64());
                 let _ = reply.try_send(committed);
             });
         }
