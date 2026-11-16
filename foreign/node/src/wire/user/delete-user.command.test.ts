@@ -15,23 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use async_trait::async_trait;
-use iggy_common::{Identifier, IggyError, SegmentClient};
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { DELETE_USER } from './delete-user.command.js';
 
-#[async_trait]
-impl SegmentClient for ClientWrapper {
-    async fn delete_segments(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: u32,
-        segments_count: u32,
-    ) -> Result<(), IggyError> {
-        super::dispatch_client!(
-            self,
-            SegmentClient::delete_segments(stream_id, topic_id, partition_id, segments_count)
-        )
-        .await
-    }
-}
+describe('DeleteUser', () => {
+
+  describe('serialize', () => {
+
+    it('serialize numeric identifier', () => {
+      const expected = Buffer.from([1, 4, 0x39, 0x30, 0, 0]);
+      assert.deepEqual(DELETE_USER.serialize({ userId: 12345 }), expected);
+    });
+
+    it('serialize string identifier', () => {
+      const expected = Buffer.from([2, 4, 0x62, 0x6f, 0x62, 0x31]);
+      assert.deepEqual(DELETE_USER.serialize({ userId: 'bob1' }), expected);
+    });
+
+  });
+});

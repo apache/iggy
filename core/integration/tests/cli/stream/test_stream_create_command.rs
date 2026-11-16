@@ -17,12 +17,13 @@
 
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+    printed_id,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use iggy::prelude::{Client, StreamEncryptionKey, StreamEncryptionSource};
+use iggy::prelude::{Client, StreamCreateOptions, StreamEncryptionKey, StreamEncryptionSource};
 use iggy_common::ServerKeyContext;
 use integration::harness::{EncryptionConfig, TestServerConfig};
 use predicates::prelude::PredicateBooleanExt;
@@ -30,6 +31,7 @@ use predicates::str::{contains, diff, starts_with};
 use serial_test::parallel;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 pub(super) const SERVER_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
@@ -38,6 +40,7 @@ const STREAM_KEY_ENV: &str = "IGGY_STREAM_ENCRYPTION_KEY";
 struct TestStreamCreateCmd {
     stream_id: Option<u32>,
     stream_name: String,
+    printed_id: OnceLock<u32>,
 }
 
 impl TestStreamCreateCmd {
@@ -45,7 +48,12 @@ impl TestStreamCreateCmd {
         Self {
             stream_id,
             stream_name: name,
+            printed_id: OnceLock::new(),
         }
+    }
+
+    fn neighbor_name(&self) -> String {
+        format!("{}-neighbor", self.stream_name)
     }
 
     fn to_args(&self) -> Vec<String> {
@@ -64,7 +72,13 @@ impl TestStreamCreateCmd {
 
 #[async_trait]
 impl IggyCmdTestCase for TestStreamCreateCmd {
-    async fn prepare_server_state(&mut self, _client: &dyn Client) {}
+    // A stream that already exists takes ID 0, so the new stream gets a nonzero ID.
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        client
+            .create_stream(&self.neighbor_name(), &StreamCreateOptions::default())
+            .await
+            .expect("create neighbor stream");
+    }
 
     fn get_command(&self) -> IggyCmdCommand {
         IggyCmdCommand::new()
@@ -75,11 +89,15 @@ impl IggyCmdTestCase for TestStreamCreateCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let stream_id = "ID auto incremented";
+        let name = &self.stream_name;
+        let id = printed_id(
+            &command_state,
+            &format!("Stream with name: {name} and ID: "),
+        );
+        self.printed_id.set(id).expect("verify_command runs once");
 
         let message = format!(
-            "Executing create stream with name: {} and {}\nStream with name: {} and {} created\n",
-            self.stream_name, stream_id, self.stream_name, stream_id
+            "Executing create stream with name: {name}\nStream with name: {name} and ID: {id} created\n"
         );
 
         command_state.success().stdout(diff(message));
@@ -92,11 +110,16 @@ impl IggyCmdTestCase for TestStreamCreateCmd {
         assert!(stream.is_ok());
         let stream = stream.unwrap().expect("Stream not found");
         assert_eq!(stream.name, self.stream_name);
+        assert_eq!(self.printed_id.get().copied(), Some(stream.id));
 
         let delete = client
             .delete_stream(&self.stream_name.clone().try_into().unwrap())
             .await;
         assert!(delete.is_ok());
+        client
+            .delete_stream(&self.neighbor_name().try_into().unwrap())
+            .await
+            .expect("delete neighbor stream");
     }
 }
 
@@ -171,24 +194,31 @@ impl IggyCmdTestCase for TestStreamCreateWithKeyCmd {
 
     fn verify_command(&self, command_state: Assert) {
         let name = &self.stream_name;
-        let created = format!(
-            "Executing create stream with name: {name} and ID auto incremented\n\
-             Stream with name: {name} and ID auto incremented created\n"
-        );
+        let id_prefix = format!("Stream with name: {name} and ID: ");
+        let created = |id| {
+            format!(
+                "Executing create stream with name: {name}\n\
+                 Stream with name: {name} and ID: {id} created\n"
+            )
+        };
         let mut command_state = match self.expected_key() {
             ExpectedKey::Stream(key) => {
                 let kek_fingerprint = ServerKeyContext::from_config(SERVER_KEY, &[], true)
                     .expect("server key")
                     .kek_fingerprint()
                     .expect("KEK fingerprint");
+                let created = created(printed_id(&command_state, &id_prefix));
                 command_state.success().stdout(diff(format!(
                     "{created}Stream encryption key source: stream, fingerprint: {}, KEK fingerprints: {kek_fingerprint}\n",
                     key.fingerprint()
                 )))
             }
-            ExpectedKey::Generated => command_state.success().stdout(starts_with(format!(
-                "{created}Stream encryption key source: server, fingerprint: "
-            ))),
+            ExpectedKey::Generated => {
+                let created = created(printed_id(&command_state, &id_prefix));
+                command_state.success().stdout(starts_with(format!(
+                    "{created}Stream encryption key source: server, fingerprint: "
+                )))
+            }
             ExpectedKey::Refused => command_state.failure().stderr(contains(
                 "Stream encryption key must be standard base64 of exactly 32 bytes",
             )),
@@ -286,6 +316,12 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestStreamCreateCmd::new(None, String::from("prod")))
+        .await;
+
+    // The legacy -s flag is ignored, so the output shows the ID from the server.
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestStreamCreateCmd::new(Some(7), String::from("legacy")))
         .await;
 }
 

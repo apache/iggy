@@ -116,7 +116,7 @@ try {
 
   // DELETE TOPIC
   const r_deleteTopic = await deleteTopic(s)({
-    streamId: topic1.streamId, topicId: t2.id, partitionsCount: 3
+    streamId: topic1.streamId, topicId: t2.id
   });
   console.log('RESPONSE_deleteTopic', r_deleteTopic);
 
