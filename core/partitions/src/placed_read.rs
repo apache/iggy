@@ -34,6 +34,7 @@
 //! both hold is taken once, from the long-term segment.
 
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Instant;
 
 use compio::fs::File;
@@ -275,10 +276,17 @@ impl PlacedReadPlan {
     }
 
     /// One wait on the object store, which ends at the poll's deadline.
+    ///
+    /// A read that this shard answers from memory is ready at once, and most
+    /// reads at the tail are. It takes no timer.
     async fn wait<T>(
         &self,
         read: impl Future<Output = Result<T, DiskFault>>,
     ) -> Result<T, DiskFault> {
+        let mut read = std::pin::pin!(read);
+        if let Poll::Ready(read) = futures::poll!(read.as_mut()) {
+            return read;
+        }
         let now = Instant::now();
         match self.deadline {
             None => read.await,
