@@ -108,6 +108,12 @@ where
         if partition.created_revision() != created_revision {
             return;
         }
+        // A reader of the manifest must never find a segment it lists
+        // missing, so the manifest stops listing a segment before its
+        // objects go.
+        if self.manifest_publisher.borrow().is_some() && partition.object_deletes_await_manifest() {
+            return;
+        }
         let Some((job, scope)) = partition.begin_object_delete(now, committed_up_to) else {
             return;
         };

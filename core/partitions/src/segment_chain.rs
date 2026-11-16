@@ -27,8 +27,6 @@
 //! A torn last record is a crash mid-append. Any other record that does not
 //! decode refuses the whole file: read as absent, it would drop a segment from
 //! the chain without a trace.
-//!
-//! No partition enables a chain yet, so nothing in production writes one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1169,6 +1167,15 @@ impl SegmentChain {
             records,
             torn_tail: false,
         }
+    }
+
+    /// The sealed segments the store holds exactly as this replica records
+    /// them, in offset order: the run from the front whose hash a floor
+    /// advance matched.
+    pub(crate) fn stored_segments(&self) -> impl Iterator<Item = &SegmentRecord> {
+        self.sealed
+            .values()
+            .take_while(|segment| self.confirmed.contains(&segment.start_offset))
     }
 
     /// The trim point retention appends before it unlinks the segment ending at

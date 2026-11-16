@@ -211,6 +211,9 @@ where
     object_deletes: ObjectDeletes,
     /// Number of the last object-delete job this partition started.
     object_delete_jobs: u64,
+    /// What this replica publishes of the partition's manifest while it is
+    /// the primary.
+    pub(crate) manifest_publishes: crate::manifest_publish::ManifestPublishes,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1033,6 +1036,7 @@ where
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
             object_delete_jobs: 0,
+            manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -6051,6 +6055,11 @@ where
     /// Hand polls the store that holds this partition's remote segments.
     pub fn set_remote_segments(&mut self, remote: Rc<crate::RemoteSegments>) {
         self.remote_segments = Some(remote);
+    }
+
+    #[must_use]
+    pub const fn has_remote_segments(&self) -> bool {
+        self.remote_segments.is_some()
     }
 
     /// [`Self::build_poll_plan`] for a poll whose reply holds at most
@@ -13672,7 +13681,7 @@ where
     /// Whether this replica is the one that deletes the partition's objects:
     /// the primary of a tiered partition that applied the view it started,
     /// as for [`Self::total_retention_end`].
-    fn deletes_objects(&self) -> bool {
+    pub(crate) fn deletes_objects(&self) -> bool {
         let consensus = &self.consensus;
         self.is_tiered()
             && consensus.is_primary()

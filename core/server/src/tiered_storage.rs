@@ -26,13 +26,16 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use configs::tiered_storage::{S3UrlStyle, TieredStorageBackend, TieredStorageConfig};
+use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::IggyByteSize;
 use iggy_object_store::s3::{S3Config, S3Store, SharedCredentials, UrlStyle};
 use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, ObjectStoreError, StoreIdentity,
 };
 use message_bus::IggyMessageBus;
-use partitions::{ExecutorDeleter, ExecutorUploader};
+use partitions::{
+    ExecutorDeleter, ExecutorManifestPublisher, ExecutorObjects, ExecutorUploader, RemoteSegments,
+};
 use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
 use shard::{Sender, channel};
 use tracing::{info, warn};
@@ -117,6 +120,10 @@ pub fn probe(
 /// its segment uploader and object deleter only while its node passes the
 /// check. Shard 0 runs the check itself, and the other shards follow it.
 ///
+/// The partitions of the shard read their remote segments through the
+/// service from here on, which is what lets the node report that it can
+/// tier topics.
+///
 /// Returns the stop signal of the check's task, or `None` without a backend.
 pub fn start(
     config: &TieredStorageConfig,
@@ -129,9 +136,22 @@ pub fn start(
     let backend = store(config, credentials).ok().flatten()?;
     let layout = layout(config).ok()?;
     let service = TierService::new(backend, Rc::clone(bus), &service_config(config));
+    shard
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(service.clone())),
+            layout.clone(),
+        )));
+    shard
+        .plane
+        .metadata()
+        .applied_frontier()
+        .set_tiered_storage_ready(true);
     let handlers = TierHandlers::new(
         Rc::new(ExecutorUploader::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorDeleter::new(service, layout.clone())),
+        Rc::new(ExecutorDeleter::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorManifestPublisher::new(service, layout.clone())),
     );
     // The check gets a store of its own, outside the service, so no queued
     // job and no retry delays what it finds.
@@ -148,8 +168,8 @@ pub fn start(
             backend = %config.backend,
             store = %store_location(config),
             prefix = %config.prefix,
-            "tier service started; uploads and object deletes wait for the store identity \
-             check, and tiering stays off, as this version cannot read evicted segments back"
+            "tier service started; uploads, object deletes and the tiering of topics wait for \
+             the store identity check"
         );
     }
     let (stop_tx, stop_rx) = channel(1);

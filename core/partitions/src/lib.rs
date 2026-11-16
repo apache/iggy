@@ -43,7 +43,7 @@ pub use persistence::{
 };
 pub use repair_memory::RepairMemoryBudget;
 mod remote_segments;
-pub use remote_segments::{RemoteObjects, RemoteRange, RemoteSegments};
+pub use remote_segments::{ExecutorObjects, RemoteObjects, RemoteRange, RemoteSegments};
 mod object_delete;
 mod segment;
 pub mod segment_anchor;
@@ -54,6 +54,10 @@ pub use object_delete::{
     ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
     ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects, delete_incarnation, delete_objects,
     delete_segments, list_segment_starts, sweep_segments, sweepable,
+};
+mod manifest_publish;
+pub use manifest_publish::{
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
 };
 pub use segment_chain::object_prefix;
 pub use segment_upload::{

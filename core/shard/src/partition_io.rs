@@ -11409,6 +11409,7 @@ mod tests {
         }
     }
 
+    mod manifest_publishes;
     mod object_deletes;
     mod segment_uploads;
     mod tier_service_uploads;
