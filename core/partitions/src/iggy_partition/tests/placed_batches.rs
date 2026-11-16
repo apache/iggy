@@ -458,3 +458,103 @@ async fn given_a_placing_partition_when_a_poll_completes_should_refuse_it_as_una
 
     assert!(matches!(completed, Err(IggyError::FeatureUnavailable)));
 }
+
+/// A placing partition whose segments fit two placed batches.
+async fn placing_partition_of_small_segments() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>)
+{
+    let (directory, mut partition) = Box::pin(placing_partition()).await;
+    partition.runtime_options.segment_size = Some(placed_segment_size());
+    partition.log.active_segment_mut().max_size = placed_segment_size();
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    (directory, partition)
+}
+
+#[compio::test]
+async fn given_a_placing_origin_when_a_placing_replica_installs_its_offer_should_hold_the_same_placed_batches()
+ {
+    let (origin_directory, mut origin) = Box::pin(placing_partition_of_small_segments()).await;
+    let (records, placements) = placed_records(5);
+    Box::pin(commit_records(&mut origin, 1, &records)).await;
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    let (receiver_directory, mut receiver) = Box::pin(placing_partition_of_small_segments()).await;
+
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+
+    assert_eq!(
+        segment_file_bytes(receiver_directory.path()),
+        segment_file_bytes(origin_directory.path())
+    );
+    let installed: Vec<_> = segment_file_bytes(receiver_directory.path())
+        .iter()
+        .flat_map(|bytes| placed_batches_in(bytes))
+        .collect();
+    assert_eq!(installed.len(), 5);
+    for (index, (placed, placement)) in installed.iter().zip(&placements).enumerate() {
+        assert_eq!(placed.header.base_offset, index as u64);
+        assert_eq!(placed.placement, *placement);
+    }
+    let starts: Vec<_> = receiver
+        .log
+        .segments()
+        .iter()
+        .map(|segment| (segment.start_offset, segment.end_offset))
+        .collect();
+    assert_eq!(starts, [(0, 1), (2, 3), (4, 4)]);
+}
+
+/// The offer of a placing origin that committed `count` placed batches. The
+/// origin is dropped, and its directory holds the segments the offer names.
+async fn placed_offer(
+    count: u64,
+) -> (
+    tempfile::TempDir,
+    Rc<crate::state_transfer::PartitionStateTransferOffer>,
+) {
+    let (directory, mut origin) = Box::pin(placing_partition_of_small_segments()).await;
+    let (records, _) = placed_records(count);
+    Box::pin(commit_records(&mut origin, 1, &records)).await;
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    (directory, offer)
+}
+
+/// A replica walks a transferred segment as what its own segments hold, so
+/// placed batches never land in a partition of whole batches.
+#[compio::test]
+async fn given_a_placing_origin_when_a_replica_of_whole_batches_spills_its_segment_should_refuse_it()
+ {
+    let (_origin_directory, offer) = Box::pin(placed_offer(2)).await;
+    let config = repair_config();
+    let (_receiver_directory, receiver) =
+        Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
+    let entry = offer.segments[0].entry;
+    let bytes = offered_segment_bytes(&offer).remove(0);
+
+    let spilled = Box::pin(receiver.spill_transfer_segment(&entry, bytes, None)).await;
+
+    assert!(matches!(
+        spilled,
+        Err(crate::state_transfer::SpillError::Walk(_))
+    ));
+}
+
+#[compio::test]
+async fn given_a_damaged_placed_batch_in_a_transferred_segment_when_spilling_should_refuse_it() {
+    let (_origin_directory, offer) = Box::pin(placed_offer(2)).await;
+    let (_receiver_directory, receiver) = Box::pin(placing_partition_of_small_segments()).await;
+    let mut entry = offer.segments[0].entry;
+    let mut bytes = offered_segment_bytes(&offer).remove(0);
+    // Inside the second placement, with a checksum that covers the damage, so
+    // only the walk can tell.
+    bytes[PLACED_BATCH_SIZE + COMMAND_HEADER_SIZE + 16] ^= 1;
+    entry.checksum = consensus::state_artifact_checksum(&bytes);
+
+    let spilled = Box::pin(receiver.spill_transfer_segment(&entry, bytes, None)).await;
+
+    assert!(matches!(
+        spilled,
+        Err(crate::state_transfer::SpillError::Walk(_))
+    ));
+}

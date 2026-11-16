@@ -53,6 +53,7 @@ use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
 use iggy_binary_protocol::batch::BatchProducer;
+use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::requests::partitions::retire_consumer_group_owners::CONSUMER_GROUP_OWNERS_MAX;
 use iggy_binary_protocol::requests::partitions::{
     InstallConsumerGroupOwnerRequest, RetireConsumerGroupOwnersRequest,
@@ -1412,8 +1413,9 @@ impl std::error::Error for SegmentWalkError {}
 pub(crate) async fn walk_segment_payload(
     base_offset: u64,
     bytes: &[u8],
+    placed: bool,
 ) -> Result<(SegmentWalkStats, Vec<u8>), SegmentWalkError> {
-    let mut walk = SegmentWalk::new(base_offset);
+    let mut walk = SegmentWalk::new(base_offset, placed);
     walk.advance(bytes).await?;
     walk.finish()
 }
@@ -1421,6 +1423,10 @@ pub(crate) async fn walk_segment_payload(
 /// A walk that stops at the end of the bytes it was given and resumes there,
 /// so a seeded prefix and the suffix that completes it are each walked once.
 pub(crate) struct SegmentWalk {
+    /// Whether the payload holds placed batches: the segment of a partition
+    /// that places its batches. Each one passes its own checksum, where a
+    /// whole batch passes its batch and message checksums.
+    placed: bool,
     base_offset: u64,
     /// Payload bytes walked so far.
     position: usize,
@@ -1431,8 +1437,9 @@ pub(crate) struct SegmentWalk {
 }
 
 impl SegmentWalk {
-    pub(crate) const fn new(base_offset: u64) -> Self {
+    pub(crate) const fn new(base_offset: u64, placed: bool) -> Self {
         Self {
+            placed,
             base_offset,
             position: 0,
             next_offset: base_offset,
@@ -1461,13 +1468,23 @@ impl SegmentWalk {
                 since_yield = 0;
                 yield_to_reactor().await;
             }
-            let batch = decode_batch_slice(&bytes[self.position..]).map_err(|source| {
-                SegmentWalkError::Batch {
-                    position: self.position as u64,
-                    source,
-                }
-            })?;
-            let header = batch.header;
+            let (header, stored_len) = if self.placed {
+                let placed = PlacedBatch::decode(&bytes[self.position..]).map_err(|_| {
+                    SegmentWalkError::Batch {
+                        position: self.position as u64,
+                        source: iggy_common::IggyError::InvalidCommand,
+                    }
+                })?;
+                (placed.header, PLACED_BATCH_SIZE)
+            } else {
+                let batch = decode_batch_slice(&bytes[self.position..]).map_err(|source| {
+                    SegmentWalkError::Batch {
+                        position: self.position as u64,
+                        source,
+                    }
+                })?;
+                (batch.header, batch.header.total_size())
+            };
             if self.stats.is_none() && header.base_offset != self.base_offset {
                 return Err(SegmentWalkError::BaseOffsetMismatch {
                     expected: self.base_offset,
@@ -1546,8 +1563,8 @@ impl SegmentWalk {
             // at the 256-byte command header (no zero-step loop is possible)
             // and `decode_batch_slice` already rejects a body shorter than
             // `total_size()`.
-            self.position += header.total_size();
-            since_yield += header.total_size();
+            self.position += stored_len;
+            since_yield += stored_len;
         }
         Ok(())
     }
@@ -3257,6 +3274,7 @@ where
             memo.adopted.remove(&entry.frontier);
         }
         Ok(SegmentSpillJob {
+            placed: self.places_batches(),
             partition_dir,
             entry: *entry,
             bytes,
@@ -3355,6 +3373,7 @@ where
             .map(|(entry, index)| (index, *entry, self.held_segment(entry)))
             .collect();
         Some(ReuseScanJob {
+            placed: self.places_batches(),
             partition_dir,
             namespace_raw: self.consensus().group(),
             memoized,
@@ -3483,9 +3502,10 @@ where
                 else {
                     return false;
                 };
+                let placed = self.places_batches();
                 let read =
                     self.spawn_local_work(prefix_read_stopped, move |cancelled| async move {
-                        read_segment_prefix(&log_path, entry, len, &cancelled).await
+                        read_segment_prefix(&log_path, entry, len, placed, &cancelled).await
                     });
                 if let Some(session) = self.transfer.as_mut() {
                     session.seed = Some(PrefixSeed::Reading { artifact, read });
@@ -5220,6 +5240,7 @@ pub(crate) async fn read_segment_prefix(
     log_path: &str,
     entry: consensus::StateArtifact,
     len: u64,
+    placed: bool,
     cancelled: &Cell<bool>,
 ) -> std::io::Result<(Vec<u8>, SeededPrefix)> {
     let capacity = usize::try_from(entry.len).map_err(std::io::Error::other)?;
@@ -5240,7 +5261,7 @@ pub(crate) async fn read_segment_prefix(
         hash_segment_range(log_path, position, end, &mut hasher, Some(&mut bytes)).await?;
         position = end;
     }
-    let mut walk = SegmentWalk::new(entry.frontier);
+    let mut walk = SegmentWalk::new(entry.frontier, placed);
     let walk = walk.advance(&bytes).await.is_ok().then_some(walk);
     Ok((bytes, SeededPrefix { len, hasher, walk }))
 }
@@ -5286,6 +5307,8 @@ const fn segment_spill_stopped() -> Result<SpilledSegment, SpillError> {
 }
 
 struct SegmentSpillJob {
+    /// Whether the segment holds placed batches.
+    placed: bool,
     partition_dir: String,
     entry: consensus::StateArtifact,
     bytes: Vec<u8>,
@@ -5298,6 +5321,7 @@ impl SegmentSpillJob {
             return Err(SpillError::Cancelled);
         }
         let Self {
+            placed,
             partition_dir,
             entry,
             bytes,
@@ -5328,7 +5352,7 @@ impl SegmentSpillJob {
                 frontier: entry.frontier,
             });
         }
-        let mut walk = walk.unwrap_or_else(|| SegmentWalk::new(entry.frontier));
+        let mut walk = walk.unwrap_or_else(|| SegmentWalk::new(entry.frontier, placed));
         walk.advance(&bytes).await.map_err(SpillError::Walk)?;
         let (stats, index_bytes) = walk.finish().map_err(SpillError::Walk)?;
         if cancelled.get() {
@@ -5382,6 +5406,8 @@ impl SegmentSpillJob {
 /// A reuse scan that a detached task runs. It holds no partition state, so
 /// the pump runs while it does.
 struct ReuseScanJob {
+    /// Whether the segments hold placed batches.
+    placed: bool,
     partition_dir: String,
     namespace_raw: u64,
     memoized: BTreeMap<u64, StagedSegmentMeta>,
@@ -5457,7 +5483,7 @@ impl ReuseScanJob {
     ) -> Option<StagedSegmentMeta> {
         if let Some(held) = held
             && let Some(meta) = held
-                .link(&self.partition_dir, entry, self.namespace_raw)
+                .link(&self.partition_dir, entry, self.namespace_raw, self.placed)
                 .await
         {
             return Some(meta);
@@ -5475,7 +5501,7 @@ impl ReuseScanJob {
         if !verify_state_artifact_yielding(entry, &bytes).await {
             return None;
         }
-        adopt_staged_segment(&self.partition_dir, entry, &bytes)
+        adopt_staged_segment(&self.partition_dir, entry, &bytes, self.placed)
             .await
             .ok()
     }
@@ -5499,6 +5525,7 @@ impl HeldSegment {
         partition_dir: &str,
         entry: &consensus::StateArtifact,
         namespace_raw: u64,
+        placed: bool,
     ) -> Option<StagedSegmentMeta> {
         let log_metadata = compio::fs::metadata(&self.log_path).await.ok()?;
         // The install opens the log at exactly the manifest length.
@@ -5521,7 +5548,7 @@ impl HeldSegment {
             );
             return None;
         }
-        let mut meta = adopt_staged_segment(partition_dir, entry, &bytes)
+        let mut meta = adopt_staged_segment(partition_dir, entry, &bytes, placed)
             .await
             .ok()?;
         meta.linked = true;
@@ -5544,8 +5571,9 @@ async fn adopt_staged_segment(
     partition_dir: &str,
     entry: &consensus::StateArtifact,
     bytes: &[u8],
+    placed: bool,
 ) -> Result<StagedSegmentMeta, SpillError> {
-    let (stats, index_bytes) = walk_segment_payload(entry.frontier, bytes)
+    let (stats, index_bytes) = walk_segment_payload(entry.frontier, bytes, placed)
         .await
         .map_err(SpillError::Walk)?;
     let (log_staging, index_staging) = staging_paths(partition_dir, entry.frontier);

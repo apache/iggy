@@ -350,6 +350,7 @@ async fn given_a_held_prefix_when_spilling_the_artifact_should_stage_what_a_whol
         held.to_str().unwrap(),
         artifact,
         prefix_len as u64,
+        false,
         &Cell::new(false),
     )
     .await
@@ -395,6 +396,7 @@ async fn given_a_held_prefix_with_other_bytes_when_spilling_should_fail_the_chec
         held.to_str().unwrap(),
         artifact,
         prefix_len as u64,
+        false,
         &Cell::new(false),
     )
     .await
