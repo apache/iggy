@@ -22,6 +22,10 @@ pub mod host;
 pub mod metrics;
 mod partition_io;
 pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
+mod fresh_writes;
+pub use fresh_writes::{
+    FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_WINDOW, FinishedFreshUpload, PlacedSend,
+};
 mod manifest_publishes;
 mod object_deletes;
 mod poll;
@@ -1245,6 +1249,9 @@ pub enum LifecycleFrame {
     /// The result of a publish that a [`Self::PublishManifest`] pass started,
     /// sent by the task that ran it.
     ManifestPublishFinished(Box<FinishedManifestPublish>),
+    /// The result of the upload of a fresh object, sent by the task that ran
+    /// it, with the sends that wait for the object.
+    FreshUploadFinished(Box<FinishedFreshUpload>),
 }
 
 /// What the task publishing a manifest hands back to the pump.
@@ -2076,6 +2083,10 @@ where
     /// so the next manifest pass takes them from here.
     undelivered_manifest_publishes: Rc<RefCell<Vec<FinishedManifestPublish>>>,
 
+    /// The upload-first produce path of the partitions here that place their
+    /// batches.
+    fresh_writes: fresh_writes::FreshWrites,
+
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
     /// number only tells two advances apart in a prepare.
@@ -2421,6 +2432,7 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            fresh_writes: fresh_writes::FreshWrites::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3390,6 +3402,7 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            fresh_writes: fresh_writes::FreshWrites::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -5418,6 +5431,10 @@ where
                     && let Err(error) = self.validate_partition_attachment(&request, &attachment)
                 {
                     Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
+                    return;
+                }
+                if self.places_send(request.header()) {
+                    self.offer_fresh_send(request, reply);
                     return;
                 }
                 let (sender, receiver) = consensus::oneshot_channel();

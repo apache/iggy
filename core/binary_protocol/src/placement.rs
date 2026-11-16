@@ -221,6 +221,21 @@ pub fn placed_header(bytes: &[u8]) -> Result<BatchHeader, WireError> {
     BatchHeader::decode(&header)
 }
 
+/// The batch header in the first bytes of `bytes`, whole batch or placed.
+///
+/// For server code that reads only what both carry, such as the offsets, the
+/// message count and the producer.
+///
+/// # Errors
+/// What [`BatchHeader::decode`] or [`placed_header`] refuses.
+pub fn stored_header(bytes: &[u8]) -> Result<BatchHeader, WireError> {
+    if is_placed(bytes) {
+        placed_header(bytes)
+    } else {
+        BatchHeader::decode(bytes)
+    }
+}
+
 /// Whether the batch header in the first bytes of `bytes` marks a placed
 /// batch. False for a buffer too short to hold a flags byte.
 #[must_use]

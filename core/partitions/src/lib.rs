@@ -55,6 +55,8 @@ pub use object_delete::{
     ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects, delete_incarnation, delete_objects,
     delete_segments, list_segment_starts, sweep_segments, sweepable,
 };
+mod fresh_upload;
+pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
 mod manifest_publish;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,

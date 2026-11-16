@@ -11409,6 +11409,7 @@ mod tests {
         }
     }
 
+    mod fresh_writes;
     mod manifest_publishes;
     mod object_deletes;
     mod segment_uploads;

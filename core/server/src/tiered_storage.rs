@@ -34,7 +34,8 @@ use iggy_object_store::{
 };
 use message_bus::IggyMessageBus;
 use partitions::{
-    ExecutorDeleter, ExecutorManifestPublisher, ExecutorObjects, ExecutorUploader, RemoteSegments,
+    ExecutorDeleter, ExecutorFreshUploader, ExecutorManifestPublisher, ExecutorObjects,
+    ExecutorUploader, RemoteSegments,
 };
 use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
 use shard::{Sender, channel};
@@ -151,7 +152,11 @@ pub fn start(
     let handlers = TierHandlers::new(
         Rc::new(ExecutorUploader::new(service.clone(), layout.clone())),
         Rc::new(ExecutorDeleter::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorManifestPublisher::new(service, layout.clone())),
+        Rc::new(ExecutorManifestPublisher::new(
+            service.clone(),
+            layout.clone(),
+        )),
+        Rc::new(ExecutorFreshUploader::new(service, layout.clone())),
     );
     // The check gets a store of its own, outside the service, so no queued
     // job and no retry delays what it finds.

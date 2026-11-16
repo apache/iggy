@@ -742,6 +742,63 @@ fn decode_prepare_slice_inner(
     Ok(batch)
 }
 
+/// The blob of an admitted `SendMessages` request in its pipeline form
+/// `[RoutedRequestHeader][256B batch header][blob]`, as
+/// [`convert_request_message`] returns it.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a request too short for a batch header.
+pub fn admitted_blob(request: &Message<RoutedRequestHeader>) -> Result<&[u8], IggyError> {
+    let start = std::mem::size_of::<RoutedRequestHeader>() + COMMAND_HEADER_SIZE;
+    request
+        .as_slice()
+        .get(start..request.header().size as usize)
+        .ok_or(IggyError::InvalidCommand)
+}
+
+/// The request that commits where the blob of `request` sits in the object
+/// store: the header of `request`, and the placed batch of its batch at
+/// `position` of the object `object_id`.
+///
+/// `request` is an admitted `SendMessages` in its pipeline form. The result
+/// answers to the same client, session and request number, so its reply and
+/// its retries are those of the send.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a request that is not one whole batch.
+pub fn place_request(
+    request: &Message<RoutedRequestHeader>,
+    object_id: u128,
+    position: u64,
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
+    let header_size = std::mem::size_of::<RoutedRequestHeader>();
+    let body = request
+        .as_slice()
+        .get(header_size..request.header().size as usize)
+        .ok_or(IggyError::InvalidCommand)?;
+    // Admission checked the messages. It leaves the batch checksum for the
+    // stamp to fill, so that one says nothing here.
+    let batch = body
+        .get(..COMMAND_HEADER_SIZE)
+        .and_then(|header| BatchHeader::decode(header).ok())
+        .filter(|batch| body.len() == batch.total_size() && batch.message_count > 0)
+        .ok_or(IggyError::InvalidCommand)?;
+    let placed = PlacedBatch::new(
+        batch,
+        Placement::of(object_id, position, &body[COMMAND_HEADER_SIZE..]),
+    );
+    let total = header_size + PLACED_BATCH_SIZE;
+    let mut message = Message::<RoutedRequestHeader>::new(total);
+    placed.encode_into(&mut message.as_mut_slice()[header_size..]);
+    let request_header = *request.header();
+    Ok(
+        message.transmute_header(|_, header: &mut RoutedRequestHeader| {
+            *header = request_header;
+            header.size = u32::try_from(total).expect("a placed request fits u32");
+        }),
+    )
+}
+
 /// Stamp the offset and the timestamp of a message prepare into its batch
 /// header, and renew the checksum that covers them.
 ///
@@ -1581,5 +1638,32 @@ mod tests {
             decode_prepare_batch_trusted(damaged.as_slice()),
             Err(IggyError::InvalidCommand)
         );
+    }
+    #[test]
+    fn given_an_admitted_send_when_placing_it_should_keep_its_identity_and_point_at_its_blob() {
+        let namespace = IggyNamespace::new(1, 1, 3);
+        let body = wire_send_messages_body(&sample_messages());
+        let admitted =
+            convert_request_message(namespace, wire_request_message(&body), ChecksumMode::Skip)
+                .expect("admission");
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let batch = BatchHeader::decode(&admitted.as_slice()[header_size..]).expect("batch");
+        let blob = admitted_blob(&admitted).expect("blob").to_vec();
+
+        let placed = place_request(&admitted, 9, 4096).expect("placed request");
+
+        assert_eq!(
+            placed.header().size as usize,
+            header_size + PLACED_BATCH_SIZE
+        );
+        assert_eq!(placed.header().client, admitted.header().client);
+        assert_eq!(placed.header().request, admitted.header().request);
+        assert_eq!(placed.header().operation, admitted.header().operation);
+        let decoded = PlacedBatch::decode(&placed.as_slice()[header_size..]).expect("placed batch");
+        assert_eq!(decoded.header.message_count, batch.message_count);
+        assert_eq!(decoded.header.batch_length, batch.batch_length);
+        assert_eq!(decoded.header.partition_id, 3);
+        assert_eq!(decoded.placement, Placement::of(9, 4096, &blob));
+        assert!(decoded.placement.matches(&blob));
     }
 }
