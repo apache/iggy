@@ -237,6 +237,7 @@ components:
       - "sort"
       - "doctest"
       - "machete"
+      - "deny"
       - "test"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"

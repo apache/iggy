@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri, miri-nightly)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, deny, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri, miri-nightly)"
     required: true
   component:
     description: "Component name (for context)"
@@ -59,7 +59,7 @@ runs:
         coverage: ${{ inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' }}
         # These tasks do not compile workspace crates and need no native
         # libraries. All compiling tasks keep the existing dependency setup.
-        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
+        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' && inputs.task != 'deny' }}
         # Miri builds against a nightly toolchain with a separate `target/miri`
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.
@@ -71,11 +71,11 @@ runs:
         shared-key: ${{ inputs.task == 'miri' && 'miri' || inputs.task == 'runtime' && 'runtime' || 'dev' }}
         # Shards download the build artifact. Metadata-only tasks need no target cache.
         # The nightly Miri job runs once a day and builds from scratch.
-        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test' || inputs.task == 'miri-nightly') && 'false' || 'true' }}
+        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'deny' || inputs.task == 'test' || inputs.task == 'miri-nightly') && 'false' || 'true' }}
         save-cache: ${{ inputs.save-cache }}
         # Artifact builders do not pull test containers. Test shards have ~78 GB
         # free when tests start and use ~15 GB, so the cleanup costs minutes.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || startsWith(inputs.task, 'miri') || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || startsWith(inputs.task, 'miri') || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'deny' || inputs.task == 'doctest') && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -96,6 +96,12 @@ runs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-machete
+
+    - name: Install cargo-deny
+      if: inputs.task == 'deny'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
 
     # cargo-http-registry has no prebuilt artifact in taiki-e/install-action,
     # so it stays a source build. verify-publish is a low-frequency task.
@@ -162,6 +168,11 @@ runs:
     - name: Cargo machete
       if: inputs.task == 'machete'
       run: cargo machete --with-metadata
+      shell: bash
+
+    - name: Cargo deny
+      if: inputs.task == 'deny'
+      run: ./scripts/ci/cargo-deny.sh
       shell: bash
 
     - name: Doc test
