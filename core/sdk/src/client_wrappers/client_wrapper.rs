@@ -21,6 +21,8 @@ use crate::http::http_transport::HttpTransport;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
+use async_dropper::AsyncDrop;
+use async_trait::async_trait;
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
@@ -36,8 +38,39 @@ use iggy_common::{
     select_send_partition, send_binary_messages, sync_group_assignment,
 };
 
+// The types that the client traits' signatures name, for the impls that `whichever` writes.
+use async_broadcast::Receiver;
+use iggy_common::{
+    BatchProducer, Checkpoint, Client, ClientInfo, ClientInfoDetails, ClusterClient,
+    ClusterMetadata, ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupClient,
+    ConsumerGroupDetails, ConsumerOffsetClient, ConsumerOffsetInfo, DecodeError, DiagnosticEvent,
+    IdentityInfo, MetadataChanges, MetadataChangesQuery, NamedPageQuery, NonZeroIggyDuration,
+    OptionSpec, OptionsScope, Page, PageQuery, Partition, PartitionClient, Permissions,
+    PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
+    RawPersonalAccessToken, SegmentClient, Snapshot, SnapshotCompression, Stats, Stream,
+    StreamClient, StreamCreateOptions, StreamDetails, StreamUpdateOptions, SystemSnapshotType,
+    Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient,
+    UserCreateOptions, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
+};
+use std::time::Instant;
+
+// `whichever` writes `impl <Trait> for ClientWrapper` for each client trait: one `match` per
+// method that calls the transport's own impl. Each trait carries `#[whichever::dispatchable]`
+// in `iggy_common`, which hands its signatures to this crate.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
+#[whichever::dispatch(Client, from = false)]
+#[whichever::dispatch(ClusterClient)]
+#[whichever::dispatch(ConsumerGroupClient)]
+#[whichever::dispatch(ConsumerOffsetClient)]
+#[whichever::dispatch(MessageClient)]
+#[whichever::dispatch(PartitionClient)]
+#[whichever::dispatch(PersonalAccessTokenClient)]
+#[whichever::dispatch(SegmentClient)]
+#[whichever::dispatch(StreamClient)]
+#[whichever::dispatch(SystemClient)]
+#[whichever::dispatch(TopicClient)]
+#[whichever::dispatch(UserClient)]
 pub enum ClientWrapper {
     Iggy(IggyClient),
     Http(HttpClient),
@@ -364,6 +397,13 @@ impl ClientWrapper {
                 .await
             }
         }
+    }
+}
+
+#[async_trait]
+impl AsyncDrop for ClientWrapper {
+    async fn async_drop(&mut self) {
+        let _ = UserClient::logout_user(self).await;
     }
 }
 

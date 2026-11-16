@@ -69,7 +69,7 @@ describe('e2e -> topic', async () => {
 
   it('e2e -> topic::delete', async () => {
     assert.ok(await c.topic.delete({
-      streamId: streamName, topicId: topicName, partitionsCount: 0
+      streamId: streamName, topicId: topicName
     }));
   });
 

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::args::common::{ListMode, PageArgs};
 use clap::{Args, Subcommand};
 use iggy::prelude::Identifier;
 
@@ -46,6 +47,18 @@ pub(crate) enum PartitionAction {
     ///  iggy partition delete 1 sensor 16
     #[clap(verbatim_doc_comment, visible_alias = "d")]
     Delete(PartitionDeleteArgs),
+    /// List partitions for the specified topic ID
+    /// and stream ID.
+    ///
+    /// Stream ID can be specified as a stream name or ID
+    /// Topic ID can be specified as a topic name or ID
+    ///
+    /// Examples
+    ///  iggy partition list 1 1
+    ///  iggy partition list prod sensor -l list
+    ///  iggy partition list prod sensor --desc --limit 100
+    #[clap(verbatim_doc_comment, visible_alias = "l")]
+    List(PartitionListArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -80,4 +93,23 @@ pub(crate) struct PartitionDeleteArgs {
     /// Partitions count to be deleted
     #[arg(value_parser = clap::value_parser!(u32).range(1..100_001))]
     pub(crate) partitions_count: u32,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PartitionListArgs {
+    /// Stream ID to list partitions
+    ///
+    /// Stream ID can be specified as a stream name or ID
+    #[arg(value_parser = clap::value_parser!(Identifier))]
+    pub(crate) stream_id: Identifier,
+    /// Topic ID to list partitions
+    ///
+    /// Topic ID can be specified as a topic name or ID
+    #[arg(value_parser = clap::value_parser!(Identifier))]
+    pub(crate) topic_id: Identifier,
+    /// List mode (table or list)
+    #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
+    pub(crate) list_mode: ListMode,
+    #[command(flatten)]
+    pub(crate) page: PageArgs,
 }

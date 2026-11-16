@@ -5651,7 +5651,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.12.0"
+version = "0.12.1-edge.1"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -5685,11 +5685,12 @@ dependencies = [
  "tracing",
  "trait-variant",
  "webpki-roots 1.0.11",
+ "whichever",
 ]
 
 [[package]]
 name = "iggy-bench"
-version = "0.7.0"
+version = "0.7.1-edge.1"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -5749,7 +5750,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.15.0"
+version = "0.15.1-edge.1"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -5784,7 +5785,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-gateway-kafka"
-version = "0.2.1-edge.1"
+version = "0.2.1-edge.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5823,7 +5824,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.6.0"
+version = "0.6.1-edge.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -5874,7 +5875,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.12.0"
+version = "0.12.1-edge.1"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -5889,7 +5890,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.12.0"
+version = "0.12.1-edge.1"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -5924,6 +5925,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "whichever",
  "xaes-256-gcm",
 ]
 
@@ -9834,7 +9836,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.10.0"
+version = "0.10.1-edge.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -12091,6 +12093,26 @@ dependencies = [
  "home",
  "rustix 0.38.44",
  "winsafe",
+]
+
+[[package]]
+name = "whichever"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68887c9512981e597d730f1d95b2eb6abdd53385e4e76c35a95e7121e16232b0"
+dependencies = [
+ "whichever-macros",
+]
+
+[[package]]
+name = "whichever-macros"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb15ad553239d9fdefac12e31e16c7682dc62a2106ba035aec69c5dd15835a7b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]

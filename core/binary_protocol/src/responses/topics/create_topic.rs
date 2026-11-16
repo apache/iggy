@@ -17,7 +17,7 @@
 
 /// `CreateTopic` reply ships the freshly-created topic.
 ///
-/// Same `[TopicHeader][PartitionResponse]*` layout as `GetTopicResponse`,
+/// Same `[TopicResponse][PartitionResponse]*` layout as `GetTopicResponse`,
 /// so the SDK reuses one decoder for both calls. Legacy server's
 /// `create_topic_handler` builds this shape directly; the server's metadata
 /// STM emits the same bytes from `apply`.
