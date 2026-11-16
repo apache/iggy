@@ -5035,8 +5035,10 @@ mod tests {
             (5009, false),
             // The server refuses an oversized first message before it stores the offset.
             (80, false),
-            // A new offset key above the limit refuses the read before it returns messages.
+            // A new offset key above the limit, or while the disk is over its usage limit, refuses
+            // the read before it returns messages.
             (3024, false),
+            (4109, false),
             (3, true),
             (30, true),
             (40, true),
@@ -6306,14 +6308,15 @@ mod tests {
     }
 
     /// The server refuses a first message larger than `max_bytes`, and a read that needs a new
-    /// offset key above the limit, before it stores the offset, so each refusal proves the
-    /// outcome of a committing poll.
+    /// offset key above the limit or while the disk is over its usage limit, before it stores
+    /// the offset, so each refusal proves the outcome of a committing poll.
     #[tokio::test(start_paused = true)]
     async fn given_a_refusal_before_the_store_when_a_committing_poll_is_refused_should_return_it_and_leave_its_partition_open()
      {
         for refusal in [
             IggyError::InvalidSizeBytes,
             IggyError::TooManyConsumerOffsets,
+            IggyError::DiskUsageLimitReached,
         ] {
             let f = Fixture::new().await;
             f.cluster.script(

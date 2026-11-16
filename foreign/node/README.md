@@ -510,7 +510,7 @@ deadline. After uncertainty, only committed-result proof can release the lane.
 
 An auto-commit poll (100/106) or a committing fetch (109) with an unknown outcome throws `FetchProgressUncertainError` (local code 14010) and retains progress blocks for every affected partition history. Its `operationId` is a client-lifetime recovery key, not a server replay receipt. A lost reply, a transport failure after the send, a disconnect or a logout while the call waits leave the outcome unknown.
 
-So does every refusal except those that prove the server stored nothing: 5, 6, 58, 80, 87, 89, 90, 1009, 1010, 2010, 2011, 3007, 3024, 4100 and 5009 for a whole reply, and 58, 80, 87, 89, 3007, 3024 and 5009 for a fetch section.
+So does every refusal except those that prove the server stored nothing: 5, 6, 58, 80, 87, 89, 90, 1009, 1010, 2010, 2011, 3007, 3024, 4100, 4109 and 5009 for a whole reply, and 58, 80, 87, 89, 3007, 3024, 4109 and 5009 for a fetch section.
 
 Later progress polls, fetches, stores and deletes fail with `LaneBlockedError` carrying that ID, the blocked partition and `errorCode` 14009. Stateless reads, `GetOffset` inspection and sends remain available. Reconnect, sign-in and late replies do not clear these blocks.
 

@@ -376,6 +376,7 @@ fn commit_outcomes() -> CommitOutcomes {
         IggyError::TopicNameNotFound(String::new(), String::new()),
         IggyError::PartitionNotFound(0, IggyIdentifier::default(), IggyIdentifier::default()),
         IggyError::TooManyConsumerOffsets,
+        IggyError::DiskUsageLimitReached,
         IggyError::InvalidOffset(0),
         IggyError::ConsumerGroupPartitionNotOwned(0, 0),
         IggyError::ShardCommunicationError,

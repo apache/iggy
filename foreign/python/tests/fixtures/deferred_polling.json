@@ -484,6 +484,11 @@
         "certain": true
       },
       {
+        "status": 4109,
+        "error": "disk_usage_limit_reached",
+        "certain": true
+      },
+      {
         "status": 4100,
         "error": "invalid_offset",
         "certain": true
@@ -588,6 +593,11 @@
       {
         "status": 3024,
         "error": "too_many_consumer_offsets",
+        "certain": true
+      },
+      {
+        "status": 4109,
+        "error": "disk_usage_limit_reached",
         "certain": true
       },
       {

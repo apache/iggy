@@ -35,13 +35,15 @@ public enum CommitErrorScope {
     public boolean provesNothingStored(long status) {
         return switch (IggyErrorCode.fromCode((int) status)) {
             // The server refuses a first message larger than the byte limit before it stores an offset, and a read
-            // that needs a new offset key above the limit returns no messages.
+            // that needs a new offset key above the limit, or while the disk is over its usage limit, returns no
+            // messages.
             case TRANSIENT_NOT_ACCEPTED,
                     INVALID_SIZE_BYTES,
                     HISTORY_UNAVAILABLE,
                     NOT_PRIMARY,
                     PARTITION_NOT_FOUND,
                     TOO_MANY_CONSUMER_OFFSETS,
+                    DISK_USAGE_LIMIT_REACHED,
                     CONSUMER_GROUP_PARTITION_NOT_OWNED -> true;
             case FEATURE_UNAVAILABLE,
                     INVALID_IDENTIFIER,

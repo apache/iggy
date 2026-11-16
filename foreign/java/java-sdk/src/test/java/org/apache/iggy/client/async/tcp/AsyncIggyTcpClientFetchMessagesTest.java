@@ -863,7 +863,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {58, 80, 87, 89, 3007, 3024, 5009})
+    @ValueSource(ints = {58, 80, 87, 89, 3007, 3024, 4109, 5009})
     void shouldKeepDefinitelyRefusedSectionsFreeForTheNextProgressCall(int status) throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
             CompletableFuture<Void> served = singleNode(socket, request -> {
@@ -1535,7 +1535,7 @@ class AsyncIggyTcpClientFetchMessagesTest {
      * its outcome unknown and blocks the partition until the caller abandons the poll.
      */
     @ParameterizedTest
-    @CsvSource({"3024, false", "72, true", "11001, true"})
+    @CsvSource({"3024, false", "4109, false", "72, true", "11001, true"})
     void shouldEndACommittingPollWithItsCertainRefusalOrAsUnknownProgress(int status, boolean uncertain)
             throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {

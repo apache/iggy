@@ -50,8 +50,10 @@ impl CommitErrorScope {
                     | IggyError::PartitionNotFound(..)
                     | IggyError::InvalidOffset(..)
                     | IggyError::ConsumerGroupPartitionNotOwned(..)
-                    // A read that needs a new offset key above the limit returns no messages.
+                    // A read that needs a new offset key above the limit, or while the disk is
+                    // over its usage limit, returns no messages.
                     | IggyError::TooManyConsumerOffsets
+                    | IggyError::DiskUsageLimitReached
             ),
             // None of these leaves an offset stored in the history that the request named.
             Self::Section => matches!(
@@ -63,6 +65,7 @@ impl CommitErrorScope {
                     | IggyError::ConsumerGroupPartitionNotOwned(..)
                     | IggyError::PartitionNotFound(..)
                     | IggyError::TooManyConsumerOffsets
+                    | IggyError::DiskUsageLimitReached
             ),
         }
     }
@@ -93,6 +96,13 @@ mod tests {
             assert!(!CommitErrorScope::Request.proves_nothing_stored(&error));
             assert!(!CommitErrorScope::Section.proves_nothing_stored(&error));
         }
+    }
+
+    /// The partition refuses a new offset key at the disk usage limit before it stores anything.
+    #[test]
+    fn given_disk_usage_limit_when_classifying_then_should_prove_nothing_stored_in_both_scopes() {
+        assert!(CommitErrorScope::Request.proves_nothing_stored(&IggyError::DiskUsageLimitReached));
+        assert!(CommitErrorScope::Section.proves_nothing_stored(&IggyError::DiskUsageLimitReached));
     }
 
     #[test]
