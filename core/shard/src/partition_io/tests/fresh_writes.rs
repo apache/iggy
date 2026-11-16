@@ -417,3 +417,139 @@ async fn given_a_partition_that_had_a_rewrite_pass_when_more_sends_commit_should
     assert_eq!(partition.long_term_segments().len(), 2);
     assert_eq!(partition.long_term_lag(), 0);
 }
+
+/// Stores the object, and then holds the answer back until told.
+struct HeldUploader {
+    uploader: MemoryUploader,
+    release: RefCell<Option<futures::channel::oneshot::Receiver<()>>>,
+}
+
+impl FreshObjectUploader for HeldUploader {
+    fn upload(
+        &self,
+        object_id: FreshObjectId,
+        bytes: bytes::Bytes,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, FreshUploadOutcome> {
+        let upload = self.uploader.upload(object_id, bytes, scope);
+        let release = self.release.borrow_mut().take();
+        Box::pin(async move {
+            let outcome = upload.await;
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            outcome
+        })
+    }
+}
+
+/// A store that does not answer holds back the sends of its window and
+/// nothing else: the pump keeps running, and a partition that keeps its
+/// batches whole commits a send meanwhile. The producer of the held send is
+/// answered only after the store answered and the placement committed.
+#[compio::test]
+async fn given_a_store_that_does_not_answer_when_sends_wait_for_it_should_keep_serving_other_partitions()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let (release, held) = futures::channel::oneshot::channel();
+    let uploader = Rc::new(HeldUploader {
+        uploader: ExecutorFreshUploader::new(InlineTierExecutor::new(MemoryStore::new()), layout()),
+        release: RefCell::new(Some(held)),
+    });
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    let whole = IggyNamespace::new(0, 0, 1);
+    let committed = |owner: &IoTestShard, namespace: IggyNamespace| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .unwrap()
+            .consensus()
+            .commit_min()
+    };
+
+    let answer = pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| {
+            uploader.uploader.executor().store().keys().len() == 1
+        })
+        .await;
+
+        let (reply, other) = channel(1);
+        owner.senders[0]
+            .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                request: send_request(whole, 2),
+                reply,
+                attachment: None,
+            }))
+            .unwrap();
+        until(&owner, |owner| committed(owner, whole) == 1).await;
+        until(&owner, |_| !other.is_empty()).await;
+        assert!(
+            answer.is_empty(),
+            "the object is stored and the store has not answered: no answer yet"
+        );
+        assert_eq!(committed(&owner, namespace()), 0);
+
+        release.send(()).unwrap();
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        until(&owner, |_| !answer.is_empty()).await;
+        answer
+    })
+    .await;
+
+    assert!(answer.try_recv().unwrap().is_some());
+    let (stored, refused, bytes) = owner.metrics().fresh_uploads_value();
+    assert_eq!((stored, refused), (1, 0));
+    assert!(bytes > 100);
+}
+
+/// The sends of every placing partition of the shard go into the object of
+/// the open window, so the uploads follow the windows and not the
+/// partitions.
+#[compio::test]
+async fn given_sends_to_two_placing_partitions_in_one_window_when_it_closes_should_store_one_object()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let other = IggyNamespace::new(0, 0, 1);
+    {
+        let partition = owner.plane.partitions().get_mut_by_ns(&other).unwrap();
+        partition.set_runtime_options(TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+        partition.register_builtin_state_machines().unwrap();
+    }
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        let (reply, _second) = channel(1);
+        owner.senders[0]
+            .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                request: sized_send_request(other, 2, 100),
+                reply,
+                attachment: None,
+            }))
+            .unwrap();
+        until(&owner, |owner| {
+            committed_sends(owner) == 1
+                && owner
+                    .plane
+                    .partitions()
+                    .get_by_ns(&other)
+                    .unwrap()
+                    .consensus()
+                    .commit_min()
+                    == 1
+        })
+        .await;
+    })
+    .await;
+
+    assert_eq!(uploader.store().keys().len(), 1);
+    assert_eq!(owner.metrics().fresh_uploads_value().0, 1);
+}
