@@ -369,6 +369,11 @@ pub struct ShardMetrics {
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
     partition_segment_upload_lag_seconds: Gauge,
+    fresh_objects: Gauge,
+    fresh_object_bytes: Gauge,
+    fresh_object_oldest_age_seconds: Gauge,
+    fresh_objects_unnamed: Gauge,
+    fresh_objects_deleted_total: Counter,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -477,6 +482,11 @@ impl ShardMetrics {
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
             partition_segment_upload_lag_seconds: Gauge::default(),
+            fresh_objects: Gauge::default(),
+            fresh_object_bytes: Gauge::default(),
+            fresh_object_oldest_age_seconds: Gauge::default(),
+            fresh_objects_unnamed: Gauge::default(),
+            fresh_objects_deleted_total: Counter::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -952,6 +962,38 @@ impl ShardMetrics {
         self.partition_segment_upload_lag_seconds.get()
     }
 
+    /// Republished by every sweep of fresh objects: how many objects of
+    /// this replica the store holds, their bytes, the age of the oldest, and
+    /// how many of them nothing names.
+    pub fn set_fresh_objects(&self, objects: usize, bytes: u64, oldest: Duration, unnamed: usize) {
+        self.fresh_objects
+            .set(i64::try_from(objects).unwrap_or(i64::MAX));
+        self.fresh_object_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.fresh_object_oldest_age_seconds
+            .set(i64::try_from(oldest.as_secs()).unwrap_or(i64::MAX));
+        self.fresh_objects_unnamed
+            .set(i64::try_from(unnamed).unwrap_or(i64::MAX));
+    }
+
+    pub fn record_fresh_objects_deleted(&self, objects: usize) {
+        self.fresh_objects_deleted_total.inc_by(objects as u64);
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_value(&self) -> i64 {
+        self.fresh_objects.get()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_deleted_value(&self) -> u64 {
+        self.fresh_objects_deleted_total.get()
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1352,6 +1394,32 @@ impl ShardMetrics {
             "age of the oldest sealed segment that waits for its upload to the object store, \
              over the tiered partitions this shard leads",
             self.partition_segment_upload_lag_seconds.clone(),
+        );
+        registry.register(
+            "fresh_objects",
+            "fresh objects of this replica in the object store, as its last sweep listed them",
+            self.fresh_objects.clone(),
+        );
+        registry.register(
+            "fresh_object_bytes",
+            "bytes of the fresh objects of this replica in the object store",
+            self.fresh_object_bytes.clone(),
+        );
+        registry.register(
+            "fresh_object_oldest_age_seconds",
+            "age of the oldest fresh object of this replica in the object store",
+            self.fresh_object_oldest_age_seconds.clone(),
+        );
+        registry.register(
+            "fresh_objects_unnamed",
+            "fresh objects of this replica that no placed batch names and that wait out \
+             their grace period",
+            self.fresh_objects_unnamed.clone(),
+        );
+        registry.register(
+            "fresh_objects_deleted",
+            "fresh objects this replica deleted",
+            self.fresh_objects_deleted_total.clone(),
         );
         registry.register(
             "retirement_debts_paid",

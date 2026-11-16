@@ -1266,6 +1266,21 @@ where
             LifecycleFrame::SegmentRewriteFinished(finished) => {
                 self.on_segment_rewrite_finished(*finished).await;
             }
+            LifecycleFrame::SweepFreshObjects { now } => {
+                self.on_sweep_fresh_objects(now);
+            }
+            LifecycleFrame::FreshObjectsListed(finished) => {
+                self.on_fresh_objects_listed(*finished);
+            }
+            LifecycleFrame::ReportFreshObjects { sweep } => {
+                self.on_report_fresh_objects(sweep);
+            }
+            LifecycleFrame::FreshObjectsReported(report) => {
+                self.on_fresh_objects_reported(*report);
+            }
+            LifecycleFrame::FreshObjectsDeleted(finished) => {
+                self.on_fresh_objects_deleted(*finished);
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,

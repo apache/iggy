@@ -351,3 +351,252 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
         "the fresh object, the log and its index"
     );
 }
+
+/// The whole store of one test: the fresh objects, the long-term segments,
+/// and the sweeps, all through one executor.
+#[allow(clippy::future_not_send)]
+async fn swept_owner(directory: &Path) -> (IoTestShard, super::object_deletes::Shared) {
+    use super::object_deletes::Shared;
+    use partitions::{
+        ExecutorFreshSweeper, ExecutorLongTermWriter, ExecutorObjects, RemoteSegments,
+    };
+
+    let owner = Box::pin(placing_owner(directory)).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_fresh_sweeper(Some(Rc::new(ExecutorFreshSweeper::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(executor.clone())),
+            layout(),
+        )));
+    (owner, executor)
+}
+
+/// The ids of the fresh objects the store holds, ascending.
+fn fresh_objects(store: &MemoryStore) -> Vec<u128> {
+    let mut objects: Vec<_> = store
+        .keys()
+        .iter()
+        .filter_map(|key| layout().parse_fresh_key(key))
+        .collect();
+    objects.sort_unstable();
+    objects
+}
+
+/// Run one sweep at `now` to the answer of every shard, and let the delete
+/// it started end.
+#[allow(clippy::future_not_send)]
+async fn sweep(owner: &IoTestShard, now: IggyTimestamp) {
+    let settled = owner.fresh_sweeps_settled();
+    owner.request_sweep_fresh_objects(now);
+    until(owner, |owner| owner.fresh_sweeps_settled() > settled).await;
+    // The delete runs inline in the memory store, and its result is one
+    // frame behind.
+    compio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// A time one grace period and a second after `now`.
+fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
+    let grace = u64::try_from(partitions::FRESH_OBJECT_GRACE.as_micros()).unwrap();
+    IggyTimestamp::from(now.as_micros() + grace + 1_000_000)
+}
+
+/// Rewrite the committed sends of the partition up to `floor`.
+#[allow(clippy::future_not_send)]
+async fn rewrite_up_to(owner: &IoTestShard, floor: u64) {
+    let partitions = owner.plane.partitions();
+    let revision = partitions
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    owner.request_rewrite_segments(namespace(), revision);
+    until(owner, |owner| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+            == Some(floor)
+    })
+    .await;
+}
+
+/// Once the rewrite caught up, nothing reads the fresh objects again, and
+/// the sweep leaves none behind.
+#[compio::test]
+async fn given_sends_in_long_term_segments_when_sweeps_run_past_the_grace_should_delete_their_fresh_objects()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let _second = submit_send(&owner, 2, 100);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        assert_eq!(fresh_objects(store).len(), 2);
+
+        // Both are named above the floor.
+        sweep(&owner, now).await;
+        sweep(&owner, past_grace(now)).await;
+        assert_eq!(fresh_objects(store).len(), 2);
+
+        rewrite_up_to(&owner, 1).await;
+        let unnamed_since = past_grace(now);
+        sweep(&owner, unnamed_since).await;
+        assert_eq!(
+            fresh_objects(store).len(),
+            2,
+            "an object waits out its grace period from when a sweep found it unnamed"
+        );
+        sweep(&owner, past_grace(unnamed_since)).await;
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
+    assert_eq!(store.keys().len(), 2, "the long-term log and its index");
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 2);
+}
+
+/// One object can hold sends that are rewritten and sends that are not. It
+/// stays for as long as one placed batch above the floor names it.
+#[compio::test]
+async fn given_a_send_above_the_long_term_floor_when_sweeps_run_should_keep_its_fresh_object() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let kept = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        rewrite_up_to(&owner, 0).await;
+        let _second = submit_send(&owner, 2, 100);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        let objects = fresh_objects(store);
+        assert_eq!(objects.len(), 2);
+
+        sweep(&owner, now).await;
+        sweep(&owner, past_grace(now)).await;
+        sweep(&owner, past_grace(past_grace(now))).await;
+        objects[1]
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![kept]);
+}
+
+/// An object whose sends never committed is named by no placed batch. So is
+/// one a shard of an earlier life of this replica wrote. The objects of
+/// another replica are that replica's to judge.
+#[compio::test]
+async fn given_objects_no_placed_batch_names_when_sweeps_run_should_delete_those_of_this_replica_after_the_grace()
+ {
+    use iggy_object_store::{PutBody, PutOptions};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let replica = owner.partition_consensus.self_replica_id;
+    let orphan = FreshObjectId::new(replica, 5, 1, 0).unwrap().get();
+    let foreign = FreshObjectId::new(replica + 1, 0, 1, 0).unwrap().get();
+    for object in [orphan, foreign] {
+        store
+            .put(
+                &layout().fresh_key(object),
+                PutBody::from_bytes(bytes::Bytes::from_static(b"IGGYFRS1 never committed")),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        let _send = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        sweep(&owner, now).await;
+        assert_eq!(fresh_objects(store).len(), 3);
+        sweep(&owner, past_grace(now)).await;
+    })
+    .await;
+
+    let left = fresh_objects(store);
+    assert_eq!(left.len(), 2);
+    assert!(!left.contains(&orphan));
+    assert!(left.contains(&foreign));
+}
+
+/// Stores the object, and then holds the answer back until told.
+struct HeldUploader {
+    uploader: ExecutorFreshUploader<super::object_deletes::Shared>,
+    release: RefCell<Option<futures::channel::oneshot::Receiver<()>>>,
+}
+
+impl FreshObjectUploader for HeldUploader {
+    fn upload(
+        &self,
+        object_id: FreshObjectId,
+        bytes: bytes::Bytes,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, FreshUploadOutcome> {
+        let upload = self.uploader.upload(object_id, bytes, scope);
+        let release = self.release.borrow_mut().take();
+        Box::pin(async move {
+            let outcome = upload.await;
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            outcome
+        })
+    }
+}
+
+/// Between the moment the store holds an object and the moment its sends
+/// reach their partitions, no journal names the object. The shard that
+/// wrote it does.
+#[compio::test]
+async fn given_an_object_whose_sends_wait_when_sweeps_run_past_the_grace_should_keep_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let (release, held) = futures::channel::oneshot::channel();
+    owner.set_fresh_uploader(Some(Rc::new(HeldUploader {
+        uploader: ExecutorFreshUploader::new(executor.clone(), layout()),
+        release: RefCell::new(Some(held)),
+    })));
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        let _send = submit_send(&owner, 1, 100);
+        until(&owner, |_| fresh_objects(store).len() == 1).await;
+        assert_eq!(committed_sends(&owner), 0);
+
+        sweep(&owner, now).await;
+        sweep(&owner, past_grace(now)).await;
+        assert_eq!(fresh_objects(store).len(), 1);
+
+        release.send(()).unwrap();
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        sweep(&owner, past_grace(past_grace(now))).await;
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store).len(), 1);
+}

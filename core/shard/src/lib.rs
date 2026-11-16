@@ -26,6 +26,10 @@ mod fresh_writes;
 pub use fresh_writes::{
     FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_WINDOW, FinishedFreshUpload, PlacedSend,
 };
+mod fresh_sweeps;
+pub use fresh_sweeps::{
+    FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport, FreshSweeps,
+};
 mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
@@ -1266,6 +1270,26 @@ pub enum LifecycleFrame {
     /// The result of a rewrite that a [`Self::RewriteSegments`] pass
     /// started, sent by the task that ran it.
     SegmentRewriteFinished(Box<FinishedSegmentRewrite>),
+    /// Start a sweep of the fresh objects of this replica, on its first
+    /// shard: list them, when no sweep is in flight. The timer task stamps
+    /// `now`. Does nothing on another shard or on one without a sweeper.
+    SweepFreshObjects {
+        now: IggyTimestamp,
+    },
+    /// The listing that a [`Self::SweepFreshObjects`] pass started, sent by
+    /// the task that ran it.
+    FreshObjectsListed(Box<FinishedFreshListing>),
+    /// The first shard asks every shard which fresh objects its partitions
+    /// still name, for the sweep `sweep`.
+    ReportFreshObjects {
+        sweep: u64,
+    },
+    /// A shard's answer to [`Self::ReportFreshObjects`], sent to the first
+    /// shard by the task that read the partitions.
+    FreshObjectsReported(Box<FreshObjectsReport>),
+    /// The result of the delete that a sweep started, sent by the task that
+    /// ran it.
+    FreshObjectsDeleted(Box<FinishedFreshDelete>),
 }
 
 /// What the task rewriting a segment hands back to the pump.
@@ -2112,6 +2136,10 @@ where
     /// batches.
     fresh_writes: fresh_writes::FreshWrites,
 
+    /// The sweep of the fresh objects of this replica, which its first shard
+    /// runs.
+    fresh_sweeps: fresh_sweeps::FreshSweeps,
+
     /// Late-bound writer of long-term segments. `None` on a shard without an
     /// object store, where every rewrite pass is a no-op.
     long_term_writer: RefCell<Option<Rc<dyn partitions::LongTermWriter>>>,
@@ -2467,6 +2495,7 @@ where
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
+            fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
             long_term_writer: RefCell::new(None),
             undelivered_segment_rewrites: Rc::default(),
             floor_advance_requests: Cell::new(0),
@@ -3439,6 +3468,7 @@ where
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
+            fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
             long_term_writer: RefCell::new(None),
             undelivered_segment_rewrites: Rc::default(),
             floor_advance_requests: Cell::new(0),

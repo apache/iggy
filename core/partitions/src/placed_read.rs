@@ -33,6 +33,7 @@
 //! from those, and goes on into the placed batches above it. A batch that
 //! both hold is taken once, from the long-term segment.
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -223,6 +224,61 @@ impl PlacedReadPlan {
             }
         }
         Ok(())
+    }
+
+    /// The fresh objects that the placed batches above `floor` name, in the
+    /// partition's segments and in its journal. With no floor, those of
+    /// every placed batch the partition holds.
+    ///
+    /// The journal's batches count whether they are committed or not: one
+    /// that is not yet committed may still commit.
+    pub(crate) async fn fresh_objects_above(
+        &self,
+        floor: Option<u64>,
+    ) -> Result<BTreeSet<u128>, DiskFault> {
+        let first = floor.map_or(0, |floor| floor.saturating_add(1));
+        let reaches =
+            |header: &BatchHeader| header.base_offset + u64::from(header.message_count) > first;
+        let mut objects = BTreeSet::new();
+        let directory = match &self.partition_dir {
+            PartitionDirResolution::Resolved(directory) => Some(directory),
+            PartitionDirResolution::NoFiles => None,
+            PartitionDirResolution::Unresolvable => return Err(DiskFault::Retryable),
+        };
+        for segment in &self.segments {
+            if segment.end_offset < first {
+                continue;
+            }
+            let Some(directory) = directory else {
+                break;
+            };
+            let path = format!("{directory}/{:0>20}.log", segment.start_offset);
+            let file = File::open(&path).await.map_err(|_| DiskFault::Retryable)?;
+            let count = segment.size / PLACED_BATCH_SIZE as u64;
+            let mut index = first_reaching(&file, count, first).await?;
+            while index < count {
+                let batches = PLACED_PER_READ.min(count - index);
+                for batch in read_placed(&file, index, batches).await? {
+                    if reaches(&batch.header) {
+                        objects.insert(batch.placement.object_id);
+                    }
+                }
+                index += batches;
+            }
+        }
+        for entry in &self.resident {
+            // An entry that does not decode is no placed batch a poll could
+            // read, and the journal refuses it long before this walk.
+            let Ok(batch) = decode_prepare_batch_trusted(entry.as_slice()) else {
+                return Err(DiskFault::Unreadable);
+            };
+            if let Some(placement) = batch.placement
+                && reaches(&batch.header)
+            {
+                objects.insert(placement.object_id);
+            }
+        }
+        Ok(objects)
     }
 
     /// The whole batch of `placed`: its header with the batch checksum it
@@ -461,6 +517,24 @@ impl Wanted {
             .filter(|position| *position < size)
             .unwrap_or(0)
     }
+}
+
+/// The index of the first of `count` placed batches in `file` that holds an
+/// offset at or after `first`, or `count` when none does.
+async fn first_reaching(file: &File, count: u64, first: u64) -> Result<u64, DiskFault> {
+    let (mut low, mut high) = (0, count);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let Some(batch) = read_placed(file, middle, 1).await?.pop() else {
+            return Err(DiskFault::Unreadable);
+        };
+        if batch.header.base_offset + u64::from(batch.header.message_count) > first {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    Ok(low)
 }
 
 /// `count` placed batches of `file`, from the `index`-th one on. Each one

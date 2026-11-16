@@ -54,6 +54,7 @@ use server_common::send_messages::{
 };
 use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -114,6 +115,11 @@ pub struct FreshWrites {
     scope: TierScope,
     /// Results of uploads whose frame the inbox refused, for the next tick.
     undelivered: Rc<RefCell<Vec<FinishedFreshUpload>>>,
+    /// The objects that a send still waits on, each with how many: from the
+    /// start of its upload until every request it carries is answered. A
+    /// request in between may be in no journal yet, so nothing else says
+    /// that its object is needed.
+    awaited: Rc<RefCell<BTreeMap<u128, usize>>>,
 }
 
 impl Default for FreshWrites {
@@ -126,6 +132,25 @@ impl Default for FreshWrites {
             started_at: IggyTimestamp::now().as_micros(),
             scope: TierScope::new(),
             undelivered: Rc::default(),
+            awaited: Rc::default(),
+        }
+    }
+}
+
+impl FreshWrites {
+    /// The fresh objects that a send of this shard still waits on.
+    pub(crate) fn awaited_objects(&self) -> BTreeSet<u128> {
+        self.awaited.borrow().keys().copied().collect()
+    }
+}
+
+/// One send of `object` was answered.
+fn settle_awaited(awaited: &RefCell<BTreeMap<u128, usize>>, object: u128) {
+    let mut awaited = awaited.borrow_mut();
+    if let Some(sends) = awaited.get_mut(&object) {
+        *sends -= 1;
+        if *sends == 0 {
+            awaited.remove(&object);
         }
     }
 }
@@ -280,6 +305,10 @@ where
         let Window {
             id, object, sends, ..
         } = window;
+        self.fresh_writes
+            .awaited
+            .borrow_mut()
+            .insert(id.get(), sends.len());
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
         self.bus.spawn(async move {
@@ -349,8 +378,10 @@ where
         if stored && let Some(remote) = self.plane.partitions().remote_segments() {
             remote.cache_fresh_object(finished.object_id.get(), finished.bytes);
         }
+        let object = finished.object_id.get();
         for PlacedSend { request, reply } in finished.sends {
             if !stored {
+                settle_awaited(&self.fresh_writes.awaited, object);
                 Self::answer_partition_submit_deny(
                     request.header(),
                     Some(reply),
@@ -365,8 +396,10 @@ where
                 .await;
             // Awaited off the pump, as for any other submit: the commit that
             // fires the receiver needs the pump to keep draining acks.
+            let awaited = Rc::clone(&self.fresh_writes.awaited);
             self.bus.spawn(async move {
                 let committed = receiver.await.ok().map(Message::into_generic);
+                settle_awaited(&awaited, object);
                 let _ = reply.try_send(committed);
             });
         }

@@ -1391,3 +1391,69 @@ async fn given_a_published_long_term_segment_when_building_the_manifest_should_l
     let (_, published, _) = partition.begin_manifest_publish(now).unwrap();
     assert_eq!(published, manifest);
 }
+
+/// The fresh objects the partition names above its long-term floor.
+async fn objects_in_use(partition: &IggyPartition<IggyMessageBus>) -> Vec<u128> {
+    partition
+        .fresh_objects_in_use()
+        .expect("the partition places its batches")
+        .read()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+#[compio::test]
+async fn given_a_partition_of_whole_batches_when_asking_for_its_fresh_objects_should_name_none() {
+    let config = repair_config();
+    let (_directory, partition) = Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
+
+    assert!(partition.fresh_objects_in_use().is_none());
+}
+
+/// A batch in the journal may still commit, so its object is needed whether
+/// it is committed or not.
+#[compio::test]
+async fn given_placed_batches_only_in_the_journal_when_asking_for_fresh_objects_should_name_theirs()
+{
+    let (_directory, mut partition) = Box::pin(placing_partition()).await;
+    let (records, placements) = placed_records(2);
+    for (index, record) in records.iter().enumerate() {
+        let index = index as u64;
+        let prepare = stamped_placed_prepare(&partition, index + 1, index, record);
+        Box::pin(partition.append_received_send_messages_to_journal(prepare))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        Box::pin(objects_in_use(&partition)).await,
+        vec![placements[0].object_id]
+    );
+}
+
+/// The rewrite moves the floor past the batches it stored, and the batches
+/// committed after it name their object again.
+#[compio::test]
+async fn given_a_long_term_floor_when_asking_for_fresh_objects_should_name_those_of_the_batches_above_it()
+ {
+    let (_whole, placed, object) = whole_and_placed(4);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&placed[..3], &store)).await;
+    let named = PlacedBatch::decode(&placed[0]).unwrap().placement.object_id;
+    assert_eq!(Box::pin(objects_in_use(&partition)).await, vec![named]);
+
+    let writer = writer(&store);
+    Box::pin(rewrite_pass(&mut partition, &writer, 100))
+        .await
+        .unwrap();
+    assert_eq!(partition.long_term_floor(), Some(2));
+    assert_eq!(
+        Box::pin(objects_in_use(&partition)).await,
+        Vec::<u128>::new()
+    );
+
+    Box::pin(commit_records(&mut partition, 4, &placed[3..])).await;
+    assert_eq!(Box::pin(objects_in_use(&partition)).await, vec![named]);
+}
