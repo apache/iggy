@@ -101,7 +101,14 @@ impl Default for FreshObject {
 impl FreshObject {
     #[must_use]
     pub fn new() -> Self {
-        let mut bytes = BytesMut::with_capacity(MAGIC.len());
+        Self::with_capacity(0)
+    }
+
+    /// An object with room for `blob_bytes` bytes of blobs, so that pushing
+    /// them moves no byte that is already in.
+    #[must_use]
+    pub fn with_capacity(blob_bytes: usize) -> Self {
+        let mut bytes = BytesMut::with_capacity(MAGIC.len() + blob_bytes);
         bytes.extend_from_slice(MAGIC);
         Self { bytes }
     }

@@ -26,7 +26,13 @@
 //!
 //! The segment cleaner stages the first pass over a partition. From then on
 //! the pump's tick starts each pass when the partition's wait is over, and
-//! the wait follows how full the stored segments come out.
+//! the wait follows how full the stored segments come out. A segment that
+//! ended at its byte cap has more behind it, and the pass for that starts
+//! when the segment's command commits.
+//!
+//! A commit to the long-term log also stages a publish of the partition's
+//! manifest, so a reader of the bucket finds the segment without waiting
+//! for the segment cleaner.
 //!
 //! A segment is stored before its command commits. A pass that finds such
 //! a segment sends its command again and starts no rewrite, so a command
@@ -39,11 +45,12 @@ use crate::{
 };
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::PrepareHeader;
+use iggy_common::IggyTimestamp;
 use iggy_object_store::ManifestSegment;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::{LONG_TERM_SEGMENT_BYTES, LongTermWriter};
+use partitions::{IggyPartition, LONG_TERM_SEGMENT_BYTES, LongTermWriter};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
@@ -102,7 +109,30 @@ where
         self.run_rewrite_pass(namespace, created_revision).await;
     }
 
+    /// Act on a command that changed the long-term log of `partition`, if
+    /// one did since the last call: stage a publish of its manifest, and
+    /// make the rewrite that waited for the command due.
+    pub(crate) fn stage_long_term_change(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) {
+        if partition.take_long_term_changed() {
+            self.long_term_changed(namespace, partition.created_revision());
+        }
+    }
+
+    fn long_term_changed(&self, namespace: IggyNamespace, created_revision: u64) {
+        self.rewrite_pacing
+            .borrow_mut()
+            .committed(&(namespace, created_revision), self.bus.monotonic_micros());
+        if self.manifest_publisher.borrow().is_some() {
+            self.request_publish_manifest(namespace, created_revision, IggyTimestamp::now());
+        }
+    }
+
     /// The pump's tick: settle the rewrites whose frame the inbox refused,
+    /// act on the commands that committed outside a partition I/O step,
     /// start the passes that are due, and report how far the rewrites are
     /// behind.
     #[allow(clippy::future_not_send)]
@@ -116,6 +146,22 @@ where
         let undelivered = std::mem::take(&mut *self.undelivered_segment_rewrites.borrow_mut());
         for finished in undelivered {
             self.settle_segment_rewrite(finished).await;
+        }
+        let partitions = self.plane.partitions();
+        let changed: Vec<_> = self
+            .rewrite_pacing
+            .borrow()
+            .paced()
+            .filter(|(namespace, created_revision)| {
+                partitions.get_by_ns(namespace).is_some_and(|partition| {
+                    partition.created_revision() == *created_revision
+                        && partition.take_long_term_changed()
+                })
+            })
+            .copied()
+            .collect();
+        for (namespace, created_revision) in changed {
+            self.long_term_changed(namespace, created_revision);
         }
         let due = self
             .rewrite_pacing
@@ -169,10 +215,14 @@ where
                 Ok(Some(_)) => pacing.started(key, lag),
                 // Its result sets when the next pass is due.
                 Ok(None) if partition.segment_rewrite_running() => pacing.started(key, lag),
-                Ok(None) => pacing.settle(key, RewriteResult::Idle, now),
+                Ok(None) => {
+                    pacing.settle(key, RewriteResult::Idle, now);
+                    // A full long-term log starts no rewrite and still lags.
+                    pacing.set_lag(key, lag);
+                }
                 Err(_) => {
                     pacing.set_lag(key, lag);
-                    pacing.settle(key, RewriteResult::Unchanged, now);
+                    pacing.settle(key, RewriteResult::Resent, now);
                 }
             }
             started
@@ -222,9 +272,9 @@ where
 
     /// Hand `finished` to the partition that started it, commit the segment
     /// it stored, and set when the partition's next pass is due. A segment
-    /// that came out nearly full has a backlog behind it, which drains
-    /// without a wait. A failure waits, so a store that refuses is not
-    /// asked in a loop.
+    /// that ended before the commit point has a backlog behind it, whose
+    /// pass starts when the segment's command commits. A failure waits, so
+    /// a store that refuses is not asked in a loop.
     #[allow(clippy::future_not_send)]
     async fn settle_segment_rewrite(&self, finished: FinishedSegmentRewrite)
     where
@@ -246,7 +296,8 @@ where
         let stored = partition.finish_segment_rewrite(finished.id, finished.outcome);
         let result = stored.map_or(RewriteResult::Unchanged, |stored| RewriteResult::Stored {
             bytes: stored.size,
-            target: LONG_TERM_SEGMENT_BYTES as u64,
+            cap: LONG_TERM_SEGMENT_BYTES as u64,
+            reached_commit: partition.stored_segment_reached_commit(),
         });
         self.rewrite_pacing
             .borrow_mut()

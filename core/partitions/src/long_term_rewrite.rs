@@ -54,6 +54,7 @@ use crate::IggyPartition;
 use crate::Partition;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
+use crate::long_term::LONG_TERM_SEGMENTS_MAX;
 use crate::placed_read::PlacedReadPlan;
 use crate::poll_plan::DiskFault;
 use crate::segment_chain::{HashSource, SegmentRecord, hash_segment_file};
@@ -368,6 +369,8 @@ pub struct LongTermRewrites {
     /// Where the segment from the floor on must end: where the one another
     /// primary stored ends.
     ends_at: Option<u64>,
+    /// The commit point the last rewrite started at.
+    committed_at_start: u64,
     /// Number of the last rewrite this partition started.
     jobs: u64,
 }
@@ -388,6 +391,11 @@ where
     pub fn begin_segment_rewrite(&mut self) -> Option<(u64, SegmentRewrite, TierScopeToken)> {
         if !self.places_batches() || !self.state_machines_current() {
             self.long_term_rewrites = LongTermRewrites::default();
+            return None;
+        }
+        // The log refuses a segment past this, and a stored segment whose
+        // command is refused holds back every later rewrite.
+        if self.long_term_segments().len() >= LONG_TERM_SEGMENTS_MAX {
             return None;
         }
         let floor = self.long_term_floor();
@@ -421,6 +429,7 @@ where
         rewrites.jobs += 1;
         let id = rewrites.jobs;
         rewrites.running = Some((id, scope));
+        rewrites.committed_at_start = committed;
         let rewrite = SegmentRewrite {
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             start_offset,
@@ -498,6 +507,17 @@ where
                 && self.state_machines_current()
                 && self.long_term_floor() < Some(stored.end_offset)
         })
+    }
+
+    /// Whether the segment the last rewrite stored holds every message that
+    /// was committed when the rewrite started. A segment that ended earlier
+    /// has more behind it.
+    #[must_use]
+    pub fn stored_segment_reached_commit(&self) -> bool {
+        let rewrites = &self.long_term_rewrites;
+        rewrites
+            .stored
+            .is_none_or(|stored| stored.end_offset >= rewrites.committed_at_start)
     }
 
     /// Whether a rewrite this partition started has yet to hand its result

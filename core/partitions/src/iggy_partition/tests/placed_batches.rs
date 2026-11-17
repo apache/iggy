@@ -1502,6 +1502,161 @@ async fn given_a_long_term_floor_when_asking_for_fresh_objects_should_name_those
     assert_eq!(Box::pin(objects_in_use(&partition)).await, vec![named]);
 }
 
+/// Send the command of `segment` as the primary does, and commit it on the
+/// replica as it stands then.
+async fn commit_segment_command(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    segment: &iggy_object_store::ManifestSegment,
+    lose_primacy_first: bool,
+) {
+    let request = partition.publish_segment_request(segment, 1).unwrap();
+    Box::pin(partition.on_request(request, None)).await;
+    let head = partition.consensus().sequencer().current_sequence();
+    if lose_primacy_first {
+        lose_primacy(partition);
+    }
+    partition.consensus().advance_commit_max(head);
+    let config = repair_config();
+    for _ in 0..4 {
+        Box::pin(partition.commit_journal(&config)).await;
+    }
+    assert_eq!(partition.long_term_segments(), [*segment]);
+}
+
+/// The primary publishes the manifest and rewrites, so it is the one that
+/// learns of a commit to the long-term log.
+#[compio::test]
+async fn given_a_primary_when_the_command_of_a_segment_commits_should_note_that_the_log_changed() {
+    use crate::LongTermWriter;
+    let (_whole, placed, object) = whole_and_placed(2);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let outcome = writer(&store).write(rewrite, scope).await;
+    let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
+    assert!(!partition.take_long_term_changed());
+
+    Box::pin(commit_segment_command(&mut partition, &segment, false)).await;
+
+    assert!(partition.take_long_term_changed());
+    assert!(!partition.take_long_term_changed(), "taken once");
+}
+
+#[compio::test]
+async fn given_a_backup_when_the_command_of_a_segment_commits_should_not_note_that_the_log_changed()
+{
+    use crate::LongTermWriter;
+    let (_whole, placed, object) = whole_and_placed(2);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let outcome = writer(&store).write(rewrite, scope).await;
+    let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
+
+    Box::pin(commit_segment_command(&mut partition, &segment, true)).await;
+
+    assert!(!partition.take_long_term_changed());
+}
+
+/// The log refuses a segment past its limit. A segment stored then would
+/// wait for its command forever, and hold back every rewrite after it.
+#[compio::test]
+async fn given_a_full_long_term_log_when_a_pass_runs_should_start_no_rewrite() {
+    let (_whole, placed, object) = whole_and_placed(2);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
+    let segments = crate::long_term::LONG_TERM_SEGMENTS_MAX as u64;
+    for offset in 0..segments {
+        let payload = crate::long_term::PublishSegment(iggy_object_store::ManifestSegment {
+            start_offset: offset,
+            end_offset: offset,
+            start_timestamp: 0,
+            end_timestamp: 0,
+            max_timestamp: 0,
+            size: 1,
+            crc32c: 0,
+            hash: [0; iggy_object_store::SEGMENT_HASH_LEN],
+        })
+        .encode();
+        let applied = partition
+            .state_machines
+            .apply(
+                100 + offset,
+                crate::state_machine::MachineCommand {
+                    kind: crate::long_term::PUBLISH_SEGMENT,
+                    payload: &payload,
+                },
+            )
+            .unwrap();
+        assert_eq!(applied, crate::state_machine::Applied::Changed);
+    }
+    // One committed message above the floor, which a rewrite would take.
+    partition.dirty_offset.store(segments, Ordering::Release);
+    partition.offset.store(segments, Ordering::Release);
+    assert_eq!(partition.long_term_lag(), 1);
+
+    assert!(partition.begin_segment_rewrite().is_none());
+    assert!(!partition.segment_rewrite_running());
+}
+
+/// A segment that ends before the commit point its rewrite started at has
+/// committed messages behind it, as one cut at the byte cap does.
+#[compio::test]
+async fn given_a_segment_that_ends_before_the_commit_point_when_stored_should_say_more_is_behind() {
+    use crate::LongTermWriter;
+    let (_whole, placed, object) = whole_and_placed(4);
+    let store = Box::pin(store_with(object)).await;
+    Box::pin(store_segment_of_a_deposed_primary(&placed[..2], &store)).await;
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
+    let writer = writer(&store);
+    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let outcome = writer.write(rewrite, scope).await;
+    assert_eq!(partition.finish_segment_rewrite(id, outcome), None);
+
+    let first = Box::pin(rewrite_pass(&mut partition, &writer, 100))
+        .await
+        .unwrap();
+    assert_eq!(first.end_offset, 1);
+    assert!(!partition.stored_segment_reached_commit());
+
+    let second = Box::pin(rewrite_pass(&mut partition, &writer, 101))
+        .await
+        .unwrap();
+    assert_eq!(second.end_offset, 3);
+    assert!(partition.stored_segment_reached_commit());
+}
+
+/// A segment committed while the manifest was being stored is not in it,
+/// and no publish starts while one runs, so the end of the publish asks for
+/// the next one.
+#[compio::test]
+async fn given_a_segment_published_during_a_manifest_publish_when_it_ends_should_ask_for_another() {
+    const STORED: crate::ManifestPublishOutcome = Ok(Ok(()));
+    let (_whole, placed, object) = whole_and_placed(4);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&placed[..2], &store)).await;
+    let writer = writer(&store);
+    let now = IggyTimestamp::now();
+    Box::pin(rewrite_pass(&mut partition, &writer, 100)).await;
+    let (id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    assert_eq!(manifest.floor, Some(1));
+    Box::pin(commit_records(&mut partition, 3, &placed[2..])).await;
+    Box::pin(rewrite_pass(&mut partition, &writer, 101)).await;
+    assert!(
+        partition.begin_manifest_publish(now).is_none(),
+        "one at a time"
+    );
+
+    assert!(partition.finish_manifest_publish(id, &STORED, now));
+
+    let (id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    assert_eq!(manifest.floor, Some(3));
+    assert!(
+        !partition.finish_manifest_publish(id, &STORED, now),
+        "the log stood still"
+    );
+}
+
 /// Reads `store`, and counts the reads.
 struct CountedStore {
     store: Rc<iggy_object_store::MemoryStore>,
@@ -1792,9 +1947,11 @@ async fn given_a_replica_that_lost_primacy_when_a_placed_request_arrives_should_
     let config = repair_config();
     let (_directory, mut partition) = Box::pin(placing_partition()).await;
     let placed = placed_client_request(&partition, 1, 2);
+    assert!(partition.takes_placed_sends() && partition.has_request_room());
     let view = partition.consensus.view() + 1;
     partition.consensus.set_view(view);
     assert!(!partition.consensus.is_primary());
+    assert!(!partition.takes_placed_sends());
 
     Box::pin(partition.on_placed_request(placed, None)).await;
     Box::pin(settle_partition_io(&mut partition, &config)).await;
