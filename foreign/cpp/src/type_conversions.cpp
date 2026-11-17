@@ -46,6 +46,16 @@ std::vector<std::string> TextsFromFfi(const rust::Vec<rust::String> &texts) {
     return result;
 }
 
+// Bytes, not rust::String, so the bridge refuses text that is not UTF-8 with invalid_command.
+rust::Vec<std::uint8_t> TextToFfiBytes(const std::string &text) {
+    rust::Vec<std::uint8_t> bytes;
+    bytes.reserve(text.size());
+    for (const char character : text) {
+        bytes.push_back(static_cast<std::uint8_t>(character));
+    }
+    return bytes;
+}
+
 }  // namespace
 
 LoginInfo LoginInfo::FromFfi(ffi::LoginInfo login_info) {
@@ -854,6 +864,78 @@ MetadataChanges MetadataChanges::FromFfi(ffi::MetadataChanges changes) {
     if (changes.has_current_page_token) {
         result.current_page_token_ = MetadataCurrentPageToken::FromFfi(std::move(changes.current_page_token));
     }
+    return result;
+}
+
+ffi::PageQuery PageQuery::ToFfi() const {
+    ffi::PageQuery query{};
+    query.order      = static_cast<ffi::PageOrder>(order_);
+    query.descending = descending_;
+    query.limit      = limit_;
+    query.has_cursor = cursor_.has_value();
+    if (cursor_) {
+        query.cursor = TextToFfiBytes(*cursor_);
+    }
+    return query;
+}
+
+ffi::NamedPageQuery NamedPageQuery::ToFfi() const {
+    ffi::NamedPageQuery query{};
+    query.page     = page_.ToFfi();
+    query.has_name = name_.has_value();
+    if (name_) {
+        query.name = TextToFfiBytes(*name_);
+    }
+    return query;
+}
+
+StreamsPage StreamsPage::FromFfi(ffi::StreamsPage page) {
+    StreamsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &stream : page.items) {
+        result.items_.push_back(Stream::FromFfi(std::move(stream)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+TopicsPage TopicsPage::FromFfi(ffi::TopicsPage page) {
+    TopicsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &topic : page.items) {
+        result.items_.push_back(Topic::FromFfi(std::move(topic)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+PartitionsPage PartitionsPage::FromFfi(ffi::PartitionsPage page) {
+    PartitionsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &partition : page.items) {
+        result.items_.push_back(Partition::FromFfi(std::move(partition)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+ConsumerGroupsPage ConsumerGroupsPage::FromFfi(ffi::ConsumerGroupsPage page) {
+    ConsumerGroupsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &group : page.items) {
+        result.items_.push_back(ConsumerGroup::FromFfi(std::move(group)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+UsersPage UsersPage::FromFfi(ffi::UsersPage page) {
+    UsersPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &user : page.items) {
+        result.items_.push_back(UserInfo::FromFfi(std::move(user)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
     return result;
 }
 

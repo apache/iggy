@@ -499,7 +499,9 @@ export class MetadataChangeCursor {
   static parse(text: string): MetadataChangeCursor {
     if (text.length !== CURSOR_TEXT_LENGTH)
       throw invalidCommand('a change cursor is 63 characters');
-    const cursor = decodeCursor(decodeCanonicalBase64(text, METADATA_CHANGE_CURSOR_PREFIX));
+    const cursor = decodeCursor(
+      decodeCanonicalBase64(text, METADATA_CHANGE_CURSOR_PREFIX, COMMAND_CODE.GetMetadataChanges)
+    );
     if (cursor === undefined)
       throw invalidCommand(NON_CANONICAL_CURSOR);
     return cursor;
@@ -545,7 +547,9 @@ export class MetadataCurrentPageToken {
   static parse(text: string): MetadataCurrentPageToken {
     if (text.length > MAX_PAGE_TOKEN_TEXT_LENGTH)
       throw invalidCommand('the page token is too long');
-    const payload = decodeCanonicalBase64(text, METADATA_CURRENT_PAGE_TOKEN_PREFIX);
+    const payload = decodeCanonicalBase64(
+      text, METADATA_CURRENT_PAGE_TOKEN_PREFIX, COMMAND_CODE.GetMetadataChanges
+    );
     const refusal = pageTokenRefusal(payload);
     if (refusal !== undefined)
       throw invalidCommand(refusal);
@@ -1125,14 +1129,16 @@ const keyFitsGroup = (group: MetadataChangeGroup, key: Buffer): boolean => {
 /**
  * Strips `prefix` and decodes unpadded Base64url that encodes back to the
  * same text, so one value has exactly one text form.
+ *
+ * @throws ResponseError with code 3 (invalid command) against `commandCode`
  */
-const decodeCanonicalBase64 = (text: string, prefix: string): Buffer => {
+export const decodeCanonicalBase64 = (text: string, prefix: string, commandCode: number): Buffer => {
   if (!text.startsWith(prefix))
-    throw invalidCommand(`expected the ${prefix} prefix`);
+    throw responseError(commandCode, INVALID_COMMAND, `expected the ${prefix} prefix`);
   const encoded = text.slice(prefix.length);
   const bytes = Buffer.from(encoded, 'base64url');
   if (bytes.toString('base64url') !== encoded)
-    throw invalidCommand('expected canonical unpadded Base64url');
+    throw responseError(commandCode, INVALID_COMMAND, 'expected canonical unpadded Base64url');
   return bytes;
 };
 

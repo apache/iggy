@@ -21,6 +21,9 @@ package org.apache.iggy.client.async;
 
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
 
 import java.util.concurrent.CompletableFuture;
 
@@ -72,4 +75,15 @@ public interface PartitionsClient {
      * @return A CompletableFuture that completes when the operation is done
      */
     CompletableFuture<Void> deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount);
+
+    /**
+     * Gets one page of the partitions of a topic.
+     *
+     * @param streamId The stream identifier
+     * @param topicId The topic identifier
+     * @param query The order, limit and cursor of the page
+     * @return A CompletableFuture that completes with the page, or fails with an invalid
+     *         command error when the query breaks the page rules
+     */
+    CompletableFuture<Page<Partition>> getPartitionsPage(StreamId streamId, TopicId topicId, PageQuery query);
 }

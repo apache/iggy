@@ -25,6 +25,8 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import tools.jackson.core.type.TypeReference;
 
 import java.math.BigInteger;
@@ -56,6 +58,12 @@ class StreamsHttpClient implements StreamsClient {
         var request = httpClient.prepareGetRequest(STREAMS);
         List<HttpStream> streams = httpClient.execute(request, new TypeReference<>() {});
         return streams.stream().map(HttpStream::toStreamBase).toList();
+    }
+
+    @Override
+    public Page<StreamBase> getStreamsPage(NamedPageQuery query) {
+        HttpPage<HttpStream> page = HttpPage.read(httpClient, STREAMS, query, new TypeReference<>() {});
+        return page.toPage(HttpStream::toStreamBase);
     }
 
     @Override

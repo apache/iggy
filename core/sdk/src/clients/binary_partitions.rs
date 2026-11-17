@@ -19,7 +19,7 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::PartitionClient;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, Page, PageQuery, Partition};
 
 #[async_trait]
 impl PartitionClient for IggyClient {
@@ -39,5 +39,14 @@ impl PartitionClient for IggyClient {
         partitions_count: u32,
     ) -> Result<(), IggyError> {
         super::with_client!(self, client => client.delete_partitions(stream_id, topic_id, partitions_count).await)
+    }
+
+    async fn get_partitions_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &PageQuery,
+    ) -> Result<Page<Partition>, IggyError> {
+        super::with_client!(self, client => client.get_partitions_page(stream_id, topic_id, query).await)
     }
 }

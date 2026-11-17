@@ -216,7 +216,7 @@ fn parse_micros(value: &str) -> Result<IggyTimestamp, IggyError> {
 }
 
 /// A decimal integer without a sign, padding or leading zeros.
-fn parse_canonical<T: FromStr>(value: &str) -> Result<T, IggyError> {
+pub(crate) fn parse_canonical<T: FromStr>(value: &str) -> Result<T, IggyError> {
     let canonical = !value.is_empty()
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && (value == "0" || !value.starts_with('0'));

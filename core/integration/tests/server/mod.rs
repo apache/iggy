@@ -50,6 +50,8 @@ mod topic_metrics_vsr;
 pub(crate) mod http_client;
 // Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
+// Raw-HTTP page keys of the list routes.
+mod http_list_pages;
 // Raw-HTTP wire-contract residue against the server (status codes + typed error
 // bodies); the RBAC matrix lives in permissions_scenario.
 mod http_rbac;

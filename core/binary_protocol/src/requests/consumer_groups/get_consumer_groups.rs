@@ -15,44 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::WireError;
-use crate::WireIdentifier;
 use crate::codec::{WireDecode, WireEncode};
+use crate::primitives::page::{WirePageQuery, decode_trailing_page};
+use crate::{WireError, WireIdentifier};
 use bytes::BytesMut;
 
-/// `GetConsumerGroups` request.
+/// `GetConsumerGroups` request: one page of the consumer groups of a topic,
+/// in id order.
 ///
-/// Wire format: `[stream_id][topic_id]`
+/// Wire format: `[stream_id:WireIdentifier][topic_id:WireIdentifier][page]`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetConsumerGroupsRequest {
     pub stream_id: WireIdentifier,
     pub topic_id: WireIdentifier,
+    pub page: WirePageQuery,
 }
 
 impl WireEncode for GetConsumerGroupsRequest {
     fn encoded_size(&self) -> usize {
-        self.stream_id.encoded_size() + self.topic_id.encoded_size()
+        self.stream_id.encoded_size() + self.topic_id.encoded_size() + self.page.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.stream_id.encode(buf);
         self.topic_id.encode(buf);
+        self.page.encode(buf);
     }
 }
 
 impl WireDecode for GetConsumerGroupsRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let mut pos = 0;
-        let (stream_id, n) = WireIdentifier::decode(&buf[pos..])?;
-        pos += n;
-        let (topic_id, n) = WireIdentifier::decode(&buf[pos..])?;
-        pos += n;
+        let (stream_id, stream_size) = WireIdentifier::decode(buf)?;
+        let (topic_id, topic_size) = WireIdentifier::decode(&buf[stream_size..])?;
+        let (page, consumed) = decode_trailing_page(buf, stream_size + topic_size)?;
         Ok((
             Self {
                 stream_id,
                 topic_id,
+                page,
             },
-            pos,
+            consumed,
         ))
     }
 }
@@ -60,43 +62,55 @@ impl WireDecode for GetConsumerGroupsRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WireName;
 
-    #[test]
-    fn roundtrip_numeric() {
-        let req = GetConsumerGroupsRequest {
-            stream_id: WireIdentifier::numeric(1),
-            topic_id: WireIdentifier::numeric(2),
-        };
-        let bytes = req.to_bytes();
-        let (decoded, consumed) = GetConsumerGroupsRequest::decode(&bytes).unwrap();
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, req);
-    }
-
-    #[test]
-    fn roundtrip_named() {
-        let req = GetConsumerGroupsRequest {
+    fn request() -> GetConsumerGroupsRequest {
+        GetConsumerGroupsRequest {
             stream_id: WireIdentifier::named("stream-1").unwrap(),
-            topic_id: WireIdentifier::named("topic-1").unwrap(),
-        };
-        let bytes = req.to_bytes();
-        let (decoded, consumed) = GetConsumerGroupsRequest::decode(&bytes).unwrap();
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, req);
+            topic_id: WireIdentifier::numeric(2),
+            page: WirePageQuery {
+                descending: true,
+                name: Some(WireName::new("group").unwrap()),
+                ..WirePageQuery::default()
+            },
+        }
     }
 
     #[test]
-    fn truncated_returns_error() {
-        let req = GetConsumerGroupsRequest {
+    fn given_a_page_when_round_tripping_should_keep_every_field() {
+        let request = request();
+        let bytes = request.to_bytes();
+        assert_eq!(bytes.len(), request.encoded_size());
+        assert_eq!(
+            GetConsumerGroupsRequest::decode(&bytes).unwrap(),
+            (request, bytes.len())
+        );
+    }
+
+    #[test]
+    fn given_a_first_page_when_encoding_should_pin_the_bytes() {
+        let request = GetConsumerGroupsRequest {
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(2),
+            page: WirePageQuery::default(),
         };
-        let bytes = req.to_bytes();
-        for i in 0..bytes.len() {
+        let mut expected = WireIdentifier::numeric(1).to_bytes().to_vec();
+        expected.extend_from_slice(&WireIdentifier::numeric(2).to_bytes());
+        expected.extend_from_slice(&[0, 0, 100, 0, 0, 0, 0, 0]);
+        assert_eq!(&request.to_bytes()[..], &expected[..]);
+    }
+
+    #[test]
+    fn given_a_truncated_request_or_bytes_after_it_when_decoding_should_refuse() {
+        let bytes = request().to_bytes();
+        for length in 0..bytes.len() {
             assert!(
-                GetConsumerGroupsRequest::decode(&bytes[..i]).is_err(),
-                "expected error for truncation at byte {i}"
+                GetConsumerGroupsRequest::decode(&bytes[..length]).is_err(),
+                "a request cut at {length} bytes must not decode"
             );
         }
+        let mut longer = bytes.to_vec();
+        longer.push(0);
+        assert!(GetConsumerGroupsRequest::decode(&longer).is_err());
     }
 }

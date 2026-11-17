@@ -21,7 +21,7 @@ mod snapshot;
 mod store;
 
 pub use current::{CurrentState, current_page};
-pub use query::{MAX_SCANNED_ENTRIES, change_page};
+pub use query::{MAX_PAGE_BYTES, MAX_SCANNED_ENTRIES, change_page};
 
 pub use snapshot::{ChangeEntrySnapshot, ChangeLogSnapshot, RingSnapshot};
 pub use store::{

@@ -194,6 +194,7 @@ class IggyErrorCodeTest {
         "89, NOT_PRIMARY",
         "90, DEFERRED_POLL_CAPACITY_EXCEEDED",
         "96, TIERED_READ_FAILED",
+        "97, REPLY_TOO_LARGE",
 
         // Client errors
         "100, CLIENT_NOT_FOUND",

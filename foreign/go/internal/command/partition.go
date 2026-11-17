@@ -23,6 +23,25 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
+// GetPartitions asks for one page of the partitions of a topic.
+type GetPartitions struct {
+	StreamId iggcon.Identifier
+	TopicId  iggcon.Identifier
+	Query    iggcon.PageQuery
+}
+
+func (g *GetPartitions) Code() Code {
+	return GetPartitionsCode
+}
+
+func (g *GetPartitions) MarshalBinary() ([]byte, error) {
+	identifiers, err := iggcon.MarshalIdentifiers(g.StreamId, g.TopicId)
+	if err != nil {
+		return nil, err
+	}
+	return g.Query.AppendBinary(identifiers)
+}
+
 type CreatePartitions struct {
 	StreamId        iggcon.Identifier `json:"streamId"`
 	TopicId         iggcon.Identifier `json:"topicId"`

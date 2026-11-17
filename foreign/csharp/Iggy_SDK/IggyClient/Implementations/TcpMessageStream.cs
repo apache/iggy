@@ -65,6 +65,10 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
         CommandCodes.FETCH_MESSAGES_CODE
     ];
 
+    /// <summary>The first page of a whole list read: ascending id order, in the largest pages.</summary>
+    private static readonly NamedPageQuery WholeListQuery
+        = new() { Page = new PageQuery { Limit = PageQuery.MAX_LIMIT } };
+
     private readonly IggyClientConfigurator _configuration;
 
     // The configurator stays settable after construction, so the endpoint the client was built for is pinned here:
@@ -205,18 +209,15 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default)
+    public Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default)
     {
-        var message = Array.Empty<byte>();
-        using IMemoryOwner<byte> responseBuffer
-            = await SendWithResponseAsync(CommandCodes.GET_STREAMS_CODE, message, token: token);
+        return ReadWholeListAsync(CommandCodes.GET_STREAMS_CODE, [], BinaryMapper.MapToStream, token);
+    }
 
-        if (responseBuffer.Memory.Length == 0)
-        {
-            return [];
-        }
-
-        return BinaryMapper.MapStreams(responseBuffer.Memory.Span);
+    /// <inheritdoc />
+    public Task<Page<StreamResponse>> GetStreamsPageAsync(NamedPageQuery query, CancellationToken token = default)
+    {
+        return ReadPageAsync(CommandCodes.GET_STREAMS_CODE, [], query, BinaryMapper.MapToStream, token);
     }
 
     /// <inheritdoc />
@@ -236,19 +237,17 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId,
+    public Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId,
         CancellationToken token = default)
     {
-        var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
-        using IMemoryOwner<byte> responseBuffer
-            = await SendWithResponseAsync(CommandCodes.GET_TOPICS_CODE, message, token: token);
+        return ReadWholeListAsync(CommandCodes.GET_TOPICS_CODE, [streamId], BinaryMapper.MapToTopic, token);
+    }
 
-        if (responseBuffer.Memory.Length == 0)
-        {
-            return [];
-        }
-
-        return BinaryMapper.MapTopics(responseBuffer.Memory.Span);
+    /// <inheritdoc />
+    public Task<Page<TopicResponse>> GetTopicsPageAsync(Identifier streamId, NamedPageQuery query,
+        CancellationToken token = default)
+    {
+        return ReadPageAsync(CommandCodes.GET_TOPICS_CODE, [streamId], query, BinaryMapper.MapToTopic, token);
     }
 
     /// <inheritdoc />
@@ -568,20 +567,20 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId,
+    public Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId,
         Identifier topicId,
         CancellationToken token = default)
     {
-        var message = TcpContracts.GetGroups(streamId, topicId);
-        using IMemoryOwner<byte> responseBuffer
-            = await SendWithResponseAsync(CommandCodes.GET_CONSUMER_GROUPS_CODE, message, token: token);
+        return ReadWholeListAsync(CommandCodes.GET_CONSUMER_GROUPS_CODE, [streamId, topicId],
+            BinaryMapper.MapToConsumerGroup, token);
+    }
 
-        if (responseBuffer.Memory.Length == 0)
-        {
-            return [];
-        }
-
-        return BinaryMapper.MapConsumerGroups(responseBuffer.Memory.Span);
+    /// <inheritdoc />
+    public Task<Page<ConsumerGroupResponse>> GetConsumerGroupsPageAsync(Identifier streamId, Identifier topicId,
+        NamedPageQuery query, CancellationToken token = default)
+    {
+        return ReadPageAsync(CommandCodes.GET_CONSUMER_GROUPS_CODE, [streamId, topicId], query,
+            BinaryMapper.MapToConsumerGroup, token);
     }
 
     /// <inheritdoc />
@@ -662,6 +661,14 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
         var message = TcpContracts.CreatePartitions(streamId, topicId, partitionsCount);
         await SendAckAsync(CommandCodes.CREATE_PARTITIONS_CODE, message, token);
         _groupState.InvalidateTopicDiscovery();
+    }
+
+    /// <inheritdoc />
+    public Task<Page<PartitionResponse>> GetPartitionsPageAsync(Identifier streamId, Identifier topicId,
+        PageQuery query, CancellationToken token = default)
+    {
+        return ReadPageAsync(CommandCodes.GET_PARTITIONS_CODE, [streamId, topicId],
+            new NamedPageQuery { Page = query }, BinaryMapper.MapToPartition, token);
     }
 
     /// <inheritdoc />
@@ -867,18 +874,15 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<UserResponse>> GetUsersAsync(CancellationToken token = default)
+    public Task<IReadOnlyList<UserResponse>> GetUsersAsync(CancellationToken token = default)
     {
-        var message = Array.Empty<byte>();
-        using IMemoryOwner<byte> responseBuffer
-            = await SendWithResponseAsync(CommandCodes.GET_USERS_CODE, message, token: token);
+        return ReadWholeListAsync(CommandCodes.GET_USERS_CODE, [], BinaryMapper.MapToUserResponse, token);
+    }
 
-        if (responseBuffer.Memory.Length == 0)
-        {
-            return [];
-        }
-
-        return BinaryMapper.MapUsers(responseBuffer.Memory.Span);
+    /// <inheritdoc />
+    public Task<Page<UserResponse>> GetUsersPageAsync(NamedPageQuery query, CancellationToken token = default)
+    {
+        return ReadPageAsync(CommandCodes.GET_USERS_CODE, [], query, BinaryMapper.MapToUserResponse, token);
     }
 
     /// <inheritdoc />
@@ -1421,6 +1425,46 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
     private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token)
     {
         using IMemoryOwner<byte> _ = await SendWithResponseAsync(code, body, token: token);
+    }
+
+    private async Task<Page<T>> ReadPageAsync<T>(int code, Identifier[] parents, NamedPageQuery query,
+        PageItemReader<T> readItem, CancellationToken token, long? deadline = null, ulong? startedUnder = null)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(code,
+            TcpContracts.GetPage(query, parents), token: token, deadline: deadline, startedUnder: startedUnder);
+
+        return BinaryMapper.MapPage(responseBuffer.Memory.Span, readItem);
+    }
+
+    /// <summary>
+    ///     Reads pages until one has no next cursor. The result is not one consistent read: an entity that someone
+    ///     creates or deletes during the walk can be in it or not. The walk is one call, so every page keeps the
+    ///     sign-in and the deadline that the walk started with.
+    /// </summary>
+    private async Task<IReadOnlyList<T>> ReadWholeListAsync<T>(int code, Identifier[] parents,
+        PageItemReader<T> readItem, CancellationToken token)
+    {
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        var generation = _consensusSession.Generation;
+        var items = new List<T>();
+        var query = WholeListQuery;
+        Page<T> page;
+        do
+        {
+            page = await ReadPageAsync(code, parents, query, readItem, token, deadline, generation);
+            if (page.Next is { } next && next.Equals(query.Page.Cursor))
+            {
+                throw new MalformedResponseException(
+                    "The server answered the page cursor it was sent, so the list walk would not end.");
+            }
+
+            items.AddRange(page.Items);
+            query = query with { Page = query.Page with { Cursor = page.Next } };
+        } while (page.Next is not null);
+
+        return items;
     }
 
     internal async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
