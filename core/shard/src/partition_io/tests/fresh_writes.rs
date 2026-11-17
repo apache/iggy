@@ -430,8 +430,8 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
     assert_eq!(store.head(&log_key).await.unwrap().size, segments[0].size);
     assert_eq!(
         store.keys().len(),
-        3,
-        "the fresh object, the log and its index"
+        4,
+        "a fresh object per send, the log and its index"
     );
 }
 
