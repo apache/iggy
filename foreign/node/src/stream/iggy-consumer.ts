@@ -57,6 +57,8 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
 
 /**
  * Hands over the messages of a topic one at a time, on a `PartitionReader`.
+ * After a loop ends, a later iteration or `consume()` continues with the next
+ * unread message of its batch. Use one iterator or handler loop at a time.
  * With `CommitPolicy.Manual` the application commits checkpoints. With
  * `CommitPolicy.OnRead` the server stores the offset of each read and
  * `shutdown()` moves it back to the last message handed over. It does not
@@ -79,6 +81,7 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   private stopped = false;
   /** The batch whose messages the consumer hands over, until a seek of its partition drops the rest. */
   private current?: PolledBatch;
+  private index = 0;
 
   /** @internal */
   constructor(
@@ -95,13 +98,14 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<ConsumerMessage> {
+    this.countProcessed();
     while (!this.stopped) {
       const batch = await this.nextBatch();
       if (!batch) return;
       this.current = batch;
-      for (let index = 0; index < batch.messages.length && this.current === batch; index += 1) {
+      while (this.index < batch.messages.length && this.current === batch) {
         if (this.stopped) return;
-        const message = this.hand(batch, index);
+        const message = this.hand(batch, this.index++);
         yield message;
         this.countProcessed();
       }
@@ -115,13 +119,14 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
    * handler runs leaves it uncounted too.
    */
   async consume(handler: (message: ConsumerMessage) => Promise<void> | void): Promise<void> {
+    this.countProcessed();
     while (!this.stopped) {
       const batch = await this.nextBatch();
       if (!batch) return;
       this.current = batch;
-      for (let index = 0; index < batch.messages.length && this.current === batch; index += 1) {
+      while (this.index < batch.messages.length && this.current === batch) {
         if (this.stopped) return;
-        const message = this.hand(batch, index);
+        const message = this.hand(batch, this.index++);
         // A shutdown while the handler runs must not count its message.
         const handled = this.uncounted;
         this.uncounted = undefined;
@@ -195,9 +200,13 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   }
 
   private async nextBatch(): Promise<PolledBatch | undefined> {
+    if (this.current && this.index < this.current.messages.length) return this.current;
+    this.current = undefined;
     while (true) {
       try {
-        return await this.reader.next();
+        const batch = await this.reader.next();
+        this.index = 0;
+        return batch;
       } catch (error) {
         if (this.stopped && !(error instanceof ReadError)) return undefined;
         if (!(error instanceof ReadError) || error.skip || error.stopsPartition || error.lost) throw error;

@@ -3973,6 +3973,103 @@ describe('partition reader', () => {
 });
 
 describe('consumer', () => {
+  for (const commit of [CommitPolicy.Manual, CommitPolicy.OnRead,
+    CommitPolicy.Auto({ interval: 3_600_000, after: CommitAfter.Processing })]) {
+    for (const take of [1, 2]) {
+      it(`resumes an iteration after taking ${take} messages with ${commit.kind}`, async () => {
+        const topic = new FakeTopic(8n);
+        const consumer = new IggyConsumer(await open(topic, [1], { commit }),
+          commit.kind === 'auto' ? CommitAfter.Processing : undefined);
+        const received: bigint[] = [];
+        try {
+          for (let iteration = 0; iteration < 3; iteration++) {
+            let taken = 0;
+            for await (const { message } of consumer) {
+              received.push(message.headers.offset);
+              if (++taken === take) break;
+            }
+          }
+          assert.deepEqual(received, Array.from({ length: 3 * take }, (_, index) => BigInt(index)));
+        } finally {
+          await consumer.shutdown();
+        }
+        assert.equal(topic.stored.get(1), commit.kind === 'manual' ? undefined : BigInt(3 * take - 1));
+        const restarted = await open(topic, [1], { commit: CommitPolicy.Manual }, PollingStrategy.Next);
+        try {
+          const batch = await restarted.next({ signal: AbortSignal.timeout(1_000) });
+          assert.equal(batch.messages[0].headers.offset, commit.kind === 'manual' ? 0n : BigInt(3 * take));
+        } finally {
+          await restarted.close();
+        }
+      });
+    }
+  }
+
+  it('counts the previous message when a new iteration asks for the next one', async () => {
+    const topic = new FakeTopic(4n);
+    const commit = CommitPolicy.Auto({ every: CommitEvery.Message, after: CommitAfter.Processing });
+    const consumer = new IggyConsumer(await open(topic, [1], { commit }), CommitAfter.Processing);
+    try {
+      for await (const { message } of consumer) {
+        assert.equal(message.headers.offset, 0n);
+        break;
+      }
+      assert.equal(topic.stored.get(1), undefined);
+      for await (const { message } of consumer) {
+        assert.equal(message.headers.offset, 1n);
+        break;
+      }
+      await waitFor(() => topic.stored.get(1) === 0n, 'the previous iteration was not counted');
+    } finally {
+      await consumer.shutdown();
+    }
+    assert.equal(topic.stored.get(1), 1n);
+  });
+
+  it('keeps unread messages when switching between iteration and a handler that fails', async () => {
+    const topic = new FakeTopic(6n);
+    const consumer = new IggyConsumer(await open(topic, [1]));
+    const received: bigint[] = [];
+    const failure = new Error('handler failed');
+    try {
+      for await (const { message } of consumer) {
+        received.push(message.headers.offset);
+        break;
+      }
+      await assert.rejects(consumer.consume(({ message }) => {
+        received.push(message.headers.offset);
+        throw failure;
+      }), (error: unknown) => error === failure);
+      for await (const { message } of consumer) {
+        received.push(message.headers.offset);
+        break;
+      }
+      assert.deepEqual(received, [0n, 1n, 2n]);
+    } finally {
+      await consumer.shutdown();
+    }
+  });
+
+  it('drops the unread remainder on a seek between iterations', async () => {
+    const topic = new FakeTopic(6n);
+    const consumer = new IggyConsumer(await open(topic, [1]));
+    const received: bigint[] = [];
+    try {
+      for await (const { message } of consumer) {
+        received.push(message.headers.offset);
+        break;
+      }
+      await consumer.seek(1, PollingStrategy.Offset(4n));
+      for await (const { message } of consumer) {
+        received.push(message.headers.offset);
+        break;
+      }
+      assert.deepEqual(received, [0n, 4n]);
+    } finally {
+      await consumer.shutdown();
+    }
+  });
+
   it('counts a message once the iterator is read again, and the last one on shutdown', async () => {
     const topic = new FakeTopic(4n);
     const reader = await open(topic, [1], {
