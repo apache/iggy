@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{BenchmarkGroupMetricsLight, BenchmarkReportLight};
+use crate::metrics::{GroupMetrics, is_member};
+use crate::{BenchmarkGroupMetricsLight, BenchmarkIndividualMetricsLight, BenchmarkReportLight};
 use bench_report::{
     actor_kind::ActorKind, benchmark_kind::BenchmarkKind, group_metrics_kind::GroupMetricsKind,
 };
 use human_repr::HumanCount;
 
 impl BenchmarkReportLight {
+    /// The subtext of the embed charts. The throughput lines give the group rates of the dashboard
+    /// pages, not the report's sums of the actors' own rates.
     pub fn subtext(&self) -> String {
         let params_text = self.format_params();
         let mut stats = Vec::new();
@@ -44,10 +47,10 @@ impl BenchmarkReportLight {
             s.summary.kind == GroupMetricsKind::ProducersAndConsumers
                 || s.summary.kind == GroupMetricsKind::ProducingConsumers
         }) {
+            let total = GroupMetrics::new(total, &self.individual_metrics);
             stats.push(format!(
                 "Total System Throughput: {:.2} MB/s, {:.0} msg/s",
-                total.summary.total_throughput_megabytes_per_second,
-                total.summary.total_throughput_messages_per_second
+                total.throughput_megabytes_per_second, total.throughput_messages_per_second
             ));
         }
         let stats_text = stats.join("\n");
@@ -77,7 +80,7 @@ impl BenchmarkReportLight {
         self.group_metrics
             .iter()
             .filter(|s| s.summary.kind != GroupMetricsKind::ProducersAndConsumers) // Skip total summary as it will be added separately
-            .map(|summary| summary.format_throughput_per_actor_kind())
+            .map(|summary| summary.format_throughput_per_actor_kind(&self.individual_metrics))
             .collect::<Vec<String>>()
             .join("\n")
     }
@@ -194,15 +197,32 @@ impl BenchmarkReportLight {
 }
 
 impl BenchmarkGroupMetricsLight {
-    fn format_throughput_per_actor_kind(&self) -> String {
+    /// The average is the group rate divided by the number of actors in the group, so the averages
+    /// add up to the total.
+    fn format_throughput_per_actor_kind(
+        &self,
+        actors: &[BenchmarkIndividualMetricsLight],
+    ) -> String {
+        let group = GroupMetrics::new(self, actors);
+        let members = actors
+            .iter()
+            .filter(|actor| is_member(self.summary.kind, actor.summary.actor_kind))
+            .count();
+        let per_actor = |total: f64| {
+            if members > 0 {
+                total / members as f64
+            } else {
+                0.0
+            }
+        };
         format!(
             "{} Throughput  •  Total: {:.2} MB/s, {:.0} msg/s  •  Avg Per {}: {:.2} MB/s, {:.0} msg/s",
             self.summary.kind,
-            self.summary.total_throughput_megabytes_per_second,
-            self.summary.total_throughput_messages_per_second,
+            group.throughput_megabytes_per_second,
+            group.throughput_messages_per_second,
             self.summary.kind.actor(),
-            self.summary.average_throughput_megabytes_per_second,
-            self.summary.average_throughput_messages_per_second,
+            per_actor(group.throughput_megabytes_per_second),
+            per_actor(group.throughput_messages_per_second),
         )
     }
 
@@ -226,6 +246,7 @@ impl BenchmarkGroupMetricsLight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::{CLUSTER_RUN, OLD_ERA_RUN, report};
     use bench_report::cluster::{BenchmarkClusterInfo, BenchmarkClusterNode};
 
     fn node(name: &str, role: &str) -> BenchmarkClusterNode {
@@ -266,5 +287,36 @@ mod tests {
             three_node_cluster().label()
         );
         assert_eq!(clustered.format_params(), expected);
+    }
+
+    /// The report sums the actors' own rates to 801.85 MB/s. The slowest of the 20 producers ran
+    /// 2 % longer than the fastest, so the group moved 784.25 MB/s.
+    #[test]
+    fn given_actors_finishing_apart_when_writing_subtext_should_print_dashboard_group_rate() {
+        let subtext = report(CLUSTER_RUN).subtext();
+
+        assert!(
+            subtext.contains(
+                "Producers Throughput  •  Total: 784.25 MB/s, 784254 msg/s  •  \
+                 Avg Per Producer: 39.21 MB/s, 39213 msg/s"
+            ),
+            "{subtext}"
+        );
+        assert!(!subtext.contains("801.85"), "{subtext}");
+    }
+
+    #[test]
+    fn given_producer_and_consumer_run_when_writing_subtext_should_print_dashboard_system_rate() {
+        let subtext = report(OLD_ERA_RUN).subtext();
+
+        for line in [
+            "Producers Throughput  •  Total: 1415.68 MB/s, 1415679 msg/s  •  \
+             Avg Per Producer: 176.96 MB/s, 176960 msg/s",
+            "Consumers Throughput  •  Total: 1414.93 MB/s, 1414927 msg/s  •  \
+             Avg Per Consumer: 176.87 MB/s, 176866 msg/s",
+            "Total System Throughput: 2829.85 MB/s, 2829855 msg/s",
+        ] {
+            assert!(subtext.lines().any(|text| text == line), "{subtext}");
+        }
     }
 }
