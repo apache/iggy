@@ -374,6 +374,8 @@ pub struct ShardMetrics {
     fresh_object_bytes: Gauge,
     fresh_object_oldest_age_seconds: Gauge,
     fresh_objects_unnamed: Gauge,
+    fresh_objects_due: Gauge,
+    fresh_listings_truncated: Gauge,
     fresh_objects_deleted_total: Counter,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
@@ -511,6 +513,8 @@ impl ShardMetrics {
             fresh_object_bytes: Gauge::default(),
             fresh_object_oldest_age_seconds: Gauge::default(),
             fresh_objects_unnamed: Gauge::default(),
+            fresh_objects_due: Gauge::default(),
+            fresh_listings_truncated: Gauge::default(),
             fresh_objects_deleted_total: Counter::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
@@ -1078,6 +1082,34 @@ impl ShardMetrics {
             .set(i64::try_from(unnamed).unwrap_or(i64::MAX));
     }
 
+    /// Republished at the end of every sweep of fresh objects: how many of
+    /// its listings stopped before the last key of their scope, and how many
+    /// objects past their grace period it left in the store.
+    pub fn set_fresh_sweep_backlog(&self, truncated: usize, due: usize) {
+        self.fresh_listings_truncated
+            .set(i64::try_from(truncated).unwrap_or(i64::MAX));
+        self.fresh_objects_due
+            .set(i64::try_from(due).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_unnamed_value(&self) -> i64 {
+        self.fresh_objects_unnamed.get()
+    }
+
+    /// Test-only read, mirroring the siblings: the listings the last sweep
+    /// cut short, and the objects it left due.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_sweep_backlog_value(&self) -> (i64, i64) {
+        (
+            self.fresh_listings_truncated.get(),
+            self.fresh_objects_due.get(),
+        )
+    }
+
     pub fn record_fresh_objects_deleted(&self, objects: usize) {
         self.fresh_objects_deleted_total.inc_by(objects as u64);
     }
@@ -1514,7 +1546,8 @@ impl ShardMetrics {
         );
         registry.register(
             "fresh_objects",
-            "fresh objects of this replica in the object store, as its last sweep listed them",
+            "fresh objects of this replica that its last sweep listed; fewer than the store \
+             holds while fresh_listings_truncated is not zero",
             self.fresh_objects.clone(),
         );
         registry.register(
@@ -1532,6 +1565,18 @@ impl ShardMetrics {
             "fresh objects of this replica that no placed batch names and that wait out \
              their grace period",
             self.fresh_objects_unnamed.clone(),
+        );
+        registry.register(
+            "fresh_objects_due",
+            "fresh objects of this replica past their grace period that its last sweep left \
+             in the object store",
+            self.fresh_objects_due.clone(),
+        );
+        registry.register(
+            "fresh_listings_truncated",
+            "listings of the last sweep of fresh objects that stopped at their share of keys, \
+             of one per shard and one for the replica",
+            self.fresh_listings_truncated.clone(),
         );
         registry.register(
             "fresh_objects_deleted",

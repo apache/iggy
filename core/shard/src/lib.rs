@@ -29,7 +29,8 @@ pub use fresh_writes::{
 };
 mod fresh_sweeps;
 pub use fresh_sweeps::{
-    FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport, FreshSweeps,
+    FRESH_SWEEP_INTERVAL, FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport,
+    FreshSweeps,
 };
 mod long_term_rewrites;
 mod manifest_publishes;
@@ -1273,8 +1274,10 @@ pub enum LifecycleFrame {
     /// started, sent by the task that ran it.
     SegmentRewriteFinished(Box<FinishedSegmentRewrite>),
     /// Start a sweep of the fresh objects of this replica, on its first
-    /// shard: list them, when no sweep is in flight. The timer task stamps
-    /// `now`. Does nothing on another shard or on one without a sweeper.
+    /// shard: list them, when no sweep is in flight. The shard's tick starts
+    /// its sweeps without this frame, which is for a caller that wants one
+    /// at a `now` of its own. Does nothing on another shard or on one
+    /// without a sweeper.
     SweepFreshObjects {
         now: IggyTimestamp,
     },
@@ -1289,8 +1292,8 @@ pub enum LifecycleFrame {
     /// A shard's answer to [`Self::ReportFreshObjects`], sent to the first
     /// shard by the task that read the partitions.
     FreshObjectsReported(Box<FreshObjectsReport>),
-    /// The result of the delete that a sweep started, sent by the task that
-    /// ran it.
+    /// The result of one delete job of a sweep, sent by the task that ran
+    /// it.
     FreshObjectsDeleted(Box<FinishedFreshDelete>),
 }
 
