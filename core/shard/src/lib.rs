@@ -32,6 +32,7 @@ pub use fresh_sweeps::{
     FRESH_SWEEP_INTERVAL, FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport,
     FreshSweeps,
 };
+pub mod long_term_merges;
 mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
@@ -1307,6 +1308,20 @@ pub enum LifecycleFrame {
     /// The result of a read that a [`Self::CheckTopicObjects`] pass started,
     /// sent by the task that ran it.
     TopicObjectCheckFinished(Box<FinishedTopicObjectCheck>),
+    /// The result of a merge of long-term segments that the pump's tick
+    /// started, sent by the task that ran it.
+    SegmentMergeFinished(Box<FinishedSegmentMerge>),
+}
+
+/// What the task merging long-term segments hands back to the pump.
+pub struct FinishedSegmentMerge {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the merge. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the merge.
+    pub id: u64,
+    pub outcome: partitions::MergeOutcome,
 }
 
 /// What the task rewriting a segment hands back to the pump.
@@ -2186,6 +2201,10 @@ where
     /// Late-bound stores of the geo peers, empty on a node without peers.
     /// See [`Self::set_peer_stores`].
     peer_stores: RefCell<Rc<peers::PeerStores<B>>>,
+    /// The merges of small long-term segments of the placing partitions
+    /// here: the merger, the results the inbox refused, and when the shard
+    /// looks for the next merge.
+    long_term_merges: long_term_merges::ShardMerges,
 
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
@@ -2539,6 +2558,7 @@ where
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_stores: RefCell::default(),
+            long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3438,6 +3458,7 @@ where
     /// # Panics
     /// Panics when the target cannot address the largest supported partition I/O job.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn without_inbox(
         identity: ShardIdentity,
         bus: B,
@@ -3515,6 +3536,7 @@ where
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_stores: RefCell::default(),
+            long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),

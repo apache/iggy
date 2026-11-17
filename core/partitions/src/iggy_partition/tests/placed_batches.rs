@@ -879,7 +879,7 @@ const FRESH_OBJECT: u128 = 0x51;
 
 /// The same batches for two partitions: as whole records, and as placed
 /// records whose blobs sit back to back in one fresh object.
-fn whole_and_placed(count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
+pub(super) fn whole_and_placed(count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
     whole_and_placed_in(FRESH_OBJECT, count)
 }
 
@@ -903,7 +903,7 @@ fn whole_and_placed_in(object_id: u128, count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8
 }
 
 /// A store that holds `object` as the fresh object the placed records name.
-async fn store_with(object: bytes::Bytes) -> Rc<iggy_object_store::MemoryStore> {
+pub(super) async fn store_with(object: bytes::Bytes) -> Rc<iggy_object_store::MemoryStore> {
     use iggy_object_store::ObjectStore;
     let store = Rc::new(iggy_object_store::MemoryStore::new());
     store
@@ -1027,12 +1027,12 @@ async fn given_no_store_yet_when_polling_should_ask_for_a_retry() {
     );
 }
 
-type MemoryWriter =
+pub(super) type MemoryWriter =
     crate::ExecutorLongTermWriter<iggy_object_store::InlineTierExecutor<SharedStore>>;
 
 /// A store that the rewrites and the polls of a test both reach.
 #[derive(Clone)]
-struct SharedStore(Rc<iggy_object_store::MemoryStore>);
+pub(super) struct SharedStore(pub(super) Rc<iggy_object_store::MemoryStore>);
 
 impl iggy_object_store::ObjectStore for SharedStore {
     async fn put(
@@ -1074,7 +1074,7 @@ impl iggy_object_store::ObjectStore for SharedStore {
     }
 }
 
-fn writer(store: &Rc<iggy_object_store::MemoryStore>) -> MemoryWriter {
+pub(super) fn writer(store: &Rc<iggy_object_store::MemoryStore>) -> MemoryWriter {
     crate::ExecutorLongTermWriter::new(
         iggy_object_store::InlineTierExecutor::new(SharedStore(Rc::clone(store))),
         super::remote_poll::layout(),
@@ -1083,7 +1083,7 @@ fn writer(store: &Rc<iggy_object_store::MemoryStore>) -> MemoryWriter {
 
 /// A primary alone in its group that committed `placed`, whose polls and
 /// rewrites read `store`.
-async fn placing_primary_with(
+pub(super) async fn placing_primary_with(
     placed: &[Vec<u8>],
     store: &Rc<iggy_object_store::MemoryStore>,
 ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
@@ -1118,7 +1118,7 @@ async fn rewrite_pass(
 }
 
 /// Commit the command of `segment` to the long-term log as op `op`.
-fn commit_published_segment(
+pub(super) fn commit_published_segment(
     partition: &mut IggyPartition<IggyMessageBus>,
     segment: &iggy_object_store::ManifestSegment,
     op: u64,
@@ -1137,7 +1137,7 @@ fn commit_published_segment(
     assert_eq!(applied, crate::state_machine::Applied::Changed);
 }
 
-async fn object_bytes(store: &iggy_object_store::MemoryStore, key: &str) -> Vec<u8> {
+pub(super) async fn object_bytes(store: &iggy_object_store::MemoryStore, key: &str) -> Vec<u8> {
     use iggy_object_store::ObjectStore;
     let size = store.head(key).await.unwrap().size;
     store.get_range(key, 0..size).await.unwrap().bytes.to_vec()
@@ -2046,7 +2046,7 @@ async fn given_batches_of_one_fresh_object_when_polling_them_should_ask_the_stor
 /// offsets of every batch in the segments its manifest lists, and the bytes
 /// of those segments back to back. Each segment and each batch passes the
 /// checks a reader can make on its own.
-async fn read_from_the_bucket_alone(
+pub(super) async fn read_from_the_bucket_alone(
     store: &iggy_object_store::MemoryStore,
 ) -> (
     iggy_object_store::PartitionManifest,
@@ -2092,7 +2092,7 @@ async fn read_from_the_bucket_alone(
 }
 
 /// Store the partition's manifest, as its publish pass does.
-async fn publish_manifest(
+pub(super) async fn publish_manifest(
     partition: &mut IggyPartition<IggyMessageBus>,
     store: &Rc<iggy_object_store::MemoryStore>,
 ) {
@@ -2156,7 +2156,7 @@ async fn given_rewritten_batches_when_reading_the_bucket_alone_should_find_every
 
 /// A replica of a group of three that leads view 0 and committed `placed`,
 /// whose polls and rewrites read `store`.
-async fn placing_leader_of_three_with(
+pub(super) async fn placing_leader_of_three_with(
     placed: &[Vec<u8>],
     store: &Rc<iggy_object_store::MemoryStore>,
 ) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
@@ -2191,7 +2191,7 @@ pub(super) fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
 }
 
 /// The log objects of long-term segments the store holds.
-fn long_term_logs(store: &iggy_object_store::MemoryStore) -> usize {
+pub(super) fn long_term_logs(store: &iggy_object_store::MemoryStore) -> usize {
     let layout = super::remote_poll::layout();
     store
         .keys()

@@ -2456,3 +2456,240 @@ async fn given_a_sweep_in_flight_when_more_sweeps_are_asked_for_should_start_non
 
     assert_eq!(owner.fresh_sweeps_settled(), 2);
 }
+
+/// Merges in a memory store once the test lets them, and counts them.
+struct GatedMerger {
+    merger: partitions::ExecutorLongTermMerger<super::object_deletes::Shared>,
+    /// Whether a merge that starts waits for [`Self::open`].
+    closed: Cell<bool>,
+    gate: RefCell<Vec<futures::channel::oneshot::Sender<()>>>,
+    started: Cell<u32>,
+}
+
+impl GatedMerger {
+    fn new(executor: super::object_deletes::Shared) -> Rc<Self> {
+        Rc::new(Self {
+            merger: partitions::ExecutorLongTermMerger::new(executor, layout()),
+            closed: Cell::new(false),
+            gate: RefCell::default(),
+            started: Cell::new(0),
+        })
+    }
+
+    fn open(&self) {
+        self.closed.set(false);
+        for waiting in self.gate.borrow_mut().drain(..) {
+            let _ = waiting.send(());
+        }
+    }
+}
+
+impl partitions::LongTermMerger for GatedMerger {
+    fn merge(
+        &self,
+        merge: partitions::SegmentMerge,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, partitions::MergeOutcome> {
+        self.started.set(self.started.get() + 1);
+        let merging = self.merger.merge(merge, scope);
+        if !self.closed.get() {
+            return merging;
+        }
+        let (open, opened) = futures::channel::oneshot::channel();
+        self.gate.borrow_mut().push(open);
+        Box::pin(async move {
+            let _ = opened.await;
+            merging.await
+        })
+    }
+}
+
+/// An owner that stores, rewrites and merges in one memory store, and the
+/// merger it merges with.
+#[allow(clippy::future_not_send)]
+async fn merging_owner(directory: &Path) -> (IoTestShard, Rc<GatedMerger>) {
+    use super::object_deletes::Shared;
+    use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
+
+    let owner = Box::pin(placing_owner(directory)).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(executor.clone())),
+            layout(),
+        )));
+    let merger = GatedMerger::new(executor);
+    owner.set_long_term_merger(Some(merger.clone()));
+    (owner, merger)
+}
+
+/// Commit the send numbered `request` and wait until a long-term segment
+/// of its own holds it.
+#[allow(clippy::future_not_send)]
+async fn send_and_rewrite(owner: &IoTestShard, request: u64) {
+    use crate::rewrite_pacing::RewriteResult;
+    let revision = super::segment_uploads::staged_revision(owner);
+    let _answer = submit_send(owner, request, 100);
+    until(owner, |owner| committed_sends(owner) == request).await;
+    if owner
+        .rewrite_pacing
+        .borrow()
+        .paces(&(namespace(), revision))
+    {
+        // The wait is longer than a test may take, so the pass is made due
+        // after the shortest one.
+        owner.rewrite_pacing.borrow_mut().settle(
+            (namespace(), revision),
+            RewriteResult::Resent,
+            owner.bus.monotonic_micros(),
+        );
+    } else {
+        owner.request_rewrite_segments(namespace(), revision);
+    }
+    until(owner, |owner| {
+        long_term_ends(owner).last() == Some(&(request - 1))
+    })
+    .await;
+}
+
+/// The last offset of every long-term segment of the fixture's partition.
+fn long_term_ends(owner: &IoTestShard) -> Vec<u64> {
+    owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace())
+        .unwrap()
+        .long_term_segments()
+        .iter()
+        .map(|segment| segment.end_offset)
+        .collect()
+}
+
+fn scan_for_merges_now(owner: &IoTestShard) {
+    owner
+        .long_term_merges
+        .schedule
+        .borrow_mut()
+        .scan_at(owner.bus.monotonic_micros());
+}
+
+/// The whole merge on one shard: the scan finds the two small segments,
+/// the merge stores one in their place, and the replace it commits leaves
+/// the long-term log with that one. Nothing is merged before a scan is due.
+#[compio::test]
+async fn given_small_long_term_segments_when_the_merge_scan_is_due_should_replace_them_with_one() {
+    use iggy_object_store::{LongTermKey, SegmentObject};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, merger) = Box::pin(merging_owner(directory.path())).await;
+    let revision = super::segment_uploads::staged_revision(&owner);
+
+    pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        send_and_rewrite(&owner, 2).await;
+        assert_eq!(long_term_ends(&owner), [0, 1]);
+        compio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(merger.started.get(), 0, "the scan of this interval is over");
+        assert_eq!(long_term_ends(&owner), [0, 1]);
+
+        scan_for_merges_now(&owner);
+
+        until(&owner, |owner| long_term_ends(owner) == [1]).await;
+        until(&owner, |owner| {
+            owner.metrics().long_term_merges_value() == (1, 2)
+        })
+        .await;
+        until(&owner, |owner| {
+            owner
+                .long_term_merges
+                .schedule
+                .borrow()
+                .due_pass(u64::MAX)
+                .is_none()
+        })
+        .await;
+    })
+    .await;
+
+    assert_eq!(merger.started.get(), 1);
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    let merged = partition.long_term_segments()[0];
+    assert_eq!((merged.start_offset, merged.end_offset), (0, 1));
+    assert!(!partition.segment_merge_running());
+    let log_key = layout().long_term_key(&LongTermKey {
+        prefix: partitions::object_prefix(namespace(), revision),
+        start_offset: 0,
+        end_offset: 1,
+        object: SegmentObject::Log,
+    });
+    let store = merger.merger.executor().0.store();
+    assert_eq!(store.head(&log_key).await.unwrap().size, merged.size);
+}
+
+/// A merge that takes long holds back no rewrite: the sends that commit
+/// while it runs get their long-term segment. It does hold back the shard's
+/// next merge, since a shard runs one at a time.
+#[compio::test]
+async fn given_a_merge_in_flight_when_sends_commit_should_rewrite_them_and_start_no_other_merge() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, merger) = Box::pin(merging_owner(directory.path())).await;
+
+    pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        send_and_rewrite(&owner, 2).await;
+        merger.closed.set(true);
+        scan_for_merges_now(&owner);
+        until(&owner, |_| merger.started.get() == 1).await;
+
+        send_and_rewrite(&owner, 3).await;
+
+        assert_eq!(long_term_ends(&owner), [0, 1, 2]);
+        scan_for_merges_now(&owner);
+        compio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(merger.started.get(), 1, "one merge at a time");
+        assert_eq!(long_term_ends(&owner), [0, 1, 2]);
+
+        merger.open();
+        until(&owner, |owner| long_term_ends(owner) == [1, 2]).await;
+        until(&owner, |owner| {
+            owner.metrics().long_term_merges_value() == (1, 2)
+        })
+        .await;
+    })
+    .await;
+
+    // The merged segment came out small, so only the next scan merges it
+    // with the segment that follows.
+    assert_eq!(merger.started.get(), 1);
+}
+
+/// A shard that lost its merger scans nothing, and a shard that gets one
+/// scans at once.
+#[compio::test]
+async fn given_a_shard_without_a_merger_when_it_gets_one_should_scan_then() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, merger) = Box::pin(merging_owner(directory.path())).await;
+    owner.set_long_term_merger(None);
+
+    pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        send_and_rewrite(&owner, 2).await;
+        compio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(long_term_ends(&owner), [0, 1]);
+
+        owner.set_long_term_merger(Some(merger.clone()));
+
+        until(&owner, |owner| long_term_ends(owner) == [1]).await;
+    })
+    .await;
+}

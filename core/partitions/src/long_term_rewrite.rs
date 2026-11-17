@@ -250,9 +250,7 @@ impl BuiltSegment {
     fn of(start_offset: u64, batches: &[Frozen<4096>]) -> Result<Self, RewriteError> {
         let mut next_offset = start_offset;
         let mut built: Option<Self> = None;
-        let mut position = 0u64;
-        let mut indexed_at: Option<u64> = None;
-        let mut index = Vec::new();
+        let mut index = SegmentIndex::default();
         for batch in batches {
             let header = decode_prepare_batch_trusted(batch.as_slice())
                 .map_err(|_| RewriteError::Read(DiskFault::Unreadable))?
@@ -263,15 +261,14 @@ impl BuiltSegment {
                     found: Some(header.base_offset),
                 });
             }
-            if indexed_at.is_none_or(|indexed| position - indexed >= INDEX_STRIDE_BYTES) {
-                indexed_at = Some(position);
-                for field in [header.base_offset, header.base_timestamp, position] {
-                    index.extend_from_slice(&field.to_le_bytes());
-                }
-            }
+            index.push(
+                header.base_offset,
+                header.base_timestamp,
+                header.batch_length,
+            );
             let end_offset = header.base_offset + u64::from(header.message_count) - 1;
             let timestamp = header.base_timestamp;
-            position += header.batch_length;
+            let size = index.position();
             next_offset = end_offset + 1;
             built = Some(built.map_or(
                 Self {
@@ -279,18 +276,19 @@ impl BuiltSegment {
                     start_timestamp: timestamp,
                     end_timestamp: timestamp,
                     max_timestamp: timestamp,
-                    size: position,
+                    size,
                     index: Vec::new(),
                 },
                 |previous| Self {
                     end_offset,
                     end_timestamp: timestamp,
                     max_timestamp: previous.max_timestamp.max(timestamp),
-                    size: position,
+                    size,
                     ..previous
                 },
             ));
         }
+        let index = index.into_bytes();
         debug_assert_eq!(index.len() % IGGY_INDEX_SIZE, 0);
         built
             .map(|built| Self { index, ..built })
@@ -298,6 +296,45 @@ impl BuiltSegment {
                 expected: start_offset,
                 found: None,
             })
+    }
+}
+
+/// The index of a long-term segment, built from its batches in the order
+/// the segment holds them. It depends on nothing but the bytes of the
+/// segment, so every writer of the same segment builds the same index.
+#[derive(Default)]
+pub struct SegmentIndex {
+    /// The bytes of the segment before the next batch.
+    position: u64,
+    /// Where the batch of the last entry starts.
+    indexed_at: Option<u64>,
+    entries: Vec<u8>,
+}
+
+impl SegmentIndex {
+    /// Take the next batch of the segment. The first batch gets an entry,
+    /// and so does each batch that starts [`INDEX_STRIDE_BYTES`] or more
+    /// after the batch of the entry before.
+    pub fn push(&mut self, base_offset: u64, base_timestamp: u64, batch_length: u64) {
+        if self
+            .indexed_at
+            .is_none_or(|indexed| self.position - indexed >= INDEX_STRIDE_BYTES)
+        {
+            self.indexed_at = Some(self.position);
+            for field in [base_offset, base_timestamp, self.position] {
+                self.entries.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        self.position += batch_length;
+    }
+
+    /// The bytes of the batches taken so far.
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.entries
     }
 }
 
@@ -316,7 +353,7 @@ async fn write_log(path: &str, batches: &[Frozen<4096>]) -> io::Result<()> {
     file.sync_all().await
 }
 
-async fn write_file(path: &str, bytes: Vec<u8>) -> io::Result<()> {
+pub async fn write_file(path: &str, bytes: Vec<u8>) -> io::Result<()> {
     let mut file = compio::fs::File::create(path).await?;
     let compio::BufResult(written, _) = file.write_all_at(bytes, 0).await;
     written?;

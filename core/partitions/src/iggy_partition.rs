@@ -234,6 +234,9 @@ where
     /// What this replica found of its geo topic's object while it is the
     /// primary. Boxed to keep the partition small on the stack.
     pub(crate) topic_object_check: Box<crate::topic_object::TopicObjectCheck>,
+    /// The merges of this partition's small long-term segments, while this
+    /// replica is the primary. Behind a pointer, as the deletes are.
+    pub(crate) long_term_merges: Box<crate::long_term_merge::LongTermMerges>,
     /// The fetches of remote segments' indexes that polls have in flight.
     pub(crate) index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1062,6 +1065,7 @@ where
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
             topic_object_check: Box::default(),
+            long_term_merges: Box::default(),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),

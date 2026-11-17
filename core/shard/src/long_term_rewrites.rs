@@ -126,6 +126,7 @@ where
         self.rewrite_pacing
             .borrow_mut()
             .committed(&(namespace, created_revision), self.bus.monotonic_micros());
+        self.long_term_merge_committed(&(namespace, created_revision));
         if self.manifest_publisher.borrow().is_some() {
             self.request_publish_manifest(namespace, created_revision, IggyTimestamp::now());
         }

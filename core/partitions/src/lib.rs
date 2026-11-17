@@ -89,6 +89,11 @@ pub use long_term_delete::{
     LONG_TERM_DELETE_DELAY, LONG_TERM_SWEEP_DEAD_MAX, LONG_TERM_SWEEP_INTERVAL, LongTermObject,
     SegmentSpan, SweptLongTerm,
 };
+mod long_term_merge;
+pub use long_term_merge::{
+    ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LONG_TERM_MERGE_READ_BYTES, LongTermMerger,
+    MergeError, MergeOutcome, MergePass, MergeRun, MergeSettled, SegmentMerge,
+};
 mod long_term_rewrite;
 pub use long_term_rewrite::{
     ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError, RewriteOutcome,

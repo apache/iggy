@@ -378,6 +378,8 @@ pub struct ShardMetrics {
     partition_segment_upload_lag_seconds: Gauge,
     partition_long_term_rewrite_lag_messages: Gauge,
     partition_long_term_unannounced_objects: Gauge,
+    partition_long_term_merges_total: Counter,
+    partition_long_term_merged_segments_total: Counter,
     fresh_objects: Gauge,
     fresh_object_bytes: Gauge,
     fresh_object_oldest_age_seconds: Gauge,
@@ -529,6 +531,8 @@ impl ShardMetrics {
             partition_segment_upload_lag_seconds: Gauge::default(),
             partition_long_term_rewrite_lag_messages: Gauge::default(),
             partition_long_term_unannounced_objects: Gauge::default(),
+            partition_long_term_merges_total: Counter::default(),
+            partition_long_term_merged_segments_total: Counter::default(),
             fresh_objects: Gauge::default(),
             fresh_object_bytes: Gauge::default(),
             fresh_object_oldest_age_seconds: Gauge::default(),
@@ -1234,6 +1238,25 @@ impl ShardMetrics {
         self.partition_long_term_unannounced_objects.get()
     }
 
+    /// A merge of long-term segments committed on a partition this shard
+    /// leads, and put one segment in the place of `replaced`.
+    pub fn record_long_term_merge(&self, replaced: usize) {
+        self.partition_long_term_merges_total.inc();
+        self.partition_long_term_merged_segments_total
+            .inc_by(replaced as u64);
+    }
+
+    /// Test-only read, mirroring the siblings: the merges that committed
+    /// and the segments they replaced.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_merges_value(&self) -> (u64, u64) {
+        (
+            self.partition_long_term_merges_total.get(),
+            self.partition_long_term_merged_segments_total.get(),
+        )
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1685,6 +1708,17 @@ impl ShardMetrics {
             "objects of long-term segments in the store that no long-term log lists and \
              that no later state of it rules out, over the partitions this shard leads",
             self.partition_long_term_unannounced_objects.clone(),
+        );
+        registry.register(
+            "partition_long_term_merges",
+            "merges of small long-term segments that committed, over the partitions this \
+             shard leads",
+            self.partition_long_term_merges_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_merged_segments",
+            "long-term segments that committed merges replaced, each merge by one segment",
+            self.partition_long_term_merged_segments_total.clone(),
         );
         registry.register(
             "retirement_debts_paid",

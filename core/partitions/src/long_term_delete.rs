@@ -517,6 +517,12 @@ where
         }
     }
 
+    /// How many dead objects this view has queued.
+    #[cfg(test)]
+    pub(crate) fn queued_dead_long_term_objects(&self) -> usize {
+        self.long_term_deletes.dead.queued()
+    }
+
     /// Whether this replica is the one that deletes the partition's
     /// long-term objects: the settled primary of a partition that places
     /// its batches.

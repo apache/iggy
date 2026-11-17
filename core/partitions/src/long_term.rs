@@ -353,7 +353,7 @@ impl LongTermLog {
 /// What a segment that holds the bytes of `sources` back to back records,
 /// with `hash` for its bytes, which the sources cannot give. `None` for no
 /// source, and for sizes no segment has.
-fn concatenated(
+pub(crate) fn concatenated(
     sources: &[ManifestSegment],
     hash: [u8; SEGMENT_HASH_LEN],
 ) -> Option<ManifestSegment> {
