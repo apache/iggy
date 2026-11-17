@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerOffsetInfo, IggyMessage, MessageClient, Partitioning, Permissions,
+    ConsumerOffsetInfo, IggyMessage, MessageClient, Page, Partition, Partitioning, Permissions,
     PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
     RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails,
     UserClient, UserCreateOptions, UserInfo, UserInfoDetails, UserStatus,
@@ -180,7 +180,7 @@ async fn should_list_tools(harness: &TestHarness) {
         .expect("Failed to list tools");
 
     assert!(!tools.tools.is_empty());
-    assert_eq!(tools.tools.len(), 41);
+    assert_eq!(tools.tools.len(), 42);
 }
 
 #[iggy_harness(server(mcp))]
@@ -227,6 +227,144 @@ async fn should_return_list_of_streams(harness: &TestHarness) {
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].name, seeds::names::STREAM);
     assert_eq!(streams[0].topics_count, 1);
+}
+
+#[iggy_harness(server(mcp))]
+async fn should_return_pages_of_streams(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    for name in ["pages-1", "pages-2", "pages-3"] {
+        let _: StreamDetails =
+            invoke(&mcp_client, "create_stream", Some(json!({"name": name}))).await;
+    }
+    invoke_empty(
+        &mcp_client,
+        "delete_stream",
+        Some(json!({"stream_id": "pages-2"})),
+    )
+    .await;
+    // The new stream takes the freed id, so the id order and the creation
+    // order differ.
+    let _: StreamDetails = invoke(
+        &mcp_client,
+        "create_stream",
+        Some(json!({"name": "pages-4"})),
+    )
+    .await;
+    let names = |streams: &[Stream]| -> Vec<String> {
+        streams.iter().map(|stream| stream.name.clone()).collect()
+    };
+
+    let first: Page<Stream> = invoke(&mcp_client, "get_streams", Some(json!({"limit": 2}))).await;
+    assert_eq!(names(&first.items), ["pages-1", "pages-4"]);
+    let next = first.next.expect("a next cursor").to_string();
+    let last: Page<Stream> = invoke(
+        &mcp_client,
+        "get_streams",
+        Some(json!({"limit": 2, "cursor": next})),
+    )
+    .await;
+    assert_eq!(
+        (names(&last.items), last.next),
+        (vec!["pages-3".to_owned()], None)
+    );
+
+    let newest: Page<Stream> = invoke(
+        &mcp_client,
+        "get_streams",
+        Some(json!({"order": "created", "descending": true, "limit": 1})),
+    )
+    .await;
+    assert_eq!(names(&newest.items), ["pages-4"]);
+
+    let whole: Vec<Stream> = invoke(&mcp_client, "get_streams", None).await;
+    assert_eq!(
+        names(&whole),
+        ["pages-1", "pages-4", "pages-3"],
+        "without limit and cursor, the whole list in id order"
+    );
+    let newest_first: Vec<Stream> = invoke(
+        &mcp_client,
+        "get_streams",
+        Some(json!({"order": "created", "descending": true})),
+    )
+    .await;
+    assert_eq!(
+        names(&newest_first),
+        ["pages-4", "pages-3", "pages-1"],
+        "without limit and cursor, the whole list in the asked order"
+    );
+    let named: Vec<Stream> =
+        invoke(&mcp_client, "get_streams", Some(json!({"name": "pages-3"}))).await;
+    assert_eq!(
+        names(&named),
+        ["pages-3"],
+        "without limit and cursor, the whole list with the asked filter"
+    );
+
+    for (arguments, error) in [
+        (json!({"cursor": "pg1_"}), "Failed to parse cursor"),
+        (json!({"order": "name"}), "Failed to parse order"),
+        (json!({"limit": 0}), "Invalid command"),
+    ] {
+        let params = CallToolRequestParams::new("get_streams".to_owned())
+            .with_arguments(arguments.as_object().expect("Tool arguments").clone());
+        let result = mcp_client.call_tool(params).await;
+        assert!(
+            matches!(&result, Err(ServiceError::McpError(refusal)) if refusal.message.contains(error)),
+            "{arguments}: {result:?}"
+        );
+    }
+}
+
+#[iggy_harness(server(mcp))]
+async fn should_return_pages_of_partitions(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let _: StreamDetails =
+        invoke(&mcp_client, "create_stream", Some(json!({"name": "pages"}))).await;
+    let _: TopicDetails = invoke(
+        &mcp_client,
+        "create_topic",
+        Some(json!({"stream_id": "pages", "name": "events", "partitions_count": 3})),
+    )
+    .await;
+    let topic = json!({"stream_id": "pages", "topic_id": "events"});
+    let read = |extra: serde_json::Value| {
+        let mut arguments = topic.clone();
+        arguments
+            .as_object_mut()
+            .expect("Tool arguments")
+            .extend(extra.as_object().expect("Page arguments").clone());
+        arguments
+    };
+    let ids = |page: &Page<Partition>| -> Vec<u32> {
+        page.items.iter().map(|partition| partition.id).collect()
+    };
+
+    let first: Page<Partition> = invoke(
+        &mcp_client,
+        "get_partitions",
+        Some(read(json!({"limit": 2}))),
+    )
+    .await;
+    assert_eq!(ids(&first), [0, 1]);
+    let next = first.next.expect("a next cursor").to_string();
+    let last: Page<Partition> = invoke(
+        &mcp_client,
+        "get_partitions",
+        Some(read(json!({"limit": 2, "cursor": next}))),
+    )
+    .await;
+    assert_eq!((ids(&last), last.next), (vec![2], None));
+
+    let default: Page<Partition> = invoke(&mcp_client, "get_partitions", Some(topic.clone())).await;
+    assert_eq!((ids(&default), default.next), (vec![0, 1, 2], None));
+    let descending: Page<Partition> = invoke(
+        &mcp_client,
+        "get_partitions",
+        Some(read(json!({"descending": true}))),
+    )
+    .await;
+    assert_eq!(ids(&descending), [2, 1, 0]);
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
@@ -292,6 +430,51 @@ async fn should_return_list_of_topics(harness: &TestHarness) {
     assert_eq!(topics[0].name, seeds::names::TOPIC);
     assert_eq!(topics[0].partitions_count, 1);
     assert_eq!(topics[0].messages_count, 1);
+
+    for name in ["topic-1", "topic-2"] {
+        let _: TopicDetails = invoke(
+            &mcp_client,
+            "create_topic",
+            Some(json!({"stream_id": seeds::names::STREAM, "name": name, "partitions_count": 1})),
+        )
+        .await;
+    }
+    invoke_empty(
+        &mcp_client,
+        "delete_topic",
+        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": "topic-1"})),
+    )
+    .await;
+    // The new topic takes the freed id, so the id order and the creation
+    // order differ.
+    let _: TopicDetails = invoke(
+        &mcp_client,
+        "create_topic",
+        Some(json!({"stream_id": seeds::names::STREAM, "name": "topic-3", "partitions_count": 1})),
+    )
+    .await;
+    let names = |topics: &[Topic]| -> Vec<String> {
+        topics.iter().map(|topic| topic.name.clone()).collect()
+    };
+    let by_created: Vec<Topic> = invoke(
+        &mcp_client,
+        "get_topics",
+        Some(json!({"stream_id": seeds::names::STREAM, "order": "created"})),
+    )
+    .await;
+    assert_eq!(
+        names(&by_created),
+        [seeds::names::TOPIC, "topic-2", "topic-3"],
+        "without limit and cursor, the whole list in the asked order"
+    );
+    let page: Page<Topic> = invoke(
+        &mcp_client,
+        "get_topics",
+        Some(json!({"stream_id": seeds::names::STREAM, "order": "created", "limit": 2})),
+    )
+    .await;
+    assert_eq!(names(&page.items), [seeds::names::TOPIC, "topic-2"]);
+    assert!(page.next.is_some(), "one more topic follows the page");
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
@@ -547,6 +730,21 @@ async fn should_return_consumer_groups(harness: &TestHarness) {
     .await;
 
     assert!(!groups.is_empty());
+
+    let page: Page<ConsumerGroup> = invoke(
+        &mcp_client,
+        "get_consumer_groups",
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "name": seeds::names::CONSUMER_GROUP,
+            "limit": 10,
+        })),
+    )
+    .await;
+    let names: Vec<&str> = page.items.iter().map(|group| group.name.as_str()).collect();
+    assert_eq!(names, [seeds::names::CONSUMER_GROUP]);
+    assert_eq!(page.next, None);
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
@@ -731,6 +929,18 @@ async fn should_return_users() {
     let users: Vec<UserInfo> = invoke(&mcp_client, "get_users", None).await;
 
     assert_eq!(users.len(), 2);
+
+    let ids = |users: &[UserInfo]| -> Vec<u32> { users.iter().map(|user| user.id).collect() };
+    let first: Page<UserInfo> = invoke(&mcp_client, "get_users", Some(json!({"limit": 1}))).await;
+    assert_eq!(ids(&first.items), ids(&users[..1]));
+    let next = first.next.expect("a next cursor").to_string();
+    let last: Page<UserInfo> = invoke(
+        &mcp_client,
+        "get_users",
+        Some(json!({"limit": 1, "cursor": next})),
+    )
+    .await;
+    assert_eq!((ids(&last.items), last.next), (ids(&users[1..]), None));
 }
 
 #[tokio::test]
@@ -1045,6 +1255,7 @@ async fn should_refuse_administration_tools_by_default(harness: &TestHarness) {
             json!({"name": seeds::names::PERSONAL_ACCESS_TOKEN}),
         ),
         ("get_users", json!({})),
+        ("get_users", json!({"limit": 1})),
         ("get_user", json!({"user_id": seeds::names::USER})),
         (
             "create_user",

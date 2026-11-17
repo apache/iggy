@@ -154,6 +154,7 @@ pub use types::identifier::*;
 pub use types::message::*;
 pub use types::metadata_changes::*;
 pub use types::options::*;
+pub use types::page::*;
 pub use types::partition::*;
 pub use types::permissions::permissions_global::*;
 pub use types::permissions::personal_access_token::*;

@@ -75,8 +75,8 @@ use iggy_binary_protocol::requests::messages::{FetchMessagesRequest, PollMessage
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
-    EvictionReason, GenericHeader, HEADER_SIZE, Operation, RequestHeader, RoutedRequestHeader,
-    WireDecode,
+    EvictionReason, GenericHeader, HEADER_SIZE, MAX_RECORD_REPLY_SIZE, Operation, RequestHeader,
+    RoutedRequestHeader, WireDecode,
 };
 use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
@@ -1029,6 +1029,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                     origin,
                     request,
                     context,
+                    MAX_RECORD_REPLY_SIZE,
                 )
                 .await;
                 return;
@@ -1051,6 +1052,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                     origin,
                     request,
                     context,
+                    MAX_RECORD_REPLY_SIZE,
                 )
                 .await;
             });
@@ -1392,10 +1394,10 @@ mod tests {
     use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
-        FETCH_MESSAGES_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE,
-        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
-        GET_STATS_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
-        STORE_CONSUMER_OFFSET_CODE,
+        DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
+        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+        GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE,
+        POLL_MESSAGES_DEFERRED_CODE, STORE_CONSUMER_OFFSET_CODE,
     };
     use iggy_binary_protocol::dispatch::lookup_command;
     use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeStatus;
@@ -1413,8 +1415,9 @@ mod tests {
         CreateStreamRequest, UpdateStreamResolvedRequest,
     };
     use iggy_binary_protocol::requests::system::{
-        BindSessionRequest, GetClientRequest, GetClientsRequest, GetMetadataChangesRequest,
-        GetStatsRequest, ResourceTarget, UpdateResourceRequest,
+        BindSessionRequest, DescribeOptionsRequest, GetClientRequest, GetClientsRequest,
+        GetMetadataChangesRequest, GetStatsRequest, OPTIONS_SCOPE_TOPIC, ResourceTarget,
+        UpdateResourceRequest,
     };
     use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicResolvedRequest};
     use iggy_binary_protocol::requests::users::login_register::{
@@ -2032,6 +2035,100 @@ mod tests {
             ReadRevocation::TopicDeleting,
         )
         .await;
+    }
+
+    /// `GetClients` and the reads of `build_non_replicated_response` answer a
+    /// reply frame above the cap with a bare `ReplyTooLarge`, and the same
+    /// read under the cap still answers on that connection.
+    #[compio::test]
+    async fn given_a_reply_above_the_cap_when_reading_should_refuse_it_and_keep_the_connection() {
+        let describe_options = DescribeOptionsRequest {
+            scope: OPTIONS_SCOPE_TOPIC,
+        };
+        for (code, body) in [
+            (GET_CLIENTS_CODE, GetClientsRequest.to_bytes()),
+            (DESCRIBE_OPTIONS_CODE, describe_options.to_bytes()),
+        ] {
+            let bus = SpyBus::default();
+            let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+            let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+            shard.attach_senders(vec![sender]);
+            let shard = Rc::new(shard);
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .ensure_root_user("iggy", "hash");
+            let sessions = bind_reader_session(&shard).await;
+            let server_config = Arc::new(ServerConfig::default());
+            for reply_cap in [HEADER_SIZE, MAX_RECORD_REPLY_SIZE] {
+                let context = sessions
+                    .borrow_mut()
+                    .touch_connection(READER_TRANSPORT, true, std::time::Instant::now())
+                    .unwrap();
+                let request = request_message(
+                    Operation::NonReplicated,
+                    READER_CLIENT,
+                    READER_SESSION,
+                    1,
+                    &body,
+                )
+                .transmute_header(|old, header: &mut RoutedRequestHeader| {
+                    *header = old;
+                    header.reserved[..4].copy_from_slice(&code.to_le_bytes());
+                });
+                let mut read = Box::pin(handle_non_replicated_request(
+                    &shard,
+                    &sessions,
+                    &server_config,
+                    ClientOrigin::capture(&shard.bus, READER_TRANSPORT),
+                    request,
+                    context,
+                    reply_cap,
+                ));
+                if code == GET_CLIENTS_CODE {
+                    assert!(futures::poll!(read.as_mut()).is_pending());
+                    let Ok(ShardFrame::Lifecycle(LifecycleFrame::ListClients {
+                        reply: ListClientsReply::Clients(reply),
+                    })) = shard_inbox.try_recv()
+                    else {
+                        panic!("GetClients must ask the shard for its clients");
+                    };
+                    let reader = sessions.borrow().client_record(READER_TRANSPORT).unwrap();
+                    reply.try_send(vec![reader]).unwrap();
+                }
+                read.await;
+            }
+            await_replies(&bus, 2).await;
+            let replies: Vec<_> = bus
+                .client_replies
+                .borrow()
+                .iter()
+                .map(|(client, frame)| {
+                    (
+                        *client,
+                        frame_command(frame),
+                        reply_status(frame),
+                        frame.len() > HEADER_SIZE,
+                    )
+                })
+                .collect();
+            let reply = Command::Reply as u8;
+            assert_eq!(
+                replies,
+                [
+                    (
+                        READER_TRANSPORT,
+                        reply,
+                        IggyError::ReplyTooLarge.as_code(),
+                        false
+                    ),
+                    (READER_TRANSPORT, reply, 0, true),
+                ],
+                "code {code}: a refusal without a body, then the reply under the cap"
+            );
+        }
     }
 
     /// Every read that asks another shard before it answers: the client reads

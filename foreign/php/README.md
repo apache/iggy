@@ -254,6 +254,32 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
 - `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
 - SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller), 4041 (unsupported option key) and 2018 (invalid replication factor).
 
+## List Pages
+
+`getStreamsPage()`, `getTopicsPage()`, `getPartitionsPage()`, `getConsumerGroupsPage()` and `getUsersPage()` read one page of a list. Named arguments set the order, the direction, the limit, the cursor and a name filter. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`, so a walk ends at the first page without one.
+
+```php
+use Iggy\PageOrder;
+
+$cursor = null;
+do {
+    $page = $client->getStreamsPage(order: PageOrder::Created, limit: 50, cursor: $cursor, name: 'orders');
+    foreach ($page->items as $stream) {
+        echo $stream->id, ' ', $stream->name, PHP_EOL;
+    }
+    $cursor = $page->next;
+} while ($cursor !== null);
+```
+
+- A null `order` reads in `PageOrder::Id` order, and `descending: true` reverses the order. `PageOrder::Created` sorts by creation time and then by id. Partitions and consumer groups walk by id in both orders, because their ids follow creation.
+- `limit` is 1 to 1000, and a null `limit` reads 100. `name` keeps the entries whose name holds the text, case-sensitive, and is 1 to 255 bytes. A partition has no name, so `getPartitionsPage()` takes no `name`.
+- A cursor is the `pg1_` text that the CLI and the HTTP API use. It holds only a position, so send it back with the same order, direction, filter and parent ids.
+- A query out of range, or a cursor text that the client cannot read, throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor that does not fit the query, and a partition name, with the same error. Over HTTP, these server refusals throw code 300, and the message holds the server's error.
+- The argument check runs first. A `limit` that is not an integer or does not fit 32 unsigned bits throws `IggyException` with code 0.
+- Each page is a separate read. An entity that someone creates or deletes during a walk can appear or not appear, so a walk is not a snapshot. `getMetadataChanges()` gives an exact copy. `getTopicsPage()` of a stream that does not exist returns an empty page without `next`.
+- Pages hold `Iggy\Stream`, `Iggy\Topic`, `Iggy\Partition`, `Iggy\ConsumerGroup` or `Iggy\UserInfo` objects with readonly snake_case properties. `created_at` is in microseconds. Streams, topics and users return `options` and `derived_options` arrays like `StreamDetails`, and streams also return its three `encryption_*` properties.
+- The reply of `getStream()` or `getTopic()` can pass the server cap of a little over 64 MB. Over TCP, QUIC and WebSocket, the call then throws `ReplyTooLarge` (code 97). The connection stays usable, and `getTopicsPage()` and `getPartitionsPage()` read such a stream or topic in pages.
+
 ## Metadata Changes
 
 `getMetadataChanges()` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission, and a query the server would refuse throws `Invalid command` (code 3) before anything is sent.

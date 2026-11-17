@@ -30,10 +30,11 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -85,23 +86,26 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
     @Override
     public CompletableFuture<List<ConsumerGroup>> getConsumerGroups(StreamId streamId, TopicId topicId) {
-        var payload = BytesSerializer.toBytes(streamId);
-        payload.writeBytes(BytesSerializer.toBytes(topicId));
-
         log.debug("Getting consumer groups - Stream: {}, Topic: {}", streamId, topicId);
 
-        return AsyncTcpConnection.mapResponse(
-                connection().send(CommandCode.ConsumerGroup.GET_ALL.getValue(), payload), response -> {
-                    try {
-                        List<ConsumerGroup> groups = new ArrayList<>();
-                        while (response.isReadable()) {
-                            groups.add(BytesDeserializer.readConsumerGroup(response));
-                        }
-                        return groups;
-                    } finally {
-                        response.release();
-                    }
-                });
+        return PageReads.readWholeList(
+                connectionSupplier,
+                CommandCode.ConsumerGroup.GET_ALL,
+                BytesDeserializer::readConsumerGroup,
+                streamId,
+                topicId);
+    }
+
+    @Override
+    public CompletableFuture<Page<ConsumerGroup>> getConsumerGroupsPage(
+            StreamId streamId, TopicId topicId, NamedPageQuery query) {
+        return PageReads.read(
+                connection(),
+                CommandCode.ConsumerGroup.GET_ALL,
+                query,
+                BytesDeserializer::readConsumerGroup,
+                streamId,
+                topicId);
     }
 
     @Override

@@ -67,9 +67,33 @@ public interface IIggyStream
     /// <summary>
     ///     Retrieves information about all streams.
     /// </summary>
+    /// <remarks>
+    ///     Over TCP the client reads the list in pages of 1000 in id order, so the result is not one consistent read:
+    ///     a stream that someone creates or deletes during the read can be in it or not. Every page keeps the sign-in
+    ///     and the call deadline that the read started with. Over HTTP the server returns the whole list in one reply,
+    ///     but it builds that reply from pages of 1000, so it is not one consistent read either.
+    /// </remarks>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns a read-only collection of stream information.</returns>
+    /// <exception cref="Exceptions.MalformedResponseException">
+    ///     Over TCP, when the server answers a page with the same cursor that the client sent.
+    /// </exception>
     Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default);
+
+    /// <summary>
+    ///     Reads one page of streams.
+    /// </summary>
+    /// <remarks>
+    ///     The query is checked before anything is sent. To read the next page, send the same query with the
+    ///     <see cref="Page{T}.Next" /> of this page as its cursor.
+    /// </remarks>
+    /// <param name="query">The order, the page size, the cursor and the name filter of the read.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the page.</returns>
+    /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
+    ///     Invalid command (code 3) for a query the page rules refuse, or for a cursor the server cannot use.
+    /// </exception>
+    Task<Page<StreamResponse>> GetStreamsPageAsync(NamedPageQuery query, CancellationToken token = default);
 
     /// <summary>
     ///     Deletes an existing stream and all its associated topics and messages.

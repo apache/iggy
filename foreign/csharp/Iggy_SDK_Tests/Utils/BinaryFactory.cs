@@ -178,6 +178,23 @@ internal sealed class BinaryFactory
         return entry;
     }
 
+    /// <summary>A list reply: <c>[next_len:u8][next][count:u32][item]*</c>, with a count of the given items.</summary>
+    internal static byte[] CreatePagePayload(byte[] next, params byte[][] items)
+    {
+        var payload = new byte[1 + next.Length + 4 + items.Sum(item => item.Length)];
+        payload[0] = (byte)next.Length;
+        next.CopyTo(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1 + next.Length), (uint)items.Length);
+        var position = 1 + next.Length + 4;
+        foreach (var item in items)
+        {
+            item.CopyTo(payload.AsSpan(position));
+            position += item.Length;
+        }
+
+        return payload;
+    }
+
     internal static byte[] CreateGroupPayload(uint id, uint membersCount, uint partitionsCount, string name,
         List<uint>? partitionsOnMember = null)
     {

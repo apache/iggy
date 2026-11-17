@@ -249,25 +249,17 @@ impl Projection<'_> {
                     let topic_from = after_topic.filter(|_| same_stream).unwrap_or(0);
                     for (topic_id, topic) in stream.topics.iter_from(topic_from) {
                         let same_topic = same_stream && after_topic == Some(topic_id);
-                        // Group ids are monotone and bounded per topic.
-                        let mut group_ids: Vec<u64> = topic
-                            .consumer_groups
-                            .keys()
-                            .copied()
-                            .filter(|group_id| {
-                                after_group.filter(|_| same_topic).is_none_or(|after| {
-                                    let after = after as u64;
-                                    *group_id > after
-                                        || (group == MetadataChangeGroup::ConsumerGroupMembers
-                                            && *group_id == after)
-                                })
-                            })
-                            .collect();
-                        group_ids.sort_unstable();
-                        for group_id in group_ids {
-                            let Some(consumer_group) = topic.consumer_groups.get(&group_id) else {
-                                continue;
-                            };
+                        // Members continue inside the group of the cursor, groups after it.
+                        let group_from = match after_group.filter(|_| same_topic) {
+                            None => Bound::Unbounded,
+                            Some(after) if group == MetadataChangeGroup::ConsumerGroupMembers => {
+                                Bound::Included(after as u64)
+                            }
+                            Some(after) => Bound::Excluded(after as u64),
+                        };
+                        for (&group_id, consumer_group) in
+                            topic.consumer_groups.range((group_from, Bound::Unbounded))
+                        {
                             let wire_group_id = group_id as u32;
                             if group == MetadataChangeGroup::ConsumerGroups {
                                 let Ok(name) = WireName::new(consumer_group.name.as_ref()) else {
