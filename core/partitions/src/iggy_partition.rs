@@ -203,6 +203,10 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
+    /// Set when a command of the long-term log applies on the primary, and
+    /// taken by the shard, which publishes the manifest and starts the
+    /// rewrite that waited for the command.
+    pub(crate) long_term_changed: Cell<bool>,
     /// The highest committed truncation watermark a timed pass read from
     /// metadata for this partition. The watermark only rises, so the one
     /// metadata holds now is never below it.
@@ -1037,6 +1041,7 @@ where
             segment_upload_attempts: 0,
             upload_cursor: None,
             upload_wanted: Cell::new(false),
+            long_term_changed: Cell::new(false),
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
             object_delete_jobs: 0,

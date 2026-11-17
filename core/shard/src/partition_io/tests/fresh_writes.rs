@@ -352,6 +352,60 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
     );
 }
 
+/// A reader of the bucket finds a long-term segment through the manifest,
+/// so the commit of the segment's command is what asks for the manifest.
+/// Nothing else asks for one here.
+#[compio::test]
+async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publish_the_manifest() {
+    use super::object_deletes::Shared;
+    use iggy_object_store::PartitionManifest;
+    use partitions::{
+        ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects, RemoteSegments,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_manifest_publisher(Some(Rc::new(ExecutorManifestPublisher::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let partitions = owner.plane.partitions();
+    partitions.set_remote_segments(Rc::new(RemoteSegments::new(
+        Rc::new(ExecutorObjects::new(executor.clone())),
+        layout(),
+    )));
+    let revision = partitions
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
+    let store = executor.0.store();
+
+    pumped(&owner, async {
+        let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |_| store.keys().contains(&manifest_key)).await;
+    })
+    .await;
+
+    let size = store.head(&manifest_key).await.unwrap().size;
+    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    assert_eq!(manifest.floor, Some(1));
+    assert_eq!(manifest.segments, partition.long_term_segments());
+}
+
 /// The segment cleaner stages only the first pass over a partition. The
 /// sends that commit after it are rewritten when the partition's wait is
 /// over, which the pump's tick finds.
@@ -359,7 +413,7 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
 async fn given_a_partition_that_had_a_rewrite_pass_when_more_sends_commit_should_rewrite_them_from_the_tick()
  {
     use super::object_deletes::Shared;
-    use crate::rewrite_pacing::{REWRITE_INTERVAL_MAX, REWRITE_INTERVAL_START};
+    use crate::rewrite_pacing::{REWRITE_INTERVAL_MAX, REWRITE_INTERVAL_START, RewriteResult};
     use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
 
     let directory = tempfile::tempdir().unwrap();
@@ -401,6 +455,13 @@ async fn given_a_partition_that_had_a_rewrite_pass_when_more_sends_commit_should
         assert!(
             wait > REWRITE_INTERVAL_START && wait <= REWRITE_INTERVAL_MAX,
             "a small segment lengthens the wait: {wait:?}"
+        );
+        // The wait is longer than this test may take, so the next pass is
+        // made due after the shortest one.
+        owner.rewrite_pacing.borrow_mut().settle(
+            key,
+            RewriteResult::Resent,
+            owner.bus.monotonic_micros(),
         );
 
         let _second = submit_send(&owner, 2, 100);
