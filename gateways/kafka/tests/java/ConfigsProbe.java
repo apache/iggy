@@ -34,14 +34,14 @@ import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.InvalidConfigurationException;
 
 /**
- * Kafka 3.9 AdminClient probe for DescribeConfigs, the deprecated AlterConfigs API and
- * IncrementalAlterConfigs, the only alter API a 4.x client has.
- * Prints elapsed time for 50 describes and does not fail on a latency threshold.
+ * Kafka 4.4 AdminClient probe for DescribeConfigs and IncrementalAlterConfigs, the only alter API
+ * that a Kafka 4 client has. Kafka 4.0 removed {@code Admin.alterConfigs}, so the AlterConfigs API
+ * is tested on the wire instead. Prints elapsed time for 50 describes and does not fail on a
+ * latency threshold.
  */
 public final class ConfigsProbe {
     private ConfigsProbe() {}
 
-    @SuppressWarnings("deprecation")
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
             throw new IllegalArgumentException("usage: ConfigsProbe <bootstrap> <topic>");
@@ -71,7 +71,9 @@ public final class ConfigsProbe {
             System.out.println("cleanup.policy=absent");
 
             try {
-                admin.alterConfigs(Map.of(resource, config("no.such", "1"))).all().get();
+                admin.incrementalAlterConfigs(Map.of(resource, List.of(op("no.such", "1", AlterConfigOp.OpType.SET))))
+                        .all()
+                        .get();
                 throw new AssertionError("unknown key was accepted");
             } catch (ExecutionException exception) {
                 if (!(exception.getCause() instanceof InvalidConfigurationException)) {
@@ -83,14 +85,18 @@ public final class ConfigsProbe {
             Config stillDefault = describe(admin, resource);
             require("-1".equals(stillDefault.get("retention.ms").value()), "unknown key wrote retention");
 
-            admin.alterConfigs(Map.of(resource, config("retention.ms", "8000")), new AlterConfigsOptions().validateOnly(true))
+            admin.incrementalAlterConfigs(
+                            Map.of(resource, List.of(op("retention.ms", "8000", AlterConfigOp.OpType.SET))),
+                            new AlterConfigsOptions().validateOnly(true))
                     .all()
                     .get();
             Config validated = describe(admin, resource);
             require("-1".equals(validated.get("retention.ms").value()), "validate_only wrote retention");
             System.out.println("validate_only_retention.ms=" + validated.get("retention.ms").value());
 
-            admin.alterConfigs(Map.of(resource, config("retention.ms", "8000"))).all().get();
+            admin.incrementalAlterConfigs(Map.of(resource, List.of(op("retention.ms", "8000", AlterConfigOp.OpType.SET))))
+                    .all()
+                    .get();
             Config altered = describe(admin, resource);
             ConfigEntry changed = altered.get("retention.ms");
             require("8000".equals(changed.value()), "altered retention.ms");
@@ -180,10 +186,6 @@ public final class ConfigsProbe {
 
     private static Config describe(AdminClient admin, ConfigResource resource) throws Exception {
         return admin.describeConfigs(List.of(resource)).all().get().get(resource);
-    }
-
-    private static Config config(String name, String value) {
-        return new Config(List.of(new ConfigEntry(name, value)));
     }
 
     private static AlterConfigOp op(String name, String value, AlterConfigOp.OpType type) {

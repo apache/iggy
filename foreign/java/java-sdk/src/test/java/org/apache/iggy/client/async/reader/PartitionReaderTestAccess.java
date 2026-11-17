@@ -46,6 +46,12 @@ public final class PartitionReaderTestAccess {
         return new PartitionReaderTestAccess(transport, reader);
     }
 
+    /** {@link PartitionReaderCancelTest#memberWithANewOwner} on a group transport. */
+    public static PartitionReaderTestAccess memberWithANewOwner() throws Exception {
+        FakeTransport transport = new FakeTransport(true);
+        return new PartitionReaderTestAccess(transport, PartitionReaderCancelTest.memberWithANewOwner(transport));
+    }
+
     public PartitionReader reader() {
         return reader;
     }
@@ -53,6 +59,15 @@ public final class PartitionReaderTestAccess {
     /** The next read that the reader sends, as an opaque handle. */
     public Object nextRead() throws InterruptedException {
         return transport.nextRead();
+    }
+
+    /** Answers {@code read} with a refusal that the reader retries after its retry interval. */
+    public void refuseTransiently(Object read) {
+        ((FakeTransport.Read) read).answer(PartitionReaderCancelTest.TRANSIENT_REFUSAL);
+    }
+
+    public boolean readsNothingForTwoRetryIntervals() throws InterruptedException {
+        return transport.readsNothingFor(PartitionReaderTest.RETRY_INTERVAL.multipliedBy(2));
     }
 
     /** Answers {@code read} with one message of {@code partition} at each of {@code offsets}. */

@@ -15,43 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A BACKUP parking replicated partition prepares, and the frames it parked
-//! reaching the plane in op order once its partition materialises.
+//! Produce bursts after topic creation must converge on all replicas.
 //!
-//! `multi_shard_partition_convergence` covers the same fence on one node and
-//! says outright that it cannot tell a request served straight through from one
-//! that parked. This test pins the park path positively, and on the replica
-//! where getting it wrong creates a replica gap: a client request that never
-//! reaches the plane is answered with a retriable status and the SDK replays it,
-//! while a replicated PREPARE has no client behind it: nothing re-sends it once
-//! its op has quorum, so the backup gap-stops and waits out `tick_partitions`'
-//! repair debounce before anything refetches it.
+//! The SDK looks up the partition route before sending. Replicas may all
+//! materialise before the first prepare arrives, so this workload does not
+//! guarantee that any frame parks. Partition primaries can also differ from
+//! the metadata leader.
 //!
-//! The window on a backup is the metadata hand-off. A backup learns a metadata
-//! commit from the `commit` field of the next prepare on that plane or from the
-//! `Commit` the primary sends on its next consensus tick, and then still has to
-//! build the namespace. Nothing in `create_topic`'s reply path waits for that,
-//! so a produce issued the instant `create_topic` returns reaches the backups as
-//! a partition prepare for a namespace they have not yet heard of, let alone
-//! built. Four producers on their own connections keep a burst in flight across
-//! that gap, so several ops of one partition park together and the order they
-//! leave in is observable.
-//!
-//! Three things are asserted, and they fail separately:
-//!
-//! - The path was entered on a backup. `redispatch_parked_frames` logs at
-//!   `debug`, hence the `logging.level` override; the marker on a node
-//!   that is not the leader is proof, because a fresh partition group seeds its
-//!   view from the metadata plane, so every partition primary here is the
-//!   metadata leader and no client request lands anywhere else.
-//! - No park path degraded into a shed, an aged-out answer, or an incarnation
-//!   rejection, and no replica dropped a prepare for arriving out of order.
-//!   That last marker is the direct symptom of re-dispatch losing a frame's
-//!   arrival position.
-//! - Every acked message is readable in dense offset order, each producer's own
-//!   sends stay in the order it made them, and all three replicas hold
-//!   byte-identical segments. A prepare lost to the gap check leaves a backup
-//!   short until the repair driver's next pass closes the gap.
+//! Assert dense offsets, per-producer order, byte-identical replicas, and no
+//! degraded park paths or partition gaps. Deterministic coverage of parked
+//! prepare ordering lives in the simulator's
+//! `parked_prepare_redispatch_is_seed_replayable`, which holds one backup
+//! unmaterialised and checks the parked prefix precedes a later inbox op.
 //!
 //! The harness removes an ambient `RUST_LOG` when this test supplies its explicit
 //! logging level, and the log oracle falls back from captured stdout to the
@@ -69,7 +44,6 @@ use integration::iggy_harness;
 use tokio::time::{Instant, sleep};
 
 const STREAM: &str = "parked-redispatch-stream";
-/// Each topic is one shot at the race.
 const TOPICS: u32 = 6;
 const PARTITIONS: u32 = 4;
 /// The reconciler builds a topic's namespaces in id order, so the last one has
@@ -84,9 +58,6 @@ const TOTAL_MESSAGES: usize = PRODUCERS * PER_PRODUCER;
 /// Budget for eagerly flushed batches to reach every node's segment files.
 const FLUSH_INSTALL_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-
-/// `IggyShard::redispatch_parked_frames`, at `debug`.
-const REDISPATCH_MARKER: &str = "re-dispatching parked partition frames after materialisation";
 
 /// Modes in which the park path gives up instead of converging. All three cost
 /// a frame: the first two shed or answer, the third refuses a namespace whose
@@ -113,12 +84,11 @@ fn topic_name(index: u32) -> String {
 }
 
 #[iggy_harness(cluster_nodes = 3, server(logging.level = "info,shard=debug"))]
-async fn given_a_produce_burst_right_after_create_topic_when_backups_park_the_prepares_should_re_dispatch_them_in_order(
+async fn given_a_new_topic_when_producers_send_a_burst_should_preserve_order_on_all_replicas(
     harness: &mut TestHarness,
 ) {
-    // Read once, before any topic exists: the leader is the primary of every
-    // partition group created below, so it is also the only node a produce can
-    // be admitted on.
+    // Bootstrap through the metadata leader; the SDK routes each send to its
+    // partition's primary.
     let leader = disk::leader_node_index_via(harness, 0).await;
     let setup = harness
         .root_client_for_node(leader)
@@ -130,8 +100,8 @@ async fn given_a_produce_burst_right_after_create_topic_when_backups_park_the_pr
         .expect("create stream");
     let stream = Identifier::named(STREAM).expect("stream identifier");
 
-    // Connected and logged in before the first `create_topic`, so the burst
-    // costs one round trip rather than a handshake.
+    // Connect and log in before topic creation, leaving only routing and sends
+    // on the burst path.
     let mut producers = Vec::with_capacity(PRODUCERS);
     for _ in 0..PRODUCERS {
         producers.push(
@@ -173,7 +143,6 @@ async fn given_a_produce_burst_right_after_create_topic_when_backups_park_the_pr
         .await
         .expect("stop the cluster for the at-rest comparison");
 
-    assert_backup_re_dispatched(harness, leader);
     assert_no_degraded_park_paths(harness);
     disk::assert_replica_data_identical(&data_paths, false);
 }
@@ -227,8 +196,8 @@ async fn produce_burst(
 }
 
 /// Payloads of the target partition in offset order, asserting the offsets are
-/// dense on the way out: a hole would mean an acked op the leader itself cannot
-/// serve.
+/// dense on the way out: a hole would mean an acked op the partition primary
+/// cannot serve.
 async fn poll_payloads(
     client: &IggyClient,
     stream: &Identifier,
@@ -289,9 +258,8 @@ fn assert_producer_order(polled: &[String], sent: &[Vec<String>], topic_index: u
     }
 }
 
-/// Poll until every node's segments hold every payload at a non-decreasing
-/// position. A backup that lost a prepare to the gap check never gets it back,
-/// so this is where the loss surfaces first, naming the node.
+/// Check payload completeness before comparing segments, so identical but
+/// incomplete replicas cannot pass.
 async fn wait_until_payloads_installed(harness: &TestHarness, payloads: &[String]) {
     let deadline = Instant::now() + FLUSH_INSTALL_TIMEOUT;
     loop {
@@ -312,31 +280,6 @@ async fn wait_until_payloads_installed(harness: &TestHarness, payloads: &[String
         );
         sleep(POLL_INTERVAL).await;
     }
-}
-
-/// The point of the test. A non-leader node logging the re-dispatch is a backup
-/// that parked REPLICATED prepares: client requests only ever reach the leader,
-/// which is the primary of every partition group created here.
-fn assert_backup_re_dispatched(harness: &TestHarness, leader: usize) {
-    let counts: Vec<(usize, usize)> = (0..harness.cluster_size())
-        .map(|node| {
-            (
-                node,
-                server_log_occurrences(harness.node(node), REDISPATCH_MARKER),
-            )
-        })
-        .collect();
-    let on_backups: usize = counts
-        .iter()
-        .filter(|(node, _)| *node != leader)
-        .map(|(_, count)| *count)
-        .sum();
-    assert!(
-        on_backups > 0,
-        "no backup logged {REDISPATCH_MARKER:?} (leader is node {leader}, per-node counts \
-         {counts:?}); either the produce never raced materialisation, in which case this test \
-         proves nothing, or the configured debug marker was not written"
-    );
 }
 
 fn assert_no_degraded_park_paths(harness: &TestHarness) {
@@ -361,10 +304,6 @@ fn assert_no_degraded_park_paths(harness: &TestHarness) {
              repair driver's debounce"
         );
     }
-}
-
-fn server_log_occurrences(server: &ServerHandle, marker: &str) -> usize {
-    server_log_plain(server).matches(marker).count()
 }
 
 /// The shared handle falls back to the server's own appender when

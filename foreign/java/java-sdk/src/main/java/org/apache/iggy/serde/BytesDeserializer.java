@@ -61,6 +61,9 @@ import org.apache.iggy.system.MetadataChangeRecord;
 import org.apache.iggy.system.MetadataChanges;
 import org.apache.iggy.system.MetadataCurrentItem;
 import org.apache.iggy.system.OptionSpec;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageCursor;
+import org.apache.iggy.system.PageQuery;
 import org.apache.iggy.system.Stats;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
@@ -80,6 +83,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -96,6 +100,8 @@ public final class BytesDeserializer {
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int READY_PARTITION_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
+    // A poll reply names its partition (u32), current offset (u64) and message count (u32) before its context.
+    private static final int POLL_REPLY_BYTES_BEFORE_CONTEXT = Integer.BYTES + Long.BYTES + Integer.BYTES;
     // A fetch names at most this many partitions, MAX_PARTITIONS_PER_REQUEST in core/binary_protocol/src/lib.rs.
     private static final int MAX_FETCH_SECTIONS = 1000;
     private static final int MIN_CLUSTER_NODE_BYTES = 19;
@@ -284,6 +290,14 @@ public final class BytesDeserializer {
         var context = readPartitionContext(response);
         return new PolledMessages(
                 partitionId, currentOffset, messagesCount, readMessages(response, messagesCount), context);
+    }
+
+    /**
+     * Reads only the context of a poll reply. It decodes no message, so a message that does not decode cannot fail it.
+     */
+    public static PartitionContext readPolledContext(ByteBuf response) {
+        response.skipBytes(POLL_REPLY_BYTES_BEFORE_CONTEXT);
+        return readPartitionContext(response);
     }
 
     /** Reads the batch records of a poll reply or of a fetch section, which must hold {@code count} messages. */
@@ -712,6 +726,32 @@ public final class BytesDeserializer {
     /** Decodes a current state item body under its group code, all of {@code body} and nothing past it. */
     public static MetadataChangeBody readMetadataItemBody(int group, ByteBuf body) {
         return readMetadataChangesPart(() -> MetadataChangesReader.readItemBody(group, body));
+    }
+
+    /**
+     * Reads the reply of a list command: {@code [next_len:u8][next][count:u32][item]*}. A body short of {@code count}
+     * items, or with bytes after them, is malformed. The next cursor keeps its bytes as they came, because only the
+     * server reads them.
+     */
+    public static <T> Page<T> readPage(ByteBuf response, Function<ByteBuf, T> readItem) {
+        try {
+            byte[] next = new byte[response.readUnsignedByte()];
+            response.readBytes(next);
+            long count = response.readUnsignedIntLE();
+            // A server never sends more than MAX_LIMIT items, so a larger count does not size the allocation.
+            List<T> items = new ArrayList<>((int) Math.min(count, PageQuery.MAX_LIMIT));
+            for (long index = 0; index < count; index++) {
+                items.add(readItem.apply(response));
+            }
+            if (response.isReadable()) {
+                throw new IggyMalformedResponseException(
+                        "Malformed page: " + response.readableBytes() + " bytes after its " + count + " items");
+            }
+            // A cursor has 1 to 255 bytes, so a next of 0 bytes marks the last page.
+            return new Page<>(items, PageCursor.fromBytes(next));
+        } catch (IndexOutOfBoundsException truncated) {
+            throw new IggyMalformedResponseException("Malformed page: it is truncated", truncated);
+        }
     }
 
     public static UserInfoDetails readUserInfoDetails(ByteBuf response) {

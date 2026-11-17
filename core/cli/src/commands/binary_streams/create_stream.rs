@@ -39,10 +39,6 @@ impl CreateStreamCmd {
         }
     }
 
-    fn get_stream_id_info(&self) -> String {
-        "ID auto incremented".to_string()
-    }
-
     /// Only a file named on this call supplies the key, so no key spreads across streams.
     fn options(&self) -> anyhow::Result<StreamCreateOptions> {
         let encryption_key = self
@@ -69,11 +65,7 @@ impl CreateStreamCmd {
 #[async_trait]
 impl CliCommand for CreateStreamCmd {
     fn explain(&self) -> String {
-        format!(
-            "create stream with name: {} and {}",
-            self.name,
-            self.get_stream_id_info(),
-        )
+        format!("create stream with name: {}", self.name)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
@@ -81,18 +73,12 @@ impl CliCommand for CreateStreamCmd {
         let stream = client
             .create_stream(&self.name, &options)
             .await
-            .with_context(|| {
-                format!(
-                    "Problem creating stream (name: {} and {})",
-                    self.name,
-                    self.get_stream_id_info(),
-                )
-            })?;
+            .with_context(|| format!("Problem creating stream (name: {})", self.name))?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Stream with name: {} and {} created",
+            "Stream with name: {} and ID: {} created",
             self.name,
-            self.get_stream_id_info(),
+            stream.id,
         );
         print_encryption(&stream);
 

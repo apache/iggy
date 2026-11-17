@@ -38,6 +38,10 @@ use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::metadata_changes::{MetadataChangeGroup, MetadataChangeStart, MetadataChanges};
 use crate::options::{OptionSpec, OptionsScope, StreamOptionKey, TopicOptionKey, reset_names};
+use crate::page::{
+    ConsumerGroupsPage, PageOrder, PartitionsPage, StreamsPage, TopicsPage, UsersPage,
+    named_page_query, page_query,
+};
 use crate::pending_poll::PendingPoll;
 use crate::poll_options::PollOptions;
 use crate::reader::PartitionReader;
@@ -284,6 +288,10 @@ impl IggyClient {
     }
 
     /// Gets a stream by id or name.
+    ///
+    /// Over TCP, QUIC and WebSocket, a stream with too many topics for one reply throws
+    /// ReplyTooLarge (97), and the connection stays usable. getTopicsPage() reads its topics
+    /// page by page.
     pub fn get_stream(&self, stream_id: PhpIdentifier) -> PhpResult<Option<StreamDetails>> {
         let stream_id: Identifier = stream_id.try_into()?;
         let inner = self.inner.clone();
@@ -310,6 +318,19 @@ impl IggyClient {
     /// every node unless an operator set a number. A write commits on a quorum of these nodes, so
     /// 2 keeps two copies but stops accepting writes while either node is down. The server
     /// rejects an out-of-range value with `InvalidReplicationFactor`.
+    ///
+    /// `segment_max_age_micros` starts a new segment once a batch arrives this long after the
+    /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
+    /// segments by size alone. The server refuses a duration together with
+    /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+    /// keep their meaning, and so do the three options below.
+    ///
+    /// `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
+    /// server refuses true with `Feature is unavailable` until it tiers topics.
+    /// `local_retention_age_micros` is how long a tiered topic keeps an uploaded segment on local
+    /// disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
+    /// there, unlimited when null. The server refuses an age above a finite message expiry and a
+    /// size above a finite `max_topic_size`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -328,6 +349,10 @@ impl IggyClient {
         partition_resize_policy: Option<String>,
         replication_factor: Option<&Zval>,
         raw: Option<BTreeMap<String, String>>,
+        segment_max_age_micros: Option<&Zval>,
+        tiered_storage: Option<bool>,
+        local_retention_age_micros: Option<&Zval>,
+        local_retention_size: Option<&Zval>,
     ) -> PhpResult {
         let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
@@ -340,6 +365,11 @@ impl IggyClient {
         )?;
         let replication_factor =
             optional_unsigned::<u32>(replication_factor, "replication_factor")?;
+        let segment_max_age_micros =
+            optional_u64(segment_max_age_micros, "segment_max_age_micros")?;
+        let local_retention_age_micros =
+            optional_u64(local_retention_age_micros, "local_retention_age_micros")?;
+        let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?;
         let compression_algorithm = match compression_algorithm {
             Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
             None => CompressionAlgorithm::default(),
@@ -353,6 +383,12 @@ impl IggyClient {
             })?;
         let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+        let segment_max_age =
+            segment_max_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+        let local_retention_age =
+            local_retention_age_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
+        let local_retention_size =
+            local_retention_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
 
@@ -373,6 +409,13 @@ impl IggyClient {
                 .map(IggyByteSize::from),
             preallocate_segments,
             replication_factor,
+            segment_max_age: (segment_max_age != IggyExpiry::ServerDefault)
+                .then_some(segment_max_age),
+            tiered_storage,
+            local_retention_age: (local_retention_age != IggyExpiry::ServerDefault)
+                .then_some(local_retention_age),
+            local_retention_size: (local_retention_size != MaxTopicSize::ServerDefault)
+                .then_some(local_retention_size),
             raw: raw.unwrap_or_default(),
         };
 
@@ -393,6 +436,12 @@ impl IggyClient {
     /// default. `raw` and `raw_reset` reach keys this build does not know, and the server
     /// decides whether each one may be set or reset. `raw` is marked
     /// `#[\SensitiveParameter]`, because an unknown key may hold a secret.
+    ///
+    /// `tiered_storage` set to true turns tiered storage on. The server refuses false, an update
+    /// never turns it off, and refuses true with `Feature is unavailable` until it tiers topics.
+    /// `local_retention_age_micros` and `local_retention_size` change how long and how much a
+    /// tiered topic keeps on local disk after upload, with the same int or decimal string values
+    /// and the same refusal of 0 as the expiry and the size cap.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(reset = Vec::<TopicOptionKey>::new()))]
     pub fn update_topic(
@@ -405,12 +454,24 @@ impl IggyClient {
         reset: Vec<TopicOptionKey>,
         raw: Option<BTreeMap<String, String>>,
         raw_reset: Option<Vec<String>>,
+        tiered_storage: Option<bool>,
+        local_retention_age_micros: Option<&Zval>,
+        local_retention_size: Option<&Zval>,
     ) -> PhpResult {
         let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
             .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
             .transpose()?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?
             .map(|bytes| positive_update(bytes, "max_topic_size").map(MaxTopicSize::from))
+            .transpose()?;
+        let local_retention_age =
+            optional_u64(local_retention_age_micros, "local_retention_age_micros")?
+                .map(|micros| {
+                    positive_update(micros, "local_retention_age_micros").map(IggyExpiry::from)
+                })
+                .transpose()?;
+        let local_retention_size = optional_u64(local_retention_size, "local_retention_size")?
+            .map(|bytes| positive_update(bytes, "local_retention_size").map(MaxTopicSize::from))
             .transpose()?;
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
@@ -419,6 +480,9 @@ impl IggyClient {
             name,
             message_expiry,
             max_topic_size,
+            tiered_storage,
+            local_retention_age,
+            local_retention_size,
             reset,
             raw_reset,
             raw: raw.unwrap_or_default(),
@@ -489,6 +553,10 @@ impl IggyClient {
     }
 
     /// Gets a topic by stream and topic id/name.
+    ///
+    /// Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
+    /// ReplyTooLarge (97), and the connection stays usable. getPartitionsPage() reads its
+    /// partitions page by page.
     pub fn get_topic(
         &self,
         stream_id: PhpIdentifier,
@@ -503,6 +571,140 @@ impl IggyClient {
                 .get_topic(&stream_id, &topic_id)
                 .await
                 .map(|topic| topic.map(TopicDetails::from))
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the streams.
+    ///
+    /// `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
+    /// 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
+    /// page. `name` keeps the streams whose name holds the text, case-sensitive, and is 1 to
+    /// 255 bytes. A query outside these ranges, or a cursor text that the client cannot read,
+    /// throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor
+    /// that does not fit the query with the same error, which HTTP reports as code 300. A
+    /// `limit` that is not an integer, or that does not fit an unsigned 32-bit integer, throws
+    /// `IggyException` with code 0 from the argument check.
+    #[php(defaults(descending = false))]
+    pub fn get_streams_page(
+        &self,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<StreamsPage> {
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_streams_page(&query)
+                .await
+                .map(StreamsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the topics of a stream. A missing stream gives an empty page without
+    /// `next`. The other arguments are those of getStreamsPage().
+    #[php(defaults(descending = false))]
+    pub fn get_topics_page(
+        &self,
+        stream_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<TopicsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_topics_page(&stream_id, &query)
+                .await
+                .map(TopicsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the partitions of a topic. Partition ids follow creation, so both
+    /// orders walk by id. The other arguments are those of getStreamsPage() except `name`,
+    /// because a partition has no name.
+    #[php(defaults(descending = false))]
+    pub fn get_partitions_page(
+        &self,
+        stream_id: PhpIdentifier,
+        topic_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+    ) -> PhpResult<PartitionsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
+        let query = page_query(order, descending, limit, cursor)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_partitions_page(&stream_id, &topic_id, &query)
+                .await
+                .map(PartitionsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the consumer groups of a topic. Group ids follow creation, so both
+    /// orders walk by id. The other arguments are those of getStreamsPage().
+    #[allow(clippy::too_many_arguments)]
+    #[php(defaults(descending = false))]
+    pub fn get_consumer_groups_page(
+        &self,
+        stream_id: PhpIdentifier,
+        topic_id: PhpIdentifier,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<ConsumerGroupsPage> {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_consumer_groups_page(&stream_id, &topic_id, &query)
+                .await
+                .map(ConsumerGroupsPage::from)
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Reads one page of the users, and `name` matches the username. The other arguments are
+    /// those of getStreamsPage().
+    #[php(defaults(descending = false))]
+    pub fn get_users_page(
+        &self,
+        order: Option<PageOrder>,
+        descending: bool,
+        limit: Option<&Zval>,
+        cursor: Option<String>,
+        name: Option<String>,
+    ) -> PhpResult<UsersPage> {
+        let query = named_page_query(order, descending, limit, cursor, name)?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .get_users_page(&query)
+                .await
+                .map(UsersPage::from)
                 .map_err(to_php_exception)
         })
     }
@@ -755,8 +957,10 @@ impl IggyClient {
     /// offset, PollingStrategy::next() when null, and a continuation is refused. `options`
     /// defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
     /// 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
-    /// `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
-    /// flight and the queued batches.
+    /// `prefetch_messages`, 16000 when null, set the requested budgets for requests in flight and
+    /// queued batches. Each effective budget holds at least 32 full batches so primary groups can
+    /// wait independently: 32 MiB and 32000 messages with the default options. Larger budgets
+    /// allow more queued batches.
     #[allow(clippy::too_many_arguments)]
     pub fn reader(
         &self,

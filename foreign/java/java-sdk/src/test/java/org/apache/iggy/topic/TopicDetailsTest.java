@@ -45,7 +45,17 @@ class TopicDetailsTest {
                         HeaderValue.fromUint64(BigInteger.valueOf(10000L)),
                         "compression_algorithm",
                         HeaderValue.fromString("gzip")),
-                Map.of("max_topic_size", HeaderValue.fromUint64(BigInteger.TWO)));
+                Map.of(
+                        "max_topic_size",
+                        HeaderValue.fromUint64(BigInteger.TWO),
+                        "segment_max_age",
+                        HeaderValue.fromUint64(BigInteger.valueOf(3_600_000_000L)),
+                        "tiered_storage",
+                        HeaderValue.fromBool(false),
+                        "local_retention_age",
+                        HeaderValue.fromUint64(BigInteger.valueOf(86_400_000_000L)),
+                        "local_retention_size",
+                        HeaderValue.fromUint64(BigInteger.valueOf(1_073_741_824L))));
         var partitions = List.of(new Partition(
                 1L,
                 BigInteger.TEN,
@@ -66,6 +76,10 @@ class TopicDetailsTest {
         assertThat(topicDetails.messageExpiry()).contains(BigInteger.valueOf(10000L));
         assertThat(topicDetails.compressionAlgorithm()).contains(CompressionAlgorithm.Gzip);
         assertThat(topicDetails.maxTopicSize()).contains(BigInteger.TWO);
+        assertThat(topicDetails.segmentMaxAge()).contains(BigInteger.valueOf(3_600_000_000L));
+        assertThat(topicDetails.tieredStorage()).contains(false);
+        assertThat(topicDetails.localRetentionAge()).contains(BigInteger.valueOf(86_400_000_000L));
+        assertThat(topicDetails.localRetentionSize()).contains(BigInteger.valueOf(1_073_741_824L));
         assertThat(topicDetails.messagesCount()).isEqualTo(BigInteger.ZERO);
         assertThat(topicDetails.partitionsCount()).isEqualTo(1L);
         assertThat(topicDetails.partitions()).isEqualTo(partitions);

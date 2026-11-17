@@ -202,6 +202,13 @@ func MetadataCommit(header *[HeaderSize]byte) uint64 {
 	if operation == OperationNonReplicated || operation >= OperationSendMessages {
 		return 0
 	}
+	return ReadReplyCommit(header)
+}
+
+// ReadReplyCommit reads the commit of a reply of any operation. A
+// SyncConsumerGroup reply carries the metadata commit of the replica that
+// answered it.
+func ReadReplyCommit(header *[HeaderSize]byte) uint64 {
 	return binary.LittleEndian.Uint64(header[replyOffsetCommit:])
 }
 

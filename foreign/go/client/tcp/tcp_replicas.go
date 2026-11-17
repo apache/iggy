@@ -68,10 +68,28 @@ type replicaLinks struct {
 	connectAttempt  *connectAttempt
 	permits         chan struct{}
 	tasks           *sync.WaitGroup
+	// readyLinks closes when a slot installs a ready link. It changes under mu
+	// and is read without it by calls that wait for a link.
+	readyLinks atomic.Pointer[chan struct{}]
 }
 
 func newReplicaLinks(client *IggyTcpClient) *replicaLinks {
-	return &replicaLinks{client: client, slots: make(map[uint8]*replicaSlot), permits: make(chan struct{}, maxConcurrentDials)}
+	links := &replicaLinks{client: client, slots: make(map[uint8]*replicaSlot), permits: make(chan struct{}, maxConcurrentDials)}
+	readyLinks := make(chan struct{})
+	links.readyLinks.Store(&readyLinks)
+	return links
+}
+
+// nextReadyLink closes when a slot next installs a ready link. A call takes it
+// before it looks for its link, so a link installed after the look still
+// wakes the call.
+func (r *replicaLinks) nextReadyLink() <-chan struct{} {
+	return *r.readyLinks.Load()
+}
+
+func (r *replicaLinks) wakeRequestsLocked() {
+	next := make(chan struct{})
+	close(*r.readyLinks.Swap(&next))
 }
 
 func linkReady(link *tcpLink) bool {
@@ -270,6 +288,7 @@ func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata) error {
 		if linkReady(r.bootstrap) && (len(endpoints) == 1 || r.bootstrap.endpoint == endpoint) {
 			slot.link = r.bootstrap
 			r.bootstrap = nil
+			r.wakeRequestsLocked()
 		}
 		r.slots[id] = slot
 		r.startSlotLocked(id, slot)
@@ -287,7 +306,12 @@ func (r *replicaLinks) retireBootstrapLocked() {
 	}
 }
 
-func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot) {
+// runSlot keeps the link of replica id up. A new slot dials at once, because
+// requests wait for its link. Every later dial waits its jitter, including the
+// first redial after a stable link resets the backoff. After a restart of a
+// slot that ran out of retries, the first dial waits its jitter too, so
+// clients that restart their slots together spread their dials.
+func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot, restart bool) {
 	exhausted := false
 	defer func() {
 		r.mu.Lock()
@@ -319,8 +343,10 @@ func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot)
 			exhausted = configuration.enabled
 			return
 		}
-		if err := r.client.pause(ctx, reconnectDelay(configuration.interval, failures)); err != nil {
-			return
+		if restart || !initial {
+			if err := r.client.pause(ctx, reconnectDelay(configuration.interval, failures)); err != nil {
+				return
+			}
 		}
 		initial = false
 		connection, err := r.dial(ctx, slot.endpoint)
@@ -354,6 +380,7 @@ func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot)
 		}
 		slot.link = link
 		r.retireBootstrapLocked()
+		r.wakeRequestsLocked()
 		r.mu.Unlock()
 	}
 }
@@ -364,10 +391,11 @@ func (r *replicaLinks) startSlotLocked(id uint8, slot *replicaSlot) {
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
 	slot.cancel = cancel
+	restart := slot.retriesExhausted
 	slot.retriesExhausted = false
 	tasks := r.tasks
 	tasks.Add(1)
-	go func() { defer tasks.Done(); r.runSlot(ctx, id, slot) }()
+	go func() { defer tasks.Done(); r.runSlot(ctx, id, slot, restart) }()
 }
 
 func (r *replicaLinks) anyLocked() *tcpLink {

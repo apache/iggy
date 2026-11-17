@@ -258,7 +258,7 @@ class TestTopicOptions:
     """Typed topic create options and generic topic updates."""
 
     @pytest.mark.asyncio
-    async def test_given_keyword_topic_options_when_creating_should_preserve_all_eleven_settings(  # noqa: E501
+    async def test_given_keyword_topic_options_when_creating_should_preserve_all_fifteen_settings(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Every known create setting has a typed field and reads back explicit."""
@@ -282,6 +282,14 @@ class TestTopicOptions:
                 size_of_messages_required_to_save=4096,
                 preallocate_segments=True,
                 replication_factor=1,
+                # A finite age is refused together with preallocate_segments.
+                segment_max_age=IggyExpiry.NeverExpire(),
+                # Turning tiered storage on is refused until the server tiers topics.
+                tiered_storage=False,
+                local_retention_age=IggyExpiry.ExpireDuration(
+                    duration=timedelta(minutes=30)
+                ),
+                local_retention_size=MaxTopicSize.Custom(bytes=GIB // 2),
             ),
         )
 
@@ -300,6 +308,10 @@ class TestTopicOptions:
             "size_of_messages_required_to_save": 4096,
             "preallocate_segments": True,
             "replication_factor": 1,
+            "segment_max_age": U64_MAX,
+            "tiered_storage": False,
+            "local_retention_age": MICROS_PER_HOUR // 2,
+            "local_retention_size": GIB // 2,
         }
         assert topic.derived_options.to_scalar_dict() == {}
         assert topic.compression_algorithm == "gzip"
@@ -584,7 +596,7 @@ class TestSharedVectors:
             for scope in row["scopes"]:
                 if row["storage"] == "map" and row["mutability"] != "read_only":
                     assert key in create_fields[scope], f"{scope} create {key}"
-                if row["mutability"] == "updatable":
+                if row["mutability"] in ("updatable", "enable_only"):
                     assert key in update_fields[scope], f"{scope} update {key}"
                 if row["flags"] & resettable:
                     assert hasattr(OptionKey, member_name(key)), f"reset {key}"

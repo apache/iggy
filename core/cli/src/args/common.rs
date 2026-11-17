@@ -15,17 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use clap::ValueEnum;
-use iggy::prelude::OptionKey;
+use clap::builder::{NonEmptyStringValueParser, RangedU64ValueParser};
+use clap::{Args, ValueEnum};
+use iggy::prelude::{
+    NamedPageQuery, OptionKey, PAGE_CURSOR_PREFIX, PageCursor, PageOrder, PageQuery,
+};
 use iggy_cli::commands::binary_client::get_clients::GetClientsOutput;
 use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
 use iggy_cli::commands::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
 use iggy_cli::commands::binary_context::get_contexts::GetContextsOutput;
+use iggy_cli::commands::binary_partitions::get_partitions::GetPartitionsOutput;
 use iggy_cli::commands::binary_personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensOutput;
+use iggy_cli::commands::binary_streams::get_stream::GetStreamOutput;
 use iggy_cli::commands::binary_streams::get_streams::GetStreamsOutput;
 use iggy_cli::commands::binary_system::stats::GetStatsOutput;
+use iggy_cli::commands::binary_topics::get_topic::GetTopicOutput;
 use iggy_cli::commands::binary_topics::get_topics::GetTopicsOutput;
 use iggy_cli::commands::binary_users::get_users::GetUsersOutput;
+use iggy_cli::commands::utils::list_rows::ListRows;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -39,24 +46,6 @@ impl From<ListMode> for GetClusterMetadataOutput {
         match mode {
             ListMode::Table => GetClusterMetadataOutput::Table,
             ListMode::List => GetClusterMetadataOutput::List,
-        }
-    }
-}
-
-impl From<ListMode> for GetStreamsOutput {
-    fn from(mode: ListMode) -> Self {
-        match mode {
-            ListMode::Table => GetStreamsOutput::Table,
-            ListMode::List => GetStreamsOutput::List,
-        }
-    }
-}
-
-impl From<ListMode> for GetTopicsOutput {
-    fn from(mode: ListMode) -> Self {
-        match mode {
-            ListMode::Table => GetTopicsOutput::Table,
-            ListMode::List => GetTopicsOutput::List,
         }
     }
 }
@@ -103,6 +92,179 @@ impl From<ListMode> for GetContextsOutput {
             ListMode::Table => GetContextsOutput::Table,
             ListMode::List => GetContextsOutput::List,
         }
+    }
+}
+
+/// Output format of a list command, set with `--output`.
+///
+/// `--list-mode` stays for compatibility and covers only the human formats.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ListOutput {
+    Table,
+    List,
+    Json,
+}
+
+impl From<ListMode> for ListOutput {
+    fn from(mode: ListMode) -> Self {
+        match mode {
+            ListMode::Table => ListOutput::Table,
+            ListMode::List => ListOutput::List,
+        }
+    }
+}
+
+impl From<ListOutput> for GetStreamsOutput {
+    fn from(output: ListOutput) -> Self {
+        match output {
+            ListOutput::Table => GetStreamsOutput::Table,
+            ListOutput::List => GetStreamsOutput::List,
+            ListOutput::Json => GetStreamsOutput::Json,
+        }
+    }
+}
+
+impl From<ListOutput> for GetTopicsOutput {
+    fn from(output: ListOutput) -> Self {
+        match output {
+            ListOutput::Table => GetTopicsOutput::Table,
+            ListOutput::List => GetTopicsOutput::List,
+            ListOutput::Json => GetTopicsOutput::Json,
+        }
+    }
+}
+
+/// List flags shared by commands that can print JSON.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ListOutputArgs {
+    /// List mode (table or list)
+    #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
+    pub(crate) list_mode: ListMode,
+
+    /// Output format (table, list or json), cannot be combined with --list-mode
+    #[clap(short, long, value_enum, conflicts_with = "list_mode")]
+    pub(crate) output: Option<ListOutput>,
+}
+
+impl ListOutputArgs {
+    pub(crate) fn output(&self) -> ListOutput {
+        self.output.unwrap_or_else(|| self.list_mode.into())
+    }
+}
+
+/// Output format of a get command, set with `--output`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum GetOutput {
+    Table,
+    Json,
+}
+
+impl From<GetOutput> for GetStreamOutput {
+    fn from(output: GetOutput) -> Self {
+        match output {
+            GetOutput::Table => GetStreamOutput::Table,
+            GetOutput::Json => GetStreamOutput::Json,
+        }
+    }
+}
+
+impl From<GetOutput> for GetTopicOutput {
+    fn from(output: GetOutput) -> Self {
+        match output {
+            GetOutput::Table => GetTopicOutput::Table,
+            GetOutput::Json => GetTopicOutput::Json,
+        }
+    }
+}
+
+impl From<ListMode> for GetPartitionsOutput {
+    fn from(mode: ListMode) -> Self {
+        match mode {
+            ListMode::Table => GetPartitionsOutput::Table,
+            ListMode::List => GetPartitionsOutput::List,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ListOrder {
+    Id,
+    Created,
+}
+
+impl From<ListOrder> for PageOrder {
+    fn from(order: ListOrder) -> Self {
+        match order {
+            ListOrder::Id => PageOrder::Id,
+            ListOrder::Created => PageOrder::Created,
+        }
+    }
+}
+
+/// The page flags of every list command that reads pages.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PageArgs {
+    /// Print the rows in descending order
+    #[arg(long)]
+    pub(crate) desc: bool,
+
+    /// Print at most N rows
+    ///
+    /// If more rows follow them, the last line is `next: <CURSOR>`.
+    /// Pass that cursor to --after to print the rows that follow.
+    #[arg(long, value_name = "N", value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
+    pub(crate) limit: Option<usize>,
+
+    /// Print the rows after this cursor
+    ///
+    /// The cursor comes from the `next:` line of a list with --limit.
+    /// Use the same other flags as that list.
+    #[arg(long, value_name = "CURSOR", value_parser = parse_page_cursor)]
+    pub(crate) after: Option<PageCursor>,
+}
+
+/// The cursor error of the SDK is `InvalidCommand`, which names no flag.
+fn parse_page_cursor(text: &str) -> Result<PageCursor, String> {
+    text.parse().map_err(|_| {
+        format!("not a page cursor, expected the {PAGE_CURSOR_PREFIX} text of a \"next:\" line")
+    })
+}
+
+/// The page flags of the lists of named entities: streams, topics, consumer
+/// groups and users.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct NamedPageArgs {
+    /// Order of the rows, by ID or by creation time
+    #[arg(long, value_enum, default_value_t = ListOrder::Id)]
+    pub(crate) sort: ListOrder,
+
+    #[command(flatten)]
+    pub(crate) page: PageArgs,
+
+    /// Print only the rows whose name holds this text (case-sensitive)
+    #[arg(long, value_name = "TEXT", value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) name: Option<String>,
+}
+
+impl From<PageArgs> for ListRows {
+    fn from(args: PageArgs) -> Self {
+        ListRows {
+            query: NamedPageQuery::from(PageQuery {
+                descending: args.desc,
+                cursor: args.after,
+                ..PageQuery::default()
+            }),
+            row_limit: args.limit,
+        }
+    }
+}
+
+impl From<NamedPageArgs> for ListRows {
+    fn from(args: NamedPageArgs) -> Self {
+        let mut rows = ListRows::from(args.page);
+        rows.query.page.order = args.sort.into();
+        rows.query.name = args.name;
+        rows
     }
 }
 

@@ -201,6 +201,7 @@ fn principal(manage_topics: bool) -> AuthenticatedPrincipal {
             manage_topics,
             ..PrincipalPermissions::default()
         },
+        topic_reads: Arc::default(),
         permissions_known: true,
     }
 }

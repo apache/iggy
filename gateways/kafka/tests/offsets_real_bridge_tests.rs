@@ -27,16 +27,26 @@ mod iggy_server;
 #[path = "common/wire.rs"]
 mod wire;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use iggy::prelude::{Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier};
+use iggy::prelude::{
+    Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, Permissions, StreamClient,
+    StreamPermissions, TopicClient, TopicPermissions,
+};
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
+use iggy_gateway_kafka::auth::{AuthenticatedPrincipal, TopicReads, UserKey};
 use iggy_gateway_kafka::bridge::{IggyBridge, OFFSET_GROUP_PREFIX};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::protocol::api::{ConnectionState, ERROR_NONE, GatewayState};
+use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
+use iggy_gateway_kafka::protocol::api::{
+    ConnectionState, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_NONE,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+};
 use iggy_gateway_kafka::protocol::handlers::{offset_commit, offset_fetch};
 
 use codec::Decoder;
@@ -82,14 +92,43 @@ async fn commit(state: &GatewayState, topic: &str, offset: i64) -> i16 {
 
 /// [`commit`] for `group`.
 async fn commit_as(state: &GatewayState, group: &str, topic: &str, offset: i64) -> i16 {
+    commit_by(state, None, group, topic, offset).await
+}
+
+/// [`commit_as`] on a connection that `principal` signed in on.
+async fn commit_by(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    group: &str,
+    topic: &str,
+    offset: i64,
+) -> i16 {
     let body = build_offset_commit_request(COMMIT_VERSION, group, topic, offset);
     let connection = ConnectionState::default();
-    let response = offset_commit::handle(state, &connection, COMMIT_VERSION, body)
+    let response = offset_commit::handle(state, &connection, principal, COMMIT_VERSION, body)
         .await
         .expect_response("OffsetCommit answers");
     let codes = decode_commit_codes(response);
     assert_eq!(codes.len(), 1, "one partition was committed");
     codes[0]
+}
+
+/// A signed-in Iggy user that may poll, and read topics when `read_topics`.
+fn principal(read_topics: bool) -> AuthenticatedPrincipal {
+    AuthenticatedPrincipal {
+        username: "reporting".to_string(),
+        user: Some(UserKey {
+            user_id: 9,
+            created_at: 1,
+        }),
+        permissions: PrincipalPermissions {
+            read_topics,
+            poll_messages: true,
+            ..PrincipalPermissions::default()
+        },
+        topic_reads: Arc::default(),
+        permissions_known: true,
+    }
 }
 
 /// The group error and partition 0's `(offset, error)` for `group` on `topic`.
@@ -227,6 +266,168 @@ async fn given_a_commit_the_offset_should_live_under_an_external_group_in_iggy()
         Some(7)
     );
     assert_eq!(stored(Consumer::group(group)).await, None);
+}
+
+/// A principal that may poll but holds no read or manage permission on topics or streams commits
+/// nothing, also to a group that exists, as Iggy would create no group for it. A listener that
+/// authenticates no one commits as before.
+#[tokio::test]
+#[serial]
+async fn given_a_principal_without_a_read_permission_should_commit_nothing() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic(&server, "orders").await;
+    let state = connected_state(&server).await;
+    let poller = principal(false);
+    let raw = iggy_server::raw_client(&server).await;
+    let (stream, topic) = (iggy_id("kafka"), iggy_id("orders"));
+    let iggy_group = iggy_id(&format!("{OFFSET_GROUP_PREFIX}fresh"));
+
+    assert_eq!(
+        commit_by(&state, Some(&poller), "fresh", "orders", 7).await,
+        ERROR_GROUP_AUTHORIZATION_FAILED
+    );
+    assert!(
+        raw.get_consumer_group(&stream, &topic, &iggy_group)
+            .await
+            .expect("read the group")
+            .is_none(),
+        "the refused commit creates no Iggy group"
+    );
+
+    assert_eq!(
+        commit_by(&state, Some(&principal(true)), "fresh", "orders", 8).await,
+        ERROR_NONE
+    );
+    assert_eq!(
+        commit_by(&state, Some(&poller), "fresh", "orders", 9).await,
+        ERROR_GROUP_AUTHORIZATION_FAILED,
+        "also once the group exists"
+    );
+    assert_eq!(
+        fetch(&state, "fresh", "orders").await,
+        (ERROR_NONE, 8, ERROR_NONE)
+    );
+
+    let anonymous = AuthenticatedPrincipal::anonymous();
+    assert_eq!(
+        commit_by(&state, Some(&anonymous), "open", "orders", 3).await,
+        ERROR_NONE
+    );
+}
+
+/// [`principal`] without a global read, holding the stream and topic grants of `permissions`.
+fn scoped(permissions: &Permissions) -> AuthenticatedPrincipal {
+    let mut principal = principal(false);
+    principal.topic_reads = Arc::new(TopicReads::of(permissions));
+    principal
+}
+
+/// `granted` on stream `stream`, and nothing else.
+fn on_stream(stream: usize, granted: StreamPermissions) -> Permissions {
+    Permissions {
+        streams: Some(BTreeMap::from([(stream, granted)])),
+        ..Permissions::default()
+    }
+}
+
+/// Iggy creates a consumer group for a user with a read or manage grant on the topic's stream, or
+/// on the topic, and not only for one with a global grant. A principal with such a grant commits
+/// there, and nowhere else. The ids come from the change log, as the grants do.
+#[tokio::test]
+#[serial]
+async fn given_a_stream_or_topic_grant_should_commit_only_where_it_may_read() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic(&server, "orders").await;
+    seed_topic(&server, "refunds").await;
+    let state = connected_state(&server).await;
+    let bridge = state.bridge.as_ref().expect("a bridge");
+    let shown = tokio::time::timeout(Duration::from_secs(10), async {
+        while bridge.topic_shape("orders").is_none() || bridge.topic_shape("refunds").is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(shown.is_ok(), "the change log shows both topics");
+    let raw = iggy_server::raw_client(&server).await;
+    let stream = raw
+        .get_stream(&iggy_id("kafka"))
+        .await
+        .expect("read the stream")
+        .expect("the stream exists");
+    let orders = raw
+        .get_topic(&iggy_id("kafka"), &iggy_id("orders"))
+        .await
+        .expect("read the topic")
+        .expect("the topic exists");
+    let stream_id = usize::try_from(stream.id).expect("a stream id fits usize");
+    let orders_id = usize::try_from(orders.id).expect("a topic id fits usize");
+
+    let whole_stream = scoped(&on_stream(
+        stream_id,
+        StreamPermissions {
+            read_stream: true,
+            ..StreamPermissions::default()
+        },
+    ));
+    assert_eq!(
+        commit_by(&state, Some(&whole_stream), "wide", "refunds", 4).await,
+        ERROR_NONE,
+        "a stream grant covers each topic of the stream"
+    );
+
+    let only_orders = scoped(&on_stream(
+        stream_id,
+        StreamPermissions {
+            topics: Some(BTreeMap::from([(
+                orders_id,
+                TopicPermissions {
+                    read_topic: true,
+                    ..TopicPermissions::default()
+                },
+            )])),
+            ..StreamPermissions::default()
+        },
+    ));
+    assert_eq!(
+        commit_by(&state, Some(&only_orders), "narrow", "orders", 5).await,
+        ERROR_NONE
+    );
+    assert_eq!(
+        commit_by(&state, Some(&only_orders), "narrow", "refunds", 6).await,
+        ERROR_GROUP_AUTHORIZATION_FAILED,
+        "the topic grant is on orders only"
+    );
+    assert!(
+        raw.get_consumer_group(
+            &iggy_id("kafka"),
+            &iggy_id("refunds"),
+            &iggy_id(&format!("{OFFSET_GROUP_PREFIX}narrow"))
+        )
+        .await
+        .expect("read the group")
+        .is_none(),
+        "the refused commit creates no Iggy group"
+    );
+
+    let other_stream = scoped(&on_stream(
+        stream_id + 1,
+        StreamPermissions {
+            read_stream: true,
+            ..StreamPermissions::default()
+        },
+    ));
+    assert_eq!(
+        commit_by(&state, Some(&other_stream), "elsewhere", "orders", 7).await,
+        ERROR_GROUP_AUTHORIZATION_FAILED,
+        "a grant on another stream"
+    );
+    assert_eq!(
+        commit_by(&state, Some(&only_orders), "narrow", "gone", 8).await,
+        ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+        "a topic the change log does not show, which clients retry"
+    );
 }
 
 /// Kafka consumers read any negative offset as none, so a negative commit deletes the key. A key

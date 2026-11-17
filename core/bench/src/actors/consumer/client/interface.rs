@@ -19,6 +19,7 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use iggy::prelude::*;
 
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
+use crate::utils::warmup::BenchmarkWarmup;
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkConsumerConfig {
@@ -26,7 +27,7 @@ pub struct BenchmarkConsumerConfig {
     pub consumer_group_id: Option<u32>,
     pub stream_id: String,
     pub messages_per_batch: BenchmarkNumericParameter,
-    pub warmup_time: IggyDuration,
+    pub warmup: BenchmarkWarmup,
     pub polling_kind: PollingKind,
     pub poll_options: PollOptions,
     pub origin_timestamp_latency_calculation: bool,
@@ -35,6 +36,18 @@ pub struct BenchmarkConsumerConfig {
 
 pub trait ConsumerClient: Send + Sync {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError>;
+
+    /// Returns no batch once `stop` completes. A group member with drained partitions can wait in
+    /// one call until the request timeout, long after the warmup or the run should end.
+    async fn consume_batch_until(
+        &mut self,
+        stop: impl Future<Output = ()>,
+    ) -> Result<Option<BatchMetrics>, IggyError> {
+        tokio::select! {
+            polled = self.consume_batch() => polled,
+            () = stop => Ok(None),
+        }
+    }
 
     /// Starts each partition at offset 0 after warmup. Explicit offsets avoid a race between
     /// separate store and delete requests when a consumer group transfers a partition.

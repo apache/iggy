@@ -507,6 +507,7 @@ fn principal_reading(manage_topics: bool, permissions_known: bool) -> Authentica
             manage_topics,
             ..PrincipalPermissions::default()
         },
+        topic_reads: Arc::default(),
         permissions_known,
     }
 }

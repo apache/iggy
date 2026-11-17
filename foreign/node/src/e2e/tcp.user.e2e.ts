@@ -166,7 +166,7 @@ describe('e2e -> user', async () => {
       await assert.rejects(c.user.updatePermissions({ userId: grantUser.id, permissions: dangling }), refused);
       assert.deepEqual((await c.user.get({ userId: grantUser.id }))?.permissions, permissions);
     }
-    await c.topic.delete({ streamId: stream.id, topicId: topic.id, partitionsCount: 1 });
+    await c.topic.delete({ streamId: stream.id, topicId: topic.id });
     const afterTopic = await c.user.get({ userId: grantUser.id });
     assert.ok(afterTopic?.permissions);
     assert.deepEqual(afterTopic.permissions.streams[0].topics, []);

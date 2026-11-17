@@ -50,7 +50,7 @@ it knows the server supports flexible encoding.
 
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
-| 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
+| 18 | ApiVersions | 0 | 5 | 0, 1, 2, 3, 4, 5 | Advertise supported ranges; flexible encoding at v3+. v5 names the cluster and the node that the client wants to reach (KIP-1242), see [Java clients](#java-clients) |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+. Each partition lists as many gateways as replicas as the replication factor of the topic ([`CONFIGS.md`](CONFIGS.md#replicas-in-metadata)). With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
@@ -98,7 +98,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 14 | SyncGroup | 0–5 | v4 |
 | 15 | DescribeGroups | 0–6 | v5 |
 | 16 | ListGroups | 0–5 | v3 |
-| 18 | ApiVersions | 0–3 | v3 |
+| 18 | ApiVersions | 0–5 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
 | 20 | DeleteTopics | 1–5 | v4 |
 | 22 | InitProducerId | 0–5 | v2 |
@@ -109,6 +109,22 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 44 | IncrementalAlterConfigs | 0–1 | v1 |
 | 47 | OffsetDelete | 0 | never |
 | 60 | DescribeCluster | 0–2 | v0 |
+
+### Java clients
+
+Java clients from Kafka 3.0 to 3.8 open ApiVersions at v3. Clients from 3.9 to 4.3 open it at
+v4, and 4.4 clients open it at v5. The gateway serves each of these versions, so no client asks
+again at a lower version (KIP-511). CI runs the Java clients of Kafka 3.9.2, 4.0.2 and 4.4.0.
+
+v5 adds the cluster and the node that the client wants to reach (KIP-1242). Java clients from
+4.4 and franz-go from 1.22.0 send them. A v5 request that names only one of the two gets
+`INVALID_REQUEST` (42), as from a Kafka 4.4 broker. If the node or the cluster is not this
+gateway's, the gateway answers `REBOOTSTRAP_REQUIRED` (129). The client then starts again from its
+bootstrap servers. Gateways without the bridge each draw their own cluster id, so when
+`IGGY_KAFKA_BROKERS` lists several of them, the gateway compares only the node.
+
+`kafka-protocol` 0.18 stops at ApiVersions v4, so `iggy_kafka_wire::api_versions` decodes the two
+v5 fields. The v5 response has no new field, so the v4 encoder writes it.
 
 ### Cluster id
 
@@ -189,8 +205,9 @@ Three things enforce that, in the order a client meets them:
    records. Under `acks=0` there is no response to carry 35, so the connection is closed
    instead, the same way a Kafka broker answers an `acks=0` produce error.
 
-An idempotent (non-transactional) producer is unaffected: it gets a producer id and works
-untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
+An idempotent (non-transactional) producer is unaffected: it gets a producer id, and each of its
+batches lands once unless `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`. See
+[`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 ### DeleteRecords is not advertised ([#3547](https://github.com/apache/iggy/issues/3547))
 
@@ -448,11 +465,17 @@ below it are still open for the issues that build on top of it.
       partition 0 is the controller, and each group has one coordinator that another gateway
       takes over when it stops (#4515, `docs/CONSUMER_GROUPS.md`). Without it, each gateway
       leads every partition it reports.
-- [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
-      against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
-      not reproduced or root-caused against the current `kafka_protocol`-based decode path in this
-      session, so not carried forward as a fix here rather than guessed at. Needs fresh
-      reproduction against a real `kcat` before it's re-closed.
+- [x] librdkafka / `kcat` trailing bytes on all-topics Metadata requests (#4828, #4299):
+      librdkafka 2.x's `rd_kafka_MetadataRequest0` in `src/rdkafka_request.c` reserves a 4-byte
+      `i32` array count placeholder (`rd_kafka_buf_write_arraycnt_pos`) for `TopicArrayCnt`.
+      When requesting all topics (`total_topic_cnt == 0`) at flexible versions (`ApiVersion >= 9`),
+      it keeps 0 without calling `rd_kafka_buf_finalize_arraycnt`, leaving 4 zero bytes where
+      a 1-byte compact array varint null (`0x00`) was expected and failing to compact the buffer by
+      3 bytes. Real Kafka brokers accept this because their request parser does not reject
+      unconsumed bytes at the end of the frame. Resolved via `decode_metadata_guarded` in
+      `iggy_kafka_wire::codec`, which tolerates up to 3 unconsumed zero bytes specifically for
+      flexible all-topics Metadata requests while preserving strict bounds validation and
+      exhaustive decoding everywhere else.
 - [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::partition_probes` and
       `EARLIEST` answers `0`. A timestamp answers the first record Iggy appended at or after it,

@@ -175,6 +175,19 @@ namespace Iggy {
          * 2 keeps two copies but stops accepting writes while either node is down. The server
          * rejects an out-of-range value with `InvalidReplicationFactor`.
          *
+         * `segment_max_age_micros` starts a new segment once a batch arrives this long after the
+         * active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
+         * segments by size alone. The server refuses a duration together with
+         * `preallocate_segments`. It follows `raw`, so positional calls written before it existed
+         * keep their meaning, and so do the three options below.
+         *
+         * `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
+         * server refuses true with `Feature is unavailable` until it tiers topics.
+         * `local_retention_age_micros` is how long a tiered topic keeps an uploaded segment on local
+         * disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
+         * there, unlimited when null. The server refuses an age above a finite message expiry and a
+         * size above a finite `max_topic_size`.
+         *
          * @param mixed $stream
          * @param string $name
          * @param int $partitions_count
@@ -190,9 +203,13 @@ namespace Iggy {
          * @param string|null $partition_resize_policy
          * @param mixed $replication_factor
          * @param array|null $raw
+         * @param mixed $segment_max_age_micros
+         * @param bool|null $tiered_storage
+         * @param mixed $local_retention_age_micros
+         * @param mixed $local_retention_size
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
 
         /**
          * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
@@ -285,6 +302,21 @@ namespace Iggy {
         public static function fromConnectionString(string $connection_string): \Iggy\Client {}
 
         /**
+         * Reads one page of the consumer groups of a topic. Group ids follow creation, so both
+         * orders walk by id. The other arguments are those of getStreamsPage().
+         *
+         * @param mixed $stream_id
+         * @param mixed $topic_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\ConsumerGroupsPage
+         */
+        public function getConsumerGroupsPage(mixed $stream_id, mixed $topic_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\ConsumerGroupsPage {}
+
+        /**
          * Returns the offset stored on `partition_id` for a standalone consumer, or for a consumer
          * group when `group` is true, or null when nothing is stored. In a cluster the node of the
          * connection answers from its own replica, which can lag a store that just returned.
@@ -318,7 +350,26 @@ namespace Iggy {
         public function getMetadataChanges(\Iggy\MetadataChangeStart $start, array $groups = [], mixed $since = null, mixed $until = null, mixed $limit = null): \Iggy\MetadataChanges {}
 
         /**
+         * Reads one page of the partitions of a topic. Partition ids follow creation, so both
+         * orders walk by id. The other arguments are those of getStreamsPage() except `name`,
+         * because a partition has no name.
+         *
+         * @param mixed $stream_id
+         * @param mixed $topic_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @return \Iggy\PartitionsPage
+         */
+        public function getPartitionsPage(mixed $stream_id, mixed $topic_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null): \Iggy\PartitionsPage {}
+
+        /**
          * Gets a stream by id or name.
+         *
+         * Over TCP, QUIC and WebSocket, a stream with too many topics for one reply throws
+         * ReplyTooLarge (97), and the connection stays usable. getTopicsPage() reads its topics
+         * page by page.
          *
          * @param mixed $stream_id
          * @return \Iggy\StreamDetails|null
@@ -326,13 +377,65 @@ namespace Iggy {
         public function getStream(mixed $stream_id): ?\Iggy\StreamDetails {}
 
         /**
+         * Reads one page of the streams.
+         *
+         * `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
+         * 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
+         * page. `name` keeps the streams whose name holds the text, case-sensitive, and is 1 to
+         * 255 bytes. A query outside these ranges, or a cursor text that the client cannot read,
+         * throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor
+         * that does not fit the query with the same error, which HTTP reports as code 300. A
+         * `limit` that is not an integer, or that does not fit an unsigned 32-bit integer, throws
+         * `IggyException` with code 0 from the argument check.
+         *
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\StreamsPage
+         */
+        public function getStreamsPage(?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\StreamsPage {}
+
+        /**
          * Gets a topic by stream and topic id/name.
+         *
+         * Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
+         * ReplyTooLarge (97), and the connection stays usable. getPartitionsPage() reads its
+         * partitions page by page.
          *
          * @param mixed $stream_id
          * @param mixed $topic_id
          * @return \Iggy\TopicDetails|null
          */
         public function getTopic(mixed $stream_id, mixed $topic_id): ?\Iggy\TopicDetails {}
+
+        /**
+         * Reads one page of the topics of a stream. A missing stream gives an empty page without
+         * `next`. The other arguments are those of getStreamsPage().
+         *
+         * @param mixed $stream_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\TopicsPage
+         */
+        public function getTopicsPage(mixed $stream_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\TopicsPage {}
+
+        /**
+         * Reads one page of the users, and `name` matches the username. The other arguments are
+         * those of getStreamsPage().
+         *
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\UsersPage
+         */
+        public function getUsersPage(?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\UsersPage {}
 
         /**
          * Builds a reader of the partitions that a consumer group assigns to this member.
@@ -411,8 +514,10 @@ namespace Iggy {
          * offset, PollingStrategy::next() when null, and a continuation is refused. `options`
          * defaults to a wait of 5 seconds for up to 1000 messages per request: a reader that waits
          * 0 polls an idle topic in a busy loop. `prefetch_bytes`, 16 MiB when null, and
-         * `prefetch_messages`, the larger of 16000 and `count` when null, bound the requests in
-         * flight and the queued batches.
+         * `prefetch_messages`, 16000 when null, set the requested budgets for requests in flight and
+         * queued batches. Each effective budget holds at least 32 full batches so primary groups can
+         * wait independently: 32 MiB and 32000 messages with the default options. Larger budgets
+         * allow more queued batches.
          *
          * @param mixed $stream
          * @param mixed $topic
@@ -554,6 +659,12 @@ namespace Iggy {
          * decides whether each one may be set or reset. `raw` is marked
          * `#[\SensitiveParameter]`, because an unknown key may hold a secret.
          *
+         * `tiered_storage` set to true turns tiered storage on. The server refuses false, an update
+         * never turns it off, and refuses true with `Feature is unavailable` until it tiers topics.
+         * `local_retention_age_micros` and `local_retention_size` change how long and how much a
+         * tiered topic keeps on local disk after upload, with the same int or decimal string values
+         * and the same refusal of 0 as the expiry and the size cap.
+         *
          * @param mixed $stream
          * @param mixed $topic
          * @param string|null $name
@@ -562,9 +673,12 @@ namespace Iggy {
          * @param array $reset
          * @param array|null $raw
          * @param array|null $raw_reset
+         * @param bool|null $tiered_storage
+         * @param mixed $local_retention_age_micros
+         * @param mixed $local_retention_size
          * @return void
          */
-        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null): void {}
+        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
     }
 
     /**
@@ -670,6 +784,7 @@ namespace Iggy {
          * recreated partition fails with HistoryUnavailable (87), and one from a previous owner
          * fails with ConsumerGroupPartitionNotOwned (5009). A checkpoint that this consumer did not
          * deliver, and every commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+         * The call ends at a deadline 10 s after its start, as PartitionReader::commit() does.
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
@@ -718,6 +833,7 @@ namespace Iggy {
          * The delete uses the context of its route. It can fail once with HistoryUnavailable
          * (87), or ConsumerGroupPartitionNotOwned (5009), after another client deleted and
          * recreated the partition. The failed route is dropped, and the next call routes again.
+         * The call ends at a deadline 10 s after its start, as commit() does.
          *
          * @param int|null $partition_id
          * @return void
@@ -786,8 +902,11 @@ namespace Iggy {
         /**
          * Sets the next read position of a partition and drops the rest of its current batch. Under
          * CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before it, so
-         * a restart resumes at the new position, and a failed store fails the seek with its
-         * exception and moves nothing. Every other seek stores nothing.
+         * a restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+         * deletes the stored offset, and a seek to a timestamp stores the offset before the first
+         * message at the timestamp, if there is one. A failed read, lookup, store or delete fails
+         * the seek with its exception and moves nothing. Every other seek stores nothing. The call
+         * ends at a deadline 10 s after its start, as commit() does.
          *
          * It also resumes a partition that stopped, for example after HistoryUnavailable (87), or
          * after a message that does not decode: seek to the `skip` of its ReadException. A
@@ -835,6 +954,8 @@ namespace Iggy {
          * (5009), after another client deleted and recreated the partition. The failed route is
          * dropped, and the next call routes again.
          *
+         * The call ends at a deadline 10 s after its start, as commit() does.
+         *
          * @param int $offset
          * @param int|null $partition_id
          * @return void
@@ -854,6 +975,46 @@ namespace Iggy {
          * @return string
          */
         public function topic(): string {}
+    }
+
+    /**
+     * One consumer group of a `ConsumerGroupsPage`.
+     */
+    class ConsumerGroup {
+        public readonly int $id;
+
+        public readonly int $members_count;
+
+        public readonly string $name;
+
+        public readonly int $partitions_count;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One page of the consumer groups of a topic, as `Client::getConsumerGroupsPage()` returns it.
+     */
+    class ConsumerGroupsPage {
+        /**
+         * The consumer groups of the page, each an `Iggy\ConsumerGroup`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 
     /**
@@ -2111,6 +2272,14 @@ namespace Iggy {
     }
 
     /**
+     * The order of a list page. Values are the HTTP API names.
+     */
+    enum PageOrder: string {
+      case Id = 'id';
+      case Created = 'created';
+    }
+
+    /**
      * One partition of a topic.
      */
     class Partition {
@@ -2157,7 +2326,9 @@ namespace Iggy {
      * budget (one fetch per primary that may wait for messages, the partitions with messages left
      * behind spread over the other slots), a seek() to an offset stores the offset before it, and
      * close() moves the offset back to the last delivered message. Destroying the reader without
-     * close() stops it without waiting, moves no offset back and does not leave the group.
+     * close() stops it without waiting, moves no offset back and does not leave the group. Under
+     * onRead(), such a reader or a crash loses the batches that the server stored before the
+     * application took them, up to the effective budget, which holds at least 32 batches.
      */
     class PartitionReader {
         public function __construct() {}
@@ -2184,6 +2355,10 @@ namespace Iggy {
          * A checkpoint of an older generation of its partition, or at or below the last commit of
          * its generation, stores nothing. A checkpoint that this reader did not deliver, and every
          * commit under CommitPolicy::onRead(), fail with InvalidCommand (3).
+         *
+         * PHP cannot cancel the call, so it ends at a deadline 10 s after its start: after a
+         * refusal for an earlier owner (5009), the read of the new owner retries only until then,
+         * and the call throws the refusal.
          *
          * @param \Iggy\Checkpoint $checkpoint
          * @return void
@@ -2232,9 +2407,14 @@ namespace Iggy {
          *
          * Under CommitPolicy::onRead(), a seek to an offset above 0 first stores the offset before
          * it, under the history of a continuation or else of the last delivered message, so a
-         * restart resumes at the new position. A failed store fails the seek with its exception and
-         * nothing moves. Every other seek stores nothing. The new position waits for the end of the
-         * committing read in flight, whose reply the new generation drops.
+         * restart resumes at the new position. A seek to offset 0 or PollingStrategy::first()
+         * deletes the stored offset under the same history when the server holds one, because the
+         * commit of a read never moves the offset back. A seek to a timestamp first reads one
+         * message at the timestamp without a commit, and then acts as a seek to the offset of that
+         * message. Without such a message it stores nothing. A failed read, lookup, store or delete
+         * fails the seek with its exception and nothing moves. Every other seek stores nothing. The
+         * new position waits for the end of the committing read in flight, whose reply the new
+         * generation drops. The call ends at a deadline 10 s after its start, as commit() does.
          *
          * A partition that the reader does not read, and a continuation of another partition,
          * fail with InvalidCommand (3). Under CommitPolicy::onRead(), a read with an unknown
@@ -2245,6 +2425,31 @@ namespace Iggy {
          * @return void
          */
         public function seek(int $partition_id, \Iggy\PollingStrategy $start): void {}
+    }
+
+    /**
+     * One page of the partitions of a topic, as `Client::getPartitionsPage()` returns it.
+     */
+    class PartitionsPage {
+        /**
+         * The partitions of the page, each an `Iggy\Partition`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 
     /**
@@ -2591,6 +2796,69 @@ namespace Iggy {
         public function __construct() {}
     }
 
+    /**
+     * One stream of a `StreamsPage`.
+     */
+    class Stream {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in, including the read-only encryption projections.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        /**
+         * Fingerprints of the server keys that wrap the stream's key, comma-separated: one
+         * outside a server key rotation. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_kek_fingerprint;
+
+        /**
+         * Fingerprint of the stream's key, 16 lowercase hex characters. Compare it with
+         * `Client::encryptionKeyFingerprint()` of a key you hold. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_fingerprint;
+
+        /**
+         * Who chose the stream's at-rest key: `stream`, `server`, or `none` for a plaintext
+         * stream. A source a newer server reports is returned as its text.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_source;
+
+        public readonly int $id;
+
+        public readonly int $messages_count;
+
+        public readonly string $name;
+
+        /**
+         * Options the creating client set, as option name to scalar value. Key material is
+         * never returned.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        public readonly int $size_bytes;
+
+        public readonly int $topics_count;
+
+        public function __construct() {}
+    }
+
     class StreamDetails {
         /**
          * Options the server filled in, including the read-only encryption projections.
@@ -2656,6 +2924,71 @@ namespace Iggy {
       case EncryptionKekFingerprint = 'encryption_kek_fingerprint';
     }
 
+    /**
+     * One page of the streams, as `Client::getStreamsPage()` returns it.
+     */
+    class StreamsPage {
+        /**
+         * The streams of the page, each an `Iggy\Stream`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One topic of a `TopicsPage`.
+     */
+    class Topic {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in from its catalog defaults.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        public readonly int $id;
+
+        public readonly int $messages_count;
+
+        public readonly string $name;
+
+        /**
+         * Options the creating or updating client set, as option name to scalar value.
+         * Integers above `PHP_INT_MAX`, such as never-expire and unlimited
+         * (18446744073709551615), are decimal strings.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        public readonly int $partitions_count;
+
+        public readonly int $size_bytes;
+
+        public function __construct() {}
+    }
+
     class TopicDetails {
         /**
          * Options the server filled in from its catalog defaults.
@@ -2697,8 +3030,8 @@ namespace Iggy {
     /**
      * Topic option keys, as the cases an update's reset list takes.
      *
-     * Only `MessageExpiry` and `MaxTopicSize` are resettable in this release. The server refuses
-     * every other case with its own category.
+     * Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
+     * resettable in this release. The server refuses every other case with its own category.
      */
     enum TopicOptionKey: string {
       case Name = 'name';
@@ -2713,6 +3046,99 @@ namespace Iggy {
       case SizeOfMessagesRequiredToSave = 'size_of_messages_required_to_save';
       case PreallocateSegments = 'preallocate_segments';
       case ReplicationFactor = 'replication_factor';
+      case SegmentMaxAge = 'segment_max_age';
+      case TieredStorage = 'tiered_storage';
+      case LocalRetentionAge = 'local_retention_age';
+      case LocalRetentionSize = 'local_retention_size';
+    }
+
+    /**
+     * One page of the topics of a stream, as `Client::getTopicsPage()` returns it.
+     */
+    class TopicsPage {
+        /**
+         * The topics of the page, each an `Iggy\Topic`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One user of a `UsersPage`.
+     */
+    class UserInfo {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        public readonly int $id;
+
+        /**
+         * Options the creating client set, as option name to scalar value.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        /**
+         * `active` or `inactive`.
+         *
+         * @var string
+         */
+        public readonly string $status;
+
+        public readonly string $username;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One page of the users, as `Client::getUsersPage()` returns it.
+     */
+    class UsersPage {
+        /**
+         * The users of the page, each an `Iggy\UserInfo`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 }
 
@@ -2758,11 +3184,24 @@ namespace Iggy\Exception {
     class ReadException extends \Iggy\Exception\IggyException {
         /**
          * Whether the reader stopped the partition after six refusals in a row that a retry does
-         * not change, such as Unauthorized (41). A seek of the partition reads it again.
+         * not change, such as Unauthorized (41), or after one TieredReadFailed (96). A seek of the
+         * partition reads it again.
          *
          * @var bool
          */
         public readonly bool $is_lasting_refusal;
+
+        /**
+         * For messages that a lost read committed and that the reader could not read again: their
+         * first and last offset, as [first, last]. The code is then FetchProgressUncertain
+         * (14010). Null for every other error. This error stops nothing and needs no seek. A
+         * batch that the reader holds after the range comes next, and a seek before the
+         * application takes it drops it. If the reader stopped the partition, the error that
+         * stopped it comes after that batch.
+         *
+         * @var array|null
+         */
+        public readonly ?array $lost;
 
         /**
          * The partition of the error, or null for an error of the whole reader.
@@ -2773,7 +3212,8 @@ namespace Iggy\Exception {
 
         /**
          * For a message that does not decode: the continuation after it. The reader reads the
-         * message again until a seek of its partition to this continuation skips it.
+         * message again until a seek of its partition to this continuation skips it. Null for
+         * every other error.
          *
          * @var \Iggy\PollingStrategy|null
          */

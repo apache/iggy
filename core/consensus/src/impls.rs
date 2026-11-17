@@ -4662,6 +4662,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
         self.clear_pipeline();
         self.advance_commit_max(commit_op);
+        // A checkpoint above the head of an adopted `StartView` holds every op that
+        // log names, so an open proof has nothing left to check. The parked log goes
+        // too: the plane reads its head as the log head, now below the commit floor.
+        // A primary-elect keeps its parked log: its view starts from that log.
+        let covers_adopted_log = self.view_log_unproven.get()
+            && !self.is_primary_elect()
+            && self
+                .pending_view_log
+                .borrow()
+                .as_ref()
+                .is_some_and(|pending| pending.op_head < commit_op);
+        if covers_adopted_log {
+            self.pending_view_log.borrow_mut().take();
+            self.settle_view_log_proof();
+        }
     }
 
     fn finish_view_probe(&self) {
@@ -5277,6 +5292,27 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        // A commit number can reach a backup before its prepare does, and a vote
+        // reports a commit only up to the head of its sender (`dvc_commit`). When
+        // the replicas that held the op lost it, the merge ends below a commit
+        // that this replica knows. No replica can supply the ops between, so as
+        // primary it would never apply up to `commit_max`, and a primary takes
+        // no request before that. Its heartbeats would keep the backups in the
+        // view. Refuse instead: the status timeout votes to leave the view, and
+        // a replica that does not know the op can lead the next one.
+        // `handle_start_view` applies the same rule to a backup.
+        if merged.op_head < self.commit_max() {
+            tracing::error!(
+                replica = self.replica,
+                view = self.view.get(),
+                op_head = merged.op_head,
+                commit_max = self.commit_max(),
+                "view change cannot start: the merged log ends below an op that this replica \
+                 knows as committed; refusing the view"
+            );
+            return Vec::new();
+        }
+
         // Quorum closed now the merge decided: re-merging after parking could
         // produce a different log than the one already being repaired toward.
         self.do_view_change_quorum.set(true);
@@ -5329,8 +5365,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Sizes handed to the DVC merge. `merge_view_change` raises the quorum to
-    /// every replica, and drops absence nacks, when too few senders trust their
-    /// logs.
+    /// every replica, drops absence nacks, and discards an op that no replica
+    /// can serve, when too few senders trust their logs.
     const fn merge_quorums(&self) -> MergeQuorums {
         MergeQuorums {
             view_change: self.quorum_view_change(),
@@ -5345,6 +5381,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             } else {
                 self.replica_count as usize
             },
+            unservable_discards: false,
         }
     }
 
@@ -5731,6 +5768,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             // Keep the hash chain continuous: the next prepare must chain onto the
             // head this view adopted, not onto whatever was appended last.
             self.set_last_prepare_checksum(head.checksum);
+        } else if new_op == 0 {
+            // An empty log has no head header, and its first op chains onto zero.
+            // A leftover anchor would name an op that this merge dropped.
+            self.set_last_prepare_checksum(0);
         }
         for header in &merged.headers {
             self.observe_prepare_timestamp(header.timestamp);
@@ -11488,6 +11529,182 @@ mod adopted_view_claim_tests {
             HEAD,
             "the merge must keep op {HEAD}, which view {OLD_VIEW} committed"
         );
+    }
+
+    /// A state transfer wipes the journal and installs what a primary of the view
+    /// committed. Parked `StartView` headers above the checkpoint still wait for
+    /// their bodies. A checkpoint above the adopted head leaves none to wait for.
+    #[test]
+    fn given_an_adopted_start_view_when_a_checkpoint_passes_its_head_should_drop_the_parked_log_and_settle_the_proof()
+     {
+        const PASSED: u64 = HEAD + 3;
+        let history = history_in(PARTITION_GROUP);
+        let backup = adopt_unrepaired(&history);
+
+        for checkpoint in [HEAD - 2, HEAD] {
+            backup.install_checkpoint(checkpoint, None);
+            assert_eq!(
+                backup.with_pending_view_log(|pending| pending.op_head),
+                Some(HEAD),
+                "the checkpoint at op {checkpoint} does not pass the adopted head"
+            );
+            assert!(backup.view_log_unproven());
+            assert_eq!(backup.sequencer().current_sequence(), HEAD);
+        }
+
+        backup.install_checkpoint(PASSED, None);
+        assert_eq!(
+            backup.with_pending_view_log(|pending| pending.op_head),
+            None,
+            "the checkpoint at op {PASSED} holds every op of the adopted log, and the parked \
+             head still names an op below the commit point {}",
+            backup.commit_min(),
+        );
+        assert!(
+            !backup.view_log_unproven(),
+            "nothing of the adopted log is left to prove above the checkpoint"
+        );
+        assert_eq!(backup.sequencer().current_sequence(), PASSED);
+        assert_eq!(backup.log_view_claim(), ADOPTED_VIEW);
+    }
+
+    /// Live prepares of the adopted view can lift the head above the op where the
+    /// checkpoint lands. The install wipes them and keeps the head.
+    #[test]
+    fn given_a_head_above_the_checkpoint_when_the_checkpoint_passes_the_adopted_head_should_settle_the_proof_and_keep_the_head()
+     {
+        const LIVE_HEAD: u64 = HEAD + 4;
+        const CHECKPOINT: u64 = HEAD + 2;
+        let history = history_in(PARTITION_GROUP);
+        let backup = adopt_unrepaired(&history);
+        backup.sequencer().set_sequence(LIVE_HEAD);
+
+        backup.install_checkpoint(CHECKPOINT, None);
+
+        assert!(
+            !backup.view_log_is_pending(),
+            "the parked log still ends at op {HEAD}, below the checkpoint at op {CHECKPOINT}"
+        );
+        assert!(
+            !backup.view_log_unproven(),
+            "the proof stayed open for head {LIVE_HEAD} with no parked log, so no repaired \
+             prepare can become the header that proof starts from"
+        );
+        assert_eq!(backup.sequencer().current_sequence(), LIVE_HEAD);
+    }
+
+    /// A primary-elect starts its view from the merge it parked. A checkpoint
+    /// above the merged head must not drop that log, or the view never starts.
+    #[test]
+    fn given_a_primary_elect_when_a_checkpoint_passes_its_merged_head_should_keep_the_parked_log() {
+        const PASSED: u64 = HEAD + 3;
+        let history = history_in(PARTITION_GROUP);
+        let plane = plane_of(PARTITION_GROUP);
+        let elect = adopt_unrepaired(&history);
+        // What the plane's reconcile does once the journal matches the parked headers.
+        elect.settle_view_log_proof();
+        elect.enter_view_change(
+            plane,
+            MERGED_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        let peer = StoredDvc {
+            replica: OLD_PRIMARY,
+            log_view: ADOPTED_VIEW,
+            op: HEAD,
+            commit: HEAD - 1,
+            suffix: held(&history, HEAD - 1, HEAD),
+            untrusted_log: false,
+        };
+        for dvc in [dvc_of(&elect), peer] {
+            assert!(dvc_record(
+                &mut elect.do_view_change_from_all_replicas.borrow_mut(),
+                dvc
+            ));
+        }
+        assert!(elect.complete_view_change_as_primary(plane).is_empty());
+        assert!(elect.is_primary_elect());
+        assert!(
+            elect.view_log_unproven(),
+            "the merge is proven already, so the install has no open proof to settle"
+        );
+
+        elect.install_checkpoint(PASSED, None);
+
+        assert_eq!(
+            elect.with_pending_view_log(|pending| pending.op_head),
+            Some(HEAD),
+            "the checkpoint at op {PASSED} dropped the merge that view {MERGED_VIEW} starts from"
+        );
+        assert!(elect.is_primary_elect());
+        assert!(elect.view_log_unproven());
+
+        // Known gap: the start takes the merged head as it is and compares
+        // nothing with the commit point, so the view opens below the checkpoint.
+        let actions = elect.start_pending_view(plane);
+        assert!(
+            matches!(
+                actions.first(),
+                Some(VsrAction::SendStartView { op: HEAD, .. })
+            ),
+            "view {MERGED_VIEW} must start from the parked log: {actions:?}"
+        );
+        assert_eq!(elect.sequencer().current_sequence(), HEAD);
+        assert_eq!(elect.commit_min(), PASSED);
+    }
+
+    /// A commit number can reach a backup before its prepare does, and a vote
+    /// reports a commit only up to the head of its sender. When the replicas
+    /// that held the op lost it, the merge ends below a commit that this replica
+    /// knows. As primary it could never apply up to that `commit_max`, and a
+    /// primary takes no request before it does.
+    #[test]
+    fn given_a_known_commit_above_the_merged_head_when_the_merge_decides_should_not_lead_the_view()
+    {
+        const LOST: u64 = HEAD;
+        let history = history_in(PARTITION_GROUP);
+        let plane = plane_of(PARTITION_GROUP);
+        let candidate = backup_in(PARTITION_GROUP, OLD_VIEW, OLD_VIEW, LOST - 1, LOST - 1);
+        candidate.set_local_dvc_suffix(held(&history, LOST - 2, LOST - 1));
+        // A heartbeat of the old primary that overtook the prepare.
+        candidate.advance_commit_max(LOST);
+        candidate.enter_view_change(
+            plane,
+            MERGED_VIEW,
+            ViewChangeReason::ReceivedStartViewChange,
+        );
+        let restarted_without_the_op = StoredDvc {
+            replica: OLD_PRIMARY,
+            log_view: OLD_VIEW,
+            op: LOST - 1,
+            commit: LOST - 2,
+            suffix: held(&history, LOST - 2, LOST - 1),
+            untrusted_log: false,
+        };
+        let vote = dvc_of(&candidate);
+        assert_eq!(
+            (vote.op, vote.commit),
+            (LOST - 1, LOST - 1),
+            "the vote cannot name the commit of op {LOST}"
+        );
+        for dvc in [vote, restarted_without_the_op] {
+            assert!(dvc_record(
+                &mut candidate.do_view_change_from_all_replicas.borrow_mut(),
+                dvc
+            ));
+        }
+
+        assert!(candidate.complete_view_change_as_primary(plane).is_empty());
+
+        assert!(
+            !candidate.view_log_is_pending(),
+            "the replica parked a log that ends at op {}, below op {LOST} that it knows as \
+             committed",
+            LOST - 1
+        );
+        assert!(!candidate.is_primary_elect());
+        assert_eq!(candidate.status(), Status::ViewChange);
+        assert_eq!(candidate.commit_max(), LOST);
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::stm::result::{
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::stm::stream::{PatchError, patched_options, public_reply_options};
+use crate::stm::walk::{Directed, range_after};
 use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
@@ -130,6 +131,29 @@ define_state! {
         // seek by key instead of sorting the per-user maps. Never persisted.
         pub(crate) personal_access_token_name_index: BTreeSet<(UserId, Arc<str>)>,
         pub(crate) permissioner: Permissioner,
+        // `(created_at micros, user id)` of every user, so a page in creation
+        // order seeks by key. Never persisted, rebuilt on restore.
+        pub(crate) created_index: BTreeSet<(u64, usize)>,
+    }
+}
+
+impl UsersInner {
+    /// The users after `after` in creation order, newest first when
+    /// `descending`. The key of a user is `(created_at micros, user id)`.
+    pub fn users_by_created(
+        &self,
+        after: Option<(u64, usize)>,
+        descending: bool,
+    ) -> impl Iterator<Item = ((u64, usize), &User)> {
+        Directed::new(
+            self.created_index
+                .range(range_after(after.as_ref(), descending)),
+            descending,
+        )
+        .filter_map(|&key| {
+            let user = self.items.get(key.1)?;
+            (user.created_at.as_micros() == key.0).then_some((key, user))
+        })
     }
 }
 
@@ -244,16 +268,15 @@ impl UsersInner {
         &self,
         user_id: UserId,
     ) -> Vec<(Arc<str>, Option<IggyTimestamp>)> {
-        let mut tokens: Vec<_> = self
-            .personal_access_tokens
-            .get(&user_id)
-            .map(|user_tokens| {
-                user_tokens
-                    .values()
-                    .map(|pat| (Arc::clone(&pat.name), pat.expiry_at))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut tokens: Vec<_> =
+            self.personal_access_tokens
+                .get(&user_id)
+                .map_or_default(|user_tokens| {
+                    user_tokens
+                        .values()
+                        .map(|pat| (Arc::clone(&pat.name), pat.expiry_at))
+                        .collect()
+                });
         tokens.sort_by(|(left, _), (right, _)| left.cmp(right));
         tokens
     }
@@ -586,6 +609,7 @@ impl StateHandler for CreateUserRequest {
         if let Some(user) = state.items.get_mut(id) {
             user.id = id as UserId;
         }
+        state.created_index.insert((timestamp.as_micros(), id));
 
         state.index.insert(username_arc, id as UserId);
         // A reused ID must not inherit token-index entries from its previous holder.
@@ -743,7 +767,10 @@ impl StateHandler for DeleteUserRequest {
                     change_actor(&state.apply_context),
                 )
             }));
-            state.items.remove(user_id);
+            let removed = state.items.remove(user_id);
+            state
+                .created_index
+                .remove(&(removed.created_at.as_micros(), user_id));
             state.index.remove(&username);
             state.remove_personal_access_tokens(user_id as UserId);
             state
@@ -1303,10 +1330,15 @@ impl UsersInner {
         // Rebuild the permissioner from the restored users rather than the
         // snapshot vecs, which are intentionally empty (see `to_snapshot`).
         let permissioner = permissioner_of(&items);
+        let created_index = items
+            .iter()
+            .map(|(id, user)| (user.created_at.as_micros(), id))
+            .collect();
 
         Self {
             index,
             items,
+            created_index,
             personal_access_tokens,
             personal_access_token_index,
             personal_access_token_expiry_index,
@@ -2396,6 +2428,93 @@ mod tests {
         assert_eq!(
             users.items.get(0).map(|user| user.status),
             Some(UserStatus::Active)
+        );
+    }
+
+    fn user_creation_keys(users: &UsersInner) -> BTreeSet<(u64, usize)> {
+        users
+            .items
+            .iter()
+            .map(|(id, user)| (user.created_at.as_micros(), id))
+            .collect()
+    }
+
+    fn create_user_at(users: &mut UsersInner, username: &str, micros: u64) {
+        let request = CreateUserRequest {
+            username: WireName::new(username).unwrap(),
+            password: "hash".to_owned(),
+            status: 1,
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let reply = StateHandler::apply(&request, users, IggyTimestamp::from(micros));
+        assert_eq!(reply.code, 0);
+    }
+
+    fn delete_user_at(users: &mut UsersInner, user_id: usize, micros: u64) {
+        let request = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(u32::try_from(user_id).unwrap()),
+        };
+        let reply = StateHandler::apply(&request, users, IggyTimestamp::from(micros));
+        assert_eq!(reply.code, 0);
+    }
+
+    #[test]
+    fn given_random_user_creates_and_deletes_when_applied_should_keep_the_creation_index_exact() {
+        let mut users = UsersInner::new();
+        create_user_at(&mut users, "root", 1);
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for step in 2..=400u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let deletable: Vec<usize> = users
+                .items
+                .iter()
+                .map(|(id, _)| id)
+                .filter(|&id| id != DEFAULT_ROOT_USER_ID as usize)
+                .collect();
+            if deletable.is_empty() || !seed.is_multiple_of(3) {
+                create_user_at(&mut users, &format!("user{step}"), step);
+            } else {
+                let pick = usize::try_from(seed % deletable.len() as u64).unwrap();
+                delete_user_at(&mut users, deletable[pick], step);
+            }
+            assert_eq!(
+                users.created_index,
+                user_creation_keys(&users),
+                "step {step}"
+            );
+        }
+        assert!(users.created_index.len() > 10);
+        let snapshot = Users::from(users.clone()).to_snapshot();
+        let restored = UsersInner::inner_from_snapshot(snapshot);
+        assert_eq!(restored.created_index, user_creation_keys(&users));
+    }
+
+    #[test]
+    fn given_a_reused_user_id_when_walking_by_creation_should_list_the_new_user_last() {
+        let mut users = UsersInner::new();
+        for (micros, username) in [(10, "root"), (20, "bravo"), (30, "charlie")] {
+            create_user_at(&mut users, username, micros);
+        }
+        delete_user_at(&mut users, 1, 40);
+        create_user_at(&mut users, "delta", 50);
+        assert_eq!(users.items[1].username.as_ref(), "delta");
+
+        let by_created = |after, descending| {
+            users
+                .users_by_created(after, descending)
+                .map(|((_, id), _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by_created(None, false), [0, 2, 1]);
+        assert_eq!(by_created(None, true), [1, 2, 0]);
+        assert_eq!(by_created(Some((30, 2)), false), [1]);
+        assert_eq!(
+            by_created(Some((20, 1)), true),
+            [0],
+            "a deleted key still splits"
         );
     }
 }

@@ -518,8 +518,51 @@ struct TopicOptionsTests {
         #expect(try TopicCreateOptions(messageExpiry: .after(.microseconds(1))).toResourceOptions()[key] == .explicit(.uint64(1)))
         #expect(try TopicCreateOptions(messageExpiry: .never).toResourceOptions()[key] == .explicit(.uint64(UInt64.max)))
         #expect(try TopicCreateOptions(messageExpiry: .serverDefault).toResourceOptions()[key] == nil)
+        let ageKey = TopicOptionKey.segmentMaxAge.rawValue
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(segmentMaxAge: .after(.zero)).encode() }
+        #expect(try TopicCreateOptions(segmentMaxAge: .after(.seconds(3_600))).toResourceOptions()[ageKey] == .explicit(.uint64(3_600_000_000)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .never).toResourceOptions()[ageKey] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .serverDefault).toResourceOptions()[ageKey] == nil)
+        let localAgeKey = TopicOptionKey.localRetentionAge.rawValue
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(localRetentionAge: .after(.zero)).encode() }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(localRetentionAge: .after(.zero)).toPatch() }
+        #expect(try TopicCreateOptions(localRetentionAge: .after(.seconds(1_800))).toResourceOptions()[localAgeKey] == .explicit(.uint64(1_800_000_000)))
+        #expect(try TopicCreateOptions(localRetentionAge: .never).toResourceOptions()[localAgeKey] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(localRetentionAge: .serverDefault).toResourceOptions()[localAgeKey] == nil)
         // On an update the server default changes nothing. A reset restores the default.
         #expect(
             try TopicUpdateOptions(name: "renamed", messageExpiry: .serverDefault, maxTopicSize: .serverDefault).toResourceOptions().keys.sorted() == ["name"])
+        #expect(
+            try TopicUpdateOptions(name: "renamed", localRetentionAge: .serverDefault, localRetentionSize: .serverDefault).toResourceOptions().keys.sorted()
+                == ["name"])
+    }
+
+    /// A tiered topic keeps nothing on local disk longer, or in a larger
+    /// amount, than it keeps at all, so a read bounds both by the topic's own.
+    @Test func localRetentionReadsYieldToTheTopicBounds() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "events", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let unreported = topic([:])
+        #expect(!unreported.tieredStorage)
+        #expect(unreported.localRetentionAge == .after(.seconds(86_400)))
+        #expect(unreported.localRetentionSize == .unlimited)
+        let bounded = topic([
+            TopicOptionKey.messageExpiry.rawValue: .explicit(.uint64(3_600_000_000)),
+            TopicOptionKey.maxTopicSize.rawValue: .explicit(.uint64(1 << 30)),
+            TopicOptionKey.tieredStorage.rawValue: .explicit(.bool(true)),
+        ])
+        #expect(bounded.tieredStorage)
+        #expect(bounded.localRetentionAge == .after(.seconds(3_600)))
+        #expect(bounded.localRetentionSize == .bytes(1 << 30))
+        let explicit = topic([
+            TopicOptionKey.messageExpiry.rawValue: .explicit(.uint64(3_600_000_000)),
+            TopicOptionKey.localRetentionAge.rawValue: .explicit(.uint64(1_800_000_000)),
+            TopicOptionKey.localRetentionSize.rawValue: .explicit(.uint64(1 << 20)),
+        ])
+        #expect(explicit.localRetentionAge == .after(.seconds(1_800)))
+        #expect(explicit.localRetentionSize == .bytes(1 << 20))
     }
 }

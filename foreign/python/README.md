@@ -212,7 +212,7 @@ asyncio.run(main())
 
 `create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
 
-A topic's `message_expiry` and `max_topic_size` are the only resettable keys. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
+A topic's `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` are the only resettable keys. `tiered_storage` can only be turned on by an update, never off. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
 
 The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
 
@@ -266,6 +266,43 @@ asyncio.run(main())
 A stream encryption key must be 32 random bytes, given as `bytes` or as their canonical base64 text. The key travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is your responsibility.
 
 The server never returns the key, only `encryption_key_source`, `encryption_key_fingerprint` and `encryption_kek_fingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `"server"`. An invalid key raises `ValueError` before anything is sent, and no repr or error message contains it.
+
+## List Pages
+
+`get_streams`, `get_topics`, `get_consumer_groups` and `get_users` return a whole list in id order. The list is read in pages of 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the read can appear or not appear.
+
+`get_streams_page`, `get_topics_page`, `get_partitions_page`, `get_consumer_groups_page` and `get_users_page` return one page. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`.
+
+```python
+import asyncio
+
+from apache_iggy import IggyClient, PageOrder
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+
+    cursor = None
+    while True:
+        page = await client.get_streams_page(
+            order=PageOrder.Created, name="orders", cursor=cursor
+        )
+        for stream in page.items:
+            print(stream.id, stream.name)
+        if page.next is None:
+            break
+        cursor = page.next
+
+
+asyncio.run(main())
+```
+
+`order` selects `PageOrder.Id`, the default, or `PageOrder.Created`, and `descending=True` reverses it. `limit` sets the size of a page, from 1 to 1000, and is 100 by default. `name` keeps the entries whose name holds the text, case-sensitive. A partition has no name, so `get_partitions_page` takes no `name`.
+
+A cursor is the `pg1_` text that the HTTP API and the CLI use. Before it sends anything, the client refuses a cursor or a query that breaks the page rules. It raises `IggyError` with the invalid command code (3). Examples are a bad cursor text, a limit of 0 or above 1000, and a name that is empty or longer than 255 bytes. A `limit` outside the unsigned 32-bit range raises `OverflowError` instead.
+
+The server refuses a cursor that it cannot use, such as the cursor of another order, also with invalid command. Over HTTP, a refusal from the server raises `IggyError` with code 300 (HTTP response error), and its message holds the server error body.
 
 ## Metadata Changes
 
@@ -607,7 +644,9 @@ until `abandon_operation()`, as described above. `poll_messages()` refuses
 `reader()` returns a `PartitionReader`, which reads the partitions of a topic
 with prefetch and keeps the position of each one. A `Consumer.Single` reads the
 `partitions` that you pass. A `Consumer.Group` joins its group and reads the
-partitions that the server assigns to it. `next()` returns the next batch of
+partitions that the server assigns to it. A join with an unknown outcome raises
+its error, and the next `reader()` joins again. A join that landed keeps its
+member in the group until the session ends. `next()` returns the next batch of
 one partition and never an empty one, and `commit()` stores the offset of a
 checkpoint. The default options wait up to five seconds for messages. `next()`
 has no time limit. To bound it, use `asyncio.wait_for()`: a cancelled `next()`
@@ -615,6 +654,15 @@ leaves its batch in the reader. Call `close()` when you are done, or use the
 reader in `async with`, which closes it. `async for` reads batches until
 `close()`. `delete_consumer_position()` deletes the offset stored for the
 partition of a checkpoint.
+
+When the offset store of `commit()` gets `ConsumerGroupPartitionNotOwned` (5009)
+for a partition that the reader still has, `commit()` reads the owner of the
+partition again. The server can refuse that read for a short time, and
+`commit()` repeats it after each such refusal, with no time limit. To bound
+`commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends nothing more,
+but a write that it already sent can still take effect. `close()` waits for
+every pending call of the reader, so cancel a pending `commit()` before
+`close()`.
 
 ```python
 from apache_iggy import Consumer, IggyClient, PollingStrategy
@@ -642,7 +690,11 @@ async def read_batches(client: IggyClient):
 yields its messages one at a time. The `commit` of its `poll_options` says when
 offsets are stored. `CommitPolicy.Manual()`, the default, stores none: commit the
 checkpoint of a message after you process it. `CommitPolicy.OnRead()` makes the
-server store the offset of each read. `CommitPolicy.Auto(AutoCommit(...))` makes
+server store the offset of each read. A reader or a consumer with `OnRead` reads
+ahead. A crash, or an exit without `close()` or `shutdown()`, loses the batches
+that the server stored before the application took them. The loss is at most the
+effective prefetch budget, which holds at least 32 batches.
+`CommitPolicy.Auto(AutoCommit(...))` makes
 the consumer store the latest counted position at an `interval` or on a
 `CommitEvery` event, and on shutdown. A message counts after its processing with
 `CommitAfter.Processing`, when it is handed over with `CommitAfter.Delivery`, or
@@ -682,6 +734,33 @@ itself. A partition that was deleted and created again stops with
 `HistoryUnavailable` (87) until `seek(partition_id, start)` picks a new start.
 `consume_messages()` then raises the error and stops. Call it again after the
 seek. If a message does not decode, pass `skip` to `seek()` to read past it.
+A lost read can commit messages that the reader cannot read again. Then the
+reader raises `FetchProgressUncertain` (14010) once. Its `lost` holds the first
+and last offset of those messages as `(first, last)`. This error stops nothing
+and needs no seek. A seek after it drops the batch that follows the range. If
+the reader stopped the partition, the error that stopped it comes after that
+batch. Earlier versions gave this error a `skip` after the range. Code that
+handles `FetchProgressUncertain` with an abandon and a `seek()` must now check
+`lost` first and do neither for this error.
+
+## Interpreter Exit
+
+Before the interpreter exits, shut the SDK down: await `shutdown()` on each
+consumer and producer, and `close()` on each reader.
+
+The SDK registers an `atexit` handler at its first import. From that handler
+on, the threads of the SDK hand no result to Python. A thread that enters
+Python during finalization can abort the process. After that handler:
+
+- A call in flight can stay pending and never complete.
+- A call from a thread other than the exiting main thread raises
+  `RuntimeError`. An example is a daemon thread that runs the event loop.
+- A `consume_messages()` run ends and calls its callback no more.
+
+Python runs `atexit` handlers in reverse order of registration. A handler that
+you register before the first import of `apache_iggy` runs after the handler of
+the SDK. A wait for the SDK in such a handler can hang. Before you register
+such a handler, import `apache_iggy`, or shut the SDK down before the exit.
 
 ## Examples
 

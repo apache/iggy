@@ -41,6 +41,7 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "ConsumerGroupsPage",
     "ConsumerOffsetInfo",
     "DirectProducerConfig",
     "GlobalPermissions",
@@ -94,11 +95,13 @@ __all__ = [
     "OptionError",
     "OptionKey",
     "OptionSpec",
+    "PageOrder",
     "Partition",
     "PartitionContext",
     "PartitionReader",
     "PartitionResizePolicy",
     "Partitioning",
+    "PartitionsPage",
     "PendingOperationError",
     "PendingOperationsConfig",
     "Permissions",
@@ -114,11 +117,14 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "SnapshotCompression",
     "Stats",
     "Stream",
     "StreamDetails",
     "StreamOptions",
     "StreamPermissions",
+    "StreamsPage",
+    "SystemSnapshotType",
     "TcpConfig",
     "TcpReconnectionConfig",
     "TokenInfo",
@@ -126,11 +132,13 @@ __all__ = [
     "TopicDetails",
     "TopicOptions",
     "TopicPermissions",
+    "TopicsPage",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
     "UserOptions",
     "UserStatus",
+    "UsersPage",
     "WebSocketConfig",
     "WebSocketFramingConfig",
     "WebSocketReconnectionConfig",
@@ -598,6 +606,23 @@ class ConsumerGroupMember:
     def partitions(self) -> builtins.list[builtins.int]:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
+        """
+
+@typing.final
+class ConsumerGroupsPage:
+    r"""
+    One page of a list, as `IggyClient.get_consumer_groups_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[ConsumerGroup]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
         """
 
 @typing.final
@@ -1241,6 +1266,36 @@ class IggyClient:
                 authenticated, the user lacks the permission, or the request
                 fails.
         """
+    def snapshot(
+        self,
+        snapshot_compression: SnapshotCompression,
+        snapshot_types: typing.Sequence[SystemSnapshotType],
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+
+        Requires an authenticated session whose user holds the `manage_servers`
+        global permission.
+
+        Args:
+            snapshot_compression: Archive compression method as a
+                `SnapshotCompression` enum.
+            snapshot_types: Data to include in the snapshot as a list of
+                `SystemSnapshotType` enums. `SystemSnapshotType.All` cannot be
+                combined with any other snapshot type.
+
+        Returns:
+            An awaitable that resolves to the ZIP archive `bytes`.
+
+        Raises:
+            TypeError: If `snapshot_compression` is not a `SnapshotCompression`
+                or `snapshot_types` contains elements other than `SystemSnapshotType`.
+            ValueError: If `snapshot_types` is empty.
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, the user lacks the permission, `SystemSnapshotType.All` is
+                combined with another snapshot type, the 30-second binary
+                operation deadline expires, or the request fails.
+        """
     def describe_options(
         self, scope: builtins.str
     ) -> collections.abc.Awaitable[list[OptionSpec]]:
@@ -1344,13 +1399,40 @@ class IggyClient:
         """
     def get_users(self) -> collections.abc.Awaitable[list[UserInfo]]:
         r"""
-        Get the info about all the users.
+        Get the info about all the users, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A user that someone creates or deletes during the read can appear or
+        not appear. `get_users_page` reads one page.
 
         Returns:
             An awaitable that resolves to `list[UserInfo]`.
 
         Raises:
             RuntimeError: If the request fails.
+        """
+    def get_users_page(
+        self,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[UsersPage]:
+        r"""
+        Reads one page of the users. `name` matches the username.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules.
+
+        Returns:
+            An awaitable that resolves to `UsersPage`.
+
+        Raises:
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the users gets the unauthorized code.
         """
     def create_user(
         self,
@@ -1564,11 +1646,17 @@ class IggyClient:
         r"""
         Gets stream by id.
         Returns the stream details, or `None` if the stream does not exist.
-        Raises `RuntimeError` on failure.
+        Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+        larger than the reply size limit raises `IggyError` with code 97
+        (`ReplyTooLarge`). `get_topics_page` reads the topics in pages.
         """
     def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
-        Return all streams.
+        Return all streams, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A stream that someone creates or deletes during the read can appear or
+        not appear. `get_streams_page` reads one page.
 
         Returns:
             A list of `Stream` summaries.
@@ -1576,6 +1664,44 @@ class IggyClient:
         Raises:
             RuntimeError: If the client is not authenticated, the user lacks global
                 `read_streams` or `manage_streams` permission, or the request fails.
+        """
+    def get_streams_page(
+        self,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[StreamsPage]:
+        r"""
+        Reads one page of the streams.
+
+        Pass the page's `next` as `cursor`, with the same other arguments, to
+        read the next page. The read ends at the first page whose `next` is
+        `None`. A page can be empty and still have a `next`.
+
+        Args:
+            order: `PageOrder.Id`, the default, or `PageOrder.Created`.
+            descending: Read from the last item to the first.
+            limit: Items per page, 1 to 1000. Defaults to 100.
+            cursor: The `next` of the previous page, `None` for the first page.
+            name: Keep only the items whose name holds this text, case-sensitive.
+                1 to 255 bytes.
+
+        Returns:
+            An awaitable that resolves to `StreamsPage`.
+
+        Raises:
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: If the request fails. A cursor or a query that breaks
+                the page rules raises it with the invalid command code before
+                anything is sent. The server refuses a cursor that it cannot
+                use, such as the cursor of another order, with the same code.
+                Over HTTP, a refusal from the server has code 300 (HTTP response
+                error), and its message holds the server error body. A user
+                without the permission to read the streams gets the
+                unauthorized code.
         """
     def update_stream(
         self,
@@ -1674,13 +1800,19 @@ class IggyClient:
         r"""
         Gets topic by stream and id.
         Returns the topic details, or `None` if the topic does not exist.
-        Raises `RuntimeError` on failure.
+        Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+        larger than the reply size limit raises `IggyError` with code 97
+        (`ReplyTooLarge`). `get_partitions_page` reads the partitions in pages.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[list[Topic]]:
         r"""
-        Get all topics in a stream.
+        Get all topics in a stream, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A topic that someone creates or deletes during the read can appear or
+        not appear. `get_topics_page` reads one page.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -1690,6 +1822,35 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the identifier is invalid or the request fails.
+        """
+    def get_topics_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[TopicsPage]:
+        r"""
+        Reads one page of the topics of a stream. A missing stream gives an
+        empty page without `next`.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `TopicsPage`.
+
+        Raises:
+            ValueError: If the identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topics gets the unauthorized code.
         """
     def update_topic(
         self,
@@ -1701,6 +1862,9 @@ class IggyClient:
         reset: builtins.list[OptionKey] | None = None,
         options: builtins.dict[builtins.str, builtins.str] | None = None,
         raw_reset: builtins.list[builtins.str] | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1721,19 +1885,34 @@ class IggyClient:
                 nothing either, reset `OptionKey.MaxTopicSize` to return to the
                 default.
             reset: Keys to return to their defaults as `list[OptionKey] | None`:
-                `OptionKey.MessageExpiry` or `OptionKey.MaxTopicSize`.
+                `OptionKey.MessageExpiry`, `OptionKey.MaxTopicSize`,
+                `OptionKey.LocalRetentionAge` or `OptionKey.LocalRetentionSize`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so an updatable server key can be set from this build.
                 A create-only key is refused by name.
             raw_reset: Additional reset names as `list[str] | None`, sent
                 verbatim so a key newer than this build can be reset. The
                 server decides them.
+            tiered_storage: `True` turns tiered storage on, unchanged when
+                `None`. The server refuses `False`, an update never turns it
+                off, and refuses `True` with `FeatureUnavailable` until it
+                tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, unchanged when
+                `None`. `IggyExpiry.ServerDefault()` changes nothing either,
+                reset `OptionKey.LocalRetentionAge` to return to the default.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
+                nothing either, reset `OptionKey.LocalRetentionSize` to return
+                to the default.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `local_retention_age` or `local_retention_size` is out of range.
             OptionError: A `RuntimeError` carrying the error `code` and
                 `kind` when the client or the server refuses an option.
             RuntimeError: Before anything is sent, if the update changes
@@ -1817,6 +1996,37 @@ class IggyClient:
                 `manage_streams` or `manage_topics`, per-stream `manage_stream` or
                 `manage_topics`, or per-topic `manage_topic` permission, or the
                 request fails.
+        """
+    def get_partitions_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[PartitionsPage]:
+        r"""
+        Reads one page of the partitions of a topic.
+
+        Takes the keyword arguments of `get_streams_page` except `name`,
+        because a partition has no name. The cursor rules are the same.
+        Partition ids follow creation, so `PageOrder.Created` gives the id
+        order too.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `PartitionsPage`.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topic gets the unauthorized code.
         """
     def delete_segments(
         self,
@@ -1903,7 +2113,11 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
         r"""
-        Get all consumer groups for the specified stream and topic.
+        Get all consumer groups for the specified stream and topic, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A group that someone creates or deletes during the read can appear or
+        not appear. `get_consumer_groups_page` reads one page.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -1915,6 +2129,37 @@ class IggyClient:
         Raises:
             ValueError: If an identifier is invalid.
             RuntimeError: If the request fails.
+        """
+    def get_consumer_groups_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[ConsumerGroupsPage]:
+        r"""
+        Reads one page of the consumer groups of a topic.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules. Group ids follow creation, so `PageOrder.Created` gives
+        the id order too.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `ConsumerGroupsPage`.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topic gets the unauthorized code.
         """
     def delete_consumer_group(
         self,
@@ -2174,15 +2419,17 @@ class IggyClient:
         by default. A continuation is refused, because it belongs to one partition. `options`
         sets each request, and defaults to `PollOptions(max_wait=timedelta(seconds=5))`: a
         reader without a wait polls an idle topic in a busy loop. `prefetch_bytes` (16 MiB by
-        default) and `prefetch_messages` (the larger of 16,000 and `options.count` by default)
-        bound the requests in flight and the queued batches.
+        default) and `prefetch_messages` (16,000 by default) request budgets for reads in flight
+        and queued batches. Each effective budget holds at least 32 reads at the configured
+        count and byte limit, even if a smaller budget is requested. Larger budgets allow more
+        queued batches; network requests have a separate per-consumer limit of 32.
 
         Raises `IggyError` with `InvalidCommand` (3) for partitions of a group, a
         `Consumer.Single` without partitions or a continuation as `start`,
         `FeatureUnavailable` for a consumer group over HTTP, the errors of `options`, and the
-        error of the group join. A join with an unknown outcome raises `PendingOperationError`:
-        the client keeps it, so a new `reader()` raises `lane_blocked` until
-        `resolve_operation()` or `abandon_operation()` settles it.
+        error of the group join. A join with an unknown outcome raises `PendingOperationError`
+        after `reader()` abandoned it on the client, so the next `reader()` joins again. A join
+        that landed keeps its member in the group until the session ends.
         """
     def consumer_group(
         self,
@@ -2212,8 +2459,11 @@ class IggyClient:
         the default, stores none, so commit checkpoints after processing, or each restart reads
         the same messages again. `CommitPolicy.OnRead()` makes the server store the offset of
         each reply, and `CommitPolicy.Auto(...)` makes the consumer store counted positions.
-        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (the larger of 16,000 and
-        the poll count by default) bound the requests in flight and the queued batches.
+        `prefetch_bytes` (16 MiB by default) and `prefetch_messages` (16,000 by default) request
+        budgets for reads in flight and queued batches. Each effective budget holds at least
+        32 reads at the configured poll count and byte limit, even if a smaller budget is
+        requested. Larger budgets allow more queued batches; network requests have a separate
+        per-consumer limit of 32.
         `offset_drain_timeout` controls how long shutdown waits for pending automatic offset
         stores before closing the reader. It defaults to five seconds; zero skips that wait.
         Call `shutdown()` before dropping the consumer.
@@ -2376,7 +2626,9 @@ class IggyConsumer:
         r"""
         Sets the next read position of a partition and drops the rest of its batch that the
         consumer yields from. With `CommitPolicy.OnRead()`, a seek to an offset above 0 first
-        stores the offset before it, so a restart resumes at the new position. Every other seek
+        stores the offset before it, so a restart resumes at the new position. A seek to offset 0
+        or `PollingStrategy.First()` deletes the stored offset. A seek to a timestamp stores the
+        offset before the first message at the timestamp, if there is one. Every other seek
         stores nothing. It resumes a stopped partition.
         `start` is a new strategy or a continuation of the same partition, such as
         `ReadError.skip`. After `HistoryUnavailable` (87), the partition reads nothing until
@@ -2384,9 +2636,9 @@ class IggyConsumer:
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the consumer does not
         read and for a continuation of another partition, `PendingOperationError` under
         `CommitPolicy.OnRead()` while a read of the partition has an unknown outcome
-        (abandon its operation first), the errors of the offset store with `OnRead`, and
-        `RuntimeError` while `consume_messages()` runs, also from its callback: seek after the
-        run ends.
+        (abandon its operation first), the errors of the read, lookup, store or delete with
+        `OnRead`, and `RuntimeError` while `consume_messages()` runs, also from its callback:
+        seek after the run ends.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -3721,6 +3973,24 @@ class OptionKey:
     Fingerprints of the server keys wrapping the stream's key, computed by
     the server.
     """
+    SegmentMaxAge: typing.ClassVar[OptionKey]
+    r"""
+    Topic segment age roll, fixed at creation.
+    """
+    TieredStorage: typing.ClassVar[OptionKey]
+    r"""
+    Topic tiered storage. An update only turns it on.
+    """
+    LocalRetentionAge: typing.ClassVar[OptionKey]
+    r"""
+    Time a tiered topic keeps an uploaded segment on local disk,
+    resettable to one day.
+    """
+    LocalRetentionSize: typing.ClassVar[OptionKey]
+    r"""
+    Cap on the uploaded segments a tiered topic keeps on local disk,
+    resettable to unlimited.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -3783,6 +4053,16 @@ class OptionSpec:
         the resource.
         """
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class PageOrder:
+    r"""
+    The order of a list page: `Id` by id, `Created` by creation time and then
+    by id.
+    """
+
+    Id: typing.ClassVar[PageOrder]
+    Created: typing.ClassVar[PageOrder]
 
 @typing.final
 class Partition:
@@ -3890,12 +4170,15 @@ class PartitionReader:
       while `next()` waits and then fills its budget (one fetch per primary that may wait for
       messages, the partitions with messages left behind spread over the other slots), a `seek()`
       to an offset stores the offset before it, and `close()` moves the offset back to the last
-      delivered message.
+      delivered message. A crash, or a reader dropped without `close()`, loses the batches that
+      the server stored before the application took them, up to the effective budget, which
+      holds at least 32 batches.
     - The reader stays usable after a `ReadError` and retries by itself. `HistoryUnavailable`
       (87) stops its partition until `seek()`. With `OnRead`, an unknown outcome stops its
       partition until `IggyClient.abandon_operation()` and `seek()`.
-    - The calls on one reader run one at a time, so a call waits for a pending `next()`.
-      `next()` is cancel safe: cancel it before `close()`.
+    - The calls on one reader run one at a time, so each call waits for the pending ones, and
+      `close()` waits for all of them. `next()` is cancel safe. Cancel a pending `next()` or
+      `commit()` before `close()`.
     - Dropping the reader stops its tasks without waiting, and it moves no offset back.
     - `async for` reads its batches until `close()`, and `async with` closes it on exit.
     """
@@ -3911,6 +4194,13 @@ class PartitionReader:
         Stores the offset of a checkpoint that this reader delivered, which covers every earlier
         message of its partition. A checkpoint of an older generation of its partition, or at or
         below the last commit of its generation, stores nothing.
+
+        When the offset store gets `ConsumerGroupPartitionNotOwned` (5009) for a partition that
+        the reader still has, `commit()` reads the owner of the partition again. The server can
+        refuse that read for a short time, and `commit()` repeats it after each such refusal, with
+        no time limit. To bound `commit()`, use `asyncio.wait_for()`. A cancelled `commit()` sends
+        nothing more, but a write that it already sent can still take effect. `close()` waits for
+        a pending `commit()`, so cancel it before `close()`.
 
         Raises `IggyError` with `InvalidCommand` (3) under `CommitPolicy.OnRead()` and for a
         checkpoint that this reader did not deliver, the errors of the offset store, and
@@ -3937,14 +4227,18 @@ class PartitionReader:
 
         With `CommitPolicy.OnRead()`, a seek to an offset above 0 first stores the offset before
         it, under the history of a continuation or else of the last delivered message, so a
-        restart resumes at the new position. A failed store fails the seek and nothing moves.
-        Every other seek stores nothing. The new position waits for the end of the committing
-        read in flight, whose reply the new generation drops.
+        restart resumes at the new position. A seek to offset 0 or `PollingStrategy.First()`
+        deletes the stored offset under the same history when the server holds one, because the
+        commit of a read never moves the offset back. A seek to a timestamp first reads one
+        message at the timestamp without a commit, and then acts as a seek to the offset of that
+        message. Without such a message it stores nothing. A failed read, lookup, store or delete
+        fails the seek and nothing moves. Every other seek stores nothing. The new position waits
+        for the end of the committing read in flight, whose reply the new generation drops.
 
         Raises `IggyError` with `InvalidCommand` (3) for a partition that the reader does not read
         and for a continuation of another partition, `PendingOperationError` with `OnRead` while
         a read of the partition has an unknown outcome (abandon its operation first), the errors
-        of the offset store with `OnRead`, and `RuntimeError` after `close()`.
+        of the read, lookup, store or delete with `OnRead`, and `RuntimeError` after `close()`.
         """
     def partitions(self) -> collections.abc.Awaitable[list[builtins.int]]:
         r"""
@@ -4035,9 +4329,29 @@ class Partitioning:
         """
 
 @typing.final
+class PartitionsPage:
+    r"""
+    One page of a list, as `IggyClient.get_partitions_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Partition]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
 class PendingOperationError(IggyError):
     r"""
-    An operation whose retained identity is needed to recover or release its lane.
+    An operation with an unknown outcome, or a call that such an operation blocks. `operation_id`
+    names the operation for `IggyClient.resolve_operation()` and `IggyClient.abandon_operation()`.
+    The client retains no operation for kind `not_retained`, and none for a group join that
+    `reader()` abandoned.
     """
     @property
     def operation_id(self) -> builtins.int: ...
@@ -4452,7 +4766,18 @@ class ReadError(IggyError):
     def is_lasting_refusal(self) -> builtins.bool:
         r"""
         Whether the reader stopped the partition after six refusals in a row that a retry does
-        not change, such as `Unauthorized` (41). A `seek()` of the partition reads it again.
+        not change, such as `Unauthorized` (41), or after one `TieredReadFailed` (96). A `seek()`
+        of the partition reads it again.
+        """
+    @property
+    def lost(self) -> tuple[builtins.int, builtins.int] | None:
+        r"""
+        For messages that a lost read committed and that the reader could not read again: their
+        first and last offset, as `(first, last)`. The error is then `FetchProgressUncertain`
+        (14010). `None` for every other error. This error stops nothing and needs no `seek()`.
+        A batch that the reader holds after the range comes next, and a `seek()` before the
+        application takes it drops it. If the reader stopped the partition, the error that
+        stopped it comes after that batch.
         """
     @property
     def error(self) -> IggyError:
@@ -4465,7 +4790,7 @@ class ReadError(IggyError):
         r"""
         For a message that does not decode: the continuation after it. The messages before it
         arrive in a batch before this error, and the reader reads the message again until
-        `seek()` to this continuation skips it.
+        `seek()` to this continuation skips it. `None` for every other error.
         """
     @property
     def record(self) -> bytes | None: ...
@@ -4598,6 +4923,33 @@ class SendMessagesResponse:
         topic's policy: quorum commit, plus stable storage and crash-safe retry
         receipts for persisted topics.
         """
+
+@typing.final
+class SnapshotCompression:
+    r"""
+    Compression method for server snapshots.
+    """
+
+    Stored: typing.ClassVar[SnapshotCompression]
+    r"""
+    Store the file as is without compression.
+    """
+    Deflated: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using Deflate.
+    """
+    Bzip2: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using BZIP2.
+    """
+    Zstd: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using ZStandard.
+    """
+    Xz: typing.ClassVar[SnapshotCompression]
+    r"""
+    Compress the file using XZ.
+    """
 
 @typing.final
 class Stats:
@@ -5055,6 +5407,58 @@ class StreamPermissions:
         """
 
 @typing.final
+class StreamsPage:
+    r"""
+    One page of a list, as `IggyClient.get_streams_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Stream]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
+class SystemSnapshotType:
+    r"""
+    Type of system data to include in a snapshot.
+    """
+
+    FilesystemOverview: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Overview of the filesystem.
+    """
+    ProcessList: typing.ClassVar[SystemSnapshotType]
+    r"""
+    List of currently running processes.
+    """
+    ResourceUsage: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Resource usage statistics of the system.
+    """
+    Test: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Test snapshot type for development purposes.
+    """
+    ServerLogs: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server logs.
+    """
+    ServerConfig: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Server configuration.
+    """
+    All: typing.ClassVar[SystemSnapshotType]
+    r"""
+    Everything.
+    """
+
+@typing.final
 class TcpConfig:
     r"""
     Configuration for the TCP transport, accepted by `IggyClient(...)`.
@@ -5352,14 +5756,19 @@ class TopicOptions:
         size_of_messages_required_to_save: builtins.int | None = None,
         preallocate_segments: builtins.bool | None = None,
         replication_factor: builtins.int | None = None,
+        segment_max_age: IggyExpiry | None = None,
+        tiered_storage: builtins.bool | None = None,
+        local_retention_age: IggyExpiry | None = None,
+        local_retention_size: MaxTopicSize | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
         Constructs topic create options.
 
         Every setting left as `None` resolves against the server default at
-        admission. Only `message_expiry`, `max_topic_size` and the name can
-        change after creation, through `update_topic`.
+        admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
+        `local_retention_age`, `local_retention_size` and the name can change
+        after creation, through `update_topic`.
 
         Args:
             partitions_count: Number of partitions as `int`, at most 1000.
@@ -5389,12 +5798,31 @@ class TopicOptions:
                 accepting writes while either node is down. The server rejects
                 an out-of-range value with an `OptionError` of kind
                 `invalid_replication_factor`.
+            segment_max_age: Age past a segment's first batch at which a batch
+                starts the next segment, as `IggyExpiry | None`, at least 10
+                minutes. `IggyExpiry.ServerDefault()` is the same as `None`,
+                which rolls segments by size alone. The server refuses a
+                duration together with `preallocate_segments=True`.
+            tiered_storage: Move sealed segments to the object store as
+                `bool | None`. `None` leaves it off. The server refuses `True`
+                with `FeatureUnavailable` until it tiers topics.
+            local_retention_age: How long a tiered topic keeps an uploaded
+                segment on local disk as `IggyExpiry | None`, one day when
+                `None`. `IggyExpiry.ServerDefault()` is the same as `None`.
+                The server refuses an age above a finite `message_expiry`.
+            local_retention_size: Topic-wide cap on the uploaded segments a
+                tiered topic keeps on local disk as `MaxTopicSize | None`,
+                unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
+                same as `None`. The server refuses a size above a finite
+                `max_topic_size`.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
 
         Raises:
-            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            ValueError: If `message_expiry`, `max_topic_size`,
+                `segment_max_age`, `local_retention_age` or
+                `local_retention_size` is out of range.
             RuntimeError: If `compression_algorithm` names no known algorithm.
             TypeError: If a durability is not a `Durability`.
         """
@@ -5453,6 +5881,23 @@ class TopicPermissions:
             poll_messages: Allow polling messages from the topic and managing
                 its consumer offsets.
             send_messages: Allow sending messages to the topic.
+        """
+
+@typing.final
+class TopicsPage:
+    r"""
+    One page of a list, as `IggyClient.get_topics_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Topic]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
         """
 
 @typing.final
@@ -5598,6 +6043,23 @@ class UserStatus:
     r"""
     The user account is inactive and cannot be used.
     """
+
+@typing.final
+class UsersPage:
+    r"""
+    One page of a list, as `IggyClient.get_users_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[UserInfo]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
 
 @typing.final
 class WebSocketConfig:

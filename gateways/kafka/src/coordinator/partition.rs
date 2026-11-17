@@ -39,6 +39,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::bridge::{BridgeError, CoordinatorLink, LoggedRecord};
+use crate::coordinator::CoordinationConfig;
 use crate::coordinator::record::{Body, CommittedOffset, NO_CHECKPOINT, Record, RecordError};
 use crate::coordinator::replay::{Applied, CheckpointUnit, PartitionState, TopicPartition};
 use crate::protocol::api::{
@@ -75,9 +76,10 @@ const CHECKPOINT_AGE: Duration = Duration::from_hours(24);
 /// still writes one inside the log's retention.
 const CHECKPOINT_CHECK: Duration = Duration::from_hours(1);
 
-/// How old a logged commit gets before an equal one is logged again. A consumer commits every
-/// assigned partition every 5 s, also when its position did not move, so most commits change
-/// nothing. Logging one an hour keeps the commit time that expiry reads close.
+/// How old a logged commit gets at most before an equal one is logged again. A consumer commits
+/// every assigned partition every 5 s, also when its position did not move, so most commits change
+/// nothing. Logging one an hour keeps the commit time that expiry reads close. See
+/// [`unchanged_refresh`].
 const UNCHANGED_REFRESH: Duration = Duration::from_hours(1);
 
 /// Why a served partition stopped.
@@ -177,6 +179,8 @@ pub struct PartitionLog {
     node_id: u16,
     /// Valid records after which the writer writes a checkpoint.
     checkpoint_records: u64,
+    /// How old a logged commit gets before an equal one is logged again.
+    unchanged_refresh: Duration,
     /// The message bytes of one send at most.
     max_send_bytes: u64,
     /// What the log holds, up to the last record read.
@@ -303,7 +307,7 @@ impl PartitionLog {
         link: Arc<CoordinatorLink>,
         partition: u32,
         node_id: u16,
-        checkpoint_records: u64,
+        config: CoordinationConfig,
         claimed: Claimed,
         stopped: mpsc::UnboundedSender<Stopped>,
         parent: &CancellationToken,
@@ -314,7 +318,8 @@ impl PartitionLog {
             partition,
             claim: claimed.claim,
             node_id,
-            checkpoint_records,
+            checkpoint_records: config.checkpoint_records,
+            unchanged_refresh: unchanged_refresh(config.retention()),
             max_send_bytes: link.max_send_bytes(),
             state: tokio::sync::Mutex::new(claimed.state),
             checkpoint: AtomicU64::new(checkpoint),
@@ -384,7 +389,7 @@ impl PartitionLog {
 
     /// Appends the commits of `group_id` that change what the log holds, as [`Self::append_by`].
     /// A commit equal to the logged one, of an offset with no commit in flight, writes nothing
-    /// until the logged one is [`UNCHANGED_REFRESH`] old: a load restores the same offset.
+    /// until the logged one is [`unchanged_refresh`] old: a load restores the same offset.
     ///
     /// # Errors
     ///
@@ -427,7 +432,7 @@ impl PartitionLog {
                 && logged
                     .and_then(|logged| logged.entries.get(&key.1))
                     .and_then(Option::as_ref)
-                    .is_some_and(|logged| repeats(logged, &committed));
+                    .is_some_and(|logged| repeats(logged, &committed, self.unchanged_refresh));
             if unchanged {
                 continue;
             }
@@ -984,10 +989,17 @@ impl PartitionLog {
     }
 }
 
+/// How old a logged commit gets before an equal one is logged again: [`UNCHANGED_REFRESH`], or a
+/// quarter of `retention` when that is less. Expiry reads the logged commit time, so a group
+/// that commits on never looks idle for a whole retention.
+fn unchanged_refresh(retention: Duration) -> Duration {
+    UNCHANGED_REFRESH.min(retention / 4)
+}
+
 /// Whether `committed` repeats `logged`: the same offset, epoch, metadata and topic, committed
-/// within [`UNCHANGED_REFRESH`] of it.
-fn repeats(logged: &CommittedOffset, committed: &CommittedOffset) -> bool {
-    let refresh = i64::try_from(UNCHANGED_REFRESH.as_millis()).unwrap_or(i64::MAX);
+/// within `refresh` of it.
+fn repeats(logged: &CommittedOffset, committed: &CommittedOffset, refresh: Duration) -> bool {
+    let refresh = i64::try_from(refresh.as_millis()).unwrap_or(i64::MAX);
     logged.offset == committed.offset
         && logged.leader_epoch == committed.leader_epoch
         && logged.metadata == committed.metadata
@@ -1020,6 +1032,7 @@ mod tests {
             claim: 1,
             node_id: 1,
             checkpoint_records: 10,
+            unchanged_refresh: UNCHANGED_REFRESH,
             max_send_bytes,
             state: tokio::sync::Mutex::new(PartitionState::default()),
             checkpoint: AtomicU64::new(NO_CHECKPOINT),
@@ -1160,6 +1173,19 @@ mod tests {
             .changed_commits("g", commits(&[(0, 5, 1_000 + refresh)]))
             .await;
         assert_eq!(refreshed.len(), 1, "an hour later it is logged again");
+    }
+
+    #[test]
+    fn given_a_short_retention_should_log_an_equal_commit_again_well_inside_it() {
+        assert_eq!(
+            unchanged_refresh(Duration::from_hours(24 * 7)),
+            UNCHANGED_REFRESH
+        );
+        assert_eq!(
+            unchanged_refresh(Duration::from_mins(20)),
+            Duration::from_mins(5),
+            "a group that commits on never looks idle for a whole retention"
+        );
     }
 
     /// Each chunk is built under the state's lock, which the reader and offset reads wait for, so

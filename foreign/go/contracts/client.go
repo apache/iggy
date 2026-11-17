@@ -52,9 +52,20 @@ type Client interface {
 	// Authentication is required, and the permission to read the streams.
 	GetStream(ctx context.Context, streamId Identifier) (*StreamDetails, error)
 
-	// GetStreams get the info about all the streams.
+	// GetStreams get the info about all the streams. It reads every page of
+	// the list, so the result is not one consistent read. Every page keeps the
+	// sign-in and the deadline that the call started with. If the Next of a
+	// page is the cursor that its request sent, the call fails with
+	// ierror.ErrInvalidFormat.
 	// Authentication is required, and the permission to read the streams.
 	GetStreams(ctx context.Context) ([]Stream, error)
+
+	// GetStreamsPage get one page of the streams. Send the Next of the page
+	// as the Cursor of the next query, with the same other fields, until Next
+	// is nil. A query that breaks the page rules is refused with
+	// ierror.ErrInvalidCommand before anything is sent.
+	// Authentication is required, and the permission to read the streams.
+	GetStreamsPage(ctx context.Context, query NamedPageQuery) (*Page[Stream], error)
 
 	// CreateStream create a new stream. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the streams.
@@ -78,9 +89,21 @@ type Client interface {
 	// Authentication is required, and the permission to read the topics.
 	GetTopic(ctx context.Context, streamId, topicId Identifier) (*TopicDetails, error)
 
-	// GetTopics get the info about all the topics.
+	// GetTopics get the info about all the topics. It reads every page of the
+	// list, so the result is not one consistent read. Every page keeps the
+	// sign-in and the deadline that the call started with. If the Next of a
+	// page is the cursor that its request sent, the call fails with
+	// ierror.ErrInvalidFormat.
 	// Authentication is required, and the permission to read the topics.
 	GetTopics(ctx context.Context, streamId Identifier) ([]Topic, error)
+
+	// GetTopicsPage get one page of the topics of a stream, as GetStreamsPage
+	// does for the streams. If the stream does not exist, a query without a
+	// Cursor gets an empty last page. A query with a Cursor fails with
+	// ierror.ErrStreamIdNotFound, because the stream was deleted during the
+	// walk.
+	// Authentication is required, and the permission to read the topics.
+	GetTopicsPage(ctx context.Context, streamId Identifier, query NamedPageQuery) (*Page[Topic], error)
 
 	// DescribeOptions get the option catalog for a resource scope: every key,
 	// with its kind, default and bounds, and whether an update may set or
@@ -202,6 +225,8 @@ type Client interface {
 	// StoreConsumerPosition stores a polled position under the partition context of its poll.
 	// A store that outlives an incarnation or owner change fails with ErrHistoryUnavailable or
 	// ErrConsumerGroupPartitionNotOwned instead of committing into the new incarnation.
+	// A zero context takes the context of the route, as in StoreConsumerOffset. Another context that
+	// names no incarnation takes the incarnation of the route and keeps its owner and op.
 	// Authentication is required, and the permission to poll the messages.
 	StoreConsumerPosition(
 		ctx context.Context,
@@ -222,8 +247,16 @@ type Client interface {
 	) (*ConsumerOffsetInfo, error)
 
 	// GetConsumerGroups get the info about all the consumer groups for the given stream and topic by unique IDs or names.
+	// It reads every page of the list, so the result is not one consistent read.
+	// Every page keeps the sign-in and the deadline that the call started with.
+	// If the Next of a page is the cursor that its request sent, the call fails with ierror.ErrInvalidFormat.
 	// Authentication is required, and the permission to read the streams or topics.
 	GetConsumerGroups(ctx context.Context, streamId Identifier, topicId Identifier) ([]ConsumerGroup, error)
+
+	// GetConsumerGroupsPage get one page of the consumer groups of a topic,
+	// as GetStreamsPage does for the streams.
+	// Authentication is required, and the permission to read the streams or topics.
+	GetConsumerGroupsPage(ctx context.Context, streamId, topicId Identifier, query NamedPageQuery) (*Page[ConsumerGroup], error)
 
 	// DeleteConsumerOffset delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
@@ -241,6 +274,9 @@ type Client interface {
 		partitionId *uint32,
 	) error
 
+	// DeleteConsumerPosition deletes the stored offset of position.PartitionId under the partition
+	// context of position. A zero context takes the context of the route. Another context that
+	// names no incarnation takes the incarnation of the route and keeps its owner and op.
 	DeleteConsumerPosition(ctx context.Context, consumer Consumer, streamId Identifier, topicId Identifier, position ConsumerPosition) error
 
 	// GetConsumerGroup get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.
@@ -301,6 +337,11 @@ type Client interface {
 		groupId Identifier,
 	) (*ConsumerGroupAssignment, error)
 
+	// GetPartitionsPage get one page of the partitions of a topic, as
+	// GetStreamsPage does for the streams.
+	// Authentication is required, and the permission to read the topics.
+	GetPartitionsPage(ctx context.Context, streamId, topicId Identifier, query PageQuery) (*Page[PartitionContract], error)
+
 	// CreatePartitions create new N partitions for a topic by unique ID or name.
 	// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 0 to 4).
 	// Authentication is required, and the permission to manage the partitions.
@@ -335,9 +376,18 @@ type Client interface {
 	// Authentication is required, and the permission to read the users, unless the provided user ID is the same as the authenticated user.
 	GetUser(ctx context.Context, identifier Identifier) (*UserInfoDetails, error)
 
-	// GetUsers get the info about all the users.
+	// GetUsers get the info about all the users. It reads every page of the
+	// list, so the result is not one consistent read. Every page keeps the
+	// sign-in and the deadline that the call started with. If the Next of a
+	// page is the cursor that its request sent, the call fails with
+	// ierror.ErrInvalidFormat.
 	// Authentication is required, and the permission to read the users.
 	GetUsers(ctx context.Context) ([]UserInfo, error)
+
+	// GetUsersPage get one page of the users, as GetStreamsPage does for the
+	// streams.
+	// Authentication is required, and the permission to read the users.
+	GetUsersPage(ctx context.Context, query NamedPageQuery) (*Page[UserInfo], error)
 
 	// CreateUser create a new user. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the users.

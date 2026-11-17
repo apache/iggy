@@ -32,45 +32,21 @@ alias pcs := profile-cpu-server
 alias pcc := profile-cpu-client
 alias pis := profile-io-server
 alias pic := profile-io-client
-alias ctc := clean-test-containers
-
-# Every test container is named `iggy-test-<service>[-<uuid>]` (see
-# fixtures::unique_container_name). Reuse fixtures (elasticsearch, doris) keep
-# their container running, and a crashed run can orphan any fixture's container,
-# so the recipes below reap everything matching the prefix on exit.
-reap_test_containers := "docker ps -aqf 'name=^iggy-test-' | xargs -r docker rm -f >/dev/null 2>&1 || true"
 
 build:
   cargo build
 
 test: build
-  #!/usr/bin/env bash
-  set -euo pipefail
-  trap "{{reap_test_containers}}" EXIT
   cargo test
 
 tests TEST: build
-  #!/usr/bin/env bash
-  set -euo pipefail
-  trap "{{reap_test_containers}}" EXIT
   cargo test {{TEST}}
 
 nextest: build
-  #!/usr/bin/env bash
-  set -euo pipefail
-  trap "{{reap_test_containers}}" EXIT
   cargo nextest run --retries 2
 
 nextests TEST: build
-  #!/usr/bin/env bash
-  set -euo pipefail
-  trap "{{reap_test_containers}}" EXIT
   cargo nextest run --nocapture -- {{TEST}}
-
-# Force-remove all `iggy-test-*` containers on demand. Useful after running
-# `cargo nextest run` directly (outside the recipes above).
-clean-test-containers:
-  {{reap_test_containers}}
 
 # Run Miri (UB detector) on the unsafe-heavy crates that don't pull
 # tokio/compio. Uses the same crates, flags and pinned nightly

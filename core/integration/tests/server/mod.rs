@@ -42,6 +42,7 @@ mod poll_semantics_vsr;
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
 mod stats_vsr;
+mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.
 mod topic_metrics_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
@@ -49,6 +50,8 @@ mod topic_metrics_vsr;
 pub(crate) mod http_client;
 // Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
+// Raw-HTTP page keys of the list routes.
+mod http_list_pages;
 // Raw-HTTP wire-contract residue against the server (status codes + typed error
 // bodies); the RBAC matrix lives in permissions_scenario.
 mod http_rbac;
@@ -84,6 +87,9 @@ mod consumer_offset_quota_vsr;
 mod consumer_offset_recovery;
 // A write that runs out of file descriptors flushes, then exits with status 4.
 mod descriptor_exhaustion_vsr;
+// The disk usage estimate stays within a stated bound of statvfs, and a
+// sample picks up writes the server cannot charge.
+mod disk_usage;
 mod general;
 mod partitions_limit_vsr;
 // The expired-token cleaner deletes under the reserved client id, and later

@@ -32,6 +32,9 @@ on:
       rust_runtime_plan:
         description: "Selected Rust tests and storage-compat checks, which need CI artifacts; empty when none run"
         value: ${{ jobs.detect.outputs.rust_runtime_plan }}
+      stack_base:
+        description: "Base branch commit under the stack when the top pull request tests every layer; empty otherwise"
+        value: ${{ jobs.detect.outputs.stack_base }}
       python_matrix:
         description: "Matrix for Python SDK"
         value: ${{ jobs.detect.outputs.python_matrix }}
@@ -78,6 +81,7 @@ jobs:
       third_party_licenses: ${{ github.event_name != 'pull_request' || steps.changed.outputs.third_party_licenses == 'true' }}
       rust_plan: ${{ steps.mk.outputs.rust_plan }}
       rust_runtime_plan: ${{ steps.mk.outputs.rust_runtime_plan }}
+      stack_base: ${{ steps.mk.outputs.stack_base }}
       python_matrix: ${{ steps.mk.outputs.python_matrix }}
       php_matrix: ${{ steps.mk.outputs.php_matrix }}
       node_matrix: ${{ steps.mk.outputs.node_matrix }}
@@ -117,10 +121,8 @@ jobs:
               - 'about.hbs'
               - 'scripts/ci/third-party-licenses.sh'
               - 'scripts/ci/render-node-licenses.mjs'
-              - 'scripts/ci/apt-install.sh'
               - '.github/actions/utils/validate-third-party-licenses/**'
               - '.github/actions/utils/setup-rust/**'
-              - '.github/actions/utils/free-disk-space/**'
               - '.github/workflows/_detect.yml'
               - '.github/workflows/_common.yml'
               - '.github/workflows/pre-merge.yml'
@@ -153,6 +155,39 @@ jobs:
 
             let changedFiles = [];
             try { changedFiles = JSON.parse(changedFilesJson); } catch {}
+
+            // A native stack starts this workflow for every layer. Only the lowest
+            // unmerged pull request and the top one run the full plan. The layers
+            // between them run STACK_MIDDLE_RUST_TASKS, so the top one answers for
+            // their changes and takes the diff of the whole stack.
+            // https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/optimizing-ci-for-stacked-pull-requests
+            const STACK_MIDDLE_RUST_TASKS = ['fmt', 'sort', 'machete', 'clippy'];
+            const pullRequest = context.payload.pull_request;
+            const stack = pullRequest?.stack;
+            const isLowestUnmerged = stack && stack.base.ref === pullRequest.base.ref;
+            const isTop = stack && stack.position === stack.size;
+            // "<" and not "!isTop": a payload without these numbers keeps the full plan.
+            const isStackMiddle = stack && !isLowestUnmerged && stack.position < stack.size;
+            // A stack of two has no middle layer, so its top keeps its own diff.
+            // `size` also counts merged and closed layers. The top of two open
+            // layers still takes the whole stack, which costs time only. A closed
+            // top leaves the layer below it in the middle role, so such a stack
+            // merges one pull request at a time from the bottom.
+            const testsWholeStack = isTop && !isLowestUnmerged && stack.size > 2;
+            let stackBase = '';
+            if (testsWholeStack) {
+              // The merge ref of a layer has the merge ref of the layer below as
+              // its first parent, so the default base of every later job is that
+              // layer. The merge base is the base branch commit under the lowest
+              // layer: commits that reached the base branch after the stack forked
+              // stay out. A git failure throws: a silent fallback would test the
+              // top layer only.
+              const git = (...args) => require('child_process').execFileSync('git', args,
+                { encoding: 'utf8', maxBuffer: Infinity });
+              stackBase = git('merge-base', `origin/${stack.base.ref}`, 'HEAD').trim();
+              changedFiles = git('diff', '--name-only', '--no-renames', '-z', stackBase, 'HEAD')
+                .split('\0').filter(Boolean);
+            }
             const files = changedFiles.map(p => p.replace(/\\/g, '/'));
 
             const escapeRe = s => s.replace(/([.+^${}()|[\]\\])/g, '\\$1');
@@ -343,40 +378,6 @@ jobs:
               });
             }
 
-            // On master push, run everything
-            if (context.eventName === 'push' && context.ref === 'refs/heads/master') {
-              // Clear existing groups to avoid duplicates - we'll run everything anyway
-              groups.rust = [];
-              groups.python = [];
-              groups.php = [];
-              groups.node = [];
-              groups.go = [];
-              groups.java = [];
-              groups.csharp = [];
-              groups.cpp = [];
-              groups.swift = [];
-              groups.bdd = [];
-              groups.examples = [];
-              groups.other = [];
-
-              for (const [name, cfg] of Object.entries(components)) {
-                if (!cfg.tasks || cfg.tasks.length === 0) continue;
-                const entries = cfg.tasks.map(task => ({ component: name, task }));
-                if (name === 'rust' || name.startsWith('rust-')) groups.rust.push(...entries);
-                else if (name === 'sdk-python') groups.python.push(...entries);
-                else if (name === 'sdk-php') groups.php.push(...entries);
-                else if (name === 'sdk-node') groups.node.push(...entries);
-                else if (name === 'sdk-go') groups.go.push(...entries);
-                else if (name === 'sdk-java') groups.java.push(...entries);
-                else if (name === 'sdk-csharp') groups.csharp.push(...entries);
-                else if (name === 'sdk-cpp') groups.cpp.push(...entries);
-                else if (name === 'sdk-swift') groups.swift.push(...entries);
-                else if (name.startsWith('bdd-')) groups.bdd.push(...entries);
-                else if (name.startsWith('examples-')) groups.examples.push(...entries);
-                else groups.other.push(...entries);
-              }
-            }
-
             // Deduplicate entries in each group (in case of any edge cases)
             const dedupeGroup = (group) => {
               const seen = new Set();
@@ -392,6 +393,18 @@ jobs:
             Object.keys(groups).forEach(key => {
               groups[key] = dedupeGroup(groups[key]);
             });
+
+            if (isStackMiddle) {
+              for (const group of Object.keys(groups)) {
+                groups[group] = group === 'rust'
+                  ? groups[group].filter(({task}) => STACK_MIDDLE_RUST_TASKS.includes(task))
+                  : [];
+              }
+              console.log(`::notice title=Stack ${stack.number}::Pull request ${stack.position} of ${stack.size} runs lint only. ` +
+                'Tests run on the lowest unmerged pull request and on the top one. Merge the lowest one alone or the whole stack.');
+            } else if (testsWholeStack) {
+              console.log(`::notice title=Stack ${stack.number}::The top pull request tests the changes of every unmerged layer.`);
+            }
 
             const matrix = a => a.length ? { include: a } : { include: [{ component: 'noop', task: 'noop' }] };
 
@@ -419,7 +432,7 @@ jobs:
                 const uniqueTasks = [...new Set(tasks.map(t => t.task))];
                 console.log(`  ✓ ${name}: ${uniqueTasks.join(', ')}`);
               } else {
-                console.log(`  ✗ ${name}: SKIPPED (no changes detected)`);
+                console.log(`  ✗ ${name}: SKIPPED (${isStackMiddle ? 'middle layer of a stack' : 'no changes detected'})`);
               }
             });
 
@@ -451,6 +464,7 @@ jobs:
               checks: rustRuntime.filter(entry => entry.task !== 'test'),
               tests: rustRuntime.some(entry => entry.task === 'test'),
             }) : '');
+            setOutput('stack_base', stackBase);
             setOutput('python_matrix', JSON.stringify(matrix(groups.python)));
             setOutput('php_matrix', JSON.stringify(matrix(groups.php)));
             setOutput('node_matrix', JSON.stringify(matrix(groups.node)));
