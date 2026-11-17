@@ -23,11 +23,19 @@
 //! partitions between them, and the object keeps the number of the shard
 //! that wrote it.
 //!
+//! The first shard starts a sweep from its pump's tick, every
+//! [`FRESH_SWEEP_INTERVAL`] for as long as it has a sweeper. A sweep that
+//! left work it could have done starts the next one at once: objects that
+//! are due after it deleted some, or a listing that stopped at its share of
+//! keys after it found or deleted something.
+//!
 //! A sweep lists the objects, and then asks every shard which objects its
 //! partitions name above their long-term floors or a send still waits on.
 //! Each shard reads that after the listing ended, so an object the listing
 //! holds and no answer names was already unnamed when it was listed. Such
-//! an object is deleted once the sweeps found it so for a grace period.
+//! an object is deleted once the sweeps found it so for a grace period. The
+//! sweep deletes all that are due, one delete job after another, and each
+//! job's result passes through the pump's inbox before the next starts.
 //!
 //! A shard answers that it cannot tell while one of its placing partitions
 //! is not in normal status, such as during a view change or a state
@@ -45,16 +53,25 @@ use iggy_object_store::TierScope;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use partitions::{
-    FRESH_OBJECT_GRACE, FreshDeleteOutcome, FreshListOutcome, FreshListing, FreshObjectSweeper,
-    FreshSweep,
+    FRESH_DELETES_PER_BATCH, FRESH_OBJECT_GRACE, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome,
+    FreshListOutcome, FreshListing, FreshObjectSweeper, FreshSweep,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-/// Timer ticks a sweep may wait for the answers of the shards before the
-/// next one replaces it.
+/// How often the first shard starts a sweep.
+///
+/// A tenth of the grace period, so an object goes that much later than its
+/// grace at most. Every sweep makes each shard read its placed batches
+/// above the long-term floor and costs one listing call per shard, so a
+/// shorter interval buys little: a sweep that left work starts the next one
+/// at once.
+pub const FRESH_SWEEP_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Sweep starts that a sweep may wait through for the answers of the shards
+/// before the next one replaces it.
 const SWEEP_TICKS_MAX: u32 = 8;
 
 /// What the task listing the fresh objects hands back to the pump.
@@ -90,11 +107,31 @@ struct Sweep {
     ticks: u32,
 }
 
+/// A sweep after the last shard's answer, while it deletes.
+struct Deleting {
+    /// The objects that are due and in no delete job yet.
+    due: VecDeque<u128>,
+    /// Objects of this sweep that a delete job left in the store.
+    failed: usize,
+    deleted: usize,
+    /// Scopes whose listing did not reach their last key.
+    truncated: usize,
+    /// Objects this sweep first found unnamed.
+    found_unnamed: usize,
+}
+
 /// What the first shard keeps for the sweep of fresh objects.
 pub struct FreshSweeps {
     sweeper: RefCell<Option<Rc<dyn FreshObjectSweeper>>>,
     state: RefCell<FreshSweep>,
     sweep: RefCell<Option<Sweep>>,
+    /// Boxed, as the shard is held by value in the futures of its tests.
+    deleting: RefCell<Option<Box<Deleting>>>,
+    interval_micros: Cell<u64>,
+    keys_per_sweep: Cell<usize>,
+    /// When the tick starts the next sweep, on the bus's monotonic clock.
+    /// `None` until the first tick with a sweeper.
+    next_sweep_at: Cell<Option<u64>>,
     sweeps: Cell<u64>,
     /// Sweeps that took the answer of every shard.
     settled: Cell<u64>,
@@ -112,6 +149,10 @@ impl Default for FreshSweeps {
             sweeper: RefCell::new(None),
             state: RefCell::default(),
             sweep: RefCell::new(None),
+            deleting: RefCell::new(None),
+            interval_micros: Cell::new(micros(FRESH_SWEEP_INTERVAL)),
+            keys_per_sweep: Cell::new(FRESH_OBJECTS_PER_SWEEP),
+            next_sweep_at: Cell::new(None),
             sweeps: Cell::new(0),
             settled: Cell::new(0),
             running: Rc::default(),
@@ -147,9 +188,18 @@ where
         self.fresh_sweeps.settled.get()
     }
 
-    /// Stage a sweep of the replica's fresh objects on this shard's pump.
-    /// Only the first shard sweeps, so any other stages nothing. A refused
-    /// frame is picked up by the timer's next tick.
+    /// Set how often this shard starts a sweep, and how many keys the
+    /// listings of one sweep take together.
+    pub fn set_fresh_sweep_pace(&self, interval: Duration, keys_per_sweep: usize) {
+        self.fresh_sweeps.interval_micros.set(micros(interval));
+        self.fresh_sweeps.keys_per_sweep.set(keys_per_sweep);
+        self.fresh_sweeps.next_sweep_at.set(None);
+    }
+
+    /// Stage a sweep of the replica's fresh objects on this shard's pump,
+    /// apart from the ones its tick starts. Only the first shard sweeps, so
+    /// any other stages nothing, and a sweep staged while one runs is
+    /// dropped.
     pub fn request_sweep_fresh_objects(&self, now: IggyTimestamp) {
         if self.id != 0 {
             return;
@@ -162,6 +212,26 @@ where
         }));
     }
 
+    /// The pump's tick: start a sweep when one is due. The first sweep is
+    /// due one interval after the shard got its sweeper.
+    pub(crate) fn tick_fresh_sweeps(&self) {
+        let sweeps = &self.fresh_sweeps;
+        if self.id != 0 || sweeps.sweeper.borrow().is_none() {
+            return;
+        }
+        let now = self.bus.monotonic_micros();
+        let next = now.saturating_add(sweeps.interval_micros.get());
+        let Some(due_at) = sweeps.next_sweep_at.get() else {
+            sweeps.next_sweep_at.set(Some(next));
+            return;
+        };
+        if now < due_at {
+            return;
+        }
+        sweeps.next_sweep_at.set(Some(next));
+        self.on_sweep_fresh_objects(IggyTimestamp::from(self.bus.realtime_micros()));
+    }
+
     pub(crate) fn on_sweep_fresh_objects(&self, now: IggyTimestamp) {
         let sweeps = &self.fresh_sweeps;
         let Some(sweeper) = sweeps.sweeper.borrow().clone() else {
@@ -170,6 +240,9 @@ where
         if self.id != 0 || sweeps.running.get() {
             return;
         }
+        // No job runs, so the frame of a delete was refused. What that sweep
+        // left is due again in this one.
+        *sweeps.deleting.borrow_mut() = None;
         {
             let mut sweep = sweeps.sweep.borrow_mut();
             if let Some(waiting) = sweep.as_mut() {
@@ -193,13 +266,18 @@ where
         };
         let sweep = sweeps.sweeps.get();
         let replica = self.partition_consensus.self_replica_id;
+        let shards = u16::try_from(self.senders.len()).unwrap_or(u16::MAX);
+        let requests = sweeps
+            .state
+            .borrow()
+            .plan(shards, sweeps.keys_per_sweep.get());
         let scope = sweeps.scope.token();
         let running = Rc::clone(&sweeps.running);
         running.set(true);
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
         self.bus.spawn(async move {
-            let outcome = sweeper.list(replica, scope).await;
+            let outcome = sweeper.list(replica, requests, scope).await;
             running.set(false);
             let finished = Box::new(FinishedFreshListing { sweep, outcome });
             let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::FreshObjectsListed(
@@ -216,30 +294,18 @@ where
         let Some(sweep) = slot.as_mut().filter(|sweep| sweep.id == finished.sweep) else {
             return;
         };
-        let listing = match finished.outcome {
-            Ok(Ok(listing)) => listing,
-            Ok(Err(error)) => {
-                tracing::warn!(shard = self.id, %error, "listing the fresh objects failed");
-                *slot = None;
-                return;
-            }
-            Err(_) => {
-                *slot = None;
-                return;
-            }
+        let Ok(listing) = finished.outcome else {
+            *slot = None;
+            return;
         };
-        if listing.objects.is_empty() {
+        if listing.scopes.iter().all(|scope| scope.objects.is_empty())
+            && sweeps.state.borrow().is_empty()
+        {
             // Nothing to ask the shards about.
             let now = sweep.now;
             *slot = None;
             drop(slot);
-            sweeps
-                .state
-                .borrow_mut()
-                .settle(&listing, &BTreeSet::new(), now, FRESH_OBJECT_GRACE);
-            self.metrics
-                .set_fresh_objects(0, 0, std::time::Duration::ZERO, 0);
-            sweeps.settled.set(sweeps.settled.get() + 1);
+            self.settle_fresh_sweep(&listing, &BTreeSet::new(), now);
             return;
         }
         sweep.listing = Some(listing);
@@ -267,20 +333,23 @@ where
         // journal by then or names nothing.
         let awaited = self.fresh_writes.awaited_objects();
         let partitions = self.plane.partitions();
+        let placing: Vec<_> = partitions
+            .namespaces()
+            .filter_map(|namespace| partitions.get_by_ns(namespace))
+            .filter(|partition| partition.places_batches())
+            .collect();
+        // Asked of every partition before any read is planned: one that is
+        // not normal makes all the plans useless.
+        let certain = placing
+            .iter()
+            .all(|partition| partition.consensus().is_normal());
         let mut reads = Vec::new();
-        let mut certain = true;
-        for namespace in partitions.namespaces() {
-            let Some(partition) = partitions.get_by_ns(namespace) else {
-                continue;
-            };
-            let Some(read) = partition.fresh_objects_in_use() else {
-                continue;
-            };
-            if !partition.consensus().is_normal() {
-                certain = false;
-                break;
-            }
-            reads.push(read);
+        if certain {
+            reads.extend(
+                placing
+                    .iter()
+                    .filter_map(|partition| partition.fresh_objects_in_use()),
+            );
         }
         self.bus.spawn(async move {
             let mut in_use = certain.then_some(awaited);
@@ -335,35 +404,70 @@ where
             return;
         };
         let in_use: BTreeSet<u128> = sweep.reports.into_iter().flatten().flatten().collect();
-        let (due, unnamed) = {
+        self.settle_fresh_sweep(&listing, &in_use, sweep.now);
+    }
+
+    /// Take a sweep into the state the sweeps keep, and start deleting what
+    /// is due.
+    fn settle_fresh_sweep(
+        &self,
+        listing: &FreshListing,
+        in_use: &BTreeSet<u128>,
+        now: IggyTimestamp,
+    ) {
+        let sweeps = &self.fresh_sweeps;
+        let (settled, unnamed) = {
             let mut state = sweeps.state.borrow_mut();
-            let due = state.settle(&listing, &in_use, sweep.now, FRESH_OBJECT_GRACE);
-            (due, state.len())
+            let settled = state.settle(listing, in_use, now, FRESH_OBJECT_GRACE);
+            (settled, state.len())
         };
         let oldest = listing
             .oldest
             .and_then(|oldest| SystemTime::now().duration_since(oldest).ok())
             .unwrap_or_default();
         self.metrics
-            .set_fresh_objects(listing.objects.len(), listing.bytes, oldest, unnamed);
+            .set_fresh_objects(listing.objects().len(), listing.bytes, oldest, unnamed);
         sweeps.settled.set(sweeps.settled.get() + 1);
-        if due.is_empty() || sweeps.running.get() {
+        *sweeps.deleting.borrow_mut() = Some(Box::new(Deleting {
+            due: settled.due.into(),
+            failed: 0,
+            deleted: 0,
+            truncated: listing.truncated(),
+            found_unnamed: settled.found_unnamed,
+        }));
+        self.delete_due_fresh_objects();
+    }
+
+    /// Start the next delete job of the sweep, or end the sweep when nothing
+    /// is left for one.
+    fn delete_due_fresh_objects(&self) {
+        let sweeps = &self.fresh_sweeps;
+        let batch: Vec<u128> = {
+            let mut deleting = sweeps.deleting.borrow_mut();
+            let Some(deleting) = deleting.as_mut() else {
+                return;
+            };
+            let batch = deleting.due.len().min(FRESH_DELETES_PER_BATCH);
+            deleting.due.drain(..batch).collect()
+        };
+        let sweeper = sweeps.sweeper.borrow().clone();
+        let sender = self.senders.get(self.id as usize).cloned();
+        let (Some(sweeper), Some(sender)) = (sweeper, sender) else {
+            self.end_fresh_sweep(batch.len());
+            return;
+        };
+        if batch.is_empty() || sweeps.running.get() {
+            self.end_fresh_sweep(batch.len());
             return;
         }
-        let Some(sweeper) = sweeps.sweeper.borrow().clone() else {
-            return;
-        };
-        let Some(sender) = self.senders.get(self.id as usize).cloned() else {
-            return;
-        };
         let scope = sweeps.scope.token();
         let running = Rc::clone(&sweeps.running);
         running.set(true);
         self.bus.spawn(async move {
-            let outcome = sweeper.delete(due.clone(), scope).await;
+            let outcome = sweeper.delete(batch.clone(), scope).await;
             running.set(false);
             let finished = Box::new(FinishedFreshDelete {
-                objects: due,
+                objects: batch,
                 outcome,
             });
             let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::FreshObjectsDeleted(
@@ -372,25 +476,63 @@ where
         });
     }
 
-    /// Forget the objects a delete removed. One that is still there is found
-    /// by the next sweep, as is one whose result never arrived.
+    /// Forget the objects a delete removed, and go on with the next job of
+    /// the sweep. One that is still there is found by the next sweep, as is
+    /// one whose result never arrived.
     pub(crate) fn on_fresh_objects_deleted(&self, finished: FinishedFreshDelete) {
-        let Ok(failed) = finished.outcome else {
-            return;
+        let sweeps = &self.fresh_sweeps;
+        let sent = finished.objects.len();
+        let deleted: Vec<u128> = match &finished.outcome {
+            Ok(failed) => finished
+                .objects
+                .into_iter()
+                .filter(|object| !failed.contains(object))
+                .collect(),
+            Err(_) => Vec::new(),
         };
-        let deleted: Vec<u128> = finished
-            .objects
-            .into_iter()
-            .filter(|object| !failed.contains(object))
-            .collect();
-        if !failed.is_empty() {
+        if deleted.len() < sent {
             tracing::warn!(
                 shard = self.id,
-                failed = failed.len(),
+                failed = sent - deleted.len(),
                 "some fresh objects were not deleted; the next sweep sends them again"
             );
         }
-        self.fresh_sweeps.state.borrow_mut().forget(&deleted);
+        sweeps.state.borrow_mut().forget(&deleted);
         self.metrics.record_fresh_objects_deleted(deleted.len());
+        if let Some(deleting) = sweeps.deleting.borrow_mut().as_mut() {
+            deleting.deleted += deleted.len();
+            deleting.failed += sent - deleted.len();
+        }
+        if deleted.is_empty() {
+            // A store that deleted nothing of a whole job is not asked for
+            // the next one.
+            self.end_fresh_sweep(0);
+        } else {
+            self.delete_due_fresh_objects();
+        }
     }
+
+    /// The sweep is over: `unsent` objects of a job that did not start are
+    /// still due, with the ones no job took and the ones a job left.
+    fn end_fresh_sweep(&self, unsent: usize) {
+        let sweeps = &self.fresh_sweeps;
+        let Some(deleting) = sweeps.deleting.borrow_mut().take() else {
+            return;
+        };
+        let due = deleting.due.len() + deleting.failed + unsent;
+        self.metrics
+            .set_fresh_sweep_backlog(deleting.truncated, due);
+        // Only a sweep that got something done is followed at once, so a
+        // store that refuses deletes is not asked without a pause.
+        let more_to_delete = due > 0 && deleting.deleted > 0;
+        let more_to_list =
+            deleting.truncated > 0 && (deleting.found_unnamed > 0 || deleting.deleted > 0);
+        if more_to_delete || more_to_list {
+            sweeps.next_sweep_at.set(Some(0));
+        }
+    }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
