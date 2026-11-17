@@ -1114,6 +1114,7 @@ version = "0.1.0"
 dependencies = [
  "bench-report",
  "blake3",
+ "charming",
  "chrono",
  "human-repr",
  "semver",
@@ -5703,6 +5704,7 @@ dependencies = [
  "actix-web",
  "bench-dashboard-shared",
  "bench-report",
+ "blake3",
  "charming",
  "chrono",
  "clap",
@@ -9921,6 +9923,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "twox-hash",
+ "whichever",
 ]
 
 [[package]]
