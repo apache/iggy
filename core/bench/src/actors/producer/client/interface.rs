@@ -17,7 +17,7 @@
 
 use crate::{
     actors::{ApiLabel, BatchMetrics, BenchmarkInit},
-    utils::batch_generator::BenchmarkBatchGenerator,
+    utils::{batch_generator::BenchmarkBatchGenerator, warmup::BenchmarkWarmup},
 };
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use iggy::prelude::*;
@@ -29,7 +29,7 @@ pub struct BenchmarkProducerConfig {
     pub partitions: u32,
     pub messages_per_batch: BenchmarkNumericParameter,
     pub message_size: BenchmarkNumericParameter,
-    pub warmup_time: IggyDuration,
+    pub warmup: BenchmarkWarmup,
     pub pretty: bool,
 }
 
