@@ -1837,9 +1837,11 @@ async fn given_a_replica_that_lost_primacy_when_a_placed_request_arrives_should_
     let config = repair_config();
     let (_directory, mut partition) = Box::pin(placing_partition()).await;
     let placed = placed_client_request(&partition, 1, 2);
+    assert!(partition.takes_placed_sends() && partition.has_request_room());
     let view = partition.consensus.view() + 1;
     partition.consensus.set_view(view);
     assert!(!partition.consensus.is_primary());
+    assert!(!partition.takes_placed_sends());
 
     Box::pin(partition.on_placed_request(placed, None)).await;
     Box::pin(settle_partition_io(&mut partition, &config)).await;

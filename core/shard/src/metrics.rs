@@ -405,6 +405,16 @@ pub struct ShardMetrics {
     fresh_uploads_total: Counter,
     fresh_upload_failures_total: Counter,
     fresh_upload_bytes_total: Counter,
+    /// Attempts at storing a fresh object after one that failed.
+    fresh_upload_retries_total: Counter,
+    /// Sends to partitions that place their batches that this shard answered
+    /// as not accepted, before or after it stored their messages.
+    fresh_sends_denied_total: Counter,
+    /// Fresh objects whose upload holds one of the shard's upload slots.
+    fresh_uploads_in_flight: Gauge,
+    /// Sends whose messages this shard holds or stored and whose request
+    /// has not reached its partition.
+    fresh_staged_sends: Gauge,
     /// The three parts of a send to a partition that places its batches:
     /// the wait of its upload window, the upload of its fresh object, and
     /// the commit of where its messages sit.
@@ -425,6 +435,7 @@ impl ShardMetrics {
     /// virtue of being constructed once per shard; the shard id does not
     /// appear in the label set (see [`FrameDropLabel`] doc).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn for_shard() -> Self {
         let frame_drops_total: Family<FrameDropLabel, Counter> = Family::default();
         let cached_counters = Arc::new(std::array::from_fn(|_| {
@@ -521,9 +532,13 @@ impl ShardMetrics {
             fresh_uploads_total: Counter::default(),
             fresh_upload_failures_total: Counter::default(),
             fresh_upload_bytes_total: Counter::default(),
-            fresh_window_wait: latency_histogram(),
-            fresh_upload: latency_histogram(),
-            fresh_commit: latency_histogram(),
+            fresh_upload_retries_total: Counter::default(),
+            fresh_sends_denied_total: Counter::default(),
+            fresh_uploads_in_flight: Gauge::default(),
+            fresh_staged_sends: Gauge::default(),
+            fresh_window_wait: fresh_latency_histogram(),
+            fresh_upload: fresh_latency_histogram(),
+            fresh_commit: fresh_latency_histogram(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
         }
@@ -544,7 +559,7 @@ impl ShardMetrics {
         self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
     }
 
-    /// An upload window closed after `wait`, counted from its first send.
+    /// An upload window started its upload `wait` after its first send.
     pub(crate) fn record_fresh_window_wait(&self, wait: Duration) {
         self.fresh_window_wait.observe(wait.as_secs_f64());
     }
@@ -561,6 +576,26 @@ impl ShardMetrics {
         }
     }
 
+    /// An attempt at storing a fresh object failed, and another follows.
+    pub(crate) fn record_fresh_upload_retry(&self) {
+        self.fresh_upload_retries_total.inc();
+    }
+
+    /// A send to a partition that places its batches was answered as not
+    /// accepted.
+    pub(crate) fn record_fresh_send_denied(&self) {
+        self.fresh_sends_denied_total.inc();
+    }
+
+    /// The shard has `in_flight` uploads of fresh objects and holds `staged`
+    /// sends for them.
+    pub(crate) fn set_fresh_load(&self, in_flight: usize, staged: usize) {
+        self.fresh_uploads_in_flight
+            .set(i64::try_from(in_flight).unwrap_or(i64::MAX));
+        self.fresh_staged_sends
+            .set(i64::try_from(staged).unwrap_or(i64::MAX));
+    }
+
     /// The histogram of the time from a stored object to the answer of each
     /// send in it, for the task that waits for the answer.
     pub(crate) fn fresh_commit_latency(&self) -> Histogram {
@@ -575,6 +610,19 @@ impl ShardMetrics {
             self.fresh_uploads_total.get(),
             self.fresh_upload_failures_total.get(),
             self.fresh_upload_bytes_total.get(),
+        )
+    }
+
+    /// Test-only read: upload retries, denied sends, uploads in flight and
+    /// staged sends.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_load_value(&self) -> (u64, u64, i64, i64) {
+        (
+            self.fresh_upload_retries_total.get(),
+            self.fresh_sends_denied_total.get(),
+            self.fresh_uploads_in_flight.get(),
+            self.fresh_staged_sends.get(),
         )
     }
 
@@ -1570,6 +1618,28 @@ impl ShardMetrics {
             self.fresh_upload_bytes_total.clone(),
         );
         registry.register(
+            "fresh_upload_retries",
+            "attempts at storing a fresh object after an attempt that failed",
+            self.fresh_upload_retries_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied",
+            "sends to partitions that place their batches that this shard answered as not \
+             accepted",
+            self.fresh_sends_denied_total.clone(),
+        );
+        registry.register(
+            "fresh_uploads_in_flight",
+            "fresh objects whose upload holds one of the shard's upload slots",
+            self.fresh_uploads_in_flight.clone(),
+        );
+        registry.register(
+            "fresh_staged_sends",
+            "sends whose messages this shard holds or stored and whose request has not \
+             reached its partition",
+            self.fresh_staged_sends.clone(),
+        );
+        registry.register(
             "fresh_window_wait_seconds",
             "how long an upload window stayed open after its first send",
             self.fresh_window_wait.clone(),
@@ -1713,6 +1783,18 @@ fn latency_histogram() -> Histogram {
         LATENCY_BUCKET_FACTOR,
         LATENCY_BUCKET_COUNT,
     ))
+}
+
+/// Buckets for the parts of a send that goes to the object store first, which
+/// take from 1 ms to a few hundred: every millisecond up to 5 ms, every 5 ms
+/// up to 100 ms, every 10 ms up to 200 ms, and from there half as much again
+/// per bucket up to about a minute.
+fn fresh_latency_histogram() -> Histogram {
+    let millis = (1..=5_u32)
+        .chain((10..=100).step_by(5))
+        .chain((110..=200).step_by(10))
+        .map(|millis| f64::from(millis) / 1_000.0);
+    Histogram::new(millis.chain(exponential_buckets(0.3, 1.5, 14)))
 }
 
 /// The `command` of a request whose code the command table does not hold.

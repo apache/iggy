@@ -47,6 +47,9 @@ pub enum TierJobClass {
     DemandFetch,
     /// The upload of a sealed segment.
     Upload,
+    /// The upload of a fresh object, which producers wait for. It has slots
+    /// of its own, so it never waits behind an [`Self::Upload`].
+    FreshUpload,
     /// Readahead and chunk hydration that no poll waits for yet.
     SpeculativeFetch,
     /// Object deletes, on their own quota so that deletion keeps pace with
@@ -58,9 +61,10 @@ pub enum TierJobClass {
 }
 
 impl TierJobClass {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::DemandFetch,
         Self::Upload,
+        Self::FreshUpload,
         Self::SpeculativeFetch,
         Self::Delete,
         Self::Housekeeping,
@@ -244,6 +248,8 @@ impl TierJobRequest {
     /// - An upload streams its segment and holds only a few pieces at once.
     ///   Its bytes are the length of the segment, and the cap bounds the
     ///   bytes in flight to the store.
+    /// - The upload of a fresh object holds the whole object in memory. Its
+    ///   bytes are the length of the object.
     /// - Deletes and housekeeping count only jobs, and keep 0 bytes.
     ///
     /// A job with more bytes than the cap of its class runs alone, once no

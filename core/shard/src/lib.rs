@@ -24,7 +24,8 @@ mod partition_io;
 pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
 mod fresh_writes;
 pub use fresh_writes::{
-    FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_WINDOW, FinishedFreshUpload, PlacedSend,
+    FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL, FRESH_UPLOADS,
+    FinishedFreshUpload,
 };
 mod long_term_rewrites;
 mod manifest_publishes;
@@ -1251,8 +1252,8 @@ pub enum LifecycleFrame {
     /// The result of a publish that a [`Self::PublishManifest`] pass started,
     /// sent by the task that ran it.
     ManifestPublishFinished(Box<FinishedManifestPublish>),
-    /// The result of the upload of a fresh object, sent by the task that ran
-    /// it, with the sends that wait for the object.
+    /// The result of an attempt at the upload of a fresh object, sent by the
+    /// task that ran it.
     FreshUploadFinished(Box<FinishedFreshUpload>),
     /// Per-shard pass over a partition that places its batches: rewrite its
     /// committed batches above the long-term floor into a segment, when this

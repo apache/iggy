@@ -7915,6 +7915,38 @@ where
         self.release_send_space();
     }
 
+    /// Whether this replica answers every client request as not accepted for
+    /// now: it is not a primary in normal status, or it is on its way out.
+    fn refuses_requests(&self) -> bool {
+        let consensus = self.consensus();
+        self.fatal.is_some()
+            || self.maintenance.shutdown.is_some()
+            || self.io_active.is_retiring()
+            || self.transition.is_some()
+            || self.materialization_missing
+            || consensus.is_follower()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+    }
+
+    /// Whether a send may go to the object store for this partition now: the
+    /// partition places its batches, and this replica would not refuse the
+    /// request that commits where they sit. The node's upload path asks
+    /// before it stores a send's messages, and again before it hands the
+    /// request over.
+    #[must_use]
+    pub fn takes_placed_sends(&self) -> bool {
+        self.places_batches() && !self.refuses_requests()
+    }
+
+    /// Whether [`Self::on_placed_request`] has room for one more request. A
+    /// request handed over without room is answered as not accepted.
+    #[must_use]
+    pub fn has_request_room(&self) -> bool {
+        self.consensus()
+            .with_pipeline(|pipeline| !pipeline.request_queue_full())
+    }
+
     /// Whether `message` is a request [`Self::on_placed_request`] takes: a
     /// `SendMessages` whose body is one placed batch for this partition.
     fn is_placed_request(&self, message: &Message<RoutedRequestHeader>) -> bool {
@@ -8028,16 +8060,7 @@ where
                 .await;
                 return;
             }
-            if self.fatal.is_some()
-                || self.maintenance.shutdown.is_some()
-                || self.io_active.is_retiring()
-                || self.transition.is_some()
-                || self.materialization_missing
-                || consensus.is_follower()
-                || !consensus.is_normal()
-                || consensus.is_transferring()
-                || committed_history_pending
-            {
+            if self.refuses_requests() || committed_history_pending {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
