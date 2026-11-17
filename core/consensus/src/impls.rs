@@ -6368,9 +6368,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Enqueue a self-ack for the next owner service round.
+    ///
+    /// The queue holds one self-ack per pipeline slot. A primary that held its
+    /// acks, as for its first superblock write, can release them after its
+    /// backups committed the ops, more at once than the queue holds. `on_ack`
+    /// ignores a self-ack whose prepare left the pipeline, so a full queue
+    /// drops those.
     pub(crate) fn push_loopback(&self, message: Message<GenericHeader>) {
         let notify = {
             let mut queue = self.loopback_queue.borrow_mut();
+            if queue.len() >= self.prepare_queue_max {
+                queue.retain(|queued| self.pipeline_needs_self_ack(queued));
+                if !self.pipeline_needs_self_ack(&message) {
+                    return;
+                }
+            }
             assert!(
                 queue.len() < self.prepare_queue_max,
                 "loopback queue overflow: {} items",
@@ -6390,13 +6402,27 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Whether the undrained loopback already carries this replica's `PrepareOk` for `op`.
     fn loopback_holds_prepare_ok(&self, op: u64) -> bool {
-        self.loopback_queue.borrow().iter().any(|message| {
-            message.header().command == Command::PrepareOk
-                && bytemuck::checked::try_from_bytes::<PrepareOkHeader>(
-                    &message.as_slice()[..size_of::<PrepareOkHeader>()],
-                )
-                .is_ok_and(|header| header.op == op)
-        })
+        self.loopback_queue
+            .borrow()
+            .iter()
+            .filter_map(Self::queued_prepare_ok)
+            .any(|header| header.op == op)
+    }
+
+    /// Whether `on_ack` would still count `message`: the pipeline holds its prepare.
+    fn pipeline_needs_self_ack(&self, message: &Message<GenericHeader>) -> bool {
+        Self::queued_prepare_ok(message)
+            .is_none_or(|header| self.pipeline_holds_entry(header.op, header.prepare_checksum))
+    }
+
+    fn queued_prepare_ok(message: &Message<GenericHeader>) -> Option<&PrepareOkHeader> {
+        if message.header().command != Command::PrepareOk {
+            return None;
+        }
+        bytemuck::checked::try_from_bytes::<PrepareOkHeader>(
+            &message.as_slice()[..size_of::<PrepareOkHeader>()],
+        )
+        .ok()
     }
 
     /// Drain all pending loopback messages into `buf`, leaving the queue empty.

@@ -220,6 +220,88 @@ async fn given_a_self_ack_queued_in_loopback_when_the_prepare_timeout_keeps_firi
     );
 }
 
+/// A group born above view 0 has no durable view, so its primary holds every
+/// self-ack until its first superblock write lands, while its two backups
+/// commit the ops. The write then releases the held acks in one pass.
+#[compio::test]
+async fn given_backups_that_commit_while_the_first_superblock_write_waits_when_it_lands_should_commit_the_held_op()
+ {
+    const PRIMARY: u8 = 1;
+    let directory = tempfile::tempdir().unwrap();
+    let config = repair_config();
+    let (mut partition, _replies) = recording_partition_at(PRIMARY, 3);
+    partition.consensus.restore_view(consensus::ViewRestore {
+        durable_view: None,
+        view_fallback: None,
+        seed_view: Some(u32::from(PRIMARY)),
+    });
+    partition.consensus.join(consensus::JoinMode::Init);
+    partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+    partition.runtime_options.durability = iggy_common::Durability::Replicated;
+    partition.open_persistence().await.unwrap();
+    let store = Rc::new(PingPongSuperblock::open(directory.path()).await.unwrap());
+    partition.set_superblock(store, None);
+    dispatch_io(&partition);
+    assert!(partition.consensus().needs_superblock_persist());
+
+    let capacity = partition
+        .consensus()
+        .with_pipeline(consensus::Pipeline::prepare_queue_max);
+    let last = u64::try_from(capacity).unwrap() + 1;
+    let mut request = checksumless_send_request(partition.namespace(), 1);
+    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+        .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+    for op in 1..=last {
+        let send =
+            request
+                .deep_copy()
+                .transmute_header(|header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.client = u128::from(op);
+                });
+        partition.on_request(send, None).await;
+        let header = partition
+            .consensus()
+            .with_pipeline(|pipeline| pipeline.entry_by_op(op).map(|entry| entry.header))
+            .expect("the primary admitted the send");
+        // The newest two ops keep one backup vote each, so they need the
+        // primary's own: the ack of the first waits in a full queue.
+        let backups: &[u8] = if op + 1 >= last { &[0] } else { &[0, 2] };
+        for &backup in backups {
+            partition
+                .on_ack(backup_prepare_ok(&partition, backup, &header), &config)
+                .await;
+        }
+    }
+    assert_eq!(partition.consensus().commit_min(), last - 2);
+    assert_eq!(
+        partition.pending_persisted_acks.borrow().len(),
+        usize::try_from(last).unwrap()
+    );
+
+    let crate::PartitionIoStep::Ready(plan) = partition.resume_io(&config).await else {
+        panic!("the superblock write must be ready");
+    };
+    assert_eq!(
+        plan.continuation,
+        crate::PartitionIoContinuation::Superblock
+    );
+    execute_partition_io_plan(&mut partition, &config, plan).await;
+    partition.drive_persistence().await;
+
+    assert!(partition.pending_persisted_acks.borrow().is_empty());
+    let mut acknowledgments = Vec::new();
+    partition
+        .consensus()
+        .drain_loopback_into(&mut acknowledgments);
+    for ack in acknowledgments {
+        partition
+            .on_ack(ack.try_into_typed::<PrepareOkHeader>().unwrap(), &config)
+            .await;
+    }
+    assert_eq!(partition.consensus().commit_min(), last);
+}
+
 #[compio::test]
 async fn given_a_replica_that_lost_primacy_when_the_local_write_is_retried_should_neither_submit_nor_ack()
  {
