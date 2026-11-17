@@ -191,8 +191,7 @@ pub fn stage_owned_partitions(
             );
         }
         let max_bytes = budget.map(|budget| budget.max_bytes);
-        if let Some(incarnation) =
-            should_roll_active_segment(shard, namespace, now, message_expiry, max_bytes)
+        if let Some(incarnation) = should_roll_active_segment(shard, namespace, now, message_expiry)
         {
             let metadata_op = shard.plane.metadata().applied_frontier().get();
             // Keep retries for the same metadata frontier idempotent while the
@@ -226,7 +225,6 @@ fn should_roll_active_segment(
     namespace: IggyNamespace,
     now: IggyTimestamp,
     message_expiry: IggyExpiry,
-    max_bytes: Option<u64>,
 ) -> Option<u64> {
     shard
         .plane
@@ -234,7 +232,8 @@ fn should_roll_active_segment(
         .with_partition(&namespace, |partition| {
             (partition.consensus().is_primary()
                 && partition.consensus().is_normal()
-                && partition.retention_roll_needed(now, message_expiry, max_bytes))
+                && !partition.roll_segment_pending()
+                && partition.retention_roll_needed(now, message_expiry))
             .then_some(partition.created_revision())
         })
         .flatten()

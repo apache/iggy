@@ -279,6 +279,36 @@ async fn given_an_explicit_roll_when_materializing_should_split_chunks_at_it() {
     assert_eq!(persistence.segment_reference(3).unwrap().start_offset, 1);
 }
 
+#[compio::test]
+async fn given_consecutive_explicit_rolls_when_materializing_should_keep_one_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut partition, config) = aged_backup(root.path(), IggyExpiry::NeverExpire).await;
+    let first = stamped_segment_prepare(1, 0, 0, b"before", 1_000);
+    let first_roll = roll_segment_prepare(2, first.header().checksum);
+    let second_roll = roll_segment_prepare(3, first_roll.header().checksum);
+    let second = stamped_segment_prepare(4, second_roll.header().checksum, 1, b"after", 1_001);
+    for prepare in [first, first_roll, second_roll, second] {
+        partition.on_replicate(prepare).await;
+    }
+    partition
+        .persistence
+        .as_ref()
+        .unwrap()
+        .drain_with_timeout(compio::runtime::time::sleep)
+        .await
+        .unwrap();
+    commit_on_heartbeat(&mut partition, &config, 4).await;
+    settle_partition_io(&mut partition, &config).await;
+    partition.flush_committed_messages(&config).await.unwrap();
+    settle_partition_io(&mut partition, &config).await;
+
+    assert!(partition.fatal().is_none());
+    assert_eq!(layout(&partition), vec![(0, 0, true), (1, 1, false)]);
+    let persistence = partition.persistence.as_ref().unwrap();
+    assert_eq!(persistence.segment_reference(1).unwrap().start_offset, 0);
+    assert_eq!(persistence.segment_reference(4).unwrap().start_offset, 1);
+}
+
 /// A transfer resets the receiver's WAL around the installed active segment,
 /// which has to carry the age bound and that segment's first stamp, or the WAL
 /// and materialization roll the next batches at different places.

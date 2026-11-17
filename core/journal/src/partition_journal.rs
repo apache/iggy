@@ -1076,8 +1076,18 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
     /// Rebuild the entry index from the published prefix, which must verify in
     /// full. `lost_publication` extends the walk past that prefix through
     /// [`Self::recover_unpublished_tail`].
+    #[allow(clippy::too_many_lines)]
     async fn recover_entries(&mut self, lost_publication: bool) -> io::Result<()> {
         let mut state = self.state;
+        let mut replay_next_offset = state
+            .segment_storage
+            .map_or(0, |segments| segments.checkpoint.position.next_offset);
+        if let Some(segments) = &mut state.segment_storage {
+            // Rebuild the logical tail from the published checkpoint. The
+            // frontier tail already includes the retained suffix, so replaying
+            // a roll against it would allocate that boundary a second time.
+            segments.tail = segments.checkpoint;
+        }
         let mut position = 0;
         let mut previous = state.checkpoint;
         let mut checksum = state.checkpoint_checksum;
@@ -1086,31 +1096,59 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             let (header, length, prepare, reference) =
                 self.read_record(position, state.length).await?;
             let checkpoint_prepare = position == 0 && state.checkpoint_prepare;
-            let (next_offset, segment_first_timestamp) = if let Some(segments) =
-                &mut state.segment_storage
-            {
-                if header.operation == Operation::RollSegment {
-                    let (reserved, next_offset) = segments.reserve(&header, prepare.as_slice())?;
-                    if reserved.is_some() {
-                        return Err(invalid("roll operation has a segment body"));
+            let (next_offset, segment_first_timestamp) =
+                if let Some(segments) = &mut state.segment_storage {
+                    if header.operation == Operation::RollSegment {
+                        if header.op > state.checkpoint {
+                            segments.reserve_roll_at(replay_next_offset)?;
+                            (Some(replay_next_offset), 0)
+                        } else {
+                            // A roll at the checkpoint is represented by its
+                            // checkpoint cursor. Older control entries do not
+                            // need a segment boundary when rebuilding the
+                            // retained index.
+                            (
+                                (header.op == state.checkpoint)
+                                    .then_some(segments.checkpoint.position.next_offset),
+                                0,
+                            )
+                        }
+                    } else if let Some(reference) = reference {
+                        let next_offset = segments::batch_next_offset(prepare.as_slice())?;
+                        let already_in_checkpoint = reference.start_offset
+                            == segments.checkpoint.position.start_offset
+                            && reference.position + reference.length
+                                <= segments.checkpoint.position.length
+                            && next_offset <= segments.checkpoint.position.next_offset;
+                        if header.op > state.checkpoint && !already_in_checkpoint {
+                            let (expected, _) = segments.reserve(&header, prepare.as_slice())?;
+                            let expected = expected
+                                .ok_or_else(|| invalid("message has no segment reference"))?;
+                            if expected.start_offset != reference.start_offset
+                                || expected.position != reference.position
+                                || expected.length != reference.length
+                            {
+                                return Err(invalid(
+                                    "recovered segment reference disagrees with the WAL tail",
+                                ));
+                            }
+                            replay_next_offset = next_offset;
+                        }
+                        (
+                            Some(next_offset),
+                            segments.recovered_first_timestamp(
+                                reference,
+                                prepare.as_slice(),
+                                checkpoint_prepare,
+                                &mut previous_segment,
+                            )?,
+                        )
+                    } else {
+                        (None, 0)
                     }
-                    (next_offset, 0)
-                } else if let Some(reference) = reference {
-                    (
-                        Some(segments::batch_next_offset(prepare.as_slice())?),
-                        segments.recovered_first_timestamp(
-                            reference,
-                            prepare.as_slice(),
-                            checkpoint_prepare,
-                            &mut previous_segment,
-                        )?,
-                    )
                 } else {
                     (None, 0)
-                }
-            } else {
-                (None, 0)
-            };
+                };
             self.recovered_prepares.push(prepare);
             if checkpoint_prepare {
                 if header.op != state.checkpoint || header.checksum != state.checkpoint_checksum {
@@ -1564,11 +1602,10 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                     .segment_boundary(checkpoint)
                     .ok_or_else(|| invalid("missing segment checkpoint boundary"))?;
             }
-            if let Some(from_op) = truncate.filter(|from_op| *from_op > 0) {
-                segments.tail = self
-                    .segment_boundary(from_op - 1)
-                    .ok_or_else(|| invalid("missing segment rollback boundary"))?;
-            }
+            // Rebuild the retained suffix from the checkpoint cursor. Using
+            // the pre-truncate tail here and replaying the same rolls again
+            // allocates a fresh segment for an already-applied boundary.
+            segments.tail = segments.checkpoint;
         }
         if let Some((prepare, reference)) = checkpoint_prepare {
             let length =
@@ -1619,7 +1656,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             let mut next_offset = entry.next_offset;
             let payload = &record.as_slice()[RECORD_PREFIX..RECORD_PREFIX + payload_length];
             let mut converted = false;
-            if reference.is_none()
+            if op > checkpoint
                 && let Some(segments) = &mut state.segment_storage
             {
                 let header = bytemuck::checked::try_from_bytes::<PrepareHeader>(
@@ -1627,23 +1664,39 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 )
                 .map_err(|_| invalid("invalid prepare during segment migration"))?;
                 if header.operation == Operation::RollSegment {
-                    let (reserved, roll_next_offset) = segments.reserve(header, payload)?;
-                    if reserved.is_some() {
+                    let roll_next_offset = next_offset
+                        .or(Some(segments.tail.position.next_offset))
+                        .ok_or_else(|| invalid("roll operation has no segment boundary"))?;
+                    segments.reserve_roll_at(roll_next_offset)?;
+                    if reference.is_some() {
                         return Err(invalid("roll operation has a segment body"));
                     }
-                    next_offset = roll_next_offset;
-                } else if header.operation == Operation::SendMessages
-                    && segments::decode_batch(payload)?.base_offset
-                        >= segments.tail.position.next_offset
-                {
-                    (reference, next_offset) = segments.reserve(header, payload)?;
-                    if let Some(reference) = reference {
+                    next_offset = Some(roll_next_offset);
+                } else if header.operation == Operation::SendMessages {
+                    if let Some(existing) = reference {
+                        // Legacy referenced records predate owned-segment
+                        // offsets. The installed checkpoint already anchors
+                        // the physical tail; leave those bodies in place and
+                        // only advance it for newly migrated inline records.
+                        if let Some(next_offset) = next_offset {
+                            segments.replay_reference(
+                                existing,
+                                next_offset,
+                                entry.segment_first_timestamp,
+                            )?;
+                        }
+                    } else {
+                        let (expected, expected_next_offset) = segments.reserve(header, payload)?;
+                        let expected =
+                            expected.ok_or_else(|| invalid("message has no segment reference"))?;
                         self.write_segment_body(
-                            reference,
+                            expected,
                             &Frozen::from(Owned::copy_from_slice(payload)),
                         )
                         .await?;
+                        reference = Some(expected);
                         converted = true;
+                        next_offset = expected_next_offset;
                     }
                 }
             }
@@ -3335,6 +3388,56 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_retained_roll_when_checkpointing_and_truncating_should_replay_it_once() {
+        const BODY_BYTES: usize = 4096;
+        let partition = tempdir().unwrap();
+        let directory = partition.path().join("prepares-7");
+        let mut journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        journal
+            .enable_segment_storage(SegmentPosition::default(), (4 * BODY_BYTES) as u64, None)
+            .await
+            .unwrap();
+        let first = segment_prepare(1, 0, 0, BODY_BYTES);
+        let roll = roll_segment_prepare(2, first.header().checksum);
+        let second = segment_prepare(3, roll.header().checksum, 1, BODY_BYTES);
+        let dropped = segment_prepare(4, second.header().checksum, 2, BODY_BYTES);
+        journal
+            .append_batch_buffered(&[
+                first.clone().into_frozen(),
+                roll.into_frozen(),
+                second.clone().into_frozen(),
+                dropped.into_frozen(),
+            ])
+            .await
+            .unwrap();
+        journal.sync().await.unwrap();
+        journal.checkpoint(1).await.unwrap();
+        journal.truncate_from(4).await.unwrap();
+
+        let replacement = segment_prepare(4, second.header().checksum, 2, BODY_BYTES / 2);
+        journal
+            .append(replacement.clone().into_frozen())
+            .await
+            .unwrap();
+        assert_eq!(
+            journal
+                .segment_reference(replacement.header())
+                .unwrap()
+                .start_offset,
+            1
+        );
+        drop(journal);
+
+        let journal = PartitionPrepareJournal::open(&directory, 42, 7)
+            .await
+            .unwrap();
+        assert_eq!(journal.prepares().await.unwrap().len(), 4);
+        assert_eq!(journal.segment_checkpoint().unwrap().next_offset, 1);
+    }
+
+    #[compio::test]
     async fn oversized_durable_segment_layout_is_refused_before_recovery_allocation() {
         let partition = tempdir().unwrap();
         let directory = partition.path().join("prepares-7");
@@ -4548,6 +4651,23 @@ mod tests {
         header.checksum_body = u128::from(checksum);
         header.checksum = header.identity_checksum();
         Message::try_from(bytes).unwrap()
+    }
+
+    fn roll_segment_prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
+        let size = size_of::<PrepareHeader>();
+        Message::<PrepareHeader>::new(size).transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::RollSegment;
+            header.group = 42;
+            header.op = op;
+            header.parent = parent;
+            header.client = 0;
+            header.request = op;
+            header.session = 1;
+            header.retry_capacity = 0;
+            header.size = u32::try_from(size).unwrap();
+            header.checksum = header.identity_checksum();
+        })
     }
 
     /// A build that predates the two-slot layout reads block 0 and truncates to

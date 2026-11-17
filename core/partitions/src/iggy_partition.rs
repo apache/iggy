@@ -10824,6 +10824,7 @@ where
                 .is_some_and(|entry| peek_operation(entry) == Operation::RollSegment)
         });
         if roll_requested {
+            let segment_is_empty = segment.size.as_bytes_u64() == 0;
             let next_offset = segment
                 .end_offset
                 .checked_add(1)
@@ -10833,6 +10834,12 @@ where
                 .as_mut()
                 .expect("materialization exists");
             pending.next_entry += 1;
+            if segment_is_empty {
+                // The WAL treats consecutive rolls at an empty tail as one
+                // boundary. Consume the marker without creating another
+                // empty segment, so materialization keeps the same layout.
+                return Ok(MaterializationStep::Progress);
+            }
             pending.phase = MaterializationPhase::Rotate(next_offset);
             return Ok(MaterializationStep::Ready);
         }
@@ -13119,12 +13126,32 @@ where
     /// files inline and returns their counts.
     /// Whether retention would become effective if the active segment were
     /// sealed now. Empty active segments are deliberately left alone.
-    pub fn retention_roll_needed(
-        &self,
-        now: IggyTimestamp,
-        message_expiry: IggyExpiry,
-        max_bytes: Option<u64>,
-    ) -> bool {
+    #[must_use]
+    pub fn roll_segment_pending(&self) -> bool {
+        let journal_pending = self.log.journal().inner.with_entries(|entries| {
+            entries
+                .iter()
+                .any(|entry| peek_operation(entry) == Operation::RollSegment)
+        });
+        journal_pending
+            || self.consensus.with_pipeline(|pipeline| {
+                pipeline
+                    .pending_requests()
+                    .any(|entry| entry.message.header().operation == Operation::RollSegment)
+                    || pipeline
+                        .prepare_head()
+                        .zip(pipeline.prepare_tail())
+                        .is_some_and(|(head, tail)| {
+                            (head.header.op..=tail.header.op).any(|op| {
+                                pipeline.message_by_op(op).is_some_and(|entry| {
+                                    entry.header.operation == Operation::RollSegment
+                                })
+                            })
+                        })
+            })
+    }
+
+    pub fn retention_roll_needed(&self, now: IggyTimestamp, message_expiry: IggyExpiry) -> bool {
         let active = self.log.active_segment();
         if active.size.as_bytes_u64() == 0 {
             return false;
@@ -13135,17 +13162,7 @@ where
                 if active.max_timestamp != 0
                     && active.max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
         );
-        let over_budget = max_bytes.is_some_and(|limit| {
-            self.log
-                .segments()
-                .iter()
-                .rev()
-                .skip(1)
-                .map(|segment| segment.size.as_bytes_u64())
-                .sum::<u64>()
-                > limit
-        });
-        expires || over_budget
+        expires
     }
 
     pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
