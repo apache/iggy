@@ -18,3 +18,4 @@
 mod test_partition_create_command;
 mod test_partition_delete_command;
 mod test_partition_help_command;
+mod test_partition_list_command;

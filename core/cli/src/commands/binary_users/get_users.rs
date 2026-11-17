@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::utils::list_rows::{ListRows, print_next};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
@@ -29,11 +30,12 @@ pub enum GetUsersOutput {
 
 pub struct GetUsersCmd {
     output: GetUsersOutput,
+    rows: ListRows,
 }
 
 impl GetUsersCmd {
-    pub fn new(output: GetUsersOutput) -> Self {
-        GetUsersCmd { output }
+    pub fn new(output: GetUsersOutput, rows: ListRows) -> Self {
+        GetUsersCmd { output, rows }
     }
 }
 
@@ -41,6 +43,7 @@ impl Default for GetUsersCmd {
     fn default() -> Self {
         GetUsersCmd {
             output: GetUsersOutput::Table,
+            rows: ListRows::default(),
         }
     }
 }
@@ -56,8 +59,9 @@ impl CliCommand for GetUsersCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let users = client
-            .get_users()
+        let (users, next) = self
+            .rows
+            .read(|query| async move { client.get_users_page(&query).await })
             .await
             .with_context(|| String::from("Problem getting list of users"))?;
 
@@ -95,6 +99,7 @@ impl CliCommand for GetUsersCmd {
                 });
             }
         }
+        print_next(next);
 
         Ok(())
     }

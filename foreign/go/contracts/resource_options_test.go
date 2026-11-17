@@ -679,10 +679,11 @@ func checkStreamResponse(t *testing.T, constants fixtureConstants, vector stream
 	response := decodeHex(t, vector.ResponseHex)
 	details, err := binaryserialization.DeserializeStream(response)
 	require.NoError(t, err)
-	streams, err := binaryserialization.DeserializeStreams(response)
+	// A last page of this one stream: no next cursor, then a count of 1.
+	page, err := binaryserialization.DeserializeStreamsPage(append([]byte{0, 1, 0, 0, 0}, response...))
 	require.NoError(t, err)
-	require.Len(t, streams, 1)
-	assert.Equal(t, details.Stream, streams[0])
+	require.Len(t, page.Items, 1)
+	assert.Equal(t, details.Stream, page.Items[0])
 
 	stream := details.Stream
 	expected := vector.Expected

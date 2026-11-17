@@ -437,6 +437,17 @@ mod tests {
     }
 
     #[test]
+    fn given_reply_too_large_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::ReplyTooLarge;
+        assert_eq!(error.as_code(), 97);
+        assert_eq!(error.as_string(), "reply_too_large");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+    }
+
+    #[test]
     fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
         const PARTITION_ID: u32 = 7;
         const OPERATION_ID: u64 = 42;

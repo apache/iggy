@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use clap::builder::{NonEmptyStringValueParser, RangedU64ValueParser};
 use clap::{Args, ValueEnum};
-use iggy::prelude::OptionKey;
+use iggy::prelude::{
+    NamedPageQuery, OptionKey, PAGE_CURSOR_PREFIX, PageCursor, PageOrder, PageQuery,
+};
 use iggy_cli::commands::binary_client::get_clients::GetClientsOutput;
 use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
 use iggy_cli::commands::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
 use iggy_cli::commands::binary_context::get_contexts::GetContextsOutput;
+use iggy_cli::commands::binary_partitions::get_partitions::GetPartitionsOutput;
 use iggy_cli::commands::binary_personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensOutput;
 use iggy_cli::commands::binary_streams::get_stream::GetStreamOutput;
 use iggy_cli::commands::binary_streams::get_streams::GetStreamsOutput;
@@ -28,6 +32,7 @@ use iggy_cli::commands::binary_system::stats::GetStatsOutput;
 use iggy_cli::commands::binary_topics::get_topic::GetTopicOutput;
 use iggy_cli::commands::binary_topics::get_topics::GetTopicsOutput;
 use iggy_cli::commands::binary_users::get_users::GetUsersOutput;
+use iggy_cli::commands::utils::list_rows::ListRows;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -169,6 +174,97 @@ impl From<GetOutput> for GetTopicOutput {
             GetOutput::Table => GetTopicOutput::Table,
             GetOutput::Json => GetTopicOutput::Json,
         }
+    }
+}
+
+impl From<ListMode> for GetPartitionsOutput {
+    fn from(mode: ListMode) -> Self {
+        match mode {
+            ListMode::Table => GetPartitionsOutput::Table,
+            ListMode::List => GetPartitionsOutput::List,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ListOrder {
+    Id,
+    Created,
+}
+
+impl From<ListOrder> for PageOrder {
+    fn from(order: ListOrder) -> Self {
+        match order {
+            ListOrder::Id => PageOrder::Id,
+            ListOrder::Created => PageOrder::Created,
+        }
+    }
+}
+
+/// The page flags of every list command that reads pages.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PageArgs {
+    /// Print the rows in descending order
+    #[arg(long)]
+    pub(crate) desc: bool,
+
+    /// Print at most N rows
+    ///
+    /// If more rows follow them, the last line is `next: <CURSOR>`.
+    /// Pass that cursor to --after to print the rows that follow.
+    #[arg(long, value_name = "N", value_parser = RangedU64ValueParser::<usize>::new().range(1..))]
+    pub(crate) limit: Option<usize>,
+
+    /// Print the rows after this cursor
+    ///
+    /// The cursor comes from the `next:` line of a list with --limit.
+    /// Use the same other flags as that list.
+    #[arg(long, value_name = "CURSOR", value_parser = parse_page_cursor)]
+    pub(crate) after: Option<PageCursor>,
+}
+
+/// The cursor error of the SDK is `InvalidCommand`, which names no flag.
+fn parse_page_cursor(text: &str) -> Result<PageCursor, String> {
+    text.parse().map_err(|_| {
+        format!("not a page cursor, expected the {PAGE_CURSOR_PREFIX} text of a \"next:\" line")
+    })
+}
+
+/// The page flags of the lists of named entities: streams, topics, consumer
+/// groups and users.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct NamedPageArgs {
+    /// Order of the rows, by ID or by creation time
+    #[arg(long, value_enum, default_value_t = ListOrder::Id)]
+    pub(crate) sort: ListOrder,
+
+    #[command(flatten)]
+    pub(crate) page: PageArgs,
+
+    /// Print only the rows whose name holds this text (case-sensitive)
+    #[arg(long, value_name = "TEXT", value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) name: Option<String>,
+}
+
+impl From<PageArgs> for ListRows {
+    fn from(args: PageArgs) -> Self {
+        ListRows {
+            query: NamedPageQuery::from(PageQuery {
+                descending: args.desc,
+                cursor: args.after,
+                ..PageQuery::default()
+            }),
+            row_limit: args.limit,
+        }
+    }
+}
+
+impl From<NamedPageArgs> for ListRows {
+    fn from(args: NamedPageArgs) -> Self {
+        let mut rows = ListRows::from(args.page);
+        rows.query.page.order = args.sort.into();
+        rows.query.name = args.name;
+        rows
     }
 }
 

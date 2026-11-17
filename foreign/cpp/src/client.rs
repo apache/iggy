@@ -47,7 +47,7 @@ use iggy_binary_protocol::responses::system::{
 use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::{
     Credentials as RustCredentials, IggyError, MetadataChangeCursor, MetadataChangeRecord,
-    MetadataChanges, MetadataChangesQuery, MetadataCurrentItem, MetadataCurrentPageToken,
+    MetadataChanges, MetadataChangesQuery, MetadataCurrentItem, MetadataCurrentPageToken, Page,
     PendingOperationsConfig, stream_key_fingerprint,
 };
 use serde::Deserialize;
@@ -341,6 +341,19 @@ impl Client {
                 .map_err(|error| format!("Could not get streams: {error}"))?;
             Ok(streams.into_iter().map(ffi::Stream::from).collect())
         })
+    }
+
+    pub fn get_streams_page(
+        &self,
+        query: ffi::NamedPageQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::StreamsPage, String> {
+        *error_info = ffi::ErrorInfo::default();
+        read_page(query, |query| async move {
+            self.inner.get_streams_page(&query).await
+        })
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not get streams page: {error}"))
     }
 
     pub fn create_stream(
@@ -788,6 +801,24 @@ impl Client {
         })
     }
 
+    pub fn get_topics_page(
+        &self,
+        stream_id: ffi::Identifier,
+        query: ffi::NamedPageQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::TopicsPage, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not get topics page: invalid stream identifier: {error}")
+        })?;
+        let stream_id = &rust_stream_id;
+        read_page(query, |query| async move {
+            self.inner.get_topics_page(stream_id, &query).await
+        })
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not get topics page on stream '{rust_stream_id}': {error}"))
+    }
+
     pub fn update_topic(
         &self,
         stream_id: ffi::Identifier,
@@ -905,6 +936,34 @@ impl Client {
                     )
                 })?;
             Ok(())
+        })
+    }
+
+    pub fn get_partitions_page(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        query: ffi::PageQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::PartitionsPage, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not get partitions page: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not get partitions page: invalid topic identifier: {error}")
+        })?;
+        let (stream_id, topic_id) = (&rust_stream_id, &rust_topic_id);
+        read_page(query, |query| async move {
+            self.inner
+                .get_partitions_page(stream_id, topic_id, &query)
+                .await
+        })
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| {
+            format!(
+                "Could not get partitions page for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
+            )
         })
     }
 
@@ -1026,6 +1085,34 @@ impl Client {
                     )
                 })?;
             Ok(groups.into_iter().map(ffi::ConsumerGroup::from).collect())
+        })
+    }
+
+    pub fn get_consumer_groups_page(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        query: ffi::NamedPageQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::ConsumerGroupsPage, String> {
+        *error_info = ffi::ErrorInfo::default();
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not get consumer groups page: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not get consumer groups page: invalid topic identifier: {error}")
+        })?;
+        let (stream_id, topic_id) = (&rust_stream_id, &rust_topic_id);
+        read_page(query, |query| async move {
+            self.inner
+                .get_consumer_groups_page(stream_id, topic_id, &query)
+                .await
+        })
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| {
+            format!(
+                "Could not get consumer groups page for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
+            )
         })
     }
 
@@ -1551,6 +1638,19 @@ impl Client {
         })
     }
 
+    pub fn get_users_page(
+        &self,
+        query: ffi::NamedPageQuery,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::UsersPage, String> {
+        *error_info = ffi::ErrorInfo::default();
+        read_page(query, |query| async move {
+            self.inner.get_users_page(&query).await
+        })
+        .inspect_err(|error| error_info.record(error))
+        .map_err(|error| format!("Could not get users page: {error}"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_user(
         &self,
@@ -1841,6 +1941,21 @@ pub fn decode_metadata_current_item(
         .map_err(|error| format!("Could not decode the metadata current item: {error}"))
 }
 
+/// Parses and validates the query before anything is sent, then reads one page.
+fn read_page<FfiQuery, Query, T, P, Read, Reply>(
+    query: FfiQuery,
+    read: Read,
+) -> Result<P, IggyError>
+where
+    Query: TryFrom<FfiQuery, Error = IggyError>,
+    Read: FnOnce(Query) -> Reply,
+    Reply: Future<Output = Result<Page<T>, IggyError>>,
+    P: From<Page<T>>,
+{
+    let query = Query::try_from(query)?;
+    RUNTIME.block_on(read(query)).map(P::from)
+}
+
 fn is_option_error(error: &IggyError) -> bool {
     matches!(
         error,
@@ -1981,6 +2096,18 @@ mod tests {
             r#"{"id":1013,"reason":"invalid"}"#.to_owned(),
         ));
         assert_eq!(other.kind, "http_response_error");
+    }
+
+    #[test]
+    fn given_reply_too_large_when_recording_should_keep_its_code_and_kind() {
+        let mut info = ffi::ErrorInfo::default();
+
+        info.record(&IggyError::ReplyTooLarge);
+
+        assert_eq!(info.code, 97);
+        assert_eq!(info.kind, "reply_too_large");
+        assert!(!info.has_operation_id);
+        assert!(!info.has_blocked_partition_id);
     }
 
     #[test]

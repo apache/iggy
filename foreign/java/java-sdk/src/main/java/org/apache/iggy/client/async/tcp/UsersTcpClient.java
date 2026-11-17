@@ -25,6 +25,8 @@ import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
@@ -77,8 +79,12 @@ public class UsersTcpClient implements UsersClient {
 
     @Override
     public CompletableFuture<List<UserInfo>> getUsers() {
-        var payload = Unpooled.EMPTY_BUFFER;
-        return connection().exchangeForList(CommandCode.User.GET_ALL, payload, BytesDeserializer::readUserInfo);
+        return PageReads.readWholeList(connectionSupplier, CommandCode.User.GET_ALL, BytesDeserializer::readUserInfo);
+    }
+
+    @Override
+    public CompletableFuture<Page<UserInfo>> getUsersPage(NamedPageQuery query) {
+        return PageReads.read(connection(), CommandCode.User.GET_ALL, query, BytesDeserializer::readUserInfo);
     }
 
     @Override

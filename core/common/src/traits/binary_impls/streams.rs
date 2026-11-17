@@ -16,22 +16,24 @@
 // under the License.
 
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::wire_conversions::{identifier_to_wire, streams_from_wire};
+use crate::wire_conversions::{identifier_to_wire, page_from_wire};
 use crate::{
-    BinaryClient, Identifier, IggyError, Stream, StreamClient, StreamCreateOptions, StreamDetails,
-    StreamUpdateOptions,
+    BinaryClient, Identifier, IggyError, NamedPageQuery, Page, Stream, StreamClient,
+    StreamCreateOptions, StreamDetails, StreamUpdateOptions,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_STREAM_CODE, DELETE_STREAM_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
 };
+use iggy_binary_protocol::primitives::page::WirePageQuery;
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
 };
 use iggy_binary_protocol::requests::system::ResourceTarget;
+use iggy_binary_protocol::responses::PageResponse;
+use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
-use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> StreamClient for B {
@@ -52,15 +54,23 @@ impl<B: BinaryClient> StreamClient for B {
     }
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
+        super::read_whole_list(
+            self,
+            |query| async move { self.get_streams_page(&query).await },
+        )
+        .await
+    }
+
+    async fn get_streams_page(&self, query: &NamedPageQuery) -> Result<Page<Stream>, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let request = GetStreamsRequest {
+            page: WirePageQuery::try_from(query)?,
+        };
         let response = self
-            .send_raw_with_response(GET_STREAMS_CODE, GetStreamsRequest.to_bytes())
+            .send_raw_with_response(GET_STREAMS_CODE, request.to_bytes())
             .await?;
-        if response.is_empty() {
-            return Ok(Vec::new());
-        }
-        let wire_resp = super::decode_response::<GetStreamsResponse>(&response)?;
-        Ok(streams_from_wire(wire_resp)?)
+        let page = super::decode_response::<PageResponse<StreamResponse>>(&response)?;
+        page_from_wire(page, Stream::try_from)
     }
 
     async fn create_stream(

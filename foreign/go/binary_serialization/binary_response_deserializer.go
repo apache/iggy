@@ -84,22 +84,6 @@ func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
 	}, nil
 }
 
-func DeserializeStreams(payload []byte) ([]iggcon.Stream, error) {
-	streams := make([]iggcon.Stream, 0)
-	position := 0
-
-	for position < len(payload) {
-		stream, readBytes, err := DeserializeToStream(payload, position)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize stream at offset %d: %w", position, err)
-		}
-		streams = append(streams, stream)
-		position += readBytes
-	}
-
-	return streams, nil
-}
-
 const streamFixedSize = 4 + 8 + 4 + 8 + 8 + 1 // 33 bytes: id + created_at + topics_count + size_bytes + messages_count + name_len
 
 func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, error) {
@@ -467,29 +451,6 @@ func readLengthPrefixed(payload []byte, position int, field string) ([]byte, int
 	return payload[position : position+length], 4 + length, nil
 }
 
-func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
-	if len(payload) < 4 {
-		return nil, fmt.Errorf(
-			"not enough data to read topics count: need 4 bytes, got %d", len(payload))
-	}
-	topicsCount := binary.LittleEndian.Uint32(payload[0:4])
-	position := 4
-
-	// The declared count is server-controlled; the allocation hint is capped
-	// by what the body could possibly hold.
-	topics := make([]iggcon.Topic, 0, boundedCapacity(topicsCount, len(payload)-position, topicMinimumSize))
-	for i := uint32(0); i < topicsCount; i++ {
-		topic, readBytes, err := DeserializeToTopic(payload, position)
-		if err != nil {
-			return nil, err
-		}
-		topics = append(topics, topic)
-		position += readBytes
-	}
-
-	return topics, nil
-}
-
 func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 	topic, position, err := DeserializeToTopic(payload, 0)
 	if err != nil {
@@ -688,42 +649,37 @@ func deserializeNodeIds(payload []byte, position int, field string) ([]uint8, in
 	return bytes.Clone(payload[start : start+count]), start + count, nil
 }
 
-func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {
-	var consumerGroups []iggcon.ConsumerGroup
-	length := len(payload)
-	position := 0
+// consumerGroupFixedSize covers the fields before the name:
+// id + partitions_count + members_count + name_len.
+const consumerGroupFixedSize = 4 + 4 + 4 + 1
 
-	for position < length {
-		// use slices
-		consumerGroup, readBytes := DeserializeToConsumerGroup(payload, position)
-		consumerGroups = append(consumerGroups, *consumerGroup)
-		position += readBytes
+func DeserializeToConsumerGroup(payload []byte, position int) (iggcon.ConsumerGroup, int, error) {
+	remaining := len(payload) - position
+	if remaining < consumerGroupFixedSize {
+		return iggcon.ConsumerGroup{}, 0, fmt.Errorf(
+			"not enough data to read consumer group header: need %d bytes, got %d",
+			consumerGroupFixedSize, remaining)
+	}
+	readBytes := consumerGroupFixedSize + int(payload[position+12])
+	if remaining < readBytes {
+		return iggcon.ConsumerGroup{}, 0, fmt.Errorf(
+			"not enough data to read consumer group name: need %d bytes, got %d",
+			readBytes, remaining)
 	}
 
-	return consumerGroups
+	return iggcon.ConsumerGroup{
+		Id:              binary.LittleEndian.Uint32(payload[position : position+4]),
+		PartitionsCount: binary.LittleEndian.Uint32(payload[position+4 : position+8]),
+		MembersCount:    binary.LittleEndian.Uint32(payload[position+8 : position+12]),
+		Name:            string(payload[position+consumerGroupFixedSize : position+readBytes]),
+	}, readBytes, nil
 }
 
-func DeserializeToConsumerGroup(payload []byte, position int) (*iggcon.ConsumerGroup, int) {
-	id := binary.LittleEndian.Uint32(payload[position : position+4])
-	partitionsCount := binary.LittleEndian.Uint32(payload[position+4 : position+8])
-	membersCount := binary.LittleEndian.Uint32(payload[position+8 : position+12])
-	nameLength := int(payload[position+12])
-	name := string(payload[position+13 : position+13+nameLength])
-
-	readBytes := 12 + 1 + nameLength
-
-	consumerGroup := iggcon.ConsumerGroup{
-		Id:              id,
-		MembersCount:    membersCount,
-		PartitionsCount: partitionsCount,
-		Name:            name,
+func DeserializeConsumerGroup(payload []byte) (*iggcon.ConsumerGroupDetails, error) {
+	consumerGroup, pos, err := DeserializeToConsumerGroup(payload, 0)
+	if err != nil {
+		return nil, err
 	}
-
-	return &consumerGroup, readBytes
-}
-
-func DeserializeConsumerGroup(payload []byte) *iggcon.ConsumerGroupDetails {
-	consumerGroup, pos := DeserializeToConsumerGroup(payload, 0)
 	members := make([]iggcon.ConsumerGroupMember, 0)
 	for pos < len(payload) {
 		m, readBytes := DeserializeToConsumerGroupMember(payload, pos)
@@ -734,9 +690,9 @@ func DeserializeConsumerGroup(payload []byte) *iggcon.ConsumerGroupDetails {
 		return members[i].ID < members[j].ID
 	})
 	return &iggcon.ConsumerGroupDetails{
-		ConsumerGroup: *consumerGroup,
+		ConsumerGroup: consumerGroup,
 		Members:       members,
-	}
+	}, nil
 }
 
 func DeserializeToConsumerGroupMember(payload []byte, position int) (iggcon.ConsumerGroupMember, int) {
@@ -753,27 +709,6 @@ func DeserializeToConsumerGroupMember(payload []byte, position int) (iggcon.Cons
 		PartitionsCount: partitionsCount,
 		Partitions:      partitions,
 	}, readBytes
-}
-
-func DeserializeUsers(payload []byte) ([]iggcon.UserInfo, error) {
-	if len(payload) == 0 {
-		return nil, errors.New("empty payload")
-	}
-
-	var result []iggcon.UserInfo
-	length := len(payload)
-	position := 0
-
-	for position < length {
-		response, readBytes, err := deserializeToUser(payload, position)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, *response)
-		position += readBytes
-	}
-
-	return result, nil
 }
 
 func DeserializeUser(payload []byte) (*iggcon.UserInfoDetails, error) {
