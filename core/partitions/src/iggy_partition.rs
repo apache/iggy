@@ -13225,17 +13225,6 @@ where
         let Some(up_to) = expired.into_iter().chain(oversized).max() else {
             return SegmentRemoval::default();
         };
-        // A placed batch above the long-term floor is the only record of
-        // where its messages sit in the object store. Removing it would lose
-        // them for the rewrite, and so for every other cluster.
-        let up_to = if self.places_batches() {
-            match self.long_term_floor() {
-                Some(floor) => up_to.min(floor),
-                None => return SegmentRemoval::default(),
-            }
-        } else {
-            up_to
-        };
         self.remove_sealed_segments_up_to(up_to).await
     }
 
@@ -13297,6 +13286,18 @@ where
     /// return an empty result. Only an idle partition without a dispatcher removes
     /// files inline and returns their counts.
     pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
+        // A placed batch above the long-term floor is the only record of
+        // where its messages sit in the object store. Removing it would lose
+        // them for the rewrite, and so for every other cluster, whoever
+        // asked: retention, or a client that deletes segments.
+        let up_to_offset = if self.places_batches() {
+            match self.long_term_floor() {
+                Some(floor) => up_to_offset.min(floor),
+                None => return SegmentRemoval::default(),
+            }
+        } else {
+            up_to_offset
+        };
         self.maintenance.retention = Some(
             self.maintenance
                 .retention

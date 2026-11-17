@@ -1410,6 +1410,43 @@ async fn given_expired_placed_batches_when_cleaning_should_keep_those_above_the_
     );
 }
 
+/// A client that deletes segments names an offset, and the removal it leads
+/// to must stop where retention stops.
+#[compio::test]
+async fn given_placed_batches_when_removing_segments_up_to_an_offset_should_keep_those_above_the_long_term_floor()
+ {
+    let (_whole, placed, object) = whole_and_placed(6);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&[], &store)).await;
+    partition.runtime_options.segment_size = Some(placed_segment_size());
+    partition.log.active_segment_mut().max_size = placed_segment_size();
+    let config = repair_config();
+    let starts = |partition: &IggyPartition<IggyMessageBus>| -> Vec<u64> {
+        partition
+            .log
+            .segments()
+            .iter()
+            .map(|segment| segment.start_offset)
+            .collect()
+    };
+
+    Box::pin(commit_records(&mut partition, 1, &placed[..3])).await;
+    Box::pin(partition.remove_sealed_segments_up_to(u64::MAX)).await;
+    settle_partition_io(&mut partition, &config).await;
+    assert_eq!(starts(&partition), [0, 2], "no long-term segment yet");
+
+    let rewritten = Box::pin(rewrite_pass(&mut partition, &writer(&store), 100))
+        .await
+        .unwrap();
+    assert_eq!(rewritten.end_offset, 2);
+    Box::pin(commit_records(&mut partition, 4, &placed[3..])).await;
+    Box::pin(partition.remove_sealed_segments_up_to(u64::MAX)).await;
+    settle_partition_io(&mut partition, &config).await;
+
+    assert!(partition.fatal().is_none());
+    assert_eq!(starts(&partition), [2, 4, 6]);
+}
+
 /// A reader of the bucket finds the partition's segments in its manifest.
 #[compio::test]
 async fn given_a_published_long_term_segment_when_building_the_manifest_should_list_it() {
