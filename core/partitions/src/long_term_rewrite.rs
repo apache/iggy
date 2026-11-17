@@ -65,7 +65,7 @@ use crate::state_transfer::STAGING_SUFFIX;
 pub const LONG_TERM_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bytes of a segment between two entries of its index.
-const INDEX_STRIDE_BYTES: u64 = 64 * 1024;
+pub const INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 
 /// One rewrite, as the partition's owner captured it.
 pub struct SegmentRewrite {

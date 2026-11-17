@@ -118,15 +118,19 @@ where
         partition: &IggyPartition<B, SB>,
     ) {
         if partition.take_long_term_changed() {
-            self.long_term_changed(namespace, partition.created_revision());
+            self.long_term_changed(
+                namespace,
+                partition.created_revision(),
+                partition.merges_under_pressure(),
+            );
         }
     }
 
-    fn long_term_changed(&self, namespace: IggyNamespace, created_revision: u64) {
+    fn long_term_changed(&self, namespace: IggyNamespace, created_revision: u64, pressed: bool) {
         self.rewrite_pacing
             .borrow_mut()
             .committed(&(namespace, created_revision), self.bus.monotonic_micros());
-        self.long_term_merge_committed(&(namespace, created_revision));
+        self.long_term_merge_committed(&(namespace, created_revision), pressed);
         if self.manifest_publisher.borrow().is_some() {
             self.request_publish_manifest(namespace, created_revision, IggyTimestamp::now());
         }
@@ -135,7 +139,8 @@ where
     /// The pump's tick: settle the rewrites whose frame the inbox refused,
     /// act on the commands that committed outside a partition I/O step,
     /// start the passes that are due, and report how far the rewrites are
-    /// behind and how many objects no long-term log accounts for.
+    /// behind, how long the longest long-term log is, and how many objects
+    /// no long-term log accounts for or wait for their delete.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
@@ -150,6 +155,8 @@ where
         }
         let partitions = self.plane.partitions();
         let mut unannounced_objects = 0;
+        let mut dead_objects = 0;
+        let mut most_segments = 0;
         let mut changed = Vec::new();
         for key in self.rewrite_pacing.borrow().paced() {
             let (namespace, created_revision) = key;
@@ -160,14 +167,18 @@ where
                 continue;
             };
             unannounced_objects += partition.long_term_unannounced_objects();
+            dead_objects += partition.queued_dead_long_term_objects();
+            most_segments = most_segments.max(partition.long_term_segments().len());
             if partition.take_long_term_changed() {
-                changed.push(*key);
+                changed.push((*key, partition.merges_under_pressure()));
             }
         }
         self.metrics
             .set_long_term_unannounced_objects(unannounced_objects);
-        for (namespace, created_revision) in changed {
-            self.long_term_changed(namespace, created_revision);
+        self.metrics.set_long_term_dead_objects(dead_objects);
+        self.metrics.set_long_term_segments(most_segments);
+        for ((namespace, created_revision), pressed) in changed {
+            self.long_term_changed(namespace, created_revision, pressed);
         }
         let due = self
             .rewrite_pacing

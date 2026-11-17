@@ -67,7 +67,7 @@ const LONG_TERM_READ_BYTES: u64 = 1024 * 1024;
 
 /// The most a read of a long-term segment's index asks for. The index of a
 /// segment is a small fraction of this.
-const LONG_TERM_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+pub const LONG_TERM_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A local segment of placed batches as a poll plan snapshots it.
 #[derive(Debug, Clone, Copy)]

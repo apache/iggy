@@ -2464,6 +2464,8 @@ struct GatedMerger {
     closed: Cell<bool>,
     gate: RefCell<Vec<futures::channel::oneshot::Sender<()>>>,
     started: Cell<u32>,
+    /// The class of every merge that started, in order.
+    classes: RefCell<Vec<iggy_object_store::TierJobClass>>,
 }
 
 impl GatedMerger {
@@ -2473,6 +2475,7 @@ impl GatedMerger {
             closed: Cell::new(false),
             gate: RefCell::default(),
             started: Cell::new(0),
+            classes: RefCell::default(),
         })
     }
 
@@ -2491,6 +2494,7 @@ impl partitions::LongTermMerger for GatedMerger {
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, partitions::MergeOutcome> {
         self.started.set(self.started.get() + 1);
+        self.classes.borrow_mut().push(merge.class);
         let merging = self.merger.merge(merge, scope);
         if !self.closed.get() {
             return merging;
@@ -2803,8 +2807,11 @@ async fn given_expired_long_term_segments_when_retention_passes_run_should_commi
             "the policy of another incarnation"
         );
 
+        assert_eq!(owner.metrics().long_term_trims_value(), 0);
+
         owner.request_retain_long_term(namespace(), revision, much_later, one_second, None);
         let trimmed = manifest_with(1).await;
+        assert_eq!(owner.metrics().long_term_trims_value(), 1);
         assert_eq!((trimmed.floor, trimmed.trim_point), (Some(2), Some(1)));
         assert_eq!(long_term_ends(&owner), [2]);
         assert_eq!(local_segments(&owner), [0, 2]);
@@ -2813,6 +2820,190 @@ async fn given_expired_long_term_segments_when_retention_passes_run_should_commi
         owner.request_retain_long_term(namespace(), revision, much_later, one_second, None);
         until(&owner, |owner| local_segments(owner) == [2]).await;
         until(&owner, |_| !first_log.exists()).await;
+        assert_eq!(
+            owner.metrics().long_term_trims_value(),
+            1,
+            "a pass that decides on no trim sends none"
+        );
     })
     .await;
+}
+
+/// Commit segments too large to merge after the ones the long-term log of
+/// the fixture's partition holds, until it holds `segments`. The store
+/// holds the object of none of them.
+#[allow(clippy::future_not_send)]
+async fn publish_healthy_segments(owner: &IoTestShard, segments: usize) {
+    use iggy_object_store::{ManifestSegment, SEGMENT_HASH_LEN};
+
+    let held = |owner: &IoTestShard| {
+        let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+        partition.long_term_segments().len()
+    };
+    while held(owner) < segments {
+        let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+        let next = partition.long_term_floor().map_or(0, |floor| floor + 1);
+        let mut sent = 0;
+        for offset in (next..).take(segments - held(owner)) {
+            let segment = ManifestSegment {
+                start_offset: offset,
+                end_offset: offset,
+                start_timestamp: 0,
+                end_timestamp: 0,
+                max_timestamp: 0,
+                size: partitions::LONG_TERM_MERGE_MIN_BYTES,
+                crc32c: 0,
+                hash: [0; SEGMENT_HASH_LEN],
+            };
+            let request = partition
+                .publish_segment_request(&segment, 1_000_000 + offset)
+                .unwrap();
+            let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                request,
+                reply: channel(1).0,
+                attachment: None,
+            });
+            // The inbox is full: the pump takes what it holds first.
+            if owner.senders[0].try_send(frame).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        let after = held(owner) + sent;
+        until(owner, |owner| held(owner) == after).await;
+    }
+}
+
+/// The scan of the interval is over, and the long-term log grows to the
+/// threshold. The commit that takes it there starts the merge, in the class
+/// that does not wait for an idle shard, and no commit below it does.
+#[compio::test]
+async fn given_a_long_term_log_that_reaches_the_pressure_threshold_when_the_segment_commits_should_merge_without_a_scan()
+ {
+    use iggy_object_store::TierJobClass;
+    use partitions::LONG_TERM_SEGMENTS_PRESSURE;
+
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, merger) = Box::pin(merging_owner(directory.path())).await;
+    let below = i64::try_from(LONG_TERM_SEGMENTS_PRESSURE - 1).unwrap();
+
+    pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        send_and_rewrite(&owner, 2).await;
+        publish_healthy_segments(&owner, LONG_TERM_SEGMENTS_PRESSURE - 1).await;
+        compio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(merger.started.get(), 0, "the log is below the threshold");
+        until(&owner, |owner| {
+            owner.metrics().long_term_segments_value() == below
+        })
+        .await;
+
+        publish_healthy_segments(&owner, LONG_TERM_SEGMENTS_PRESSURE).await;
+
+        until(&owner, |owner| {
+            owner.metrics().long_term_merges_value() == (1, 2)
+        })
+        .await;
+        until(&owner, |owner| {
+            owner.metrics().long_term_segments_value() == below
+        })
+        .await;
+    })
+    .await;
+
+    assert_eq!(*merger.classes.borrow(), [TierJobClass::Upload]);
+    assert_eq!(long_term_ends(&owner)[..2], [1, 2]);
+}
+
+/// A merge leaves the log one segment shorter and two objects dead. The
+/// shard reports the length of its longest log, the objects that wait for
+/// their delete, and the ones a delete removed.
+#[compio::test]
+async fn given_a_merge_that_commits_when_its_sources_are_deleted_should_report_the_log_the_dead_objects_and_the_deletes()
+ {
+    use iggy_common::IggyDuration;
+    use iggy_object_store::{PartitionManifest, SegmentObject};
+    use partitions::{ExecutorDeleter, ExecutorManifestPublisher};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, merger) = Box::pin(merging_owner(directory.path())).await;
+    let executor = merger.merger.executor().clone();
+    owner.set_manifest_publisher(Some(Rc::new(ExecutorManifestPublisher::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_object_deleter(Some(Rc::new(ExecutorDeleter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let revision = super::segment_uploads::staged_revision(&owner);
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
+    let store = executor.0.store();
+    let manifest_segments = async || {
+        let meta = store.head(&manifest_key).await.ok()?;
+        let object = store.get_range(&manifest_key, 0..meta.size).await.ok()?;
+        Some(
+            PartitionManifest::decode(&object.bytes)
+                .ok()?
+                .segments
+                .len(),
+        )
+    };
+    let metrics = owner.metrics();
+
+    pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        send_and_rewrite(&owner, 2).await;
+        until(&owner, |_| metrics.long_term_segments_value() == 2).await;
+        assert_eq!(metrics.long_term_dead_objects_value(), 0);
+
+        scan_for_merges_now(&owner);
+
+        until(&owner, |_| metrics.long_term_segments_value() == 1).await;
+        until(&owner, |_| metrics.long_term_dead_objects_value() == 2).await;
+        assert_eq!(metrics.long_term_deleted_objects_value(), 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while manifest_segments().await != Some(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no manifest of the merged segment was stored"
+            );
+            compio::time::sleep(TASK_POLL_INTERVAL).await;
+        }
+        // The objects wait from the moment the partition learns of the
+        // manifest, which is after the store holds it.
+        compio::time::sleep(Duration::from_millis(100)).await;
+        // The delay is over at this time, and the listing the first pass
+        // makes is not yet due again.
+        let after_the_delay = IggyTimestamp::from(
+            IggyTimestamp::now().as_micros()
+                + IggyDuration::from(Duration::from_hours(1)).as_micros(),
+        );
+        while metrics.long_term_deleted_objects_value() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dead objects were not deleted"
+            );
+            owner.request_delete_objects(namespace(), revision, after_the_delay, 0);
+            compio::time::sleep(TASK_POLL_INTERVAL).await;
+        }
+        until(&owner, |_| metrics.long_term_dead_objects_value() == 0).await;
+    })
+    .await;
+
+    assert_eq!(metrics.long_term_deleted_objects_value(), 2);
+    assert_eq!(
+        store
+            .keys()
+            .iter()
+            .filter(|key| {
+                layout()
+                    .parse_long_term_key(key)
+                    .is_some_and(|key| key.object == SegmentObject::Log)
+            })
+            .count(),
+        1,
+        "the merged segment is the one long-term log left"
+    );
 }

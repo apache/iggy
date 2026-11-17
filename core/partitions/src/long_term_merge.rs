@@ -38,6 +38,11 @@
 //!
 //! Merges run beside the rewrites and wait for none of them: a replace and
 //! the publish of the next segment commute.
+//!
+//! A log of segments that are all large enough is never merged, and still
+//! takes no segment beyond [`LONG_TERM_SEGMENTS_MAX`]. From
+//! [`LONG_TERM_SEGMENTS_PRESSURE`] segments on, a partition merges larger
+//! ones into larger ones, and no longer waits for the shard to be idle.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -57,9 +62,13 @@ use message_bus::MessageBus;
 use tracing::{debug, error, warn};
 
 use crate::IggyPartition;
-use crate::long_term::{REPLACE_SOURCES_MAX, concatenated};
+use crate::iggy_index::IGGY_INDEX_SIZE;
+use crate::long_term::{LONG_TERM_SEGMENTS_MAX, REPLACE_SOURCES_MAX, concatenated};
 use crate::long_term_delete::LongTermObject;
-use crate::long_term_rewrite::{LONG_TERM_SEGMENT_BYTES, SegmentIndex, write_file};
+use crate::long_term_rewrite::{
+    INDEX_STRIDE_BYTES, LONG_TERM_SEGMENT_BYTES, SegmentIndex, write_file,
+};
+use crate::placed_read::LONG_TERM_INDEX_BYTES;
 use crate::segment_chain::{HashSource, SegmentHasher, SegmentHashes, SegmentRecord};
 use crate::segment_upload::{SegmentUpload, UploadError, upload_segment_under};
 use crate::state_transfer::{ChunkHasher, STAGING_SUFFIX, hash_segment_range};
@@ -71,6 +80,55 @@ pub const LONG_TERM_MERGE_MIN_BYTES: u64 = LONG_TERM_SEGMENT_BYTES as u64 / 2;
 /// Bytes of a source that a merge reads from the store, and holds in
 /// memory, at once.
 pub const LONG_TERM_MERGE_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Segments from which a long-term log is near its limit: three quarters of
+/// [`LONG_TERM_SEGMENTS_MAX`].
+///
+/// A partition that holds this many merges whatever makes its log shorter,
+/// so that it does not stop publishing at the limit.
+pub const LONG_TERM_SEGMENTS_PRESSURE: usize = LONG_TERM_SEGMENTS_MAX / 4 * 3;
+
+/// Bytes a merged segment holds at most when its log is near the limit.
+pub const LONG_TERM_MERGE_PRESSURE_BYTES: u64 = 1024 * 1024 * 1024;
+
+// A poll reads no more than `LONG_TERM_INDEX_BYTES` of an index, so the
+// index of the largest merged segment has to fit in them.
+const _: () = assert!(
+    LONG_TERM_MERGE_PRESSURE_BYTES.div_ceil(INDEX_STRIDE_BYTES) * IGGY_INDEX_SIZE as u64
+        <= LONG_TERM_INDEX_BYTES
+);
+
+/// Which segments a merge reads, and how large the one it writes may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeLimits {
+    /// Bytes below which a segment is small enough to merge.
+    pub small_below: u64,
+    /// Bytes the merged segment holds at most.
+    pub output_max: u64,
+}
+
+impl MergeLimits {
+    /// The limits of a log that is not near its limit: two small segments
+    /// always fit in one.
+    pub const NORMAL: Self = Self {
+        small_below: LONG_TERM_MERGE_MIN_BYTES,
+        output_max: LONG_TERM_SEGMENT_BYTES as u64,
+    };
+
+    /// Twice these limits. `None` when the merged segment would hold more
+    /// than [`LONG_TERM_MERGE_PRESSURE_BYTES`].
+    #[must_use]
+    pub const fn doubled(self) -> Option<Self> {
+        let output_max = self.output_max.saturating_mul(2);
+        if output_max > LONG_TERM_MERGE_PRESSURE_BYTES {
+            return None;
+        }
+        Some(Self {
+            small_below: self.small_below.saturating_mul(2),
+            output_max,
+        })
+    }
+}
 
 /// The segments one merge replaces: `count` segments of the long-term log
 /// that follow each other, from the one at `first`.
@@ -95,15 +153,15 @@ impl MergeRun {
     /// One merge for every run of small segments in `segments`, the
     /// long-term log in offset order.
     ///
-    /// A segment below [`LONG_TERM_MERGE_MIN_BYTES`] is small, and a run is
-    /// every small segment between two that are not. A merge takes the
-    /// segments from the start of its run for as long as their bytes fit in
-    /// one segment and a replace takes that many. A segment that is not
-    /// small is never read again: merging it would cost its bytes and make
-    /// the log no shorter. A small segment alone in its run stays.
+    /// A segment below `limits.small_below` is small, and a run is every
+    /// small segment between two that are not. A merge takes the segments
+    /// from the start of its run for as long as their bytes fit in
+    /// `limits.output_max` and a replace takes that many. A segment that is
+    /// not small is not read: merging it would cost its bytes and make the
+    /// log no shorter. A small segment alone in its run stays.
     #[must_use]
-    pub fn all(segments: &[ManifestSegment]) -> Vec<Self> {
-        let small = |segment: &&ManifestSegment| segment.size < LONG_TERM_MERGE_MIN_BYTES;
+    pub fn all(segments: &[ManifestSegment], limits: MergeLimits) -> Vec<Self> {
+        let small = |segment: &&ManifestSegment| segment.size < limits.small_below;
         let mut merges = Vec::new();
         let mut first = 0;
         while first < segments.len() {
@@ -116,7 +174,7 @@ impl MergeRun {
             };
             for segment in &segments[first..first + run] {
                 if merge.count == REPLACE_SOURCES_MAX
-                    || merge.bytes + segment.size > LONG_TERM_SEGMENT_BYTES as u64
+                    || merge.bytes + segment.size > limits.output_max
                 {
                     break;
                 }
@@ -131,15 +189,16 @@ impl MergeRun {
         merges
     }
 
-    /// The merge of `segments` that makes the log shortest, and of several
-    /// that do, the one at the lowest offset. A merge that would read a
-    /// segment `skipped` names is left out.
+    /// The merge of `segments` within `limits` that makes the log shortest,
+    /// and of several that do, the one at the lowest offset. A merge that
+    /// would read a segment `skipped` names is left out.
     #[must_use]
     pub fn best(
         segments: &[ManifestSegment],
+        limits: MergeLimits,
         skipped: impl Fn(&ManifestSegment) -> bool,
     ) -> Option<Self> {
-        Self::all(segments)
+        Self::all(segments, limits)
             .into_iter()
             .filter(|merge| !merge.sources(segments).iter().any(&skipped))
             // The first of equal ones is the one at the lowest offset.
@@ -150,6 +209,20 @@ impl MergeRun {
                     best
                 }
             })
+    }
+
+    /// The best merge of a log near its limit: the one within
+    /// [`MergeLimits::NORMAL`], and when there is none, the one within the
+    /// first doubling of them that has one. The cheapest merge that makes
+    /// the log shorter is taken, and none writes a segment of more than
+    /// [`LONG_TERM_MERGE_PRESSURE_BYTES`].
+    #[must_use]
+    pub fn relieving(
+        segments: &[ManifestSegment],
+        skipped: impl Fn(&ManifestSegment) -> bool,
+    ) -> Option<Self> {
+        std::iter::successors(Some(MergeLimits::NORMAL), |limits| limits.doubled())
+            .find_map(|limits| Self::best(segments, limits, &skipped))
     }
 
     fn sources<'a>(&self, segments: &'a [ManifestSegment]) -> &'a [ManifestSegment] {
@@ -164,6 +237,9 @@ pub struct SegmentMerge {
     /// order.
     pub sources: Vec<ManifestSegment>,
     pub partition_dir: String,
+    /// The class the merge runs in: [`TierJobClass::Housekeeping`], or
+    /// [`TierJobClass::Upload`] for a log near its limit.
+    pub class: TierJobClass,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -204,8 +280,11 @@ pub trait LongTermMerger {
     ) -> LocalBoxFuture<'static, MergeOutcome>;
 }
 
-/// Merges through a tier executor, in its housekeeping class, so a merge
-/// starts only when no read and no upload waits, and one runs at a time.
+/// Merges through a tier executor, in the class each merge names.
+///
+/// In the housekeeping class a merge starts only when no read and no upload
+/// waits. A log near its limit cannot wait for that, and its merge takes
+/// the place of an upload.
 pub struct ExecutorLongTermMerger<E> {
     executor: E,
     layout: KeyLayout,
@@ -231,7 +310,8 @@ impl<E: TierExecutor> LongTermMerger for ExecutorLongTermMerger<E> {
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, MergeOutcome> {
         let layout = self.layout.clone();
-        let request = TierJobRequest::new(TierJobClass::Housekeeping, scope);
+        let bytes = merge.sources.iter().map(|source| source.size).sum();
+        let request = TierJobRequest::new(merge.class, scope).with_bytes(bytes);
         self.executor
             .submit(request, move |store: Rc<E::Store>| async move {
                 merge.run(&*store, &layout).await
@@ -513,7 +593,8 @@ pub struct LongTermMerges {
     quarantined: BTreeSet<u64>,
     /// The first offset of the last merged segment of this view, when it
     /// came out small. Only a shard's scan merges it again, so a run that
-    /// grows by a segment at a time is not rewritten once for each.
+    /// grows by a segment at a time is not rewritten once for each. A log
+    /// near its limit does not wait for the scan.
     resting: Option<u64>,
     /// Number of the last merge this partition started. Kept across views,
     /// so the result of a merge of an earlier view is never taken for
@@ -544,8 +625,8 @@ where
     /// How many segments shorter the best merge of this partition makes its
     /// long-term log, and the offset that merge starts at. `None` when this
     /// replica merges nothing: it is not the primary of a partition that
-    /// places its batches, a merge of its own is not settled yet, or no two
-    /// small segments follow each other.
+    /// places its batches, a merge of its own is not settled yet, or no
+    /// merge makes its log shorter.
     #[must_use]
     pub fn segment_merge_reclaim(&self) -> Option<(usize, u64)> {
         let lane = &self.long_term_merges;
@@ -555,10 +636,18 @@ where
         // The scan that asks merges what rests, and another view's
         // quarantine is not this one's.
         let quarantined = (lane.view == Some(self.consensus().view())).then_some(&lane.quarantined);
-        MergeRun::best(self.long_term_segments(), |segment| {
+        self.best_segment_merge(|segment| {
             quarantined.is_some_and(|quarantined| quarantined.contains(&segment.start_offset))
         })
         .map(|merge| (merge.reclaim(), merge.start_offset))
+    }
+
+    /// Whether this replica merges the partition's long-term segments and
+    /// its log holds [`LONG_TERM_SEGMENTS_PRESSURE`] of them or more. Its
+    /// next merge is then due at once.
+    #[must_use]
+    pub fn merges_under_pressure(&self) -> bool {
+        self.merges_long_term_segments() && self.long_term_log_near_limit()
     }
 
     /// Start the best merge of this partition's long-term segments, when
@@ -581,17 +670,17 @@ where
             return None;
         }
         let partition_dir = self.partition_dir()?;
+        let near_limit = self.long_term_log_near_limit();
         let lane = self.long_term_merges_of_this_view();
-        if pass == MergePass::Scan {
+        if pass == MergePass::Scan || near_limit {
             lane.resting = None;
         }
         if lane.running.is_some() || lane.stored.is_some() {
             return None;
         }
         let lane = &self.long_term_merges;
-        let segments = self.long_term_segments();
-        let run = MergeRun::best(segments, |segment| lane.skips(segment))?;
-        let sources = run.sources(segments).to_vec();
+        let run = self.best_segment_merge(|segment| lane.skips(segment))?;
+        let sources = run.sources(self.long_term_segments()).to_vec();
         let prefix = crate::object_prefix(self.namespace(), self.created_revision());
         let scope = TierScope::new();
         let token = scope.token();
@@ -607,6 +696,11 @@ where
             prefix,
             sources,
             partition_dir,
+            class: if near_limit {
+                TierJobClass::Upload
+            } else {
+                TierJobClass::Housekeeping
+            },
         };
         Some((id, merge, token))
     }
@@ -722,6 +816,22 @@ where
         self.places_batches() && self.state_machines_current()
     }
 
+    fn long_term_log_near_limit(&self) -> bool {
+        self.long_term_segments().len() >= LONG_TERM_SEGMENTS_PRESSURE
+    }
+
+    /// The best merge of the partition's long-term segments that reads no
+    /// segment `skipped` names. A log near its limit takes larger segments
+    /// when it has no small ones to merge.
+    fn best_segment_merge(&self, skipped: impl Fn(&ManifestSegment) -> bool) -> Option<MergeRun> {
+        let segments = self.long_term_segments();
+        if self.long_term_log_near_limit() {
+            MergeRun::relieving(segments, skipped)
+        } else {
+            MergeRun::best(segments, MergeLimits::NORMAL, skipped)
+        }
+    }
+
     /// The merge state of the current view. What an earlier view left is
     /// dropped, and its merge cancelled.
     fn long_term_merges_of_this_view(&mut self) -> &mut LongTermMerges {
@@ -738,6 +848,8 @@ where
 mod tests {
     use super::*;
     use iggy_object_store::SEGMENT_HASH_LEN;
+    use std::cell::RefCell;
+    use std::future::Future;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -759,14 +871,15 @@ mod tests {
     }
 
     fn merges(sizes: &[u64]) -> Vec<(usize, usize)> {
-        MergeRun::all(&log(sizes))
+        MergeRun::all(&log(sizes), MergeLimits::NORMAL)
             .iter()
             .map(|merge| (merge.first, merge.count))
             .collect()
     }
 
     fn best(sizes: &[u64]) -> Option<(usize, usize)> {
-        MergeRun::best(&log(sizes), |_| false).map(|merge| (merge.first, merge.count))
+        MergeRun::best(&log(sizes), MergeLimits::NORMAL, |_| false)
+            .map(|merge| (merge.first, merge.count))
     }
 
     #[test]
@@ -788,7 +901,7 @@ mod tests {
     fn given_a_run_broken_by_a_healthy_segment_when_selecting_should_merge_each_side_alone() {
         let sizes = [MIB, MIB, 48 * MIB, MIB, MIB, MIB];
 
-        let found = MergeRun::all(&log(&sizes));
+        let found = MergeRun::all(&log(&sizes), MergeLimits::NORMAL);
 
         assert_eq!(
             found,
@@ -814,7 +927,7 @@ mod tests {
         // 20 + 20 + 24 fills a segment to the byte, and one more would not.
         assert_eq!(merges(&[20 * MIB, 20 * MIB, 24 * MIB, MIB, MIB]), [(0, 3)]);
         assert_eq!(merges(&[20 * MIB, 20 * MIB, 24 * MIB + 1, MIB]), [(0, 2)]);
-        let found = MergeRun::all(&log(&[31 * MIB, 31 * MIB, 31 * MIB]));
+        let found = MergeRun::all(&log(&[31 * MIB, 31 * MIB, 31 * MIB]), MergeLimits::NORMAL);
         assert_eq!(found[0].bytes, 62 * MIB);
         assert_eq!(found[0].reclaim(), 1);
     }
@@ -845,9 +958,167 @@ mod tests {
         let sizes = [MIB, MIB, 48 * MIB, MIB, MIB, MIB];
         let segments = log(&sizes);
 
-        let found = MergeRun::best(&segments, |segment| segment.start_offset == 4);
+        let found = MergeRun::best(&segments, MergeLimits::NORMAL, |segment| {
+            segment.start_offset == 4
+        });
 
         assert_eq!(found.map(|merge| (merge.first, merge.count)), Some((0, 2)));
+    }
+
+    fn relieving(sizes: &[u64]) -> Option<(usize, usize)> {
+        MergeRun::relieving(&log(sizes), |_| false).map(|merge| (merge.first, merge.count))
+    }
+
+    #[test]
+    fn given_the_normal_limits_when_doubling_should_stop_at_the_pressure_output() {
+        let doublings: Vec<MergeLimits> =
+            std::iter::successors(Some(MergeLimits::NORMAL), |limits| limits.doubled()).collect();
+
+        let outputs: Vec<u64> = doublings.iter().map(|limits| limits.output_max).collect();
+        assert_eq!(
+            outputs,
+            [64 * MIB, 128 * MIB, 256 * MIB, 512 * MIB, 1024 * MIB]
+        );
+        assert_eq!(outputs.last(), Some(&LONG_TERM_MERGE_PRESSURE_BYTES));
+        assert!(
+            doublings
+                .iter()
+                .all(|limits| limits.small_below * 2 == limits.output_max),
+            "two small segments always fit in one"
+        );
+    }
+
+    #[test]
+    fn given_limits_when_selecting_should_call_small_and_fill_what_they_say() {
+        let sizes = [40 * MIB, 40 * MIB, 40 * MIB, 40 * MIB, 64 * MIB, MIB, MIB];
+        let limits = MergeLimits {
+            small_below: 64 * MIB,
+            output_max: 128 * MIB,
+        };
+
+        let found: Vec<(usize, usize)> = MergeRun::all(&log(&sizes), limits)
+            .iter()
+            .map(|merge| (merge.first, merge.count))
+            .collect();
+
+        assert_eq!(found, [(0, 3), (5, 2)]);
+        assert_eq!(merges(&sizes), [(5, 2)]);
+    }
+
+    #[test]
+    fn given_small_segments_when_relieving_should_merge_them_within_the_normal_limits() {
+        let sizes = [40 * MIB, 40 * MIB, 40 * MIB, MIB, MIB];
+
+        assert_eq!(relieving(&sizes), Some((3, 2)));
+        assert_eq!(relieving(&sizes), best(&sizes));
+    }
+
+    #[test]
+    fn given_only_healthy_segments_when_relieving_should_merge_within_the_first_doubling_that_can()
+    {
+        assert_eq!(best(&[40 * MIB, 40 * MIB, 40 * MIB, 40 * MIB]), None);
+        assert_eq!(
+            relieving(&[40 * MIB, 40 * MIB, 40 * MIB, 40 * MIB]),
+            Some((0, 3)),
+            "three fit in 128 MiB, and a fourth does not"
+        );
+        assert_eq!(
+            relieving(&[64 * MIB, 64 * MIB, 64 * MIB, 64 * MIB, 64 * MIB]),
+            Some((0, 4)),
+            "a segment of 64 MiB is small from the second doubling on"
+        );
+        assert_eq!(
+            relieving(&[300 * MIB, 300 * MIB, 300 * MIB, 300 * MIB]),
+            Some((0, 3))
+        );
+    }
+
+    #[test]
+    fn given_segments_of_half_the_pressure_output_when_relieving_should_find_no_merge() {
+        let half = LONG_TERM_MERGE_PRESSURE_BYTES / 2;
+
+        assert_eq!(relieving(&[half, half, half]), None);
+        assert_eq!(relieving(&[half - 1, half - 1, half - 1]), Some((0, 2)));
+        assert_eq!(relieving(&[half - 1, half + 1, half - 1]), None);
+        let merged = MergeRun::relieving(&log(&[half - 1, half - 1, half - 1]), |_| false).unwrap();
+        assert!(merged.bytes <= LONG_TERM_MERGE_PRESSURE_BYTES);
+    }
+
+    #[test]
+    fn given_a_skipped_segment_when_relieving_should_read_it_within_no_limits() {
+        let sizes = [MIB, MIB, 40 * MIB, 40 * MIB];
+        let segments = log(&sizes);
+
+        let found = MergeRun::relieving(&segments, |segment| segment.start_offset == 1);
+
+        assert_eq!(found, None);
+        assert_eq!(relieving(&sizes), Some((0, 2)));
+    }
+
+    /// An executor that runs each job at once and keeps what it was asked
+    /// for.
+    struct Recording {
+        store: Rc<iggy_object_store::MemoryStore>,
+        requests: RefCell<Vec<(TierJobClass, u64)>>,
+    }
+
+    impl TierExecutor for Recording {
+        type Store = iggy_object_store::MemoryStore;
+
+        fn submit<T, F, Fut>(
+            &self,
+            request: TierJobRequest,
+            job: F,
+        ) -> iggy_object_store::TierJobHandle<T>
+        where
+            T: 'static,
+            F: FnOnce(Rc<Self::Store>) -> Fut + 'static,
+            Fut: Future<Output = T> + 'static,
+        {
+            self.requests
+                .borrow_mut()
+                .push((request.class(), request.bytes()));
+            let job = job(Rc::clone(&self.store));
+            iggy_object_store::TierJobHandle::new(async move { Ok(job.await) })
+        }
+    }
+
+    /// The class decides whether the merge waits for an idle shard, and the
+    /// bytes count against what the uploads of the shard hold at once.
+    #[compio::test]
+    async fn given_a_merge_when_running_it_should_ask_for_its_class_and_the_bytes_of_its_sources() {
+        let merger = ExecutorLongTermMerger::new(
+            Recording {
+                store: Rc::new(iggy_object_store::MemoryStore::new()),
+                requests: RefCell::default(),
+            },
+            KeyLayout::new("root").unwrap(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+
+        for class in [TierJobClass::Housekeeping, TierJobClass::Upload] {
+            let merge = SegmentMerge {
+                prefix: ObjectPrefix {
+                    stream_id: 1,
+                    topic_id: 2,
+                    partition_id: 3,
+                    created_revision: 4,
+                },
+                sources: log(&[3, 4]),
+                partition_dir: directory.path().to_string_lossy().into_owned(),
+                class,
+            };
+            let outcome = merger.merge(merge, TierScope::new().token()).await;
+            assert!(
+                matches!(outcome, Ok(Err(MergeError::Store(_)))),
+                "the store holds no source"
+            );
+        }
+
+        assert_eq!(
+            merger.executor().requests.take(),
+            [(TierJobClass::Housekeeping, 7), (TierJobClass::Upload, 7)]
+        );
     }
 
     /// Copy an object of `bytes` that the log committed as `source`.

@@ -31,6 +31,10 @@
 //! segment that a merge left small is merged again with what follows it by
 //! a scan, and not by the pass after a merge.
 //!
+//! A partition whose long-term log is near its limit does not wait for the
+//! scan: the commit that leaves it there makes a pass over it due as soon
+//! as the shard merges for no other partition.
+//!
 //! A merge runs in a detached task and reports back as a frame, as a
 //! rewrite does. Nothing here is shared with the rewrites, so a rewrite
 //! never waits for a merge.
@@ -51,6 +55,7 @@ use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -68,6 +73,9 @@ pub struct MergeSchedule {
     scan_due_at: u64,
     /// The partition this shard merges for, and when its next pass is due.
     active: Option<(RewriteKey, u64)>,
+    /// The partitions whose long-term log changed while it was near its
+    /// limit, and that the shard has not passed over since.
+    pressed: BTreeSet<RewriteKey>,
 }
 
 impl MergeSchedule {
@@ -91,9 +99,30 @@ impl MergeSchedule {
         due
     }
 
+    /// The long-term log of `key` changed and is near its limit, so a pass
+    /// over the partition is due without a scan. The partition the shard
+    /// merges for gets its passes already.
+    pub fn press(&mut self, key: RewriteKey) {
+        if self.active.is_none_or(|(active, _)| active != key) {
+            self.pressed.insert(key);
+        }
+    }
+
+    /// A partition whose log is near its limit, to pass over now. `None`
+    /// while the shard merges for a partition. A partition is handed out
+    /// once for every time its log changed, so one that has nothing to
+    /// merge is not passed over again and again.
+    pub fn take_pressed(&mut self) -> Option<RewriteKey> {
+        if self.active.is_some() {
+            return None;
+        }
+        self.pressed.pop_first()
+    }
+
     /// Merge for `key` and for no other partition, and pass over it again
     /// at `due_at`.
-    pub const fn hold(&mut self, key: RewriteKey, due_at: u64) {
+    pub fn hold(&mut self, key: RewriteKey, due_at: u64) {
+        self.pressed.remove(&key);
         self.active = Some((key, due_at));
     }
 
@@ -138,6 +167,24 @@ fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Where the best merge of a partition stands among those of the shard's
+/// other partitions, the highest first. A log near its limit stops taking
+/// segments soon, so its merge goes before any that only saves more
+/// segments.
+fn merge_rank(
+    pressed: bool,
+    reclaim: usize,
+    start_offset: u64,
+    namespace: IggyNamespace,
+) -> (bool, usize, Reverse<u64>, Reverse<u64>) {
+    (
+        pressed,
+        reclaim,
+        Reverse(start_offset),
+        Reverse(namespace.inner()),
+    )
+}
+
 /// What a pass over a partition found to do.
 enum MergeStep {
     /// Send the command of the merged segment again.
@@ -169,17 +216,20 @@ where
         self.long_term_merges.merger.borrow().clone()
     }
 
-    /// A command changed the long-term log of `key`.
-    pub(crate) fn long_term_merge_committed(&self, key: &RewriteKey) {
-        self.long_term_merges
-            .schedule
-            .borrow_mut()
-            .committed(key, self.bus.monotonic_micros());
+    /// A command changed the long-term log of `key`. `pressed` says that
+    /// the log is near its limit and this shard merges it.
+    pub(crate) fn long_term_merge_committed(&self, key: &RewriteKey, pressed: bool) {
+        let mut schedule = self.long_term_merges.schedule.borrow_mut();
+        schedule.committed(key, self.bus.monotonic_micros());
+        if pressed {
+            schedule.press(*key);
+        }
     }
 
     /// The pump's tick: settle the merges whose frame the inbox refused,
     /// pass over the partition this shard merges for when that is due, and
-    /// scan for the next one when the shard merges for none.
+    /// when the shard merges for none, pass over a partition whose log is
+    /// near its limit, or scan for the next one.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_merges(&self)
     where
@@ -199,6 +249,11 @@ where
         let now = self.bus.monotonic_micros();
         let due = self.long_term_merges.schedule.borrow().due_pass(now);
         if let Some(key) = due {
+            self.run_merge_pass(key, MergePass::Drain).await;
+            return;
+        }
+        let pressed = self.long_term_merges.schedule.borrow_mut().take_pressed();
+        if let Some(key) = pressed {
             self.run_merge_pass(key, MergePass::Drain).await;
             return;
         }
@@ -223,7 +278,8 @@ where
 
     /// The partition whose best merge makes its long-term log shortest, of
     /// the partitions this shard rewrites. Of several that gain alike, the
-    /// one whose merge starts at the lowest offset.
+    /// one whose merge starts at the lowest offset. A partition whose log
+    /// is near its limit goes before any that is not.
     fn best_merge(&self) -> Option<RewriteKey> {
         let partitions = self.plane.partitions();
         self.rewrite_pacing
@@ -231,14 +287,12 @@ where
             .paced()
             .filter_map(|key| {
                 let (namespace, created_revision) = key;
-                let (reclaim, start_offset) = partitions
+                let partition = partitions
                     .get_by_ns(namespace)
-                    .filter(|partition| partition.created_revision() == *created_revision)?
-                    .segment_merge_reclaim()?;
-                Some((
-                    (reclaim, Reverse(start_offset), Reverse(namespace.inner())),
-                    *key,
-                ))
+                    .filter(|partition| partition.created_revision() == *created_revision)?;
+                let (reclaim, start_offset) = partition.segment_merge_reclaim()?;
+                let pressed = partition.merges_under_pressure();
+                Some((merge_rank(pressed, reclaim, start_offset, *namespace), *key))
             })
             .max_by_key(|(rank, _)| *rank)
             .map(|(_, key)| key)
@@ -458,6 +512,64 @@ mod tests {
             schedule.take_scan(INTERVAL),
             "a scan that was due while the shard merged is due once it stops"
         );
+    }
+
+    #[test]
+    fn given_merges_of_several_partitions_when_ranking_should_put_a_log_near_its_limit_first() {
+        let (first, second) = (key(0).0, key(1).0);
+
+        assert!(merge_rank(true, 1, 9, second) > merge_rank(false, 1000, 0, first));
+        assert!(merge_rank(true, 2, 9, second) > merge_rank(true, 1, 0, first));
+        assert!(merge_rank(false, 2, 9, second) > merge_rank(false, 1, 0, first));
+        assert!(merge_rank(false, 1, 0, second) > merge_rank(false, 1, 9, first));
+        assert!(merge_rank(false, 1, 0, first) > merge_rank(false, 1, 0, second));
+    }
+
+    #[test]
+    fn given_a_pressed_partition_when_the_shard_merges_for_none_should_pass_over_it_once() {
+        let mut schedule = MergeSchedule::default();
+        assert!(schedule.take_scan(10));
+        assert_eq!(schedule.take_pressed(), None);
+
+        schedule.press(key(3));
+        schedule.press(key(3));
+        schedule.press(key(2));
+
+        assert_eq!(schedule.take_pressed(), Some(key(2)));
+        assert_eq!(schedule.take_pressed(), Some(key(3)));
+        assert_eq!(schedule.take_pressed(), None, "once for every change");
+        assert!(!schedule.take_scan(11), "a pass is not a scan");
+    }
+
+    #[test]
+    fn given_a_partition_the_shard_merges_for_when_another_is_pressed_should_pass_over_it_after_the_release()
+     {
+        let mut schedule = MergeSchedule::default();
+        schedule.hold(key(0), 500);
+
+        schedule.press(key(1));
+        schedule.press(key(0));
+
+        assert_eq!(schedule.take_pressed(), None, "one merge at a time");
+        schedule.release(&key(0));
+        assert_eq!(schedule.take_pressed(), Some(key(1)));
+        assert_eq!(
+            schedule.take_pressed(),
+            None,
+            "the partition the shard merged for got its passes"
+        );
+    }
+
+    #[test]
+    fn given_a_pressed_partition_when_the_shard_starts_to_merge_for_it_should_not_pass_over_it_again()
+     {
+        let mut schedule = MergeSchedule::default();
+        schedule.press(key(0));
+
+        schedule.hold(key(0), 500);
+        schedule.release(&key(0));
+
+        assert_eq!(schedule.take_pressed(), None);
     }
 
     #[test]

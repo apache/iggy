@@ -118,6 +118,7 @@ where
             partition.long_term_retention_end(now, message_expiry, max_bytes)
         };
         if let Some(up_to_offset) = decision {
+            self.metrics.record_long_term_trim();
             self.trim_segments(namespace, up_to_offset).await;
         }
     }

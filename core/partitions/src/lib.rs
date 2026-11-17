@@ -91,8 +91,9 @@ pub use long_term_delete::{
 };
 mod long_term_merge;
 pub use long_term_merge::{
-    ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LONG_TERM_MERGE_READ_BYTES, LongTermMerger,
-    MergeError, MergeOutcome, MergePass, MergeRun, MergeSettled, SegmentMerge,
+    ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LONG_TERM_MERGE_PRESSURE_BYTES,
+    LONG_TERM_MERGE_READ_BYTES, LONG_TERM_SEGMENTS_PRESSURE, LongTermMerger, MergeError,
+    MergeLimits, MergeOutcome, MergePass, MergeRun, MergeSettled, SegmentMerge,
 };
 mod long_term_rewrite;
 pub use long_term_rewrite::{

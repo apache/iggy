@@ -24,15 +24,16 @@ use super::remote_poll::layout;
 use super::*;
 use crate::long_term::{
     LONG_TERM_SEGMENTS_MAX, PUBLISH_SEGMENT, PublishSegment, REPLACE_SEGMENTS, ReplaceSegments,
+    concatenated,
 };
 use crate::state_machine::{Applied, MachineCommand};
 use crate::{
-    ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LongTermMerger, LongTermWriter, MergeError,
-    MergePass, MergeSettled,
+    ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LONG_TERM_SEGMENTS_PRESSURE, LongTermMerger,
+    LongTermWriter, MergeError, MergePass, MergeSettled,
 };
 use iggy_object_store::{
     InlineTierExecutor, ManifestSegment, MemoryStore, ObjectStore, PutBody, PutOptions,
-    SEGMENT_HASH_LEN, SegmentObject,
+    SEGMENT_HASH_LEN, SegmentObject, TierJobClass,
 };
 
 type MemoryMerger = ExecutorLongTermMerger<InlineTierExecutor<SharedStore>>;
@@ -566,5 +567,220 @@ async fn given_a_partition_of_whole_batches_when_a_merge_pass_runs_should_merge_
     assert!(partition.partition_dir().is_some());
 
     assert_eq!(partition.segment_merge_reclaim(), None);
+    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+}
+
+/// A leader of three whose long-term log holds a segment of one offset for
+/// each of `sizes`, and after them segments too large to merge up to
+/// `segments` in all. The store holds the object of none of them.
+async fn leader_with_log_of(
+    sizes: &[u64],
+    segments: usize,
+) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+    let (_whole, placed, object) = whole_and_placed(1);
+    let store = Box::pin(store_with(object)).await;
+    let (directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+    for (index, offset) in (0..segments).zip(0..) {
+        let segment = ManifestSegment {
+            size: sizes
+                .get(index)
+                .copied()
+                .unwrap_or(LONG_TERM_MERGE_MIN_BYTES),
+            ..healthy_segment(offset)
+        };
+        let payload = PublishSegment(segment).encode();
+        assert_eq!(
+            apply(&mut partition, 100 + offset, PUBLISH_SEGMENT, &payload),
+            Applied::Changed
+        );
+    }
+    assert_eq!(partition.long_term_segments().len(), segments);
+    (directory, partition)
+}
+
+/// End the merge numbered `id` as one that stored the segment its `sources`
+/// add up to, commit its replace, and settle it.
+fn store_and_commit(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    id: u64,
+    sources: &[ManifestSegment],
+    op: u64,
+) -> ManifestSegment {
+    let merged = concatenated(sources, [0; SEGMENT_HASH_LEN]).unwrap();
+    assert_eq!(
+        partition.finish_segment_merge(id, Ok(Ok(merged))),
+        Some(merged)
+    );
+    let replace = ReplaceSegments(merged).encode();
+    assert_eq!(
+        apply(partition, op, REPLACE_SEGMENTS, &replace),
+        Applied::Changed
+    );
+    assert_eq!(
+        partition.settle_segment_merge(),
+        MergeSettled::Committed {
+            replaced: sources.len()
+        }
+    );
+    merged
+}
+
+const AFTER_THE_LOG: u64 = 1_000_000;
+
+/// One segment short of the threshold, a partition merges as any other:
+/// small segments only, when the shard is idle, and a merged segment that
+/// came out small waits for the next scan.
+#[compio::test]
+async fn given_a_log_one_segment_below_the_pressure_threshold_when_merge_passes_run_should_merge_as_a_short_log_does()
+ {
+    let below = LONG_TERM_SEGMENTS_PRESSURE - 1;
+    let (_directory, mut partition) = Box::pin(leader_with_log_of(&[1, 1], below)).await;
+    assert!(!partition.merges_under_pressure());
+    assert_eq!(partition.segment_merge_reclaim(), Some((1, 0)));
+
+    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+
+    assert_eq!(merge.class, TierJobClass::Housekeeping);
+    assert_eq!(merge.sources, &partition.long_term_segments()[..2]);
+    store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG);
+    assert_eq!(partition.long_term_segments().len(), below - 1);
+    assert_eq!(
+        partition.segment_merge_reclaim(),
+        None,
+        "segments that are large enough stay as they are"
+    );
+    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
+    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+}
+
+/// The pass that finds the log at the threshold is any pass, not only a
+/// shard's scan, and the merge it starts does not wait for an idle shard.
+#[compio::test]
+async fn given_a_log_at_the_pressure_threshold_when_a_pass_outside_a_scan_runs_should_merge_in_the_upload_class()
+ {
+    let (_directory, mut partition) =
+        Box::pin(leader_with_log_of(&[1, 1], LONG_TERM_SEGMENTS_PRESSURE)).await;
+    assert!(partition.merges_under_pressure());
+    assert_eq!(partition.segment_merge_reclaim(), Some((1, 0)));
+
+    let (_, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+
+    assert_eq!(merge.class, TierJobClass::Upload);
+    assert_eq!(
+        merge.sources,
+        &partition.long_term_segments()[..2],
+        "small segments go first, within the usual limits"
+    );
+}
+
+/// No segment of the log is small, so no merge of the usual kind makes it
+/// shorter, and it would reach the limit and take no segment any more.
+/// Larger segments are merged into larger ones until the log is below the
+/// threshold, and no further.
+#[compio::test]
+async fn given_a_log_of_only_healthy_segments_at_the_pressure_threshold_when_merge_passes_run_should_shrink_it_below_the_threshold()
+ {
+    let (_directory, mut partition) =
+        Box::pin(leader_with_log_of(&[], LONG_TERM_SEGMENTS_PRESSURE + 3)).await;
+    assert_eq!(
+        partition.segment_merge_reclaim(),
+        Some((3, 0)),
+        "four segments of 32 MiB fit in one of 128 MiB"
+    );
+
+    let mut merges = 0;
+    while let Some((id, merge, _scope)) = partition.begin_segment_merge(MergePass::Drain) {
+        assert_eq!(merge.class, TierJobClass::Upload);
+        assert_eq!(merge.sources.len(), 4);
+        let merged = store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG + merges);
+        assert_eq!(merged.size, 4 * LONG_TERM_MERGE_MIN_BYTES);
+        merges += 1;
+    }
+
+    assert_eq!(merges, 2);
+    assert_eq!(
+        partition.long_term_segments().len(),
+        LONG_TERM_SEGMENTS_PRESSURE - 3
+    );
+    assert!(!partition.merges_under_pressure());
+    assert_eq!(partition.segment_merge_reclaim(), None);
+    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+}
+
+/// A merged segment that came out small rests until the next scan. A log
+/// near its limit has no time for that: the pass after the merge reads the
+/// segment again, with the larger ones that follow it.
+#[compio::test]
+async fn given_a_merged_segment_that_rests_when_the_log_is_at_the_pressure_threshold_should_merge_it_again_at_once()
+ {
+    let (_directory, mut partition) =
+        Box::pin(leader_with_log_of(&[1, 1], LONG_TERM_SEGMENTS_PRESSURE + 1)).await;
+    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    let merged = store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG);
+    assert_eq!(merged.size, 2);
+    assert_eq!(
+        partition.long_term_segments().len(),
+        LONG_TERM_SEGMENTS_PRESSURE
+    );
+
+    let (_, next, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+
+    assert_eq!(next.class, TierJobClass::Upload);
+    assert_eq!(next.sources.len(), 4);
+    assert_eq!(next.sources[0], merged);
+}
+
+/// Pressure changes which segments a merge may read and where it runs. It
+/// does not make a replica merge that is not the primary, read a source the
+/// store holds other bytes for, or start a merge beside its own.
+#[compio::test]
+async fn given_a_log_at_the_pressure_threshold_when_a_merge_is_held_back_should_stay_held_back() {
+    let (_directory, mut partition) =
+        Box::pin(leader_with_log_of(&[], LONG_TERM_SEGMENTS_PRESSURE)).await;
+
+    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    assert!(
+        partition.begin_segment_merge(MergePass::Drain).is_none(),
+        "one at a time"
+    );
+    assert_eq!(partition.segment_merge_reclaim(), None);
+    let merged = concatenated(&merge.sources, [0; SEGMENT_HASH_LEN]).unwrap();
+    assert_eq!(
+        partition.finish_segment_merge(id, Ok(Ok(merged))),
+        Some(merged)
+    );
+    assert_eq!(
+        partition.settle_segment_merge(),
+        MergeSettled::Waiting(merged)
+    );
+    assert!(
+        partition.begin_segment_merge(MergePass::Drain).is_none(),
+        "the command of the stored one has not committed"
+    );
+    assert_eq!(partition.segment_merge_reclaim(), None);
+
+    lose_primacy(&mut partition);
+    assert!(!partition.merges_under_pressure());
+    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
+    regain_primacy(&mut partition);
+    assert!(partition.merges_under_pressure());
+
+    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    let diverged = merge.sources[1].start_offset;
+    assert_eq!(
+        partition.finish_segment_merge(
+            id,
+            Ok(Err(MergeError::SourceDiverged {
+                start_offset: diverged
+            }))
+        ),
+        None
+    );
+    assert_eq!(
+        partition.segment_merge_reclaim(),
+        None,
+        "every merge that makes the log shorter reads the source"
+    );
+    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
     assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
 }

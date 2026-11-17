@@ -380,6 +380,10 @@ pub struct ShardMetrics {
     partition_long_term_unannounced_objects: Gauge,
     partition_long_term_merges_total: Counter,
     partition_long_term_merged_segments_total: Counter,
+    partition_long_term_segments: Gauge,
+    partition_long_term_dead_objects: Gauge,
+    partition_long_term_trims_total: Counter,
+    partition_long_term_deleted_objects_total: Counter,
     fresh_objects: Gauge,
     fresh_object_bytes: Gauge,
     fresh_object_oldest_age_seconds: Gauge,
@@ -533,6 +537,10 @@ impl ShardMetrics {
             partition_long_term_unannounced_objects: Gauge::default(),
             partition_long_term_merges_total: Counter::default(),
             partition_long_term_merged_segments_total: Counter::default(),
+            partition_long_term_segments: Gauge::default(),
+            partition_long_term_dead_objects: Gauge::default(),
+            partition_long_term_trims_total: Counter::default(),
+            partition_long_term_deleted_objects_total: Counter::default(),
             fresh_objects: Gauge::default(),
             fresh_object_bytes: Gauge::default(),
             fresh_object_oldest_age_seconds: Gauge::default(),
@@ -1257,6 +1265,62 @@ impl ShardMetrics {
         )
     }
 
+    /// Republished by the pump's tick: the most segments the long-term log
+    /// of one partition this shard leads holds. A log takes no segment
+    /// beyond its limit, so this is how far the fullest one is from it.
+    pub fn set_long_term_segments(&self, segments: usize) {
+        self.partition_long_term_segments
+            .set(i64::try_from(segments).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_segments_value(&self) -> i64 {
+        self.partition_long_term_segments.get()
+    }
+
+    /// Republished by the pump's tick: the objects no long-term log lists
+    /// any more that wait to be deleted, summed over the partitions this
+    /// shard leads.
+    pub fn set_long_term_dead_objects(&self, objects: usize) {
+        self.partition_long_term_dead_objects
+            .set(i64::try_from(objects).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_dead_objects_value(&self) -> i64 {
+        self.partition_long_term_dead_objects.get()
+    }
+
+    /// A partition this shard leads sent a trim of its long-term log.
+    pub fn record_long_term_trim(&self) {
+        self.partition_long_term_trims_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_trims_value(&self) -> u64 {
+        self.partition_long_term_trims_total.get()
+    }
+
+    /// A delete removed `objects` long-term objects of a partition this
+    /// shard leads from the store.
+    pub fn record_long_term_objects_deleted(&self, objects: usize) {
+        self.partition_long_term_deleted_objects_total
+            .inc_by(objects as u64);
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_deleted_objects_value(&self) -> u64 {
+        self.partition_long_term_deleted_objects_total.get()
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1719,6 +1783,30 @@ impl ShardMetrics {
             "partition_long_term_merged_segments",
             "long-term segments that committed merges replaced, each merge by one segment",
             self.partition_long_term_merged_segments_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_segments",
+            "most segments the long-term log of one partition this shard leads holds, \
+             of the 65536 a log takes",
+            self.partition_long_term_segments.clone(),
+        );
+        registry.register(
+            "partition_long_term_dead_objects",
+            "objects of long-term segments that no long-term log lists any more and that \
+             wait to be deleted, over the partitions this shard leads",
+            self.partition_long_term_dead_objects.clone(),
+        );
+        registry.register(
+            "partition_long_term_trims",
+            "trims of a long-term log that the partitions this shard leads sent, one for \
+             every retention pass until the trim commits",
+            self.partition_long_term_trims_total.clone(),
+        );
+        registry.register(
+            "partition_long_term_deleted_objects",
+            "objects of long-term segments that the partitions this shard leads deleted \
+             from the store, the log and the index of a segment as one",
+            self.partition_long_term_deleted_objects_total.clone(),
         );
         registry.register(
             "retirement_debts_paid",

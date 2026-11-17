@@ -14155,16 +14155,28 @@ where
     /// grace period from `now`. A sweep that failed is repeated by a later
     /// pass. A delete forgets the segments it removed, and the ones it
     /// did not stay queued.
+    ///
+    /// Returns how many long-term objects a delete removed, which is none
+    /// on a partition that does not place its batches.
     pub fn finish_object_delete(
         &mut self,
         id: u64,
         outcome: crate::ObjectDeleteOutcome,
         now: IggyTimestamp,
-    ) {
+    ) -> usize {
         if self.places_batches() {
-            self.finish_long_term_delete(id, outcome, now);
-            return;
+            return self.finish_long_term_delete(id, outcome, now);
         }
+        self.finish_segment_object_delete(id, outcome, now);
+        0
+    }
+
+    fn finish_segment_object_delete(
+        &mut self,
+        id: u64,
+        outcome: crate::ObjectDeleteOutcome,
+        now: IggyTimestamp,
+    ) {
         let awaited = self
             .object_deletes
             .running

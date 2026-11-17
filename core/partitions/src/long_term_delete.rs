@@ -375,32 +375,33 @@ where
     ///
     /// A listing queues the dead objects it found. One that failed is
     /// repeated by a later pass. A delete forgets the objects it removed,
-    /// and the ones it did not stay queued.
+    /// and the ones it did not stay queued. Returns how many objects a
+    /// delete removed.
     pub(crate) fn finish_long_term_delete(
         &mut self,
         id: u64,
         outcome: ObjectDeleteOutcome,
         now: IggyTimestamp,
-    ) {
+    ) -> usize {
         let awaited = self
             .long_term_deletes
             .running
             .as_ref()
             .is_some_and(|(running, _, _)| *running == id);
         if !awaited {
-            return;
+            return 0;
         }
         if !self.deletes_long_term_objects()
             || self.long_term_deletes.view != Some(self.consensus().view())
         {
             self.long_term_deletes.clear();
-            return;
+            return 0;
         }
         let namespace_raw = self.namespace().inner();
         let stored = self.stored_manifest_progress();
         let deletes = &mut self.long_term_deletes;
         let Some((_, running, _scope)) = deletes.running.take() else {
-            return;
+            return 0;
         };
         match (running, outcome) {
             (
@@ -424,6 +425,7 @@ where
                     queued = deletes.dead.queued(),
                     "listed the long-term objects of the partition"
                 );
+                0
             }
             (
                 RunningLongTermDelete::Sweep { .. },
@@ -434,6 +436,7 @@ where
                     %error,
                     "listing the long-term objects of the partition failed and is tried again"
                 );
+                0
             }
             (
                 RunningLongTermDelete::Delete(sent),
@@ -448,11 +451,14 @@ where
                         "some long-term objects were not deleted and are tried again"
                     );
                 }
+                sent.iter()
+                    .filter(|object| !failed.contains(object))
+                    .count()
             }
             // A cancelled job, or a result of another kind of work, settles
             // nothing: the queue is as the job found it, and a listing that
             // did not finish runs again.
-            (RunningLongTermDelete::Sweep { .. } | RunningLongTermDelete::Delete(_), _) => {}
+            (RunningLongTermDelete::Sweep { .. } | RunningLongTermDelete::Delete(_), _) => 0,
         }
     }
 
@@ -517,10 +523,17 @@ where
         }
     }
 
-    /// How many dead objects this view has queued.
-    #[cfg(test)]
-    pub(crate) fn queued_dead_long_term_objects(&self) -> usize {
-        self.long_term_deletes.dead.queued()
+    /// How many dead objects this view has queued for their delete. Zero
+    /// on a replica that is not the primary.
+    #[must_use]
+    pub fn queued_dead_long_term_objects(&self) -> usize {
+        if self.long_term_deletes.view == Some(self.consensus().view())
+            && self.deletes_long_term_objects()
+        {
+            self.long_term_deletes.dead.queued()
+        } else {
+            0
+        }
     }
 
     /// Whether this replica is the one that deletes the partition's

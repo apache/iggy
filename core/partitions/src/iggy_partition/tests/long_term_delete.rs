@@ -458,3 +458,66 @@ async fn given_a_backup_when_a_pass_runs_should_start_no_job() {
     );
     assert_eq!(partition.long_term_unannounced_objects(), 0);
 }
+
+/// One pass, as [`pass`], that returns what its job did and how many
+/// objects the partition counts as deleted by it.
+async fn counted_pass(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    deleter: &Deleter,
+    now: IggyTimestamp,
+) -> (ObjectDeleteWork, usize) {
+    let (job, scope) = partition.begin_object_delete(now, 0).unwrap();
+    let (id, work) = (job.id, job.work.clone());
+    let outcome = deleter.run(job, scope).await;
+    (work, partition.finish_object_delete(id, outcome, now))
+}
+
+/// What waits for its delete and what a delete removed are what an operator
+/// reads the store's garbage from. A listing removes nothing, and an object
+/// the store kept is not counted as gone.
+#[compio::test]
+async fn given_dead_objects_when_passes_run_should_count_the_queued_and_the_deleted() {
+    let (_directory, mut partition, [first, second, _], deleter) =
+        Box::pin(leader_with_stored_segments()).await;
+    let now = IggyTimestamp::now();
+    assert_eq!(partition.queued_dead_long_term_objects(), 0);
+    Box::pin(replace_first_two(&mut partition, &deleter, &first, &second)).await;
+    assert_eq!(partition.queued_dead_long_term_objects(), 2);
+    store_manifest(&mut partition, now);
+    let due = after(now, delay());
+
+    let (listing, counted) = Box::pin(counted_pass(&mut partition, &deleter, due)).await;
+    assert_eq!(listing, sweep_of(&[(0, 1), (2, 3)]));
+    assert_eq!(counted, 0);
+    store(&deleter)
+        .deletes
+        .replace(Deletes::RefuseKey(long_term_key(
+            0,
+            0,
+            SegmentObject::Index,
+        )));
+    let (delete, counted) = Box::pin(counted_pass(&mut partition, &deleter, due)).await;
+    assert_eq!(delete, delete_of(&[(0, 0), (1, 1)]));
+    assert_eq!(counted, 1);
+    assert_eq!(partition.queued_dead_long_term_objects(), 1);
+
+    store(&deleter).deletes.replace(Deletes::Work);
+    let (delete, counted) = Box::pin(counted_pass(&mut partition, &deleter, due)).await;
+    assert_eq!(delete, delete_of(&[(0, 0)]));
+    assert_eq!(counted, 1);
+    assert_eq!(partition.queued_dead_long_term_objects(), 0);
+}
+
+/// What a replica queued while it led is not what it deletes once it does
+/// not, so it reports none of it.
+#[compio::test]
+async fn given_dead_objects_queued_by_a_primary_when_it_is_demoted_should_report_none() {
+    let (_directory, mut partition, [first, second, _], deleter) =
+        Box::pin(leader_with_stored_segments()).await;
+    Box::pin(replace_first_two(&mut partition, &deleter, &first, &second)).await;
+    assert_eq!(partition.queued_dead_long_term_objects(), 2);
+
+    lose_primacy(&mut partition);
+
+    assert_eq!(partition.queued_dead_long_term_objects(), 0);
+}
