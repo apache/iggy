@@ -32,6 +32,7 @@ import { syncGroup } from '../wire/consumer-group/sync-group.command.js';
 import {
   decodeFetchSection, fetchMessages, fetchSectionError, type FetchMessagesSection
 } from '../wire/message/fetch-messages.command.js';
+import { FRAME_HEADER_SIZE } from '../wire/message/iggy-header.utils.js';
 import { pollMessages } from '../wire/message/poll-messages.command.js';
 import { PollingStrategy, PollingStrategyKind, type PollMessagesResponse } from '../wire/message/poll.utils.js';
 import { CommitPolicy, pollOptions, wireOptions, type PollOptions } from '../wire/message/poll-options.js';
@@ -101,7 +102,11 @@ export type PartitionReaderRequest = {
   options?: Partial<PollOptions>,
   /**
    * Requested read-ahead bytes, 16 MiB by default, raised to hold at least 32
-   * full batches. With `CommitPolicy.OnRead` the server stores the offset of
+   * full batches. Counts message frame headers, payloads and encoded user
+   * headers, not total retained memory. Payload views retain whole replies,
+   * including the uncounted 256-byte batch header per record. Small records
+   * can therefore retain several times this budget.
+   * With `CommitPolicy.OnRead` the server stores the offset of
    * each read before the application takes its batch. A crash, or a reader
    * that stops without `close()`, loses the batches that the reader held: up
    * to the effective budget, which holds at least 32 batches.
@@ -910,9 +915,10 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     } else {
       state.handed = state.delivered = state.firstHanded = undefined;
     }
-    this.queue.unshift({ partitionId: batch.partitionId, generation, batch, messages: batch.messages.length,
-      bytes: batch.messages.reduce((sum, message) => sum + message.payload.length, 0) });
+    const bytes = this.batchBytes(batch);
+    this.queue.unshift({ partitionId: batch.partitionId, generation, batch, messages: batch.messages.length, bytes });
     this.queuedMessages += batch.messages.length;
+    this.queuedBytes += bytes;
   }
 
   /** @internal Counts messages that a consumer delivered or processed. */
@@ -1676,11 +1682,16 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
     this.enqueueBatch(target, polledBatch(polled, target.sent, { reader: this.id, generation: target.generation }));
   }
 
+  private batchBytes(batch: PolledBatch): number {
+    return batch.messages.reduce((sum, message) =>
+      sum + FRAME_HEADER_SIZE + message.payload.length + message.headers.userHeadersLength, 0);
+  }
+
   private enqueueBatch(target: Target, batch: PolledBatch): void {
     this.enqueue({
       partitionId: target.partition, generation: target.generation, batch,
       messages: batch.messages.length,
-      bytes: batch.messages.reduce((sum, message) => sum + message.payload.length, 0)
+      bytes: this.batchBytes(batch)
     });
   }
 

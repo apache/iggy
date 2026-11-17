@@ -300,6 +300,19 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
+    /// A list reply, `[next_len:u8][next][count:u32][item]*`. A next of no
+    /// bytes marks the last page.
+    static func pageBody(next: [UInt8] = [], items: [[UInt8]] = []) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(UInt8(next.count))
+        writer.write(next)
+        writer.write(UInt32(items.count))
+        for item in items {
+            writer.write(item)
+        }
+        return writer.bytes
+    }
+
     /// A topic with three partitions, 0 to 2, under `contexts`.
     static func topicBody(contexts: [PartitionContext]) -> [UInt8] {
         precondition(contexts.count == 3, "the golden topic header names three partitions")
@@ -420,6 +433,8 @@ final class FakeVSRServer: @unchecked Sendable {
             return .ok(polledBody(partitionID: 0, context: routeContext))
         case .fetchMessages:
             return .ok(fetchedBody([]))
+        case .getStreams, .getTopics, .getPartitions, .getConsumerGroups, .getUsers:
+            return .ok(pageBody())
         case .cancelDeferredRequest:
             return .stall
         default:

@@ -23,7 +23,7 @@
 //! `NonReplicatedResponse` dispatch shim.
 
 use crate::cluster_meta::ClusterRoster;
-use crate::namespace::ensure_topic_exists;
+use crate::namespace::{ensure_topic_exists, resolve_topic, stream_not_found};
 use crate::reply_frame::{build_empty_reply, build_reply_from_bytes};
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShard};
@@ -34,67 +34,72 @@ use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PARTITIONS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE,
 };
+use iggy_binary_protocol::primitives::page::{WirePageCursor, WirePageQuery};
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
+use iggy_binary_protocol::requests::partitions::GetPartitionsRequest;
 use iggy_binary_protocol::requests::personal_access_tokens::GetPersonalAccessTokensRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::system::{
     DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
 };
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
-use iggy_binary_protocol::requests::users::GetUserRequest;
+use iggy_binary_protocol::requests::users::{GetUserRequest, GetUsersRequest};
+use iggy_binary_protocol::responses::PageResponse;
 use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
-use iggy_binary_protocol::responses::consumer_groups::GetConsumerGroupsResponse;
+use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse,
 };
 use iggy_binary_protocol::responses::streams::StreamResponse;
-use iggy_binary_protocol::responses::streams::get_stream::{
-    GetStreamResponse, TopicHeader as StreamTopicHeader,
-};
-use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
-use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
-use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
     ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
 };
 use iggy_common::wire_conversions::{describe_options_response, resource_options_to_wire_split};
 use iggy_common::{
-    HeaderValue, IggyError, IggyTimestamp, OptionKey, OptionsScope, ResourceOptions, UserStatus,
-    public_options,
+    HeaderValue, IggyError, IggyTimestamp, NamedPageQuery, OptionKey, OptionsScope, PageCursor,
+    PageOrder, PageQuery, ResourceOptions, UserStatus, public_options,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use metadata::change_log::{MAX_PAGE_BYTES, MAX_SCANNED_ENTRIES};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Stream, StreamsInner, Topic};
-use metadata::stm::user::User;
+use metadata::stm::user::{User, UsersInner};
+use metadata::stm::walk::slice_after;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::warn;
 
-/// The stored fields a stream or topic read returns. Reads copy them under the
-/// metadata read guard and project the options after it, because the writer
-/// publishing the next apply waits for every reader to leave.
-struct StoredEntry {
+/// The stored fields a stream or topic read returns. A page projects them
+/// under the metadata read guard with the options borrowed, because it holds
+/// at most `MAX_PAGE_LIMIT` items. A detail read copies them with
+/// [`Self::into_owned`] under the guard and projects the options after it,
+/// because the writer publishing the next apply waits for every reader to
+/// leave.
+struct StoredEntry<'a> {
     id: usize,
     created_at: IggyTimestamp,
     /// Topics of a stream, partitions of a topic.
@@ -102,20 +107,46 @@ struct StoredEntry {
     size_bytes: u64,
     messages_count: u64,
     name: Arc<str>,
-    options: ResourceOptions,
+    options: Cow<'a, ResourceOptions>,
 }
 
-/// The stored fields a user read returns, copied like [`StoredEntry`].
-struct StoredUser {
+/// The stored fields a user read returns, read like [`StoredEntry`].
+struct StoredUser<'a> {
     id: u32,
     created_at: IggyTimestamp,
     status: UserStatus,
     username: Arc<str>,
-    options: ResourceOptions,
+    options: Cow<'a, ResourceOptions>,
 }
 
-impl From<&Stream> for StoredEntry {
-    fn from(stream: &Stream) -> Self {
+impl StoredEntry<'_> {
+    fn into_owned(self) -> StoredEntry<'static> {
+        StoredEntry {
+            id: self.id,
+            created_at: self.created_at,
+            children_count: self.children_count,
+            size_bytes: self.size_bytes,
+            messages_count: self.messages_count,
+            name: self.name,
+            options: Cow::Owned(self.options.into_owned()),
+        }
+    }
+}
+
+impl StoredUser<'_> {
+    fn into_owned(self) -> StoredUser<'static> {
+        StoredUser {
+            id: self.id,
+            created_at: self.created_at,
+            status: self.status,
+            username: self.username,
+            options: Cow::Owned(self.options.into_owned()),
+        }
+    }
+}
+
+impl<'a> From<&'a Stream> for StoredEntry<'a> {
+    fn from(stream: &'a Stream) -> Self {
         Self {
             id: stream.id,
             created_at: stream.created_at,
@@ -123,13 +154,13 @@ impl From<&Stream> for StoredEntry {
             size_bytes: stream.stats.size_bytes_inconsistent(),
             messages_count: stream.stats.messages_count_inconsistent(),
             name: Arc::clone(&stream.name),
-            options: stream.options.clone(),
+            options: Cow::Borrowed(&stream.options),
         }
     }
 }
 
-impl From<&Topic> for StoredEntry {
-    fn from(topic: &Topic) -> Self {
+impl<'a> From<&'a Topic> for StoredEntry<'a> {
+    fn from(topic: &'a Topic) -> Self {
         Self {
             id: topic.id,
             created_at: topic.created_at,
@@ -137,19 +168,19 @@ impl From<&Topic> for StoredEntry {
             size_bytes: topic.stats.size_bytes_inconsistent(),
             messages_count: topic.stats.messages_count_inconsistent(),
             name: Arc::clone(&topic.name),
-            options: topic.options.clone(),
+            options: Cow::Borrowed(&topic.options),
         }
     }
 }
 
-impl From<&User> for StoredUser {
-    fn from(user: &User) -> Self {
+impl<'a> From<&'a User> for StoredUser<'a> {
+    fn from(user: &'a User) -> Self {
         Self {
             id: user.id,
             created_at: user.created_at,
             status: user.status,
             username: Arc::clone(&user.username),
-            options: user.options.clone(),
+            options: Cow::Borrowed(&user.options),
         }
     }
 }
@@ -353,12 +384,9 @@ where
                 })
             })
         }
-        GET_STREAMS_CODE => {
-            let _ = GetStreamsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(NonReplicatedResponse::Bytes(
-                build_get_streams_response(shard)?.to_bytes(),
-            ))
-        }
+        GET_STREAMS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_get_streams_response(shard, body)?.to_bytes(),
+        )),
         GET_TOPIC_CODE => {
             let request =
                 GetTopicRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
@@ -368,15 +396,14 @@ where
                 })
             })
         }
-        GET_TOPICS_CODE => {
-            let request =
-                GetTopicsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(NonReplicatedResponse::Bytes(
-                build_get_topics_response(shard, &request.stream_id)?.to_bytes(),
-            ))
-        }
+        GET_TOPICS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_get_topics_response(shard, body)?.to_bytes(),
+        )),
+        GET_PARTITIONS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_get_partitions_response(shard, body)?.to_bytes(),
+        )),
         GET_USERS_CODE => Ok(NonReplicatedResponse::Bytes(
-            build_get_users_response(shard)?.to_bytes(),
+            build_get_users_response(shard, body)?.to_bytes(),
         )),
         GET_USER_CODE => {
             let request =
@@ -405,7 +432,9 @@ where
             ))
         }
         GET_CONSUMER_GROUP_CODE => build_consumer_group_response(shard, body),
-        GET_CONSUMER_GROUPS_CODE => build_consumer_groups_response(shard, body),
+        GET_CONSUMER_GROUPS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_consumer_groups_response(shard, body)?.to_bytes(),
+        )),
         // A table-listed non-replicated code with no arm is a routing bug and
         // an unknown code is a client bug; the empty-ok that used to cover both
         // attested a read that never ran. Only the named arms return `Empty`,
@@ -445,7 +474,7 @@ where
 fn build_consumer_groups_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     body: &[u8],
-) -> Result<NonReplicatedResponse, IggyError>
+) -> Result<PageResponse<ConsumerGroupResponse>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -455,16 +484,12 @@ where
 {
     let request =
         GetConsumerGroupsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-    ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
-    let groups = shard
+    shard
         .plane
         .metadata()
         .mux_stm
         .streams()
-        .consumer_group_list(&request.stream_id, &request.topic_id);
-    Ok(groups.map_or(NonReplicatedResponse::Empty, |groups| {
-        NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
-    }))
+        .read(|streams| consumer_groups_page(streams, request, PAGE_BUDGET))
 }
 
 /// Build the binary `GetClusterMetadata` reply from the shared roster assembly.
@@ -649,7 +674,10 @@ where
                     .items
                     .get(stream_id)
                     .ok_or(IggyError::InvalidIdentifier)?;
-                Ok(Some((StoredEntry::from(stream), stored_topics(stream))))
+                Ok(Some((
+                    StoredEntry::from(stream).into_owned(),
+                    stored_topics(stream),
+                )))
             })?;
     let Some((stream, topics)) = stored else {
         return Ok(None);
@@ -662,7 +690,8 @@ where
 
 fn build_get_streams_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-) -> Result<GetStreamsResponse, IggyError>
+    body: &[u8],
+) -> Result<PageResponse<StreamResponse>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -670,71 +699,63 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let streams = shard
+    let request = GetStreamsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    let (page, skipped) = shard
         .plane
         .metadata()
         .mux_stm
         .streams()
-        .read(stored_streams);
-    listed_streams(&streams).map(|streams| GetStreamsResponse { streams })
+        .read(|streams| streams_page(streams, request.page, PAGE_BUDGET))?;
+    log_skipped(&skipped);
+    Ok(page)
 }
 
-fn stored_streams(streams: &StreamsInner) -> Vec<StoredEntry> {
-    streams
-        .items
-        .iter()
-        .map(|(_, stream)| StoredEntry::from(stream))
-        .collect()
-}
-
-fn stored_topics(stream: &Stream) -> Vec<StoredEntry> {
+fn stored_topics(stream: &Stream) -> Vec<StoredEntry<'static>> {
     stream
         .topics
         .iter()
-        .map(|(_, topic)| StoredEntry::from(topic))
-        .collect()
-}
-
-/// Every stream a list read serves, see [`servable`].
-fn listed_streams(streams: &[StoredEntry]) -> Result<Vec<StreamResponse>, IggyError> {
-    streams
-        .iter()
-        .filter_map(|stream| {
-            servable(
-                stream_response(stream),
-                OptionsScope::Stream,
-                stream.id,
-                None,
-            )
-            .transpose()
-        })
+        .map(|(_, topic)| StoredEntry::from(topic).into_owned())
         .collect()
 }
 
 /// Every topic of stream `stream_id` a list read serves, see [`servable`].
 fn listed_topics(
     stream_id: usize,
-    topics: &[StoredEntry],
-) -> Result<Vec<StreamTopicHeader>, IggyError> {
-    topics
+    topics: &[StoredEntry<'_>],
+) -> Result<Vec<TopicResponse>, IggyError> {
+    let mut skipped = Vec::new();
+    let listed = topics
         .iter()
         .filter_map(|topic| {
             servable(
-                topic_header(topic),
+                topic_response(topic),
+                &mut skipped,
                 OptionsScope::Topic,
                 topic.id,
                 Some(stream_id),
             )
             .transpose()
         })
-        .collect()
+        .collect();
+    log_skipped(&skipped);
+    listed
+}
+
+/// A list entry that this build cannot read, see [`servable`].
+struct SkippedEntry {
+    scope: OptionsScope,
+    resource_id: usize,
+    stream_id: Option<usize>,
+    key: String,
 }
 
 /// A list entry, or `None` for a resource whose stored critical state this
 /// build cannot read. That resource still fails its own read, but it must not
-/// fail the list every other resource is served in.
+/// fail the list every other resource is served in. It lands in `skipped`, and
+/// the caller logs it with [`log_skipped`] after the metadata read guard.
 fn servable<T>(
     entry: Result<T, IggyError>,
+    skipped: &mut Vec<SkippedEntry>,
     scope: OptionsScope,
     resource_id: usize,
     stream_id: Option<usize>,
@@ -742,15 +763,27 @@ fn servable<T>(
     match entry {
         Ok(entry) => Ok(Some(entry)),
         Err(IggyError::UnsupportedCriticalOption(key)) => {
-            warn!(
-                scope = %scope,
+            skipped.push(SkippedEntry {
+                scope,
                 resource_id,
                 stream_id,
-                "Leaving {scope} {resource_id} out of the list, its critical option {key} is not readable by this build."
-            );
+                key,
+            });
             Ok(None)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn log_skipped(skipped: &[SkippedEntry]) {
+    for entry in skipped {
+        let (scope, resource_id, key) = (entry.scope, entry.resource_id, &entry.key);
+        warn!(
+            scope = %scope,
+            resource_id,
+            stream_id = entry.stream_id,
+            "Leaving {scope} {resource_id} out of the list, its critical option {key} is not readable by this build."
+        );
     }
 }
 
@@ -785,7 +818,7 @@ fn public_blocks(
     resource_options_to_wire_split(&public_options(scope, stored)?)
 }
 
-fn user_response(user: &StoredUser) -> Result<UserResponse, IggyError> {
+fn user_response(user: &StoredUser<'_>) -> Result<UserResponse, IggyError> {
     let (options, derived_options) = public_blocks(OptionsScope::User, &user.options)?;
     Ok(UserResponse {
         id: user.id,
@@ -799,7 +832,8 @@ fn user_response(user: &StoredUser) -> Result<UserResponse, IggyError> {
 
 fn build_get_users_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-) -> Result<GetUsersResponse, IggyError>
+    body: &[u8],
+) -> Result<PageResponse<UserResponse>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -807,26 +841,15 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let users = shard.plane.metadata().mux_stm.users().read(|users| {
-        users
-            .items
-            .iter()
-            .map(|(_, user)| StoredUser::from(user))
-            .collect::<Vec<_>>()
-    });
-    users
-        .iter()
-        .filter_map(|user| {
-            servable(
-                user_response(user),
-                OptionsScope::User,
-                user.id as usize,
-                None,
-            )
-            .transpose()
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|users| GetUsersResponse { users })
+    let request = GetUsersRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    let (page, skipped) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| users_page(users, request.page, PAGE_BUDGET))?;
+    log_skipped(&skipped);
+    Ok(page)
 }
 
 fn build_get_user_response<B, MJ, S, SB>(
@@ -850,7 +873,10 @@ where
                 return Ok(None);
             };
             let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
-            Ok(Some((StoredUser::from(user), user.permissions.clone())))
+            Ok(Some((
+                StoredUser::from(user).into_owned(),
+                user.permissions.clone(),
+            )))
         })?;
     let Some((user, permissions)) = stored else {
         return Ok(None);
@@ -928,21 +954,21 @@ where
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Some((StoredEntry::from(topic), partitions)))
+                Ok(Some((StoredEntry::from(topic).into_owned(), partitions)))
             })?;
     let Some((topic, partitions)) = stored else {
         return Ok(None);
     };
     Ok(Some(GetTopicResponse {
-        topic: topic_header(&topic)?,
+        topic: topic_response(&topic)?,
         partitions,
     }))
 }
 
 fn build_get_topics_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-) -> Result<GetTopicsResponse, IggyError>
+    body: &[u8],
+) -> Result<PageResponse<TopicResponse>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -950,30 +976,18 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let stored =
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .read(|streams| -> Result<_, IggyError> {
-                // Legacy parity: a missing stream lists as empty, not StreamNotFound.
-                let Some(resolved_stream) = streams.resolve_stream_id(stream_id) else {
-                    return Ok(None);
-                };
-                let stream = streams
-                    .items
-                    .get(resolved_stream)
-                    .ok_or(IggyError::InvalidIdentifier)?;
-                Ok(Some((stream.id, stored_topics(stream))))
-            })?;
-    let Some((stream_id, topics)) = stored else {
-        return Ok(GetTopicsResponse { topics: Vec::new() });
-    };
-    listed_topics(stream_id, &topics).map(|topics| GetTopicsResponse { topics })
+    let request = GetTopicsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    let (page, skipped) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|streams| topics_page(streams, request, PAGE_BUDGET))?;
+    log_skipped(&skipped);
+    Ok(page)
 }
 
-fn stream_response(stream: &StoredEntry) -> Result<StreamResponse, IggyError> {
+fn stream_response(stream: &StoredEntry<'_>) -> Result<StreamResponse, IggyError> {
     let (options, derived_options) = public_blocks(OptionsScope::Stream, &stream.options)?;
     Ok(StreamResponse {
         id: usize_to_u32(stream.id)?,
@@ -987,9 +1001,9 @@ fn stream_response(stream: &StoredEntry) -> Result<StreamResponse, IggyError> {
     })
 }
 
-fn topic_header(topic: &StoredEntry) -> Result<StreamTopicHeader, IggyError> {
+fn topic_response(topic: &StoredEntry<'_>) -> Result<TopicResponse, IggyError> {
     let (options, derived_options) = public_blocks(OptionsScope::Topic, &topic.options)?;
-    Ok(StreamTopicHeader {
+    Ok(TopicResponse {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
         partitions_count: usize_to_u32(topic.children_count)?,
@@ -1099,12 +1113,355 @@ fn partition_response(
     })
 }
 
+/// The budgets of one page read, see [`collect_page`].
+#[derive(Debug, Clone, Copy)]
+struct PageBudget {
+    scanned_entries: usize,
+    page_bytes: usize,
+}
+
+const PAGE_BUDGET: PageBudget = PageBudget {
+    scanned_entries: MAX_SCANNED_ENTRIES,
+    page_bytes: MAX_PAGE_BYTES,
+};
+
+/// One page of an ordered walk, built under the metadata read guard.
+///
+/// `walk` yields each entry after the cursor with its position, and `project`
+/// builds the wire item of an entry, or `None` for an entry the page skips.
+/// The page stops after `limit` items, after `scanned_entries` walked entries,
+/// or before the item that would take it past `page_bytes`. The first item
+/// always fits, so every page read makes progress. `next` is the position of
+/// the last walked entry, absent once the walk reached the end of the order.
+///
+/// An id walk over an `IdSlab` also passes the free slots of deleted entries,
+/// and they do not count. One page can therefore walk every slot up to the
+/// highest id ever used: at most `MAX_STREAMS` for streams and `MAX_TOPICS` for
+/// topics, and the peak number of users for users.
+fn collect_page<E, T: WireEncode>(
+    mut walk: impl Iterator<Item = (WirePageCursor, E)>,
+    limit: usize,
+    budget: PageBudget,
+    mut project: impl FnMut(E) -> Result<Option<T>, IggyError>,
+) -> Result<PageResponse<T>, IggyError> {
+    let mut items = Vec::new();
+    let mut bytes = 0;
+    let mut scanned = 0;
+    let mut walked = None;
+    while let Some((position, entry)) = walk.next() {
+        if let Some(item) = project(entry)? {
+            let size = item.encoded_size();
+            if !items.is_empty() && bytes + size > budget.page_bytes {
+                return Ok(PageResponse {
+                    items,
+                    next: walked,
+                });
+            }
+            bytes += size;
+            items.push(item);
+        }
+        walked = Some(position);
+        scanned += 1;
+        if items.len() == limit || scanned == budget.scanned_entries {
+            // The look-ahead only tells whether the order goes on.
+            let next = walk.next().and(walked);
+            return Ok(PageResponse { items, next });
+        }
+    }
+    Ok(PageResponse { items, next: None })
+}
+
+/// The start of a walk in id order. A creation cursor names no position in it.
+fn id_after(cursor: Option<PageCursor>) -> Result<Option<usize>, IggyError> {
+    match cursor.map(WirePageCursor::from) {
+        None => Ok(None),
+        // An id beyond `usize` lies past every entry, as `usize::MAX` does.
+        Some(WirePageCursor::Id(id)) => Ok(Some(usize::try_from(id).unwrap_or(usize::MAX))),
+        Some(WirePageCursor::Created { .. }) => Err(IggyError::InvalidCommand),
+    }
+}
+
+fn build_get_partitions_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    body: &[u8],
+) -> Result<PageResponse<PartitionResponse>, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let request = GetPartitionsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    let nodes = shard.replica_topology().replica_count;
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        let metadata_op = shard.plane.metadata().applied_frontier().get();
+        partitions_page(streams, request, metadata_op, nodes)
+    })
+}
+
+/// One page of the partitions of a topic, in id order. Partition ids follow
+/// creation, so the creation order walks the same way.
+fn partitions_page(
+    streams: &StreamsInner,
+    request: GetPartitionsRequest,
+    metadata_op: u64,
+    nodes: u8,
+) -> Result<PageResponse<PartitionResponse>, IggyError> {
+    let query = PageQuery::try_from(request.page)?;
+    let after = id_after(query.cursor)?;
+    let (stream_id, topic_id) = resolve_topic(streams, &request.stream_id, &request.topic_id)?;
+    let topic = streams
+        .items
+        .get(stream_id)
+        .and_then(|stream| stream.topics.get(topic_id))
+        .ok_or(IggyError::InvalidIdentifier)?;
+    let walk = topic
+        .partitions_after(after, query.descending)
+        .map(|partition| (WirePageCursor::Id(partition.id as u64), partition));
+    collect_page(walk, query.limit as usize, PAGE_BUDGET, |partition| {
+        partition_response(streams, stream_id, topic_id, partition, metadata_op, nodes).map(Some)
+    })
+}
+
+/// One page of the streams, and the streams it leaves out because this build
+/// cannot read them.
+fn streams_page(
+    streams: &StreamsInner,
+    page: WirePageQuery,
+    budget: PageBudget,
+) -> Result<(PageResponse<StreamResponse>, Vec<SkippedEntry>), IggyError> {
+    let NamedPageQuery { page: query, name } = NamedPageQuery::try_from(page)?;
+    let start = WalkStart::try_from(&query)?;
+    let limit = query.limit as usize;
+    let mut skipped = Vec::new();
+    let project = |stream: &Stream| {
+        if !matches_name(&stream.name, name.as_deref()) {
+            return Ok(None);
+        }
+        servable(
+            stream_response(&StoredEntry::from(stream)),
+            &mut skipped,
+            OptionsScope::Stream,
+            stream.id,
+            None,
+        )
+    };
+    let page = match start {
+        WalkStart::Id(after) => collect_page(
+            streams
+                .items
+                .walk(after, query.descending)
+                .map(|(id, stream)| (WirePageCursor::Id(id as u64), stream)),
+            limit,
+            budget,
+            project,
+        ),
+        WalkStart::Created(after) => collect_page(
+            streams
+                .streams_by_created(after, query.descending)
+                .map(|((created_at, id), stream)| (created_cursor(created_at, id), stream)),
+            limit,
+            budget,
+            project,
+        ),
+    }?;
+    Ok((page, skipped))
+}
+
+/// One page of the topics of a stream, and the topics it leaves out because
+/// this build cannot read them. A missing stream lists as an empty last page,
+/// as the full list did. After the first page it is `StreamIdNotFound`: the
+/// stream was deleted during the walk, so the pages read are not the list.
+fn topics_page(
+    streams: &StreamsInner,
+    request: GetTopicsRequest,
+    budget: PageBudget,
+) -> Result<(PageResponse<TopicResponse>, Vec<SkippedEntry>), IggyError> {
+    let NamedPageQuery { page: query, name } = NamedPageQuery::try_from(request.page)?;
+    let start = WalkStart::try_from(&query)?;
+    let Some(stream_id) = streams.resolve_stream_id(&request.stream_id) else {
+        if query.cursor.is_some() {
+            return Err(stream_not_found(&request.stream_id));
+        }
+        return Ok((
+            PageResponse {
+                items: Vec::new(),
+                next: None,
+            },
+            Vec::new(),
+        ));
+    };
+    let stream = streams
+        .items
+        .get(stream_id)
+        .ok_or(IggyError::InvalidIdentifier)?;
+    let limit = query.limit as usize;
+    let mut skipped = Vec::new();
+    let project = |topic: &Topic| {
+        if !matches_name(&topic.name, name.as_deref()) {
+            return Ok(None);
+        }
+        servable(
+            topic_response(&StoredEntry::from(topic)),
+            &mut skipped,
+            OptionsScope::Topic,
+            topic.id,
+            Some(stream_id),
+        )
+    };
+    let page = match start {
+        WalkStart::Id(after) => collect_page(
+            stream
+                .topics
+                .walk(after, query.descending)
+                .map(|(id, topic)| (WirePageCursor::Id(id as u64), topic)),
+            limit,
+            budget,
+            project,
+        ),
+        WalkStart::Created(after) => {
+            let topics = stream.topics_by_created();
+            collect_page(
+                slice_after(&topics, |(key, _)| *key, after, query.descending)
+                    .map(|&((created_at, id), topic)| (created_cursor(created_at, id), topic)),
+                limit,
+                budget,
+                project,
+            )
+        }
+    }?;
+    Ok((page, skipped))
+}
+
+/// One page of the consumer groups of a topic, in id order. Group ids follow
+/// creation, so the creation order walks the same way.
+fn consumer_groups_page(
+    streams: &StreamsInner,
+    request: GetConsumerGroupsRequest,
+    budget: PageBudget,
+) -> Result<PageResponse<ConsumerGroupResponse>, IggyError> {
+    let NamedPageQuery { page: query, name } = NamedPageQuery::try_from(request.page)?;
+    let after = id_after(query.cursor)?;
+    let (stream_id, topic_id) = resolve_topic(streams, &request.stream_id, &request.topic_id)?;
+    let topic = streams
+        .items
+        .get(stream_id)
+        .and_then(|stream| stream.topics.get(topic_id))
+        .ok_or(IggyError::InvalidIdentifier)?;
+    let walk = topic
+        .consumer_groups_after(after.map(|id| id as u64), query.descending)
+        .map(|group| (WirePageCursor::Id(group.id), group));
+    collect_page(walk, query.limit as usize, budget, |group| {
+        Ok(
+            matches_name(&group.name, name.as_deref())
+                .then(|| topic.consumer_group_response(group)),
+        )
+    })
+}
+
+/// One page of the users, and the users it leaves out because this build
+/// cannot read them.
+fn users_page(
+    users: &UsersInner,
+    page: WirePageQuery,
+    budget: PageBudget,
+) -> Result<(PageResponse<UserResponse>, Vec<SkippedEntry>), IggyError> {
+    let NamedPageQuery { page: query, name } = NamedPageQuery::try_from(page)?;
+    let start = WalkStart::try_from(&query)?;
+    let limit = query.limit as usize;
+    let mut skipped = Vec::new();
+    let project = |user: &User| {
+        if !matches_name(&user.username, name.as_deref()) {
+            return Ok(None);
+        }
+        servable(
+            user_response(&StoredUser::from(user)),
+            &mut skipped,
+            OptionsScope::User,
+            user.id as usize,
+            None,
+        )
+    };
+    let page = match start {
+        WalkStart::Id(after) => collect_page(
+            users
+                .items
+                .walk(after, query.descending)
+                .map(|(id, user)| (WirePageCursor::Id(id as u64), user)),
+            limit,
+            budget,
+            project,
+        ),
+        WalkStart::Created(after) => collect_page(
+            users
+                .users_by_created(after, query.descending)
+                .map(|((created_at, id), user)| (created_cursor(created_at, id), user)),
+            limit,
+            budget,
+            project,
+        ),
+    }?;
+    Ok((page, skipped))
+}
+
+/// Where a walk in the order of a query starts.
+enum WalkStart {
+    Id(Option<usize>),
+    Created(Option<(u64, usize)>),
+}
+
+impl TryFrom<&PageQuery> for WalkStart {
+    type Error = IggyError;
+
+    fn try_from(query: &PageQuery) -> Result<Self, Self::Error> {
+        match query.order {
+            PageOrder::Id => id_after(query.cursor).map(Self::Id),
+            PageOrder::Created => created_after(query.cursor).map(Self::Created),
+        }
+    }
+}
+
+/// The start of a walk in creation order. An id cursor names no position in
+/// it.
+fn created_after(cursor: Option<PageCursor>) -> Result<Option<(u64, usize)>, IggyError> {
+    match cursor.map(WirePageCursor::from) {
+        None => Ok(None),
+        // An id beyond `usize` lies past every entry of its time, as `usize::MAX` does.
+        Some(WirePageCursor::Created { created_at, id }) => Ok(Some((
+            created_at,
+            usize::try_from(id).unwrap_or(usize::MAX),
+        ))),
+        Some(WirePageCursor::Id(_)) => Err(IggyError::InvalidCommand),
+    }
+}
+
+const fn created_cursor(created_at: u64, id: usize) -> WirePageCursor {
+    WirePageCursor::Created {
+        created_at,
+        id: id as u64,
+    }
+}
+
+/// Whether `name` holds the name filter of a page, as a case-sensitive
+/// substring.
+fn matches_name(name: &str, filter: Option<&str>) -> bool {
+    filter.is_none_or(|filter| name.contains(filter))
+}
+
 pub enum NonReplicatedResponse {
     Empty,
     Bytes(Bytes),
 }
 
 impl NonReplicatedResponse {
+    pub(crate) const fn body_len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Bytes(body) => body.len(),
+        }
+    }
+
     pub(crate) fn into_reply(
         self,
         request_header: &RoutedRequestHeader,
@@ -1124,7 +1481,16 @@ impl NonReplicatedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{HeaderKey, OptionValue};
+    use iggy_binary_protocol::primitives::page::WirePageOrder;
+    use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
+    };
+    use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
+    use iggy_common::{HeaderKey, Identifier, OptionValue};
+    use metadata::stm::StateHandler;
+    use metadata::stm::stream::Partition;
     use std::str::FromStr;
 
     #[test]
@@ -1157,10 +1523,36 @@ mod tests {
         let names = |names: Vec<&WireName>| -> Vec<String> {
             names.iter().map(|name| name.as_str().to_owned()).collect()
         };
-        let listed = listed_streams(&stored_streams(&streams)).expect("the stream list builds");
+        let skipped_keys = |skipped: Vec<SkippedEntry>| -> Vec<(OptionsScope, String)> {
+            skipped
+                .into_iter()
+                .map(|entry| (entry.scope, entry.key))
+                .collect()
+        };
+        let (page, skipped) =
+            streams_page(&streams, WirePageQuery::default(), PAGE_BUDGET).expect("a stream page");
         assert_eq!(
-            names(listed.iter().map(|stream| &stream.name).collect()),
+            names(page.items.iter().map(|stream| &stream.name).collect()),
             ["readable"]
+        );
+        assert_eq!(page.next, None);
+        assert_eq!(
+            skipped_keys(skipped),
+            [(OptionsScope::Stream, "future_key".to_owned())]
+        );
+        let topics_request = GetTopicsRequest {
+            stream_id: WireIdentifier::numeric(u32::try_from(readable_slot).unwrap()),
+            page: WirePageQuery::default(),
+        };
+        let (page, skipped) =
+            topics_page(&streams, topics_request, PAGE_BUDGET).expect("a topic page");
+        assert_eq!(
+            names(page.items.iter().map(|topic| &topic.name).collect()),
+            ["kept"]
+        );
+        assert_eq!(
+            skipped_keys(skipped),
+            [(OptionsScope::Topic, "future_key".to_owned())]
         );
         let readable = streams.items.get(readable_slot).expect("stream stored");
         let topics =
@@ -1317,7 +1709,7 @@ mod tests {
                 Partition::new(1, 1, created_at, 0, 0),
             ],
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
-            consumer_groups: ahash::AHashMap::default(),
+            consumer_groups: std::collections::BTreeMap::new(),
             consumer_group_index: ahash::AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
@@ -1380,12 +1772,624 @@ mod tests {
         );
         topic.set_options(options.clone());
 
-        let header = topic_header(&StoredEntry::from(&topic)).expect("topic header builds");
+        let header = topic_response(&StoredEntry::from(&topic)).expect("topic header builds");
 
         let mut explicit = resource_options_from_wire(&header.options, true).unwrap();
         explicit.extend(resource_options_from_wire(&header.derived_options, false).unwrap());
         assert_eq!(explicit, options);
         assert_eq!((&header.options).into_iter().count(), 1);
         assert_eq!((&header.derived_options).into_iter().count(), 1);
+    }
+
+    const ENTRIES: u64 = 10;
+    /// The encoded size of each test item, `e0` to `e9` behind a length byte.
+    const ITEM_BYTES: usize = 3;
+
+    /// One page of the entries 0 to 9 after `after`, keeping the entries that
+    /// `keep` accepts.
+    fn entries_page(
+        after: Option<u64>,
+        limit: usize,
+        budget: PageBudget,
+        keep: impl Fn(u64) -> bool,
+    ) -> PageResponse<WireName> {
+        let walk = (0..ENTRIES)
+            .filter(|id| after.is_none_or(|after| *id > after))
+            .map(|id| (WirePageCursor::Id(id), id));
+        collect_page(walk, limit, budget, |id| {
+            Ok(keep(id).then(|| WireName::new(format!("e{id}")).unwrap()))
+        })
+        .unwrap()
+    }
+
+    /// Every page from the start, as (items, pages read). `read_page` reads the
+    /// page after a cursor, as a client does with the `next` of each page.
+    fn walk_pages<T>(
+        mut read_page: impl FnMut(Option<WirePageCursor>) -> PageResponse<T>,
+    ) -> (Vec<T>, usize) {
+        let mut items = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            let page = read_page(cursor);
+            items.extend(page.items);
+            let Some(next) = page.next else {
+                return (items, pages);
+            };
+            cursor = Some(next);
+        }
+    }
+
+    /// Every page of the entries from the start, as (item names, pages read).
+    fn walk_entries(
+        limit: usize,
+        budget: PageBudget,
+        keep: impl Fn(u64) -> bool + Copy,
+    ) -> (Vec<String>, usize) {
+        let (items, pages) = walk_pages(|cursor| {
+            let after = cursor.map(|cursor| match cursor {
+                WirePageCursor::Id(id) => id,
+                cursor @ WirePageCursor::Created { .. } => {
+                    panic!("an id walk returned {cursor:?}")
+                }
+            });
+            entries_page(after, limit, budget, keep)
+        });
+        let names = items.iter().map(|name| name.as_str().to_owned()).collect();
+        (names, pages)
+    }
+
+    fn names(ids: impl IntoIterator<Item = u64>) -> Vec<String> {
+        ids.into_iter().map(|id| format!("e{id}")).collect()
+    }
+
+    #[test]
+    fn given_any_limit_when_walking_every_page_should_return_each_entry_once() {
+        for limit in [1, 2, 3, 5, 9, 10, 11, 1000] {
+            let (walked, pages) = walk_entries(limit, PAGE_BUDGET, |_| true);
+            assert_eq!(walked, names(0..ENTRIES), "limit {limit}");
+            assert_eq!(
+                pages,
+                10_usize.div_ceil(limit),
+                "limit {limit}: only the page that reaches the end has no next"
+            );
+            let (even, _) = walk_entries(limit, PAGE_BUDGET, |id| id % 2 == 0);
+            assert_eq!(even, names((0..ENTRIES).step_by(2)), "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn given_a_byte_budget_when_paging_should_stop_before_the_item_that_passes_it() {
+        let budget = |items| PageBudget {
+            page_bytes: items * ITEM_BYTES,
+            ..PAGE_BUDGET
+        };
+        let page = entries_page(None, 1000, budget(3), |_| true);
+        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.next, Some(WirePageCursor::Id(2)));
+
+        let tight = PageBudget {
+            page_bytes: 1,
+            ..PAGE_BUDGET
+        };
+        let page = entries_page(None, 1000, tight, |_| true);
+        assert_eq!(page.items.len(), 1, "the first item fits any budget");
+        assert_eq!(page.next, Some(WirePageCursor::Id(0)));
+        assert_eq!(walk_entries(1000, tight, |_| true).0, names(0..ENTRIES));
+    }
+
+    #[test]
+    fn given_skipped_entries_before_the_byte_stop_when_paging_should_continue_after_them() {
+        let keep = |id| id != 1 && id != 2;
+        let one_item = PageBudget {
+            page_bytes: ITEM_BYTES,
+            ..PAGE_BUDGET
+        };
+        let page = entries_page(None, 1000, one_item, keep);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.next, Some(WirePageCursor::Id(2)));
+        let page = entries_page(Some(2), 1000, one_item, keep);
+        assert_eq!(page.items[0].as_str(), "e3");
+    }
+
+    #[test]
+    fn given_a_filter_without_a_match_when_paging_should_end_after_the_scan_budget_pages() {
+        let scan = |entries| PageBudget {
+            scanned_entries: entries,
+            ..PAGE_BUDGET
+        };
+        let page = entries_page(None, 1000, scan(4), |_| false);
+        assert_eq!(page.items, Vec::<WireName>::new());
+        assert_eq!(page.next, Some(WirePageCursor::Id(3)));
+        assert_eq!(walk_entries(1000, scan(4), |_| false), (Vec::new(), 3));
+        assert_eq!(walk_entries(1000, scan(5), |_| false), (Vec::new(), 2));
+    }
+
+    fn topic_with_partitions(count: usize) -> StreamsInner {
+        let created_at = IggyTimestamp::from(1u64);
+        let mut streams = StreamsInner::new();
+        let mut stream = Stream::new(Arc::from("orders"), created_at);
+        let mut topic = Topic::new(Arc::from("events"), created_at, stream.stats.clone());
+        topic.partitions = (0..count)
+            .map(|id| Partition::new(id, id as u64, created_at, 0, 0))
+            .collect();
+        stream.topics.insert(topic);
+        streams.items.insert(stream);
+        streams
+    }
+
+    fn partition_ids(
+        streams: &StreamsInner,
+        stream_id: u32,
+        page: WirePageQuery,
+    ) -> Result<(Vec<u32>, Option<WirePageCursor>), IggyError> {
+        let request = GetPartitionsRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(0),
+            page,
+        };
+        partitions_page(streams, request, 0, 1).map(|page| {
+            let ids = page.items.iter().map(|partition| partition.id).collect();
+            (ids, page.next)
+        })
+    }
+
+    #[test]
+    fn given_a_topic_when_paging_its_partitions_should_walk_ids_in_both_directions() {
+        let streams = topic_with_partitions(5);
+        let page = |descending, limit, cursor: Option<u64>| {
+            let query = WirePageQuery {
+                descending,
+                limit,
+                cursor: cursor.map(WirePageCursor::Id),
+                ..WirePageQuery::default()
+            };
+            partition_ids(&streams, 0, query).unwrap()
+        };
+        let id = |id| Some(WirePageCursor::Id(id));
+        assert_eq!(page(false, 2, None), (vec![0, 1], id(1)));
+        assert_eq!(page(false, 2, Some(1)), (vec![2, 3], id(3)));
+        assert_eq!(page(false, 2, Some(3)), (vec![4], None));
+        assert_eq!(page(true, 2, None), (vec![4, 3], id(3)));
+        assert_eq!(page(true, 2, Some(3)), (vec![2, 1], id(1)));
+        assert_eq!(page(true, 2, Some(1)), (vec![0], None));
+        assert_eq!(page(false, 5, None), (vec![0, 1, 2, 3, 4], None));
+        assert_eq!(page(false, 10, Some(u64::MAX)), (Vec::new(), None));
+        assert_eq!(page(true, 10, Some(u64::MAX)), (vec![4, 3, 2, 1, 0], None));
+
+        let created = WirePageQuery {
+            order: WirePageOrder::Created,
+            limit: 2,
+            ..WirePageQuery::default()
+        };
+        assert_eq!(
+            partition_ids(&streams, 0, created).unwrap(),
+            (vec![0, 1], id(1)),
+            "partition ids follow creation"
+        );
+    }
+
+    #[test]
+    fn given_a_page_block_partitions_cannot_serve_when_paging_should_refuse_it() {
+        let streams = topic_with_partitions(3);
+        let refused = [
+            WirePageQuery {
+                cursor: Some(WirePageCursor::Created {
+                    created_at: 1,
+                    id: 0,
+                }),
+                ..WirePageQuery::default()
+            },
+            WirePageQuery {
+                name: Some(WireName::new("p").unwrap()),
+                ..WirePageQuery::default()
+            },
+            WirePageQuery {
+                limit: 0,
+                ..WirePageQuery::default()
+            },
+            WirePageQuery {
+                limit: 1001,
+                ..WirePageQuery::default()
+            },
+        ];
+        for query in refused {
+            assert_eq!(
+                partition_ids(&streams, 0, query.clone()),
+                Err(IggyError::InvalidCommand),
+                "{query:?}"
+            );
+        }
+        assert_eq!(
+            partition_ids(&streams, 7, WirePageQuery::default()),
+            Err(IggyError::StreamIdNotFound(Identifier::default()))
+        );
+        let missing_topic = GetPartitionsRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(7),
+            page: WirePageQuery::default(),
+        };
+        assert_eq!(
+            partitions_page(&streams, missing_topic, 0, 1).map(|page| page.items.len()),
+            Err(IggyError::TopicIdNotFound(
+                Identifier::default(),
+                Identifier::default()
+            ))
+        );
+    }
+
+    /// Applies one fixture request at `micros`, as a commit does.
+    fn apply_at<R: StateHandler>(request: &R, state: &mut R::State, micros: u64) {
+        let reply = request.apply(state, IggyTimestamp::from(micros));
+        assert_eq!(reply.code, 0, "the fixture request applies");
+    }
+
+    fn create_stream(name: &str) -> CreateStreamRequest {
+        CreateStreamRequest {
+            name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
+        }
+    }
+
+    /// A topic of stream 0 without partitions, so that a delete of it ends in
+    /// its own apply.
+    fn create_topic(name: &str) -> CreateTopicWithAssignmentsRequest {
+        CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 0,
+                name: WireName::new(name).unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: Vec::new(),
+        }
+    }
+
+    fn create_user(username: &str) -> CreateUserRequest {
+        CreateUserRequest {
+            username: WireName::new(username).unwrap(),
+            password: "hash".to_owned(),
+            status: 1,
+            permissions: None,
+            options: WireOptions::empty(),
+        }
+    }
+
+    /// Streams `a` to `e`, then `b` deleted and `f` created in its id: the id
+    /// order is `a f c d e`, the creation order `a c d e f`. Stream `a` holds
+    /// the topics `ta` to `tc`, then `ta` deleted and `td` created in its id:
+    /// the id order is `td tb tc`, the creation order `tb tc td`. Topic `tb`
+    /// holds the groups `g0` to `g4`.
+    fn paged_streams() -> StreamsInner {
+        let mut streams = StreamsInner::new();
+        for (micros, name) in [(10, "a"), (20, "b"), (30, "c"), (40, "d"), (50, "e")] {
+            apply_at(&create_stream(name), &mut streams, micros);
+        }
+        let delete_stream = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(1),
+        };
+        apply_at(&delete_stream, &mut streams, 60);
+        apply_at(&create_stream("f"), &mut streams, 70);
+        for (micros, name) in [(80, "ta"), (90, "tb"), (100, "tc")] {
+            apply_at(&create_topic(name), &mut streams, micros);
+        }
+        let delete_topic = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        apply_at(&delete_topic, &mut streams, 110);
+        apply_at(&create_topic("td"), &mut streams, 120);
+        for (micros, name) in [
+            (130, "g0"),
+            (140, "g1"),
+            (150, "g2"),
+            (160, "g3"),
+            (170, "g4"),
+        ] {
+            let create_group = CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(1),
+                name: WireName::new(name).unwrap(),
+            };
+            apply_at(&create_group, &mut streams, micros);
+        }
+        streams
+    }
+
+    /// Walks every page of `order` in both directions at each limit up to one
+    /// past the entry count, and checks the names against `ascending` and the
+    /// number of pages read.
+    fn assert_walks<T>(
+        order: WirePageOrder,
+        ascending: &[&str],
+        read_page: impl Fn(WirePageQuery) -> PageResponse<T>,
+        name: impl Fn(&T) -> &str,
+    ) {
+        for descending in [false, true] {
+            let mut expected = ascending.to_vec();
+            if descending {
+                expected.reverse();
+            }
+            for limit in 1..=expected.len() + 1 {
+                let (items, pages) = walk_pages(|cursor| {
+                    read_page(WirePageQuery {
+                        order,
+                        descending,
+                        limit: u32::try_from(limit).unwrap(),
+                        cursor,
+                        ..WirePageQuery::default()
+                    })
+                });
+                let names: Vec<&str> = items.iter().map(&name).collect();
+                let case = format!("{order:?} descending={descending} limit={limit}");
+                assert_eq!(names, expected, "{case}");
+                assert_eq!(pages, expected.len().div_ceil(limit), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_reused_stream_id_when_paging_streams_should_walk_each_order_both_ways() {
+        let streams = paged_streams();
+        let read_page = |page| streams_page(&streams, page, PAGE_BUDGET).unwrap().0;
+        assert_walks(
+            WirePageOrder::Id,
+            &["a", "f", "c", "d", "e"],
+            read_page,
+            |stream| stream.name.as_str(),
+        );
+        assert_walks(
+            WirePageOrder::Created,
+            &["a", "c", "d", "e", "f"],
+            read_page,
+            |stream| stream.name.as_str(),
+        );
+    }
+
+    #[test]
+    fn given_creates_and_deletes_between_pages_when_walking_should_list_each_lasting_stream_once() {
+        let cases = [
+            // `g` takes id 0 behind the cursor, `h` takes id 3 ahead of it.
+            (WirePageOrder::Id, ["a", "f", "c", "h", "e"].as_slice()),
+            (
+                WirePageOrder::Created,
+                ["a", "c", "e", "f", "g", "h"].as_slice(),
+            ),
+        ];
+        for (order, expected) in cases {
+            let mut streams = paged_streams();
+            let page = |streams: &StreamsInner, cursor| {
+                let query = WirePageQuery {
+                    order,
+                    limit: 2,
+                    cursor,
+                    ..WirePageQuery::default()
+                };
+                streams_page(streams, query, PAGE_BUDGET).unwrap().0
+            };
+            let first = page(&streams, None);
+            for (stream_id, micros) in [(0, 180), (3, 190)] {
+                let delete = DeleteStreamRequest {
+                    stream_id: WireIdentifier::numeric(stream_id),
+                };
+                apply_at(&delete, &mut streams, micros);
+            }
+            apply_at(&create_stream("g"), &mut streams, 200);
+            apply_at(&create_stream("h"), &mut streams, 210);
+            let resume = first.next.expect("a second page");
+            let (rest, _) = walk_pages(|cursor| page(&streams, Some(cursor.unwrap_or(resume))));
+            let names: Vec<&str> = first
+                .items
+                .iter()
+                .chain(&rest)
+                .map(|stream| stream.name.as_str())
+                .collect();
+            assert_eq!(names, expected, "{order:?} order");
+        }
+    }
+
+    #[test]
+    fn given_a_reused_topic_id_when_paging_topics_should_walk_each_order_both_ways() {
+        let streams = paged_streams();
+        let read_page = |page| {
+            let request = GetTopicsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                page,
+            };
+            topics_page(&streams, request, PAGE_BUDGET).unwrap().0
+        };
+        assert_walks(WirePageOrder::Id, &["td", "tb", "tc"], read_page, |topic| {
+            topic.name.as_str()
+        });
+        assert_walks(
+            WirePageOrder::Created,
+            &["tb", "tc", "td"],
+            read_page,
+            |topic| topic.name.as_str(),
+        );
+
+        let missing_stream = GetTopicsRequest {
+            stream_id: WireIdentifier::numeric(9),
+            page: WirePageQuery::default(),
+        };
+        let (page, skipped) = topics_page(&streams, missing_stream, PAGE_BUDGET).unwrap();
+        assert_eq!(
+            (page.items.len(), page.next, skipped.len()),
+            (0, None, 0),
+            "a missing stream lists as an empty last page"
+        );
+        let stream_deleted_during_the_walk = GetTopicsRequest {
+            stream_id: WireIdentifier::numeric(9),
+            page: WirePageQuery {
+                cursor: Some(WirePageCursor::Id(0)),
+                ..WirePageQuery::default()
+            },
+        };
+        assert!(
+            matches!(
+                topics_page(&streams, stream_deleted_during_the_walk, PAGE_BUDGET),
+                Err(IggyError::StreamIdNotFound(_))
+            ),
+            "a page after the first one needs its stream"
+        );
+    }
+
+    #[test]
+    fn given_a_reused_user_id_when_paging_users_should_start_the_creation_order_at_root() {
+        let mut users = UsersInner::new();
+        for (micros, username) in [(10, "root"), (20, "bravo"), (30, "charlie"), (40, "delta")] {
+            apply_at(&create_user(username), &mut users, micros);
+        }
+        let delete_user = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(1),
+        };
+        apply_at(&delete_user, &mut users, 50);
+        apply_at(&create_user("echo"), &mut users, 60);
+        let read_page = |page| users_page(&users, page, PAGE_BUDGET).unwrap().0;
+        assert_walks(
+            WirePageOrder::Id,
+            &["root", "echo", "charlie", "delta"],
+            read_page,
+            |user| user.username.as_str(),
+        );
+        assert_walks(
+            WirePageOrder::Created,
+            &["root", "charlie", "delta", "echo"],
+            read_page,
+            |user| user.username.as_str(),
+        );
+    }
+
+    #[test]
+    fn given_consumer_groups_when_paging_should_walk_ids_for_each_order() {
+        let streams = paged_streams();
+        let request = |topic_id, page| GetConsumerGroupsRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(topic_id),
+            page,
+        };
+        let read_page =
+            |page| consumer_groups_page(&streams, request(1, page), PAGE_BUDGET).unwrap();
+        let groups = ["g0", "g1", "g2", "g3", "g4"];
+        for order in [WirePageOrder::Id, WirePageOrder::Created] {
+            assert_walks(order, &groups, read_page, |group| group.name.as_str());
+        }
+        let created = WirePageQuery {
+            order: WirePageOrder::Created,
+            limit: 2,
+            ..WirePageQuery::default()
+        };
+        assert!(
+            matches!(read_page(created).next, Some(WirePageCursor::Id(_))),
+            "a creation walk of groups goes on with an id cursor"
+        );
+
+        let created_cursor = WirePageQuery {
+            order: WirePageOrder::Created,
+            cursor: Some(WirePageCursor::Created {
+                created_at: 130,
+                id: 0,
+            }),
+            ..WirePageQuery::default()
+        };
+        assert_eq!(
+            consumer_groups_page(&streams, request(1, created_cursor), PAGE_BUDGET)
+                .map(|page| page.items.len()),
+            Err(IggyError::InvalidCommand)
+        );
+        assert_eq!(
+            consumer_groups_page(&streams, request(9, WirePageQuery::default()), PAGE_BUDGET)
+                .map(|page| page.items.len()),
+            Err(IggyError::TopicIdNotFound(
+                Identifier::default(),
+                Identifier::default()
+            ))
+        );
+        let missing_stream = GetConsumerGroupsRequest {
+            stream_id: WireIdentifier::numeric(9),
+            ..request(1, WirePageQuery::default())
+        };
+        assert_eq!(
+            consumer_groups_page(&streams, missing_stream, PAGE_BUDGET)
+                .map(|page| page.items.len()),
+            Err(IggyError::StreamIdNotFound(Identifier::default()))
+        );
+    }
+
+    #[test]
+    fn given_a_name_filter_when_paging_streams_should_bound_the_scan_of_each_page() {
+        let streams = paged_streams();
+        let two_scanned = PageBudget {
+            scanned_entries: 2,
+            ..PAGE_BUDGET
+        };
+        let filtered = |name: &str, cursor| WirePageQuery {
+            name: Some(WireName::new(name).unwrap()),
+            cursor,
+            ..WirePageQuery::default()
+        };
+        let read_page = |name, cursor| {
+            streams_page(&streams, filtered(name, cursor), two_scanned)
+                .unwrap()
+                .0
+        };
+
+        let first = read_page("z", None);
+        assert_eq!(
+            (first.items.len(), first.next),
+            (0, Some(WirePageCursor::Id(1))),
+            "streams a and f scanned"
+        );
+        let (found, pages) = walk_pages(|cursor| read_page("z", cursor));
+        assert_eq!(
+            (found.len(), pages),
+            (0, 3),
+            "five streams, two scanned per page"
+        );
+        let (found, _) = walk_pages(|cursor| read_page("d", cursor));
+        let names: Vec<&str> = found.iter().map(|stream| stream.name.as_str()).collect();
+        assert_eq!(names, ["d"]);
+    }
+
+    #[test]
+    fn given_a_cursor_of_the_other_order_when_paging_should_refuse_it() {
+        let streams = paged_streams();
+        let users = UsersInner::new();
+        let created_cursor = WirePageCursor::Created {
+            created_at: 10,
+            id: 0,
+        };
+        for (order, cursor) in [
+            (WirePageOrder::Id, created_cursor),
+            (WirePageOrder::Created, WirePageCursor::Id(0)),
+        ] {
+            let page = WirePageQuery {
+                order,
+                cursor: Some(cursor),
+                ..WirePageQuery::default()
+            };
+            assert_eq!(
+                streams_page(&streams, page.clone(), PAGE_BUDGET).map(|(page, _)| page.items.len()),
+                Err(IggyError::InvalidCommand),
+                "streams in {order:?} order"
+            );
+            let missing_stream = GetTopicsRequest {
+                stream_id: WireIdentifier::numeric(9),
+                page: page.clone(),
+            };
+            assert_eq!(
+                topics_page(&streams, missing_stream, PAGE_BUDGET)
+                    .map(|(page, _)| page.items.len()),
+                Err(IggyError::InvalidCommand),
+                "the query is checked before the stream, in {order:?} order"
+            );
+            assert_eq!(
+                users_page(&users, page, PAGE_BUDGET).map(|(page, _)| page.items.len()),
+                Err(IggyError::InvalidCommand),
+                "users in {order:?} order"
+            );
+        }
     }
 }

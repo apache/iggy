@@ -29,15 +29,25 @@ import (
 )
 
 func (c *IggyTcpClient) GetConsumerGroups(ctx context.Context, streamId, topicId iggcon.Identifier) ([]iggcon.ConsumerGroup, error) {
+	return readWholeList(ctx, c, func(ctx context.Context, query iggcon.PageQuery) (*iggcon.Page[iggcon.ConsumerGroup], error) {
+		return c.GetConsumerGroupsPage(ctx, streamId, topicId, iggcon.NamedPageQuery{PageQuery: query})
+	})
+}
+
+func (c *IggyTcpClient) GetConsumerGroupsPage(
+	ctx context.Context,
+	streamId, topicId iggcon.Identifier,
+	query iggcon.NamedPageQuery,
+) (*iggcon.Page[iggcon.ConsumerGroup], error) {
 	buffer, err := c.do(ctx, &command.GetConsumerGroups{
 		StreamId: streamId,
 		TopicId:  topicId,
+		Query:    query,
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	return binaryserialization.DeserializeConsumerGroups(buffer), err
+	return binaryserialization.DeserializeConsumerGroupsPage(buffer)
 }
 
 func (c *IggyTcpClient) GetConsumerGroup(ctx context.Context, streamId, topicId, groupId iggcon.Identifier) (*iggcon.ConsumerGroupDetails, error) {
@@ -55,8 +65,7 @@ func (c *IggyTcpClient) GetConsumerGroup(ctx context.Context, streamId, topicId,
 		return nil, ierror.ErrConsumerGroupIdNotFound
 	}
 
-	consumerGroupDetails := binaryserialization.DeserializeConsumerGroup(buffer)
-	return consumerGroupDetails, err
+	return binaryserialization.DeserializeConsumerGroup(buffer)
 }
 
 func (c *IggyTcpClient) CreateConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, name string) (*iggcon.ConsumerGroupDetails, error) {
@@ -73,8 +82,7 @@ func (c *IggyTcpClient) CreateConsumerGroup(ctx context.Context, streamId iggcon
 	if err != nil {
 		return nil, err
 	}
-	consumerGroup := binaryserialization.DeserializeConsumerGroup(buffer)
-	return consumerGroup, err
+	return binaryserialization.DeserializeConsumerGroup(buffer)
 }
 
 func (c *IggyTcpClient) DeleteConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {

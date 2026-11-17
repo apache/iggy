@@ -44,13 +44,13 @@ use iggy_common::{
     BatchProducer, Checkpoint, Client, ClientInfo, ClientInfoDetails, ClusterClient,
     ClusterMetadata, ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupClient,
     ConsumerGroupDetails, ConsumerOffsetClient, ConsumerOffsetInfo, DecodeError, DiagnosticEvent,
-    IdentityInfo, MetadataChanges, MetadataChangesQuery, NonZeroIggyDuration, OptionSpec,
-    OptionsScope, PartitionClient, Permissions, PersonalAccessTokenClient,
-    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages, RawPersonalAccessToken,
-    SegmentClient, Snapshot, SnapshotCompression, Stats, Stream, StreamClient, StreamCreateOptions,
-    StreamDetails, StreamUpdateOptions, SystemSnapshotType, Topic, TopicClient, TopicCreateOptions,
-    TopicDetails, TopicUpdateOptions, UserClient, UserCreateOptions, UserInfo, UserInfoDetails,
-    UserStatus, UserUpdateOptions,
+    IdentityInfo, MetadataChanges, MetadataChangesQuery, NamedPageQuery, NonZeroIggyDuration,
+    OptionSpec, OptionsScope, Page, PageQuery, Partition, PartitionClient, Permissions,
+    PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
+    RawPersonalAccessToken, SegmentClient, Snapshot, SnapshotCompression, Stats, Stream,
+    StreamClient, StreamCreateOptions, StreamDetails, StreamUpdateOptions, SystemSnapshotType,
+    Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient,
+    UserCreateOptions, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
 };
 use std::time::Instant;
 

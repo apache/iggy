@@ -22,8 +22,8 @@ use crate::prelude::{Identifier, IggyError};
 use async_trait::async_trait;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::{
-    DEFAULT_PARTITIONS_COUNT, OptionInputMap, Topic, TopicClient, TopicCreateOptions, TopicDetails,
-    TopicUpdateOptions,
+    DEFAULT_PARTITIONS_COUNT, NamedPageQuery, OptionInputMap, Page, Topic, TopicClient,
+    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 
 #[async_trait]
@@ -47,6 +47,24 @@ impl TopicClient for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidJsonResponse)?;
         Ok(topics)
+    }
+
+    async fn get_topics_page(
+        &self,
+        stream_id: &Identifier,
+        query: &NamedPageQuery,
+    ) -> Result<Page<Topic>, IggyError> {
+        query.validate()?;
+        let response = self
+            .get_with_query(
+                &get_path(&stream_id.as_cow_str()),
+                &query.http_query_pairs(),
+            )
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
     }
 
     async fn create_topic(

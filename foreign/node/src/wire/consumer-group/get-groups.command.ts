@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { CommandResponse } from '../../client/client.type.js';
+import type { ClientProvider, CommandResponse } from '../../client/client.type.js';
 import type { ConsumerGroup } from './group.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
-import { deserializeConsumerGroups } from './group.utils.js';
+import { deserializeConsumerGroup } from './group.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
+import {
+  deserializePage, readWholeList, serializeNamedPageQuery, type NamedPageQuery, type Page
+} from '../page.utils.js';
 
 /**
  * Parameters for the get consumer groups command.
@@ -33,26 +36,39 @@ export type GetGroups = {
 };
 
 /**
+ * Parameters for the get consumer groups page command: the topic and one page
+ * request.
+ */
+export type GetGroupsPage = GetGroups & NamedPageQuery;
+
+/**
  * Get consumer groups command definition.
- * Retrieves all consumer groups within a topic.
+ * Retrieves one page of the consumer groups within a topic.
  */
 export const GET_GROUPS = {
   code: COMMAND_CODE.GetGroups,
 
-  serialize: ({ streamId, topicId }: GetGroups) => {
+  serialize: ({ streamId, topicId, ...query }: GetGroupsPage) => {
     return Buffer.concat([
       serializeIdentifier(streamId),
       serializeIdentifier(topicId),
+      serializeNamedPageQuery(COMMAND_CODE.GetGroups, query)
     ]);
   },
 
-  deserialize: (r: CommandResponse) => {
-    return deserializeConsumerGroups(r.data);
-  }
+  deserialize: (r: CommandResponse) => deserializePage(r.data, deserializeConsumerGroup)
 };
 
 
 /**
- * Executable get consumer groups command function.
+ * Executable get consumer groups page command function.
  */
-export const getGroups = wrapCommand<GetGroups, ConsumerGroup[]>(GET_GROUPS);
+export const getGroupsPage = wrapCommand<GetGroupsPage, Page<ConsumerGroup>>(GET_GROUPS);
+
+/**
+ * Executable get consumer groups command function. Reads every consumer group
+ * of the topic page by page.
+ */
+export const getGroups = (c: ClientProvider) =>
+  ({ streamId, topicId }: GetGroups): Promise<ConsumerGroup[]> =>
+    readWholeList(c, GET_GROUPS, (query) => ({ streamId, topicId, ...query }));
