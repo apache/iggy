@@ -1718,6 +1718,138 @@ async fn given_a_backup_when_a_replace_or_a_trim_commits_should_apply_it_and_not
     assert!(!partition.take_long_term_changed());
 }
 
+/// A trim below the first segment and a replace sent twice commit and leave
+/// the log as it was. The manifest in the store already says what they
+/// would, so neither asks for another.
+#[compio::test]
+async fn given_a_primary_when_a_command_that_changes_nothing_commits_should_not_note_that_the_log_changed()
+ {
+    let (_directory, mut partition, [first, second, third]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    let merged = merged_of(&first, &second);
+    let replace = partition.replace_segments_request(&merged, 10).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, replace, false)).await;
+    let trim = partition.trim_segments_request(1, 11).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, trim, false)).await;
+    assert_eq!(partition.long_term_segments(), [third]);
+    assert!(partition.take_long_term_changed());
+
+    let trim_again = partition.trim_segments_request(1, 12).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, trim_again, false)).await;
+    assert!(!partition.take_long_term_changed());
+
+    // The last segment stays whatever the offset, so this one removes
+    // nothing either.
+    let trim_everything = partition.trim_segments_request(u64::MAX, 13).unwrap();
+    Box::pin(commit_long_term_request(
+        &mut partition,
+        trim_everything,
+        false,
+    ))
+    .await;
+    assert_eq!(partition.long_term_segments(), [third]);
+    assert!(!partition.take_long_term_changed());
+}
+
+#[compio::test]
+async fn given_a_primary_when_a_replace_commits_twice_should_note_that_the_log_changed_once() {
+    let (_directory, mut partition, [first, second, third]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    let merged = merged_of(&first, &second);
+    let replace = partition.replace_segments_request(&merged, 10).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, replace, false)).await;
+    assert!(partition.take_long_term_changed());
+
+    let replace_again = partition.replace_segments_request(&merged, 11).unwrap();
+    Box::pin(commit_long_term_request(
+        &mut partition,
+        replace_again,
+        false,
+    ))
+    .await;
+
+    assert_eq!(partition.long_term_segments(), [merged, third]);
+    assert!(!partition.take_long_term_changed());
+}
+
+/// A replace leaves the floor and the trim point where they were and lists
+/// one segment where the manifest in the store lists several. A reader
+/// would look for the objects of those, which are deleted later, so the
+/// manifest is stored again.
+#[compio::test]
+async fn given_a_replace_at_an_unchanged_floor_when_a_manifest_pass_runs_should_publish_the_shorter_list()
+ {
+    const STORED: crate::ManifestPublishOutcome = Ok(Ok(()));
+    let (_directory, mut partition, [first, second, third]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    let now = IggyTimestamp::now();
+    let (id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    assert_eq!(manifest.segments, [first, second, third]);
+    assert!(!partition.finish_manifest_publish(id, &STORED, now));
+    assert!(
+        partition.begin_manifest_publish(now).is_none(),
+        "the manifest in the store is the current one"
+    );
+    let merged = merged_of(&first, &second);
+    let replace = partition.replace_segments_request(&merged, 10).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, replace, false)).await;
+
+    let (id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+
+    assert_eq!(manifest.floor, Some(3));
+    assert_eq!(manifest.trim_point, None);
+    assert_eq!(manifest.segments, [merged, third]);
+    assert!(!partition.finish_manifest_publish(id, &STORED, now));
+    assert!(partition.begin_manifest_publish(now).is_none());
+}
+
+/// No publish starts while one runs. A replace that commits meanwhile moves
+/// neither the floor nor the trim point, and the manifest being stored
+/// still lists what it replaced, so the end of the publish asks for the
+/// next one.
+#[compio::test]
+async fn given_a_replace_during_a_manifest_publish_when_it_ends_should_ask_for_another() {
+    const STORED: crate::ManifestPublishOutcome = Ok(Ok(()));
+    let (_directory, mut partition, [first, second, _]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    let now = IggyTimestamp::now();
+    let (id, _, _scope) = partition.begin_manifest_publish(now).unwrap();
+    let replace = partition
+        .replace_segments_request(&merged_of(&first, &second), 10)
+        .unwrap();
+    Box::pin(commit_long_term_request(&mut partition, replace, false)).await;
+
+    assert!(partition.finish_manifest_publish(id, &STORED, now));
+}
+
+/// A reader takes the trim point as the offset below which the partition
+/// holds nothing, and refuses a manifest whose segments start at or below
+/// it.
+#[compio::test]
+async fn given_a_trimmed_long_term_log_when_building_the_manifest_should_carry_the_trim_point() {
+    let (_directory, mut partition, [_, second, third]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    let now = IggyTimestamp::now();
+    assert_eq!(partition.long_term_trim_point(), None);
+    let (id, _, _scope) = partition.begin_manifest_publish(now).unwrap();
+    partition.finish_manifest_publish(id, &Ok(Ok(())), now);
+    let trim = partition.trim_segments_request(0, 10).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, trim, false)).await;
+
+    let (_, manifest, _scope) = partition
+        .begin_manifest_publish(now)
+        .expect("a trim is a change of the manifest");
+
+    assert_eq!(partition.long_term_trim_point(), Some(0));
+    assert_eq!(manifest.trim_point, Some(0));
+    assert_eq!(manifest.floor, Some(3));
+    assert_eq!(manifest.segments, [second, third]);
+    assert_eq!(
+        iggy_object_store::PartitionManifest::decode(&manifest.encode()).unwrap(),
+        manifest
+    );
+}
+
 /// The primary publishes the manifest and rewrites, so it is the one that
 /// learns of a commit to the long-term log.
 #[compio::test]

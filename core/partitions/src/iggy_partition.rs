@@ -206,7 +206,7 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
-    /// Set when a command of the long-term log applies on the primary, and
+    /// Set when a command changes the long-term log on the primary, and
     /// taken by the shard, which publishes the manifest and starts the
     /// rewrite that waited for the command.
     pub(crate) long_term_changed: Cell<bool>,

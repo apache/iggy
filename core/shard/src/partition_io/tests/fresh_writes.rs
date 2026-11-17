@@ -818,6 +818,131 @@ async fn given_a_partition_that_had_a_rewrite_pass_when_more_sends_commit_should
     assert_eq!(partition.long_term_lag(), 0);
 }
 
+/// Submit a trim of the long-term log up to `up_to_offset`, as the primary
+/// sends one.
+fn submit_trim(owner: &IoTestShard, up_to_offset: u64, request: u64) {
+    let request = owner
+        .plane
+        .partitions()
+        .get_by_ns(&namespace())
+        .unwrap()
+        .trim_segments_request(up_to_offset, request)
+        .unwrap();
+    owner.senders[0]
+        .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+            request,
+            reply: channel(1).0,
+            attachment: None,
+        }))
+        .unwrap();
+}
+
+/// A trim changes what the manifest lists, and a reader must stop looking
+/// for the segments it removed before their objects go, so its commit asks
+/// for the manifest. A trim that removes nothing leaves the manifest in the
+/// store as the current one, and asks for none.
+#[compio::test]
+async fn given_a_manifest_publisher_when_a_trim_commits_should_publish_the_manifest_only_if_it_removed_a_segment()
+ {
+    use super::object_deletes::Shared;
+    use crate::rewrite_pacing::RewriteResult;
+    use iggy_object_store::PartitionManifest;
+    use partitions::{
+        ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects, RemoteSegments,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_manifest_publisher(Some(Rc::new(ExecutorManifestPublisher::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let partitions = owner.plane.partitions();
+    partitions.set_remote_segments(Rc::new(RemoteSegments::new(
+        Rc::new(ExecutorObjects::new(executor.clone())),
+        layout(),
+    )));
+    let revision = partitions
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let key = (namespace(), revision);
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
+    let store = executor.0.store();
+    let stored_manifest = async || {
+        let size = store.head(&manifest_key).await.ok()?.size;
+        let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+        Some(PartitionManifest::decode(&object.bytes).unwrap())
+    };
+    let manifest_with = async |segments: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match stored_manifest().await {
+                Some(manifest) if manifest.segments.len() == segments => return manifest,
+                _ => assert!(
+                    std::time::Instant::now() < deadline,
+                    "no manifest of {segments} segments was stored"
+                ),
+            }
+            compio::time::sleep(TASK_POLL_INTERVAL).await;
+        }
+    };
+    let floor = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+    };
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| floor(owner) == Some(0)).await;
+        // The wait is longer than this test may take, so the next pass is
+        // made due after the shortest one.
+        owner.rewrite_pacing.borrow_mut().settle(
+            key,
+            RewriteResult::Resent,
+            owner.bus.monotonic_micros(),
+        );
+        let _second = submit_send(&owner, 2, 100);
+        until(&owner, |owner| floor(owner) == Some(1)).await;
+        let listed = manifest_with(2).await;
+        assert_eq!((listed.floor, listed.trim_point), (Some(1), None));
+
+        submit_trim(&owner, 0, 1000);
+        let trimmed = manifest_with(1).await;
+        assert_eq!((trimmed.floor, trimmed.trim_point), (Some(1), Some(0)));
+        let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+        assert_eq!(trimmed.segments, partition.long_term_segments());
+
+        let commits = committed(&owner, namespace());
+        submit_trim(&owner, 0, 1001);
+        until(&owner, |owner| committed(owner, namespace()) > commits).await;
+        for _ in 0..20 {
+            compio::time::sleep(TASK_POLL_INTERVAL).await;
+        }
+        assert_eq!(
+            stored_manifest().await.unwrap().published_at,
+            trimmed.published_at,
+            "the manifest in the store is the one of the first trim"
+        );
+    })
+    .await;
+}
+
 /// Stores the object, and then holds the answer back until told.
 struct HeldUploader {
     uploader: MemoryUploader,

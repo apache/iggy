@@ -30,6 +30,7 @@
 //! cancelled, and would otherwise leave an older manifest there until the
 //! next change.
 
+use std::cmp::Ordering;
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -112,13 +113,43 @@ impl<E: TierExecutor> ManifestPublisher for ExecutorManifestPublisher<E> {
     }
 }
 
-/// What a manifest says the store holds: its floor and its trim point. Both
-/// only rise, so two manifests of one incarnation that agree on them list the
-/// same segments.
+/// What a manifest says the store holds: its floor, its trim point and how
+/// many segments it lists.
+///
+/// The floor and the trim point only rise. Between two changes of either,
+/// the list only gets shorter, as a replace puts one segment in the place of
+/// several. So two manifests of one incarnation that agree on all three list
+/// the same segments, and of two that differ the greater one is the later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ManifestProgress {
+pub struct ManifestProgress {
     floor: Option<u64>,
     trim_point: Option<u64>,
+    segments: usize,
+}
+
+impl From<&PartitionManifest> for ManifestProgress {
+    fn from(manifest: &PartitionManifest) -> Self {
+        Self {
+            floor: manifest.floor,
+            trim_point: manifest.trim_point,
+            segments: manifest.segments.len(),
+        }
+    }
+}
+
+impl Ord for ManifestProgress {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.floor
+            .cmp(&other.floor)
+            .then(self.trim_point.cmp(&other.trim_point))
+            .then(other.segments.cmp(&self.segments))
+    }
+}
+
+impl PartialOrd for ManifestProgress {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// What a replica publishes while it is the primary of a tiered partition.
@@ -216,8 +247,17 @@ where
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             published_at: now.as_micros(),
             floor: self.long_term_floor(),
-            trim_point: None,
+            trim_point: self.long_term_trim_point(),
             segments: self.long_term_segments().to_vec(),
+        }
+    }
+
+    /// What a manifest of the long-term log as it is now would hold.
+    pub(crate) fn long_term_progress(&self) -> ManifestProgress {
+        ManifestProgress {
+            floor: self.long_term_floor(),
+            trim_point: self.long_term_trim_point(),
+            segments: self.long_term_segments().len(),
         }
     }
 
@@ -245,10 +285,7 @@ where
             return None;
         }
         let manifest = self.manifest(now)?;
-        let progress = ManifestProgress {
-            floor: manifest.floor,
-            trim_point: manifest.trim_point,
-        };
+        let progress = ManifestProgress::from(&manifest);
         let publishes = self.manifest_publishes_of_this_view();
         if publishes.running.is_some()
             || (publishes.published == Some(progress) && !publishes.repeat_due(now))
@@ -291,7 +328,7 @@ where
             return false;
         }
         let namespace_raw = self.namespace().inner();
-        let long_term_floor = self.places_batches().then(|| self.long_term_floor());
+        let long_term = self.places_batches().then(|| self.long_term_progress());
         let publishes = &mut self.manifest_publishes;
         let Some((_, progress, _scope)) = publishes.running.take() else {
             return false;
@@ -307,9 +344,10 @@ where
                     namespace_raw,
                     floor = ?progress.floor,
                     trim_point = ?progress.trim_point,
+                    segments = progress.segments,
                     "stored the manifest of the partition"
                 );
-                long_term_floor.is_some_and(|floor| floor != progress.floor)
+                long_term.is_some_and(|current| current != progress)
             }
             Ok(Err(error)) => {
                 warn!(
@@ -356,5 +394,51 @@ where
             };
         }
         &mut self.manifest_publishes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn progress(
+        floor: Option<u64>,
+        trim_point: Option<u64>,
+        segments: usize,
+    ) -> ManifestProgress {
+        ManifestProgress {
+            floor,
+            trim_point,
+            segments,
+        }
+    }
+
+    #[test]
+    fn given_the_states_of_one_history_when_ordering_their_progress_should_put_each_after_the_one_before()
+     {
+        // Two publishes, a replace of both segments, two more publishes, a
+        // trim of the first segment and a replace of the two that are left.
+        let history = [
+            progress(None, None, 0),
+            progress(Some(9), None, 1),
+            progress(Some(19), None, 2),
+            progress(Some(19), None, 1),
+            progress(Some(29), None, 2),
+            progress(Some(39), None, 3),
+            progress(Some(39), Some(19), 2),
+            progress(Some(39), Some(19), 1),
+        ];
+
+        for (earlier, later) in history.iter().zip(&history[1..]) {
+            assert!(earlier < later, "{earlier:?} is before {later:?}");
+        }
+        assert!(history.is_sorted());
+    }
+
+    #[test]
+    fn given_a_shorter_list_at_a_lower_floor_when_ordering_progress_should_take_the_higher_floor_as_later()
+     {
+        assert!(progress(Some(9), Some(4), 1) < progress(Some(19), None, 5));
+        assert!(progress(Some(19), None, 1) < progress(Some(19), Some(4), 5));
     }
 }

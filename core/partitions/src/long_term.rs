@@ -48,6 +48,7 @@ use message_bus::MessageBus;
 use server_common::Message;
 
 use crate::IggyPartition;
+use crate::manifest_publish::ManifestProgress;
 use crate::state_machine::{
     Applied, CommandEncodeError, CommandKind, MachineCommand, MachineId, MachineRestoreError,
     PartitionStateMachine,
@@ -467,17 +468,27 @@ where
             .map(|segment| segment.end_offset)
     }
 
+    /// The last offset a trim removed from the front of the long-term log,
+    /// `None` while the log starts at the first offset.
+    #[must_use]
+    pub fn long_term_trim_point(&self) -> Option<u64> {
+        self.state_machine::<LongTermLog>(LONG_TERM_LOG_MACHINE)
+            .and_then(LongTermLog::trim_point)
+    }
+
     /// Whether a command changed the long-term log on this primary since
     /// the last call.
     pub fn take_long_term_changed(&self) -> bool {
         self.long_term_changed.take()
     }
 
-    /// A command of `kind` applied. Only a primary notes it, since only a
-    /// primary publishes the manifest and rewrites.
-    pub(crate) fn note_long_term_command(&self, kind: CommandKind) {
-        let changes_the_log = matches!(kind, PUBLISH_SEGMENT | REPLACE_SEGMENTS | TRIM_SEGMENTS);
-        if changes_the_log && self.consensus().is_primary() {
+    /// A command applied to the log that was at `before`. Only a primary
+    /// notes a change, since only a primary publishes the manifest and
+    /// rewrites. A command the log accepts without changing, as a trim below
+    /// its first segment or one that was sent twice, is not a change: the
+    /// manifest it would ask for is the one in the store.
+    pub(crate) fn note_long_term_command(&self, before: ManifestProgress) {
+        if self.long_term_progress() != before && self.consensus().is_primary() {
             self.long_term_changed.set(true);
         }
     }
