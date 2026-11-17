@@ -20,6 +20,8 @@
 
 use super::segment_uploads::{namespace, pumped, until};
 use super::*;
+use crate::fresh_writes::FRESH_UPLOAD_DEADLINE;
+use crate::{FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX};
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_object_store::{
@@ -34,10 +36,17 @@ fn layout() -> KeyLayout {
 
 type MemoryUploader = ExecutorFreshUploader<InlineTierExecutor<MemoryStore>>;
 
+/// An interval long enough that the sends a test submits together after an
+/// upload share one window.
+const LONG_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Uploads into a memory store, unless told to refuse.
 struct TestUploader {
     uploader: MemoryUploader,
     refuses: Cell<bool>,
+    /// The first attempts that fail, in the order they come.
+    fails_first: Cell<u32>,
+    attempts: Cell<u32>,
 }
 
 impl TestUploader {
@@ -48,6 +57,8 @@ impl TestUploader {
                 layout(),
             ),
             refuses: Cell::new(false),
+            fails_first: Cell::new(0),
+            attempts: Cell::new(0),
         })
     }
 
@@ -63,7 +74,9 @@ impl FreshObjectUploader for TestUploader {
         bytes: bytes::Bytes,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, FreshUploadOutcome> {
-        if self.refuses.get() {
+        let attempt = self.attempts.get();
+        self.attempts.set(attempt + 1);
+        if self.refuses.get() || attempt < self.fails_first.get() {
             Box::pin(std::future::ready(Ok(Err(ObjectStoreError::Unavailable(
                 "503".to_owned(),
             )))))
@@ -95,6 +108,18 @@ async fn placing_owner(directory: &Path) -> IoTestShard {
     owner
 }
 
+/// Make the partition beside [`namespace`] place its batches too.
+fn place_other_partition(owner: &IoTestShard) -> IggyNamespace {
+    let other = IggyNamespace::new(0, 0, 1);
+    let partition = owner.plane.partitions().get_mut_by_ns(&other).unwrap();
+    partition.set_runtime_options(TopicRuntimeOptions {
+        places_batches: true,
+        ..Default::default()
+    });
+    partition.register_builtin_state_machines().unwrap();
+    other
+}
+
 /// Submit one send of a message of `payload_len` bytes, as a producer does.
 /// Returns where its answer arrives.
 fn submit_send(
@@ -102,15 +127,62 @@ fn submit_send(
     request: u64,
     payload_len: usize,
 ) -> Receiver<Option<Message<GenericHeader>>> {
+    submit_send_to(owner, namespace(), request, payload_len)
+}
+
+/// [`submit_send`] to `partition`.
+fn submit_send_to(
+    owner: &IoTestShard,
+    partition: IggyNamespace,
+    request: u64,
+    payload_len: usize,
+) -> Receiver<Option<Message<GenericHeader>>> {
     let (reply, answer) = channel(1);
     owner.senders[0]
         .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
-            request: sized_send_request(namespace(), request, payload_len),
+            request: sized_send_request(partition, request, payload_len),
             reply,
             attachment: None,
         }))
         .unwrap();
     answer
+}
+
+/// [`submit_send`] that waits for room in the shard's inbox, for a test that
+/// submits more sends at once than the inbox holds.
+#[allow(clippy::future_not_send)]
+async fn submit_send_when_room(
+    owner: &IoTestShard,
+    request: u64,
+    payload_len: usize,
+) -> Receiver<Option<Message<GenericHeader>>> {
+    let (reply, answer) = channel(1);
+    let mut frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+        request: sized_send_request(namespace(), request, payload_len),
+        reply,
+        attachment: None,
+    });
+    loop {
+        match owner.senders[0].try_send(frame) {
+            Ok(()) => return answer,
+            Err(crossfire::TrySendError::Full(refused)) => {
+                frame = refused;
+                compio::time::sleep(TASK_POLL_INTERVAL).await;
+            }
+            Err(crossfire::TrySendError::Disconnected(_)) => panic!("the shard's inbox is gone"),
+        }
+    }
+}
+
+/// Ops the partition `partition` committed.
+fn committed(owner: &IoTestShard, partition: IggyNamespace) -> u64 {
+    owner
+        .plane
+        .partitions()
+        .get_by_ns(&partition)
+        .unwrap()
+        .consensus()
+        .commit_min()
 }
 
 /// Ops the partition committed and wrote to its segment. Each send is one.
@@ -136,10 +208,15 @@ async fn given_sends_to_a_placing_primary_when_the_window_closes_should_store_th
     let owner = Box::pin(placing_owner(directory.path())).await;
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
 
     let answers = pumped(&owner, async {
-        let answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
-        until(&owner, |owner| committed_sends(owner) == 2).await;
+        // The shard is idle, so this send is stored at once, and the two
+        // after it wait out the interval together.
+        let _alone = submit_send(&owner, 1, 50);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let answers = [submit_send(&owner, 2, 100), submit_send(&owner, 3, 300)];
+        until(&owner, |owner| committed_sends(owner) == 3).await;
         answers
     })
     .await;
@@ -151,15 +228,17 @@ async fn given_sends_to_a_placing_primary_when_the_window_closes_should_store_th
         );
     }
     let store = uploader.store();
-    let keys = store.keys();
-    assert_eq!(keys.len(), 1, "both sends came inside one window: {keys:?}");
-    let object_id = layout().parse_fresh_key(&keys[0]).unwrap();
-    let size = store.head(&keys[0]).await.unwrap().size;
-    let object = store.get_range(&keys[0], 0..size).await.unwrap().bytes;
+    let mut keys = store.keys();
+    keys.sort();
+    assert_eq!(keys.len(), 2, "both sends came inside one window: {keys:?}");
+    let object_id = layout().parse_fresh_key(&keys[1]).unwrap();
+    let size = store.head(&keys[1]).await.unwrap().size;
+    let object = store.get_range(&keys[1], 0..size).await.unwrap().bytes;
     assert!(is_fresh_object(&object));
     let placed = stored_placed_batches(directory.path());
-    assert_eq!(placed.len(), 2);
-    for (offset, placed) in (0..).zip(&placed) {
+    assert_eq!(placed.len(), 3);
+    let placed = &placed[1..];
+    for (offset, placed) in (1..).zip(placed) {
         assert_eq!(placed.header.base_offset, offset);
         assert_eq!(placed.placement.object_id, object_id);
         let start = usize::try_from(placed.placement.position).unwrap();
@@ -195,6 +274,10 @@ async fn given_a_store_that_refuses_when_the_window_closes_should_answer_its_pro
     assert!(answer.try_recv().unwrap().is_some());
     assert_eq!(committed_sends(&owner), 0);
     assert_eq!(uploader.store().keys(), Vec::<String>::new());
+    let (stored, refused, _) = owner.metrics().fresh_uploads_value();
+    assert_eq!((stored, refused), (0, 1));
+    let (retries, denied, in_flight, staged) = owner.metrics().fresh_load_value();
+    assert_eq!((retries, denied, in_flight, staged), (2, 1, 0, 0));
 }
 
 #[compio::test]
@@ -347,8 +430,8 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
     assert_eq!(store.head(&log_key).await.unwrap().size, segments[0].size);
     assert_eq!(
         store.keys().len(),
-        3,
-        "the fresh object, the log and its index"
+        4,
+        "a fresh object per send, the log and its index"
     );
 }
 
@@ -603,6 +686,60 @@ async fn given_an_object_whose_sends_wait_when_sweeps_run_past_the_grace_should_
     assert_eq!(fresh_objects(store).len(), 1);
 }
 
+/// A reader of the bucket finds a long-term segment through the manifest,
+/// so the commit of the segment's command is what asks for the manifest.
+/// Nothing else asks for one here.
+#[compio::test]
+async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publish_the_manifest() {
+    use super::object_deletes::Shared;
+    use iggy_object_store::PartitionManifest;
+    use partitions::{
+        ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects, RemoteSegments,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_manifest_publisher(Some(Rc::new(ExecutorManifestPublisher::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let partitions = owner.plane.partitions();
+    partitions.set_remote_segments(Rc::new(RemoteSegments::new(
+        Rc::new(ExecutorObjects::new(executor.clone())),
+        layout(),
+    )));
+    let revision = partitions
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
+    let store = executor.0.store();
+
+    pumped(&owner, async {
+        let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |_| store.keys().contains(&manifest_key)).await;
+    })
+    .await;
+
+    let size = store.head(&manifest_key).await.unwrap().size;
+    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    assert_eq!(manifest.floor, Some(1));
+    assert_eq!(manifest.segments, partition.long_term_segments());
+}
+
 /// The segment cleaner stages only the first pass over a partition. The
 /// sends that commit after it are rewritten when the partition's wait is
 /// over, which the pump's tick finds.
@@ -610,7 +747,7 @@ async fn given_an_object_whose_sends_wait_when_sweeps_run_past_the_grace_should_
 async fn given_a_partition_that_had_a_rewrite_pass_when_more_sends_commit_should_rewrite_them_from_the_tick()
  {
     use super::object_deletes::Shared;
-    use crate::rewrite_pacing::{REWRITE_INTERVAL_MAX, REWRITE_INTERVAL_START};
+    use crate::rewrite_pacing::{REWRITE_INTERVAL_MAX, REWRITE_INTERVAL_START, RewriteResult};
     use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
 
     let directory = tempfile::tempdir().unwrap();
@@ -652,6 +789,13 @@ async fn given_a_partition_that_had_a_rewrite_pass_when_more_sends_commit_should
         assert!(
             wait > REWRITE_INTERVAL_START && wait <= REWRITE_INTERVAL_MAX,
             "a small segment lengthens the wait: {wait:?}"
+        );
+        // The wait is longer than this test may take, so the next pass is
+        // made due after the shortest one.
+        owner.rewrite_pacing.borrow_mut().settle(
+            key,
+            RewriteResult::Resent,
+            owner.bus.monotonic_micros(),
         );
 
         let _second = submit_send(&owner, 2, 100);
@@ -764,45 +908,708 @@ async fn given_sends_to_two_placing_partitions_in_one_window_when_it_closes_shou
  {
     let directory = tempfile::tempdir().unwrap();
     let owner = Box::pin(placing_owner(directory.path())).await;
-    let other = IggyNamespace::new(0, 0, 1);
-    {
-        let partition = owner.plane.partitions().get_mut_by_ns(&other).unwrap();
-        partition.set_runtime_options(TopicRuntimeOptions {
-            places_batches: true,
-            ..Default::default()
-        });
-        partition.register_builtin_state_machines().unwrap();
-    }
+    let other = place_other_partition(&owner);
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
 
     pumped(&owner, async {
-        let _first = submit_send(&owner, 1, 100);
-        let (reply, _second) = channel(1);
-        owner.senders[0]
-            .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
-                request: sized_send_request(other, 2, 100),
-                reply,
-                attachment: None,
-            }))
-            .unwrap();
+        // Stored at once, so the two sends after it share the next window.
+        let _alone = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let _first = submit_send(&owner, 2, 100);
+        let _second = submit_send_to(&owner, other, 3, 100);
         until(&owner, |owner| {
-            committed_sends(owner) == 1
-                && owner
-                    .plane
-                    .partitions()
-                    .get_by_ns(&other)
-                    .unwrap()
-                    .consensus()
-                    .commit_min()
-                    == 1
+            committed_sends(owner) == 2 && committed(owner, other) == 1
         })
         .await;
     })
     .await;
 
-    assert_eq!(uploader.store().keys().len(), 1);
-    assert_eq!(owner.metrics().fresh_uploads_value().0, 1);
+    assert_eq!(uploader.store().keys().len(), 2);
+    assert_eq!(owner.metrics().fresh_uploads_value().0, 2);
+}
+
+/// Holds every attempt at an upload until the test settles it, so the test
+/// picks the order the uploads end in and which of them the store fails.
+struct GatedUploader {
+    uploader: Rc<MemoryUploader>,
+    /// Every attempt in the order it started: its object, and how to end it.
+    started: RefCell<
+        Vec<(
+            FreshObjectId,
+            Option<futures::channel::oneshot::Sender<bool>>,
+        )>,
+    >,
+}
+
+impl GatedUploader {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            uploader: Rc::new(ExecutorFreshUploader::new(
+                InlineTierExecutor::new(MemoryStore::new()),
+                layout(),
+            )),
+            started: RefCell::default(),
+        })
+    }
+
+    fn started(&self) -> usize {
+        self.started.borrow().len()
+    }
+
+    /// The object of the attempt that started as number `attempt`.
+    fn object_id(&self, attempt: usize) -> u128 {
+        self.started.borrow()[attempt].0.get()
+    }
+
+    /// End the attempt that started as number `attempt`: the store takes the
+    /// object, or fails in a way a retry can get past.
+    fn settle(&self, attempt: usize, stores: bool) {
+        let settle = self.started.borrow_mut()[attempt].1.take().unwrap();
+        settle.send(stores).unwrap();
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.uploader.executor().store().keys()
+    }
+}
+
+impl FreshObjectUploader for GatedUploader {
+    fn upload(
+        &self,
+        object_id: FreshObjectId,
+        bytes: bytes::Bytes,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, FreshUploadOutcome> {
+        let (settle, settled) = futures::channel::oneshot::channel();
+        self.started.borrow_mut().push((object_id, Some(settle)));
+        let uploader = Rc::clone(&self.uploader);
+        Box::pin(async move {
+            if settled.await == Ok(true) {
+                uploader.upload(object_id, bytes, scope).await
+            } else {
+                Ok(Err(ObjectStoreError::Unavailable("503".to_owned())))
+            }
+        })
+    }
+}
+
+/// Objects can finish in any order, and the sends of a partition still
+/// commit in the order they came.
+#[compio::test]
+async fn given_two_uploads_when_the_later_object_is_stored_first_should_commit_the_sends_in_the_order_they_came()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 2);
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let second = submit_send(&owner, 2, 100);
+        until(&owner, |_| uploader.started() == 2).await;
+
+        uploader.settle(1, true);
+        until(&owner, |owner| owner.metrics().fresh_uploads_value().0 == 1).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(committed_sends(&owner), 0);
+        assert!(second.is_empty(), "the send before it waits for its object");
+        assert_eq!(owner.metrics().fresh_load_value().3, 2);
+
+        uploader.settle(0, true);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+    })
+    .await;
+
+    let placed = stored_placed_batches(directory.path());
+    assert_eq!(
+        placed
+            .iter()
+            .map(|placed| (placed.header.base_offset, placed.placement.object_id))
+            .collect::<Vec<_>>(),
+        [(0, uploader.object_id(0)), (1, uploader.object_id(1))]
+    );
+    assert_eq!(owner.metrics().fresh_load_value(), (0, 0, 0, 0));
+}
+
+/// A partition holds only so many requests at once. The sends past that
+/// wait on the shard for room, and their messages are not stored in vain.
+#[compio::test]
+async fn given_more_sends_than_a_partition_has_room_for_when_their_object_is_stored_should_commit_them_all()
+ {
+    const SENDS: u64 =
+        2 * (consensus::PIPELINE_PREPARE_QUEUE_MAX + consensus::PIPELINE_REQUEST_QUEUE_MAX) as u64;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 1);
+
+    let answers = pumped(&owner, async {
+        let first = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        // The one upload slot is taken, so these share the next object.
+        let mut answers = vec![first];
+        for request in 2..=SENDS {
+            answers.push(submit_send_when_room(&owner, request, 100).await);
+        }
+        until(&owner, |owner| {
+            owner.metrics().fresh_load_value().3 == i64::try_from(SENDS).unwrap()
+        })
+        .await;
+        uploader.settle(0, true);
+        until(&owner, |_| uploader.started() == 2).await;
+        uploader.settle(1, true);
+        until(&owner, |owner| committed_sends(owner) == SENDS).await;
+        until(&owner, |_| answers.iter().all(|answer| !answer.is_empty())).await;
+        answers
+    })
+    .await;
+
+    assert_eq!(answers.len() as u64, SENDS);
+    assert_eq!(uploader.keys().len(), 2);
+    let (_, denied, _, staged) = owner.metrics().fresh_load_value();
+    assert_eq!((denied, staged), (0, 0));
+    let placed = stored_placed_batches(directory.path());
+    assert_eq!(
+        placed
+            .iter()
+            .map(|placed| placed.header.base_offset)
+            .collect::<Vec<_>>(),
+        (0..SENDS).collect::<Vec<_>>()
+    );
+}
+
+#[compio::test]
+async fn given_a_store_that_fails_once_when_uploading_should_try_again_under_the_same_id_and_commit()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    uploader.fails_first.set(1);
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    let answer = pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        until(&owner, |_| !answer.is_empty()).await;
+        answer
+    })
+    .await;
+
+    assert!(answer.try_recv().unwrap().is_some());
+    assert_eq!(uploader.attempts.get(), 2);
+    let keys = uploader.store().keys();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        stored_placed_batches(directory.path())[0]
+            .placement
+            .object_id,
+        layout().parse_fresh_key(&keys[0]).unwrap()
+    );
+    let (stored, refused, _) = owner.metrics().fresh_uploads_value();
+    assert_eq!((stored, refused), (1, 0));
+    let (retries, denied, ..) = owner.metrics().fresh_load_value();
+    assert_eq!((retries, denied), (1, 0));
+}
+
+/// The producer of a send in an object the store failed sends it again. A
+/// later send of the same partition must not commit ahead of it, so it is
+/// answered the same way. The sends of other partitions are not held back.
+#[compio::test]
+async fn given_an_object_the_store_fails_for_good_when_later_sends_wait_should_answer_those_of_its_partitions_and_commit_the_rest()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let other = place_other_partition(&owner);
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 2);
+
+    pumped(&owner, async {
+        let failed = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let later = submit_send(&owner, 2, 100);
+        until(&owner, |_| uploader.started() == 2).await;
+        // Both upload slots are taken, so this one waits in the window.
+        let unrelated = submit_send_to(&owner, other, 3, 100);
+
+        // The first object fails on every attempt. Each one starts after the
+        // one before it failed.
+        for (attempt, started) in [(0, 3), (2, 4)] {
+            uploader.settle(attempt, false);
+            until(&owner, |_| uploader.started() == started).await;
+            assert_eq!(uploader.object_id(started - 1), uploader.object_id(0));
+            assert!(failed.is_empty() && later.is_empty());
+        }
+        uploader.settle(3, false);
+        until(&owner, |_| !failed.is_empty() && !later.is_empty()).await;
+        assert!(unrelated.is_empty());
+
+        // The slot of the failed object goes to the window.
+        until(&owner, |_| uploader.started() == 5).await;
+        uploader.settle(1, true);
+        uploader.settle(4, true);
+        until(&owner, |owner| committed(owner, other) == 1).await;
+        until(&owner, |_| !unrelated.is_empty()).await;
+        until(&owner, |owner| owner.metrics().fresh_uploads_value().0 == 2).await;
+    })
+    .await;
+
+    assert_eq!(committed(&owner, namespace()), 0);
+    let (stored, refused, _) = owner.metrics().fresh_uploads_value();
+    assert_eq!((stored, refused), (2, 1));
+    assert_eq!(owner.metrics().fresh_load_value(), (2, 2, 0, 0));
+}
+
+/// The interval counts from the start of the last upload. A send that finds
+/// it passed is stored at once, and one that comes sooner waits for the rest
+/// of it.
+#[compio::test]
+async fn given_an_idle_shard_when_sends_arrive_should_upload_the_first_at_once_and_the_next_an_interval_after_it()
+ {
+    const INTERVAL: Duration = Duration::from_secs(1);
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(INTERVAL, 4);
+    let stored = |count: usize| uploader.store().keys().len() == count;
+
+    pumped(&owner, async {
+        assert_eq!(owner.fresh_uploads_deadline(), None);
+        let first_sent = std::time::Instant::now();
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |_| stored(1)).await;
+        assert!(first_sent.elapsed() < INTERVAL / 2);
+
+        let _second = submit_send(&owner, 2, 100);
+        compio::time::sleep(INTERVAL / 4).await;
+        assert_eq!(uploader.store().keys().len(), 1);
+        let due_in = owner
+            .fresh_uploads_deadline()
+            .expect("the open window has a deadline of its own")
+            .saturating_sub(owner.bus.monotonic_micros());
+        assert!(
+            Duration::from_micros(due_in) <= INTERVAL * 3 / 4,
+            "{due_in}"
+        );
+        until(&owner, |_| stored(2)).await;
+        assert!(first_sent.elapsed() >= INTERVAL);
+
+        compio::time::sleep(INTERVAL + INTERVAL / 10).await;
+        let third_sent = std::time::Instant::now();
+        let _third = submit_send(&owner, 3, 100);
+        until(&owner, |_| stored(3)).await;
+        assert!(third_sent.elapsed() < INTERVAL / 2);
+        until(&owner, |owner| committed_sends(owner) == 3).await;
+    })
+    .await;
+}
+
+/// A send is never split. One that does not fit beside the sends of the
+/// window starts the next object, and a send as large as an object is one.
+#[compio::test]
+async fn given_a_send_larger_than_an_object_when_the_window_holds_sends_should_store_it_as_its_own_object()
+ {
+    let large = usize::try_from(FRESH_OBJECT_BYTES).unwrap() + 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 1);
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let _second = submit_send_when_room(&owner, 2, 100).await;
+        let _large = submit_send_when_room(&owner, 3, large).await;
+        let _fourth = submit_send_when_room(&owner, 4, 100).await;
+        until(&owner, |owner| owner.metrics().fresh_load_value().3 == 4).await;
+        for attempt in 0..4 {
+            until(&owner, |_| uploader.started() == attempt + 1).await;
+            uploader.settle(attempt, true);
+        }
+        until(&owner, |owner| committed_sends(owner) == 4).await;
+    })
+    .await;
+
+    let store = uploader.uploader.executor().store();
+    let mut sizes = Vec::new();
+    for attempt in 0..4 {
+        let key = layout().fresh_key(uploader.object_id(attempt));
+        sizes.push(store.head(&key).await.unwrap().size);
+    }
+    assert!(sizes[2] > large as u64, "{sizes:?}");
+    assert!(
+        sizes[0] < 1024 && sizes[1] < 1024 && sizes[3] < 1024,
+        "{sizes:?}"
+    );
+    let placed = stored_placed_batches(directory.path());
+    assert_eq!(
+        placed
+            .iter()
+            .map(|placed| placed.placement.object_id)
+            .collect::<Vec<_>>(),
+        (0..4)
+            .map(|attempt| uploader.object_id(attempt))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// One cap holds the bytes of every send that has not reached its
+/// partition, whether its object is open, waits for an upload or uploads.
+#[compio::test]
+async fn given_fresh_bytes_at_the_cap_when_a_send_arrives_should_answer_it_and_keep_nothing_of_it()
+{
+    const OBJECTS: u64 = FRESH_PENDING_BYTES_MAX / FRESH_OBJECT_BYTES / 2;
+    let send_bytes = 2 * usize::try_from(FRESH_OBJECT_BYTES).unwrap() - 4096;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 1);
+
+    pumped(&owner, async {
+        // One object uploads and the others wait for its slot, so the open
+        // window is empty when the cap is reached.
+        let mut held = Vec::new();
+        for request in 1..=OBJECTS {
+            held.push(submit_send_when_room(&owner, request, send_bytes).await);
+        }
+        let staged = i64::try_from(OBJECTS).unwrap();
+        until(&owner, |owner| {
+            owner.metrics().fresh_load_value().3 == staged
+        })
+        .await;
+        let refused = submit_send(&owner, OBJECTS + 1, send_bytes);
+        until(&owner, |_| !refused.is_empty()).await;
+
+        assert!(refused.try_recv().unwrap().is_some());
+        assert!(held.iter().all(|answer| answer.is_empty()));
+        let (_, denied, in_flight, staged_after) = owner.metrics().fresh_load_value();
+        assert_eq!((denied, in_flight, staged_after), (1, 1, staged));
+        assert_eq!(uploader.started(), 1);
+    })
+    .await;
+
+    assert_eq!(committed_sends(&owner), 0);
+}
+
+/// The partition would refuse the request after the upload, so the shard
+/// asks first and stores nothing for it.
+#[compio::test]
+async fn given_a_primary_that_takes_no_requests_when_a_send_arrives_should_answer_it_and_upload_nothing()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace())
+            .unwrap()
+            .begin_shutdown_io();
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| !answer.is_empty()).await;
+
+        assert!(answer.try_recv().unwrap().is_some());
+        assert_eq!(uploader.started(), 0);
+        assert_eq!(owner.metrics().fresh_load_value(), (0, 1, 0, 0));
+    })
+    .await;
+}
+
+/// The sends of a partition that stops taking requests are answered while
+/// their object still uploads, not when the store answers at last.
+#[compio::test]
+async fn given_a_partition_that_stops_taking_requests_when_its_sends_wait_for_an_upload_should_answer_them()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        assert!(answer.is_empty());
+
+        owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace())
+            .unwrap()
+            .begin_shutdown_io();
+        until(&owner, |_| !answer.is_empty()).await;
+
+        assert!(answer.try_recv().unwrap().is_some());
+        let (_, denied, in_flight, staged) = owner.metrics().fresh_load_value();
+        assert_eq!((denied, in_flight, staged), (1, 1, 0));
+    })
+    .await;
+
+    assert_eq!(committed_sends(&owner), 0);
+}
+
+/// A store that stopped answering must not hold the producers until they
+/// give up, nor the upload slot that the next object needs.
+#[compio::test]
+async fn given_a_store_that_never_answers_when_the_upload_runs_out_of_time_should_answer_its_sends_and_free_the_slot()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 1);
+
+    pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        compio::time::sleep(
+            FRESH_UPLOAD_DEADLINE
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        )
+        .await;
+        assert!(answer.is_empty());
+        compio::time::sleep(Duration::from_secs(1)).await;
+        until(&owner, |_| !answer.is_empty()).await;
+
+        assert!(answer.try_recv().unwrap().is_some());
+        let (stored, refused, _) = owner.metrics().fresh_uploads_value();
+        assert_eq!((stored, refused), (0, 1));
+        assert_eq!(owner.metrics().fresh_load_value(), (0, 1, 0, 0));
+
+        let _next = submit_send(&owner, 2, 100);
+        until(&owner, |_| uploader.started() == 2).await;
+        uploader.settle(1, true);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+    })
+    .await;
+}
+
+/// The fresh objects the shard tells a sweep to keep.
+fn awaited(owner: &IoTestShard) -> Vec<u128> {
+    owner.fresh_writes.awaited_objects().into_iter().collect()
+}
+
+/// An object that has no upload slot yet is in no store and no journal. The
+/// sweep must not take it for one that nothing needs, and neither the object
+/// that uploads beside it.
+#[compio::test]
+async fn given_an_object_that_waits_for_an_upload_slot_when_asked_for_the_awaited_objects_should_name_it_until_its_send_is_answered()
+ {
+    let large = usize::try_from(FRESH_OBJECT_BYTES).unwrap() + 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+
+    pumped(&owner, async {
+        let first = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        // As large as an object, so its window closes at once, and the one
+        // upload slot is taken.
+        let second = submit_send(&owner, 2, large);
+        until(&owner, |owner| owner.metrics().fresh_load_value().3 == 2).await;
+        let uploading = uploader.object_id(0);
+        let named = awaited(&owner);
+        assert_eq!(uploader.started(), 1);
+        assert_eq!(named.len(), 2, "{named:?}");
+        assert!(named.contains(&uploading));
+
+        uploader.settle(0, true);
+        until(&owner, |_| uploader.started() == 2).await;
+        let waited = uploader.object_id(1);
+        assert!(named.contains(&waited));
+        until(&owner, |_| !first.is_empty()).await;
+        assert_eq!(awaited(&owner), vec![waited]);
+
+        uploader.settle(1, true);
+        until(&owner, |owner| {
+            let answered = !second.is_empty();
+            assert!(answered || awaited(owner) == vec![waited]);
+            answered
+        })
+        .await;
+        assert_eq!(awaited(&owner), Vec::<u128>::new());
+    })
+    .await;
+}
+
+/// Between two attempts an object has no upload running, and the attempt
+/// that failed may have left it in the store.
+#[compio::test]
+async fn given_an_object_the_store_failed_once_when_it_waits_for_its_next_attempt_should_name_it_among_the_awaited_objects()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let object = uploader.object_id(0);
+
+        uploader.settle(0, false);
+        until(&owner, |owner| owner.metrics().fresh_load_value().0 == 1).await;
+        assert_eq!(awaited(&owner), vec![object]);
+        until(&owner, |owner| {
+            assert_eq!(awaited(owner), vec![object]);
+            uploader.started() == 2
+        })
+        .await;
+        assert_eq!(uploader.object_id(1), object);
+
+        uploader.settle(1, true);
+        until(&owner, |owner| {
+            let answered = !answer.is_empty();
+            assert!(answered || awaited(owner) == vec![object]);
+            answered
+        })
+        .await;
+        assert_eq!(awaited(&owner), Vec::<u128>::new());
+    })
+    .await;
+}
+
+/// A stored object whose sends wait for room in their partition is named by
+/// no journal, and by nothing that uploads. The pump does not run until the
+/// state is read, so no send commits and the partition stays full.
+#[compio::test]
+async fn given_a_stored_object_whose_sends_wait_behind_a_full_partition_when_asked_for_the_awaited_objects_should_name_it_until_its_last_send_is_answered()
+ {
+    const SENDS: u64 =
+        2 * (consensus::PIPELINE_PREPARE_QUEUE_MAX + consensus::PIPELINE_REQUEST_QUEUE_MAX) as u64;
+    let large = usize::try_from(FRESH_OBJECT_BYTES).unwrap() + 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 2);
+    let offer = |request: u64, payload_len: usize| {
+        let (reply, answer) = channel(1);
+        owner.offer_fresh_send(sized_send_request(namespace(), request, payload_len), reply);
+        answer
+    };
+    let stored = |sequence: u64| crate::fresh_writes::FinishedFreshUpload {
+        sequence,
+        outcome: Ok(Ok(())),
+    };
+
+    // The first send uploads alone. The ones after it share the second
+    // object, which the large send closes. The large send is the third.
+    let mut answers = vec![offer(1, 100)];
+    for request in 2..=SENDS {
+        answers.push(offer(request, 100));
+    }
+    let last = offer(SENDS + 1, large);
+    until(&owner, |_| uploader.started() == 2).await;
+    Box::pin(owner.on_fresh_upload_finished(stored(0))).await;
+    Box::pin(owner.on_fresh_upload_finished(stored(1))).await;
+    until(&owner, |_| uploader.started() == 3).await;
+    Box::pin(owner.on_fresh_upload_finished(stored(2))).await;
+
+    let objects: Vec<_> = (0..3).map(|attempt| uploader.object_id(attempt)).collect();
+    let (_, denied, in_flight, staged) = owner.metrics().fresh_load_value();
+    assert_eq!((denied, in_flight), (0, 0), "every object is stored");
+    assert!(staged > 1, "sends of the second object wait for room");
+    assert!(answers.iter().all(|answer| answer.is_empty()) && last.is_empty());
+    assert_eq!(awaited(&owner), objects);
+
+    pumped(&owner, async {
+        until(&owner, |owner| {
+            let answered = !last.is_empty();
+            assert!(answered || awaited(owner).contains(&objects[2]));
+            answered
+        })
+        .await;
+    })
+    .await;
+
+    assert!(answers.iter().all(|answer| !answer.is_empty()));
+    assert_eq!(committed_sends(&owner), SENDS + 1);
+    assert_eq!(awaited(&owner), Vec::<u128>::new());
+}
+
+/// The sends of an object the store refused are answered, and so is the
+/// later send of their partition, whose own object is stored after that.
+/// Nothing waits on either object then.
+#[compio::test]
+async fn given_an_object_the_store_fails_for_good_when_its_sends_and_the_later_ones_are_answered_should_stop_naming_their_objects()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 2);
+
+    pumped(&owner, async {
+        let failed = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let later = submit_send(&owner, 2, 100);
+        until(&owner, |_| uploader.started() == 2).await;
+        let objects = [uploader.object_id(0), uploader.object_id(1)];
+        assert_eq!(awaited(&owner), objects);
+
+        for (attempt, started) in [(0, 3), (2, 4)] {
+            uploader.settle(attempt, false);
+            until(&owner, |_| uploader.started() == started).await;
+        }
+        uploader.settle(3, false);
+        until(&owner, |_| !failed.is_empty() && !later.is_empty()).await;
+        assert_eq!(
+            awaited(&owner),
+            vec![objects[1]],
+            "the later object still uploads"
+        );
+
+        uploader.settle(1, true);
+        until(&owner, |owner| owner.metrics().fresh_uploads_value().0 == 1).await;
+        assert_eq!(awaited(&owner), Vec::<u128>::new());
+    })
+    .await;
+
+    assert_eq!(committed_sends(&owner), 0);
+}
+
+/// A partition that stops taking requests drops its waiting sends. Their
+/// object is kept while it uploads, and no longer.
+#[compio::test]
+async fn given_a_partition_that_stops_taking_requests_when_the_object_of_its_sends_is_stored_should_stop_naming_it()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        let object = uploader.object_id(0);
+        owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace())
+            .unwrap()
+            .begin_shutdown_io();
+        until(&owner, |_| !answer.is_empty()).await;
+        assert_eq!(awaited(&owner), vec![object]);
+
+        uploader.settle(0, true);
+        until(&owner, |owner| owner.metrics().fresh_uploads_value().0 == 1).await;
+        assert_eq!(awaited(&owner), Vec::<u128>::new());
+    })
+    .await;
 }
 
 /// The owner of [`swept_owner`] as the first of two shards. The second one

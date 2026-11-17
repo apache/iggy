@@ -42,11 +42,12 @@ pub trait FreshObjectUploader {
     ) -> LocalBoxFuture<'static, FreshUploadOutcome>;
 }
 
-/// Uploads through a tier executor, in its upload class.
+/// Uploads through a tier executor, in its class for fresh uploads.
 ///
 /// An id names one object for good, so the put creates the object and never
 /// replaces one. A put that the store already took, which a retry after a
-/// lost answer finds, counts as stored.
+/// lost answer finds, counts as stored. So the caller can upload the same
+/// bytes under the same id again after an upload that failed.
 pub struct ExecutorFreshUploader<E> {
     executor: E,
     layout: KeyLayout,
@@ -74,7 +75,7 @@ impl<E: TierExecutor> FreshObjectUploader for ExecutorFreshUploader<E> {
     ) -> LocalBoxFuture<'static, FreshUploadOutcome> {
         let key = self.layout.fresh_key(object_id.get());
         let request =
-            TierJobRequest::new(TierJobClass::Upload, scope).with_bytes(bytes.len() as u64);
+            TierJobRequest::new(TierJobClass::FreshUpload, scope).with_bytes(bytes.len() as u64);
         self.executor
             .submit(request, move |store| async move {
                 let options = PutOptions {
@@ -103,7 +104,12 @@ impl<E: TierExecutor> FreshObjectUploader for ExecutorFreshUploader<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_object_store::{FreshObject, InlineTierExecutor, MemoryStore, TierScope};
+    use iggy_object_store::{
+        FreshObject, InlineTierExecutor, MemoryStore, TierJobHandle, TierScope,
+    };
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::rc::Rc;
 
     fn layout() -> KeyLayout {
         KeyLayout::new("iggy").unwrap()
@@ -135,6 +141,59 @@ mod tests {
         assert_eq!(store.keys(), std::slice::from_ref(&key));
         let stored = store.get_range(&key, 0..bytes.len() as u64).await.unwrap();
         assert_eq!(stored.bytes, bytes);
+    }
+
+    /// An executor that runs each job at once and keeps what it was asked
+    /// for.
+    struct Recording {
+        store: Rc<MemoryStore>,
+        requests: RefCell<Vec<(TierJobClass, u64)>>,
+    }
+
+    impl TierExecutor for Recording {
+        type Store = MemoryStore;
+
+        fn submit<T, F, Fut>(&self, request: TierJobRequest, job: F) -> TierJobHandle<T>
+        where
+            T: 'static,
+            F: FnOnce(Rc<Self::Store>) -> Fut + 'static,
+            Fut: Future<Output = T> + 'static,
+        {
+            self.requests
+                .borrow_mut()
+                .push((request.class(), request.bytes()));
+            let job = job(Rc::clone(&self.store));
+            TierJobHandle::new(async move { Ok(job.await) })
+        }
+    }
+
+    /// Producers wait for the upload, so it must not queue behind the
+    /// uploads of segments.
+    #[compio::test]
+    async fn given_a_fresh_object_when_uploading_should_ask_for_the_class_of_fresh_uploads() {
+        let uploader = ExecutorFreshUploader::new(
+            Recording {
+                store: Rc::new(MemoryStore::new()),
+                requests: RefCell::default(),
+            },
+            layout(),
+        );
+        let bytes = object(b"messages");
+        let size = bytes.len() as u64;
+
+        let outcome = uploader
+            .upload(
+                FreshObjectId::new(1, 2, 3, 4).unwrap(),
+                bytes,
+                TierScope::new().token(),
+            )
+            .await;
+
+        assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+        assert_eq!(
+            uploader.executor().requests.take(),
+            [(TierJobClass::FreshUpload, size)]
+        );
     }
 
     #[compio::test]
