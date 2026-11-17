@@ -1598,6 +1598,22 @@ async fn commit_segment_command(
     lose_primacy_first: bool,
 ) {
     let request = partition.publish_segment_request(segment, 1).unwrap();
+    Box::pin(commit_long_term_request(
+        partition,
+        request,
+        lose_primacy_first,
+    ))
+    .await;
+    assert_eq!(partition.long_term_segments(), [*segment]);
+}
+
+/// Take `request` as the primary does, and commit it on the replica as it
+/// stands then.
+async fn commit_long_term_request(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    request: Message<RoutedRequestHeader>,
+    lose_primacy_first: bool,
+) {
     Box::pin(partition.on_request(request, None)).await;
     let head = partition.consensus().sequencer().current_sequence();
     if lose_primacy_first {
@@ -1608,7 +1624,98 @@ async fn commit_segment_command(
     for _ in 0..4 {
         Box::pin(partition.commit_journal(&config)).await;
     }
-    assert_eq!(partition.long_term_segments(), [*segment]);
+}
+
+/// A leader of three whose long-term log holds the offsets `0`, `1` and
+/// `2..=3` as three segments, each committed by its own command.
+async fn leader_with_three_long_term_segments() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    [iggy_object_store::ManifestSegment; 3],
+) {
+    use crate::LongTermWriter;
+    let (_whole, placed, object) = whole_and_placed(4);
+    let store = Box::pin(store_with(object)).await;
+    let (directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+    let mut segments = Vec::new();
+    for (request, up_to) in (1..).zip([0, 1, 3]) {
+        let (id, mut rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+        rewrite.up_to = up_to;
+        let outcome = writer(&store).write(rewrite, scope).await;
+        let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
+        let command = partition
+            .publish_segment_request(&segment, request)
+            .unwrap();
+        Box::pin(commit_long_term_request(&mut partition, command, false)).await;
+        segments.push(segment);
+    }
+    assert_eq!(partition.long_term_segments(), segments);
+    assert!(partition.take_long_term_changed());
+    (directory, partition, segments.try_into().unwrap())
+}
+
+/// The segment that holds the bytes of `first` and then of `second`.
+fn merged_of(
+    first: &iggy_object_store::ManifestSegment,
+    second: &iggy_object_store::ManifestSegment,
+) -> iggy_object_store::ManifestSegment {
+    iggy_object_store::ManifestSegment {
+        end_offset: second.end_offset,
+        end_timestamp: second.end_timestamp,
+        max_timestamp: first.max_timestamp.max(second.max_timestamp),
+        size: first.size + second.size,
+        crc32c: crc32c::crc32c_combine(
+            first.crc32c,
+            second.crc32c,
+            usize::try_from(second.size).unwrap(),
+        ),
+        hash: [7; iggy_object_store::SEGMENT_HASH_LEN],
+        ..*first
+    }
+}
+
+/// A replace and a trim change what the manifest lists as a publish does,
+/// so the primary learns of their commits the same way.
+#[compio::test]
+async fn given_a_primary_when_a_replace_and_a_trim_commit_should_note_that_the_log_changed() {
+    let (_directory, mut partition, [first, second, third]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    let merged = merged_of(&first, &second);
+
+    let replace = partition.replace_segments_request(&merged, 10).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, replace, false)).await;
+
+    assert_eq!(partition.long_term_segments(), [merged, third]);
+    assert_eq!(partition.long_term_floor(), Some(3));
+    assert!(partition.take_long_term_changed());
+    assert!(!partition.take_long_term_changed(), "taken once");
+
+    let trim = partition
+        .trim_segments_request(merged.end_offset, 11)
+        .unwrap();
+    Box::pin(commit_long_term_request(&mut partition, trim, false)).await;
+
+    assert_eq!(partition.long_term_segments(), [third]);
+    assert_eq!(partition.long_term_floor(), Some(3));
+    assert!(partition.take_long_term_changed());
+}
+
+#[compio::test]
+async fn given_a_backup_when_a_replace_or_a_trim_commits_should_apply_it_and_not_note_that_the_log_changed()
+ {
+    let (_directory, mut partition, [first, second, third]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    let merged = merged_of(&first, &second);
+    let replace = partition.replace_segments_request(&merged, 10).unwrap();
+    let trim = partition
+        .trim_segments_request(merged.end_offset, 11)
+        .unwrap();
+    Box::pin(partition.on_request(replace, None)).await;
+
+    Box::pin(commit_long_term_request(&mut partition, trim, true)).await;
+
+    assert_eq!(partition.long_term_segments(), [third]);
+    assert!(!partition.take_long_term_changed());
 }
 
 /// The primary publishes the manifest and rewrites, so it is the one that
@@ -1649,7 +1756,7 @@ async fn given_a_backup_when_the_command_of_a_segment_commits_should_not_note_th
 /// The log refuses a segment past its limit. A segment stored then would
 /// wait for its command forever, and hold back every rewrite after it.
 #[compio::test]
-async fn given_a_full_long_term_log_when_a_pass_runs_should_start_no_rewrite() {
+async fn given_a_full_long_term_log_when_a_pass_runs_should_start_no_rewrite_until_it_is_shorter() {
     let (_whole, placed, object) = whole_and_placed(2);
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
@@ -1685,6 +1792,22 @@ async fn given_a_full_long_term_log_when_a_pass_runs_should_start_no_rewrite() {
 
     assert!(partition.begin_segment_rewrite().is_none());
     assert!(!partition.segment_rewrite_running());
+
+    // A trim makes the log shorter, and the next pass rewrites again.
+    let payload = crate::long_term::TrimSegments { up_to_offset: 0 }.encode();
+    let applied = partition
+        .state_machines
+        .apply(
+            100 + segments,
+            crate::state_machine::MachineCommand {
+                kind: crate::long_term::TRIM_SEGMENTS,
+                payload: &payload,
+            },
+        )
+        .unwrap();
+    assert_eq!(applied, crate::state_machine::Applied::Changed);
+    let (_, rewrite, _) = partition.begin_segment_rewrite().unwrap();
+    assert_eq!((rewrite.start_offset, rewrite.up_to), (segments, segments));
 }
 
 /// A segment that ends before the commit point its rewrite started at has
