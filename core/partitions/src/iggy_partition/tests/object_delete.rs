@@ -28,9 +28,9 @@ use crate::{
 };
 use iggy_object_store::{
     DeleteFailure, DeleteOutcome, InlineTierExecutor, ListPage, ListRequest, ListedObject,
-    MAX_KEYS_PER_REQUEST, MemoryStore, ObjectMeta, ObjectPrefix, ObjectRange, ObjectStore,
-    ObjectStoreError, PutBody, PutOptions, SEGMENT_HASH_LEN, SegmentKey, SegmentMetadata,
-    SegmentObject, TierJobClass, UserMetadata,
+    LongTermKey, MAX_KEYS_PER_REQUEST, MemoryStore, ObjectMeta, ObjectPrefix, ObjectRange,
+    ObjectStore, ObjectStoreError, PutBody, PutOptions, SEGMENT_HASH_LEN, SegmentKey,
+    SegmentMetadata, SegmentObject, TierJobClass, UserMetadata,
 };
 use std::collections::BTreeSet;
 
@@ -1366,6 +1366,109 @@ async fn given_keys_of_other_incarnations_and_unparsable_keys_when_deleting_an_i
     );
 
     assert_eq!(store.inner.keys(), kept);
+}
+
+fn long_term_key_of(
+    prefix: ObjectPrefix,
+    start_offset: u64,
+    end_offset: u64,
+    object: SegmentObject,
+) -> String {
+    layout().long_term_key(&LongTermKey {
+        prefix,
+        start_offset,
+        end_offset,
+        object,
+    })
+}
+
+/// A partition that places its batches keeps its long-term segments under
+/// keys that name both offsets. Two of them can start at one offset.
+#[compio::test]
+async fn given_long_term_segments_when_deleting_an_incarnation_should_delete_them_and_keep_those_of_others()
+ {
+    let store = Faulty::default();
+    store_incarnation(&store, PREFIX, &[0]).await;
+    let mut kept = vec![layout().manifest_key(&RECREATED)];
+    for object in SegmentObject::ALL {
+        for (start_offset, end_offset) in [(0, 4), (0, 9), (10, 19)] {
+            put(
+                &store,
+                &long_term_key_of(PREFIX, start_offset, end_offset, object),
+            )
+            .await;
+        }
+        kept.push(long_term_key_of(RECREATED, 0, 9, object));
+    }
+    for key in &kept {
+        put(&store, key).await;
+    }
+    kept.sort();
+    // A store that answers the listing with a key of the recreated
+    // incarnation.
+    store
+        .lists_also
+        .borrow_mut()
+        .push(long_term_key_of(RECREATED, 20, 29, SegmentObject::Log));
+
+    assert_eq!(
+        delete_incarnation(&store, &layout(), &PREFIX)
+            .await
+            .unwrap(),
+        0
+    );
+
+    assert_eq!(store.inner.keys(), kept);
+    // The segment keyed by its start, the long-term ones, and the manifest:
+    // every `.index` in a call before the `.log` objects.
+    assert_eq!(store.delete_calls.take(), [1, 1, 3, 3, 1]);
+}
+
+/// The manifest is what a reader starts from, so it goes last: a long-term
+/// segment that is still there keeps it, and keeps its own `.log` while its
+/// `.index` is not deleted.
+#[compio::test]
+async fn given_a_long_term_index_the_store_keeps_when_deleting_an_incarnation_should_keep_its_log_and_the_manifest()
+ {
+    let store = Faulty::default();
+    store_incarnation(&store, PREFIX, &[]).await;
+    for object in SegmentObject::ALL {
+        for (start_offset, end_offset) in [(0, 9), (10, 19)] {
+            put(
+                &store,
+                &long_term_key_of(PREFIX, start_offset, end_offset, object),
+            )
+            .await;
+        }
+    }
+    let refused = long_term_key_of(PREFIX, 10, 19, SegmentObject::Index);
+    store.deletes.replace(Deletes::RefuseKey(refused.clone()));
+
+    assert_eq!(
+        delete_incarnation(&store, &layout(), &PREFIX)
+            .await
+            .unwrap(),
+        2,
+        "the segment and the manifest"
+    );
+
+    assert_eq!(
+        store.inner.keys(),
+        [
+            refused,
+            long_term_key_of(PREFIX, 10, 19, SegmentObject::Log),
+            layout().manifest_key(&PREFIX),
+        ]
+    );
+
+    store.deletes.replace(Deletes::Work);
+    assert_eq!(
+        delete_incarnation(&store, &layout(), &PREFIX)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(store.inner.is_empty());
 }
 
 #[compio::test]

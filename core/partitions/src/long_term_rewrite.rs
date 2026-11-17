@@ -26,11 +26,11 @@
 //! object to read the partition.
 //!
 //! The segment ends where the rewrite stops: at the commit point, or once
-//! it holds [`LONG_TERM_SEGMENT_BYTES`]. Another primary can have stored a
-//! segment from the same offset that ends elsewhere, just before it lost
-//! primacy. The store refuses to replace it, and the rewrite then reports
-//! where that one ends, so the next attempt ends there too and writes the
-//! same bytes.
+//! it holds [`LONG_TERM_SEGMENT_BYTES`]. Its key names both its offsets, so
+//! a segment another primary stored from the same offset, just before it
+//! lost primacy, is another object when it ends elsewhere. The long-term log
+//! lists the one whose command commits. One that ends at the same offset
+//! holds the same bytes, and the rewrite takes it as its own.
 
 use std::io;
 use std::rc::Rc;
@@ -40,9 +40,8 @@ use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_object_store::{
-    KeyLayout, ManifestSegment, ObjectPrefix, ObjectStore, SegmentKey, SegmentMetadata,
-    SegmentObject, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope,
-    TierScopeToken,
+    KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, SegmentObject,
+    TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -58,7 +57,7 @@ use crate::long_term::LONG_TERM_SEGMENTS_MAX;
 use crate::placed_read::PlacedReadPlan;
 use crate::poll_plan::DiskFault;
 use crate::segment_chain::{HashSource, SegmentRecord, hash_segment_file};
-use crate::segment_upload::{SegmentUpload, UploadError, upload_segment};
+use crate::segment_upload::{SegmentUpload, UploadError, upload_segment_under};
 use crate::state_transfer::STAGING_SUFFIX;
 
 /// Bytes of batches at which a rewrite ends its segment. The rewrite holds
@@ -73,11 +72,8 @@ pub struct SegmentRewrite {
     pub prefix: ObjectPrefix,
     /// The first offset of the segment: the long-term floor plus one.
     pub start_offset: u64,
-    /// The last offset the segment may hold. The commit point, or where a
-    /// segment another primary stored from `start_offset` ends.
+    /// The last offset the segment may hold: the commit point.
     pub up_to: u64,
-    /// Whether the segment must end exactly at `up_to`.
-    pub ends_at_up_to: bool,
     pub partition_dir: String,
     pub(crate) read: PlacedReadPlan,
 }
@@ -92,10 +88,6 @@ pub enum RewriteError {
     Gap { expected: u64, found: Option<u64> },
     #[error("cannot write the segment: {0}")]
     Io(#[from] io::Error),
-    /// The store holds a segment from the same offset that ends at
-    /// `end_offset`, which another primary stored.
-    #[error("the store holds a segment from the same offset that ends at {end_offset}")]
-    EndsElsewhere { end_offset: u64 },
     #[error(transparent)]
     Upload(UploadError),
 }
@@ -171,12 +163,6 @@ impl SegmentRewrite {
             .await
             .map_err(RewriteError::Read)?;
         let built = BuiltSegment::of(self.start_offset, &batches)?;
-        if self.ends_at_up_to && built.end_offset != self.up_to {
-            return Err(RewriteError::Gap {
-                expected: self.up_to.saturating_add(1),
-                found: Some(built.end_offset.saturating_add(1)),
-            });
-        }
         let stem = format!("{}/{:0>20}.rewrite", self.partition_dir, self.start_offset);
         let log_path = format!("{stem}.log{STAGING_SUFFIX}");
         let index_path = format!("{stem}.index{STAGING_SUFFIX}");
@@ -219,49 +205,32 @@ impl SegmentRewrite {
             log_path: log_path.to_owned(),
             index_path: index_path.to_owned(),
         };
-        match upload_segment(store, layout, &upload).await {
-            Ok(()) => Ok(ManifestSegment {
+        let key = |object| {
+            layout.long_term_key(&LongTermKey {
+                prefix: self.prefix,
                 start_offset: record.start_offset,
                 end_offset: record.end_offset,
-                start_timestamp: record.start_timestamp,
-                end_timestamp: record.end_timestamp,
-                max_timestamp: record.max_timestamp,
-                size: record.size,
-                crc32c: record.crc32c,
-                hash: record.hash,
-            }),
-            Err(UploadError::Diverged { key }) => {
-                Err(self.ends_elsewhere(store, layout, key).await)
-            }
-            Err(error) => Err(RewriteError::Upload(error)),
-        }
-    }
-
-    /// Why the store refused the segment: where the one it holds ends, when
-    /// its metadata says so, and the refusal itself otherwise.
-    async fn ends_elsewhere<S: ObjectStore>(
-        &self,
-        store: &S,
-        layout: &KeyLayout,
-        key: String,
-    ) -> RewriteError {
-        let log_key = layout.segment_key(&SegmentKey {
-            prefix: self.prefix,
-            start_offset: self.start_offset,
-            object: SegmentObject::Log,
-        });
-        let stored = store
-            .head(&log_key)
-            .await
-            .ok()
-            .and_then(|meta| SegmentMetadata::try_from(&meta.metadata).ok())
-            .filter(|stored| stored.start_offset == self.start_offset);
-        stored.map_or(
-            RewriteError::Upload(UploadError::Diverged { key }),
-            |stored| RewriteError::EndsElsewhere {
-                end_offset: stored.end_offset,
-            },
+                object,
+            })
+        };
+        upload_segment_under(
+            store,
+            &upload,
+            key(SegmentObject::Log),
+            &key(SegmentObject::Index),
         )
+        .await
+        .map_err(RewriteError::Upload)?;
+        Ok(ManifestSegment {
+            start_offset: record.start_offset,
+            end_offset: record.end_offset,
+            start_timestamp: record.start_timestamp,
+            end_timestamp: record.end_timestamp,
+            max_timestamp: record.max_timestamp,
+            size: record.size,
+            crc32c: record.crc32c,
+            hash: record.hash,
+        })
     }
 }
 
@@ -366,9 +335,6 @@ pub struct LongTermRewrites {
     /// A segment the store holds that the long-term log does not yet. Its
     /// command is sent again until the log ends with it.
     stored: Option<ManifestSegment>,
-    /// Where the segment from the floor on must end: where the one another
-    /// primary stored ends.
-    ends_at: Option<u64>,
     /// The commit point the last rewrite started at.
     committed_at_start: u64,
     /// Number of the last rewrite this partition started.
@@ -416,14 +382,6 @@ where
         }
         let start_offset = floor.map_or(0, |floor| floor.saturating_add(1));
         let committed = committed.filter(|committed| *committed >= start_offset)?;
-        let (up_to, ends_at_up_to) = match rewrites.ends_at {
-            // The other primary rewrote batches this replica has yet to
-            // commit, which it will.
-            Some(end) if end > committed => return None,
-            Some(end) if end >= start_offset => (end, true),
-            // The log moved past that segment since.
-            Some(_) | None => (committed, false),
-        };
         let scope = TierScope::new();
         let token = scope.token();
         rewrites.jobs += 1;
@@ -433,8 +391,7 @@ where
         let rewrite = SegmentRewrite {
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             start_offset,
-            up_to,
-            ends_at_up_to,
+            up_to: committed,
             partition_dir,
             read: self.placed_read_plan(None),
         };
@@ -471,7 +428,6 @@ where
         match outcome {
             Ok(Ok(segment)) => {
                 rewrites.stored = Some(segment);
-                rewrites.ends_at = None;
                 debug!(
                     namespace_raw,
                     start_offset = segment.start_offset,
@@ -480,10 +436,6 @@ where
                     "stored a long-term segment of the partition"
                 );
                 Some(segment)
-            }
-            Ok(Err(RewriteError::EndsElsewhere { end_offset })) => {
-                rewrites.ends_at = Some(end_offset);
-                None
             }
             Ok(Err(error)) => {
                 warn!(

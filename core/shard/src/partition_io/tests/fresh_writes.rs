@@ -379,7 +379,7 @@ async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_witho
 async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish_a_long_term_segment()
  {
     use super::object_deletes::Shared;
-    use iggy_object_store::{SegmentKey, SegmentObject};
+    use iggy_object_store::{LongTermKey, SegmentObject};
     use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
 
     let directory = tempfile::tempdir().unwrap();
@@ -426,9 +426,10 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
     assert_eq!((segments[0].start_offset, segments[0].end_offset), (0, 1));
     assert_eq!(partition.unpublished_segment(), None);
     let store = executor.0.store();
-    let log_key = layout().segment_key(&SegmentKey {
+    let log_key = layout().long_term_key(&LongTermKey {
         prefix: partitions::object_prefix(namespace(), revision),
         start_offset: 0,
+        end_offset: 1,
         object: SegmentObject::Log,
     });
     assert_eq!(store.head(&log_key).await.unwrap().size, segments[0].size);

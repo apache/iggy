@@ -150,7 +150,35 @@ impl<E: TierExecutor> SegmentUploader for ExecutorUploader<E> {
     }
 }
 
-/// Store the `.log` and then the `.index` of `upload`.
+/// Store the `.log` and then the `.index` of `upload` under the keys of a
+/// segment that starts at the record's first offset, as
+/// [`upload_segment_under`] does.
+///
+/// # Errors
+/// Those of [`upload_segment_under`].
+pub async fn upload_segment<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    upload: &SegmentUpload,
+) -> Result<(), UploadError> {
+    let key = |object| {
+        layout.segment_key(&SegmentKey {
+            prefix: upload.prefix,
+            start_offset: upload.record.start_offset,
+            object,
+        })
+    };
+    upload_segment_under(
+        store,
+        upload,
+        key(SegmentObject::Log),
+        &key(SegmentObject::Index),
+    )
+    .await
+}
+
+/// Store the `.log` of `upload` under `log_key` and then its `.index` under
+/// `index_key`.
 ///
 /// An object that is there already counts as stored when it is the same one:
 /// a `.log` of the recorded size and checksum, and an `.index` that holds
@@ -161,10 +189,11 @@ impl<E: TierExecutor> SegmentUploader for ExecutorUploader<E> {
 /// [`UploadError::MediaFault`] when the local files are not what the chain
 /// records, [`UploadError::Diverged`] when the store holds something else
 /// under a key, and the store's own error otherwise.
-pub async fn upload_segment<S: ObjectStore>(
+pub async fn upload_segment_under<S: ObjectStore>(
     store: &S,
-    layout: &KeyLayout,
     upload: &SegmentUpload,
+    log_key: String,
+    index_key: &str,
 ) -> Result<(), UploadError> {
     let record = &upload.record;
     let fault = |reason| UploadError::MediaFault {
@@ -185,14 +214,6 @@ pub async fn upload_segment<S: ObjectStore>(
         return Err(fault("its index does not describe it"));
     }
 
-    let key = |object| {
-        layout.segment_key(&SegmentKey {
-            prefix: upload.prefix,
-            start_offset: record.start_offset,
-            object,
-        })
-    };
-    let log_key = key(SegmentObject::Log);
     let metadata = UserMetadata::from(&SegmentMetadata {
         start_offset: record.start_offset,
         end_offset: record.end_offset,
@@ -233,10 +254,9 @@ pub async fn upload_segment<S: ObjectStore>(
         Err(error) => return Err(UploadError::Store(error)),
     }
 
-    let index_key = key(SegmentObject::Index);
     let stored = put_file(
         store,
-        &index_key,
+        index_key,
         &upload.index_path,
         index_len,
         UserMetadata::new(),
@@ -248,9 +268,11 @@ pub async fn upload_segment<S: ObjectStore>(
         // Sparse indexes differ between replicas, so an index another primary
         // stored only has to be one.
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
-            let held = store.head(&index_key).await.map_err(UploadError::Store)?;
+            let held = store.head(index_key).await.map_err(UploadError::Store)?;
             if held.size == 0 || held.size % IGGY_INDEX_SIZE as u64 != 0 {
-                return Err(UploadError::Diverged { key: index_key });
+                return Err(UploadError::Diverged {
+                    key: index_key.to_owned(),
+                });
             }
             Ok(())
         }

@@ -1113,7 +1113,17 @@ async fn rewrite_pass(
     let outcome = writer.write(rewrite, scope).await;
     let segment = partition.finish_segment_rewrite(id, outcome)?;
     assert_eq!(partition.unpublished_segment(), Some(segment));
-    let payload = crate::long_term::PublishSegment(segment).encode();
+    commit_published_segment(partition, &segment, op);
+    Some(segment)
+}
+
+/// Commit the command of `segment` to the long-term log as op `op`.
+fn commit_published_segment(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    segment: &iggy_object_store::ManifestSegment,
+    op: u64,
+) {
+    let payload = crate::long_term::PublishSegment(*segment).encode();
     let applied = partition
         .state_machines
         .apply(
@@ -1125,7 +1135,6 @@ async fn rewrite_pass(
         )
         .unwrap();
     assert_eq!(applied, crate::state_machine::Applied::Changed);
-    Some(segment)
 }
 
 async fn object_bytes(store: &iggy_object_store::MemoryStore, key: &str) -> Vec<u8> {
@@ -1134,10 +1143,15 @@ async fn object_bytes(store: &iggy_object_store::MemoryStore, key: &str) -> Vec<
     store.get_range(key, 0..size).await.unwrap().bytes.to_vec()
 }
 
-fn long_term_key(start_offset: u64, object: iggy_object_store::SegmentObject) -> String {
-    super::remote_poll::layout().segment_key(&iggy_object_store::SegmentKey {
+fn long_term_key(
+    start_offset: u64,
+    end_offset: u64,
+    object: iggy_object_store::SegmentObject,
+) -> String {
+    super::remote_poll::layout().long_term_key(&iggy_object_store::LongTermKey {
         prefix: crate::object_prefix(IggyNamespace::new(1, 1, 0), 0),
         start_offset,
+        end_offset,
         object,
     })
 }
@@ -1177,14 +1191,14 @@ async fn given_committed_placed_batches_when_rewriting_should_store_the_segment_
     assert_eq!(
         Box::pin(object_bytes(
             &store,
-            &long_term_key(0, iggy_object_store::SegmentObject::Log)
+            &long_term_key(0, RECEIVER_OPS - 1, iggy_object_store::SegmentObject::Log)
         ))
         .await,
         expected_log
     );
     let index = Box::pin(object_bytes(
         &store,
-        &long_term_key(0, iggy_object_store::SegmentObject::Index),
+        &long_term_key(0, RECEIVER_OPS - 1, iggy_object_store::SegmentObject::Index),
     ))
     .await;
     assert_eq!(index.len(), crate::iggy_index::IGGY_INDEX_SIZE);
@@ -1291,38 +1305,71 @@ async fn store_segment_of_a_deposed_primary(
     writer(store).write(rewrite, scope).await.unwrap().unwrap();
 }
 
-/// The store keeps the first segment written from an offset. A primary
-/// that would end its own elsewhere ends it where that one does, and so
-/// writes the same bytes.
+/// A key names where its segment ends, so the segment a deposed primary
+/// left from the same offset is another object. The primary stores its own
+/// in one pass, and the other one stays in the store with nothing naming it.
 #[compio::test]
-async fn given_a_segment_another_primary_stored_when_rewriting_past_its_end_should_end_where_it_does()
+async fn given_a_segment_another_primary_stored_from_the_same_offset_when_rewriting_should_store_its_own_and_list_only_that_one()
  {
-    use crate::LongTermWriter;
-    let (_whole, placed, object) = whole_and_placed(4);
+    use iggy_object_store::SegmentObject;
+    let (whole, placed, object) = whole_and_placed(4);
+    let expected_log = Box::pin(log_of_whole_batches(&whole)).await;
     let store = Box::pin(store_with(object)).await;
     Box::pin(store_segment_of_a_deposed_primary(&placed[..2], &store)).await;
+    let orphan = Box::pin(object_bytes(
+        &store,
+        &long_term_key(0, 1, SegmentObject::Log),
+    ))
+    .await;
     let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
-    let writer = writer(&store);
 
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
-    assert_eq!((rewrite.start_offset, rewrite.up_to), (0, 3));
-    let outcome = writer.write(rewrite, scope).await;
-    assert!(matches!(
-        outcome,
-        Ok(Err(crate::RewriteError::EndsElsewhere { end_offset: 1 }))
-    ));
-    assert_eq!(partition.finish_segment_rewrite(id, outcome), None);
-
-    let first = Box::pin(rewrite_pass(&mut partition, &writer, 100))
-        .await
-        .unwrap();
-    let second = Box::pin(rewrite_pass(&mut partition, &writer, 101))
+    let segment = Box::pin(rewrite_pass(&mut partition, &writer(&store), 100))
         .await
         .unwrap();
 
-    assert_eq!((first.start_offset, first.end_offset), (0, 1));
-    assert_eq!((second.start_offset, second.end_offset), (2, 3));
+    assert_eq!((segment.start_offset, segment.end_offset), (0, 3));
+    assert_eq!(partition.long_term_segments(), [segment]);
     assert_eq!(partition.long_term_floor(), Some(3));
+    assert_eq!(
+        Box::pin(object_bytes(
+            &store,
+            &long_term_key(0, 3, SegmentObject::Log)
+        ))
+        .await,
+        expected_log
+    );
+    assert_eq!(
+        Box::pin(object_bytes(
+            &store,
+            &long_term_key(0, 1, SegmentObject::Log)
+        ))
+        .await,
+        orphan
+    );
+    assert_eq!(long_term_logs(&store), 2);
+    let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
+    assert_eq!(polled, Box::pin(polls_of_whole_batches(&whole)).await);
+}
+
+/// A segment another primary stored that ends where this one does holds the
+/// same bytes under the same key. The rewrite takes it as stored and puts
+/// nothing in its place.
+#[compio::test]
+async fn given_a_segment_another_primary_stored_with_the_same_offsets_when_rewriting_should_take_it_as_its_own()
+ {
+    let (_whole, placed, object) = whole_and_placed(2);
+    let store = Box::pin(store_with(object)).await;
+    Box::pin(store_segment_of_a_deposed_primary(&placed, &store)).await;
+    let keys = store.keys();
+    let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
+
+    let segment = Box::pin(rewrite_pass(&mut partition, &writer(&store), 100))
+        .await
+        .unwrap();
+
+    assert_eq!((segment.start_offset, segment.end_offset), (0, 1));
+    assert_eq!(store.keys(), keys);
+    assert_eq!(long_term_logs(&store), 1);
 }
 
 /// The offsets at or below the long-term floor come from the long-term
@@ -1647,18 +1694,17 @@ async fn given_a_segment_that_ends_before_the_commit_point_when_stored_should_sa
     use crate::LongTermWriter;
     let (_whole, placed, object) = whole_and_placed(4);
     let store = Box::pin(store_with(object)).await;
-    Box::pin(store_segment_of_a_deposed_primary(&placed[..2], &store)).await;
     let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
     let writer = writer(&store);
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, mut rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    assert_eq!(rewrite.up_to, 3);
+    // Stands in for the byte cap, which no test reaches.
+    rewrite.up_to = 1;
     let outcome = writer.write(rewrite, scope).await;
-    assert_eq!(partition.finish_segment_rewrite(id, outcome), None);
-
-    let first = Box::pin(rewrite_pass(&mut partition, &writer, 100))
-        .await
-        .unwrap();
+    let first = partition.finish_segment_rewrite(id, outcome).unwrap();
     assert_eq!(first.end_offset, 1);
     assert!(!partition.stored_segment_reached_commit());
+    commit_published_segment(&mut partition, &first, 100);
 
     let second = Box::pin(rewrite_pass(&mut partition, &writer, 101))
         .await
@@ -1753,7 +1799,7 @@ async fn read_from_the_bucket_alone(
     Vec<u8>,
 ) {
     use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
-    use iggy_object_store::{PartitionManifest, SegmentKey, SegmentObject};
+    use iggy_object_store::{LongTermKey, PartitionManifest, SegmentObject};
 
     let layout = super::remote_poll::layout();
     let prefix = crate::object_prefix(IggyNamespace::new(1, 1, 0), 0);
@@ -1764,9 +1810,10 @@ async fn read_from_the_bucket_alone(
     let mut batches = Vec::new();
     let mut log = Vec::new();
     for segment in &manifest.segments {
-        let key = layout.segment_key(&SegmentKey {
+        let key = layout.long_term_key(&LongTermKey {
             prefix: manifest.prefix,
             start_offset: segment.start_offset,
+            end_offset: segment.end_offset,
             object: SegmentObject::Log,
         });
         let bytes = Box::pin(object_bytes(store, &key)).await;
@@ -1894,7 +1941,7 @@ fn long_term_logs(store: &iggy_object_store::MemoryStore) -> usize {
     store
         .keys()
         .iter()
-        .filter_map(|key| layout.parse_segment_key(key))
+        .filter_map(|key| layout.parse_long_term_key(key))
         .filter(|key| key.object == iggy_object_store::SegmentObject::Log)
         .count()
 }

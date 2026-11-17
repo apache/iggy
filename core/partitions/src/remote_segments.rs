@@ -39,8 +39,8 @@ use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either, LocalBoxFuture, Shared};
 use iggy_object_store::{
-    ErrorClass, KeyLayout, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey, SegmentObject,
-    TierExecutor, TierJobClass, TierJobRequest, TierScope,
+    ErrorClass, KeyLayout, LongTermKey, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey,
+    SegmentObject, TierExecutor, TierJobClass, TierJobRequest, TierScope,
 };
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
@@ -274,17 +274,17 @@ impl RemoteSegments {
         Ok(object.bytes)
     }
 
-    /// The bytes at `range` of the segment object `key`, cut at the end of
-    /// the object.
+    /// The bytes at `range` of the long-term segment object `key`, cut at
+    /// the end of the object.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object or a refusal.
-    pub(crate) async fn read_segment_object(
+    pub(crate) async fn read_long_term_object(
         &self,
-        key: &SegmentKey,
+        key: &LongTermKey,
         range: Range<u64>,
     ) -> Result<Bytes, DiskFault> {
-        let key = self.layout.segment_key(key);
+        let key = self.layout.long_term_key(key);
         self.objects
             .get_range(&key, range)
             .await

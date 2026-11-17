@@ -43,7 +43,7 @@ use compio::io::AsyncReadAtExt;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
-use iggy_object_store::{ManifestSegment, ObjectPrefix, SegmentKey, SegmentObject};
+use iggy_object_store::{LongTermKey, ManifestSegment, ObjectPrefix, SegmentObject};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trusted};
 
@@ -156,14 +156,15 @@ impl PlacedReadPlan {
             // A shard that has not connected its store yet cannot read the
             // segment now, and can once it has.
             let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
-            let key = |object| SegmentKey {
+            let key = |object| LongTermKey {
                 prefix: self.prefix,
                 start_offset: segment.start_offset,
+                end_offset: segment.end_offset,
                 object,
             };
             let index_key = key(SegmentObject::Index);
             let index = self
-                .wait(remote.read_segment_object(&index_key, 0..LONG_TERM_INDEX_BYTES))
+                .wait(remote.read_long_term_object(&index_key, 0..LONG_TERM_INDEX_BYTES))
                 .await?;
             let log = key(SegmentObject::Log);
             let mut position = wanted.first_position(&index, segment.size);
@@ -171,7 +172,7 @@ impl PlacedReadPlan {
             while position < segment.size && !wanted.is_full() {
                 let end = segment.size.min(position.saturating_add(len));
                 let chunk = self
-                    .wait(remote.read_segment_object(&log, position..end))
+                    .wait(remote.read_long_term_object(&log, position..end))
                     .await?;
                 if chunk.len() as u64 != end - position {
                     return Err(DiskFault::Tiered);

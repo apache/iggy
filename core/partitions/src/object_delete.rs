@@ -40,9 +40,9 @@ use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    KeyLayout, ListRequest, MAX_KEYS_PER_REQUEST, ObjectPrefix, ObjectStore, ObjectStoreError,
-    SegmentKey, SegmentMetadata, SegmentObject, TierExecutor, TierJobCancelled, TierJobClass,
-    TierJobRequest, TierScope, TierScopeToken,
+    KeyLayout, ListRequest, LongTermKey, MAX_KEYS_PER_REQUEST, ObjectPrefix, ObjectStore,
+    ObjectStoreError, SegmentKey, SegmentMetadata, SegmentObject, TierExecutor, TierJobCancelled,
+    TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
 use tracing::warn;
 
@@ -285,27 +285,9 @@ pub async fn list_segment_starts<S: ObjectStore>(
     layout: &KeyLayout,
     prefix: &ObjectPrefix,
 ) -> Result<BTreeSet<u64>, ObjectStoreError> {
-    let listing_prefix = layout.incarnation_prefix(prefix);
-    let mut start_offsets = BTreeSet::new();
-    let mut continuation: Option<String> = None;
-    loop {
-        let request = ListRequest::new(&listing_prefix);
-        let request = continuation
-            .as_deref()
-            .map_or(request, |continuation| request.after(continuation));
-        let page = store.list(&request).await?;
-        start_offsets.extend(
-            page.objects
-                .iter()
-                .filter_map(|object| layout.parse_segment_key(&object.key))
-                .filter(|key| key.prefix == *prefix)
-                .map(|key| key.start_offset),
-        );
-        continuation = page.next;
-        if continuation.is_none() {
-            return Ok(start_offsets);
-        }
-    }
+    Ok(list_incarnation(store, layout, prefix)
+        .await?
+        .segment_starts)
 }
 
 /// List the segment objects of `prefix`, and read where each segment ends
@@ -363,15 +345,16 @@ pub async fn sweep_segments<S: ObjectStore>(
     })
 }
 
-/// Delete every segment object the store lists for `prefix`, then the
-/// incarnation's manifest, and return how many objects are still to delete.
+/// Delete every segment object the store lists for `prefix`, those of
+/// long-term segments included, then the incarnation's manifest, and return
+/// how many objects are still to delete.
 ///
 /// Only for an incarnation a committed delete removed: nothing here asks
-/// whether a segment is still in use. The keys come from
-/// [`list_segment_starts`], so a key under the listing prefix that the layout
-/// did not build for this incarnation stays. Deletes stop at the first call
-/// that leaves an object behind, and the manifest goes only after every
-/// segment did. Running it again deletes what is left.
+/// whether a segment is still in use. The keys are the listed ones the
+/// layout parses, so a key under the listing prefix that the layout did not
+/// build for this incarnation stays. Deletes stop at the first call that
+/// leaves an object behind, and the manifest goes only after every segment
+/// did. Running it again deletes what is left.
 ///
 /// # Errors
 /// The store's error for the listing page that failed. Nothing is deleted
@@ -381,10 +364,8 @@ pub async fn delete_incarnation<S: ObjectStore>(
     layout: &KeyLayout,
     prefix: &ObjectPrefix,
 ) -> Result<usize, ObjectStoreError> {
-    let start_offsets: Vec<u64> = list_segment_starts(store, layout, prefix)
-        .await?
-        .into_iter()
-        .collect();
+    let listed = list_incarnation(store, layout, prefix).await?;
+    let start_offsets: Vec<u64> = listed.segment_starts.into_iter().collect();
     let mut calls = start_offsets.chunks(SEGMENTS_PER_DELETE_CALL);
     let mut segments_left = 0;
     for call in calls.by_ref() {
@@ -394,6 +375,19 @@ pub async fn delete_incarnation<S: ObjectStore>(
         }
     }
     segments_left += calls.map(<[u64]>::len).sum::<usize>();
+    let long_term: Vec<(u64, u64)> = listed.long_term.into_iter().collect();
+    let mut calls = long_term.chunks(SEGMENTS_PER_DELETE_CALL);
+    if segments_left == 0 {
+        for call in calls.by_ref() {
+            segments_left = delete_long_term_segments(store, layout, prefix, call)
+                .await
+                .len();
+            if segments_left > 0 {
+                break;
+            }
+        }
+    }
+    segments_left += calls.map(<[(u64, u64)]>::len).sum::<usize>();
     if segments_left > 0 {
         // The manifest is the one object left to count besides them.
         return Ok(segments_left + 1);
@@ -401,6 +395,101 @@ pub async fn delete_incarnation<S: ObjectStore>(
     Ok(delete_objects(store, &[layout.manifest_key(prefix)])
         .await
         .len())
+}
+
+/// What the store lists for one incarnation.
+#[derive(Default)]
+struct IncarnationObjects {
+    /// The first offset of every object of a segment keyed by its start.
+    segment_starts: BTreeSet<u64>,
+    /// The first and the last offset of every object of a long-term segment.
+    long_term: BTreeSet<(u64, u64)>,
+}
+
+/// The segment objects the store lists for `prefix`, of both kinds of key.
+/// A key the layout did not build for this incarnation is left out.
+async fn list_incarnation<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    prefix: &ObjectPrefix,
+) -> Result<IncarnationObjects, ObjectStoreError> {
+    let listing_prefix = layout.incarnation_prefix(prefix);
+    let mut listed = IncarnationObjects::default();
+    let mut continuation: Option<String> = None;
+    loop {
+        let request = ListRequest::new(&listing_prefix);
+        let request = continuation
+            .as_deref()
+            .map_or(request, |continuation| request.after(continuation));
+        let page = store.list(&request).await?;
+        for object in &page.objects {
+            if let Some(key) = layout.parse_segment_key(&object.key) {
+                if key.prefix == *prefix {
+                    listed.segment_starts.insert(key.start_offset);
+                }
+            } else if let Some(key) = layout.parse_long_term_key(&object.key)
+                && key.prefix == *prefix
+            {
+                listed.long_term.insert((key.start_offset, key.end_offset));
+            }
+        }
+        continuation = page.next;
+        if continuation.is_none() {
+            return Ok(listed);
+        }
+    }
+}
+
+/// Delete both objects of every long-term segment of `prefix` in `segments`,
+/// each named by its first and its last offset, and return the ones that
+/// still have an object. Every `.index` goes before any `.log`, as in
+/// [`delete_segments`].
+async fn delete_long_term_segments<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    prefix: &ObjectPrefix,
+    segments: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    let mut failed =
+        delete_long_term_objects(store, layout, prefix, segments, SegmentObject::Index).await;
+    let without_index: Vec<(u64, u64)> = segments
+        .iter()
+        .copied()
+        .filter(|segment| !failed.contains(segment))
+        .collect();
+    failed.extend(
+        delete_long_term_objects(store, layout, prefix, &without_index, SegmentObject::Log).await,
+    );
+    failed.into_iter().collect()
+}
+
+/// Delete the `object` of every long-term segment of `prefix` in `segments`,
+/// and return the segments that still have it.
+async fn delete_long_term_objects<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    prefix: &ObjectPrefix,
+    segments: &[(u64, u64)],
+    object: SegmentObject,
+) -> BTreeSet<(u64, u64)> {
+    let keys: Vec<String> = segments
+        .iter()
+        .map(|&(start_offset, end_offset)| {
+            layout.long_term_key(&LongTermKey {
+                prefix: *prefix,
+                start_offset,
+                end_offset,
+                object,
+            })
+        })
+        .collect();
+    let failed: HashSet<String> = delete_objects(store, &keys).await.into_iter().collect();
+    segments
+        .iter()
+        .zip(&keys)
+        .filter(|(_, key)| failed.contains(*key))
+        .map(|(segment, _)| *segment)
+        .collect()
 }
 
 /// The listed segments that the starts after them place at or below `bound`,
