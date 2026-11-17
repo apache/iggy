@@ -656,7 +656,10 @@ where
     }
 }
 
+// `from = false`: a generated `From<Message<H>>` would collide with the
+// `TryFrom<Message<T>>` impl below, which validates the frame.
 #[derive(Debug)]
+#[whichever::dispatch(from = false)]
 pub enum MessageBag {
     Request(Message<RoutedRequestHeader>),
     Prepare(Message<PrepareHeader>),
@@ -701,6 +704,9 @@ pub enum MessageBag {
     ForwardCompletion(Message<ForwardCompletionHeader>),
 }
 
+// `whichever` writes the methods marked `#[dispatch]`: one `match` that makes
+// the same call on every variant's message.
+#[whichever::dispatch]
 impl MessageBag {
     /// Whether [`Self::routing`] sends frames of `command` to the metadata
     /// group, whatever group their header names.
@@ -890,128 +896,20 @@ impl MessageBag {
     /// need the frame in a generic container (the parked-frame buffer) use this;
     /// the dispatch path keeps the bag so it never re-parses.
     #[must_use]
-    pub fn into_generic(self) -> Message<GenericHeader> {
-        match self {
-            Self::Request(message) => message.into_generic(),
-            Self::Prepare(message) => message.into_generic(),
-            Self::PrepareOk(message) => message.into_generic(),
-            Self::StartViewChange(message) => message.into_generic(),
-            Self::DoViewChange(message) => message.into_generic(),
-            Self::StartView(message) => message.into_generic(),
-            Self::Commit(message) => message.into_generic(),
-            Self::CommitReply(message) => message.into_generic(),
-            Self::PrepareProgress(message) => message.into_generic(),
-            Self::RequestStartView(message) => message.into_generic(),
-            Self::RequestPrepares(message) => message.into_generic(),
-            Self::RepairPrepare(message) => message.into_generic(),
-            Self::RepairRangeReply(message) => message.into_generic(),
-            Self::RequestStateTransfer(message) => message.into_generic(),
-            Self::StateTransferTarget(message) => message.into_generic(),
-            Self::RequestStateChunk(message) => message.into_generic(),
-            Self::StateChunk(message) => message.into_generic(),
-            Self::ForwardRegister(message) => message.into_generic(),
-            Self::ForwardRegisterResult(message) => message.into_generic(),
-            Self::ForwardLogout(message) => message.into_generic(),
-            Self::ConsumerSessionHeartbeat(message) => message.into_generic(),
-            Self::ForwardLogoutResult(message) => message.into_generic(),
-            Self::ForwardCompletion(message) => message.into_generic(),
-            Self::PrimaryRebalance(message) => message.into_generic(),
-            Self::SegmentDelete(message) => message.into_generic(),
-        }
-    }
+    #[dispatch(*)]
+    pub fn into_generic(self) -> Message<GenericHeader>;
 
     #[must_use]
-    pub fn command(&self) -> Command {
-        match self {
-            Self::Request(message) => message.header().command,
-            Self::Prepare(message) => message.header().command,
-            Self::PrepareOk(message) => message.header().command,
-            Self::StartViewChange(message) => message.header().command,
-            Self::DoViewChange(message) => message.header().command,
-            Self::StartView(message) => message.header().command,
-            Self::Commit(message) => message.header().command,
-            Self::CommitReply(message) => message.header().command,
-            Self::PrepareProgress(message) => message.header().command,
-            Self::RequestStartView(message) => message.header().command,
-            Self::RequestPrepares(message) => message.header().command,
-            Self::RepairPrepare(message) => message.header().command(),
-            Self::RepairRangeReply(message) => message.header().command,
-            Self::RequestStateTransfer(message) => message.header().command,
-            Self::StateTransferTarget(message) => message.header().command,
-            Self::RequestStateChunk(message) => message.header().command,
-            Self::StateChunk(message) => message.header().command,
-            Self::ForwardRegister(message) => message.header().command,
-            Self::ForwardRegisterResult(message) => message.header().command,
-            Self::ForwardLogout(message) => message.header().command,
-            Self::ConsumerSessionHeartbeat(message) => message.header().command,
-            Self::ForwardLogoutResult(message) => message.header().command,
-            Self::ForwardCompletion(message) => message.header().command,
-            Self::PrimaryRebalance(message) => message.header().command,
-            Self::SegmentDelete(message) => message.header().command,
-        }
-    }
+    #[dispatch(*, via = .header())]
+    pub fn command(&self) -> Command;
 
     #[must_use]
-    pub fn size(&self) -> u32 {
-        match self {
-            Self::Request(message) => message.header().size(),
-            Self::Prepare(message) => message.header().size(),
-            Self::PrepareOk(message) => message.header().size(),
-            Self::StartViewChange(message) => message.header().size(),
-            Self::DoViewChange(message) => message.header().size(),
-            Self::StartView(message) => message.header().size(),
-            Self::Commit(message) => message.header().size(),
-            Self::CommitReply(message) => message.header().size(),
-            Self::PrepareProgress(message) => message.header().size(),
-            Self::RequestStartView(message) => message.header().size(),
-            Self::RequestPrepares(message) => message.header().size(),
-            Self::RepairPrepare(message) => message.header().size(),
-            Self::RepairRangeReply(message) => message.header().size(),
-            Self::RequestStateTransfer(message) => message.header().size(),
-            Self::StateTransferTarget(message) => message.header().size(),
-            Self::RequestStateChunk(message) => message.header().size(),
-            Self::StateChunk(message) => message.header().size(),
-            Self::ForwardRegister(message) => message.header().size(),
-            Self::ForwardRegisterResult(message) => message.header().size(),
-            Self::ForwardLogout(message) => message.header().size(),
-            Self::ConsumerSessionHeartbeat(message) => message.header().size(),
-            Self::ForwardLogoutResult(message) => message.header().size(),
-            Self::ForwardCompletion(message) => message.header().size(),
-            Self::PrimaryRebalance(message) => message.header().size(),
-            Self::SegmentDelete(message) => message.header().size(),
-        }
-    }
+    #[dispatch(*, via = .header())]
+    pub fn size(&self) -> u32;
 
     #[must_use]
-    pub fn operation(&self) -> Operation {
-        match self {
-            Self::Request(message) => message.header().operation,
-            Self::Prepare(message) => message.header().operation,
-            Self::PrepareOk(message) => message.header().operation,
-            Self::StartViewChange(message) => message.header().operation(),
-            Self::DoViewChange(message) => message.header().operation(),
-            Self::StartView(message) => message.header().operation(),
-            Self::Commit(message) => message.header().operation(),
-            Self::CommitReply(message) => message.header().operation(),
-            Self::PrepareProgress(message) => message.header().operation(),
-            Self::RequestStartView(message) => message.header().operation(),
-            Self::RequestPrepares(message) => message.header().operation(),
-            Self::RepairPrepare(message) => message.header().operation(),
-            Self::RepairRangeReply(message) => message.header().operation(),
-            Self::RequestStateTransfer(message) => message.header().operation(),
-            Self::StateTransferTarget(message) => message.header().operation(),
-            Self::RequestStateChunk(message) => message.header().operation(),
-            Self::StateChunk(message) => message.header().operation(),
-            Self::ForwardRegister(message) => message.header().operation(),
-            Self::ForwardRegisterResult(message) => message.header().operation(),
-            Self::ForwardLogout(message) => message.header().operation(),
-            Self::ConsumerSessionHeartbeat(message) => message.header().operation(),
-            Self::ForwardLogoutResult(message) => message.header().operation(),
-            Self::ForwardCompletion(message) => message.header().operation(),
-            Self::PrimaryRebalance(message) => message.header().operation(),
-            Self::SegmentDelete(message) => message.header().operation(),
-        }
-    }
+    #[dispatch(*, via = .header())]
+    pub fn operation(&self) -> Operation;
 }
 
 /// Why `H`'s header bytes failed bytemuck's checked cast.
