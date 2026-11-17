@@ -287,6 +287,20 @@ where
             .map(|segment| segment.end_offset)
     }
 
+    /// Whether a command changed the long-term log on this primary since
+    /// the last call.
+    pub fn take_long_term_changed(&self) -> bool {
+        self.long_term_changed.take()
+    }
+
+    /// A command of `kind` applied. Only a primary notes it, since only a
+    /// primary publishes the manifest and rewrites.
+    pub(crate) fn note_long_term_command(&self, kind: CommandKind) {
+        if kind == PUBLISH_SEGMENT && self.consensus().is_primary() {
+            self.long_term_changed.set(true);
+        }
+    }
+
     /// A request committing `segment` to the long-term log, for the
     /// primary's `on_request`. `request` is the caller's own number for it,
     /// as for [`Self::command_request`].

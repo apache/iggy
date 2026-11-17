@@ -266,30 +266,35 @@ where
     /// Take the result of the publish numbered `id`. A result of a job this
     /// partition does not wait for, or one that arrives after primacy moved,
     /// changes nothing. A publish that failed is repeated by a later pass.
+    ///
+    /// Returns whether the long-term log moved while the manifest was being
+    /// stored. No publish starts while one runs, so the caller stages the
+    /// next one.
     pub fn finish_manifest_publish(
         &mut self,
         id: u64,
         outcome: &ManifestPublishOutcome,
         now: IggyTimestamp,
-    ) {
+    ) -> bool {
         let awaited = self
             .manifest_publishes
             .running
             .as_ref()
             .is_some_and(|(running, _, _)| *running == id);
         if !awaited {
-            return;
+            return false;
         }
         if !self.publishes_manifest()
             || self.manifest_publishes.view != Some(self.consensus().view())
         {
             self.manifest_publishes = ManifestPublishes::default();
-            return;
+            return false;
         }
         let namespace_raw = self.namespace().inner();
+        let long_term_floor = self.places_batches().then(|| self.long_term_floor());
         let publishes = &mut self.manifest_publishes;
         let Some((_, progress, _scope)) = publishes.running.take() else {
-            return;
+            return false;
         };
         match outcome {
             Ok(Ok(())) => {
@@ -304,13 +309,17 @@ where
                     trim_point = ?progress.trim_point,
                     "stored the manifest of the partition"
                 );
+                long_term_floor.is_some_and(|floor| floor != progress.floor)
             }
-            Ok(Err(error)) => warn!(
-                namespace_raw,
-                %error,
-                "storing the manifest of the partition failed and is tried again"
-            ),
-            Err(TierJobCancelled) => {}
+            Ok(Err(error)) => {
+                warn!(
+                    namespace_raw,
+                    %error,
+                    "storing the manifest of the partition failed and is tried again"
+                );
+                false
+            }
+            Err(TierJobCancelled) => false,
         }
     }
 
