@@ -36,6 +36,7 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::{IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::LocalEnvelope;
+use server_common::sharding::IggyNamespace;
 use shard::Receiver;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -102,15 +103,11 @@ pub fn stage_owned_partitions(
             continue;
         };
 
-        // A partition that places its batches rewrites them into long-term
-        // segments and publishes what it stored. Each pass does nothing on a
-        // replica that is not its primary.
         if shard.plane.partitions().places_batches(&namespace)
             && let Some(created_revision) =
                 streams.with_committed_partition(namespace, |partition| partition.created_revision)
         {
-            shard.request_rewrite_segments(namespace, created_revision);
-            shard.request_publish_manifest(namespace, created_revision, now);
+            stage_long_term_passes(shard, namespace, created_revision, now);
         }
 
         // `ServerDefault` resolves to "never expire" here, matching the legacy
@@ -212,6 +209,22 @@ pub fn stage_owned_partitions(
     // advance that did not commit. It is also the only upload pass that
     // knows the committed truncation watermark.
     shard.request_upload_passes(&tiered, now);
+}
+
+/// Stage the passes of a partition that places its batches: it rewrites them
+/// into long-term segments, publishes what it stored, and deletes the objects
+/// of the segments its long-term log stopped listing. Each pass does nothing
+/// on a replica that is not the partition's primary.
+fn stage_long_term_passes(
+    shard: &ServerShard,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    now: IggyTimestamp,
+) {
+    shard.request_rewrite_segments(namespace, created_revision);
+    shard.request_publish_manifest(namespace, created_revision, now);
+    // The long-term log alone bounds these deletes, so no watermark.
+    shard.request_delete_objects(namespace, created_revision, now, 0);
 }
 
 /// What one partition of a tiered topic keeps on local disk. The topic's

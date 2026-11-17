@@ -1143,7 +1143,7 @@ async fn object_bytes(store: &iggy_object_store::MemoryStore, key: &str) -> Vec<
     store.get_range(key, 0..size).await.unwrap().bytes.to_vec()
 }
 
-fn long_term_key(
+pub(super) fn long_term_key(
     start_offset: u64,
     end_offset: u64,
     object: iggy_object_store::SegmentObject,
@@ -1609,7 +1609,7 @@ async fn commit_segment_command(
 
 /// Take `request` as the primary does, and commit it on the replica as it
 /// stands then.
-async fn commit_long_term_request(
+pub(super) async fn commit_long_term_request(
     partition: &mut IggyPartition<IggyMessageBus>,
     request: Message<RoutedRequestHeader>,
     lose_primacy_first: bool,
@@ -1628,7 +1628,7 @@ async fn commit_long_term_request(
 
 /// A leader of three whose long-term log holds the offsets `0`, `1` and
 /// `2..=3` as three segments, each committed by its own command.
-async fn leader_with_three_long_term_segments() -> (
+pub(super) async fn leader_with_three_long_term_segments() -> (
     tempfile::TempDir,
     IggyPartition<IggyMessageBus>,
     [iggy_object_store::ManifestSegment; 3],
@@ -1655,7 +1655,7 @@ async fn leader_with_three_long_term_segments() -> (
 }
 
 /// The segment that holds the bytes of `first` and then of `second`.
-fn merged_of(
+pub(super) fn merged_of(
     first: &iggy_object_store::ManifestSegment,
     second: &iggy_object_store::ManifestSegment,
 ) -> iggy_object_store::ManifestSegment {
@@ -2177,13 +2177,13 @@ async fn placing_leader_of_three_with(
 
 /// Move the partition to the next view this replica does not lead, and then
 /// to the next one it leads.
-fn lose_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
+pub(super) fn lose_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
     let view = partition.consensus.view() + 1;
     partition.consensus.set_view(view);
     assert!(!partition.consensus.is_primary());
 }
 
-fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
+pub(super) fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
     while !partition.consensus.is_primary() {
         let view = partition.consensus.view() + 1;
         partition.consensus.set_view(view);

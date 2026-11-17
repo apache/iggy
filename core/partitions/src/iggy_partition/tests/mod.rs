@@ -1902,6 +1902,7 @@ mod eviction;
 mod floor_eviction;
 mod free_space;
 mod history;
+mod long_term_delete;
 mod manifest_publish;
 mod materialization;
 mod materialization_io;

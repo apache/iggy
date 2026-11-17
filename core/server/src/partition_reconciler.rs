@@ -5662,6 +5662,53 @@ mod tests {
         ));
     }
 
+    /// Nothing else asks a partition that places its batches to delete the
+    /// objects its long-term log stopped listing. The pass carries no
+    /// truncation watermark, which does not bound those deletes.
+    #[compio::test]
+    async fn given_a_topic_that_places_its_batches_when_the_cleaner_passes_should_stage_a_delete_pass()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placing-stream");
+        seed_topic(&mux, 2, 0, "placing-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let deletes = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut deletes = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::DeleteObjects {
+                    namespace,
+                    created_revision,
+                    committed_up_to,
+                    ..
+                }) = frame
+                {
+                    deletes.push((namespace, created_revision, committed_up_to));
+                }
+            }
+            deletes
+        };
+        assert_eq!(deletes(), []);
+        let partition = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the reconciler materialized the partition");
+        let created_revision = partition.created_revision();
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+
+        assert_eq!(deletes(), [(namespace, created_revision, 0)]);
+    }
+
     /// An evicted segment is read back from the store, so the cleaner stages
     /// an eviction only while the node reads remote segments and passes the
     /// store identity check.

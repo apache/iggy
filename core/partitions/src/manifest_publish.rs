@@ -127,6 +127,17 @@ pub struct ManifestProgress {
     segments: usize,
 }
 
+impl ManifestProgress {
+    #[cfg(test)]
+    pub(crate) const fn new(floor: Option<u64>, trim_point: Option<u64>, segments: usize) -> Self {
+        Self {
+            floor,
+            trim_point,
+            segments,
+        }
+    }
+}
+
 impl From<&PartitionManifest> for ManifestProgress {
     fn from(manifest: &PartitionManifest) -> Self {
         Self {
@@ -328,6 +339,7 @@ where
             return false;
         }
         let namespace_raw = self.namespace().inner();
+        let view = self.consensus().view();
         let long_term = self.places_batches().then(|| self.long_term_progress());
         let publishes = &mut self.manifest_publishes;
         let Some((_, progress, _scope)) = publishes.running.take() else {
@@ -340,6 +352,7 @@ where
                     None => publishes.first_published_at = Some(now),
                 }
                 publishes.published = Some(progress);
+                self.long_term_deletes.manifest_stored(view, progress, now);
                 debug!(
                     namespace_raw,
                     floor = ?progress.floor,
@@ -359,6 +372,14 @@ where
             }
             Err(TierJobCancelled) => false,
         }
+    }
+
+    /// What the manifest this view last stored holds, `None` before its
+    /// first one.
+    pub(crate) fn stored_manifest_progress(&self) -> Option<ManifestProgress> {
+        self.manifest_publishes
+            .published
+            .filter(|_| self.manifest_publishes.view == Some(self.consensus().view()))
     }
 
     /// Whether the manifest this view last stored already leaves out every
@@ -406,11 +427,7 @@ mod tests {
         trim_point: Option<u64>,
         segments: usize,
     ) -> ManifestProgress {
-        ManifestProgress {
-            floor,
-            trim_point,
-            segments,
-        }
+        ManifestProgress::new(floor, trim_point, segments)
     }
 
     #[test]

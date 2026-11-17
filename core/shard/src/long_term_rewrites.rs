@@ -134,7 +134,7 @@ where
     /// The pump's tick: settle the rewrites whose frame the inbox refused,
     /// act on the commands that committed outside a partition I/O step,
     /// start the passes that are due, and report how far the rewrites are
-    /// behind.
+    /// behind and how many objects no long-term log accounts for.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
@@ -148,18 +148,23 @@ where
             self.settle_segment_rewrite(finished).await;
         }
         let partitions = self.plane.partitions();
-        let changed: Vec<_> = self
-            .rewrite_pacing
-            .borrow()
-            .paced()
-            .filter(|(namespace, created_revision)| {
-                partitions.get_by_ns(namespace).is_some_and(|partition| {
-                    partition.created_revision() == *created_revision
-                        && partition.take_long_term_changed()
-                })
-            })
-            .copied()
-            .collect();
+        let mut unannounced_objects = 0;
+        let mut changed = Vec::new();
+        for key in self.rewrite_pacing.borrow().paced() {
+            let (namespace, created_revision) = key;
+            let Some(partition) = partitions
+                .get_by_ns(namespace)
+                .filter(|partition| partition.created_revision() == *created_revision)
+            else {
+                continue;
+            };
+            unannounced_objects += partition.long_term_unannounced_objects();
+            if partition.take_long_term_changed() {
+                changed.push(*key);
+            }
+        }
+        self.metrics
+            .set_long_term_unannounced_objects(unannounced_objects);
         for (namespace, created_revision) in changed {
             self.long_term_changed(namespace, created_revision);
         }

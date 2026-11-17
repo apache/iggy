@@ -377,6 +377,7 @@ pub struct ShardMetrics {
     partitions_owing_retirement: Gauge,
     partition_segment_upload_lag_seconds: Gauge,
     partition_long_term_rewrite_lag_messages: Gauge,
+    partition_long_term_unannounced_objects: Gauge,
     fresh_objects: Gauge,
     fresh_object_bytes: Gauge,
     fresh_object_oldest_age_seconds: Gauge,
@@ -527,6 +528,7 @@ impl ShardMetrics {
             partitions_owing_retirement: Gauge::default(),
             partition_segment_upload_lag_seconds: Gauge::default(),
             partition_long_term_rewrite_lag_messages: Gauge::default(),
+            partition_long_term_unannounced_objects: Gauge::default(),
             fresh_objects: Gauge::default(),
             fresh_object_bytes: Gauge::default(),
             fresh_object_oldest_age_seconds: Gauge::default(),
@@ -1215,6 +1217,23 @@ impl ShardMetrics {
         self.partition_long_term_rewrite_lag_messages.get()
     }
 
+    /// Republished by the pump's tick: the objects in the store that no
+    /// long-term log lists and that are not dead, summed over the partitions
+    /// this shard leads, as the last listing of each found. Nothing deletes
+    /// such an object, so a count that stays above zero is storage that only
+    /// a later replace or trim over its offsets frees.
+    pub fn set_long_term_unannounced_objects(&self, objects: usize) {
+        self.partition_long_term_unannounced_objects
+            .set(i64::try_from(objects).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_unannounced_objects_value(&self) -> i64 {
+        self.partition_long_term_unannounced_objects.get()
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1660,6 +1679,12 @@ impl ShardMetrics {
             "most messages one partition this shard leads committed that no long-term \
              segment holds yet, over the partitions that place their batches",
             self.partition_long_term_rewrite_lag_messages.clone(),
+        );
+        registry.register(
+            "partition_long_term_unannounced_objects",
+            "objects of long-term segments in the store that no long-term log lists and \
+             that no later state of it rules out, over the partitions this shard leads",
+            self.partition_long_term_unannounced_objects.clone(),
         );
         registry.register(
             "retirement_debts_paid",

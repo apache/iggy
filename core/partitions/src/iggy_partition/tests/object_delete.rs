@@ -40,7 +40,7 @@ const SEALED: [(u64, u64); 2] = [(0, 1), (2, 3)];
 
 /// What [`Faulty`] does with a delete.
 #[derive(Clone, Default, PartialEq, Eq)]
-enum Deletes {
+pub(super) enum Deletes {
     #[default]
     Work,
     /// Reports this key as not deleted, and deletes the others.
@@ -53,13 +53,13 @@ enum Deletes {
 /// keys of every delete call and the key of every HEAD, and that can list
 /// keys it does not hold.
 #[derive(Default)]
-struct Faulty {
-    inner: MemoryStore,
-    deletes: RefCell<Deletes>,
-    delete_calls: RefCell<Vec<usize>>,
+pub(super) struct Faulty {
+    pub(super) inner: MemoryStore,
+    pub(super) deletes: RefCell<Deletes>,
+    pub(super) delete_calls: RefCell<Vec<usize>>,
     lists_also: RefCell<Vec<String>>,
     /// Whether every listing fails.
-    lists_fail: Cell<bool>,
+    pub(super) lists_fail: Cell<bool>,
     /// Whether every HEAD fails.
     heads_fail: Cell<bool>,
     head_calls: RefCell<Vec<String>>,
@@ -136,13 +136,13 @@ impl ObjectStore for Faulty {
     }
 }
 
-type Deleter = ExecutorDeleter<InlineTierExecutor<Faulty>>;
+pub(super) type Deleter = ExecutorDeleter<InlineTierExecutor<Faulty>>;
 
-fn deleter() -> Deleter {
+pub(super) fn deleter() -> Deleter {
     ExecutorDeleter::new(InlineTierExecutor::new(Faulty::default()), layout())
 }
 
-fn store(deleter: &Deleter) -> &Faulty {
+pub(super) fn store(deleter: &Deleter) -> &Faulty {
     deleter.executor().store()
 }
 
@@ -159,7 +159,7 @@ fn keys_of(start_offset: u64) -> [String; 2] {
     [SegmentObject::Index, SegmentObject::Log].map(|object| key_of(PREFIX, start_offset, object))
 }
 
-async fn put(store: &Faulty, key: &str) {
+pub(super) async fn put(store: &Faulty, key: &str) {
     store
         .put(key, PutBody::from_bytes(vec![1]), &PutOptions::default())
         .await
@@ -210,7 +210,7 @@ async fn truncate(partition: &mut IggyPartition<IggyMessageBus>, up_to_offset: u
     assert_eq!(partition.chain_trim_point(), Some(up_to_offset));
 }
 
-fn after(moment: IggyTimestamp, micros: u64) -> IggyTimestamp {
+pub(super) fn after(moment: IggyTimestamp, micros: u64) -> IggyTimestamp {
     IggyTimestamp::from(moment.as_micros() + micros)
 }
 

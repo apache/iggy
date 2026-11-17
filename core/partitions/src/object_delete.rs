@@ -32,6 +32,10 @@
 //! [`DeletedIncarnations`] holds its incarnation for the node that saw the
 //! delete commit, and [`delete_incarnation`] removes everything the
 //! incarnation stored.
+//!
+//! A partition that places its batches deletes the objects of long-term
+//! segments instead, by the rules of [`crate::long_term_delete`], through
+//! the same jobs.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
@@ -45,6 +49,8 @@ use iggy_object_store::{
     TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
 use tracing::warn;
+
+use crate::long_term_delete::SweptLongTerm;
 
 /// How long the objects of a removed segment stay in the store after the
 /// primary learned the segment is gone.
@@ -81,6 +87,13 @@ pub enum ObjectDeleteWork {
     /// Delete every segment object and the manifest of the incarnation,
     /// which a committed delete removed.
     DeleteIncarnation,
+    /// List the objects of the incarnation's long-term segments, and sort
+    /// them by `segments`, the first and the last offset of every segment
+    /// of the long-term log in offset order.
+    SweepLongTerm { segments: Vec<(u64, u64)> },
+    /// Delete the `.index` and then the `.log` of the long-term segments
+    /// with these first and last offsets.
+    DeleteLongTerm { segments: Vec<(u64, u64)> },
 }
 
 /// A job the partition's owner captured, to run under the scope it came with.
@@ -102,6 +115,11 @@ pub enum ObjectDeleteDone {
     /// How many objects of a deleted incarnation are still to delete, or why
     /// its listing stopped.
     IncarnationDeleted(Result<usize, ObjectStoreError>),
+    /// What a listing of the long-term objects found, or why it stopped.
+    LongTermSwept(Result<SweptLongTerm, ObjectStoreError>),
+    /// The first and the last offset of the long-term segments that still
+    /// have an object.
+    LongTermDeleted { failed: Vec<(u64, u64)> },
 }
 
 /// What a job ended as: its own result, or a cancellation before it finished.
@@ -189,6 +207,29 @@ impl<E: TierExecutor> ObjectDeleter for ExecutorDeleter<E> {
                         ObjectDeleteDone::IncarnationDeleted(
                             delete_incarnation(&*store, &layout, &prefix).await,
                         )
+                    },
+                )
+                .boxed_local(),
+            ObjectDeleteWork::SweepLongTerm { segments } => self
+                .executor
+                .submit(
+                    TierJobRequest::new(TierJobClass::Housekeeping, scope),
+                    move |store| async move {
+                        ObjectDeleteDone::LongTermSwept(
+                            sweep_long_term(&*store, &layout, &prefix, &segments).await,
+                        )
+                    },
+                )
+                .boxed_local(),
+            ObjectDeleteWork::DeleteLongTerm { segments } => self
+                .executor
+                .submit(
+                    TierJobRequest::new(TierJobClass::Delete, scope),
+                    move |store| async move {
+                        ObjectDeleteDone::LongTermDeleted {
+                            failed: delete_long_term_segments(&*store, &layout, &prefix, &segments)
+                                .await,
+                        }
                     },
                 )
                 .boxed_local(),
@@ -345,6 +386,26 @@ pub async fn sweep_segments<S: ObjectStore>(
     })
 }
 
+/// List the objects of the long-term segments of `prefix`, and sort them by
+/// `segments`, the first and the last offset of every segment of the
+/// long-term log in offset order.
+///
+/// A segment is found by either of its objects, so one that lost only its
+/// `.index` is still reported.
+///
+/// # Errors
+/// The store's error for the listing page that failed. Nothing is returned
+/// for the pages before it, so the caller lists again.
+pub async fn sweep_long_term<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    prefix: &ObjectPrefix,
+    segments: &[(u64, u64)],
+) -> Result<SweptLongTerm, ObjectStoreError> {
+    let listed = list_incarnation(store, layout, prefix).await?;
+    Ok(SweptLongTerm::classified(listed.long_term, segments))
+}
+
 /// Delete every segment object the store lists for `prefix`, those of
 /// long-term segments included, then the incarnation's manifest, and return
 /// how many objects are still to delete.
@@ -441,10 +502,11 @@ async fn list_incarnation<S: ObjectStore>(
 }
 
 /// Delete both objects of every long-term segment of `prefix` in `segments`,
-/// each named by its first and its last offset, and return the ones that
-/// still have an object. Every `.index` goes before any `.log`, as in
-/// [`delete_segments`].
-async fn delete_long_term_segments<S: ObjectStore>(
+/// each named by its first and its last offset.
+///
+/// Returns the ones that still have an object. Every `.index` goes before
+/// any `.log`, as in [`delete_segments`].
+pub async fn delete_long_term_segments<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
     prefix: &ObjectPrefix,
@@ -748,7 +810,13 @@ impl DeletedIncarnations {
             ),
             // A cancelled job, or a result of another kind of work, proves
             // nothing about what the store still holds.
-            Ok(ObjectDeleteDone::Swept(_) | ObjectDeleteDone::Deleted { .. }) | Err(_) => {}
+            Ok(
+                ObjectDeleteDone::Swept(_)
+                | ObjectDeleteDone::Deleted { .. }
+                | ObjectDeleteDone::LongTermSwept(_)
+                | ObjectDeleteDone::LongTermDeleted { .. },
+            )
+            | Err(_) => {}
         }
         self.forget(&prefix);
         let due_at = now

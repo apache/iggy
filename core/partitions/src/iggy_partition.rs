@@ -219,6 +219,12 @@ where
     object_deletes: ObjectDeletes,
     /// Number of the last object-delete job this partition started.
     object_delete_jobs: u64,
+    /// What this replica deletes of its long-term objects while it is the
+    /// primary of a partition that places its batches. Behind a pointer: a
+    /// partition is moved by value through the futures that set it up, and
+    /// only the cleaner's passes and a commit to the long-term log read
+    /// this.
+    pub(crate) long_term_deletes: Box<crate::long_term_delete::LongTermDeletes>,
     /// What this replica publishes of the partition's manifest while it is
     /// the primary.
     pub(crate) manifest_publishes: crate::manifest_publish::ManifestPublishes,
@@ -1051,6 +1057,7 @@ where
             long_term_changed: Cell::new(false),
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
+            long_term_deletes: Box::default(),
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
@@ -14027,11 +14034,18 @@ where
     /// A replica that is not the primary drops what it queued and cancels
     /// the job it started, so a pass over a demoted replica is what stops
     /// its job.
+    ///
+    /// A partition that places its batches has no objects of this kind. Its
+    /// jobs are those of [`Self::begin_long_term_delete`], which no
+    /// watermark bounds.
     pub fn begin_object_delete(
         &mut self,
         now: IggyTimestamp,
         committed_up_to: u64,
     ) -> Option<(crate::ObjectDeleteJob, iggy_object_store::TierScopeToken)> {
+        if self.places_batches() {
+            return self.begin_long_term_delete(now);
+        }
         if !self.deletes_objects() {
             self.object_deletes = ObjectDeletes::default();
             return None;
@@ -14089,6 +14103,10 @@ where
         outcome: crate::ObjectDeleteOutcome,
         now: IggyTimestamp,
     ) {
+        if self.places_batches() {
+            self.finish_long_term_delete(id, outcome, now);
+            return;
+        }
         let awaited = self
             .object_deletes
             .running

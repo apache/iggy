@@ -943,6 +943,103 @@ async fn given_a_manifest_publisher_when_a_trim_commits_should_publish_the_manif
     .await;
 }
 
+/// A delete pass over a partition that places its batches lists the
+/// objects of its long-term segments. An object that the log does not list
+/// and may still come to list is kept, and the shard reports how many of
+/// those its partitions found.
+#[compio::test]
+async fn given_a_placing_partition_when_a_delete_pass_runs_should_list_its_long_term_objects_and_report_the_unannounced()
+ {
+    use super::object_deletes::Shared;
+    use iggy_object_store::{LongTermKey, PutBody, PutOptions, SegmentObject};
+    use partitions::{
+        ExecutorDeleter, ExecutorLongTermWriter, ExecutorObjects, ObjectDeleteWork, RemoteSegments,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_object_deleter(Some(Rc::new(ExecutorDeleter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let partitions = owner.plane.partitions();
+    partitions.set_remote_segments(Rc::new(RemoteSegments::new(
+        Rc::new(ExecutorObjects::new(executor.clone())),
+        layout(),
+    )));
+    let revision = partitions
+        .get_by_ns(&namespace())
+        .unwrap()
+        .created_revision();
+    let floor = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+    };
+    let store = executor.0.store();
+    // From where the segment of the log starts to above its floor, as a
+    // primary stores that lost to the one whose segment the log lists.
+    let unannounced: Vec<String> = SegmentObject::ALL
+        .iter()
+        .map(|object| {
+            layout().long_term_key(&LongTermKey {
+                prefix: partitions::object_prefix(namespace(), revision),
+                start_offset: 0,
+                end_offset: 5,
+                object: *object,
+            })
+        })
+        .collect();
+    for key in &unannounced {
+        store
+            .put(key, PutBody::from_bytes(vec![1]), &PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    pumped(&owner, async {
+        let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| floor(owner) == Some(1)).await;
+        assert_eq!(owner.metrics().long_term_unannounced_objects_value(), 0);
+
+        owner.request_delete_objects(namespace(), revision, IggyTimestamp::now(), 0);
+        until(&owner, |owner| {
+            owner.metrics().long_term_unannounced_objects_value() == 1
+        })
+        .await;
+    })
+    .await;
+
+    let keys = store.keys();
+    assert!(unannounced.iter().all(|key| keys.contains(key)));
+    let partition = owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap();
+    assert!(
+        !matches!(
+            partition.begin_object_delete(IggyTimestamp::now(), 0),
+            Some((job, _)) if matches!(job.work, ObjectDeleteWork::SweepLongTerm { .. })
+        ),
+        "the partition listed its objects in this view"
+    );
+}
+
 /// Stores the object, and then holds the answer back until told.
 struct HeldUploader {
     uploader: MemoryUploader,
