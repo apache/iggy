@@ -18,11 +18,12 @@
 //! The Advanced section: the additional insights, closed by default. Its charts only mount once the
 //! reader first opens the section, because the percentile curves hold thousands of points.
 
+use bench_dashboard_shared::omb::chart::{QuantileGroup, WindowMetric};
 use bench_dashboard_shared::omb::detail::{OmbRunDetail, OmbSeries};
 use web_sys::Element;
 use yew::prelude::*;
 
-use super::chart::{DetailRef, QuantileChart, QuantileGroup, WindowChart, WindowMetric};
+use super::chart::{DetailRef, QuantileChart, WindowChart};
 use super::with_detail;
 use crate::state::data::Loadable;
 

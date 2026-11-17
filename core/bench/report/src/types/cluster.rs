@@ -17,9 +17,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Role string that marks a node as the consensus leader; anything else counts as a follower.
-const LEADER_ROLE: &str = "leader";
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct BenchmarkClusterInfo {
     /// Human-friendly cluster name
@@ -39,33 +36,14 @@ pub struct BenchmarkClusterNode {
 }
 
 impl BenchmarkClusterInfo {
-    /// Human display label such as `3-node cluster (1 leader + 2 followers)`.
+    /// Human display label such as `3-node cluster`. The roles stay out: a node's role is its role
+    /// in the metadata consensus when the benchmark ran, and partition primaries spread over all
+    /// nodes, so "1 leader" would read as a single-leader cluster.
     pub fn label(&self) -> String {
         if self.nodes.is_empty() {
             return format!("cluster '{}'", self.name);
         }
-
-        let leaders = self
-            .nodes
-            .iter()
-            .filter(|node| node.role == LEADER_ROLE)
-            .count();
-        let followers = self.nodes.len() - leaders;
-
-        format!(
-            "{}-node cluster ({} + {})",
-            self.nodes.len(),
-            pluralize(leaders, "leader"),
-            pluralize(followers, "follower"),
-        )
-    }
-}
-
-fn pluralize(count: usize, word: &str) -> String {
-    if count == 1 {
-        format!("{count} {word}")
-    } else {
-        format!("{count} {word}s")
+        format!("{}-node cluster", self.nodes.len())
     }
 }
 
@@ -82,7 +60,7 @@ mod tests {
     }
 
     #[test]
-    fn test_label_three_nodes_one_leader() {
+    fn given_three_nodes_with_roles_when_labeled_should_count_nodes_without_roles() {
         let cluster = BenchmarkClusterInfo {
             name: "vsr".to_string(),
             nodes: vec![
@@ -91,16 +69,16 @@ mod tests {
                 node("node-3", "follower"),
             ],
         };
-        assert_eq!(cluster.label(), "3-node cluster (1 leader + 2 followers)");
+        assert_eq!(cluster.label(), "3-node cluster");
     }
 
     #[test]
-    fn test_label_single_leader_node() {
+    fn given_single_node_when_labeled_should_count_one_node() {
         let cluster = BenchmarkClusterInfo {
             name: "solo".to_string(),
             nodes: vec![node("node-1", "leader")],
         };
-        assert_eq!(cluster.label(), "1-node cluster (1 leader + 0 followers)");
+        assert_eq!(cluster.label(), "1-node cluster");
     }
 
     #[test]
