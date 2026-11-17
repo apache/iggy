@@ -28,7 +28,9 @@ use bench_dashboard_shared::summary::{BenchmarkSummary, actors, kind_name};
 use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
 use bench_report::hardware::BenchmarkHardware;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
-use bench_report::options::{BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions};
+use bench_report::options::{
+    BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions, BenchmarkTopicStorage,
+};
 use bench_report::params::{BenchmarkDataVolume, BenchmarkParams};
 use bench_report::server_stats::BenchmarkServerStats;
 use bench_report::transport::BenchmarkTransport;
@@ -196,6 +198,7 @@ pub fn option_groups(params: &BenchmarkParams) -> Vec<FactGroup> {
             ),
             fact("Max topic size", max_topic_size_text(topic.max_topic_size)),
             fact("Message expiry", message_expiry_text(topic.message_expiry)),
+            fact("Topic storage", topic_storage_text(topic.storage)),
         ],
     }];
     if let Some(consumer) = &options.consumer {
@@ -296,6 +299,7 @@ pub fn field_value(field: WorkloadField, key: &WorkloadKey) -> FieldValue {
             },
             text: message_expiry_text(topic.message_expiry),
         },
+        WorkloadField::TopicStorage => word(topic_storage_text(topic.storage)),
         WorkloadField::ConsumerOffsetDurability => poll.map_or_else(not_polled, |options| {
             word(durability_text(options.consumer_offset_durability))
         }),
@@ -589,6 +593,14 @@ fn max_topic_size_text(size: BenchmarkMaxTopicSize) -> String {
     }
 }
 
+const fn topic_storage_text(storage: BenchmarkTopicStorage) -> &'static str {
+    match storage {
+        BenchmarkTopicStorage::Local => "local",
+        BenchmarkTopicStorage::Tiered => "tiered",
+        BenchmarkTopicStorage::Geo => "geo",
+    }
+}
+
 fn message_expiry_text(expiry: BenchmarkMessageExpiry) -> String {
     match expiry {
         BenchmarkMessageExpiry::ServerDefault => SERVER_DEFAULT.to_owned(),
@@ -718,6 +730,7 @@ mod tests {
                 ("Messages required to save", "server default"),
                 ("Max topic size", "unlimited"),
                 ("Message expiry", "never"),
+                ("Topic storage", "local"),
                 ("Offset durability", "replicated"),
                 ("Max wait", "1 s"),
                 ("Min count", "1"),

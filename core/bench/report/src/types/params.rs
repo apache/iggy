@@ -109,6 +109,7 @@ mod tests {
     use crate::options::{
         BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkDurability,
         BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkTcpOptions, BenchmarkTopicOptions,
+        BenchmarkTopicStorage,
     };
     use serde_json::{Value, json};
 
@@ -157,6 +158,7 @@ mod tests {
                     messages_required_to_save: Some(128),
                     max_topic_size: BenchmarkMaxTopicSize::Bytes(1_073_741_824),
                     message_expiry: BenchmarkMessageExpiry::AfterUs(3_600_000_000),
+                    storage: BenchmarkTopicStorage::Geo,
                 },
                 consumer: Some(BenchmarkConsumerOptions {
                     consumer_offset_durability: BenchmarkDurability::Persisted,
@@ -192,7 +194,8 @@ mod tests {
                     "durability": "persisted",
                     "messages_required_to_save": 128,
                     "max_topic_size": {"bytes": 1_073_741_824_u64},
-                    "message_expiry": {"after_us": 3_600_000_000_u64}
+                    "message_expiry": {"after_us": 3_600_000_000_u64},
+                    "storage": "geo"
                 },
                 "consumer": {
                     "consumer_offset_durability": "persisted",
