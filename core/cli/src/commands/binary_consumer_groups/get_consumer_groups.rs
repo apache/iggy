@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::utils::list_rows::{ListRows, print_next};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
@@ -44,6 +45,7 @@ pub struct GetConsumerGroupsCmd {
     stream_id: Identifier,
     topic_id: Identifier,
     output: GetConsumerGroupsOutput,
+    rows: ListRows,
 }
 
 impl GetConsumerGroupsCmd {
@@ -51,11 +53,13 @@ impl GetConsumerGroupsCmd {
         stream_id: Identifier,
         topic_id: Identifier,
         output: GetConsumerGroupsOutput,
+        rows: ListRows,
     ) -> Self {
         Self {
             stream_id,
             topic_id,
             output,
+            rows,
         }
     }
 }
@@ -70,13 +74,18 @@ impl CliCommand for GetConsumerGroupsCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let consumer_groups = client
-            .get_consumer_groups(&self.stream_id, &self.topic_id)
+        let (stream_id, topic_id) = (&self.stream_id, &self.topic_id);
+        let (consumer_groups, next) = self
+            .rows
+            .read(|query| async move {
+                client
+                    .get_consumer_groups_page(stream_id, topic_id, &query)
+                    .await
+            })
             .await
             .with_context(|| {
                 format!(
-                    "Problem getting consumer groups for stream with ID: {} and topic with ID: {}",
-                    self.stream_id, self.topic_id
+                    "Problem getting consumer groups for stream with ID: {stream_id} and topic with ID: {topic_id}"
                 )
             })?;
 
@@ -107,6 +116,7 @@ impl CliCommand for GetConsumerGroupsCmd {
                 });
             }
         }
+        print_next(next);
 
         Ok(())
     }

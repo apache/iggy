@@ -19,7 +19,7 @@ use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::StreamClient;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
+use iggy_common::{Identifier, IggyError, NamedPageQuery, Page, Stream, StreamDetails};
 use iggy_common::{StreamCreateOptions, StreamUpdateOptions};
 
 #[async_trait]
@@ -30,6 +30,10 @@ impl StreamClient for IggyClient {
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
         super::with_client!(self, client => client.get_streams().await)
+    }
+
+    async fn get_streams_page(&self, query: &NamedPageQuery) -> Result<Page<Stream>, IggyError> {
+        super::with_client!(self, client => client.get_streams_page(query).await)
     }
 
     async fn create_stream(

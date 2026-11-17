@@ -25,8 +25,8 @@ use iggy_common::create_user::CreateUser;
 use iggy_common::login_user::LoginUser;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::{
-    IdentityInfo, OptionInputMap, Permissions, UserClient, UserCreateOptions, UserInfo,
-    UserInfoDetails, UserStatus, UserUpdateOptions,
+    IdentityInfo, NamedPageQuery, OptionInputMap, Page, Permissions, UserClient, UserCreateOptions,
+    UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
 };
 use secrecy::SecretString;
 
@@ -58,6 +58,15 @@ impl UserClient for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidJsonResponse)?;
         Ok(users)
+    }
+
+    async fn get_users_page(&self, query: &NamedPageQuery) -> Result<Page<UserInfo>, IggyError> {
+        query.validate()?;
+        let response = self.get_with_query(PATH, &query.http_query_pairs()).await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
     }
 
     async fn create_user(

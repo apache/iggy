@@ -368,6 +368,9 @@ where
     Ok(())
 }
 
+/// `reply_cap` is the largest reply frame a client accepts, see
+/// [`deny_oversized_reply`]. Outside tests it is
+/// [`MAX_RECORD_REPLY_SIZE`](iggy_binary_protocol::MAX_RECORD_REPLY_SIZE).
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -388,6 +391,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         address: client_address,
         metadata_watermark: watermark,
     }: ConnectionContext,
+    reply_cap: usize,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -460,17 +464,21 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
-            let response = GetClientsResponse {
+            let body = GetClientsResponse {
                 clients: infos
                     .iter()
                     .map(|info| connected_client_to_response(shard, info))
                     .collect(),
-            };
+            }
+            .to_bytes();
+            if deny_oversized_reply(shard, &request, origin, code, body.len(), reply_cap).await {
+                return;
+            }
             send_non_replicated_bytes(
                 shard,
                 &request,
                 origin,
-                response.to_bytes(),
+                body,
                 FrameChannel::Reply,
                 "get_clients",
             )
@@ -651,6 +659,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             }
             handle_default_non_replicated(
                 shard, origin, code, &request, user_id, attachment, watermark, &roster, client_ip,
+                reply_cap,
             )
             .await;
         }
@@ -1018,6 +1027,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     watermark: u64,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
+    reply_cap: usize,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1083,6 +1093,11 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         )
     }) {
         Ok(response) => {
+            if deny_oversized_reply(shard, request, origin, code, response.body_len(), reply_cap)
+                .await
+            {
+                return;
+            }
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(
                 request.header(),
@@ -1113,6 +1128,50 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
             send_non_replicated_deny(shard, request, origin, error.as_code()).await;
         }
     }
+}
+
+/// Sends `ReplyTooLarge` in place of a reply whose frame passes `reply_cap`
+/// and returns `true`. The QUIC and WebSocket links of the Rust SDK refuse a
+/// frame above [`MAX_RECORD_REPLY_SIZE`](iggy_binary_protocol::MAX_RECORD_REPLY_SIZE)
+/// by default and drop the connection, so the typed error keeps the link of
+/// every client.
+///
+/// Only `GetClients` and the reads of `build_non_replicated_response` pass
+/// this check. `GetSnapshot` checks a cap of its own, and `GetMetadataChanges`
+/// pages under a budget of its own. HTTP replies do not pass this check,
+/// because HTTP has no such cap.
+#[allow(clippy::future_not_send)]
+async fn deny_oversized_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: &Message<RoutedRequestHeader>,
+    origin: ClientOrigin,
+    code: u32,
+    body_len: usize,
+    reply_cap: usize,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if reply_frame_fits(body_len, reply_cap) {
+        return false;
+    }
+    warn!(
+        transport_client_id = origin.id,
+        code,
+        frame_size = HEADER_SIZE.saturating_add(body_len),
+        max = reply_cap,
+        "reply exceeds the client reply limit; refusing to send"
+    );
+    send_non_replicated_deny(shard, request, origin, IggyError::ReplyTooLarge.as_code()).await;
+    true
+}
+
+const fn reply_frame_fits(body_len: usize, cap: usize) -> bool {
+    HEADER_SIZE.saturating_add(body_len) <= cap
 }
 
 /// Serve `GET_SNAPSHOT_FILE`: gate on the snapshot rule (`manage_servers`,
@@ -1268,9 +1327,10 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 mod tests {
     use super::{
         FrontierUnreached, FrontierWait, MIN_DEFERRED_POLL_REPLY_MARGIN_US, hold_for_frontier,
-        read_frontier_budget, read_needs_metadata_frontier, remaining_timers,
+        read_frontier_budget, read_needs_metadata_frontier, remaining_timers, reply_frame_fits,
     };
     use configs::server::ServerConfig;
+    use iggy_binary_protocol::HEADER_SIZE;
     use iggy_binary_protocol::codes::{
         CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
         GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE,
@@ -1450,5 +1510,14 @@ mod tests {
             None,
             "a frame that outlived its timeout is not served"
         );
+    }
+
+    #[test]
+    fn given_a_reply_frame_at_the_cap_when_sized_should_fit_and_one_byte_more_should_not() {
+        let cap = HEADER_SIZE + 10;
+        assert!(reply_frame_fits(10, cap));
+        assert!(!reply_frame_fits(11, cap));
+        assert!(reply_frame_fits(0, HEADER_SIZE));
+        assert!(!reply_frame_fits(0, HEADER_SIZE - 1));
     }
 }

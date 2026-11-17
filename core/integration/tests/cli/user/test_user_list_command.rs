@@ -15,17 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::cli::common::list_runs::{ListRun, execute_list_runs};
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, OutputFormat, TestHelpCmd,
     USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use iggy::prelude::Client;
 use iggy::prelude::UserCreateOptions;
 use iggy::prelude::UserStatus;
+use iggy::prelude::{DEFAULT_ROOT_USERNAME, Identifier};
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
+
+/// The field of the username in a list mode row.
+const NAME_COLUMN: usize = 3;
 
 struct TestUserListCmd {
     username: String,
@@ -115,6 +121,65 @@ pub async fn should_be_successful() {
 
 #[tokio::test]
 #[parallel]
+pub async fn should_print_pages() {
+    execute_list_runs(
+        seed_users,
+        NAME_COLUMN,
+        vec![
+            ListRun::new(
+                "user list -l list",
+                &[DEFAULT_ROOT_USERNAME, "pages-u1", "pages-u4", "pages-u3"],
+                false,
+            ),
+            ListRun::new(
+                "user list -l list --sort created --limit 2",
+                &[DEFAULT_ROOT_USERNAME, "pages-u1"],
+                true,
+            ),
+            ListRun::new(
+                "user list -l list --sort created --after {next}",
+                &["pages-u3", "pages-u4"],
+                false,
+            ),
+            ListRun::new(
+                "user list -l list --name pages-u --desc",
+                &["pages-u3", "pages-u4", "pages-u1"],
+                false,
+            ),
+        ],
+    )
+    .await;
+}
+
+/// User `pages-u4` takes the ID of the deleted `pages-u2`, so the ID order is
+/// u1 u4 u3 and the creation order is u1 u3 u4, both after the root user.
+fn seed_users(client: &dyn Client) -> BoxFuture<'_, ()> {
+    Box::pin(async move {
+        let create_user = |name| async move {
+            client
+                .create_user(
+                    name,
+                    "secret",
+                    UserStatus::Active,
+                    None,
+                    &UserCreateOptions::default(),
+                )
+                .await
+                .expect("create user");
+        };
+        for name in ["pages-u1", "pages-u2", "pages-u3"] {
+            create_user(name).await;
+        }
+        client
+            .delete_user(&Identifier::named("pages-u2").expect("a username"))
+            .await
+            .expect("delete user");
+        create_user("pages-u4").await;
+    })
+}
+
+#[tokio::test]
+#[parallel]
 pub async fn should_help_match() {
     let mut iggy_cmd_test = IggyCmdTest::help_message();
 
@@ -128,6 +193,7 @@ Examples:
  iggy user list
  iggy user list --list-mode table
  iggy user list -l table
+ iggy user list --sort created --desc --limit 20
 
 {USAGE_PREFIX} user list [OPTIONS]
 
@@ -137,6 +203,28 @@ Options:
 {CLAP_INDENT}
           [default: table]
           [possible values: table, list]
+
+      --sort <SORT>
+          Order of the rows, by ID or by creation time
+{CLAP_INDENT}
+          [default: id]
+          [possible values: id, created]
+
+      --desc
+          Print the rows in descending order
+
+      --limit <N>
+          Print at most N rows
+{CLAP_INDENT}
+          If more rows follow them, the last line is `next: <CURSOR>`. Pass that cursor to --after to print the rows that follow.
+
+      --after <CURSOR>
+          Print the rows after this cursor
+{CLAP_INDENT}
+          The cursor comes from the `next:` line of a list with --limit. Use the same other flags as that list.
+
+      --name <TEXT>
+          Print only the rows whose name holds this text (case-sensitive)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -161,6 +249,11 @@ pub async fn should_short_help_match() {
 
 Options:
   -l, --list-mode <LIST_MODE>  List mode (table or list) [default: table] [possible values: table, list]
+      --sort <SORT>            Order of the rows, by ID or by creation time [default: id] [possible values: id, created]
+      --desc                   Print the rows in descending order
+      --limit <N>              Print at most N rows
+      --after <CURSOR>         Print the rows after this cursor
+      --name <TEXT>            Print only the rows whose name holds this text (case-sensitive)
   -h, --help                   Print help (see more with '--help')
 "#,
             ),
