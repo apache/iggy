@@ -69,9 +69,6 @@ pub async fn run_segment_cleaner(shard: Rc<ServerShard>, stop: Receiver<()>, int
             break;
         }
         stage_owned_partitions(&shard, &mut reported_floors);
-        // Fresh objects belong to no partition, so their sweep is staged
-        // once. A shard other than the replica's first stages nothing.
-        shard.request_sweep_fresh_objects(IggyTimestamp::now());
     }
     trace!(shard = shard.id, "segment cleaner exited");
 }
