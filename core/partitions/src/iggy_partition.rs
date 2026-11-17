@@ -2556,7 +2556,9 @@ where
 
     const fn requires_persistence(&self, operation: Operation) -> bool {
         match operation {
-            Operation::RetireSession | Operation::StateMachineCommand => true,
+            Operation::RetireSession | Operation::StateMachineCommand | Operation::RollSegment => {
+                true
+            }
             Operation::SendMessages => self.durability().is_persisted(),
             Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.consumer_offset_durability().is_persisted()
@@ -9819,6 +9821,14 @@ where
                 self.journal_append(frozen.clone()).await?;
                 Ok(frozen)
             }
+            Operation::RollSegment => {
+                if !message.body().is_empty() {
+                    return Err(IggyError::InvalidCommand);
+                }
+                let frozen = message.into_frozen();
+                self.journal_append(frozen.clone()).await?;
+                Ok(frozen)
+            }
             Operation::RetireSession => {
                 let retirement = RetireSessionsRequest::decode_from(message.body())
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -10786,6 +10796,7 @@ where
         journal.committed_prefix_len(self.consensus.commit_min(), through)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn drive_materialization(&mut self) -> Result<MaterializationStep, IggyError> {
         let pending = self
             .materialization
@@ -10807,6 +10818,31 @@ where
             return Ok(MaterializationStep::Pending);
         }
         let segment = self.log.active_segment();
+        let roll_requested = self.log.journal().inner.with_entries(|entries| {
+            entries
+                .get(pending.next_entry)
+                .is_some_and(|entry| peek_operation(entry) == Operation::RollSegment)
+        });
+        if roll_requested {
+            let segment_is_empty = segment.size.as_bytes_u64() == 0;
+            let next_offset = segment
+                .end_offset
+                .checked_add(1)
+                .ok_or(IggyError::CannotWriteToFile)?;
+            let pending = self
+                .materialization
+                .as_mut()
+                .expect("materialization exists");
+            pending.next_entry += 1;
+            if segment_is_empty {
+                // The WAL treats consecutive rolls at an empty tail as one
+                // boundary. Consume the marker without creating another
+                // empty segment, so materialization keeps the same layout.
+                return Ok(MaterializationStep::Progress);
+            }
+            pending.phase = MaterializationPhase::Rotate(next_offset);
+            return Ok(MaterializationStep::Ready);
+        }
         if segment.size.as_bytes_u64() >= segment.max_size.as_bytes_u64()
             || self.next_batch_rolls_by_age(pending.next_entry, pending.prefix_len)?
         {
@@ -11008,6 +11044,12 @@ where
             let mut backing = 0_usize;
             let mut file_position = position;
             for entry in entries {
+                // A committed roll is a physical boundary, not just another
+                // control entry. Stop the current write before it so the next
+                // drive pass can rotate the active segment at this operation.
+                if peek_operation(entry) == Operation::RollSegment {
+                    break;
+                }
                 let Some(meta) = materialization_batch_meta(entry, persisted_end)? else {
                     chunk.end_entry += 1;
                     continue;
@@ -13082,6 +13124,47 @@ where
     /// Mounted or busy partitions retain the watermark for the I/O lane and
     /// return an empty result. Only an idle partition without a dispatcher removes
     /// files inline and returns their counts.
+    /// Whether retention would become effective if the active segment were
+    /// sealed now. Empty active segments are deliberately left alone.
+    #[must_use]
+    pub fn roll_segment_pending(&self) -> bool {
+        let journal_pending = self.log.journal().inner.with_entries(|entries| {
+            entries
+                .iter()
+                .any(|entry| peek_operation(entry) == Operation::RollSegment)
+        });
+        journal_pending
+            || self.consensus.with_pipeline(|pipeline| {
+                pipeline
+                    .pending_requests()
+                    .any(|entry| entry.message.header().operation == Operation::RollSegment)
+                    || pipeline
+                        .prepare_head()
+                        .zip(pipeline.prepare_tail())
+                        .is_some_and(|(head, tail)| {
+                            (head.header.op..=tail.header.op).any(|op| {
+                                pipeline.message_by_op(op).is_some_and(|entry| {
+                                    entry.header.operation == Operation::RollSegment
+                                })
+                            })
+                        })
+            })
+    }
+
+    pub fn retention_roll_needed(&self, now: IggyTimestamp, message_expiry: IggyExpiry) -> bool {
+        let active = self.log.active_segment();
+        if active.size.as_bytes_u64() == 0 {
+            return false;
+        }
+        let expires = matches!(
+            message_expiry,
+            IggyExpiry::ExpireDuration(duration)
+                if active.max_timestamp != 0
+                    && active.max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
+        );
+        expires
+    }
+
     pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
         self.maintenance.retention = Some(
             self.maintenance

@@ -100,6 +100,24 @@ fn wal_segment_starts(partition: &IggyPartition<RecordingBus>, last_op: u64) -> 
     starts
 }
 
+fn roll_segment_prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
+    let size = std::mem::size_of::<PrepareHeader>();
+    Message::<PrepareHeader>::new(size).transmute_header(|_, header: &mut PrepareHeader| {
+        header.command = Command::Prepare;
+        header.operation = Operation::RollSegment;
+        header.cluster = TEST_CLUSTER;
+        header.group = IggyNamespace::new(1, 1, 0).inner();
+        header.op = op;
+        header.parent = parent;
+        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+        header.request = op;
+        header.session = 1;
+        header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
+        header.size = u32::try_from(size).unwrap();
+        header.checksum = header.identity_checksum();
+    })
+}
+
 #[compio::test]
 async fn given_stamps_past_the_age_bound_when_materializing_should_roll_where_the_wal_rolled() {
     let root = tempfile::tempdir().unwrap();
@@ -230,6 +248,65 @@ async fn given_one_commit_across_age_rolls_when_materializing_should_split_its_c
         vec![(0, 2, true), (3, 4, true), (5, 5, false)]
     );
     assert_eq!(wal_segment_starts(&partition, 6), [0, 3, 5]);
+}
+
+#[compio::test]
+async fn given_an_explicit_roll_when_materializing_should_split_chunks_at_it() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut partition, config) = aged_backup(root.path(), IggyExpiry::NeverExpire).await;
+    let first = stamped_segment_prepare(1, 0, 0, b"before", 1_000);
+    let roll = roll_segment_prepare(2, first.header().checksum);
+    let second = stamped_segment_prepare(3, roll.header().checksum, 1, b"after", 1_001);
+    for prepare in [first, roll, second] {
+        partition.on_replicate(prepare).await;
+    }
+    partition
+        .persistence
+        .as_ref()
+        .unwrap()
+        .drain_with_timeout(compio::runtime::time::sleep)
+        .await
+        .unwrap();
+    commit_on_heartbeat(&mut partition, &config, 3).await;
+    settle_partition_io(&mut partition, &config).await;
+    partition.flush_committed_messages(&config).await.unwrap();
+    settle_partition_io(&mut partition, &config).await;
+
+    assert!(partition.fatal().is_none());
+    assert_eq!(layout(&partition), vec![(0, 0, true), (1, 1, false)]);
+    let persistence = partition.persistence.as_ref().unwrap();
+    assert_eq!(persistence.segment_reference(1).unwrap().start_offset, 0);
+    assert_eq!(persistence.segment_reference(3).unwrap().start_offset, 1);
+}
+
+#[compio::test]
+async fn given_consecutive_explicit_rolls_when_materializing_should_keep_one_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut partition, config) = aged_backup(root.path(), IggyExpiry::NeverExpire).await;
+    let first = stamped_segment_prepare(1, 0, 0, b"before", 1_000);
+    let first_roll = roll_segment_prepare(2, first.header().checksum);
+    let second_roll = roll_segment_prepare(3, first_roll.header().checksum);
+    let second = stamped_segment_prepare(4, second_roll.header().checksum, 1, b"after", 1_001);
+    for prepare in [first, first_roll, second_roll, second] {
+        partition.on_replicate(prepare).await;
+    }
+    partition
+        .persistence
+        .as_ref()
+        .unwrap()
+        .drain_with_timeout(compio::runtime::time::sleep)
+        .await
+        .unwrap();
+    commit_on_heartbeat(&mut partition, &config, 4).await;
+    settle_partition_io(&mut partition, &config).await;
+    partition.flush_committed_messages(&config).await.unwrap();
+    settle_partition_io(&mut partition, &config).await;
+
+    assert!(partition.fatal().is_none());
+    assert_eq!(layout(&partition), vec![(0, 0, true), (1, 1, false)]);
+    let persistence = partition.persistence.as_ref().unwrap();
+    assert_eq!(persistence.segment_reference(1).unwrap().start_offset, 0);
+    assert_eq!(persistence.segment_reference(4).unwrap().start_offset, 1);
 }
 
 /// A transfer resets the receiver's WAL around the installed active segment,

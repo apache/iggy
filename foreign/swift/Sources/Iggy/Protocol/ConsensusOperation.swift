@@ -73,6 +73,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     case transitionPartitionHistory = 168
     case retireConsumerGroupOwners = 169
     case stateMachineCommand = 170
+    case rollSegment = 171
 
     private static let internalStart = ConsensusOperation.createTopicWithAssignments.rawValue
     private static let metadataStart = ConsensusOperation.createStream.rawValue
@@ -82,7 +83,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     /// plus the operations the server orders on the partition plane.
     var isInternal: Bool {
         switch self {
-        case .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners, .stateMachineCommand:
+        case .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners, .stateMachineCommand, .rollSegment:
             true
         default:
             rawValue >= Self.internalStart && rawValue < Self.metadataStart

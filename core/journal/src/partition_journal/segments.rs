@@ -581,11 +581,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .range(..=through_op)
             .rev()
             .find_map(|(&op, entry)| {
-                let reference = entry.reference?;
-                let next_offset = entry.next_offset?;
-                (op > self.state.checkpoint
-                    && next_offset >= segments.checkpoint.position.next_offset)
-                    .then_some(SegmentCursor {
+                if op <= self.state.checkpoint {
+                    return None;
+                }
+                if let (Some(reference), Some(next_offset)) = (entry.reference, entry.next_offset)
+                    && next_offset >= segments.checkpoint.position.next_offset
+                {
+                    return Some(SegmentCursor {
                         generation: reference.generation,
                         position: SegmentPosition {
                             start_offset: reference.start_offset,
@@ -593,7 +595,43 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                             next_offset,
                             first_timestamp: entry.segment_first_timestamp,
                         },
-                    })
+                    });
+                }
+                if entry.reference.is_none()
+                    && let Some(next_offset) = entry.next_offset
+                    && next_offset >= segments.checkpoint.position.next_offset
+                {
+                    let next_segment =
+                        self.entries
+                            .range(op.saturating_add(1)..)
+                            .find_map(|(_, next)| {
+                                next.reference
+                                    .filter(|reference| reference.start_offset == next_offset)
+                            });
+                    if let Some(reference) = next_segment {
+                        return Some(SegmentCursor {
+                            generation: reference.generation,
+                            position: SegmentPosition {
+                                start_offset: next_offset,
+                                length: 0,
+                                next_offset,
+                                first_timestamp: 0,
+                            },
+                        });
+                    }
+                    if segments.tail.position.start_offset == next_offset {
+                        return Some(SegmentCursor {
+                            generation: segments.tail.generation,
+                            position: SegmentPosition {
+                                start_offset: next_offset,
+                                length: 0,
+                                next_offset,
+                                first_timestamp: 0,
+                            },
+                        });
+                    }
+                }
+                None
             })
             .or(Some(segments.checkpoint))
     }
@@ -953,6 +991,11 @@ impl SegmentState {
         header: &PrepareHeader,
         prepare: &[u8],
     ) -> io::Result<(Option<SegmentReference>, Option<u64>)> {
+        if header.operation == Operation::RollSegment {
+            let next_offset = self.tail.position.next_offset;
+            self.reserve_roll_at(next_offset)?;
+            return Ok((None, Some(next_offset)));
+        }
         if header.operation != Operation::SendMessages {
             return Ok((None, None));
         }
@@ -985,6 +1028,76 @@ impl SegmentState {
             .ok_or_else(|| invalid("segment position exhausted"))?;
         self.tail.position.next_offset = batch_next_offset(prepare)?;
         Ok((Some(reference), Some(self.tail.position.next_offset)))
+    }
+
+    /// Replay a committed roll at the boundary it recorded the first time.
+    ///
+    /// Recovery and WAL rewrites start from an older segment cursor, then walk
+    /// the retained prepares again. A roll that was already applied before the
+    /// rewrite may therefore be encountered while the cursor is further ahead.
+    /// Treat that exact segment start as an idempotent replay, and reject any
+    /// other rewind rather than allocating a second segment for the same roll.
+    pub(super) fn reserve_roll_at(&mut self, next_offset: u64) -> io::Result<()> {
+        if next_offset < self.tail.position.next_offset {
+            if self.tail.position.start_offset == next_offset {
+                return Ok(());
+            }
+            return Err(invalid("segment roll rewinds the physical tail"));
+        }
+        if next_offset != self.tail.position.next_offset {
+            return Err(invalid("segment roll does not extend the physical tail"));
+        }
+        if self.tail.position.length > 0 {
+            self.tail = self.allocate(SegmentPosition {
+                start_offset: next_offset,
+                length: 0,
+                next_offset,
+                first_timestamp: 0,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the logical tail from a prepare whose body already lives in a
+    /// segment file. Rewritten WAL records carry only the prepare header, so
+    /// they cannot go through [`Self::reserve`], which decodes an inline batch.
+    pub(super) fn replay_reference(
+        &mut self,
+        reference: SegmentReference,
+        next_offset: u64,
+        first_timestamp: u64,
+    ) -> io::Result<()> {
+        let expected_position = reference.position;
+        if reference.start_offset == self.tail.position.start_offset {
+            if expected_position != self.tail.position.length {
+                return Err(invalid(
+                    "segment reference does not extend the physical tail",
+                ));
+            }
+        } else {
+            if reference.start_offset != self.tail.position.next_offset || reference.position != 0 {
+                return Err(invalid("segment reference skips the physical tail"));
+            }
+            self.tail = SegmentCursor {
+                generation: reference.generation,
+                position: SegmentPosition {
+                    start_offset: reference.start_offset,
+                    length: 0,
+                    next_offset: reference.start_offset,
+                    first_timestamp,
+                },
+            };
+        }
+        self.tail.generation = reference.generation;
+        self.tail.position.length = reference
+            .position
+            .checked_add(reference.length)
+            .ok_or_else(|| invalid("segment position exhausted"))?;
+        self.tail.position.next_offset = next_offset;
+        if self.tail.position.length == reference.length {
+            self.tail.position.first_timestamp = first_timestamp;
+        }
+        Ok(())
     }
 
     pub(super) fn reset_position(&mut self, position: SegmentPosition) -> io::Result<()> {
