@@ -56,8 +56,11 @@ use crate::placed_read::PlacedReadPlan;
 /// How long a fresh object that no placed batch names stays in the store.
 pub const FRESH_OBJECT_GRACE: Duration = Duration::from_mins(10);
 
-/// Fresh objects of this replica that one listing takes, oldest first. The
-/// ones past it wait for a later sweep, which finds the oldest gone.
+/// Fresh objects of this replica that one listing takes.
+///
+/// They come in the order of their keys: shard by shard, and the oldest of
+/// a shard first. The ones past it wait for a later sweep, which finds the
+/// first ones gone.
 pub const FRESH_OBJECTS_PER_SWEEP: usize = 65_536;
 
 /// Fresh objects one sweep deletes.
@@ -66,14 +69,16 @@ pub const FRESH_DELETES_PER_SWEEP: usize = 4096;
 /// The fresh objects of one replica that a listing found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FreshListing {
-    /// The ids of the objects, ascending.
+    /// The ids of the objects, in the order of their keys: by the shard
+    /// that wrote them, then ascending.
     pub objects: Vec<u128>,
     /// Bytes the objects hold together.
     pub bytes: u64,
     /// When the oldest of them was stored.
     pub oldest: Option<SystemTime>,
     /// Whether the listing reached the end of the fresh objects. One that
-    /// did not says nothing about the ids after its last.
+    /// did not says nothing about the objects whose keys come after its
+    /// last.
     pub complete: bool,
 }
 
@@ -88,8 +93,8 @@ pub type FreshDeleteOutcome = Result<Vec<u128>, TierJobCancelled>;
 /// Lists and deletes the fresh objects of a replica, behind a pointer, so
 /// the shard does not carry the executor's type.
 pub trait FreshObjectSweeper {
-    /// List the fresh objects that `replica` wrote, oldest first, at most
-    /// [`FRESH_OBJECTS_PER_SWEEP`] of them.
+    /// List the fresh objects that `replica` wrote, in the order of their
+    /// keys, at most [`FRESH_OBJECTS_PER_SWEEP`] of them.
     fn list(&self, replica: u8, scope: TierScopeToken)
     -> LocalBoxFuture<'static, FreshListOutcome>;
 
@@ -159,8 +164,8 @@ impl<E: TierExecutor> FreshObjectSweeper for ExecutorFreshSweeper<E> {
     }
 }
 
-/// List the fresh objects under `layout` that `replica` wrote, oldest first,
-/// at most [`FRESH_OBJECTS_PER_SWEEP`] of them.
+/// List the fresh objects under `layout` that `replica` wrote, in the order
+/// of their keys, at most [`FRESH_OBJECTS_PER_SWEEP`] of them.
 ///
 /// The listing asks for the replica's own prefix. A key under it that names
 /// no fresh object of the replica is skipped: this build did not write it
@@ -217,8 +222,8 @@ impl FreshSweep {
     /// Take in one sweep: `listing` is what the store holds, and `in_use`
     /// every object that a placed batch of this replica names above its
     /// partition's long-term floor or that a send still waits on, read after
-    /// the listing ended. Returns the objects to delete now, oldest first,
-    /// at most [`FRESH_DELETES_PER_SWEEP`].
+    /// the listing ended. Returns the objects to delete now, in the order
+    /// of the listing, at most [`FRESH_DELETES_PER_SWEEP`].
     ///
     /// An object is deleted once every sweep found it unnamed for `grace`.
     /// One that a sweep finds named again starts over.
@@ -231,10 +236,11 @@ impl FreshSweep {
     ) -> Vec<u128> {
         let listed: BTreeSet<u128> = listing.objects.iter().copied().collect();
         // An object that left the store has nothing left to delete. A
-        // listing that stopped early says nothing about the ids past it.
-        let last = listing.objects.last().copied();
+        // listing that stopped early says nothing about the keys past it.
+        let last = listing.objects.last().copied().map(key_order);
         self.unnamed.retain(|id, _| {
-            listed.contains(id) || (!listing.complete && last.is_some_and(|last| *id > last))
+            listed.contains(id)
+                || (!listing.complete && last.is_some_and(|last| key_order(*id) > last))
         });
         let grace = u64::try_from(grace.as_micros()).unwrap_or(u64::MAX);
         let mut due = Vec::new();
@@ -270,6 +276,12 @@ impl FreshSweep {
     pub fn is_empty(&self) -> bool {
         self.unnamed.is_empty()
     }
+}
+
+/// Where the key of the fresh object `id` sorts among the keys of its
+/// replica: under the directory of the shard that wrote it.
+const fn key_order(id: u128) -> (u16, u128) {
+    (FreshObjectId::from_raw(id).shard(), id)
 }
 
 /// The read of the fresh objects a partition names above its long-term
@@ -334,6 +346,14 @@ mod tests {
         FreshObjectId::new(replica, 0, 7, sequence).unwrap().get()
     }
 
+    /// An object that `shard` of [`REPLICA`] wrote in the life it started at
+    /// `started_at`.
+    fn id_of_shard(shard: u16, started_at: u64) -> u128 {
+        FreshObjectId::new(REPLICA, shard, started_at, 0)
+            .unwrap()
+            .get()
+    }
+
     fn sweeper() -> ExecutorFreshSweeper<InlineTierExecutor<MemoryStore>> {
         ExecutorFreshSweeper::new(InlineTierExecutor::new(MemoryStore::new()), layout())
     }
@@ -380,6 +400,40 @@ mod tests {
         assert_eq!(listed.bytes, 11);
         assert!(listed.oldest.is_some());
         assert!(listed.complete);
+    }
+
+    /// A key holds the shard ahead of the id, and an id holds the start of
+    /// its shard ahead of the shard. So the keys of two shards do not sort
+    /// as their ids do.
+    #[compio::test]
+    async fn given_objects_of_two_shards_when_listing_should_return_them_shard_by_shard() {
+        let sweeper = sweeper();
+        let store = sweeper.executor().store();
+        let older_of_later_shard = id_of_shard(1, 7);
+        let newer_of_first_shard = id_of_shard(0, 9);
+        assert!(older_of_later_shard < newer_of_first_shard);
+        store_object(store, &layout().fresh_key(older_of_later_shard), b"one").await;
+        store_object(store, &layout().fresh_key(newer_of_first_shard), b"two").await;
+
+        let listed = sweeper
+            .list(REPLICA, TierScope::new().token())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            listed.objects,
+            vec![newer_of_first_shard, older_of_later_shard]
+        );
+        assert!(listed.complete);
+
+        let failed = sweeper
+            .delete(listed.objects, TierScope::new().token())
+            .await
+            .unwrap();
+
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(store.keys(), Vec::<String>::new());
     }
 
     #[compio::test]
@@ -509,6 +563,37 @@ mod tests {
                 FRESH_OBJECT_GRACE
             ),
             vec![id(REPLICA, 2), id(REPLICA, 3)]
+        );
+    }
+
+    /// The listing stops in the directory of the first shard. The object of
+    /// the later shard has the lower id, and its key is still past the stop.
+    #[test]
+    fn given_a_listing_that_stopped_in_an_earlier_shard_when_settling_should_keep_the_objects_of_later_shards()
+     {
+        let mut sweep = FreshSweep::default();
+        let in_use = BTreeSet::new();
+        let of_first_shard = id_of_shard(0, 9);
+        let of_later_shard = id_of_shard(1, 7);
+        let both = FreshListing {
+            objects: vec![of_first_shard, of_later_shard],
+            complete: true,
+            ..FreshListing::default()
+        };
+        sweep.settle(&both, &in_use, at(100), FRESH_OBJECT_GRACE);
+        let partial = FreshListing {
+            objects: vec![of_first_shard],
+            complete: false,
+            ..FreshListing::default()
+        };
+
+        sweep.settle(&partial, &in_use, at(200), FRESH_OBJECT_GRACE);
+
+        assert_eq!(sweep.len(), 2);
+        assert_eq!(
+            sweep.settle(&both, &in_use, at(700), FRESH_OBJECT_GRACE),
+            vec![of_first_shard, of_later_shard],
+            "the grace of the object past the stop ran on"
         );
     }
 
