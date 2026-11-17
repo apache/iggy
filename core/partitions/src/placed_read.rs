@@ -96,6 +96,9 @@ pub struct PlacedReadPlan {
     /// The long-term segments the poll can start in, in offset order. Empty
     /// for a read that starts above the long-term floor.
     pub(crate) long_term: Vec<ManifestSegment>,
+    /// The last offset a long-term segment holds. The placed batches at or
+    /// below it name fresh objects that may be gone.
+    pub(crate) long_term_floor: Option<u64>,
 }
 
 impl PlacedReadPlan {
@@ -114,6 +117,15 @@ impl PlacedReadPlan {
         let mut batches = Vec::new();
         self.collect_from_long_term(&mut wanted, &mut batches)
             .await?;
+        if let Some(floor) = self.long_term_floor {
+            // The plan carries only so many long-term segments. A read that
+            // ran out of them below the floor ends there: going on above the
+            // floor would leave a gap.
+            if !self.long_term.is_empty() && !wanted.is_past(floor) {
+                return Ok(batches);
+            }
+            wanted.skip_through(floor);
+        }
         let mut placed = Vec::new();
         self.collect_from_segments(&mut wanted, &mut placed).await?;
         for entry in &self.resident {
@@ -439,6 +451,16 @@ impl Wanted {
     fn is_full(&self) -> bool {
         self.messages >= u64::from(self.query.count())
             || (self.messages > 0 && self.bytes >= self.max_bytes)
+    }
+
+    /// Whether the batches taken so far reach past `offset`.
+    const fn is_past(&self, offset: u64) -> bool {
+        self.next_offset > offset
+    }
+
+    /// Take no batch that starts at or below `offset` from here on.
+    fn skip_through(&mut self, offset: u64) {
+        self.next_offset = self.next_offset.max(offset.saturating_add(1));
     }
 
     /// Whether the first message of the poll can be in a segment of these

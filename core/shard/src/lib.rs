@@ -33,6 +33,7 @@ pub use fresh_sweeps::{
     FreshSweeps,
 };
 pub mod long_term_merges;
+mod long_term_retention;
 mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
@@ -1311,6 +1312,19 @@ pub enum LifecycleFrame {
     /// The result of a merge of long-term segments that the pump's tick
     /// started, sent by the task that ran it.
     SegmentMergeFinished(Box<FinishedSegmentMerge>),
+    /// Per-shard pass over a partition that places its batches: every
+    /// replica removes its local segments at or below the trim point of the
+    /// long-term log, and the primary works out what the topic's retention
+    /// removes from that log and commits it as a trim. The timer task
+    /// resolves the same inputs as for `CleanPartition`.
+    RetainLongTerm {
+        namespace: IggyNamespace,
+        /// The incarnation the policy was read for.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
 }
 
 /// What the task merging long-term segments hands back to the pump.

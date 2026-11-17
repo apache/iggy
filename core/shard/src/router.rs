@@ -1312,6 +1312,22 @@ where
             LifecycleFrame::SegmentMergeFinished(finished) => {
                 self.on_segment_merge_finished(*finished).await;
             }
+            LifecycleFrame::RetainLongTerm {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                self.on_retain_long_term(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                )
+                .await;
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,

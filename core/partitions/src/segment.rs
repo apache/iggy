@@ -16,6 +16,7 @@
 // under the License.
 
 use iggy_common::{IggyByteSize, IggyExpiry, IggyTimestamp};
+use iggy_object_store::ManifestSegment;
 use std::fmt::Display;
 
 /// Where a segment's bytes live.
@@ -96,13 +97,71 @@ impl Segment {
         if !self.sealed || self.max_timestamp == 0 {
             return false;
         }
+        outlived(self.max_timestamp, now, expiry)
+    }
+}
 
-        match expiry {
-            IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => false,
-            IggyExpiry::ExpireDuration(duration) => {
-                self.max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
-            }
+/// Whether a message stamped `max_timestamp` is older than `expiry` allows
+/// at `now`. `expiry` must be resolved: a `ServerDefault` expires nothing.
+fn outlived(max_timestamp: u64, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
+    match expiry {
+        IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => false,
+        IggyExpiry::ExpireDuration(duration) => {
+            max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
         }
+    }
+}
+
+/// What retention reads of a segment. The segments on a replica's disk and
+/// the long-term segments in the object store are judged by the one rule
+/// written over this.
+pub trait RetainedSegment {
+    fn last_offset(&self) -> u64;
+
+    fn stored_bytes(&self) -> u64;
+
+    /// Whether the segment takes no more messages. One that still does is
+    /// never removed.
+    fn is_closed(&self) -> bool;
+
+    /// Whether its newest message is older than `expiry` allows at `now`.
+    fn has_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool;
+}
+
+impl RetainedSegment for Segment {
+    fn last_offset(&self) -> u64 {
+        self.end_offset
+    }
+
+    fn stored_bytes(&self) -> u64 {
+        self.size.as_bytes_u64()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sealed
+    }
+
+    fn has_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
+        self.is_expired(now, expiry)
+    }
+}
+
+impl RetainedSegment for ManifestSegment {
+    fn last_offset(&self) -> u64 {
+        self.end_offset
+    }
+
+    fn stored_bytes(&self) -> u64 {
+        self.size
+    }
+
+    fn is_closed(&self) -> bool {
+        true
+    }
+
+    fn has_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
+        // A segment without a timestamp would have expired at any `now`.
+        self.max_timestamp != 0 && outlived(self.max_timestamp, now, expiry)
     }
 }
 

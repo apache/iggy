@@ -2693,3 +2693,126 @@ async fn given_a_shard_without_a_merger_when_it_gets_one_should_scan_then() {
     })
     .await;
 }
+
+/// Retention of a topic that places its batches, on the shard that leads
+/// its partition: the pass sends the trim its policy asks for, the trim
+/// commits, the manifest in the store starts at the trim point, and the
+/// next pass removes the segment of placed batches below it. A pass staged
+/// for another incarnation does nothing.
+#[compio::test]
+async fn given_expired_long_term_segments_when_retention_passes_run_should_commit_the_trim_and_remove_the_local_segment_below_it()
+ {
+    use super::object_deletes::Shared;
+    use crate::rewrite_pacing::RewriteResult;
+    use iggy_common::{IggyDuration, IggyExpiry};
+    use iggy_object_store::PartitionManifest;
+    use partitions::{
+        ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects, RemoteSegments,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_manifest_publisher(Some(Rc::new(ExecutorManifestPublisher::new(
+        executor.clone(),
+        layout(),
+    ))));
+    let partitions = owner.plane.partitions();
+    partitions.set_remote_segments(Rc::new(RemoteSegments::new(
+        Rc::new(ExecutorObjects::new(executor.clone())),
+        layout(),
+    )));
+    // Two placed batches fill a segment, so the third send opens the next.
+    partitions
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .log
+        .active_segment_mut()
+        .max_size = IggyByteSize::from(2 * PLACED_BATCH_SIZE as u64);
+    let revision = super::segment_uploads::staged_revision(&owner);
+    let key = (namespace(), revision);
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
+    let store = executor.0.store();
+    let manifest_with = async |segments: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(meta) = store.head(&manifest_key).await {
+                let object = store.get_range(&manifest_key, 0..meta.size).await.unwrap();
+                let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+                if manifest.segments.len() == segments {
+                    return manifest;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no manifest of {segments} segments was stored"
+            );
+            compio::time::sleep(TASK_POLL_INTERVAL).await;
+        }
+    };
+    let local_segments = |owner: &IoTestShard| {
+        let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+        partition
+            .log
+            .segments()
+            .iter()
+            .map(|segment| segment.start_offset)
+            .collect::<Vec<_>>()
+    };
+    let trim_point = |owner: &IoTestShard| {
+        let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+        partition.long_term_trim_point()
+    };
+    let first_log = directory.path().join("00000000000000000000.log");
+    let much_later = IggyTimestamp::from(
+        IggyTimestamp::now().as_micros() + IggyDuration::from(Duration::from_hours(1)).as_micros(),
+    );
+    let one_second = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)));
+
+    pumped(&owner, async {
+        let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 100)];
+        until(&owner, |owner| local_segments(owner) == [0, 2]).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| long_term_ends(owner) == [1]).await;
+        // The wait is longer than this test may take, so the next pass is
+        // made due after the shortest one.
+        owner.rewrite_pacing.borrow_mut().settle(
+            key,
+            RewriteResult::Resent,
+            owner.bus.monotonic_micros(),
+        );
+        let _third = submit_send(&owner, 3, 100);
+        until(&owner, |owner| long_term_ends(owner) == [1, 2]).await;
+        manifest_with(2).await;
+
+        owner.request_retain_long_term(namespace(), revision + 1, much_later, one_second, None);
+        for _ in 0..20 {
+            compio::time::sleep(TASK_POLL_INTERVAL).await;
+        }
+        assert_eq!(
+            trim_point(&owner),
+            None,
+            "the policy of another incarnation"
+        );
+
+        owner.request_retain_long_term(namespace(), revision, much_later, one_second, None);
+        let trimmed = manifest_with(1).await;
+        assert_eq!((trimmed.floor, trimmed.trim_point), (Some(2), Some(1)));
+        assert_eq!(long_term_ends(&owner), [2]);
+        assert_eq!(local_segments(&owner), [0, 2]);
+        assert!(first_log.exists());
+
+        owner.request_retain_long_term(namespace(), revision, much_later, one_second, None);
+        until(&owner, |owner| local_segments(owner) == [2]).await;
+        until(&owner, |_| !first_log.exists()).await;
+    })
+    .await;
+}

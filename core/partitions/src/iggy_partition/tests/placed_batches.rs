@@ -442,8 +442,8 @@ async fn given_a_rebooted_placing_partition_when_more_placed_batches_commit_shou
 }
 
 /// A placing partition whose segments fit two placed batches.
-async fn placing_partition_of_small_segments() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>)
-{
+pub(super) async fn placing_partition_of_small_segments()
+-> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
     let (directory, mut partition) = Box::pin(placing_partition()).await;
     partition.runtime_options.segment_size = Some(placed_segment_size());
     partition.log.active_segment_mut().max_size = placed_segment_size();
@@ -875,7 +875,7 @@ impl crate::RemoteObjects for NoStore {
     }
 }
 
-const FRESH_OBJECT: u128 = 0x51;
+pub(super) const FRESH_OBJECT: u128 = 0x51;
 
 /// The same batches for two partitions: as whole records, and as placed
 /// records whose blobs sit back to back in one fresh object.
@@ -884,7 +884,10 @@ pub(super) fn whole_and_placed(count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes
 }
 
 /// [`whole_and_placed`] with the blobs in the fresh object `object_id`.
-fn whole_and_placed_in(object_id: u128, count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
+pub(super) fn whole_and_placed_in(
+    object_id: u128,
+    count: u64,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
     let whole = segment_records(count);
     let mut object = iggy_object_store::FreshObject::new();
     let placed = whole
@@ -1417,10 +1420,12 @@ async fn given_a_long_term_floor_inside_the_log_when_polling_across_it_should_re
     assert_eq!(polled, expected);
 }
 
-/// Expiry and the size cap remove local segments, and a placed batch that
-/// no long-term segment holds yet is the only record of its messages.
+/// The age and size of placed batches say nothing of their messages, so
+/// expiry and the size cap remove a local segment only once the long-term
+/// log trimmed its offsets, wherever the floor is.
 #[compio::test]
-async fn given_expired_placed_batches_when_cleaning_should_keep_those_above_the_long_term_floor() {
+async fn given_expired_placed_batches_when_cleaning_should_keep_what_the_long_term_log_did_not_trim()
+ {
     let (_whole, placed, object) = whole_and_placed(6);
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_primary_with(&[], &store)).await;
@@ -1456,8 +1461,8 @@ async fn given_expired_placed_batches_when_cleaning_should_keep_those_above_the_
     assert!(partition.fatal().is_none());
     assert_eq!(
         starts(&partition),
-        [2, 4, 6],
-        "the segment of offsets 2 and 3 ends above the floor"
+        [0, 2, 4, 6],
+        "the long-term log holds offsets 0 to 2 and trimmed none"
     );
 }
 

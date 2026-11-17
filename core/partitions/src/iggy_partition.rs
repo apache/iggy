@@ -34,7 +34,7 @@ use crate::poll_plan::{
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::remote_segments::{IndexFetches, RemoteRange};
-use crate::segment::{Segment, SegmentLocation};
+use crate::segment::{RetainedSegment, Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
@@ -6409,6 +6409,7 @@ where
             deadline: None,
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             long_term,
+            long_term_floor: self.long_term_floor(),
         }
     }
 
@@ -13268,7 +13269,7 @@ where
     }
 
     /// Time-expiry plus size-retention in one pass, for a partition that is not
-    /// tiered: remove the leading sealed
+    /// tiered and holds whole batches: remove the leading sealed
     /// segments that have expired or that push the partition's SEALED bytes
     /// past `max_bytes`. Capped per call by
     /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
@@ -13287,6 +13288,12 @@ where
         // log of a partition that follows another cluster's.
         if self.is_tiered() || self.peer_log.is_some() {
             return SegmentRemoval::default();
+        }
+        // Its segments hold placed batches, whose size and age say nothing
+        // of the messages they name. Those are in the long-term segments,
+        // so what was trimmed there is all that goes here.
+        if self.places_batches() {
+            return self.remove_trimmed_segments().await;
         }
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
@@ -13334,6 +13341,53 @@ where
             max_bytes,
             self.min_committed_offset().map(|(barrier, _, _)| barrier),
         )
+    }
+
+    /// What the retention policy of a topic that places its batches removes
+    /// from this partition's long-term log: the end offset of the last
+    /// leading long-term segment that expired or that pushes the bytes of
+    /// the segments before the last one past `max_bytes`, held at the
+    /// consumer barrier. The last segment is never named.
+    ///
+    /// Nothing is removed here. The caller commits the offset as a trim of
+    /// the long-term log, and every replica follows the trim point with
+    /// [`Self::remove_trimmed_segments`].
+    ///
+    /// `None` on a partition that does not place its batches, and on every
+    /// replica but a primary that applied the view it started: one decision
+    /// per partition keeps the log a function of its own commands.
+    #[must_use]
+    pub fn long_term_retention_end(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> Option<u64> {
+        if !self.places_batches() || !self.state_machines_current() {
+            return None;
+        }
+        retention_end(
+            self.long_term_segments(),
+            now,
+            message_expiry,
+            max_bytes,
+            self.min_committed_offset().map(|(barrier, _, _)| barrier),
+        )
+    }
+
+    /// Remove the sealed segments of placed batches that end at or below the
+    /// trim point of the long-term log, on any replica. A segment that
+    /// reaches past the trim point stays, as does every one between it and
+    /// the long-term floor.
+    ///
+    /// Capped per call as [`Self::remove_sealed_segments_up_to`] is.
+    pub async fn remove_trimmed_segments(&mut self) -> SegmentRemoval {
+        match self.long_term_trim_point() {
+            Some(trim_point) if self.places_batches() => {
+                self.remove_sealed_segments_up_to(trim_point).await
+            }
+            _ => SegmentRemoval::default(),
+        }
     }
 
     /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
@@ -16303,18 +16357,18 @@ pub fn settle_cleaned_segment(
 /// `None` when none are expired. The last element is the active segment and is
 /// never considered. `expiry` must be resolved; a `ServerDefault` expires
 /// nothing (see [`Segment::is_expired`]).
-fn leading_expired_end(
-    segments: &[Segment],
+fn leading_expired_end<S: RetainedSegment>(
+    segments: &[S],
     now: IggyTimestamp,
     expiry: IggyExpiry,
 ) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut up_to = None;
     for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.is_expired(now, expiry) {
+        if idx == last_idx || !segment.has_expired(now, expiry) {
             break;
         }
-        up_to = Some(segment.end_offset);
+        up_to = Some(segment.last_offset());
     }
     up_to
 }
@@ -16364,20 +16418,20 @@ fn walked_segments(segments: &[Segment], count: u32, byte_budget: usize) -> usiz
 /// evict the sealed history instead: at a budget near one segment the active
 /// one alone exceeds it, and every sealed segment is dropped no matter how
 /// small the log is.
-fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
+fn leading_oversized_end<S: RetainedSegment>(segments: &[S], max_bytes: u64) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut resident: u64 = segments
         .iter()
         .take(last_idx)
-        .map(|segment| segment.size.as_bytes_u64())
+        .map(RetainedSegment::stored_bytes)
         .sum();
     let mut up_to = None;
     for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.sealed || resident <= max_bytes {
+        if idx == last_idx || !segment.is_closed() || resident <= max_bytes {
             break;
         }
-        resident -= segment.size.as_bytes_u64();
-        up_to = Some(segment.end_offset);
+        resident -= segment.stored_bytes();
+        up_to = Some(segment.last_offset());
     }
     up_to
 }
@@ -16386,8 +16440,8 @@ fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
 /// expired and the over-budget leading runs, cut back to the last segment that
 /// ends at or below `barrier`. `None` when retention removes nothing. The
 /// active segment (last element) is never named.
-fn retention_end(
-    segments: &[Segment],
+fn retention_end<S: RetainedSegment>(
+    segments: &[S],
     now: IggyTimestamp,
     expiry: IggyExpiry,
     max_bytes: Option<u64>,
@@ -16400,8 +16454,8 @@ fn retention_end(
     // `up_to` ends a sealed segment, so the walk stops before the active one.
     segments
         .iter()
-        .take_while(|segment| segment.end_offset <= through)
-        .map(|segment| segment.end_offset)
+        .map(RetainedSegment::last_offset)
+        .take_while(|last_offset| *last_offset <= through)
         .last()
 }
 

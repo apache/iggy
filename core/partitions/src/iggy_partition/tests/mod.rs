@@ -1904,6 +1904,7 @@ mod free_space;
 mod history;
 mod long_term_delete;
 mod long_term_merge;
+mod long_term_retention;
 mod manifest_publish;
 mod materialization;
 mod materialization_io;
