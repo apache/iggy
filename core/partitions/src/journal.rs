@@ -443,6 +443,9 @@ impl RepairTail {
         self.bodies.clear();
         self.headers.clear();
         self.memory = None;
+        if let Some(charge) = &self.ring_charge {
+            charge.queue_grown();
+        }
     }
 
     fn reserve(&mut self, bytes: usize) -> bool {
@@ -495,7 +498,8 @@ impl RepairTail {
 
 impl RingEntry {
     /// Heap this entry pins while the ring holds its body: the padded backing
-    /// allocation, which a slice keeps whole, and the map entry.
+    /// allocation, which a slice keeps whole, and the map entry. A lower
+    /// bound, because the map allocates more than its entries.
     fn memory_bytes(&self) -> usize {
         let capacity = self.prepare.backing_capacity();
         // A live allocation always has a layout.
@@ -544,7 +548,8 @@ impl RingBytes {
 }
 
 /// What a ring charges to the shard's repair ring budget: the heap of its
-/// bodies in memory plus `header_slots` [`EvictedHeader`] slots.
+/// bodies in memory plus `header_slots` [`EvictedHeader`] slots. A lower
+/// bound of the heap the ring holds, as [`RingEntry::memory_bytes`] is.
 const fn charged_bytes(bytes: RingBytes, header_slots: usize) -> usize {
     bytes.allocated + header_slots * size_of::<EvictedHeader>()
 }
@@ -3366,6 +3371,52 @@ mod tests {
 
         let unpinned = journal.release_ring_bodies(usize::MAX, None);
         assert_eq!((unpinned.released, unpinned.left), (2, false));
+    }
+
+    /// Retention that deletes a segment of a snapshot tail ends its lease.
+    /// The bodies the lease pinned are then free to shed, so the ring goes
+    /// back in the shed's queue.
+    #[compio::test]
+    async fn given_a_pinned_ring_when_retention_ends_its_lease_should_queue_it_for_the_shed() {
+        const OPS: u64 = 4;
+        const RING_CAPACITY: u64 = 2;
+        const TAIL_THROUGH: u64 = OPS - RING_CAPACITY;
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(usize::try_from(RING_CAPACITY).unwrap(), u64::MAX);
+        let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+        journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+        let memory = Arc::new(RepairMemoryBudget::new(usize::MAX));
+        let lease = journal.retain_repair_from(1, memory.reservation());
+        for op in 1..=OPS {
+            journal
+                .append(build_message_prepare(op, op - 1, 1, RING_PAYLOAD_LEN))
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix_located(usize::try_from(OPS).unwrap(), |op| {
+            Some(BodyPosition {
+                segment_start: op,
+                position: 0,
+            })
+        });
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        let ticket = budget.oldest_grown();
+        assert!(ticket.is_some());
+        let pinned = journal.release_ring_bodies(usize::MAX, None);
+        assert_eq!((pinned.released, pinned.left), (0, false));
+        budget.pop_grown();
+        assert_eq!(budget.oldest_grown(), None);
+
+        journal.forget_segment(TAIL_THROUGH);
+
+        assert!(!lease.is_valid());
+        assert_eq!(
+            budget.oldest_grown(),
+            ticket,
+            "the ring lost its lease but stays out of the shed's queue"
+        );
+        let unpinned = journal.release_ring_bodies(usize::MAX, None);
+        assert_eq!((unpinned.released, unpinned.left), (1, false));
     }
 
     #[compio::test]

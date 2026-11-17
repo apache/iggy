@@ -1167,9 +1167,10 @@ evicted_ring_bytes_max = "64 MiB"
 # allocate: the buffer of each batch they hold in memory, and 288 bytes for
 # each slot of the ops whose batch they released to its segment. A batch
 # counts for its whole buffer, which is a multiple of 4 KiB, so a small batch
-# costs far more here than its length. Each shard gets an equal share,
-# because a shard can shed only its own rings. Must be > 0, and the share
-# must be at least 1 byte.
+# costs far more here than its length. The count leaves out the index
+# overhead of each ring, so it is a lower bound. Each shard gets an equal
+# share, because a shard can shed only its own rings. Must be > 0, and the
+# share must be at least 1 byte.
 # Past its share, a shard releases batches to their segments, from the rings
 # that grew earliest, until its rings are one eighth under the share. With no
 # batch left to release, it drops the oldest entries of those rings until it

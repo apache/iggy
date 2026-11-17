@@ -29,12 +29,13 @@ pub const LOW_WATERMARK_DIVISOR: usize = 8;
 
 /// Byte budget for the repair rings of the partitions on one shard.
 ///
-/// A ring charges the heap it holds: the allocation of each prepare in
-/// memory, and the slots of its `EvictedHeader` deque, which keeps one header
-/// for each prepare whose body it released to a segment. The per-partition
-/// caps bound one ring, and this budget bounds their sum. Past it, the shard
-/// first releases the oldest bodies of the rings that grew earliest, then
-/// drops their oldest entries (`IggyPartitions::shed_repair_rings`).
+/// A ring charges a lower bound of the heap it holds: the allocation of each
+/// prepare in memory, and the slots of its `EvictedHeader` deque, which keeps
+/// one header for each prepare whose body it released to a segment. The
+/// per-partition caps bound one ring, and this budget bounds their sum. Past
+/// it, the shard first releases the oldest bodies of the rings that grew
+/// earliest, then drops their oldest entries
+/// (`IggyPartitions::shed_repair_rings`).
 ///
 /// Every ring keeps its newest entry, so these entries are a floor that no
 /// shed takes, and the shed works against what the budget leaves above it. A
