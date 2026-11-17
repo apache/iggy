@@ -145,7 +145,8 @@ impl HttpJwtConfig {
         }
 
         Ok(match self.get_decoding_secret() {
-            JwtSecret::Default(ref secret) => DecodingKey::from_secret(secret.as_ref()),
+            JwtSecret::Default(ref secret) => DecodingKey::from_secret(secret.as_ref())
+                .map_err(|_| IggyError::InvalidJwtSecret)?,
             JwtSecret::Base64(ref secret) => {
                 DecodingKey::from_base64_secret(secret).map_err(|_| IggyError::InvalidJwtSecret)?
             }
@@ -158,7 +159,8 @@ impl HttpJwtConfig {
         }
 
         Ok(match self.get_encoding_secret() {
-            JwtSecret::Default(ref secret) => EncodingKey::from_secret(secret.as_ref()),
+            JwtSecret::Default(ref secret) => EncodingKey::from_secret(secret.as_ref())
+                .map_err(|_| IggyError::InvalidJwtSecret)?,
             JwtSecret::Base64(ref secret) => {
                 EncodingKey::from_base64_secret(secret).map_err(|_| IggyError::InvalidJwtSecret)?
             }

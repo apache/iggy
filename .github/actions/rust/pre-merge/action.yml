@@ -175,6 +175,13 @@ runs:
       run: ./scripts/ci/cargo-deny.sh
       shell: bash
 
+    # RustSec updates must not fail the fail-fast Rust PR matrix.
+    - name: Cargo deny advisories (informational)
+      if: inputs.task == 'deny'
+      continue-on-error: true
+      run: ./scripts/ci/cargo-deny.sh advisories
+      shell: bash
+
     - name: Doc test
       if: inputs.task == 'doctest'
       env:

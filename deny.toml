@@ -29,11 +29,28 @@ feature-depth = 1
 # The lint level for crates that have been yanked from their source registry
 yanked = "warn"
 
-# Any Accepted-risk advisories must be added below after confirmation.
-ignore = []
+# Transitive unmaintained crates do not fail, but direct workspace dependencies do.
+unmaintained = "workspace"
+# Accepted risks. Revisit when safe upstream alternatives are available.
+ignore = [
+    # paste is unmaintained and requires replacing direct workspace usage.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; migration requires replacing direct workspace use" },
+
+    # figlet-rs 1.0.0 pulls in zip 0.6.x, but Iggy only uses
+    # FIGlet::standard() with the bundled font. It does not extract
+    # untrusted ZIP archives. Revisit when figlet-rs supports a
+    # patched zip release.
+    { id = "RUSTSEC-2026-0367", reason = "zip via figlet-rs; no filesystem extraction" },
+    { id = "RUSTSEC-2026-0368", reason = "zip via figlet-rs; no symlink extraction" },
+    { id = "RUSTSEC-2026-0369", reason = "zip via figlet-rs; no extraction permissions applied" },
+    { id = "RUSTSEC-2026-0429", reason = "zip via figlet-rs; no symlink extraction" },
+    { id = "RUSTSEC-2026-0545", reason = "zip via figlet-rs; no AES-encrypted ZIP entry handling" },
+    { id = "RUSTSEC-2026-0548", reason = "zip via figlet-rs; no streaming ZIP extraction" },
+]
 
 [licenses]
 # Keep aligned with about.toml and ASF redistribution policy.
+unused-allowed-license = "allow"
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

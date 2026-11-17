@@ -65,7 +65,16 @@ warnings = "deny"
 [workspace.dependencies]
 actix-cors = "0.7.2"
 actix-files = "0.7.3"
-actix-web = "4.18.1"
+actix-web = { version = "4.18.1", default-features = false, features = [
+    "macros",
+    "cookies",
+    "ws",
+    "unicode",
+    "compat",
+    "compress-brotli",
+    "compress-gzip",
+    "compress-zstd",
+] }
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 aes-gcm-siv = { version = "0.12.1", features = ["zeroize"] }
 ahash = { version = "0.8.12", features = ["serde"] }
@@ -174,7 +183,7 @@ indexmap = "2.14.2"
 ipnet = "2.12.2"
 journal = { path = "core/journal" }
 js-sys = "0.3"
-jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12.0.0", features = ["rust_crypto"] }
 kafka-protocol = { version = "0.18.0", default-features = false, features = ["broker"] }
 keyring-core = "1.0.1"
 # Pinned exactly: `metadata::stm::stream`'s keyed stats evictions lean on

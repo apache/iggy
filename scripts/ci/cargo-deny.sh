@@ -29,5 +29,17 @@ if ! command -v cargo-deny >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Running cargo-deny checks..."
-cargo deny check
+case "${1:-policy}" in
+  policy)
+    echo "Running blocking cargo-deny policy checks..."
+    cargo deny check licenses bans sources
+    ;;
+  advisories)
+    echo "Running cargo-deny advisory checks..."
+    cargo deny check advisories
+    ;;
+  *)
+    echo "Usage: $0 [policy|advisories]" >&2
+    exit 2
+    ;;
+esac
