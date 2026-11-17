@@ -13197,6 +13197,17 @@ where
         let Some(up_to) = expired.into_iter().chain(oversized).max() else {
             return SegmentRemoval::default();
         };
+        // A placed batch above the long-term floor is the only record of
+        // where its messages sit in the object store. Removing it would lose
+        // them for the rewrite, and so for every other cluster.
+        let up_to = if self.places_batches() {
+            match self.long_term_floor() {
+                Some(floor) => up_to.min(floor),
+                None => return SegmentRemoval::default(),
+            }
+        } else {
+            up_to
+        };
         self.remove_sealed_segments_up_to(up_to).await
     }
 
