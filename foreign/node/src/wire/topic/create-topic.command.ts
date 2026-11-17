@@ -104,15 +104,18 @@ export type TopicOptions = {
    */
   localRetentionSize?: bigint,
   /**
-   * Whether the topic is normal or geo. The server default is normal. The
-   * server does not offer geo topics yet and refuses `geo` with error 5,
-   * feature unavailable.
+   * Whether the topic is normal or geo. The server default is normal. A geo
+   * topic needs an object store on every node of the cluster: while one is
+   * not ready, the server refuses `geo` with error 5, feature unavailable. A
+   * geo topic refuses tiered storage and an encrypted stream, and keeps its
+   * name, options and partition count.
    */
   topicType?: TopicType,
   /**
    * How a geo topic writes its messages. A geo topic created without one uses
-   * `geo`. Only a geo topic takes a mode: the server refuses one on a normal
-   * topic with error 4042, invalid option value.
+   * `geo`. The server refuses `geo_tiered` with error 5 for now. Only a geo
+   * topic takes a mode: the server refuses one on a normal topic with error
+   * 4042, invalid option value.
    */
   geoMode?: GeoMode,
   /**

@@ -291,8 +291,8 @@ class TestTopicOptions:
                     duration=timedelta(minutes=30)
                 ),
                 local_retention_size=MaxTopicSize.Custom(bytes=GIB // 2),
-                # A geo topic is refused until the server serves geo topics,
-                # and a normal topic refuses any geo_mode.
+                # A geo topic is refused while the server has no object
+                # store, and a normal topic refuses any geo_mode.
                 topic_type=TopicType.Normal,
             ),
         )

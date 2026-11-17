@@ -142,7 +142,9 @@ public sealed class TopicOptions
     ///     Whether the topic is normal or geo. The server default is normal. Fixed at creation.
     /// </summary>
     /// <remarks>
-    ///     Not available yet: the server refuses <see cref="Enums.TopicType.Geo" /> with <c>feature_unavailable</c>.
+    ///     A geo topic needs an object store on every node of the cluster: while one is not ready, the server
+    ///     refuses <see cref="Enums.TopicType.Geo" /> with <c>feature_unavailable</c>. A geo topic refuses tiered
+    ///     storage and an encrypted stream, and keeps its name, options and partition count.
     /// </remarks>
     public TopicType? TopicType { get; init; }
 
@@ -151,6 +153,7 @@ public sealed class TopicOptions
     ///     <see cref="Enums.GeoMode.Geo" />. Fixed at creation.
     /// </summary>
     /// <remarks>
+    ///     The server refuses <see cref="Enums.GeoMode.GeoTiered" /> with <c>feature_unavailable</c> for now.
     ///     Only a geo topic takes a mode: the server refuses one on a normal topic with error code 4042,
     ///     <c>invalid_option_value</c>.
     /// </remarks>

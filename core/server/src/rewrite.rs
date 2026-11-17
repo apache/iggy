@@ -61,7 +61,7 @@ use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
     OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
-    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_geo_mode,
+    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_geo_topic,
     validate_local_retention, validate_preallocated_topic_bytes, validate_segment_max_age,
     validate_topic_segment_size,
 };
@@ -404,7 +404,7 @@ where
                     );
                     return Err(IggyError::InvalidReplicationFactor);
                 }
-                validate_geo_mode(&admitted.explicit)?;
+                validate_geo_topic(&admitted.explicit)?;
                 // No ruling on `tiered_storage` or a geo `topic_type` here:
                 // whether the cluster can tier or hold a geo topic is known to
                 // the metadata primary alone, and it checks every request it
@@ -696,6 +696,7 @@ mod tests {
         register_reply, request_message, test_shard, test_shard_with_key_context,
     };
     use bytes::Bytes;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::system::WireResetKeys;
     use iggy_binary_protocol::requests::topics::{
         CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
@@ -705,8 +706,9 @@ mod tests {
     use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
         GeoMode, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue,
-        OptionsUpdate, ServerKeyContext, StreamCreateOptions, StreamEncryptionKey, StreamKeyOrigin,
-        TopicType, TopicUpdateOptions, UserUpdateOptions, stream_wrap_set, text,
+        OptionsUpdate, PartitionResizePolicy, ServerKeyContext, StreamCreateOptions,
+        StreamEncryptionKey, StreamKeyOrigin, TopicType, TopicUpdateOptions, UserUpdateOptions,
+        stream_wrap_set, text,
     };
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::stm::StateMachine as _;
@@ -976,8 +978,8 @@ mod tests {
     }
 
     /// The edge cannot tell whether the cluster can hold a geo topic, so a
-    /// geo create passes both chains and the metadata primary refuses it, as
-    /// a reply that leaves the session in place.
+    /// geo create passes both chains. A primary whose cluster cannot tier
+    /// refuses it, as a reply that leaves the session in place.
     #[compio::test]
     async fn given_a_geo_topic_when_created_should_pass_either_chain_and_be_refused_by_the_primary()
     {
@@ -1024,25 +1026,54 @@ mod tests {
         }
     }
 
-    /// The primary would evict a client over this refusal, so the edge must
-    /// answer it.
+    /// The primary would evict a client over these refusals, so the edge must
+    /// answer them.
     #[test]
-    fn given_a_geo_mode_on_a_normal_topic_when_created_should_refuse_it_on_either_chain() {
+    fn given_a_setting_its_type_cannot_have_when_creating_a_topic_should_refuse_it_on_either_chain()
+    {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, 1));
         create_one_partition(&shard);
         let sessions = root_sessions(&shard, 1);
-        let expected = IggyError::InvalidOptionValue(OptionKey::GeoMode.to_string());
-
-        for topic_type in [None, Some(TopicType::Normal)] {
-            let body = create_topic_body(
-                "normal",
-                &TopicCreateOptions {
-                    topic_type,
+        let geo = |options: TopicCreateOptions| TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            ..options
+        };
+        let cases = [
+            (
+                TopicCreateOptions {
                     geo_mode: Some(GeoMode::Geo),
                     ..TopicCreateOptions::default()
                 },
-            );
+                OptionKey::GeoMode,
+            ),
+            (
+                TopicCreateOptions {
+                    topic_type: Some(TopicType::Normal),
+                    geo_mode: Some(GeoMode::GeoTiered),
+                    ..TopicCreateOptions::default()
+                },
+                OptionKey::GeoMode,
+            ),
+            (
+                geo(TopicCreateOptions {
+                    tiered_storage: Some(true),
+                    ..TopicCreateOptions::default()
+                }),
+                OptionKey::TieredStorage,
+            ),
+            (
+                geo(TopicCreateOptions {
+                    partition_resize_policy: Some(PartitionResizePolicy::Mutable),
+                    ..TopicCreateOptions::default()
+                }),
+                OptionKey::PartitionResizePolicy,
+            ),
+        ];
+
+        for (options, key) in cases {
+            let body = create_topic_body("topic", &options);
+            let expected = IggyError::InvalidOptionValue(key.to_string());
             let tcp = tcp_chain(
                 &shard,
                 &sessions,
@@ -1057,9 +1088,132 @@ mod tests {
                 request_message(Operation::CreateTopic, 1, 1, 1, &body),
             )
             .map(|_| ());
-            assert_eq!(tcp, Err(expected.clone()), "binary chain, {topic_type:?}");
-            assert_eq!(http, Err(expected.clone()), "HTTP chain, {topic_type:?}");
+            assert_eq!(tcp, Err(expected.clone()), "binary chain, {key}");
+            assert_eq!(http, Err(expected), "HTTP chain, {key}");
         }
+    }
+
+    /// An edge that reads a geo topic refuses a patch of it by key, so the
+    /// client learns which key it may not change.
+    #[test]
+    fn given_a_geo_topic_when_patching_it_should_refuse_any_key_on_either_chain() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        commit_geo_topic(&shard, 3);
+        let sessions = root_sessions(&shard, 1);
+        let patch_geo = |update: TopicUpdateOptions| {
+            let patch = update.to_patch().expect("the patch encodes");
+            UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(1),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let cases = [
+            (
+                patch_geo(TopicUpdateOptions {
+                    message_expiry: Some(IggyExpiry::ExpireDuration(
+                        IggyDuration::from_str("1h").unwrap(),
+                    )),
+                    ..TopicUpdateOptions::default()
+                }),
+                OptionKey::MessageExpiry,
+            ),
+            (
+                patch_geo(TopicUpdateOptions {
+                    raw_reset: [OptionKey::MessageExpiry.to_string()].into(),
+                    ..TopicUpdateOptions::default()
+                }),
+                OptionKey::MessageExpiry,
+            ),
+            (
+                patch_geo(TopicUpdateOptions {
+                    name: Some("renamed".to_owned()),
+                    ..TopicUpdateOptions::default()
+                }),
+                OptionKey::Name,
+            ),
+        ];
+
+        for (body, key) in cases {
+            let expected = IggyError::OptionNotUpdatable(key.to_string());
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            )
+            .map(|_| ());
+            assert_eq!(tcp, Err(expected.clone()), "binary chain, {key}");
+            assert_eq!(http, Err(expected), "HTTP chain, {key}");
+        }
+        // The normal topic beside it takes a patch.
+        assert_eq!(
+            http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(
+                    Operation::UpdateResource,
+                    1,
+                    1,
+                    1,
+                    &topic_patch(&[(OptionKey::MessageExpiry, "1h")], &[])
+                ),
+            )
+            .map(|_| ()),
+            Ok(())
+        );
+    }
+
+    /// Commits a one-partition geo topic as topic 1 of stream 0, with the
+    /// defaults a primary that can tier derives for it.
+    fn commit_geo_topic(shard: &Rc<TestShard>, op: u64) {
+        let explicit = TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            ..TopicCreateOptions::default()
+        };
+        let derived = derived_defaults(OptionsScope::Topic, &explicit.to_option_map().unwrap())
+            .expect("the defaults derive");
+        let body = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("geo").unwrap(),
+                options: explicit.to_wire().unwrap(),
+            },
+            derived_options: resource_options_to_wire(&derived, OptionsProvenance::All).unwrap(),
+            partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
+                partition_id: 0,
+                consensus_group_id: 1 << 20,
+                members: Vec::new(),
+            }],
+        }
+        .to_bytes();
+        let applied = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                1,
+                op,
+                &body,
+            ))
+            .expect("the create applies");
+        assert_eq!(applied.code, 0);
     }
 
     /// The edge rules on the request alone, so a patch that turns tiered

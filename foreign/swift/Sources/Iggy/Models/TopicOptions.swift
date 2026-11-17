@@ -143,11 +143,16 @@ public struct TopicCreateOptions: Sendable, Hashable {
     public var localRetentionSize: MaxTopicSize?
     /// Nil leaves the server's default, ``TopicType/normal``.
     ///
-    /// The server refuses ``TopicType/geo`` with
-    /// ``IggyErrorCode/featureUnavailable`` until it serves geo topics.
+    /// A geo topic needs an object store on every node of the cluster: while
+    /// one is not ready, the server refuses ``TopicType/geo`` with
+    /// ``IggyErrorCode/featureUnavailable``. A geo topic refuses tiered
+    /// storage and an encrypted stream, and keeps its name, options and
+    /// partition count.
     public var topicType: TopicType?
-    /// Nil gives a geo topic ``GeoMode/geo``. The server refuses any mode on
-    /// a normal topic with ``IggyErrorCode/invalidOptionValue``.
+    /// Nil gives a geo topic ``GeoMode/geo``. The server refuses
+    /// ``GeoMode/geoTiered`` with ``IggyErrorCode/featureUnavailable`` for
+    /// now, and any mode on a normal topic with
+    /// ``IggyErrorCode/invalidOptionValue``.
     public var geoMode: GeoMode?
     public var raw: [String: String]
 

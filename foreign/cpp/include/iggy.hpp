@@ -3533,8 +3533,10 @@ class TopicCreateOptions final {
      * @param topic_type TopicType::Geo also makes the topic's messages
      *        readable in the other datacenters, through the object store.
      * @return Reference to this options object.
-     * @note The server refuses TopicType::Geo with FeatureUnavailable until it
-     *       serves geo topics.
+     * @note A geo topic needs an object store on every node of the cluster:
+     *       while one is not ready, the server refuses TopicType::Geo with
+     *       FeatureUnavailable. A geo topic refuses tiered storage and an
+     *       encrypted stream, and keeps its name, options and partition count.
      */
     TopicCreateOptions &SetTopicType(::iggy::TopicType topic_type) noexcept {
         topic_type_ = topic_type;

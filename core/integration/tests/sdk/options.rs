@@ -210,6 +210,8 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
     assert_eq!(polled.messages.len(), 1);
 }
 
+/// The harness server has no object store, so it refuses every geo topic. A
+/// setting a geo topic cannot have is refused before the store matters.
 #[iggy_harness(test_client_transport = [Tcp, Http])]
 async fn given_a_topic_type_when_creating_topic_should_refuse_geo_and_report_normal(
     harness: &TestHarness,
@@ -242,6 +244,22 @@ async fn given_a_topic_type_when_creating_topic_should_refuse_geo_and_report_nor
             "normal-with-mode",
             typed(None, Some(GeoMode::Geo)),
             IggyError::InvalidOptionValue(topic_option_keys::GEO_MODE.to_owned()),
+        ),
+        (
+            "geo-tiered-storage",
+            TopicCreateOptions {
+                tiered_storage: Some(true),
+                ..typed(Some(TopicType::Geo), None)
+            },
+            IggyError::InvalidOptionValue(topic_option_keys::TIERED_STORAGE.to_owned()),
+        ),
+        (
+            "geo-mutable",
+            TopicCreateOptions {
+                partition_resize_policy: Some(PartitionResizePolicy::Mutable),
+                ..typed(Some(TopicType::Geo), None)
+            },
+            IggyError::InvalidOptionValue(topic_option_keys::PARTITION_RESIZE_POLICY.to_owned()),
         ),
     ];
     for (name, options, expected) in &refused {

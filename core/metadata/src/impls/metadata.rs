@@ -81,7 +81,7 @@ use iggy_common::{
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
     TopicResolvedOptions, UserId, admit, admit_geo_topic, admit_tiered_storage,
-    critical_keys_marker, derived_defaults, stream_wrap_set, topic_option_keys, validate_geo_mode,
+    critical_keys_marker, derived_defaults, stream_wrap_set, topic_option_keys, validate_geo_topic,
     validate_local_retention, validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
@@ -5160,12 +5160,16 @@ where
                     &OptionAdmissionContext::default(),
                 )?;
                 // A node that does not understand a critical key must refuse
-                // the topic rather than serve it without that key's effect.
+                // the topic rather than serve it without that key's effect. A
+                // geo topic writes in a mode even when the request names none,
+                // so its mode is critical either way.
+                let geo = TopicCreateOptions::from_resource_options(&admitted.explicit).is_geo();
                 let critical: Vec<OptionKey> = admitted
                     .explicit
                     .keys()
                     .filter_map(|key| OptionKey::try_from(key).ok())
                     .filter(|key| key.descriptor().critical)
+                    .chain(geo.then_some(OptionKey::GeoMode))
                     .collect();
                 if !critical.is_empty() {
                     admitted.explicit.insert(
@@ -5210,8 +5214,8 @@ where
                     ));
                 }
                 validate_segment_max_age(resolved.runtime)?;
-                validate_geo_mode(&admitted.explicit)?;
-                admit_geo_topic(&admitted.explicit)?;
+                validate_geo_topic(&admitted.explicit)?;
+                admit_geo_topic(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 admit_tiered_storage(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 validate_local_retention(&stored)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
@@ -6167,9 +6171,9 @@ mod tests {
     use iggy_common::MetadataChangeGroup;
     use iggy_common::{
         GeoMode, HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage,
-        OptionValueCodec, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, TopicType,
-        TopicUpdateOptions, UserStatus, UserUpdateOptions, WrapSet, critical_keys_marker,
-        descriptors_for, stream_wrap_set, variadic,
+        OptionValueCodec, PartitionResizePolicy, ServerKeyContext, StreamEncryptionKey,
+        StreamKeyOrigin, TopicType, TopicUpdateOptions, UserStatus, UserUpdateOptions, WrapSet,
+        check_critical_options, critical_keys_marker, descriptors_for, stream_wrap_set, variadic,
     };
     use journal::prepare_journal::{DEFAULT_SLOT_COUNT, PrepareJournal};
     use journal::superblock::SuperblockContents;
@@ -8173,7 +8177,7 @@ mod tests {
     }
 
     #[test]
-    fn given_a_topic_type_when_preparing_create_topic_should_refuse_geo_and_a_mode_on_normal() {
+    fn given_a_topic_type_when_preparing_create_topic_should_admit_geo_only_in_a_ready_cluster() {
         let typed = |topic_type: Option<TopicType>, geo_mode: Option<GeoMode>| {
             iggy_common::TopicCreateOptions {
                 topic_type,
@@ -8184,11 +8188,47 @@ mod tests {
         for cluster_ready in [false, true] {
             let plane = metadata_plane();
             plane.observe_tiered_storage_readiness(cluster_ready);
-            for geo_mode in [None, Some(GeoMode::Geo), Some(GeoMode::GeoTiered)] {
+            for geo_mode in [None, Some(GeoMode::Geo)] {
+                let admitted = prepare_topic_on(&plane, &typed(Some(TopicType::Geo), geo_mode));
+                if cluster_ready {
+                    assert!(admitted.is_ok(), "mode {geo_mode:?}: {admitted:?}");
+                } else {
+                    assert_eq!(
+                        admitted.err(),
+                        Some(IggyError::FeatureUnavailable),
+                        "mode {geo_mode:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                prepare_topic_on(
+                    &plane,
+                    &typed(Some(TopicType::Geo), Some(GeoMode::GeoTiered))
+                )
+                .err(),
+                Some(IggyError::FeatureUnavailable),
+                "geo_tiered, ready {cluster_ready}"
+            );
+            for (refused, key) in [
+                (
+                    iggy_common::TopicCreateOptions {
+                        tiered_storage: Some(true),
+                        ..typed(Some(TopicType::Geo), None)
+                    },
+                    "tiered_storage",
+                ),
+                (
+                    iggy_common::TopicCreateOptions {
+                        partition_resize_policy: Some(PartitionResizePolicy::Mutable),
+                        ..typed(Some(TopicType::Geo), None)
+                    },
+                    "partition_resize_policy",
+                ),
+            ] {
                 assert_eq!(
-                    prepare_topic_on(&plane, &typed(Some(TopicType::Geo), geo_mode)).err(),
-                    Some(IggyError::FeatureUnavailable),
-                    "ready {cluster_ready}, mode {geo_mode:?}"
+                    prepare_topic_on(&plane, &refused).err(),
+                    Some(IggyError::InvalidOptionValue(key.to_owned())),
+                    "ready {cluster_ready}"
                 );
             }
         }
@@ -8232,6 +8272,54 @@ mod tests {
                 .as_bytes(),
             b"topic_type"
         );
+    }
+
+    #[test]
+    fn given_a_ready_cluster_when_preparing_a_geo_topic_should_store_its_mode_fixed_partitions_and_both_critical_keys()
+     {
+        let plane = metadata_plane();
+        plane.observe_tiered_storage_readiness(true);
+        let persisted = prepare_topic_on(
+            &plane,
+            &iggy_common::TopicCreateOptions {
+                topic_type: Some(TopicType::Geo),
+                ..Default::default()
+            },
+        )
+        .expect("a ready cluster admits a geo topic");
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        let derived = resource_options_from_wire(&persisted.derived_options, false)
+            .expect("derived block decodes");
+        assert_eq!(
+            explicit[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"geo_mode,topic_type"
+        );
+        assert!(!explicit.contains_key(&HeaderKey::from(OptionKey::GeoMode)));
+        assert_eq!(
+            derived[&HeaderKey::from(OptionKey::GeoMode)]
+                .value
+                .as_bytes(),
+            b"geo"
+        );
+        assert_eq!(
+            derived[&HeaderKey::from(OptionKey::PartitionResizePolicy)]
+                .value
+                .as_bytes(),
+            b"fixed"
+        );
+        let mut stored = derived;
+        stored.extend(explicit);
+        assert_eq!(check_critical_options(&stored), Ok(()));
+        let resolved = TopicResolvedOptions::from(&stored);
+        assert_eq!(resolved.geo_mode, Some(GeoMode::Geo));
+        assert_eq!(
+            resolved.partition_resize_policy,
+            PartitionResizePolicy::Fixed
+        );
+        assert!(resolved.runtime.places_batches);
     }
 
     #[test]

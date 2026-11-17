@@ -5605,12 +5605,15 @@ class TopicOptions:
                 `max_topic_size`.
             topic_type: `TopicType.Geo` also makes the topic's messages
                 readable in the other datacenters, through the object store.
-                `None` creates a normal topic. The server refuses
-                `TopicType.Geo` with `FeatureUnavailable` until it serves geo
-                topics.
+                `None` creates a normal topic. A geo topic needs an object
+                store on every node of the cluster: while one is not ready,
+                the server refuses `TopicType.Geo` with `FeatureUnavailable`.
+                A geo topic refuses tiered storage and an encrypted stream,
+                and keeps its name, options and partition count.
             geo_mode: How a geo topic writes its messages, as `GeoMode | None`.
                 `None` resolves to `GeoMode.Geo` on a geo topic. The server
-                refuses any mode on a normal topic.
+                refuses `GeoMode.GeoTiered` with `FeatureUnavailable` for now,
+                and any mode on a normal topic.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.

@@ -107,6 +107,9 @@ pub fn sample(
         Outcome::InvalidTopicSize => {
             unreachable!("the simulator never sets an explicit max topic size")
         }
+        Outcome::OptionNotUpdatable => {
+            unreachable!("the simulator creates no geo topic, the one that refuses an update")
+        }
     }
 }
 

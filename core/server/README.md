@@ -575,7 +575,15 @@ Streams, topics and users take their settings from one option catalog. The binar
 
 Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy`, `replication_factor`, `topic_type`, `geo_mode` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
 
-A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `normal`. Geo topics are not available yet, so the server refuses a create that sets `topic_type` to `geo` with `FeatureUnavailable` (5). Only a geo topic has a `geo_mode` (`geo` or `geo_tiered`). The server refuses a normal topic that sets it with `InvalidOptionValue` (4042). Both keys are critical. A node on a build without them refuses a topic that sets them, and does not serve it as a normal topic.
+A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `normal`. A geo topic's partitions upload each send to the object store before they commit it. The cluster accepts a geo topic only while every node passes the store identity check of [tiered storage](#tiered-storage). Until then, the server refuses it with `FeatureUnavailable` (5).
+
+Only a geo topic has a `geo_mode`: `geo` or `geo_tiered`. A geo topic without one is stored with `geo`. Clients cannot pick `geo_tiered` yet, and the server refuses it with `FeatureUnavailable` (5). The server refuses a normal topic that sets a mode with `InvalidOptionValue` (4042).
+
+A geo topic keeps its name, options and partition count. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or options returns `OptionNotUpdatable` (4103).
+
+A create that sets `tiered_storage` to `true`, or a `partition_resize_policy` other than `fixed`, on a geo topic returns `InvalidOptionValue` (4042). A geo topic in an encrypted stream returns `FeatureUnavailable` (5), because its sends reach the object store before the stream's encryption runs.
+
+Both keys are critical. A node on a build without them refuses a topic that sets them, and does not serve it as a normal topic.
 
 The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 

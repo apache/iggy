@@ -301,8 +301,8 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
         .SetTieredStorage(false)
         .SetLocalRetentionAge(iggy::Expiry::Duration(1800000000))
         .SetLocalRetentionSize(iggy::MaxTopicSize::FromBytes(1ULL << 30))
-        // A geo topic is refused until the server serves geo topics, and a
-        // normal topic refuses any geo mode.
+        // A geo topic is refused while the server has no object store, and
+        // a normal topic refuses any geo mode.
         .SetTopicType(iggy::TopicType::Normal);
 
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));

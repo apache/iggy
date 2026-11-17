@@ -548,35 +548,57 @@ pub fn admit_tiered_storage(
     Ok(())
 }
 
-/// Refuse a mode on a normal topic: only a geo topic has one.
+/// Refuse a create that gives a topic a setting its type cannot have.
 ///
-/// `explicit` holds the keys the request sets.
+/// Only a geo topic has a mode. A geo topic moves its messages to the object
+/// store on its own write path, so it cannot also tier its local segments,
+/// and it keeps the partition count it was created with.
+///
+/// `explicit` holds the keys the request sets. The rules read the request
+/// alone, so the edge and the metadata primary give the same verdict.
 ///
 /// # Errors
 ///
 /// `InvalidOptionValue` naming `geo_mode` when `explicit` sets a mode and
-/// does not make the topic geo.
-pub fn validate_geo_mode(explicit: &ResourceOptions) -> Result<(), IggyError> {
+/// does not make the topic geo. For a geo topic, `InvalidOptionValue` naming
+/// `tiered_storage` when `explicit` turns it on, and naming
+/// `partition_resize_policy` when `explicit` sets a policy other than
+/// `fixed`.
+pub fn validate_geo_topic(explicit: &ResourceOptions) -> Result<(), IggyError> {
     let parsed = TopicCreateOptions::from_resource_options(explicit);
-    if parsed.geo_mode.is_some() && parsed.topic_type != Some(TopicType::Geo) {
-        return Err(IggyError::InvalidOptionValue(
-            topic_option_keys::GEO_MODE.to_string(),
-        ));
-    }
-    Ok(())
+    let refused = if !parsed.is_geo() {
+        parsed.geo_mode.map(|_| topic_option_keys::GEO_MODE)
+    } else if parsed.tiered_storage == Some(true) {
+        Some(topic_option_keys::TIERED_STORAGE)
+    } else if parsed
+        .partition_resize_policy
+        .is_some_and(|policy| policy != PartitionResizePolicy::Fixed)
+    {
+        Some(topic_option_keys::PARTITION_RESIZE_POLICY)
+    } else {
+        None
+    };
+    refused.map_or(Ok(()), |key| {
+        Err(IggyError::InvalidOptionValue(key.to_owned()))
+    })
 }
 
-/// Admit a request that creates a geo topic. No cluster can hold one yet.
+/// Admit a request that creates a geo topic only in a cluster whose every
+/// member can tier topics. A geo topic's partitions can land on any member,
+/// and each of them uploads a send to the object store before it commits it.
 ///
-/// `explicit` holds the keys the request sets. The metadata primary rules
-/// here, as it does on tiered storage, so the refusal reaches the client as a
-/// reply.
+/// `explicit` holds the keys the request sets. `cluster_ready` is the metadata
+/// primary's verdict on the whole cluster, so only the primary can rule here,
+/// and the refusal reaches the client as a reply.
 ///
 /// # Errors
 ///
-/// `FeatureUnavailable` when `explicit` asks for a geo topic.
-pub fn admit_geo_topic(explicit: &ResourceOptions) -> Result<(), IggyError> {
-    if TopicCreateOptions::from_resource_options(explicit).topic_type == Some(TopicType::Geo) {
+/// `FeatureUnavailable` when `explicit` asks for a geo topic while
+/// `cluster_ready` is false, and for a geo topic in the `geo_tiered` mode,
+/// which clients cannot pick yet.
+pub fn admit_geo_topic(explicit: &ResourceOptions, cluster_ready: bool) -> Result<(), IggyError> {
+    let parsed = TopicCreateOptions::from_resource_options(explicit);
+    if parsed.is_geo() && (!cluster_ready || parsed.geo_mode == Some(GeoMode::GeoTiered)) {
         return Err(IggyError::FeatureUnavailable);
     }
     Ok(())
@@ -1222,7 +1244,13 @@ impl From<&ResourceOptions> for TopicResolvedOptions {
             compression_algorithm: parsed.compression_algorithm.unwrap_or_default(),
             message_expiry,
             max_topic_size,
-            partition_resize_policy: parsed.partition_resize_policy.unwrap_or_default(),
+            // Admission stores `fixed` on every geo topic. Any other stored
+            // policy is ignored rather than trusted, as a stored mode is on a
+            // normal topic.
+            partition_resize_policy: match topic_type {
+                TopicType::Geo => PartitionResizePolicy::Fixed,
+                TopicType::Normal => parsed.partition_resize_policy.unwrap_or_default(),
+            },
             tiered_storage: parsed.tiered_storage.unwrap_or(DEFAULT_TIERED_STORAGE),
             local_retention_age: if expiry_micros(local_retention_age)
                 > expiry_micros(message_expiry)
@@ -1381,7 +1409,7 @@ pub struct TopicRuntimeOptions {
     pub tiered_storage: bool,
     /// Whether each partition of the topic places its batches: it replicates
     /// and keeps where the messages of a batch sit in the object store, not
-    /// the messages. No topic option sets it yet.
+    /// the messages. A geo topic in the `geo` mode does.
     pub places_batches: bool,
 }
 
@@ -1425,7 +1453,7 @@ impl From<&TopicCreateOptions> for TopicRuntimeOptions {
             preallocate_segments: parsed.preallocate_segments,
             segment_max_age: parsed.segment_max_age,
             tiered_storage: parsed.tiered_storage == Some(true),
-            places_batches: false,
+            places_batches: parsed.is_geo() && parsed.geo_mode.unwrap_or_default() == GeoMode::Geo,
         }
     }
 }
@@ -1454,7 +1482,8 @@ pub struct TopicCreateOptions {
     /// Message completion policy, independent of consumer-offset durability.
     pub durability: Durability,
     pub consumer_offset_durability: Durability,
-    /// Immutable after creation. `None` resolves to [`PartitionResizePolicy::Mutable`].
+    /// Immutable after creation. `None` resolves to
+    /// [`PartitionResizePolicy::Mutable`], or to `Fixed` on a geo topic.
     pub partition_resize_policy: Option<PartitionResizePolicy>,
     /// Per-topic message-count flush threshold. `None` resolves to 1024.
     /// `0` is rejected.
@@ -1480,10 +1509,14 @@ pub struct TopicCreateOptions {
     /// Topic-wide cap on the uploaded segments a tiered topic keeps on local
     /// disk. `None` resolves to unlimited, or to a finite `max_topic_size`.
     pub local_retention_size: Option<MaxTopicSize>,
-    /// Fixed at creation. `None` resolves to [`TopicType::Normal`].
+    /// Fixed at creation. `None` resolves to [`TopicType::Normal`]. A geo
+    /// topic needs an object store on every node of the cluster. It refuses
+    /// `tiered_storage` and an encrypted stream, and keeps its name, options
+    /// and partition count.
     pub topic_type: Option<TopicType>,
     /// How a geo topic writes its messages. `None` resolves to
     /// [`GeoMode::Geo`] on a geo topic, and a normal topic refuses any mode.
+    /// The server refuses [`GeoMode::GeoTiered`] for now.
     pub geo_mode: Option<GeoMode>,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
@@ -1494,6 +1527,12 @@ pub struct TopicCreateOptions {
 }
 
 impl TopicCreateOptions {
+    /// Whether these options make the topic geo.
+    #[must_use]
+    pub const fn is_geo(&self) -> bool {
+        matches!(self.topic_type, Some(TopicType::Geo))
+    }
+
     pub fn to_explicit_wire(
         &self,
         is_supplied: impl Fn(&str) -> bool,
@@ -2273,51 +2312,93 @@ mod tests {
     }
 
     #[test]
-    fn given_a_create_when_validating_its_geo_mode_should_refuse_a_mode_on_a_normal_topic() {
+    fn given_a_create_when_validating_geo_options_should_refuse_what_its_type_cannot_have() {
         for admitted in [
             explicit_options(&[]),
             explicit_options(&[(OptionKey::TopicType, "normal")]),
+            explicit_options(&[
+                (OptionKey::TopicType, "normal"),
+                (OptionKey::TieredStorage, "true"),
+                (OptionKey::PartitionResizePolicy, "mutable"),
+            ]),
             explicit_options(&[(OptionKey::TopicType, "geo")]),
             explicit_options(&[(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")]),
             explicit_options(&[
                 (OptionKey::TopicType, "geo"),
                 (OptionKey::GeoMode, "geo_tiered"),
             ]),
+            explicit_options(&[
+                (OptionKey::TopicType, "geo"),
+                (OptionKey::TieredStorage, "false"),
+                (OptionKey::PartitionResizePolicy, "fixed"),
+            ]),
         ] {
-            assert_eq!(validate_geo_mode(&admitted), Ok(()));
+            assert_eq!(validate_geo_topic(&admitted), Ok(()));
         }
-        for mode in ["geo", "geo_tiered"] {
-            for refused in [
-                explicit_options(&[(OptionKey::GeoMode, mode)]),
-                explicit_options(&[(OptionKey::TopicType, "normal"), (OptionKey::GeoMode, mode)]),
-            ] {
-                assert_eq!(
-                    validate_geo_mode(&refused),
-                    Err(IggyError::InvalidOptionValue(
-                        topic_option_keys::GEO_MODE.to_owned()
-                    ))
-                );
-            }
+        let refusals = [
+            (
+                explicit_options(&[(OptionKey::GeoMode, "geo")]),
+                topic_option_keys::GEO_MODE,
+            ),
+            (
+                explicit_options(&[
+                    (OptionKey::TopicType, "normal"),
+                    (OptionKey::GeoMode, "geo_tiered"),
+                ]),
+                topic_option_keys::GEO_MODE,
+            ),
+            (
+                explicit_options(&[
+                    (OptionKey::TopicType, "geo"),
+                    (OptionKey::TieredStorage, "true"),
+                ]),
+                topic_option_keys::TIERED_STORAGE,
+            ),
+            (
+                explicit_options(&[
+                    (OptionKey::TopicType, "geo"),
+                    (OptionKey::PartitionResizePolicy, "mutable"),
+                ]),
+                topic_option_keys::PARTITION_RESIZE_POLICY,
+            ),
+        ];
+        for (refused, key) in refusals {
+            assert_eq!(
+                validate_geo_topic(&refused),
+                Err(IggyError::InvalidOptionValue(key.to_owned()))
+            );
         }
     }
 
     #[test]
-    fn given_a_create_when_admitting_a_geo_topic_should_refuse_it_as_unavailable() {
+    fn given_a_create_when_admitting_a_geo_topic_should_need_a_ready_cluster_and_the_geo_mode() {
         for normal in [
             explicit_options(&[]),
             explicit_options(&[(OptionKey::TopicType, "normal")]),
         ] {
-            assert_eq!(admit_geo_topic(&normal), Ok(()));
+            for cluster_ready in [false, true] {
+                assert_eq!(admit_geo_topic(&normal, cluster_ready), Ok(()));
+            }
         }
         for geo in [
             explicit_options(&[(OptionKey::TopicType, "geo")]),
             explicit_options(&[(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")]),
-            explicit_options(&[
-                (OptionKey::TopicType, "geo"),
-                (OptionKey::GeoMode, "geo_tiered"),
-            ]),
         ] {
-            assert_eq!(admit_geo_topic(&geo), Err(IggyError::FeatureUnavailable));
+            assert_eq!(admit_geo_topic(&geo, true), Ok(()));
+            assert_eq!(
+                admit_geo_topic(&geo, false),
+                Err(IggyError::FeatureUnavailable)
+            );
+        }
+        let geo_tiered = explicit_options(&[
+            (OptionKey::TopicType, "geo"),
+            (OptionKey::GeoMode, "geo_tiered"),
+        ]);
+        for cluster_ready in [false, true] {
+            assert_eq!(
+                admit_geo_topic(&geo_tiered, cluster_ready),
+                Err(IggyError::FeatureUnavailable)
+            );
         }
     }
 
@@ -2353,6 +2434,37 @@ mod tests {
             (OptionKey::GeoMode, "geo_tiered"),
         ]);
         assert_eq!(geo_tiered.geo_mode, Some(GeoMode::GeoTiered));
+    }
+
+    #[test]
+    fn given_stored_type_and_mode_when_resolving_should_fix_partitions_and_place_batches_of_a_geo_topic()
+     {
+        let stored = |entries: &[(OptionKey, &str)]| -> TopicResolvedOptions {
+            TopicResolvedOptions::from(&explicit_options(entries))
+        };
+
+        let normal = stored(&[(OptionKey::PartitionResizePolicy, "mutable")]);
+        assert_eq!(
+            normal.partition_resize_policy,
+            PartitionResizePolicy::Mutable
+        );
+        assert!(!normal.runtime.places_batches);
+        let geo = stored(&[
+            (OptionKey::TopicType, "geo"),
+            (OptionKey::PartitionResizePolicy, "mutable"),
+        ]);
+        assert_eq!(geo.partition_resize_policy, PartitionResizePolicy::Fixed);
+        assert!(geo.runtime.places_batches);
+        assert!(!geo.runtime.tiered_storage);
+        let geo_tiered = stored(&[
+            (OptionKey::TopicType, "geo"),
+            (OptionKey::GeoMode, "geo_tiered"),
+        ]);
+        assert_eq!(
+            geo_tiered.partition_resize_policy,
+            PartitionResizePolicy::Fixed
+        );
+        assert!(!geo_tiered.runtime.places_batches);
     }
 
     #[test]

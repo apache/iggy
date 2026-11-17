@@ -230,8 +230,10 @@ const (
 	TopicTypeGeo TopicType = "geo"
 )
 
-// TopicTypeOption fixes the type at create. The server does not offer geo
-// topics yet and refuses TopicTypeGeo with FeatureUnavailable.
+// TopicTypeOption fixes the type at create. A geo topic needs an object store
+// on every node of the cluster: while one is not ready, the server refuses
+// TopicTypeGeo with FeatureUnavailable. A geo topic refuses tiered storage and
+// an encrypted stream, and keeps its name, options and partition count.
 func TopicTypeOption(value TopicType) HeaderEntry {
 	return stringOption(TopicOptionTopicType, string(value))
 }
@@ -247,7 +249,8 @@ const (
 	GeoModeGeoTiered GeoMode = "geo_tiered"
 )
 
-// GeoModeOption fixes a geo topic's mode at create. A normal topic takes no
+// GeoModeOption fixes a geo topic's mode at create. The server refuses
+// GeoModeGeoTiered with FeatureUnavailable for now. A normal topic takes no
 // mode, so the server refuses one there with InvalidOptionValue.
 func GeoModeOption(value GeoMode) HeaderEntry {
 	return stringOption(TopicOptionGeoMode, string(value))

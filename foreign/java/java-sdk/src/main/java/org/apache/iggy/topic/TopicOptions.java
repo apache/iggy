@@ -225,7 +225,9 @@ public final class TopicOptions {
         /**
          * Normal or geo, fixed at create. Left unset, the topic is normal.
          *
-         * <p>Not available yet: the server refuses {@link TopicType#GEO} with {@code FEATURE_UNAVAILABLE}.
+         * <p>A geo topic needs an object store on every node of the cluster: while one is not ready, the
+         * server refuses {@link TopicType#GEO} with {@code FEATURE_UNAVAILABLE}. A geo topic refuses tiered
+         * storage and an encrypted stream, and keeps its name, options and partition count.
          */
         public Builder topicType(TopicType type) {
             return set(TopicOptionKey.TOPIC_TYPE, HeaderValue.fromString(type.value()));
@@ -234,7 +236,8 @@ public final class TopicOptions {
         /**
          * How a geo topic writes its messages, fixed at create. Left unset, a geo topic uses {@link GeoMode#GEO}.
          *
-         * <p>A normal topic has no mode, so the server refuses one there with {@code INVALID_OPTION_VALUE}.
+         * <p>The server refuses {@link GeoMode#GEO_TIERED} with {@code FEATURE_UNAVAILABLE} for now. A normal
+         * topic has no mode, so the server refuses one there with {@code INVALID_OPTION_VALUE}.
          */
         public Builder geoMode(GeoMode mode) {
             return set(TopicOptionKey.GEO_MODE, HeaderValue.fromString(mode.value()));

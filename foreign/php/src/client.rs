@@ -325,10 +325,12 @@ impl IggyClient {
     /// size above a finite `max_topic_size`.
     ///
     /// `topic_type` is `normal` or `geo`, and null creates a normal topic. A geo topic's messages
-    /// also become readable in the other datacenters through the object store, and the server
-    /// refuses `geo` with `Feature is unavailable` until it serves geo topics. `geo_mode` says how
-    /// a geo topic writes its messages, `geo` or `geo_tiered`, and null resolves to `geo` there.
-    /// The server refuses any mode on a normal topic.
+    /// also become readable in the other datacenters through the object store. A geo topic needs
+    /// an object store on every node of the cluster: while one is not ready, the server refuses
+    /// `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
+    /// stream, and keeps its name, options and partition count. `geo_mode` says how a geo topic
+    /// writes its messages, `geo` or `geo_tiered`, and null resolves to `geo` there. The server
+    /// refuses `geo_tiered` with `Feature is unavailable` for now, and any mode on a normal topic.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,

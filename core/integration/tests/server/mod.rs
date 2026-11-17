@@ -42,6 +42,9 @@ mod poll_semantics_vsr;
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
 mod stats_vsr;
+// A geo topic on the `fs` object store: its sends reach the store before they
+// commit, and it keeps its partitions and options.
+mod geo_topic_fs;
 mod tiered_storage_fs;
 mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.
