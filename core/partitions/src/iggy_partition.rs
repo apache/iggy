@@ -218,6 +218,9 @@ where
     /// The rewrite of this partition's placed batches into long-term
     /// segments, while this replica is the primary.
     pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
+    /// What this replica found of its geo topic's object while it is the
+    /// primary.
+    pub(crate) topic_object_check: crate::topic_object::TopicObjectCheck,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1042,6 +1045,7 @@ where
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
+            topic_object_check: crate::topic_object::TopicObjectCheck::default(),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -8547,6 +8551,23 @@ where
                     message.header(),
                     IggyError::TransientNotAccepted.as_code(),
                     "data disk is below its free-space reserve",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+            // Other clusters adopt a geo topic from its object in the store,
+            // so a geo topic's partition takes no messages before its primary
+            // read the object back. Below the dedup lookup for the reason
+            // the reserve is.
+            if message.header().operation == Operation::SendMessages
+                && !self.takes_messages_of_its_topic()
+            {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "the primary has not read the object of the geo topic yet",
                     reply.take(),
                 )
                 .await;

@@ -57,7 +57,7 @@ use metadata::change_log::ChangeLog;
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::{
     FreshObjectSweeper, FreshObjectUploader, LongTermWriter, ManifestPublisher, ObjectDeleter,
-    SegmentUploader,
+    SegmentUploader, TopicObjects,
 };
 use shard::Receiver;
 use shard::metrics::ShardMetrics;
@@ -123,8 +123,9 @@ enum Verdict {
 
 /// What a shard writes to the object store with: its segment uploader, its
 /// object deleter, its manifest publisher, the uploader of its fresh objects,
-/// the writer of its long-term segments and the sweeper of fresh objects. The shard holds them only while
-/// its node passes the store identity check.
+/// the writer of its long-term segments, the sweeper of fresh objects and the
+/// jobs on geo topic objects. The shard holds them only while its node passes
+/// the store identity check.
 pub struct TierHandlers {
     uploader: Rc<dyn SegmentUploader>,
     deleter: Rc<dyn ObjectDeleter>,
@@ -132,6 +133,7 @@ pub struct TierHandlers {
     fresh_uploader: Rc<dyn FreshObjectUploader>,
     long_term_writer: Rc<dyn LongTermWriter>,
     fresh_sweeper: Rc<dyn FreshObjectSweeper>,
+    topic_objects: Rc<dyn TopicObjects>,
     held: bool,
 }
 
@@ -359,6 +361,7 @@ impl TierHandlers {
         fresh_uploader: Rc<dyn FreshObjectUploader>,
         long_term_writer: Rc<dyn LongTermWriter>,
         fresh_sweeper: Rc<dyn FreshObjectSweeper>,
+        topic_objects: Rc<dyn TopicObjects>,
     ) -> Self {
         Self {
             uploader,
@@ -367,6 +370,7 @@ impl TierHandlers {
             fresh_uploader,
             long_term_writer,
             fresh_sweeper,
+            topic_objects,
             held: false,
         }
     }
@@ -387,6 +391,7 @@ impl TierHandlers {
         shard.set_fresh_uploader(verified.then(|| Rc::clone(&self.fresh_uploader)));
         shard.set_long_term_writer(verified.then(|| Rc::clone(&self.long_term_writer)));
         shard.set_fresh_sweeper(verified.then(|| Rc::clone(&self.fresh_sweeper)));
+        shard.set_topic_objects(verified.then(|| Rc::clone(&self.topic_objects)));
         self.held = verified;
     }
 }
@@ -404,7 +409,7 @@ mod tests {
     };
     use partitions::{
         ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermWriter,
-        ExecutorManifestPublisher, ExecutorUploader,
+        ExecutorManifestPublisher, ExecutorTopicObjects, ExecutorUploader,
     };
 
     use super::*;
@@ -597,39 +602,29 @@ mod tests {
                 InlineTierExecutor::new(MemoryStore::new()),
                 layout(),
             )),
+            Rc::new(ExecutorTopicObjects::new(
+                InlineTierExecutor::new(MemoryStore::new()),
+                layout(),
+            )),
         );
         let held = |handlers: &mut TierHandlers, verified| {
             handlers.sync(&shard, verified);
-            (
+            [
                 shard.segment_uploader().is_some(),
                 shard.object_deleter().is_some(),
                 shard.manifest_publisher().is_some(),
                 shard.fresh_uploader().is_some(),
                 shard.long_term_writer().is_some(),
                 shard.fresh_sweeper().is_some(),
-            )
+                shard.topic_objects().is_some(),
+            ]
         };
 
-        assert_eq!(
-            held(&mut handlers, false),
-            (false, false, false, false, false, false)
-        );
-        assert_eq!(
-            held(&mut handlers, true),
-            (true, true, true, true, true, true)
-        );
-        assert_eq!(
-            held(&mut handlers, true),
-            (true, true, true, true, true, true)
-        );
-        assert_eq!(
-            held(&mut handlers, false),
-            (false, false, false, false, false, false)
-        );
-        assert_eq!(
-            held(&mut handlers, true),
-            (true, true, true, true, true, true)
-        );
+        assert_eq!(held(&mut handlers, false), [false; 7]);
+        assert_eq!(held(&mut handlers, true), [true; 7]);
+        assert_eq!(held(&mut handlers, true), [true; 7]);
+        assert_eq!(held(&mut handlers, false), [false; 7]);
+        assert_eq!(held(&mut handlers, true), [true; 7]);
     }
 
     #[test]

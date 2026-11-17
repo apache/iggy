@@ -44,6 +44,7 @@ pub mod shards_table;
 #[cfg(test)]
 mod test_support;
 pub mod tier_service;
+mod topic_object_checks;
 mod upload_pacing;
 
 pub use config::CoordinatorConfig;
@@ -1292,6 +1293,16 @@ pub enum LifecycleFrame {
     /// The result of the delete that a sweep started, sent by the task that
     /// ran it.
     FreshObjectsDeleted(Box<FinishedFreshDelete>),
+    /// Per-shard pass over the partitions of geo topics: start the read of
+    /// the topic's object on each whose primary this replica is and that
+    /// does not take messages yet. The timer task stamps `now`. Does nothing
+    /// on a shard without topic objects.
+    CheckTopicObjects {
+        now: IggyTimestamp,
+    },
+    /// The result of a read that a [`Self::CheckTopicObjects`] pass started,
+    /// sent by the task that ran it.
+    TopicObjectCheckFinished(Box<FinishedTopicObjectCheck>),
 }
 
 /// What the task rewriting a segment hands back to the pump.
@@ -1303,6 +1314,16 @@ pub struct FinishedSegmentRewrite {
     /// The partition's number for the rewrite.
     pub id: u64,
     pub outcome: partitions::RewriteOutcome,
+}
+
+/// What the task reading a geo topic's object hands back to the pump.
+pub struct FinishedTopicObjectCheck {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the read.
+    pub created_revision: u64,
+    /// The partition's number for the read.
+    pub id: u64,
+    pub outcome: partitions::TopicObjectOutcome<iggy_object_store::TopicRead>,
 }
 
 /// What the task publishing a manifest hands back to the pump.
@@ -2154,6 +2175,10 @@ where
     /// When the next rewrite pass over each placing partition here is due.
     rewrite_pacing: RefCell<rewrite_pacing::RewritePacing>,
 
+    /// The reads of geo topic objects by the primaries of the partitions
+    /// here.
+    topic_object_checks: topic_object_checks::TopicObjectChecks,
+
     /// Late-bound stores of the geo peers, empty on a node without peers.
     /// See [`Self::set_peer_stores`].
     peer_stores: RefCell<Rc<peers::PeerStores<B>>>,
@@ -2508,6 +2533,7 @@ where
             long_term_writer: RefCell::new(None),
             undelivered_segment_rewrites: Rc::default(),
             rewrite_pacing: RefCell::default(),
+            topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_stores: RefCell::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
@@ -3483,6 +3509,7 @@ where
             long_term_writer: RefCell::new(None),
             undelivered_segment_rewrites: Rc::default(),
             rewrite_pacing: RefCell::default(),
+            topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_stores: RefCell::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),

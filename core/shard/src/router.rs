@@ -1283,6 +1283,12 @@ where
             LifecycleFrame::FreshObjectsDeleted(finished) => {
                 self.on_fresh_objects_deleted(*finished);
             }
+            LifecycleFrame::CheckTopicObjects { now } => {
+                self.on_check_topic_objects(now);
+            }
+            LifecycleFrame::TopicObjectCheckFinished(finished) => {
+                self.on_topic_object_check_finished(&finished);
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,

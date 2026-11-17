@@ -222,7 +222,7 @@ async fn run<S: ObjectStore>(
 }
 
 /// This cluster's `cluster_uid`: the id of its metadata change log.
-fn own_cluster_uid(shard: &ServerShard) -> Option<u128> {
+pub fn own_cluster_uid(shard: &ServerShard) -> Option<u128> {
     shard
         .plane
         .metadata()
@@ -551,6 +551,7 @@ mod tests {
         GeoConfig {
             origin: "dc-a".to_owned(),
             peers,
+            ..GeoConfig::default()
         }
     }
 

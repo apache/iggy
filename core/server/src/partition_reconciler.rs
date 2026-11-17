@@ -181,6 +181,7 @@
 //! helping; consider a distinct "retry here shortly" code that keeps the route.
 //!
 
+use crate::geo_topics::GeoTopics;
 use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
@@ -211,7 +212,8 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, Segment, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
+    IggyPartition, Segment, StreamKeyIdentity, TOPIC_OBJECT_RETRY, delete_partitions_from_disk,
+    read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -347,6 +349,12 @@ pub struct ReconcilerCtx {
     /// The incarnations whose delete this node saw commit as the metadata
     /// primary, and whose objects wait for their delete.
     incarnation_deletes: IncarnationDeletes,
+    /// The objects of this cluster's geo topics in its store, which the
+    /// metadata primary keeps in step with committed metadata.
+    geo_topics: GeoTopics,
+    /// When the next pass over the partitions of geo topics may be staged,
+    /// in microseconds since the Unix epoch.
+    next_topic_object_check_at: Cell<u64>,
 }
 
 impl ReconcilerCtx {
@@ -365,6 +373,7 @@ impl ReconcilerCtx {
             .mux_stm
             .streams()
             .read(|inner| Arc::clone(&inner.stats_registry));
+        let geo_topics = GeoTopics::new(&config.geo);
         Self {
             shard,
             total_shards,
@@ -384,6 +393,8 @@ impl ReconcilerCtx {
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
+            geo_topics,
+            next_topic_object_check_at: Cell::new(0),
         }
     }
 
@@ -563,6 +574,7 @@ pub async fn run_reconciler(
     }
 
     ctx.incarnation_deletes.stop();
+    ctx.geo_topics.stop();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -649,8 +661,10 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         reconcile_stream_keys(ctx);
     }
     report_lifecycles(ctx).await;
-    ctx.incarnation_deletes
-        .pass(&ctx.shard, IggyTimestamp::now());
+    let now = IggyTimestamp::now();
+    ctx.incarnation_deletes.pass(&ctx.shard, now);
+    ctx.geo_topics.pass(&ctx.shard, now);
+    stage_topic_object_checks(ctx, now);
 
     if counters.total() > 0 {
         debug!(
@@ -678,6 +692,20 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         );
     }
     capped
+}
+
+/// Stage a pass over the partitions of geo topics on this shard's pump, at
+/// most once per [`TOPIC_OBJECT_RETRY`]. The pump starts the read of the
+/// topic's object for each partition whose primary does not take messages
+/// yet, so a new primary reads without waiting for a produce.
+fn stage_topic_object_checks(ctx: &ReconcilerCtx, now: IggyTimestamp) {
+    if now.as_micros() < ctx.next_topic_object_check_at.get() {
+        return;
+    }
+    let wait = u64::try_from(TOPIC_OBJECT_RETRY.as_micros()).unwrap_or(u64::MAX);
+    ctx.next_topic_object_check_at
+        .set(now.as_micros().saturating_add(wait));
+    ctx.shard.request_check_topic_objects(now);
 }
 
 /// Folds into the work set what changed since the last pass. Returns whether
@@ -2459,6 +2487,8 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 
 #[cfg(test)]
 mod tests {
+    mod geo_topics;
+
     use super::{
         CommittedTarget, Convergence, DISK_VISITS_PER_PASS, FailureCause, FailureRecord,
         GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS, PassCounters, ReconcilerCtx,
@@ -4292,6 +4322,12 @@ mod tests {
     /// Store both objects of one segment and the manifest of `prefix`, and
     /// return their keys.
     async fn store_incarnation(deleter: &MemoryDeleter, prefix: ObjectPrefix) -> Vec<String> {
+        store_objects(deleter.executor().store(), prefix).await
+    }
+
+    /// Store both objects of one segment and the manifest of `prefix` in
+    /// `store`, and return their keys.
+    async fn store_objects(store: &MemoryStore, prefix: ObjectPrefix) -> Vec<String> {
         let layout = object_layout();
         let mut keys: Vec<String> = SegmentObject::ALL
             .into_iter()
@@ -4305,9 +4341,7 @@ mod tests {
             .collect();
         keys.push(layout.manifest_key(&prefix));
         for key in &keys {
-            deleter
-                .executor()
-                .store()
+            store
                 .put(key, PutBody::from_bytes(vec![1]), &PutOptions::default())
                 .await
                 .unwrap();
@@ -4496,6 +4530,7 @@ mod tests {
                 namespace: ns,
                 created_revision: live.created_revision,
                 kind: PartitionChangeKind::Removed,
+                geo_topic: false,
             }],
             IggyTimestamp::now(),
         );
@@ -4541,6 +4576,7 @@ mod tests {
                     namespace: ns,
                     created_revision: 1,
                     kind: PartitionChangeKind::Removed,
+                    geo_topic: false,
                 }],
                 IggyTimestamp::now(),
             );

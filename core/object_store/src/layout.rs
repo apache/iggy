@@ -27,6 +27,7 @@ const FRESH: &str = "fresh";
 const FRESH_ID_DIGITS: usize = 32;
 /// Hexadecimal digits of the replica in a fresh object's key.
 const FRESH_REPLICA_DIGITS: usize = 2;
+const TOPICS: &str = "topics";
 /// Decimal digits of `u64::MAX`: the most that an id takes, and the width of
 /// a zero-padded offset.
 const U64_DIGITS: usize = 20;
@@ -86,6 +87,31 @@ pub struct SegmentKey {
     pub object: SegmentObject,
 }
 
+/// The parts of a geo topic object's key: the topic incarnation it describes.
+///
+/// Every partition of a geo topic comes with the topic, so they all share
+/// its `created_revision`, and their [`ObjectPrefix`]es follow from this key
+/// and the partition count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TopicKey {
+    pub stream_id: u64,
+    pub topic_id: u64,
+    pub created_revision: u64,
+}
+
+impl TopicKey {
+    /// Where the objects of the topic's partition `partition_id` live.
+    #[must_use]
+    pub const fn partition_prefix(&self, partition_id: u64) -> ObjectPrefix {
+        ObjectPrefix {
+            stream_id: self.stream_id,
+            topic_id: self.topic_id,
+            partition_id,
+            created_revision: self.created_revision,
+        }
+    }
+}
+
 /// Builds and parses the keys of tiered storage under the bucket prefix from
 /// configuration, its root:
 ///
@@ -94,19 +120,28 @@ pub struct SegmentKey {
 /// {root}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.index
 /// {root}/meta/{stream_id}/{topic_id}/{partition_id}/{created_revision}/manifest.bin
 /// {root}/meta/identity
+/// {root}/meta/fresh/{replica:02x}/{object_id:032x}
+/// {root}/meta/topics/{stream_id}/{topic_id}/{created_revision}
 /// ```
 ///
 /// The zero-padded offset matches the segment's file name on disk, so a
 /// listing returns the segments of an incarnation in offset order. Ids are
 /// decimal and never `meta`, so no segment key falls under `{root}/meta/`.
-/// The cluster's identity is not part of any key: the store identity object
+/// Under `{root}/meta/`, a manifest key goes on with an id, and `identity`,
+/// `fresh` and `topics` are not ids, so no two kinds share a key. The
+/// cluster's identity is not part of any key: the store identity object
 /// under [`Self::identity_key`] claims the root for one cluster.
+///
+/// One listing of [`Self::topics_prefix`] finds the object of every geo
+/// topic under the root, and one listing of [`Self::stream_topics_prefix`]
+/// finds those of one stream.
 ///
 /// Roots never nest in the keys of another root, so two clusters can share a
 /// bucket under roots such as `iggy` and `iggy/b`. A listing under a root
 /// still returns the keys of every longer root, so retire and the orphan
 /// sweep delete only the keys that [`Self::parse_segment_key`] accepts and
-/// the keys that [`Self::manifest_key`] builds.
+/// the keys that [`Self::manifest_key`] builds, and the sweep of geo topic
+/// objects acts only on the keys that [`Self::parse_topic_key`] accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyLayout {
     root: String,
@@ -237,6 +272,53 @@ impl KeyLayout {
         (self.fresh_key(id) == key).then_some(id)
     }
 
+    /// The listing prefix of every geo topic object under the root, with a
+    /// trailing `/`.
+    #[must_use]
+    pub fn topics_prefix(&self) -> String {
+        format!("{}/{META}/{TOPICS}/", self.root)
+    }
+
+    /// The listing prefix of the geo topic objects of one stream, with a
+    /// trailing `/`.
+    #[must_use]
+    pub fn stream_topics_prefix(&self, stream_id: u64) -> String {
+        format!("{}{stream_id}/", self.topics_prefix())
+    }
+
+    /// The key of the object that describes a geo topic incarnation to the
+    /// clusters that read this store.
+    #[must_use]
+    pub fn topic_key(&self, key: &TopicKey) -> String {
+        format!(
+            "{}{}/{}",
+            self.stream_topics_prefix(key.stream_id),
+            key.topic_id,
+            key.created_revision
+        )
+    }
+
+    /// The geo topic incarnation that a listed key names, or `None` when
+    /// this layout did not build the key for a geo topic object. Parsing is
+    /// strict, as for [`Self::parse_segment_key`].
+    #[must_use]
+    pub fn parse_topic_key(&self, key: &str) -> Option<TopicKey> {
+        let mut parts = key
+            .strip_prefix(self.root.as_str())?
+            .strip_prefix('/')?
+            .strip_prefix(META)?
+            .strip_prefix('/')?
+            .strip_prefix(TOPICS)?
+            .strip_prefix('/')?
+            .split('/');
+        let topic = TopicKey {
+            stream_id: parse_id(parts.next()?)?,
+            topic_id: parse_id(parts.next()?)?,
+            created_revision: parse_id(parts.next()?)?,
+        };
+        parts.next().is_none().then_some(topic)
+    }
+
     /// The segment object that a listed key names, or `None` when this layout
     /// did not build the key for a segment, as for a manifest or a key under
     /// another root. Parsing is strict, so only a key that
@@ -297,7 +379,7 @@ fn parse_offset(stem: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MAX_KEY_SEGMENT_LEN;
+    use crate::store::{MAX_KEY_SEGMENT_LEN, validate_prefix};
 
     const PREFIX: ObjectPrefix = ObjectPrefix {
         stream_id: 1,
@@ -339,6 +421,80 @@ mod tests {
             "tenant/iggy/meta/1/22/0/4096/manifest.bin"
         );
         assert_eq!(layout().identity_key(), "tenant/iggy/meta/identity");
+    }
+
+    const TOPIC: TopicKey = TopicKey {
+        stream_id: 1,
+        topic_id: 22,
+        created_revision: 4096,
+    };
+
+    #[test]
+    fn given_topic_when_building_keys_should_group_them_by_stream() {
+        let layout = layout();
+
+        assert_eq!(layout.topics_prefix(), "tenant/iggy/meta/topics/");
+        assert_eq!(layout.stream_topics_prefix(1), "tenant/iggy/meta/topics/1/");
+        assert_eq!(
+            layout.topic_key(&TOPIC),
+            "tenant/iggy/meta/topics/1/22/4096"
+        );
+        assert!(validate_prefix(&layout.topics_prefix()).is_ok());
+        assert!(validate_prefix(&layout.stream_topics_prefix(u64::MAX)).is_ok());
+        assert!(
+            layout
+                .topic_key(&TOPIC)
+                .starts_with(&layout.stream_topics_prefix(TOPIC.stream_id))
+        );
+        assert_eq!(
+            TOPIC.partition_prefix(3),
+            ObjectPrefix {
+                partition_id: 3,
+                ..PREFIX
+            }
+        );
+    }
+
+    #[test]
+    fn given_built_topic_keys_when_parsing_should_round_trip() {
+        let layout = layout();
+        for created_revision in [0, 1, 4096, u64::MAX] {
+            let topic = TopicKey {
+                created_revision,
+                ..TOPIC
+            };
+            let key = layout.topic_key(&topic);
+
+            assert!(validate_key(&key).is_ok(), "{key}");
+            assert_eq!(layout.parse_topic_key(&key), Some(topic), "{key}");
+            assert_eq!(layout.parse_segment_key(&key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn given_keys_layout_did_not_build_for_a_topic_when_parsing_should_return_none() {
+        let layout = layout();
+        let segment = layout.segment_key(&SegmentKey {
+            prefix: PREFIX,
+            start_offset: 1_000,
+            object: SegmentObject::Log,
+        });
+        for key in [
+            layout.identity_key().as_str(),
+            layout.manifest_key(&PREFIX).as_str(),
+            segment.as_str(),
+            "tenant/iggy/meta/topics/1/22",
+            "tenant/iggy/meta/topics/1/22/4096/",
+            "tenant/iggy/meta/topics/1/22/4096/x",
+            "tenant/iggy/meta/topics/01/22/4096",
+            "tenant/iggy/meta/topics/1/22/+4096",
+            "tenant/iggy/meta/topics/1/22/18446744073709551616",
+            "tenant/iggy/meta/topic/1/22/4096",
+            "tenant/iggy/b/meta/topics/1/22/4096",
+            "tenant/iggy2/meta/topics/1/22/4096",
+        ] {
+            assert_eq!(layout.parse_topic_key(key), None, "{key}");
+        }
     }
 
     #[test]
@@ -480,13 +636,18 @@ mod tests {
         root
     }
 
-    fn widest_keys(layout: &KeyLayout) -> [String; 2] {
+    fn widest_keys(layout: &KeyLayout) -> [String; 3] {
         let index = layout.segment_key(&SegmentKey {
             prefix: WIDEST,
             start_offset: u64::MAX,
             object: SegmentObject::Index,
         });
-        [index, layout.manifest_key(&WIDEST)]
+        let topic = layout.topic_key(&TopicKey {
+            stream_id: u64::MAX,
+            topic_id: u64::MAX,
+            created_revision: u64::MAX,
+        });
+        [index, layout.manifest_key(&WIDEST), topic]
     }
 
     #[test]
@@ -532,11 +693,12 @@ mod tests {
         assert_eq!(root.len(), MAX_ROOT_LEN);
         let layout = KeyLayout::new(root).unwrap();
 
-        let [index, manifest] = widest_keys(&layout);
+        let [index, manifest, topic] = widest_keys(&layout);
 
         assert_eq!(index.len(), MAX_KEY_LEN);
         assert!(validate_key(&index).is_ok());
         assert!(validate_key(&manifest).is_ok());
+        assert!(validate_key(&topic).is_ok());
     }
 
     #[test]
@@ -554,11 +716,12 @@ mod tests {
         let root = format!("{}r", "r/".repeat(MAX_ROOT_SEGMENTS - 1));
         let layout = KeyLayout::new(root).unwrap();
 
-        let [index, manifest] = widest_keys(&layout);
+        let [index, manifest, topic] = widest_keys(&layout);
 
         assert_eq!(manifest.split('/').count(), MAX_KEY_SEGMENTS);
         assert!(validate_key(&index).is_ok());
         assert!(validate_key(&manifest).is_ok());
+        assert!(validate_key(&topic).is_ok());
     }
 
     #[test]
