@@ -26,6 +26,8 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 
 import java.util.List;
 import java.util.Optional;
@@ -46,6 +48,11 @@ final class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     @Override
     public List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId) {
         return FutureUtil.resolve(delegate.getConsumerGroups(streamId, topicId));
+    }
+
+    @Override
+    public Page<ConsumerGroup> getConsumerGroupsPage(StreamId streamId, TopicId topicId, NamedPageQuery query) {
+        return FutureUtil.resolve(delegate.getConsumerGroupsPage(streamId, topicId, query));
     }
 
     @Override

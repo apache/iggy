@@ -205,8 +205,9 @@ Three things enforce that, in the order a client meets them:
    records. Under `acks=0` there is no response to carry 35, so the connection is closed
    instead, the same way a Kafka broker answers an `acks=0` produce error.
 
-An idempotent (non-transactional) producer is unaffected: it gets a producer id and works
-untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
+An idempotent (non-transactional) producer is unaffected: it gets a producer id, and each of its
+batches lands once unless `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=false`. See
+[`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 ### DeleteRecords is not advertised ([#3547](https://github.com/apache/iggy/issues/3547))
 
@@ -464,11 +465,17 @@ below it are still open for the issues that build on top of it.
       partition 0 is the controller, and each group has one coordinator that another gateway
       takes over when it stops (#4515, `docs/CONSUMER_GROUPS.md`). Without it, each gateway
       leads every partition it reports.
-- [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
-      against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
-      not reproduced or root-caused against the current `kafka_protocol`-based decode path in this
-      session, so not carried forward as a fix here rather than guessed at. Needs fresh
-      reproduction against a real `kcat` before it's re-closed.
+- [x] librdkafka / `kcat` trailing bytes on all-topics Metadata requests (#4828, #4299):
+      librdkafka 2.x's `rd_kafka_MetadataRequest0` in `src/rdkafka_request.c` reserves a 4-byte
+      `i32` array count placeholder (`rd_kafka_buf_write_arraycnt_pos`) for `TopicArrayCnt`.
+      When requesting all topics (`total_topic_cnt == 0`) at flexible versions (`ApiVersion >= 9`),
+      it keeps 0 without calling `rd_kafka_buf_finalize_arraycnt`, leaving 4 zero bytes where
+      a 1-byte compact array varint null (`0x00`) was expected and failing to compact the buffer by
+      3 bytes. Real Kafka brokers accept this because their request parser does not reject
+      unconsumed bytes at the end of the frame. Resolved via `decode_metadata_guarded` in
+      `iggy_kafka_wire::codec`, which tolerates up to 3 unconsumed zero bytes specifically for
+      flexible all-topics Metadata requests while preserving strict bounds validation and
+      exhaustive decoding everywhere else.
 - [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::partition_probes` and
       `EARLIEST` answers `0`. A timestamp answers the first record Iggy appended at or after it,

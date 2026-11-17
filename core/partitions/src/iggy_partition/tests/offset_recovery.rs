@@ -22,12 +22,7 @@ use super::*;
 #[compio::test]
 async fn given_failed_offset_directory_check_when_recovering_should_fail_the_load() {
     let dir = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: dir.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
+    let config = offsets_config(&dir);
     for (kind, path) in [
         (
             ConsumerKind::Consumer,
@@ -49,7 +44,6 @@ async fn given_failed_offset_directory_check_when_recovering_should_fail_the_loa
             &mut partition,
             &config,
             IggyNamespace::new(1, 1, 0),
-            0,
         )
         .await
         else {
@@ -73,12 +67,7 @@ async fn given_failed_offset_directory_check_when_recovering_should_fail_the_loa
 #[compio::test]
 async fn given_unwritable_offsets_dir_when_recovering_should_report_why_the_external_dir_failed() {
     let directory = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: directory.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
+    let config = offsets_config(&directory);
     // A file where the external group directory belongs fails its creation.
     // One at `offsets/` would fail the consumer directory check first.
     std::fs::create_dir_all(config.get_offsets_path(1, 1, 0)).unwrap();
@@ -95,7 +84,6 @@ async fn given_unwritable_offsets_dir_when_recovering_should_report_why_the_exte
         &mut partition,
         &config,
         IggyNamespace::new(1, 1, 0),
-        0,
     )
     .await
     .expect_err("the external group directory cannot be created");
@@ -115,12 +103,7 @@ async fn given_unwritable_offsets_dir_when_recovering_should_report_why_the_exte
 #[compio::test]
 async fn given_layout_without_external_groups_dir_when_checkpointing_after_boot_should_succeed() {
     let directory = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: directory.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
+    let config = offsets_config(&directory);
     for dir in [
         config.get_consumer_offsets_path(1, 1, 0),
         config.get_consumer_group_offsets_path(1, 1, 0),
@@ -136,7 +119,6 @@ async fn given_layout_without_external_groups_dir_when_checkpointing_after_boot_
         &mut partition,
         &config,
         IggyNamespace::new(1, 1, 0),
-        0,
     )
     .await
     .unwrap();

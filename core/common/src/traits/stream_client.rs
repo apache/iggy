@@ -16,21 +16,34 @@
 // under the License.
 
 use crate::{
-    Identifier, IggyError, Stream, StreamCreateOptions, StreamDetails, StreamUpdateOptions,
+    Identifier, IggyError, NamedPageQuery, Page, Stream, StreamCreateOptions, StreamDetails,
+    StreamUpdateOptions,
 };
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the stream module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait StreamClient {
     /// Get the info about a specific stream by unique ID or name.
     ///
     /// Authentication is required, and the permission to read the streams.
     async fn get_stream(&self, stream_id: &Identifier) -> Result<Option<StreamDetails>, IggyError>;
-    /// Get the info about all the streams.
+    /// Get the info about all the streams, in id order.
+    ///
+    /// The list is read page by page, so it is not one consistent read. A stream
+    /// that someone creates or deletes during the read can appear or not
+    /// appear.
+    /// A server that answers a page with the cursor it was sent fails the read
+    /// with `IggyError::InvalidFormat`.
     ///
     /// Authentication is required, and the permission to read the streams.
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError>;
+    /// One page of the streams. Read the next page with
+    /// [`NamedPageQuery::next`] until the page has no `next`.
+    ///
+    /// Authentication is required, and the permission to read the streams.
+    async fn get_streams_page(&self, query: &NamedPageQuery) -> Result<Page<Stream>, IggyError>;
     /// Create a new stream.
     ///
     /// `options` may carry the stream's own encryption key. The server stores

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cmp::Ordering;
+const DIGITS_PER_GROUP: usize = 3;
+const DIGIT_GROUP_SEPARATOR: char = ',';
 
 /// Format milliseconds with adaptive precision (100+ = int, 10+ = 1dp, 1+ = 2dp, else 3dp).
 pub fn format_ms(value: f64) -> String {
@@ -78,25 +79,29 @@ pub fn format_bytes(value: u64) -> String {
     }
 }
 
-/// NaN-safe partial comparison. NaN always ranks highest (worst for min, best filtered out).
-pub fn nan_safe_cmp(left: f64, right: f64) -> Ordering {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        (false, false) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+/// Format a count with a comma between groups of three digits, for example 40,000.
+pub fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / DIGITS_PER_GROUP);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(DIGITS_PER_GROUP) {
+            grouped.push(DIGIT_GROUP_SEPARATOR);
+        }
+        grouped.push(digit);
     }
+    grouped
 }
 
-/// Return `value` if finite, else `fallback`. Coerces NaN/inf into a safe sentinel.
-pub fn finite_or(value: f64, fallback: f64) -> f64 {
-    if value.is_finite() { value } else { fallback }
+pub fn runs_text(count: usize) -> String {
+    match count {
+        1 => "1 run".to_owned(),
+        _ => format!("{count} runs"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cmp::Ordering;
 
     #[test]
     fn given_small_values_when_formatting_ms_should_use_three_decimals() {
@@ -151,28 +156,18 @@ mod tests {
     }
 
     #[test]
-    fn given_finite_values_when_comparing_should_order_naturally() {
-        assert_eq!(nan_safe_cmp(1.0, 2.0), Ordering::Less);
-        assert_eq!(nan_safe_cmp(2.0, 1.0), Ordering::Greater);
-        assert_eq!(nan_safe_cmp(1.0, 1.0), Ordering::Equal);
+    fn given_counts_when_grouping_digits_should_separate_each_thousand() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1_000), "1,000");
+        assert_eq!(group_digits(40_000), "40,000");
+        assert_eq!(group_digits(1_234_567), "1,234,567");
     }
 
     #[test]
-    fn given_nan_operands_when_comparing_should_rank_nan_last() {
-        assert_eq!(nan_safe_cmp(f64::NAN, 1.0), Ordering::Greater);
-        assert_eq!(nan_safe_cmp(1.0, f64::NAN), Ordering::Less);
-        assert_eq!(nan_safe_cmp(f64::NAN, f64::NAN), Ordering::Equal);
-    }
-
-    #[test]
-    fn given_finite_value_when_calling_finite_or_should_return_value() {
-        assert_eq!(finite_or(3.0, 0.0), 3.0);
-    }
-
-    #[test]
-    fn given_nonfinite_value_when_calling_finite_or_should_return_fallback() {
-        assert_eq!(finite_or(f64::NAN, 0.0), 0.0);
-        assert_eq!(finite_or(f64::INFINITY, -1.0), -1.0);
-        assert_eq!(finite_or(f64::NEG_INFINITY, 5.0), 5.0);
+    fn given_counts_when_written_should_use_singular_for_one_run() {
+        assert_eq!(runs_text(0), "0 runs");
+        assert_eq!(runs_text(1), "1 run");
+        assert_eq!(runs_text(317), "317 runs");
     }
 }

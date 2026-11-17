@@ -152,7 +152,7 @@ try await client.updateTopic(
 try await client.updateUser("alice", options: UserUpdateOptions(status: .inactive))
 ```
 
-Only `message_expiry` and `max_topic_size` can be reset. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
+Only `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. An update can turn `tiered_storage` on, never off. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
 
 Everything else, such as a taken name or a missing resource, is refused by the server. `describeOptions(scope:)` lists every key of a scope with flags saying what an update may do with it. Renaming the signed-in user, through `username` or a raw `username` entry, moves the credentials later reconnects use.
 
@@ -165,6 +165,32 @@ try await client.updateTopic(streamID: "payments-v2", topicID: "orders", options
 `StreamCreateOptions.encryptionKey` gives the stream its own data key. It must be 32 random bytes, never derived from a password. It travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is the caller's choice.
 
 The server stores it wrapped and never returns it: reads report `encryptionKeySource`, `encryptionKeyFingerprint`, and `encryptionKekFingerprints`, and `EncryptionKey.fingerprint(_:)` computes the fingerprint of a key to compare. Without a key, a server with encryption enabled generates one for the stream.
+
+### List pages
+
+`getStreams()`, `getTopics(streamID:)`, `getConsumerGroups(streamID:topicID:)` and `getUsers()` return a whole list. Each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the read can appear or not appear. The read keeps the sign-in it started with, and one request timeout covers every page. If the server answers with the cursor it was sent, the read fails with `invalidCommand`.
+
+`getStreamsPage(_:)`, `getTopicsPage(streamID:query:)`, `getPartitionsPage(streamID:topicID:query:)`, `getConsumerGroupsPage(streamID:topicID:query:)` and `getUsersPage(_:)` return one page. To read the next page, send the same query with the `next` of the page as its `cursor`. A page can be empty and still have a `next`:
+
+```swift
+func printStreams(_ client: IggyClient) async throws {
+    var query = NamedPageQuery()
+    while true {
+        let page = try await client.getStreamsPage(query)
+        for stream in page.items {
+            print(stream.id, stream.name)
+        }
+        guard let next = page.next else {
+            return
+        }
+        query.page.cursor = next
+    }
+}
+```
+
+A `PageQuery` holds `order`, `descending`, `limit` and `cursor`. `order` selects `.id` or `.created`, and `descending` reverses it. The stream, topic, consumer group and user page methods take a `NamedPageQuery`, which holds a `PageQuery` in `page` and an optional `name`. `name` keeps the entries whose name holds the text, case-sensitive. The partitions page method takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with `invalidCommand`, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints as the `pg1_` text form that the HTTP API and the CLI use, and `PageCursor(text:)` reads it back. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with `invalidCommand`.
 
 ### Metadata changes
 
@@ -346,6 +372,8 @@ The partitions that a read served go last in the next read of their group, so a 
 
   A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, `next()` first throws `fetchProgressUncertain`, whose `lost` holds the first and the last offset of the range. Then it returns the batch after the gap. If the history no longer holds the gap or its start, for example after retention, the reader does the same with the missing range.
 
+  When `historyUnavailable` stops the partition during the gap read, the reader first reports the rest of the gap the same way. Then `next()` returns the batch after the gap, and only then it throws the error that stopped the partition.
+
   A seek to an offset above zero stores the offset before it first, once the committing read of the partition in flight ended, so a restart resumes at the sought offset. If a stored offset exists, a seek to offset zero or to `.first` deletes it instead. A seek to a timestamp first reads the message at the timestamp without a commit, then works as a seek to its offset. Without such a message it stores nothing. A read never moves the stored offset back.
 
   No committing read of the partition starts while the seek runs. A refused read, store, lookup or delete fails the seek and moves nothing. A store or delete refused as not owned goes once more, as described for `consumerGroupPartitionNotOwned` below. A store or delete with an unknown outcome also fails the seek. If that write moved the stored offset forward, the next read reads the skipped messages again. After such a delete, the partition reads on after the deleted offset.
@@ -361,7 +389,8 @@ The partitions that a read served go last in the next read of their group, so a 
   `AutoCommit.default` stores every 10,000 messages or 5 seconds after `.processing`. A store only moves forward, and a position of an older generation is dropped.
 
 A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. For a lost range it has `lost`.
-The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
+The reader reads its partitions again after `retryInterval`. A message that does not decode, `historyUnavailable` for a position read in a history that is gone, and `tieredReadFailed` for tiered data that the object store refuses for good, stop the partition until a seek. A lost range itself does not stop the partition and needs no seek.
+A read refused with `tieredReadFailed` is never sent again.
 
 `consumerGroupPartitionNotOwned` on a read of a group member is not a leave. A new session and a move of the partition away and back look the same. The partition keeps its position and what `close()` needs of it. The reader syncs its assignment and reads the partition again after `retryInterval`.
 Each further refusal in a row doubles that wait, up to 32 times `retryInterval` at the sixth. The sixth refusal in a row also makes `next()` throw one `ReadError` for the partition, the partition reads on, and the count starts again.
@@ -456,7 +485,7 @@ A handler that throws leaves its message uncounted and ends `consumeMessages(_:)
 
 `pollingStrategy` says where a partition without a position starts. With `.onRead` it applies only to a partition without a stored offset, and a partition with one resumes after it. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
 
-`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode or `historyUnavailable`, which stop the partition until a seek. A lost range (`ReadError.lost`, error 14010) ends `consumeMessages(_:)` with that error. A new call reads on.
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode, `historyUnavailable` or `tieredReadFailed`, which stop the partition until a seek. A lost range (`ReadError.lost`, error 14010) ends `consumeMessages(_:)` with that error. A new call reads on.
 
 It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
 
@@ -559,7 +588,7 @@ The hash, error-code, model, request, reply, and consensus header tests compare 
 cargo run --manifest-path Tools/golden-vectors/Cargo.toml -- Tests/IggyTests/Fixtures/golden.json
 ```
 
-The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`.
+The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`. The list page tests do the same with `Tests/IggyTests/Fixtures/list_pages.json`, generated by `core/common/examples/list_pages_fixtures.rs`.
 
 The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
 

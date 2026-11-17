@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10. Repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.12.2. Servers and applicable SDKs must deploy together. Mixed versions and
+This checkout uses binary protocol 0.12.3. Servers and applicable SDKs must deploy together. Mixed versions and
 rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
 without modification. `--fresh` deletes existing data in the configured directory.
 See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
@@ -813,9 +813,9 @@ while (true)
   read until a refresh confirmed the assignment.
 - `NextAsync` returns one batch of one partition, never empty. A canceled call leaves the batches in the
   reader. `ReadException` names the partition of an error, and the reader retries by itself. Status 87 stops a
-  partition until `SeekAsync` when its position came from an earlier read, and so do status 80 and a refusal
-  that six retries did not change. Such an error has `StopsPartition` set. `IsResumable` marks the ones that a
-  seek to `PollingStrategy.Next()` resumes after the stored offset: status 87 and the six refusals. Status 5009
+  partition until `SeekAsync` when its position came from an earlier read, and so do status 80, status 96
+  (`TieredReadFailed`) at the first one, and a refusal that six retries did not change. Such an error has `StopsPartition` set. `IsResumable` marks the ones that a
+  seek to `PollingStrategy.Next()` resumes after the stored offset: status 87, status 96 and the six refusals. Status 5009
   (`ConsumerGroupPartitionNotOwned`) alone is not a leave, and it never stops a partition. The wait before the next
   read starts at the retry interval and doubles after each 5009 in a row, up to 32 times the interval. Each sixth
   5009 in a row gives one error without `StopsPartition`, the count starts again, and the partition reads on. A new
@@ -1020,6 +1020,37 @@ Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `X
 
 Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`,
 `All`.
+
+### List Pages
+
+`GetStreamsAsync`, `GetTopicsAsync`, `GetConsumerGroupsAsync` and `GetUsersAsync` return a whole list. Over TCP, each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the walk can appear or not appear. Every page keeps the sign-in and the call deadline that the walk started with. If the server answers a page with the same cursor that the client sent, the walk fails with a `MalformedResponseException`.
+
+Over HTTP, they read the whole list in one reply. The server builds that reply from pages of 1,000 items, so it is not one consistent read either.
+
+`GetStreamsPageAsync`, `GetTopicsPageAsync`, `GetPartitionsPageAsync`, `GetConsumerGroupsPageAsync` and `GetUsersPageAsync` return one page. To read the next page, send the same query with the `Next` of the page as its cursor. A page can be empty and still have a `Next`.
+
+```c#
+var query = new NamedPageQuery();
+while (true)
+{
+    var page = await client.GetStreamsPageAsync(query);
+    foreach (var stream in page.Items)
+    {
+        Console.WriteLine($"{stream.Id} {stream.Name}");
+    }
+
+    if (page.Next is null)
+    {
+        break;
+    }
+
+    query = query with { Page = query.Page with { Cursor = page.Next } };
+}
+```
+
+A `PageQuery` holds `Order`, `Descending`, `Limit` and `Cursor`. `Order` selects `PageOrder.Id` or `PageOrder.Created`, and `Descending` reverses it. The stream, topic, consumer group and user page methods take a `NamedPageQuery`, which holds a `PageQuery` as `Page` and an optional `Name`. `Name` keeps the entries whose name holds the text, case-sensitive. `GetPartitionsPageAsync` takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with an `IggyInvalidStatusCodeException` for invalid command (code 3), before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with invalid command.
 
 ### Metadata Changes
 
@@ -1274,12 +1305,13 @@ A join that landed keeps the member in the group until the session ends.
 A read error that the reader retries by itself does not end the loop, it reaches `SubscribeToErrorEvents`. An error
 that stops a partition (`StopsPartition`) ends the loop with its `ReadException`, as a message that does not decode
 does, whose `Skip` passes it: six refusals in a row such as status 41 (Unauthorized), status 87 (HistoryUnavailable)
-for a position whose history is gone, and status 80 for a `Last` start whose first message is above the byte limit of
+for a position whose history is gone, status 96 (TieredReadFailed) at the first one, and status 80 for a `Last` start whose first message is above the byte limit of
 a read. The partition reads nothing until `SeekAsync`, and `IsResumable` says that a seek to `PollingStrategy.Next()`
 reads it again after its stored offset. A stop while a committing read that lost its reply is still pending reports
 that read as status 14010 instead, since a seek to Next would skip what it stored.
 A lost range (`ReadException.Lost`, status 14010) also ends the loop with its `ReadException`. It stops no
-partition, so the next loop reads on after the range.
+partition, so the next loop reads on after the range. A stop during the read again of a lost range reports that
+range first. The batch that the reader holds follows, then the stop with its own status.
 `DisposeAsync` calls `ShutdownAsync()`. It waits for a handler of `ConsumeAsync` that runs, unless that handler calls
 it, counts the last message of `ReceiveAsync` under `CommitAfter.Processing`, stores or rewinds the offsets, and
 leaves the group. `ShutdownAsync(token)` closes the reader with that token. So a cancel ends the reads for the owner
@@ -1390,7 +1422,7 @@ route them through.
 ```bash
 cargo build --bin iggy-server --bin iggy
 
-docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server:test .
+docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy --build-arg LICENSE_STAGE=license-skip -t iggy-server:test .
 ```
 
 #### 2. Build the Test Project

@@ -35,12 +35,19 @@ The install runs even when every update attempt failed, so a stale but
 present index set is not fatal. Downloads are separate from installation so a
 failed mirror cannot interrupt dpkg while it configures packages.
 
+The first download attempt gets a shorter cap. The Azure mirror sometimes
+serves packages at a crawl after a healthy update, while archive.ubuntu.com
+delivers the same set in seconds. A healthy download finishes well inside the
+short cap, and apt keeps the files it already fetched for the next attempt.
+
 Environment:
-  APT_UPDATE_TIMEOUT    Seconds allowed per update attempt (default: 60)
-  APT_UPDATE_ATTEMPTS   Update attempts before giving up (default: 2)
-  APT_DOWNLOAD_TIMEOUT  Seconds allowed per download attempt (default: 90)
-  APT_DOWNLOAD_ATTEMPTS Download attempts before giving up (default: 2)
-  APT_INSTALL_TIMEOUT   Seconds allowed for package configuration (default: 180)
+  APT_UPDATE_TIMEOUT         Seconds allowed per update attempt (default: 60)
+  APT_UPDATE_ATTEMPTS        Update attempts before giving up (default: 2)
+  APT_DOWNLOAD_FIRST_TIMEOUT Seconds allowed for the first download attempt
+                             when another attempt follows (default: 20)
+  APT_DOWNLOAD_TIMEOUT       Seconds allowed per later download attempt (default: 90)
+  APT_DOWNLOAD_ATTEMPTS      Download attempts before giving up (default: 2)
+  APT_INSTALL_TIMEOUT        Seconds allowed for package configuration (default: 180)
 USAGE
 }
 
@@ -57,6 +64,7 @@ esac
 
 update_timeout="${APT_UPDATE_TIMEOUT:-60}"
 update_attempts="${APT_UPDATE_ATTEMPTS:-2}"
+download_first_timeout="${APT_DOWNLOAD_FIRST_TIMEOUT:-20}"
 download_timeout="${APT_DOWNLOAD_TIMEOUT:-90}"
 download_attempts="${APT_DOWNLOAD_ATTEMPTS:-2}"
 install_timeout="${APT_INSTALL_TIMEOUT:-180}"
@@ -88,7 +96,11 @@ for attempt in $(seq 1 "${update_attempts}"); do
 done
 
 for attempt in $(seq 1 "${download_attempts}"); do
-  if sudo timeout --kill-after=10 "${download_timeout}" apt-get "${apt_options[@]}" --download-only install -y "$@"; then
+  attempt_timeout="${download_timeout}"
+  if [ "$attempt" -eq 1 ] && [ "$download_attempts" -gt 1 ]; then
+    attempt_timeout="${download_first_timeout}"
+  fi
+  if sudo timeout --kill-after=10 "${attempt_timeout}" apt-get "${apt_options[@]}" --download-only install -y "$@"; then
     break
   fi
   echo "::warning::apt-get download attempt ${attempt}/${download_attempts} timed out or failed"

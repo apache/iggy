@@ -26,6 +26,7 @@ import type { CommandResponse, RawClient, SendCommandOptions } from '../client/c
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { responseError } from '../wire/error.utils.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
+import { HeaderKeyFactory, HeaderValue, serializeHeaders } from '../wire/message/header.utils.js';
 import { encodeMessagesBatch } from '../wire/message/message.utils.js';
 import { BATCH_HEADER_SIZE, FRAME_HEADER_SIZE } from '../wire/message/iggy-header.utils.js';
 import { u128ToBuf } from '../wire/number.utils.js';
@@ -57,6 +58,7 @@ const NOT_PRIMARY = 89;
 const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
 const CONSUMER_OFFSET_NOT_FOUND = 3021;
 const INVALID_OFFSET = 4100;
+const TIERED_READ_FAILED = 96;
 const CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
 const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 /** An offset reply holds the partition, its current offset and the stored offset. */
@@ -106,10 +108,10 @@ type Read = { code: number, partition: number, kind: number, value: bigint, auto
 const UNPARSABLE_HEADERS = Buffer.from([1, 0, 0, 0, 0]);
 
 /** `count` messages from `offset` as batch records, two by default. */
-const records = (offset: bigint, unparsableHeaders = new Set<bigint>(), count = 2): Buffer => {
+const records = (offset: bigint, unparsableHeaders = new Set<bigint>(), count = 2, data?: { payload: Buffer, userHeaders: Buffer }): Buffer => {
   const batch = encodeMessagesBatch(Array.from({ length: count }, (_, index) => ({
-    id: u128ToBuf(BigInt(index + 1)), payload: Buffer.from(`m${offset + BigInt(index)}`),
-    userHeaders: unparsableHeaders.has(offset + BigInt(index)) ? UNPARSABLE_HEADERS : Buffer.alloc(0),
+    id: u128ToBuf(BigInt(index + 1)), payload: data?.payload ?? Buffer.from(`m${offset + BigInt(index)}`),
+    userHeaders: unparsableHeaders.has(offset + BigInt(index)) ? UNPARSABLE_HEADERS : data?.userHeaders ?? Buffer.alloc(0),
     originTimestamp: 0n
   })));
   batch.writeBigUInt64LE(offset, BATCH_BASE_OFFSET_AT);
@@ -130,6 +132,7 @@ const records = (offset: bigint, unparsableHeaders = new Set<bigint>(), count = 
  * that another primary leads.
  */
 class FakeTopic {
+  messageData?: { payload: Buffer, userHeaders: Buffer };
   primaries = 2;
   /** The primary of each partition that moved away from `partition % primaries`. */
   readonly movedPrimaries = new Map<number, number>();
@@ -413,7 +416,7 @@ class FakeTopic {
         this.onLostCommittingRead?.();
         throw new FetchProgressUncertainError(1n, new Error('reply lost after storing'));
       }
-      const batch = records(start, this.unparsableHeaders, held);
+      const batch = records(start, this.unparsableHeaders, held, this.messageData);
       const data = pollReply(partition, start + BigInt(held) - 1n,
         this.undecodable.has(start) ? batch.subarray(0, batch.length - 1) : batch, held, this.served());
       return reply(this.truncatedReplies.has(start) ? data.subarray(0, TRUNCATED_POLL_REPLY_SIZE) : data);
@@ -550,7 +553,7 @@ class FakeTopic {
       }
       held += 2;
       if (autocommit) this.autoCommit(partition, start + 1n);
-      const batch = records(start, this.unparsableHeaders);
+      const batch = records(start, this.unparsableHeaders, 2, this.messageData);
       sections.push({ partition, status: 0, start,
         records: this.undecodable.has(start) ? batch.subarray(0, batch.length - 1) : batch });
     }
@@ -761,6 +764,44 @@ const nextOf = async (reader: PartitionReader, partition: number) => {
 };
 
 describe('partition reader', () => {
+  for (const [headers, payloadBytes] of [[false, 1077], [true, 1], [false, 1]] as const) {
+    it(`bounds read-ahead bytes and frees space with user headers ${headers} and payload ${payloadBytes}`, async () => {
+      const budget = 128 * 1024;
+      const maxBytes = 4096;
+      const userHeaders = serializeHeaders(Array.from({ length: 4 }, (_, index) => ({
+        key: HeaderKeyFactory.String(`key${index}`), value: HeaderValue.Raw(Buffer.alloc(255))
+      })));
+      const topic = new FakeTopic(4000n);
+      topic.reportsHead = topic.countLimited = true;
+      topic.messageData = { payload: Buffer.alloc(payloadBytes),
+        userHeaders: headers ? userHeaders : Buffer.alloc(0) };
+      const frameBytes = FRAME_HEADER_SIZE + payloadBytes + topic.messageData.userHeaders.length;
+      const reader = await PartitionReader.open(async () => topic.client(), {
+        streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Single, id: 4 }, partitions: [1],
+        start: PollingStrategy.Offset(0n), options: { count: 2, maxBytes, maxWait: 100, commit: CommitPolicy.Manual },
+        prefetchBytes: budget, prefetchMessages: 4000
+      });
+      try {
+        await waitFor(() => topic.reads.length * 2 * frameBytes >= budget - maxBytes, 'prefetch did not fill');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.ok(topic.reads.length * 2 * frameBytes <= budget + 2 * maxBytes,
+          'queued message frames exceeded the byte budget');
+        const reads = topic.reads.length;
+        const queuedBytes = reader['queuedBytes'];
+        const batch = await reader.next();
+        reader.returned(batch);
+        assert.equal(reader['queuedBytes'], queuedBytes, 'returning a batch did not restore its byte budget');
+        const returned = await reader.next();
+        assert.equal(returned, batch);
+        assert.equal(batch.messages.length, 2);
+        assert.equal(batch.messages[0].headers.userHeadersLength, headers ? userHeaders.length : 0);
+        for (let index = 0; index < reads; index++) await reader.next();
+      } finally {
+        await reader.close();
+      }
+    });
+  }
+
   it('reads the partitions of each primary in one fetch and hands over every partition', async () => {
     const topic = new FakeTopic();
     const reader = await open(topic, [0, 1, 2, 3]);
@@ -1397,17 +1438,34 @@ describe('partition reader', () => {
       }
     });
 
-  it('moves an on read offset back to the last batch taken when it closes', async () => {
-    const topic = new FakeTopic(2n);
-    const reader = await open(topic, [0, 1], { commit: CommitPolicy.OnRead });
-    const taken = await reader.next();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    await reader.close();
-
-    assert.equal(topic.stored.get(taken.partitionId), 1n);
-    assert.equal(topic.stored.has(taken.partitionId === 0 ? 1 : 0), false);
-  });
+  for (const [name, start, firstOffset, partitions] of [
+    ['next', PollingStrategy.Next, 0n, [0, 1]],
+    ['next', PollingStrategy.Next, 0n, [1, 3]],
+    ['offset 0', PollingStrategy.Offset(0n), 0n, [0, 1]],
+    ['offset 4', PollingStrategy.Offset(4n), 4n, [0, 1]]
+  ] as const) {
+    it(`rewinds unread on read batches on close from ${name}, partitions ${partitions}`, async () => {
+      const topic = new FakeTopic(firstOffset + 2n);
+      const reader = await open(topic, [...partitions], { commit: CommitPolicy.OnRead }, start);
+      let taken: number;
+      try {
+        taken = (await reader.next()).partitionId;
+        await waitFor(() => partitions.every((partition) => topic.stored.get(partition) === firstOffset + 1n),
+          'both partitions were not committed by their reads');
+      } finally {
+        await reader.close();
+      }
+      assert.equal(topic.stored.get(taken), firstOffset + 1n);
+      const unread = partitions.find((partition) => partition !== taken)!;
+      assert.equal(topic.stored.get(unread), firstOffset === 0n ? undefined : firstOffset - 1n);
+      const resumed = await open(topic, [unread], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [firstOffset, firstOffset + 1n]);
+      } finally {
+        await resumed.close();
+      }
+    });
+  }
 
   it('stores the offset before an on read seek to an offset, so a restart resumes at the sought offset', async () => {
     const topic = new FakeTopic(10n);
@@ -2952,6 +3010,12 @@ describe('partition reader', () => {
       assert.deepEqual(topic.fetches[0], [1, 3]);
       assert.deepEqual([topic.stored.get(taken.partitionId), topic.stored.get(undelivered), topic.offsetDeletes],
         [start + 1n, start === 0n ? undefined : start - 1n, start === 0n ? [undelivered] : []]);
+      const resumed = await open(topic, [undelivered], { commit: CommitPolicy.OnRead });
+      try {
+        assert.deepEqual(offsets([await resumed.next()]), [start, start + 1n]);
+      } finally {
+        await resumed.close();
+      }
     });
   }
 
@@ -3900,6 +3964,32 @@ describe('partition reader', () => {
 
     assert.ok(error instanceof ReadError);
     assert.equal(error.partitionId, 1);
+    assert.ok(others.every(({ partitionId }) => partitionId === 3));
+    assert.equal(resumed.messages[0].headers.offset, 0n);
+  });
+
+  it('sends a read once that fails with a tiered read failure, and stops its partition until a seek', async () => {
+    const topic = new FakeTopic(1_000n);
+    topic.refused.set(1, TIERED_READ_FAILED);
+    const reader = await open(topic, [1, 3]);
+    const readsOf = (partition: number) => topic.reads.filter((read) => read.partition === partition).length;
+
+    let stopped: unknown;
+    while (!stopped) stopped = await reader.next().then(() => undefined, (failure: unknown) => failure);
+    const others = [await reader.next(), await reader.next()];
+    // Several retry intervals, in which a refusal that retries reads again.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const refusedReads = readsOf(1);
+    topic.refused.delete(1);
+    await reader.seek(1, PollingStrategy.Offset(0n));
+    let resumed = await reader.next();
+    while (resumed.partitionId !== 1) resumed = await reader.next();
+    await reader.close();
+
+    assert.ok(stopped instanceof ReadError);
+    assert.deepEqual([stopped.partitionId, (stopped.error as { errorCode: number }).errorCode,
+      stopped.stopsPartition, stopped.resumable], [1, TIERED_READ_FAILED, true, true]);
+    assert.equal(refusedReads, 1, 'the refused read went out again');
     assert.ok(others.every(({ partitionId }) => partitionId === 3));
     assert.equal(resumed.messages[0].headers.offset, 0n);
   });

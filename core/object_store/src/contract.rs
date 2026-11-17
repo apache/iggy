@@ -69,6 +69,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use compio::driver::ProactorBuilder;
+use compio::runtime::{Runtime, RuntimeBuilder};
 use futures::channel::oneshot;
 use futures::future::{self, Either};
 use futures::stream::{self, StreamExt};
@@ -90,6 +92,24 @@ const LARGE_PIECE_LEN: usize = 64 * 1024;
 const LARGE_PIECES: usize = 128;
 /// The most bytes of the large body that a store holds at once: an eighth.
 const LARGE_BODY_HELD_LEN: usize = 1024 * 1024;
+
+/// Longer than what a provider reads with the metadata of an object.
+const LARGE_OBJECT_LEN: usize = 50_000;
+
+/// A runtime like a shard's, to run the cases of a provider that needs one.
+/// On Linux it has no blocking pool, so a call that needs one panics.
+#[must_use]
+pub fn shard_runtime() -> Runtime {
+    let mut proactor = ProactorBuilder::new();
+    // macOS runs fs calls on the blocking pool, so it keeps one.
+    if cfg!(target_os = "linux") {
+        proactor.thread_pool_limit(0);
+    }
+    RuntimeBuilder::new()
+        .with_proactor(proactor)
+        .build()
+        .expect("runtime")
+}
 
 /// Calls `$callback!` with the name of every case in [`crate::contract`]
 /// that every provider runs, so a provider's tests pick up new cases on their
@@ -113,6 +133,7 @@ macro_rules! contract_cases {
             given_put_dropped_mid_body_when_reading_should_find_nothing,
             given_put_dropped_mid_body_over_object_when_reading_should_keep_object,
             given_object_when_reading_ranges_should_honor_edges,
+            given_large_object_when_reading_ranges_should_return_their_bytes,
             given_empty_object_when_reading_should_refuse_every_range,
             given_missing_key_when_reading_should_return_not_found,
             given_keys_when_listing_should_return_byte_order,
@@ -564,6 +585,33 @@ pub async fn given_object_when_reading_ranges_should_honor_edges(
             matches!(result, Err(ObjectStoreError::InvalidRequest(_))),
             "{start}..{end}: {result:?}"
         );
+    }
+}
+
+/// A provider can read the start of an object with its metadata and the rest
+/// apart, so these ranges cross 4 KiB and 8 KiB and lie past both.
+pub async fn given_large_object_when_reading_ranges_should_return_their_bytes(
+    store: &impl ObjectStore,
+    root: &str,
+) {
+    let key = format!("{root}/large");
+    let data = pattern(LARGE_OBJECT_LEN, 6);
+    put(store, &key, data.clone(), &PutOptions::default()).await;
+
+    for range in [
+        0..10,
+        4090..4100,
+        8190..8200,
+        20_000..30_000,
+        LARGE_OBJECT_LEN - 10..LARGE_OBJECT_LEN,
+    ] {
+        let read = store
+            .get_range(&key, range.start as u64..range.end as u64)
+            .await
+            .unwrap_or_else(|error| panic!("read {range:?}: {error}"));
+
+        assert_eq!(read.bytes, data.slice(range.clone()), "{range:?}");
+        assert_eq!(read.size, LARGE_OBJECT_LEN as u64);
     }
 }
 

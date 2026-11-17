@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-bench"
-version = "0.7.0"
+version = "0.7.1-edge.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/apache/iggy"
@@ -59,6 +59,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # The actor tests need paused time, and `full` leaves out `test-util`.
 tokio = { workspace = true, features = ["test-util"] }
 

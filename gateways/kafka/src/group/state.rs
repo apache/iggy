@@ -43,6 +43,7 @@ use crate::group::{
     LeavingMember, LeftMember, MemberDescription, MemberSnapshot, OFFSETS_ONLY_PROTOCOL_TYPE,
     OffsetDeletion, Subscribed, SyncRequest, SyncResult, owned_str,
 };
+use crate::observability::GroupCensus;
 use crate::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_FENCED_INSTANCE_ID,
     ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION, ERROR_INCONSISTENT_GROUP_PROTOCOL,
@@ -1963,6 +1964,32 @@ pub fn describe_groups(
         .collect()
 }
 
+/// The groups per Kafka state and their members, counting the groups that [`list_groups`]
+/// lists at `now`.
+pub fn census(groups: &Groups, now: Instant) -> GroupCensus {
+    let mut states: Vec<(&'static str, usize)> = [
+        GROUP_STATE_EMPTY,
+        GROUP_STATE_PREPARING_REBALANCE,
+        GROUP_STATE_COMPLETING_REBALANCE,
+        GROUP_STATE_STABLE,
+    ]
+    .map(|state| (state, 0))
+    .to_vec();
+    let mut members = 0;
+    for group in groups
+        .values()
+        .filter(|group| !group.deadlines_elapsed(now))
+    {
+        let state = group.reported_state();
+        match states.iter_mut().find(|(known, _)| *known == state) {
+            Some((_, count)) => *count += 1,
+            None => states.push((state, 1)),
+        }
+        members += group.members.len();
+    }
+    GroupCensus { states, members }
+}
+
 /// Groups currently in the map, ordered by group id.
 ///
 /// Does not tick. Groups whose sessions and pending ids are already past `now` are skipped so
@@ -3062,6 +3089,33 @@ mod tests {
         assert!(group.members.is_empty());
         assert!(group.protocol_name.is_none());
         assert!(groups.contains_key(&group_id()));
+    }
+
+    /// The metrics count the groups that `ListGroups` lists, per state, and their joined members.
+    #[test]
+    fn given_groups_in_several_states_when_taking_a_census_should_count_each_state_and_member() {
+        let config = config();
+        let mut groups = Groups::new();
+        let now = Instant::now();
+        stabilize(&mut groups, &config, now, "alpha", b"assignment");
+        stabilize(&mut groups, &config, now, "beta", b"assignment");
+        let mut pending = request("", &["range"]);
+        pending.require_known_member_id = true;
+        pending.group_id = StrBytes::from_static_str("gamma");
+        join_step(&mut groups, &config, &pending, now);
+
+        let census = census(&groups, now);
+
+        assert_eq!(
+            census.states,
+            [
+                (GROUP_STATE_EMPTY, 1),
+                (GROUP_STATE_PREPARING_REBALANCE, 0),
+                (GROUP_STATE_COMPLETING_REBALANCE, 0),
+                (GROUP_STATE_STABLE, 2),
+            ]
+        );
+        assert_eq!(census.members, 2, "a pending member id is no member yet");
     }
 
     /// `kafka-consumer-groups --describe --members` shows these two columns. A member that

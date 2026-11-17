@@ -435,6 +435,35 @@ Current pages need the parent groups of every selected group, for example `TOPIC
 
 A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` reads back, so a mirror can store it. A query the rules refuse fails with an `IggyValidationException` for invalid command before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataChangeBody.Unknown` or `MetadataChangeBody.UnknownJson`.
 
+### List Pages
+
+`getStreams`, `getTopics`, `getConsumerGroups` and `getUsers` return a whole list. Over TCP, each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. All pages share the sign-in and the request timeout of the call, so a new sign-in during the walk fails it. An entity that someone creates or deletes during the walk can appear or not appear. The walk fails with `IggyMalformedResponseException` when the server answers the page cursor it was sent.
+
+Over HTTP, they read the whole list in one reply. The server builds that reply from pages of 1,000 items, so it is not one consistent read either.
+
+`getStreamsPage`, `getTopicsPage`, `getPartitionsPage`, `getConsumerGroupsPage` and `getUsersPage` return one page. The page methods of streams, topics, consumer groups and users take a `NamedPageQuery`, which holds a `PageQuery` and an optional name. `getPartitionsPage` takes a `PageQuery`, which has no name. To read the next page, send the same query with the `next()` of the page as its cursor. A page can be empty and still have a `next()`.
+
+```java
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
+import org.apache.iggy.stream.StreamBase;
+
+NamedPageQuery query = new NamedPageQuery(PageQuery.builder().build());
+while (true) {
+    Page<StreamBase> page = client.streams().getStreamsPage(query);
+    page.items().forEach(stream -> System.out.println(stream.id() + " " + stream.name()));
+    if (page.next().isEmpty()) {
+        break;
+    }
+    query = query.withCursor(page.next().get());
+}
+```
+
+`order` selects `PageOrder.ID` or `PageOrder.CREATED`, and `descending` reverses it. The `name` of a `NamedPageQuery` keeps the entries whose name holds the text, case-sensitive. For example, `new NamedPageQuery(PageQuery.builder().build(), Optional.of("orders"))` reads the entries whose name holds `orders`.
+
+The client refuses a query that breaks the page rules with an `IggyValidationException` for invalid command, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with invalid command.
+
 ## Polling
 
 The SDK reads messages at three levels: a poll of one partition, a partition reader that reads many partitions in batches, and a consumer that hands over one message at a time. All three take `PollOptions`, whose `CommitPolicy` decides who stores the consumer offsets.
@@ -516,6 +545,7 @@ A fetch takes only an offset or `Next`. So the reader first polls a timestamp or
 - `Manual`: `commit(checkpoint)` stores the offset of a delivered checkpoint, forward only within a generation. A store whose outcome stays unknown fails the commit, and the reader releases it in the client, so a retry can store.
 - `OnRead`: the server stores each read, and the reader reads only for a waiting `next()`. After a read whose reply was lost, the reader abandons it and reads that partition again after its retry interval. That read starts after what the lost read stored, so the reader reads those messages again without a store and delivers them first.
   If the partition no longer holds a part of that range, for example after retention, `next()` fails once with `FETCH_PROGRESS_UNCERTAIN` (14010). Its `ReadException` names that part in `lost()`, its first and last offset, and the reader reads on after it. A partition that leaves before the reader read such a range again reports it the same way.
+  A partition that stops before the reader read such a range again also reports it the same way. The reader then hands over the batch after the range, and then reports the error that stopped the partition. `HISTORY_UNAVAILABLE` (87) for the read of such a range stops the partition too, because that read names the history of the range. The report of a lost range itself needs no `seek`.
 
   Only a lost read explains a read that starts past the expected offset: without one, the application or another session stored that offset, and the reader delivers from there. A partition that leaves the assignment still hands over the reads that the server stored for it.
   The close never moves back the offset of a partition that left. After the handoff, the server refuses that store, and during the handoff, a stored offset below the last served one blocks the handoff. So the batches of a left partition that the application did not take before the close are lost for the group.
@@ -539,7 +569,7 @@ A fetch takes only an offset or `Next`. So the reader first polls a timestamp or
 - `Auto(AutoCommit)`: the reader counts each batch as `CommitAfter` says (`PROCESSING` at the next `next()` or the close, `DELIVERY` when `next()` returns it, `MARKED` on `mark(checkpoint)`), and stores the latest counted position at its `interval`, on its `every` event, before a rebalance takes a partition away, and on close.
   A store whose outcome stays unknown is released in the client, so the next store of the partition goes through. `AutoCommit.defaults()` stores every 10,000 messages or 5 s after processing.
 
-A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone.
+A `ReadException` names its partition. `HISTORY_UNAVAILABLE` (87) stops a partition until `seek` when its position came from an earlier read of a history that is gone. `TIERED_READ_FAILED` (96) stops a partition until `seek` at the first refusal: the object store refused the read of tiered data for a reason that a retry does not change, so neither the reader nor a poll sends the request again.
 
 A message that does not decode arrives as a `ReadException` whose `skip()` is the continuation after it, after a batch with the messages before it, and the partition stops until a `seek`.
 
@@ -621,7 +651,7 @@ stale-client eviction or a malformed reply, the call replays the same request on
 connection within its deadline. If the server refuses to bind the session again, the client
 registers a new session and drops the operation.
 
-A call that loses its connection before it sends its request, or that cannot open one, waits for a connection within its deadline. If no connection carries it by then, the call ends with 58 (`TRANSIENT_NOT_ACCEPTED`).
+A call that loses its connection before it sends its request, or that cannot open one, waits for a connection within its deadline. If no connection carries it by then, the call ends with 58 (`TRANSIENT_NOT_ACCEPTED`). A poll, a fetch or a send to a partition that the server refuses with 58 is sent again within the same deadline, after a pause that is a random time up to a ceiling. The ceiling doubles from 50 ms to 1 s over the refusals of one call.
 
 An eviction and a reply can carry the same status, for example 30 (`STALE_CLIENT`) or 40
 (`UNAUTHENTICATED`). Only the eviction is a lost connection, so the call does not replay a

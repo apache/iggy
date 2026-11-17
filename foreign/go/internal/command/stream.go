@@ -98,14 +98,17 @@ func (g *GetStream) MarshalBinary() ([]byte, error) {
 	return g.StreamId.MarshalBinary()
 }
 
-type GetStreams struct{}
+// GetStreams asks for one page of the streams.
+type GetStreams struct {
+	Query iggcon.NamedPageQuery
+}
 
 func (g *GetStreams) Code() Code {
 	return GetStreamsCode
 }
 
 func (g *GetStreams) MarshalBinary() ([]byte, error) {
-	return []byte{}, nil
+	return g.Query.AppendBinary(nil)
 }
 
 // UpdateStream patches a stream through the generic UpdateResource command.

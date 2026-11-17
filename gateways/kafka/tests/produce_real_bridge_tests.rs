@@ -47,7 +47,7 @@ use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_INVALID_PRODUCER_EPOCH, ERROR_NONE,
     ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_UNKNOWN_PRODUCER_ID,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, handle_request_bounded,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{KEY_HEADER, MAPPING_VERSION, VERSION_HEADER, from_iggy};
 
@@ -592,8 +592,8 @@ async fn given_acks_zero_and_a_failing_partition_when_handled_should_close() {
 
     let outcome = handle_request_bounded(&state, API_KEY_PRODUCE, 3, body).await;
     assert!(
-        outcome.is_close(),
-        "Kafka closes so the client sees the loss"
+        matches!(outcome, HandleOutcome::UnacknowledgedProduceFailed),
+        "Kafka closes so the client sees the loss, got {outcome:?}"
     );
 }
 
@@ -890,7 +890,7 @@ async fn given_a_producers_request_still_running_when_handled_should_hold_back_o
         "it must not overtake the request that still runs"
     );
     assert!(
-        answer(0).await.is_close(),
+        matches!(answer(0).await, HandleOutcome::UnacknowledgedProduceFailed),
         "acks=0 has no response to carry the 7"
     );
     assert_eq!(

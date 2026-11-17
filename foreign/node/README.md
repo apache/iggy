@@ -120,7 +120,7 @@ after the server refuses those credentials, it does not sign in by itself, and
 a call fails with status 40 until the caller signs in again. A sign-in or
 logout of the caller ends each earlier call that has to wait for a new session:
 with status 40 if it sent nothing, or with `OperationUncertainError` if its
-outcome is unknown. A Next poll that commits nothing, which has no operation ID, ends with status 57 instead, and an auto-commit poll ends with `FetchProgressUncertainError` (see below). A typed send and a group poll can send more than one
+outcome is unknown. A Next poll that commits nothing, which has no operation ID, ends with status 57 instead, and an auto-commit poll ends with `FetchProgressUncertainError` (see below). A typed send, a group poll and a whole-list read can send more than one
 command. If the caller signs in or logs out before the next command of such a
 call, the call fails with status 40. Only a call that waits for the client's own sign-in goes on
 under the new session. If the server refuses that sign-in, the call fails with
@@ -286,7 +286,9 @@ try {
   names the partition of an error, or none for an error of the whole reader,
   and the reader retries by itself. Error 87 stops a partition until `seek`
   when its position is tied to the history of an earlier read, and so do error
-  80 and a refusal other than 5009 that six retries did not change. A context
+  80, error 96 (the object store refuses a read of tiered data for good, so
+  the reader never sends it again) and a refusal other than 5009 that six
+  retries did not change. A context
   that is all zero ties a position to no history. The error of each stop sets
   `stopsPartition`, and that of an 87 or a refusal stop also sets `resumable`:
   a `seek` to Next reads the partition again after its stored offset. When
@@ -389,6 +391,12 @@ try {
   (`prefetchBytes`, `prefetchMessages`). Each effective budget holds at least
   32 full batches, and larger configured budgets still apply. A budget that is
   NaN, infinite or negative is refused with error 3 before anything is sent.
+  The byte budget counts message frame headers, payloads and encoded user
+  headers. It is not a limit on retained memory: payload views keep whole
+  reply buffers alive, including the uncounted 256-byte batch header per
+  record. With one small message per record, retained buffers can occupy
+  several times the byte budget. Decoded objects and in-flight reads also
+  use memory outside this count.
   Without options a read waits up to 5 s. After a refused read, a lost read or
   a failed refresh it waits `retryInterval`, 1 s by default. While a refresh
   of the group assignment fails or gets no answer, the reader reads on under
@@ -709,7 +717,7 @@ console.log(stream.encryptionKeyFingerprint === key.fingerprint()); // true
 
 `stream.update`, `topic.update` and `user.update` change only the keys they name and leave every other setting as it is, so an update without `name` keeps the name. `reset` returns a key to the server default. Use the `StreamOptionKey`, `TopicOptionKey` and `UserOptionKey` constants to name keys.
 
-Only the topic keys `message_expiry` and `max_topic_size` can be reset. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
+Only the topic keys `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. The topic key `tiered_storage` is enable-only: an update can set it to `true`, and setting it to `false` or resetting it is refused with 4103. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
 
 The SDK checks the typed fields and `reset` before sending, in the server's order and with its error codes (4041 for an unknown key, 4105 for a read-only key, 4103 for a create-only key, 4104 for a key without a default, then the name, username or status error). For a key this build has no field or constant for, pass `options` entries and `rawReset` names. The SDK sends those as they are and the server decides, so a refusal comes back from the server.
 
@@ -725,6 +733,31 @@ await client.topic.update({
 ```
 
 Reads return every setting in `options` (keys the client set) and `derivedOptions` (keys the server filled). `u64` values stay `bigint`, so values above 2^53 keep their precision. `system.describeOptions({ scope: OptionsScope.Stream })` lists the keys a server accepts per scope, with `updatable`, `resettable`, `secret`, `readOnly` and `critical`.
+
+### list pages
+
+`stream.list`, `topic.list`, `group.list` and `user.list` return a whole list. Each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the walk can appear or not appear. The walk keeps the sign-in and the deadline that it started with. If the server answers a page request with the cursor that the request sent, the walk fails with a `DeserializeError`.
+
+`stream.listPage`, `topic.listPage`, `partition.listPage`, `group.listPage` and `user.listPage` return one page. To read the next page, send the same query with the `next` of the page as its `cursor`. A page can be empty and still have a `next`.
+
+```ts
+import { Client, type NamedPageQuery } from "apache-iggy";
+
+const printStreams = async (client: Client) => {
+  let query: NamedPageQuery = {};
+  for (;;) {
+    const page = await client.stream.listPage(query);
+    for (const stream of page.items)
+      console.log(stream.id, stream.name);
+    if (!page.next) return;
+    query = { ...query, cursor: page.next };
+  }
+};
+```
+
+A `PageQuery` holds `order`, `descending`, `limit` and `cursor`. `order` selects `PageOrder.Id` or `PageOrder.Created`, and `descending` reverses it. A `NamedPageQuery` is a `PageQuery` with an optional `name`, which keeps the entries whose name holds the text, case-sensitive. `stream.listPage`, `topic.listPage`, `group.listPage` and `user.listPage` take a `NamedPageQuery`. `partition.listPage` takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with error 3 (invalid command), before it sends anything. Examples are a limit outside 1 to 1000, a name that is empty or longer than 255 bytes, and a `partition.listPage` query with a name. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use, and `JSON.stringify` writes it as that text. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with error 3.
 
 ### metadata changes
 

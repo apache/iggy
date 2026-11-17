@@ -22,6 +22,9 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.PartitionsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
 
 final class PartitionsTcpClient implements PartitionsClient {
 
@@ -39,5 +42,10 @@ final class PartitionsTcpClient implements PartitionsClient {
     @Override
     public void deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount) {
         FutureUtil.resolve(delegate.deletePartitions(streamId, topicId, partitionsCount));
+    }
+
+    @Override
+    public Page<Partition> getPartitionsPage(StreamId streamId, TopicId topicId, PageQuery query) {
+        return FutureUtil.resolve(delegate.getPartitionsPage(streamId, topicId, query));
     }
 }

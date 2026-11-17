@@ -15,8 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.99.1
+ARG RUST_VERSION=1.100
 ARG ALPINE_VERSION=3.23
+# Source stage of LICENSE-binary in `runtime-prebuilt`. CI test images set
+# `license-skip`: they are never distributed, and cargo-about costs over a
+# minute per build. The C# coverage build keeps the default, so `license-gen`
+# stays under test. Release images build `runtime`, which ignores this.
+ARG LICENSE_STAGE=license-gen
 
 # ── from-source path ─────────────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine${ALPINE_VERSION} AS chef
@@ -132,6 +137,12 @@ RUN TARGET="$(uname -m)-unknown-linux-musl" && \
       --manifest web \
       --output /app/LICENSE-binary
 
+FROM debian:trixie-slim AS license-skip
+RUN mkdir -p /app && \
+    echo "Not generated: test image built with LICENSE_STAGE=license-skip." > /app/LICENSE-binary
+
+FROM ${LICENSE_STAGE} AS license
+
 # ── final images ──────────────────────────────────────────────────────────────
 FROM debian:trixie-slim AS runtime-prebuilt
 ARG TARGETPLATFORM
@@ -145,7 +156,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=prebuilt /out/iggy-server /usr/local/bin/iggy-server
 COPY --from=prebuilt /out/iggy        /usr/local/bin/iggy
-COPY --from=license-gen /app/LICENSE-binary /usr/share/doc/iggy/LICENSE-binary
+COPY --from=license /app/LICENSE-binary /usr/share/doc/iggy/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy/
 RUN echo "═══════════════════════════════════════════════════════════════" && \
     echo "                   IGGY SERVER BUILD SUMMARY                   " && \

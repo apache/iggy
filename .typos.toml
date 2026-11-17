@@ -159,5 +159,7 @@ extend-exclude = [
     "**/resource_options.json",
     # Metadata change fixture copies in every SDK test tree (hex and base64url payloads)
     "**/metadata_changes.json",
+    # List page fixture copies in every SDK test tree (hex and base64url payloads)
+    "**/list_pages.json",
     "**/.python-version",
 ]

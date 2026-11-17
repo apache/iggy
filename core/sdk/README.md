@@ -53,7 +53,7 @@ in the configured directory. See the [server recovery guide](../server/README.md
 Mixed versions and rolling upgrades are unsupported. Binary clients share one
 logical session across replica links using BindSession (15) and discover
 partition primaries with GetPartitionRoute (105). The minimum binary protocol
-version is 0.12.2. Commands 14, 103, 104, 107, 123 and 124 are retired. HTTP clients
+version is 0.12.3. Commands 14, 103, 104, 107, 123 and 124 are retired. HTTP clients
 use server-side forwarding.
 
 ```bash
@@ -528,10 +528,16 @@ and it holds the reads of the partition as a `seek` does. Once `shutdown()` star
 fails with `InvalidConfiguration`, unless its write already started: `shutdown()` waits for that
 write.
 If the reader cannot read again the messages that a lost read stored, those messages are lost.
-That has three causes. A rebalance moved the partition to another member before the catch-up. The
+That has four causes. A rebalance moved the partition to another member before the catch-up. The
 partition no longer holds the messages, for example after retention deleted them. Lasting refusals
-stopped the partition during the catch-up. The reader then returns one `FetchProgressUncertain`
-error for that partition, with the first and last offset of those messages in `lost`.
+stopped the partition during the catch-up. The server lost the history of the partition during the
+catch-up. The reader then returns one `FetchProgressUncertain` error for that partition, with the
+first and last offset of those messages in `lost`. This error stops nothing and has no `skip`, so
+it needs no `seek`. The batch that the reader holds after the range comes next, and a `seek` before
+the application takes that batch drops it. If the reader stopped the partition, the error that
+stopped it comes after that batch. Earlier versions gave this error a `skip` after the range. Code
+that handles `FetchProgressUncertain` with an abandon and a `seek` must now check `lost` first and
+do neither for this error.
 `close()` and `shutdown()` cancel each `OnRead` read in flight on TCP, QUIC and
 WebSocket and take its one reply, which tells what the server stored, so a read that waits on the
 server ends at once. Over HTTP, which has no cancel, they wait until the deadline of the read. Then
@@ -687,6 +693,40 @@ A partition keeps 4096 producers. Past that limit, it drops the producer that wa
 Released builds of the Rust SDK refuse a binary poll that returns a batch with a producer. They require zero bytes in that part of the header. The same holds for every client that embeds the Rust SDK: the Python, C++ and PHP SDKs, the CLI, the Kafka gateway and the connectors runtime. Released Swift SDKs refuse the batch too. The Go, Java, C# and Node.js SDKs do not read that part of the header. Upgrade every consumer of a topic before a producer writes such batches to it.
 
 Upgrade every server node first as well. A node of an older release cannot store a batch with a producer.
+
+## List pages
+
+`get_streams_page`, `get_topics_page`, `get_partitions_page`, `get_consumer_groups_page` and `get_users_page` read one page of a list. A `PageQuery` sets the order, the direction, the limit and the cursor. The lists of named entities take a `NamedPageQuery`, which adds a name filter to a `PageQuery`. A partition has no name, so `get_partitions_page` takes a `PageQuery`.
+
+To read the next page, send the same query with the `next` cursor of the page. The `next` method of either query builds that query and returns `None` after the last page. A page can be empty and still have a `next`.
+
+```rust
+use iggy::prelude::*;
+
+async fn print_streams(client: &IggyClient) -> Result<(), IggyError> {
+    let mut query = NamedPageQuery {
+        page: PageQuery {
+            order: PageOrder::Created,
+            ..PageQuery::default()
+        },
+        name: Some("orders".to_owned()),
+    };
+    loop {
+        let page = client.get_streams_page(&query).await?;
+        for stream in &page.items {
+            println!("{} {}", stream.id, stream.name);
+        }
+        match query.next(&page)? {
+            Some(next) => query = next,
+            None => return Ok(()),
+        }
+    }
+}
+```
+
+The page methods call `validate` on the query before they send anything. It refuses a limit outside 1 to 1000, and a name that is empty or longer than 255 bytes, with `InvalidCommand`. If a page answers the cursor that it was read with, `next` fails with `InvalidFormat`, so a walk cannot loop forever. A `PageCursor` prints as `pg1_` text, the form that the CLI and the HTTP API use, and `str::parse` reads it back.
+
+`get_streams`, `get_topics`, `get_consumer_groups` and `get_users` return the whole list. Over TCP, QUIC and WebSocket, they read pages of 1000 in id order, so the result is not one consistent read. Over HTTP, they read the bare array, which the server also builds from pages.
 
 ## Metadata changes
 

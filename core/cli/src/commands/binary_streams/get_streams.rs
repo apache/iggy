@@ -17,6 +17,7 @@
 
 use crate::commands::binary_streams::get_stream::encryption_source;
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::utils::list_rows::{ListRows, print_next};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
@@ -26,15 +27,17 @@ use tracing::{Level, event};
 pub enum GetStreamsOutput {
     Table,
     List,
+    Json,
 }
 
 pub struct GetStreamsCmd {
     output: GetStreamsOutput,
+    rows: ListRows,
 }
 
 impl GetStreamsCmd {
-    pub fn new(output: GetStreamsOutput) -> Self {
-        GetStreamsCmd { output }
+    pub fn new(output: GetStreamsOutput, rows: ListRows) -> Self {
+        GetStreamsCmd { output, rows }
     }
 }
 
@@ -42,6 +45,7 @@ impl Default for GetStreamsCmd {
     fn default() -> Self {
         GetStreamsCmd {
             output: GetStreamsOutput::Table,
+            rows: ListRows::default(),
         }
     }
 }
@@ -52,17 +56,23 @@ impl CliCommand for GetStreamsCmd {
         let mode = match self.output {
             GetStreamsOutput::Table => "table",
             GetStreamsOutput::List => "list",
+            GetStreamsOutput::Json => "json",
         };
         format!("list streams in {mode} mode")
     }
 
+    fn stdout_is_data(&self) -> bool {
+        matches!(self.output, GetStreamsOutput::Json)
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let streams = client
-            .get_streams()
+        let (streams, next) = self
+            .rows
+            .read(|query| async move { client.get_streams_page(&query).await })
             .await
             .with_context(|| String::from("Problem getting list of streams"))?;
 
-        if streams.is_empty() {
+        if streams.is_empty() && !self.stdout_is_data() {
             event!(target: PRINT_TARGET, Level::INFO, "No streams found!");
             return Ok(());
         }
@@ -109,7 +119,9 @@ impl CliCommand for GetStreamsCmd {
                     );
                 });
             }
+            GetStreamsOutput::Json => return self.rows.print_json(streams, next),
         }
+        print_next(next);
 
         Ok(())
     }

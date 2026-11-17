@@ -212,7 +212,7 @@ asyncio.run(main())
 
 `create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
 
-A topic's `message_expiry` and `max_topic_size` are the only resettable keys. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
+A topic's `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` are the only resettable keys. `tiered_storage` can only be turned on by an update, never off. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
 
 The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
 
@@ -266,6 +266,43 @@ asyncio.run(main())
 A stream encryption key must be 32 random bytes, given as `bytes` or as their canonical base64 text. The key travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is your responsibility.
 
 The server never returns the key, only `encryption_key_source`, `encryption_key_fingerprint` and `encryption_kek_fingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `"server"`. An invalid key raises `ValueError` before anything is sent, and no repr or error message contains it.
+
+## List Pages
+
+`get_streams`, `get_topics`, `get_consumer_groups` and `get_users` return a whole list in id order. The list is read in pages of 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the read can appear or not appear.
+
+`get_streams_page`, `get_topics_page`, `get_partitions_page`, `get_consumer_groups_page` and `get_users_page` return one page. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`.
+
+```python
+import asyncio
+
+from apache_iggy import IggyClient, PageOrder
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+
+    cursor = None
+    while True:
+        page = await client.get_streams_page(
+            order=PageOrder.Created, name="orders", cursor=cursor
+        )
+        for stream in page.items:
+            print(stream.id, stream.name)
+        if page.next is None:
+            break
+        cursor = page.next
+
+
+asyncio.run(main())
+```
+
+`order` selects `PageOrder.Id`, the default, or `PageOrder.Created`, and `descending=True` reverses it. `limit` sets the size of a page, from 1 to 1000, and is 100 by default. `name` keeps the entries whose name holds the text, case-sensitive. A partition has no name, so `get_partitions_page` takes no `name`.
+
+A cursor is the `pg1_` text that the HTTP API and the CLI use. Before it sends anything, the client refuses a cursor or a query that breaks the page rules. It raises `IggyError` with the invalid command code (3). Examples are a bad cursor text, a limit of 0 or above 1000, and a name that is empty or longer than 255 bytes. A `limit` outside the unsigned 32-bit range raises `OverflowError` instead.
+
+The server refuses a cursor that it cannot use, such as the cursor of another order, also with invalid command. Over HTTP, a refusal from the server raises `IggyError` with code 300 (HTTP response error), and its message holds the server error body.
 
 ## Metadata Changes
 
@@ -699,8 +736,12 @@ itself. A partition that was deleted and created again stops with
 seek. If a message does not decode, pass `skip` to `seek()` to read past it.
 A lost read can commit messages that the reader cannot read again. Then the
 reader raises `FetchProgressUncertain` (14010) once. Its `lost` holds the first
-and last offset of those messages as `(first, last)`, and `skip` the
-continuation after them.
+and last offset of those messages as `(first, last)`. This error stops nothing
+and needs no seek. A seek after it drops the batch that follows the range. If
+the reader stopped the partition, the error that stopped it comes after that
+batch. Earlier versions gave this error a `skip` after the range. Code that
+handles `FetchProgressUncertain` with an abandon and a `seek()` must now check
+`lost` first and do neither for this error.
 
 ## Interpreter Exit
 

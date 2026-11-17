@@ -68,6 +68,14 @@ public interface OptionKey {
     }
 
     /**
+     * Whether an update may only turn this bool key on. The flag bits report such a key as updatable and
+     * not resettable, so the server's refusal of {@code false} and of a reset is not readable from them.
+     */
+    default boolean enableOnly() {
+        return false;
+    }
+
+    /**
      * Refuses an update the server would refuse for its shape, in the server's admission order.
      *
      * <p>A patch with a raw set key or a raw reset name gets only the structural checks, because the server's
@@ -122,6 +130,11 @@ public interface OptionKey {
                 key -> !key.updatable(),
                 IggyErrorCode.OPTION_NOT_UPDATABLE,
                 "Option cannot be updated after creation");
+        requireNone(
+                reset,
+                OptionKey::enableOnly,
+                IggyErrorCode.OPTION_NOT_UPDATABLE,
+                "Option can only be turned on by an update");
         requireNone(reset, key -> !key.resettable(), IggyErrorCode.OPTION_NOT_RESETTABLE, "Option cannot be reset");
     }
 
@@ -136,6 +149,20 @@ public interface OptionKey {
                     code,
                     "Value must be between " + minBytes + " and " + maxBytes + " bytes when UTF-8 encoded",
                     Optional.of(key));
+        }
+    }
+
+    /**
+     * Refuses turning off a key an update may only turn on, with the server's code.
+     *
+     * @throws IggyValidationException carrying {@link IggyErrorCode#OPTION_NOT_UPDATABLE}
+     */
+    static void requireEnabled(OptionKey key, boolean enabled) {
+        if (key.enableOnly() && !enabled) {
+            throw refusal(
+                    IggyErrorCode.OPTION_NOT_UPDATABLE,
+                    "Option can only be turned on by an update",
+                    Optional.of(key.value()));
         }
     }
 

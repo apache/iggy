@@ -67,8 +67,8 @@ under the License.
 
     await goto(
       resolve(
-        `dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}/partitions/${page.params.partitionId}/messages`
-      ) + `?${searchParams}`,
+        `dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}/partitions/${page.params.partitionId}/messages?${searchParams}`
+      ),
       { reset: false }
     );
     currentPage = pageNum;

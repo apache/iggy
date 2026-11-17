@@ -18,9 +18,25 @@
 use iggy_common::{IggyByteSize, IggyExpiry, IggyTimestamp};
 use std::fmt::Display;
 
+/// Where a segment's bytes live.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentLocation {
+    /// Only in the local `.log`.
+    #[default]
+    Local,
+    /// In the local `.log` and in the object store.
+    Uploaded,
+    /// Only in the object store: the local `.log` is gone, and the chain's
+    /// marker stands in for it.
+    Remote,
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct Segment {
     pub sealed: bool,
+    /// A tiered segment stays in the segment list wherever its bytes live, so
+    /// resolving an offset or a timestamp never depends on the location.
+    pub location: SegmentLocation,
     pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub max_timestamp: u64,
@@ -35,8 +51,9 @@ impl Display for Segment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Segment {{ sealed: {}, max_size: {}, start_timestamp: {}, end_timestamp: {}, max_timestamp: {}, start_offset: {}, end_offset: {}, size: {} }}",
+            "Segment {{ sealed: {}, location: {:?}, max_size: {}, start_timestamp: {}, end_timestamp: {}, max_timestamp: {}, start_offset: {}, end_offset: {}, size: {} }}",
             self.sealed,
+            self.location,
             self.max_size,
             self.start_timestamp,
             self.end_timestamp,
@@ -53,6 +70,7 @@ impl Segment {
     pub fn new(start_offset: u64, max_size_bytes: IggyByteSize) -> Self {
         Self {
             sealed: false,
+            location: SegmentLocation::Local,
             max_size: max_size_bytes,
             start_timestamp: 0,
             end_timestamp: 0,

@@ -775,6 +775,26 @@ func (e DeferredPollCapacityExceeded) Is(target error) bool {
 	return ok
 }
 
+type TieredReadFailed struct{}
+
+func (e TieredReadFailed) Error() string {
+	return "tiered data cannot be read from the object store; a retry does not help"
+}
+func (e TieredReadFailed) Code() Code { return 96 }
+func (e TieredReadFailed) Is(target error) bool {
+	_, ok := target.(TieredReadFailed)
+	return ok
+}
+
+type ReplyTooLarge struct{}
+
+func (e ReplyTooLarge) Error() string { return "the reply is larger than the reply size limit" }
+func (e ReplyTooLarge) Code() Code    { return 97 }
+func (e ReplyTooLarge) Is(target error) bool {
+	_, ok := target.(ReplyTooLarge)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2983,6 +3003,8 @@ var (
 	ErrLifecycleBusy                              = LifecycleBusy{}
 	ErrNotPrimary                                 = NotPrimary{}
 	ErrDeferredPollCapacityExceeded               = DeferredPollCapacityExceeded{}
+	ErrTieredReadFailed                           = TieredReadFailed{}
+	ErrReplyTooLarge                              = ReplyTooLarge{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -3249,6 +3271,8 @@ const (
 	LifecycleBusyCode                              Code = 88
 	NotPrimaryCode                                 Code = 89
 	DeferredPollCapacityExceededCode               Code = 90
+	TieredReadFailedCode                           Code = 96
+	ReplyTooLargeCode                              Code = 97
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3587,6 +3611,10 @@ func (c Code) String() string {
 		return "NotPrimary"
 	case DeferredPollCapacityExceededCode:
 		return "DeferredPollCapacityExceeded"
+	case TieredReadFailedCode:
+		return "TieredReadFailed"
+	case ReplyTooLargeCode:
+		return "ReplyTooLarge"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -4116,6 +4144,10 @@ func FromCode(code Code) IggyError {
 		return ErrNotPrimary
 	case DeferredPollCapacityExceededCode:
 		return ErrDeferredPollCapacityExceeded
+	case TieredReadFailedCode:
+		return ErrTieredReadFailed
+	case ReplyTooLargeCode:
+		return ErrReplyTooLarge
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:

@@ -3133,7 +3133,7 @@ fn assert_unauthorized<T: std::fmt::Debug>(result: Result<T, IggyError>, context
 /// `CannotDeleteUser`, and `CannotChangePermissions`) into a generic
 /// `HttpResponseError` wrapping the typed JSON body. Read the exact code back
 /// from that body's `id` so the assertion stays exact over HTTP as well.
-fn assert_error_code<T: std::fmt::Debug>(
+pub(crate) fn assert_error_code<T: std::fmt::Debug>(
     result: Result<T, IggyError>,
     expected: IggyError,
     context: &str,

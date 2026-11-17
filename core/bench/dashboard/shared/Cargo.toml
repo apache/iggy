@@ -24,8 +24,14 @@ publish = false
 
 [dependencies]
 bench-report = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
 human-repr = { workspace = true }
+semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 
 [lints]

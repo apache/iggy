@@ -246,12 +246,39 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   The key, the `loginUser()` password and the `fromConnectionString()` string are marked `#[\SensitiveParameter]`, so exception traces hold a `SensitiveParameterValue` in their place. The `raw` arrays of `createStream()`, `updateStream()`, `createTopic()` and `updateTopic()` are marked as well, because an unknown key may hold a secret.
 
   Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
-- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros` and `max_topic_size`. Null arguments keep stored values. `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry and size cap are resettable, every other case is refused with the server's error.
+- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros`, `max_topic_size`, `local_retention_age_micros` and `local_retention_size`, and turns `tiered_storage` on, never off. Null arguments keep stored values.
+- `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry, size cap, local retention age and local retention size are resettable, every other case is refused with the server's error.
 - `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
 - `createTopic()` takes `replication_factor`, how many nodes store each partition: 1 to 32 and at most the cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply. The factor is create-only, and a value out of range is refused as `Invalid replication factor` (code 2018).
 - A topic read's `partitions` holds one `Iggy\Partition` per partition with `id`, `segments_count`, `current_offset`, `size_bytes`, `messages_count`, `members` (the node ids that store the partition) and `in_sync_members` (the members its primary last reported in sync and that are up, empty until it first reports).
 - `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
 - SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller), 4041 (unsupported option key) and 2018 (invalid replication factor).
+
+## List Pages
+
+`getStreamsPage()`, `getTopicsPage()`, `getPartitionsPage()`, `getConsumerGroupsPage()` and `getUsersPage()` read one page of a list. Named arguments set the order, the direction, the limit, the cursor and a name filter. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`, so a walk ends at the first page without one.
+
+```php
+use Iggy\PageOrder;
+
+$cursor = null;
+do {
+    $page = $client->getStreamsPage(order: PageOrder::Created, limit: 50, cursor: $cursor, name: 'orders');
+    foreach ($page->items as $stream) {
+        echo $stream->id, ' ', $stream->name, PHP_EOL;
+    }
+    $cursor = $page->next;
+} while ($cursor !== null);
+```
+
+- A null `order` reads in `PageOrder::Id` order, and `descending: true` reverses the order. `PageOrder::Created` sorts by creation time and then by id. Partitions and consumer groups walk by id in both orders, because their ids follow creation.
+- `limit` is 1 to 1000, and a null `limit` reads 100. `name` keeps the entries whose name holds the text, case-sensitive, and is 1 to 255 bytes. A partition has no name, so `getPartitionsPage()` takes no `name`.
+- A cursor is the `pg1_` text that the CLI and the HTTP API use. It holds only a position, so send it back with the same order, direction, filter and parent ids.
+- A query out of range, or a cursor text that the client cannot read, throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor that does not fit the query, and a partition name, with the same error. Over HTTP, these server refusals throw code 300, and the message holds the server's error.
+- The argument check runs first. A `limit` that is not an integer or does not fit 32 unsigned bits throws `IggyException` with code 0.
+- Each page is a separate read. An entity that someone creates or deletes during a walk can appear or not appear, so a walk is not a snapshot. `getMetadataChanges()` gives an exact copy. `getTopicsPage()` of a stream that does not exist returns an empty page without `next`.
+- Pages hold `Iggy\Stream`, `Iggy\Topic`, `Iggy\Partition`, `Iggy\ConsumerGroup` or `Iggy\UserInfo` objects with readonly snake_case properties. `created_at` is in microseconds. Streams, topics and users return `options` and `derived_options` arrays like `StreamDetails`, and streams also return its three `encryption_*` properties.
+- The reply of `getStream()` or `getTopic()` can pass the server cap of a little over 64 MB. Over TCP, QUIC and WebSocket, the call then throws `ReplyTooLarge` (code 97). The connection stays usable, and `getTopicsPage()` and `getPartitionsPage()` read such a stream or topic in pages.
 
 ## Metadata Changes
 
@@ -444,8 +471,12 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   a message that does not decode. The reader retries by itself. `HistoryUnavailable`
   (87) stops the partition until `seek()`. A lost read can commit messages that the
   reader cannot read again. Then the reader throws `FetchProgressUncertain` (14010)
-  once. Its `lost` holds the first and last offset of those messages as `[first, last]`,
-  and `skip` the continuation after them.
+  once. Its `lost` holds the first and last offset of those messages as `[first, last]`.
+  This error stops nothing and needs no seek. A seek after it drops the batch that
+  follows the range. If the reader stopped the partition, the error that stopped it
+  comes after that batch. Earlier versions gave this error a `skip` after the range.
+  Code that handles `FetchProgressUncertain` with `abandonOperation()` and a `seek()`
+  must now check `lost` first and do neither for this error.
 - Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered

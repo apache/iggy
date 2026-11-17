@@ -84,6 +84,7 @@ internal sealed class ReaderCluster : IDisposable
     private int _cancels;
     private int _joins;
     private int _leaves;
+    private int _tieredReadRefusals;
     private int _syncs;
     private int _routeLookups;
     private int _refusedRouteLookups;
@@ -99,6 +100,11 @@ internal sealed class ReaderCluster : IDisposable
     }
 
     internal ulong Limit { get; set; } = 2;
+
+    /// <summary>
+    ///     Custom records for fetches only. Must return <see cref="GOLDEN_BATCH_MESSAGES" /> messages from the given offset.
+    /// </summary>
+    internal Func<ulong, byte[]>? FetchRecords { get; init; }
 
     /// <summary>
     ///     The owner generation of every partition. A read or an offset write that names another one is refused as not
@@ -249,6 +255,12 @@ internal sealed class ReaderCluster : IDisposable
     internal HashSet<ulong> Undecodable { get; } = [];
 
     internal ConcurrentBag<uint> HistoryRefused { get; } = [];
+
+    /// <summary>Partitions whose fetch section is refused as a failed tiered read.</summary>
+    internal ConcurrentBag<uint> TieredReadRefused { get; } = [];
+
+    /// <summary>The fetch sections refused as a failed tiered read so far.</summary>
+    internal int TieredReadRefusals => Volatile.Read(ref _tieredReadRefusals);
 
     /// <summary>Partitions whose fetch section is refused as unauthorized.</summary>
     internal ConcurrentBag<uint> Unauthorized { get; } = [];
@@ -537,6 +549,14 @@ internal sealed class ReaderCluster : IDisposable
                 continue;
             }
 
+            if (TieredReadRefused.Contains(partition))
+            {
+                Interlocked.Increment(ref _tieredReadRefusals);
+                sections.Add(EmptySection(partition, 0, default, VsrError.TIERED_READ_FAILED));
+                served = true;
+                continue;
+            }
+
             if (Unauthorized.Contains(partition))
             {
                 sections.Add(EmptySection(partition, 0, default, VsrError.UNAUTHORIZED));
@@ -554,6 +574,10 @@ internal sealed class ReaderCluster : IDisposable
             served = true;
             held += GOLDEN_BATCH_MESSAGES;
             var section = GoldenSection(partition, start, ReadContext);
+            if (FetchRecords is { } records)
+            {
+                section = section with { Records = records(start) };
+            }
             section = ReportsHead ? section with { CurrentOffset = Limit - 1 } : section;
             sections.Add(Undecodable.Contains(start) ? section with { Records = [] } : section);
             if (fetch.AutoCommit)

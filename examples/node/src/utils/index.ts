@@ -59,7 +59,6 @@ export async function cleanup(client: Client, streamId: number | string, topicId
     await client.topic.delete({
       streamId: streamId,
       topicId: topicId,
-      partitionsCount: PARTITION_COUNT,
     });
     log('Topic deleted successfully.');
   } catch (error) {

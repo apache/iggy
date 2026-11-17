@@ -124,7 +124,7 @@ async fn shard_of(
         let op = install_group_owner(partition, &config, installation).await;
         assert!(group.complete_revocation(id, &installation, op));
     }
-    topic.consumer_groups.insert(0, group);
+    topic.consumer_groups.insert(0, Box::new(group));
     stream.topics.insert(topic);
     inner.items.insert(stream);
     let users = Users::default();

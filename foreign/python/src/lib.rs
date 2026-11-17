@@ -24,6 +24,7 @@ mod event_loop;
 mod identifier;
 mod metadata_changes;
 mod options;
+mod page;
 mod partitioning;
 mod permissions;
 mod poll_options;
@@ -32,6 +33,7 @@ mod reader;
 mod receive_message;
 mod resource_options;
 mod send_message;
+mod snapshot;
 mod stats;
 mod stream;
 mod topic;
@@ -60,6 +62,7 @@ use metadata_changes::{
     MetadataUnknownItem, MetadataUserChange, MetadataUserIdentity, MetadataUserPermissionsUpdated,
 };
 use options::OptionSpec;
+use page::{ConsumerGroupsPage, PageOrder, PartitionsPage, StreamsPage, TopicsPage, UsersPage};
 use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use poll_options::{AutoCommit, CommitAfter, CommitEvery, CommitPolicy, PollOptions};
@@ -77,6 +80,7 @@ use resource_options::{
     encryption_key_fingerprint,
 };
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
+use snapshot::{SnapshotCompression, SystemSnapshotType};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::{Stream, StreamDetails};
 use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
@@ -160,6 +164,14 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GlobalPermissions>()?;
     m.add_class::<StreamPermissions>()?;
     m.add_class::<TopicPermissions>()?;
+    m.add_class::<SnapshotCompression>()?;
+    m.add_class::<SystemSnapshotType>()?;
+    m.add_class::<PageOrder>()?;
+    m.add_class::<StreamsPage>()?;
+    m.add_class::<TopicsPage>()?;
+    m.add_class::<PartitionsPage>()?;
+    m.add_class::<ConsumerGroupsPage>()?;
+    m.add_class::<UsersPage>()?;
     m.add_class::<MetadataChanges>()?;
     m.add_class::<MetadataChangeRecord>()?;
     m.add_class::<MetadataCurrentItem>()?;

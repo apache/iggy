@@ -355,6 +355,14 @@
   code: 90
   format: "deferred poll capacity exceeded; retry after backoff on the same replica"
   fields: []
+- name: TieredReadFailed
+  code: 96
+  format: "tiered data cannot be read from the object store; a retry does not help"
+  fields: []
+- name: ReplyTooLarge
+  code: 97
+  format: "the reply is larger than the reply size limit"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."

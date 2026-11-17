@@ -33,6 +33,7 @@ use crate::stm::result::{
     TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
 use crate::stm::snapshot::{SnapshotError, Snapshotable};
+use crate::stm::walk::{Directed, range_after, slice_after};
 use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
@@ -71,7 +72,7 @@ use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
     ConsumerGroupDetailsResponse, ConsumerGroupMemberResponse,
 };
 use iggy_binary_protocol::responses::streams::StreamResponse;
-use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
+use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
 use iggy_common::wire_conversions::{
@@ -400,7 +401,10 @@ pub struct Topic {
 
     /// Consumer groups belonging to this topic, keyed by monotonic group id.
     /// Co-located so a stream/topic delete drops them automatically.
-    pub consumer_groups: AHashMap<u64, ConsumerGroup>,
+    ///
+    /// Boxed, because a B-tree leaf reserves room for 11 values: a topic with
+    /// one group holds about 330 B this way and about 1.3 KB with plain values.
+    pub consumer_groups: BTreeMap<u64, Box<ConsumerGroup>>,
     /// Group name -> id, for per-topic name uniqueness + name resolution.
     pub consumer_group_index: AHashMap<Arc<str>, u64>,
     /// Monotonic group-id counter; never reused so the partition-plane offset
@@ -432,7 +436,7 @@ impl Default for Topic {
             stats: Arc::new(TopicStats::default()),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
-            consumer_groups: AHashMap::default(),
+            consumer_groups: BTreeMap::new(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
@@ -452,7 +456,7 @@ impl Topic {
             stats: Arc::new(TopicStats::new(stream_stats)),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
-            consumer_groups: AHashMap::default(),
+            consumer_groups: BTreeMap::new(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
@@ -483,6 +487,62 @@ impl Topic {
             }
             WireIdentifier::String(name) => self.consumer_group_index.get(name.as_str()).copied(),
         }
+    }
+
+    /// The consumer groups after the group id `after`, in id order. Group ids
+    /// are never used again, so id order is creation order.
+    pub fn consumer_groups_after(
+        &self,
+        after: Option<u64>,
+        descending: bool,
+    ) -> impl Iterator<Item = &ConsumerGroup> {
+        Directed::new(
+            self.consumer_groups
+                .range(range_after(after.as_ref(), descending)),
+            descending,
+        )
+        .map(|(_, group)| group.as_ref())
+    }
+
+    /// The list item of `group`, one of the consumer groups of this topic.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+    pub fn consumer_group_response(&self, group: &ConsumerGroup) -> ConsumerGroupResponse {
+        ConsumerGroupResponse {
+            id: group.id as u32,
+            partitions_count: self.partitions.len() as u32,
+            members_count: group.members.len() as u32,
+            // The name was validated at create, so the fallback is unreachable.
+            name: WireName::new(group.name.as_ref())
+                .unwrap_or_else(|_| WireName::new("unknown").expect("valid")),
+        }
+    }
+
+    /// The partitions after the partition id `after`, in id order. A create
+    /// appends ids above the highest and a delete cuts the tail, so ids ascend
+    /// over the vector and id order is creation order.
+    #[must_use]
+    pub fn partitions_after(
+        &self,
+        after: Option<usize>,
+        descending: bool,
+    ) -> Directed<std::slice::Iter<'_, Partition>> {
+        slice_after(
+            &self.partitions,
+            |partition| partition.id,
+            after,
+            descending,
+        )
+    }
+
+    /// [`Self::partitions_after`] skips or repeats partitions when ids do not
+    /// ascend over `partitions`. Only the primary mints the ids of a create.
+    fn debug_assert_partition_ids_ascend(&self) {
+        debug_assert!(
+            self.partitions
+                .is_sorted_by(|left, right| left.id < right.id),
+            "partition ids must ascend over Topic::partitions"
+        );
     }
 }
 
@@ -558,6 +618,20 @@ impl Stream {
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
         }
+    }
+
+    /// The topics in creation order, keyed by `(created_at micros, topic id)`.
+    /// A stream holds at most `MAX_TOPICS` topics, so a page sorts them for
+    /// each read in place of an index that every topic apply keeps.
+    #[must_use]
+    pub fn topics_by_created(&self) -> Vec<((u64, usize), &Topic)> {
+        let mut topics: Vec<_> = self
+            .topics
+            .iter()
+            .map(|(id, topic)| ((topic.created_at.as_micros(), id), topic))
+            .collect();
+        topics.sort_unstable_by_key(|(key, _)| *key);
+        topics
     }
 
     #[must_use]
@@ -1020,6 +1094,29 @@ define_state! {
         // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
         // as streams/topics restore.
         pub stats_registry: Arc<StatsRegistry>,
+        // `(created_at micros, stream id)` of every stream, so a page in
+        // creation order seeks by key. Never persisted, rebuilt on restore.
+        pub(crate) created_index: BTreeSet<(u64, usize)>,
+    }
+}
+
+impl StreamsInner {
+    /// The streams after `after` in creation order, newest first when
+    /// `descending`. The key of a stream is `(created_at micros, stream id)`.
+    pub fn streams_by_created(
+        &self,
+        after: Option<(u64, usize)>,
+        descending: bool,
+    ) -> impl Iterator<Item = ((u64, usize), &Stream)> {
+        Directed::new(
+            self.created_index
+                .range(range_after(after.as_ref(), descending)),
+            descending,
+        )
+        .filter_map(|&key| {
+            let stream = self.items.get(key.1)?;
+            (stream.created_at.as_micros() == key.0).then_some((key, stream))
+        })
     }
 }
 
@@ -1090,6 +1187,9 @@ pub enum PartitionChangeKind {
     /// A consumer group of the partition's topic was deleted, so the group's
     /// offsets on the partition are now dead.
     ConsumerGroupDeleted,
+    /// The partition's topic turned tiered storage on, so every replica of
+    /// the partition starts its chain file.
+    TieringEnabled,
 }
 
 /// One partition change.
@@ -1754,6 +1854,35 @@ impl Streams {
         })
     }
 
+    /// What a tiered topic keeps on local disk: its `local_retention_age`
+    /// and `local_retention_size`. `None` for a topic that is not tiered.
+    #[must_use]
+    pub fn topic_local_retention(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Option<(IggyExpiry, MaxTopicSize)> {
+        self.inner.read(|inner| {
+            let resolved = &inner.items.get(stream_id)?.topics.get(topic_id)?.resolved;
+            resolved
+                .tiered_storage
+                .then_some((resolved.local_retention_age, resolved.local_retention_size))
+        })
+    }
+
+    /// Whether any topic is tiered. A node claims the object store's root for
+    /// this cluster only while no topic is tiered.
+    #[must_use]
+    pub fn has_tiered_topic(&self) -> bool {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .any(|(_, topic)| topic.resolved.tiered_storage)
+        })
+    }
+
     /// A partition's incarnation and its topic's partition count, read under
     /// one guard so a recreated topic never pairs an old incarnation with a
     /// new count. `None` while a lifecycle operation blocks the topic, as for
@@ -1824,7 +1953,7 @@ impl Streams {
     /// round-robin partition assignment). `partitions_count` is the topic's
     /// total partition count. `None` if the stream/topic/group is unknown.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn consumer_group_details(
         &self,
         stream_id: &WireIdentifier,
@@ -1848,47 +1977,9 @@ impl Streams {
                 })
                 .collect();
             Some(ConsumerGroupDetailsResponse {
-                group: ConsumerGroupResponse {
-                    id: group.id as u32,
-                    partitions_count: topic.partitions.len() as u32,
-                    members_count: group.members.len() as u32,
-                    // The name was validated at create, so the fallback is
-                    // unreachable.
-                    name: WireName::new(group.name.as_ref())
-                        .unwrap_or_else(|_| WireName::new("unknown").expect("valid")),
-                },
+                group: topic.consumer_group_response(group),
                 members,
             })
-        })
-    }
-
-    /// All consumer groups of a topic (for `GetConsumerGroups`). `None` if the
-    /// stream/topic is unknown.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
-    pub fn consumer_group_list(
-        &self,
-        stream_id: &WireIdentifier,
-        topic_id: &WireIdentifier,
-    ) -> Option<Vec<ConsumerGroupResponse>> {
-        self.inner.read(|inner| {
-            let stream_id = inner.resolve_stream_id(stream_id)?;
-            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
-            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
-            let partitions_count = topic.partitions.len() as u32;
-            Some(
-                topic
-                    .consumer_groups
-                    .values()
-                    .map(|group| ConsumerGroupResponse {
-                        id: group.id as u32,
-                        partitions_count,
-                        members_count: group.members.len() as u32,
-                        name: WireName::new(group.name.as_ref())
-                            .unwrap_or_else(|_| WireName::new("unknown").expect("valid")),
-                    })
-                    .collect(),
-            )
         })
     }
 
@@ -3138,6 +3229,7 @@ impl StateHandler for CreateStreamRequest {
         let inserted = state.items.insert(stream);
         debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
         state.index.insert(name_arc, id);
+        state.created_index.insert((timestamp.as_micros(), id));
         let changes = state
             .items
             .get(id)
@@ -3266,6 +3358,9 @@ impl StateHandler for DeleteStreamRequest {
         state.stats_registry.remove_stream(stream_id, stream);
         let removed = state.items.remove(stream_id);
         state.index.remove(&name);
+        state
+            .created_index
+            .remove(&(removed.created_at.as_micros(), stream_id));
         state.revision = state.revision.wrapping_add(1);
         state.namespace_revision = state.revision;
         for (topic_id, topic) in &removed.topics {
@@ -3390,7 +3485,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             stats: topic_stats,
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
-            consumer_groups: AHashMap::default(),
+            consumer_groups: BTreeMap::new(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
@@ -3422,6 +3517,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                 );
                 topic.partitions.push(partition);
             }
+            topic.debug_assert_partition_ids_ascend();
         }
 
         stream.topic_index.insert(name_arc, topic_id);
@@ -3462,7 +3558,7 @@ pub(crate) fn public_reply_options(
         .unwrap_or_else(|_| (WireOptions::empty(), WireOptions::empty()))
 }
 
-/// Encode the `CreateTopic` reply as `[TopicHeader][PartitionResponse]*`,
+/// Encode the `CreateTopic` reply as `[TopicResponse][PartitionResponse]*`,
 /// the `GetTopicResponse` shape the SDK already decodes, so the create
 /// reply deserializes without a schema break. Returns empty bytes on a
 /// `u32` overflow (same contract as a validation rejection) rather than
@@ -3480,7 +3576,7 @@ fn encode_create_topic_reply(
         return Bytes::new();
     };
     let (options, derived_options) = public_reply_options(OptionsScope::Topic, &topic.options);
-    let header = TopicHeader {
+    let header = TopicResponse {
         id: topic_id_u32,
         created_at: topic.created_at.into(),
         partitions_count: partitions_count_u32,
@@ -3508,10 +3604,7 @@ fn encode_create_topic_reply(
                 },
                 // A new topic always lists its members. Nothing is in sync
                 // before the partition's primary first reports.
-                members: p
-                    .members
-                    .map(|members| members.nodes().to_vec())
-                    .unwrap_or_default(),
+                members: p.members.map_or_default(|members| members.nodes().to_vec()),
                 in_sync_members: Vec::new(),
             })
         })
@@ -3597,7 +3690,13 @@ impl StateHandler for UpdateTopicResolvedRequest {
             topic.name = name.clone();
             stream.topic_index.insert(name, topic_id);
         }
+        let was_tiered = topic.resolved.tiered_storage;
         topic.set_options(options);
+        // Only a build that knows the option admits its enable, and only once
+        // every member of the cluster runs one, so every replica that applies
+        // this takes the same branch and bumps the same revision.
+        let newly_tiered =
+            !was_tiered && topic.resolved.tiered_storage && !topic.partitions.is_empty();
         // An equal patch commits as ok but changes nothing public.
         let after = stream
             .topics
@@ -3613,6 +3712,14 @@ impl StateHandler for UpdateTopicResolvedRequest {
             })
             .into_iter()
             .collect();
+        if newly_tiered {
+            state.revision = state.revision.wrapping_add(1);
+            state.record_topic_partition_changes(
+                stream_id,
+                topic_id,
+                PartitionChangeKind::TieringEnabled,
+            );
+        }
         ApplyReply {
             changes,
             ..ApplyReply::ok(Bytes::new())
@@ -3905,6 +4012,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             );
             topic.partitions.push(partition);
         }
+        topic.debug_assert_partition_ids_ascend();
         // Added partitions are unassigned until the groups rebalance.
         topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
         state.recompute_consumer_group_metadata();
@@ -4019,9 +4127,7 @@ impl StateHandler for DeletePartitionsRequest {
 ///
 /// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
 /// `items` and the nested `topics` / `consumer_groups` / `partitions` stay ordered
-/// `Vec`s even though the runtime holds them in `AHashMap`s and an [`IdSlab`]. Swapping
-/// any back to an unordered map reorders on a decode and re-encode, breaking the
-/// checkpoint checksum cross-check recovery relies on.
+/// `Vec`s, so two replicas with the same state write the same bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsSnapshot {
     pub items: Vec<(usize, StreamSnapshot)>,
@@ -4072,8 +4178,7 @@ impl Snapshotable for Streams {
                                             deleted_up_to_offset: p.deleted_up_to_offset,
                                             members: p
                                                 .members
-                                                .map(|members| members.nodes().to_vec())
-                                                .unwrap_or_default(),
+                                                .map_or_default(|members| members.nodes().to_vec()),
                                             retirement_debt_op: p.retirement_debt_op,
                                         })
                                         .collect(),
@@ -4248,7 +4353,7 @@ impl StreamsInner {
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()
-                        .map(|(id, group_snap)| (id, group_snap.into_group()))
+                        .map(|(id, group_snap)| (id, Box::new(group_snap.into_group())))
                         .collect(),
                 };
                 topic_index.insert(topic_name, topic_slab_key);
@@ -4290,9 +4395,14 @@ impl StreamsInner {
             .map(|partition| partition.retirement_debt_op)
             .max()
             .unwrap_or(0);
+        let created_index = items
+            .iter()
+            .map(|(id, stream)| (stream.created_at.as_micros(), id))
+            .collect();
         let mut inner = Self {
             index,
             items,
+            created_index,
             revision: snapshot.revision,
             namespace_revision: snapshot.namespace_revision,
             retirement_debt_revision,
@@ -5732,7 +5842,7 @@ mod tests {
 
     #[test]
     fn create_topic_apply_returns_get_topic_response_compatible_bytes() {
-        // STM apply must emit `[TopicHeader][PartitionResponse]*` so existing
+        // STM apply must emit `[TopicResponse][PartitionResponse]*` so existing
         // SDK decoders (`decode_response::<GetTopicResponse>`) parse the reply
         // without a wire-schema break.
         let mut inner = StreamsInner::new();
@@ -6007,6 +6117,109 @@ mod tests {
             IggyTimestamp::now(),
         );
         assert_eq!(apply.code, 0);
+    }
+
+    #[test]
+    fn given_topic_turned_tiered_when_checking_should_report_tiered_topic() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 1);
+        assert!(!Streams::from(inner.clone()).has_tiered_topic());
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert!(Streams::from(inner).has_tiered_topic());
+    }
+
+    /// Every replica of every partition starts its chain file when the topic
+    /// turns tiered storage on, so the enable records one change per
+    /// partition. A patch that leaves the topic tiered records nothing.
+    #[test]
+    fn given_a_topic_when_tiered_storage_is_enabled_should_record_each_partition_once() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 2);
+        let created = inner.revision;
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert!(inner.items[0].topics[0].resolved.tiered_storage);
+        let enabled = inner.revision;
+        assert_eq!(enabled, created + 1);
+        let change = |partition_id| {
+            (
+                enabled,
+                PartitionChange {
+                    namespace: IggyNamespace::new(0, 0, partition_id),
+                    created_revision: created,
+                    kind: PartitionChangeKind::TieringEnabled,
+                },
+            )
+        };
+        assert_eq!(changes_since(&inner, created), [change(0), change(1)]);
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        assert_eq!(inner.revision, enabled);
+        assert_eq!(changes_since(&inner, enabled), []);
+    }
+
+    #[test]
+    fn given_a_topic_without_partitions_when_tiered_storage_is_enabled_should_keep_the_revision() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 0);
+        let created = inner.revision;
+        let mut explicit = ResourceOptions::new();
+        explicit.insert(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(true.encode().unwrap()),
+        );
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All).unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(
+            StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        assert!(inner.items[0].topics[0].resolved.tiered_storage);
+        assert_eq!(inner.revision, created);
     }
 
     /// Readers act on every partition a commit touched, so each applied
@@ -6716,7 +6929,7 @@ mod tests {
             .assignments
             .insert(2, owner(OTHER_CLIENT, incarnation));
         group.assignments.insert(3, owner(CLIENT, incarnation + 1));
-        topic.consumer_groups.insert(group.id, group);
+        topic.consumer_groups.insert(group.id, Box::new(group));
         topic.consumer_group_index.insert(Arc::from("readers"), 3);
         let streams = Streams::from(inner);
         let stream_id = WireIdentifier::numeric(0);
@@ -7597,5 +7810,199 @@ mod tests {
         streams.seed_namespace_on(namespace, 1, 0, iggy_common::Durability::Persisted, &[1, 4]);
         assert_eq!(streams.member_outside_cluster(3), Some((namespace, 4)));
         assert_eq!(streams.member_outside_cluster(5), None);
+    }
+
+    fn stream_creation_keys(inner: &StreamsInner) -> BTreeSet<(u64, usize)> {
+        inner
+            .items
+            .iter()
+            .map(|(id, stream)| (stream.created_at.as_micros(), id))
+            .collect()
+    }
+
+    fn create_stream_at(inner: &mut StreamsInner, name: &str, micros: u64) {
+        let create = CreateStreamRequest {
+            name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
+        };
+        let reply = StateHandler::apply(&create, inner, IggyTimestamp::from(micros));
+        assert_eq!(reply.code, 0);
+    }
+
+    fn delete_stream_at(inner: &mut StreamsInner, stream_id: usize, micros: u64) {
+        let delete = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(u32::try_from(stream_id).unwrap()),
+        };
+        let reply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            inner,
+            IggyTimestamp::from(micros),
+        );
+        assert_eq!(reply.code, 0);
+    }
+
+    #[test]
+    fn given_random_stream_creates_and_deletes_when_applied_should_keep_the_creation_index_exact() {
+        let mut inner = StreamsInner::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for step in 1..=400u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let live: Vec<usize> = inner.items.iter().map(|(id, _)| id).collect();
+            if live.is_empty() || !seed.is_multiple_of(3) {
+                create_stream_at(&mut inner, &format!("s{step}"), step);
+            } else {
+                let pick = usize::try_from(seed % live.len() as u64).unwrap();
+                delete_stream_at(&mut inner, live[pick], step);
+            }
+            assert_eq!(
+                inner.created_index,
+                stream_creation_keys(&inner),
+                "step {step}"
+            );
+        }
+        assert!(inner.created_index.len() > 10);
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+        let restored = StreamsInner::inner_from_snapshot(snapshot, Arc::default());
+        assert_eq!(restored.created_index, stream_creation_keys(&inner));
+    }
+
+    #[test]
+    fn given_a_reused_stream_id_when_walking_by_creation_should_list_the_new_stream_last() {
+        let mut inner = StreamsInner::new();
+        for (micros, name) in [(10, "a"), (20, "b"), (30, "c")] {
+            create_stream_at(&mut inner, name, micros);
+        }
+        delete_stream_at(&mut inner, 0, 40);
+        create_stream_at(&mut inner, "d", 50);
+        assert_eq!(inner.items[0].name.as_ref(), "d");
+
+        let by_created = |after, descending| {
+            inner
+                .streams_by_created(after, descending)
+                .map(|((_, id), _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by_created(None, false), [1, 2, 0]);
+        assert_eq!(by_created(None, true), [0, 2, 1]);
+        assert_eq!(by_created(Some((20, 1)), false), [2, 0]);
+        assert_eq!(by_created(Some((50, 0)), true), [2, 1]);
+        assert_eq!(
+            by_created(Some((10, 0)), false),
+            [1, 2, 0],
+            "a deleted key still splits"
+        );
+        let by_id: Vec<usize> = inner.items.walk(None, false).map(|(id, _)| id).collect();
+        assert_eq!(by_id, [0, 1, 2]);
+    }
+
+    #[test]
+    fn given_a_reused_topic_id_when_sorting_by_creation_should_list_the_new_topic_last() {
+        let create_topic_at = |inner: &mut StreamsInner, name: &str, micros: u64| {
+            let create = CreateTopicWithAssignmentsRequest {
+                request: make_topic_request(0, 1, name),
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id: 0,
+                    consensus_group_id: micros,
+                    members: Vec::new(),
+                }],
+            };
+            let reply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &create,
+                inner,
+                IggyTimestamp::from(micros),
+            );
+            assert_eq!(reply.code, 0);
+        };
+        let mut inner = StreamsInner::new();
+        create_stream_at(&mut inner, "stream", 1);
+        for (micros, name) in [(10, "a"), (20, "b"), (30, "c")] {
+            create_topic_at(&mut inner, name, micros);
+        }
+        let delete = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        let reply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::from(40),
+        );
+        assert_eq!(reply.code, 0);
+        create_topic_at(&mut inner, "d", 50);
+
+        let stream = &inner.items[0];
+        assert_eq!(stream.topics[0].name.as_ref(), "d");
+        let order: Vec<usize> = stream
+            .topics_by_created()
+            .into_iter()
+            .map(|((_, id), _)| id)
+            .collect();
+        assert_eq!(order, [1, 2, 0]);
+    }
+
+    #[test]
+    fn given_partition_deletes_and_creates_when_walking_should_yield_ascending_ids() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 4);
+        let delete = DeletePartitionsRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partitions_count: 2,
+        };
+        let reply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(reply.code, 0);
+        let create = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 3,
+            },
+            partitions: (0..3)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id,
+                    consensus_group_id: 100 + u64::from(partition_id),
+                    members: Vec::new(),
+                })
+                .collect(),
+        };
+        let reply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &create,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(reply.code, 0);
+
+        let walk = |topic: &Topic, after, descending| {
+            topic
+                .partitions_after(after, descending)
+                .map(|partition| partition.id)
+                .collect::<Vec<_>>()
+        };
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(walk(topic, None, false), [0, 1, 2, 3, 4]);
+        assert_eq!(walk(topic, Some(1), false), [2, 3, 4]);
+        assert_eq!(walk(topic, Some(3), true), [2, 1, 0]);
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+        let restored = StreamsInner::inner_from_snapshot(snapshot, Arc::default());
+        assert_eq!(
+            walk(&restored.items[0].topics[0], None, false),
+            [0, 1, 2, 3, 4]
+        );
+
+        let mut sparse = topic.clone();
+        sparse.partitions.remove(2);
+        assert_eq!(walk(&sparse, Some(2), false), [3, 4]);
+        assert_eq!(walk(&sparse, Some(2), true), [1, 0]);
+        assert_eq!(walk(&sparse, None, true), [4, 3, 1, 0]);
     }
 }
