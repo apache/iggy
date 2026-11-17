@@ -15,26 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { CommandResponse } from '../../client/client.type.js';
+import type { ClientProvider, CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
-import { deserializeUsers, type BaseUser } from './user.utils.js';
+import {
+  deserializePage, readWholeList, serializeNamedPageQuery, type NamedPageQuery, type Page
+} from '../page.utils.js';
+import { deserializeBaseUser, type BaseUser } from './user.utils.js';
 
 
 /**
  * Get users command definition.
- * Retrieves all users (without permissions).
+ * Retrieves one page of the users (without permissions).
  */
 export const GET_USERS = {
   code: COMMAND_CODE.GetUsers,
 
-  serialize: () =>  Buffer.alloc(0),
+  serialize: (query: NamedPageQuery) => serializeNamedPageQuery(COMMAND_CODE.GetUsers, query),
 
-  deserialize: (r: CommandResponse) => deserializeUsers(r.data)
+  deserialize: (r: CommandResponse) => deserializePage(r.data, deserializeBaseUser)
 };
 
 
 /**
- * Executable get users command function.
+ * Executable get users page command function.
  */
-export const getUsers = wrapCommand<void, BaseUser[]>(GET_USERS);
+export const getUsersPage = wrapCommand<NamedPageQuery, Page<BaseUser>>(GET_USERS);
+
+/**
+ * Executable get users command function. Reads every user page by page.
+ */
+export const getUsers = (c: ClientProvider) =>
+  (): Promise<BaseUser[]> => readWholeList(c, GET_USERS, (query) => query);

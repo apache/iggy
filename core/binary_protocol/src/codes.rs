@@ -96,6 +96,7 @@ pub const DELETE_TOPIC_CODE: u32 = 303;
 // -- Partitions --
 pub const CREATE_PARTITIONS_CODE: u32 = 402;
 pub const DELETE_PARTITIONS_CODE: u32 = 403;
+pub const GET_PARTITIONS_CODE: u32 = 404;
 
 // -- Segments --
 pub const DELETE_SEGMENTS_CODE: u32 = 503;
@@ -171,6 +172,7 @@ mod tests {
         DELETE_TOPIC_CODE,
         CREATE_PARTITIONS_CODE,
         DELETE_PARTITIONS_CODE,
+        GET_PARTITIONS_CODE,
         DELETE_SEGMENTS_CODE,
         GET_CONSUMER_GROUP_CODE,
         GET_CONSUMER_GROUPS_CODE,

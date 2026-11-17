@@ -16,10 +16,11 @@
 // under the License.
 
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::wire_conversions::{identifier_to_wire, permissions_to_wire, users_from_wire};
+use crate::wire_conversions::{identifier_to_wire, page_from_wire, permissions_to_wire};
 use crate::{
-    BinaryClient, Credentials, Identifier, IdentityInfo, IggyError, Permissions, UserClient,
-    UserCreateOptions, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
+    BinaryClient, Credentials, Identifier, IdentityInfo, IggyError, NamedPageQuery, Page,
+    Permissions, UserClient, UserCreateOptions, UserInfo, UserInfoDetails, UserStatus,
+    UserUpdateOptions,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
@@ -27,12 +28,14 @@ use iggy_binary_protocol::codes::{
     CHANGE_PASSWORD_CODE, CREATE_USER_CODE, DELETE_USER_CODE, GET_USER_CODE, GET_USERS_CODE,
     LOGOUT_USER_CODE, UPDATE_PERMISSIONS_CODE,
 };
+use iggy_binary_protocol::primitives::page::WirePageQuery;
 use iggy_binary_protocol::requests::system::ResourceTarget;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
     LogoutUserRequest, UpdatePermissionsRequest,
 };
-use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
+use iggy_binary_protocol::responses::PageResponse;
+use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
 use secrecy::SecretString;
 
 #[async_trait::async_trait]
@@ -54,15 +57,23 @@ impl<B: BinaryClient> UserClient for B {
     }
 
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
+        super::read_whole_list(
+            self,
+            |query| async move { self.get_users_page(&query).await },
+        )
+        .await
+    }
+
+    async fn get_users_page(&self, query: &NamedPageQuery) -> Result<Page<UserInfo>, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let request = GetUsersRequest {
+            page: WirePageQuery::try_from(query)?,
+        };
         let response = self
-            .send_raw_with_response(GET_USERS_CODE, GetUsersRequest.to_bytes())
+            .send_raw_with_response(GET_USERS_CODE, request.to_bytes())
             .await?;
-        if response.is_empty() {
-            return Ok(Vec::new());
-        }
-        let wire_resp = super::decode_response::<GetUsersResponse>(&response)?;
-        users_from_wire(wire_resp)
+        let page = super::decode_response::<PageResponse<UserResponse>>(&response)?;
+        page_from_wire(page, UserInfo::try_from)
     }
 
     async fn create_user(
@@ -194,16 +205,20 @@ pub(super) async fn logout<B: BinaryClient>(client: &B, signing_in: bool) -> Res
 mod tests {
     use super::*;
     use crate::{
-        BinaryTransport, Client, ClientState, ConsumerGroupClientState, DiagnosticEvent,
-        NonZeroIggyDuration, OptionKey, PartitionContext, VsrSessionControl, VsrSessionSealed,
+        BinaryOperationLineage, BinaryTransport, Client, ClientState, ConsumerGroupClientState,
+        DiagnosticEvent, NonZeroIggyDuration, OptionKey, PartitionContext, VsrSessionControl,
+        VsrSessionSealed, binary_deadline_in_force, binary_operation_lineage,
     };
     use async_broadcast::Receiver;
     use bytes::Bytes;
+    use iggy_binary_protocol::primitives::page::WirePageCursor;
     use iggy_binary_protocol::requests::messages::PollMessagesRequest;
     use iggy_binary_protocol::requests::system::SessionIdentity;
     use iggy_binary_protocol::requests::users::login_register::BindSecret;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio::time::Instant;
 
     #[tokio::test]
     async fn given_short_username_and_status_reset_when_updating_user_should_report_admission_category()
@@ -228,10 +243,44 @@ mod tests {
         assert!(client.sent_codes().is_empty());
     }
 
-    /// An authenticated binary client that records the codes it sends.
+    #[tokio::test]
+    async fn given_a_sign_in_after_the_first_page_when_reading_all_users_should_keep_the_scope_of_the_walk()
+     {
+        let client = RecordingClient::default();
+        let page = |next| {
+            PageResponse::<UserResponse> {
+                items: Vec::new(),
+                next,
+            }
+            .to_bytes()
+        };
+        client
+            .replies
+            .lock()
+            .expect("lock")
+            .extend([page(Some(WirePageCursor::Id(1))), page(None)]);
+
+        assert!(client.get_users().await.expect("whole list").is_empty());
+
+        let scopes = client.scopes.lock().expect("lock").clone();
+        let walk = Some(BinaryOperationLineage::new(OPERATION_OWNER, 0));
+        assert_eq!(client.sent_codes(), [GET_USERS_CODE, GET_USERS_CODE]);
+        assert!(scopes.iter().all(|(lineage, _)| *lineage == walk));
+        assert!(scopes[0].1.is_some());
+        assert_eq!(scopes[0].1, scopes[1].1);
+    }
+
+    const OPERATION_OWNER: u128 = 1;
+
+    /// An authenticated binary client that records the codes it sends and the
+    /// sign-in and deadline that each request runs under. It answers each
+    /// request with the next of `replies`, and then the caller signs in again.
     #[derive(Debug, Default)]
     struct RecordingClient {
         sent: Mutex<Vec<u32>>,
+        replies: Mutex<VecDeque<Bytes>>,
+        sign_in_lineage: AtomicU64,
+        scopes: Mutex<Vec<(Option<BinaryOperationLineage>, Option<Instant>)>>,
         consumer_groups: Arc<ConsumerGroupClientState>,
     }
 
@@ -242,12 +291,29 @@ mod tests {
 
         fn record(&self, code: u32) -> Result<Bytes, IggyError> {
             self.sent.lock().expect("lock").push(code);
-            Ok(Bytes::new())
+            self.scopes
+                .lock()
+                .expect("lock")
+                .push((binary_operation_lineage(), binary_deadline_in_force()));
+            self.sign_in_lineage.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .replies
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_default())
         }
     }
 
     #[async_trait::async_trait]
     impl BinaryTransport for RecordingClient {
+        fn operation_lineage(&self) -> Option<BinaryOperationLineage> {
+            Some(BinaryOperationLineage::capture(
+                OPERATION_OWNER,
+                self.sign_in_lineage.load(Ordering::SeqCst),
+            ))
+        }
+
         async fn get_state(&self) -> ClientState {
             ClientState::Authenticated
         }

@@ -20,6 +20,8 @@
 package org.apache.iggy.client.async;
 
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
@@ -82,9 +84,23 @@ public interface UsersClient {
     /**
      * Get a list of the users currently registered.
      *
+     * <p>The client reads the list in pages of up to 1000 users, so the list is not one consistent read. All pages
+     * share the sign-in and the request timeout of the call, so a new sign-in during the read fails it. The call
+     * fails with {@link org.apache.iggy.exception.IggyMalformedResponseException} when the server answers the page
+     * cursor it was sent.
+     *
      * @return A {@link CompletableFuture} that completes with a list of {@link UserInfo} about each of the registered users.
      */
     CompletableFuture<List<UserInfo>> getUsers();
+
+    /**
+     * Get one page of the registered users. The name filter applies to the username.
+     *
+     * @param query the order, limit, cursor and name filter of the page
+     * @return a {@link CompletableFuture} that completes with the page, or fails with an invalid command error when
+     *         the query breaks the page rules
+     */
+    CompletableFuture<Page<UserInfo>> getUsersPage(NamedPageQuery query);
 
     /**
      * Create a user with the details provided and no options.

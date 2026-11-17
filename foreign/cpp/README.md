@@ -108,10 +108,12 @@ errors from these methods:
 - `StoreConsumerOffset`, `StoreConsumerPosition`, `DeleteConsumerOffset`, and `DeleteConsumerPosition`.
 - `PollMessages`, `PendingPoll::Wait`, `Reader`, and the calls of `PartitionReader`.
 - `GetMetadataChanges`.
+- `GetStreamsPage`, `GetTopicsPage`, `GetPartitionsPage`, `GetConsumerGroupsPage`, and `GetUsersPage`.
 
-Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.
+Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` and the page methods are the exception: they report every invalid query as `invalid_command`, including one the bridge refuses.
 
-Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the metadata change functions, which record invalid input as `invalid_command`.
+Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. The page functions take it as the last argument too.
+It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the metadata change functions, which record invalid input as `invalid_command`. The page functions record an invalid query as `invalid_command` too.
 
 `send_binary_request_to_replica(code, payload, replica_id, error_info)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
@@ -178,6 +180,40 @@ frozen request bytes. Configure both limits with
 `max_pending_operation_bytes` query parameters for TCP, QUIC, and WebSocket.
 HTTP continues to use its configured transport behavior and has no retained
 operation recovery.
+
+## List pages
+
+`GetStreamsPage()`, `GetTopicsPage()`, `GetPartitionsPage()`, `GetConsumerGroupsPage()` and `GetUsersPage()` read one page of a list. A page holds `Items()` and `Next()`, the cursor text of the next page. `Next()` is absent on the last page.
+
+A `PageQuery` sets the order, the direction, the limit and the cursor. The order is `PageOrder::Id` or `PageOrder::Created`, and the limit is 1 to 1000, 100 by default. A `NamedPageQuery` holds a `PageQuery` in `Page()` and adds a name filter. The streams, topics, consumer groups and users page methods take a `NamedPageQuery`. `GetPartitionsPage()` takes a `PageQuery`, which has no name.
+
+```cpp
+// Reads every stream whose name holds "orders", 50 streams per page.
+void PrintOrderStreams(iggy::IggyBlockingClient &client) {
+    iggy::NamedPageQuery query(iggy::PageQuery().SetLimit(50));
+    query.SetName("orders");
+    while (true) {
+        const auto page = client.GetStreamsPage(query);
+        for (const auto &stream : page.Items()) {
+            Print(stream);
+        }
+        if (!page.Next()) {
+            break;
+        }
+        query.Page().SetCursor(*page.Next());
+    }
+}
+```
+
+A cursor is valid only with the order, direction, name and parent of the query that returned it. If you pass `Next()` back, keep the other settings of the query. A page can be short or empty and still have a `Next()`. The name filter is case-sensitive text of 1 to 255 bytes.
+
+An invalid query is refused with `invalid_command` (3) before anything is sent. Over TCP, QUIC and WebSocket, the server refuses a cursor of another order with `invalid_command` too. Over HTTP, a refusal of the server arrives as `http_response_error` (300).
+
+Each transport reads pages through the Rust SDK, and the Rust integration tests cover all four transports. The E2E tests of this binding read pages over TCP only.
+
+`GetStreams()`, `GetTopics()`, `GetConsumerGroups()` and `GetUsers()` return the whole list. Over TCP, QUIC and WebSocket, they read pages of 1000 in id order, so the result is not one consistent read. If the server answers a page with the cursor it was sent, they throw, because such a walk never ends. Over HTTP, the server builds the list from its pages and sends one reply.
+
+Over TCP, QUIC and WebSocket, the `GetTopic()` reply of a topic with very many partitions can be too large. The server then sends the error `reply_too_large` (97) in place of the reply. `GetTopic()` reports it through the exception message only. `GetPartitionsPage()` reads those partitions in smaller replies.
 
 ## Metadata changes
 

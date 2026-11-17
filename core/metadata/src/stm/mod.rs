@@ -25,6 +25,7 @@ pub mod result;
 pub mod snapshot;
 pub mod stream;
 pub mod user;
+pub mod walk;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::Either;
 use left_right::{Absorb, ReadHandle, ReadHandleFactory, WriteHandle};

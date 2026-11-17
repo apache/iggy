@@ -662,7 +662,7 @@ public sealed partial class NativeRecoveryTests
         return release.Task;
     }
 
-    private sealed class HeldContinuations : SynchronizationContext
+    internal sealed class HeldContinuations : SynchronizationContext
     {
         private readonly ConcurrentQueue<(SendOrPostCallback Callback, object? State)> _pending = new();
         internal SemaphoreSlim Posted { get; } = new(0);

@@ -24,7 +24,7 @@ use crate::{
             low_level::LowLevelProducerClient,
         },
     },
-    utils::finish_condition::BenchmarkFinishCondition,
+    utils::{finish_condition::BenchmarkFinishCondition, warmup::BenchmarkWarmup},
 };
 use bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
@@ -50,7 +50,7 @@ impl TypedBenchmarkProducer {
         messages_per_batch: BenchmarkNumericParameter,
         message_size: BenchmarkNumericParameter,
         finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
+        warmup: BenchmarkWarmup,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
@@ -62,7 +62,7 @@ impl TypedBenchmarkProducer {
             partitions,
             messages_per_batch,
             message_size,
-            warmup_time,
+            warmup,
             pretty,
         };
 
