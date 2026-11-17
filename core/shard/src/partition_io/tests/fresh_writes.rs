@@ -28,7 +28,11 @@ use iggy_object_store::{
     FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore, ObjectStoreError,
     TierScopeToken, is_fresh_object,
 };
-use partitions::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
+use partitions::{
+    ExecutorFreshUploader, FRESH_DELETES_PER_BATCH, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome,
+    FreshListOutcome, FreshListRequest, FreshObjectSweeper, FreshObjectUploader,
+    FreshUploadOutcome,
+};
 
 fn layout() -> KeyLayout {
     KeyLayout::new("fresh-test").unwrap()
@@ -1775,4 +1779,457 @@ async fn given_an_answer_to_an_earlier_sweep_when_it_arrives_should_change_nothi
     .await;
 
     assert_eq!(fresh_objects(store), vec![object]);
+}
+
+/// A time one grace period and a second before `now`.
+fn before_grace(now: IggyTimestamp) -> IggyTimestamp {
+    let grace = u64::try_from(partitions::FRESH_OBJECT_GRACE.as_micros()).unwrap();
+    IggyTimestamp::from(now.as_micros() - grace - 1_000_000)
+}
+
+/// Store `count` fresh objects of this replica that no partition names, as
+/// `shard` wrote them in an earlier life.
+#[allow(clippy::future_not_send)]
+async fn store_orphans(
+    owner: &IoTestShard,
+    store: &MemoryStore,
+    shard: u16,
+    count: u64,
+) -> Vec<u128> {
+    use iggy_object_store::{PutBody, PutOptions};
+
+    let replica = owner.partition_consensus.self_replica_id;
+    let mut objects = Vec::new();
+    for sequence in 0..count {
+        let object = FreshObjectId::new(replica, shard, 1, sequence)
+            .unwrap()
+            .get();
+        store
+            .put(
+                &layout().fresh_key(object),
+                PutBody::from_bytes(bytes::Bytes::from_static(b"IGGYFRS1 of an earlier life")),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        objects.push(object);
+    }
+    objects
+}
+
+/// Sweeps through the owner's sweeper, except for the deletes the test
+/// tells it to leave undone.
+struct FlakySweeper {
+    sweeper: Rc<dyn FreshObjectSweeper>,
+    /// Deletes nothing while set.
+    refuses: Cell<bool>,
+    /// Objects the next delete that holds them leaves in the store.
+    keeps: RefCell<Vec<u128>>,
+    deletes: Cell<usize>,
+    /// Every listing fails at its first page while set.
+    lists_nothing: Cell<bool>,
+    lists: Cell<usize>,
+    /// The next listing ends only after this fires.
+    held_list: RefCell<Option<futures::channel::oneshot::Receiver<()>>>,
+    /// The next delete ends only after this fires.
+    held_delete: RefCell<Option<futures::channel::oneshot::Receiver<()>>>,
+}
+
+impl FlakySweeper {
+    /// Put one between `owner` and the sweeper it has.
+    fn wrap(owner: &IoTestShard) -> Rc<Self> {
+        let flaky = Rc::new(Self {
+            sweeper: owner.fresh_sweeper().unwrap(),
+            refuses: Cell::new(false),
+            keeps: RefCell::default(),
+            deletes: Cell::new(0),
+            lists_nothing: Cell::new(false),
+            lists: Cell::new(0),
+            held_list: RefCell::new(None),
+            held_delete: RefCell::new(None),
+        });
+        owner.set_fresh_sweeper(Some(flaky.clone()));
+        flaky
+    }
+}
+
+impl FreshObjectSweeper for FlakySweeper {
+    fn list(
+        &self,
+        replica: u8,
+        requests: Vec<FreshListRequest>,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, FreshListOutcome> {
+        self.lists.set(self.lists.get() + 1);
+        if let Some(held) = self.held_list.borrow_mut().take() {
+            let list = self.sweeper.list(replica, requests, scope);
+            return Box::pin(async move {
+                let _ = held.await;
+                list.await
+            });
+        }
+        if self.lists_nothing.get() {
+            let scopes = requests
+                .into_iter()
+                .map(|request| partitions::FreshListedScope {
+                    scope: request.scope,
+                    from: request.resume.and_then(|cursor| cursor.after),
+                    objects: Vec::new(),
+                    end: partitions::FreshListEnd::Failed,
+                })
+                .collect();
+            return Box::pin(std::future::ready(Ok(partitions::FreshListing {
+                scopes,
+                ..Default::default()
+            })));
+        }
+        self.sweeper.list(replica, requests, scope)
+    }
+
+    fn delete(
+        &self,
+        objects: Vec<u128>,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, FreshDeleteOutcome> {
+        self.deletes.set(self.deletes.get() + 1);
+        if self.refuses.get() {
+            return Box::pin(std::future::ready(Ok(objects)));
+        }
+        let keeps = std::mem::take(&mut *self.keeps.borrow_mut());
+        let (kept, sent): (Vec<u128>, Vec<u128>) =
+            objects.into_iter().partition(|id| keeps.contains(id));
+        let delete = self.sweeper.delete(sent, scope);
+        let held = self.held_delete.borrow_mut().take();
+        Box::pin(async move {
+            if let Some(held) = held {
+                let _ = held.await;
+            }
+            let mut failed = delete.await?;
+            failed.extend(kept);
+            Ok(failed)
+        })
+    }
+}
+
+/// Ask for a sweep at `now` until one brought the owner to `done`. A sweep
+/// asked for while another runs is dropped, and the owner starts sweeps of
+/// its own.
+#[allow(clippy::future_not_send)]
+async fn sweep_until(owner: &IoTestShard, now: IggyTimestamp, done: impl Fn(&IoTestShard) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done(owner) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sweeps did not get there"
+        );
+        owner.request_sweep_fresh_objects(now);
+        compio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A delete job takes only so many objects. The sweep runs one job after
+/// another until nothing is due, so what it deletes has no ceiling.
+#[compio::test]
+async fn given_more_objects_past_their_grace_than_one_delete_job_takes_when_a_sweep_runs_should_delete_them_all()
+ {
+    const OBJECTS: usize = FRESH_DELETES_PER_BATCH + 10;
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let sweeper = FlakySweeper::wrap(&owner);
+    Box::pin(store_orphans(&owner, store, 5, OBJECTS as u64)).await;
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        sweep(&owner, now).await;
+        assert_eq!(fresh_objects(store).len(), OBJECTS);
+        assert_eq!(
+            owner.metrics().fresh_objects_unnamed_value(),
+            i64::try_from(OBJECTS).unwrap()
+        );
+        owner.request_sweep_fresh_objects(past_grace(now));
+        until(&owner, |_| fresh_objects(store).is_empty()).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+    })
+    .await;
+
+    assert_eq!(sweeper.deletes.get(), 2);
+    assert_eq!(
+        owner.fresh_sweeps_settled(),
+        2,
+        "one sweep deleted them all"
+    );
+    assert_eq!(
+        owner.metrics().fresh_objects_deleted_value(),
+        OBJECTS as u64
+    );
+    assert_eq!(owner.metrics().fresh_sweep_backlog_value(), (0, 0));
+}
+
+/// Nothing but the shard's own tick asks for these sweeps.
+#[compio::test]
+async fn given_a_sweeper_when_the_pump_ticks_should_sweep_without_being_asked() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    Box::pin(store_orphans(&owner, store, 0, 2)).await;
+    owner.set_fresh_sweep_pace(Duration::from_millis(50), FRESH_OBJECTS_PER_SWEEP);
+
+    pumped(&owner, async {
+        until(&owner, |owner| owner.fresh_sweeps_settled() >= 2).await;
+    })
+    .await;
+
+    assert_eq!(owner.metrics().fresh_objects_value(), 2);
+    assert_eq!(owner.metrics().fresh_objects_unnamed_value(), 2);
+    assert_eq!(fresh_objects(store).len(), 2, "their grace has not passed");
+}
+
+/// The next sweep on the timer is a minute away here. The object a delete
+/// left behind goes long before that.
+#[compio::test]
+async fn given_a_sweep_that_deleted_some_objects_and_left_one_due_when_it_ends_should_start_the_next_one_at_once()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let sweeper = FlakySweeper::wrap(&owner);
+    let objects = Box::pin(store_orphans(&owner, store, 0, 3)).await;
+    owner.set_fresh_sweep_pace(Duration::from_mins(1), FRESH_OBJECTS_PER_SWEEP);
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        // The sweep the owner starts by itself reads the clock, so the
+        // objects are found unnamed in the past.
+        sweep(&owner, before_grace(now)).await;
+        sweeper.keeps.borrow_mut().push(objects[0]);
+        owner.request_sweep_fresh_objects(now);
+        until(&owner, |_| fresh_objects(store).is_empty()).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+    })
+    .await;
+
+    assert_eq!(owner.fresh_sweeps_settled(), 3);
+    assert_eq!(sweeper.deletes.get(), 2);
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 3);
+    assert_eq!(owner.metrics().fresh_sweep_backlog_value(), (0, 0));
+}
+
+/// A store that deletes nothing is not asked again without a pause, and the
+/// objects it keeps past their grace show in a gauge.
+#[compio::test]
+async fn given_a_store_that_deletes_nothing_when_a_sweep_ends_should_report_the_objects_left_due_and_wait_for_the_timer()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let sweeper = FlakySweeper::wrap(&owner);
+    Box::pin(store_orphans(&owner, store, 0, 2)).await;
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        sweep(&owner, before_grace(now)).await;
+        assert_eq!(owner.metrics().fresh_sweep_backlog_value(), (0, 0));
+        sweeper.refuses.set(true);
+        sweep(&owner, now).await;
+        assert_eq!(owner.metrics().fresh_sweep_backlog_value(), (0, 2));
+        compio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(owner.fresh_sweeps_settled(), 2);
+        assert_eq!(sweeper.deletes.get(), 1);
+        assert_eq!(fresh_objects(store).len(), 2);
+
+        sweeper.refuses.set(false);
+        sweep(&owner, now).await;
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
+    assert_eq!(owner.metrics().fresh_sweep_backlog_value(), (0, 0));
+}
+
+/// The gauge of listed objects holds only what one sweep listed. Another
+/// one says that the listings stopped short, so the first is not read as
+/// the whole store. The sweep found nothing to do, so it waits for the timer.
+#[compio::test]
+async fn given_listings_that_stop_at_their_share_of_keys_when_a_sweep_ends_should_report_how_many_did()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor, asked) = Box::pin(first_of_two_shards(directory.path())).await;
+    let store = executor.0.store();
+    let objects = Box::pin(store_orphans(&owner, store, 1, 3)).await;
+    // One key for each shard and one for the replica as a whole.
+    owner.set_fresh_sweep_pace(Duration::from_mins(1), 3);
+
+    pumped(&owner, async {
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, IggyTimestamp::now()).await;
+        answer_as_second_shard(&owner, sweep, Some(&objects));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 1).await;
+        compio::time::sleep(Duration::from_millis(100)).await;
+        assert!(asked.is_empty(), "no sweep follows at once");
+    })
+    .await;
+
+    assert_eq!(owner.metrics().fresh_objects_value(), 1);
+    assert_eq!(
+        owner.metrics().fresh_sweep_backlog_value(),
+        (2, 0),
+        "the listing of the second shard and the one of the replica"
+    );
+}
+
+/// The first shard's directory holds more objects than a sweep lists of it.
+/// The sweeps follow each other at once while they find objects, each from
+/// where the last stopped, and they reach the directory of a shard this node
+/// no longer runs. Every object is found and then deleted.
+#[compio::test]
+async fn given_a_shard_that_holds_more_objects_than_a_sweep_lists_when_sweeps_run_should_find_and_delete_those_of_every_shard()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    Box::pin(store_orphans(&owner, store, 0, 6)).await;
+    Box::pin(store_orphans(&owner, store, 5, 1)).await;
+    // Two keys for the shard and two for the replica as a whole.
+    owner.set_fresh_sweep_pace(Duration::from_mins(1), 4);
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        owner.request_sweep_fresh_objects(now);
+        until(&owner, |owner| {
+            owner.metrics().fresh_objects_unnamed_value() == 7
+        })
+        .await;
+        assert!(owner.fresh_sweeps_settled() >= 4);
+        assert_eq!(fresh_objects(store).len(), 7);
+
+        // Past the grace of the object that was found last. Each sweep
+        // lists two objects of the shard, and deletes all seven.
+        sweep_until(&owner, past_grace(IggyTimestamp::now()), |_| {
+            fresh_objects(store).is_empty()
+        })
+        .await;
+    })
+    .await;
+
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 7);
+}
+
+/// An object found unnamed stays due whether a later sweep lists it or not.
+/// A sweep that listed nothing still asks the shards before it deletes one,
+/// and keeps what a shard names.
+#[compio::test]
+async fn given_a_sweep_that_listed_nothing_when_an_object_found_earlier_is_due_should_ask_the_shards_before_deleting_it()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor, asked) = Box::pin(first_of_two_shards(directory.path())).await;
+    let store = executor.0.store();
+    let sweeper = FlakySweeper::wrap(&owner);
+    let object = Box::pin(store_unnamed_object(&owner, store)).await;
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, now).await;
+        answer_as_second_shard(&owner, sweep, Some(&[]));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 1).await;
+
+        sweeper.lists_nothing.set(true);
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, past_grace(now)).await;
+        answer_as_second_shard(&owner, sweep, Some(&[object]));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 2).await;
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fresh_objects(store), vec![object]);
+        assert_eq!(sweeper.deletes.get(), 0);
+
+        // Named no more: it is due once the grace passed again, from the
+        // sweep that lists it once more.
+        sweeper.lists_nothing.set(false);
+        let later = past_grace(now);
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, later).await;
+        answer_as_second_shard(&owner, sweep, Some(&[]));
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 3).await;
+        let sweep = sweep_asking_the_second_shard(&owner, &asked, past_grace(later)).await;
+        answer_as_second_shard(&owner, sweep, Some(&[]));
+        until(&owner, |_| fresh_objects(store).is_empty()).await;
+    })
+    .await;
+
+    assert_eq!(sweeper.deletes.get(), 1);
+}
+
+/// A partition in a view change may be missing batches its group holds, so
+/// its shard cannot tell what it needs, and the sweep deletes nothing.
+#[compio::test]
+async fn given_a_placing_partition_that_is_not_normal_when_a_sweep_runs_past_the_grace_should_delete_nothing()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let sweeper = FlakySweeper::wrap(&owner);
+    Box::pin(store_orphans(&owner, store, 0, 1)).await;
+    let now = IggyTimestamp::now();
+
+    pumped(&owner, async {
+        sweep(&owner, before_grace(now)).await;
+        let partitions = owner.plane.partitions();
+        let consensus = partitions.get_by_ns(&namespace()).unwrap().consensus();
+        let MessageBag::StartViewChange(change) = view_control_message(
+            namespace(),
+            Command::StartViewChange,
+            consensus.view() + 1,
+            consensus.replica(),
+        ) else {
+            unreachable!()
+        };
+        consensus.handle_start_view_change(consensus::PlaneKind::Partitions, change.header());
+        assert!(!consensus.is_normal());
+
+        owner.request_sweep_fresh_objects(now);
+        compio::time::sleep(Duration::from_millis(200)).await;
+    })
+    .await;
+
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+    assert_eq!(sweeper.deletes.get(), 0);
+    assert_eq!(fresh_objects(store).len(), 1);
+}
+
+/// One sweep at a time: a sweep asked for while a listing or a delete of
+/// another runs starts nothing, however often it is asked for.
+#[compio::test]
+async fn given_a_sweep_in_flight_when_more_sweeps_are_asked_for_should_start_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let sweeper = FlakySweeper::wrap(&owner);
+    Box::pin(store_orphans(&owner, store, 0, 1)).await;
+    let now = IggyTimestamp::now();
+    let ask_often = || async {
+        for _ in 0..12 {
+            owner.request_sweep_fresh_objects(past_grace(now));
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+
+    pumped(&owner, async {
+        let (release, held) = futures::channel::oneshot::channel();
+        *sweeper.held_list.borrow_mut() = Some(held);
+        owner.request_sweep_fresh_objects(now);
+        until(&owner, |_| sweeper.lists.get() == 1).await;
+        ask_often().await;
+        assert_eq!(sweeper.lists.get(), 1);
+        release.send(()).unwrap();
+        until(&owner, |owner| owner.fresh_sweeps_settled() == 1).await;
+
+        let (release, held) = futures::channel::oneshot::channel();
+        *sweeper.held_delete.borrow_mut() = Some(held);
+        owner.request_sweep_fresh_objects(past_grace(now));
+        until(&owner, |_| sweeper.deletes.get() == 1).await;
+        ask_often().await;
+        assert_eq!(sweeper.lists.get(), 2);
+        release.send(()).unwrap();
+        until(&owner, |_| fresh_objects(store).is_empty()).await;
+    })
+    .await;
+
+    assert_eq!(owner.fresh_sweeps_settled(), 2);
 }

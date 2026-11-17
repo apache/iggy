@@ -439,6 +439,7 @@ where
                         break;
                     }
                     self.tick_fresh_writes().await;
+                    self.tick_fresh_sweeps();
                     self.tick_long_term_rewrites().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
