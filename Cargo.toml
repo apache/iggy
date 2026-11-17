@@ -81,7 +81,7 @@ async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.92"
 async_zip = { version = "0.0.19", features = ["tokio", "lzma", "bzip2", "xz", "deflate", "zstd"] }
 axum = { version = "0.8.9", features = ["macros"] }
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+axum-server = { version = "0.9.0", features = ["tls-rustls"] }
 base64 = "0.23.1"
 bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
 bench-report = { path = "core/bench/report" }
@@ -265,7 +265,7 @@ system_stats = { path = "core/system_stats" }
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.4.1"
-testcontainers = { version = "0.27.3", features = ["http_wait_plain", "reusable-containers"] }
+testcontainers = { version = "0.28.0", features = ["http_wait_plain", "reusable-containers"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = "0.26.6"
