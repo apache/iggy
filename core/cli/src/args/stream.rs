@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::args::common::{GetOutput, ListOutputArgs, parse_key_value, split_reset};
+use crate::args::common::{GetOutput, ListOutputArgs, NamedPageArgs, parse_key_value, split_reset};
 use clap::{Args, Subcommand};
 use iggy::prelude::{Identifier, StreamUpdateOptions};
 use std::path::PathBuf;
@@ -66,6 +66,8 @@ pub(crate) enum StreamAction {
     ///  iggy stream list
     ///  iggy stream list --list-mode table
     ///  iggy stream list -l table
+    ///  iggy stream list --sort created --desc --limit 20
+    ///  iggy stream list --name prod --limit 50 --after pg1_AQcAAAAAAAAA
     #[clap(verbatim_doc_comment, visible_alias = "l")]
     List(StreamListArgs),
 }
@@ -146,6 +148,9 @@ pub(crate) struct StreamGetArgs {
 pub(crate) struct StreamListArgs {
     #[command(flatten)]
     pub(crate) list_output: ListOutputArgs,
+
+    #[command(flatten)]
+    pub(crate) page: NamedPageArgs,
 }
 
 #[cfg(test)]

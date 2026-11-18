@@ -57,6 +57,7 @@ pub mod command_line;
 pub mod cpu_name;
 pub mod finish_condition;
 pub mod rate_limiter;
+pub mod warmup;
 
 /// Runs of one command that start within the same second get the suffixes `_2` up to this.
 const MAX_RUN_DIR_ATTEMPTS: u32 = 100;
@@ -250,7 +251,6 @@ pub fn options_from_args(args: &IggyBenchArgs) -> BenchmarkOptions {
             max_wait_us: args.max_wait.as_micros(),
             min_count: args.min_count,
             max_bytes: args.max_bytes,
-            read_amplification: args.read_amplification(),
         }),
         client: BenchmarkClientOptions {
             warmup_time_us: args.warmup_time().as_micros(),
@@ -553,7 +553,6 @@ mod tests {
         "max_wait",
         "min_count",
         "max_bytes",
-        "read_amplification",
         "warmup_time",
         "high_level_api",
         "reuse_streams",
@@ -802,8 +801,6 @@ mod tests {
             "1GiB",
             "--message-expiry",
             "1h",
-            "--read-amplification",
-            "1.5",
             "tcp",
             "--nodelay",
             "--tls",
@@ -825,7 +822,6 @@ mod tests {
                     max_wait_us: 250_000,
                     min_count: 10,
                     max_bytes: Some(2_097_152),
-                    read_amplification: Some(1.5),
                 }),
                 client: BenchmarkClientOptions {
                     warmup_time_us: 5_000_000,

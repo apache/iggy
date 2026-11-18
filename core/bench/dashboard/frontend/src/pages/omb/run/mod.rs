@@ -28,6 +28,7 @@ mod related;
 
 use std::rc::Rc;
 
+use bench_dashboard_shared::omb::chart::WindowMetric;
 use bench_dashboard_shared::omb::compare::OmbComparability;
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
@@ -39,7 +40,7 @@ use yew_router::prelude::Link;
 
 use self::advanced::Advanced;
 use self::change::{Change, KPIS, Kpi};
-use self::chart::{DetailRef, WindowChart, WindowMetric};
+use self::chart::{DetailRef, WindowChart};
 use self::facts::{
     END_TO_END_TITLE, Fact, FactGroup, NO_SIDECAR_NOTE, UNRECORDED, end_to_end_side,
     environment_groups, estimated_start, ladder, property_groups, publish_side, workload_facts,

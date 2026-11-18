@@ -20,14 +20,13 @@
 
 use std::iter;
 
+use bench_dashboard_shared::omb::chart::{PERCENTILE_LABELS, percentile_values};
 use bench_dashboard_shared::omb::compare::OmbComparability;
 use bench_dashboard_shared::omb::result::OmbPercentiles;
 use bench_dashboard_shared::omb::summary::OmbRunSummary;
 
 use crate::components::run_labels::{messages_text, milliseconds};
-use crate::pages::omb::common::{
-    NOT_MEASURED, PERCENTILE_LABELS, change_text, mebibytes_text, percentile_values, short_id,
-};
+use crate::pages::omb::common::{NOT_MEASURED, change_text, mebibytes_text, short_id};
 use crate::pages::run::change::percent_change;
 
 const AVERAGE_LABEL: &str = "Avg";

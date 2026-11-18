@@ -776,6 +776,14 @@ async fn given_weak_offset_durability_when_owner_changes_should_preserve_progres
     ));
 
     harness.kill_cluster().unwrap();
+    // Without the cut a restart keeps the records that the OS still holds,
+    // and the offset survives whether or not the owner change published it.
+    for node in 0..harness.cluster_size() {
+        integration::harness::disk::drop_unpublished_partition_wal_tail(
+            &harness.node(node).data_path(),
+        )
+        .unwrap();
+    }
     harness.restart_cluster().await.unwrap();
     let recovered = harness.tcp_root_client().await.unwrap();
     timeout(RESOLVE_TIMEOUT, async {

@@ -28,7 +28,7 @@
 //! service, see [`ExecutorObjects`].
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 use std::time::Duration;
@@ -186,49 +186,237 @@ pub const FRESH_READ_GAP_BYTES: u64 = 256 * 1024;
 /// blobs of several batches. A single blob is read whatever its size.
 pub const FRESH_READ_BYTES_MAX: u64 = 8 * 1024 * 1024;
 
-/// The bytes of fresh objects that this shard stored or fetched, oldest
-/// first. Losing any of it loses nothing: a read that misses goes to the
-/// store.
-struct FreshCache {
-    /// A whole object, or the range of one that starts at a position.
-    entries: VecDeque<(u128, u64, Bytes)>,
-    bytes: usize,
+/// The part of the cache's budget, one in this many, that the objects this
+/// shard stored never take, so what polls fetched from the store can serve
+/// the next poll of the same bytes while the uploads fill the rest. One read
+/// of [`FRESH_READ_BYTES_MAX`] fits in it.
+const FRESH_CACHE_FETCHED_SHARE: usize = 8;
+
+const _: () =
+    assert!((FRESH_CACHE_BYTES / FRESH_CACHE_FETCHED_SHARE) as u64 >= FRESH_READ_BYTES_MAX);
+
+/// One buffer the cache keeps.
+struct CachedBytes {
+    bytes: Bytes,
+    /// Bytes of memory the buffer holds, which can be more than its length.
+    held: usize,
+    used_at: u64,
+}
+
+/// Buffers by key, with the order they were last used in.
+struct RecentBytes<K> {
+    entries: BTreeMap<K, CachedBytes>,
+    /// The key used at each turn, the least recent first.
+    order: BTreeMap<u64, K>,
+    turn: u64,
+    held: usize,
+}
+
+impl<K: Ord + Copy> RecentBytes<K> {
+    const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: BTreeMap::new(),
+            turn: 0,
+            held: 0,
+        }
+    }
+
+    fn insert(&mut self, key: K, bytes: Bytes, held: usize) {
+        self.remove(&key);
+        self.turn += 1;
+        self.held += held;
+        self.order.insert(self.turn, key);
+        self.entries.insert(
+            key,
+            CachedBytes {
+                bytes,
+                held,
+                used_at: self.turn,
+            },
+        );
+    }
+
+    fn mark_used(&mut self, key: K) {
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return;
+        };
+        self.order.remove(&entry.used_at);
+        self.turn += 1;
+        entry.used_at = self.turn;
+        self.order.insert(self.turn, key);
+    }
+
+    fn remove(&mut self, key: &K) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.order.remove(&entry.used_at);
+            self.held -= entry.held;
+        }
+    }
+
+    /// Drop the entry used the longest ago. `false` when none is left.
+    fn drop_least_recent(&mut self) -> bool {
+        let Some((_, key)) = self.order.pop_first() else {
+            return false;
+        };
+        if let Some(entry) = self.entries.remove(&key) {
+            self.held -= entry.held;
+        }
+        true
+    }
+}
+
+/// The bytes of fresh objects that this shard stored or fetched. Losing any
+/// of it loses nothing: a read that misses goes to the store.
+///
+/// The two kinds are kept apart. A consumer far behind fetches old objects
+/// faster than anything reads them twice, and in one order with the stored
+/// objects it would push out the ones the consumers at the tail read next.
+/// So a fetched range only ever takes the place of another fetched range,
+/// and a stored object takes the place of fetched ranges first.
+struct FreshCache<Id = u128> {
+    /// Whole objects this shard stored, by object id.
+    stored: RecentBytes<Id>,
+    /// Ranges read from the store, by object id and the position each starts
+    /// at. No range of an object lies inside another, so the one that starts
+    /// last at or before a position is the only one that can hold it.
+    fetched: RecentBytes<(Id, u64)>,
+    /// The most memory both kinds hold together.
     budget: usize,
 }
 
-impl FreshCache {
+impl<Id: Ord + Copy> FreshCache<Id> {
     const fn new(budget: usize) -> Self {
         Self {
-            entries: VecDeque::new(),
-            bytes: 0,
+            stored: RecentBytes::new(),
+            fetched: RecentBytes::new(),
             budget,
         }
     }
 
-    /// Keep `bytes`, which sit at `position` of the object `object_id`, and
-    /// drop the oldest entries past the budget. Bytes larger than the budget
-    /// are not kept.
-    fn insert(&mut self, object_id: u128, position: u64, bytes: Bytes) {
-        if bytes.len() > self.budget {
+    /// The most memory the stored objects hold.
+    const fn stored_budget(&self) -> usize {
+        self.budget - self.budget / FRESH_CACHE_FETCHED_SHARE
+    }
+
+    const fn held(&self) -> usize {
+        self.stored.held + self.fetched.held
+    }
+
+    /// Keep the whole object `object_id`, which this shard stored. It takes
+    /// the place of fetched ranges, and of the stored objects used the
+    /// longest ago. An object larger than the room of its kind is not kept.
+    fn insert_stored(&mut self, object_id: Id, bytes: Bytes) {
+        let limit = self.stored_budget();
+        if bytes.len() > limit {
             return;
         }
-        self.bytes += bytes.len();
-        self.entries.push_back((object_id, position, bytes));
-        while self.bytes > self.budget {
-            let Some((_, _, dropped)) = self.entries.pop_front() else {
-                break;
-            };
-            self.bytes -= dropped.len();
+        let (bytes, held) = held_within(bytes, limit);
+        self.stored.insert(object_id, bytes, held);
+        while self.stored.held > limit && self.stored.drop_least_recent() {}
+        while self.held() > self.budget && self.fetched.drop_least_recent() {}
+    }
+
+    /// Keep `bytes`, which were read from `position` of the object
+    /// `object_id`, in the place of the fetched ranges used the longest ago.
+    /// Bytes larger than the room the stored objects leave are not kept.
+    /// Returns the bytes as the caller should hold them.
+    ///
+    /// What the store returns can be a view into a larger buffer of its
+    /// transport, which no owner of the view can measure. So the cache keeps
+    /// a copy of exactly the range.
+    fn insert(&mut self, object_id: Id, position: u64, bytes: Bytes) -> Bytes {
+        let room = self.budget.saturating_sub(self.stored.held);
+        let end = position.saturating_add(bytes.len() as u64);
+        if bytes.is_empty() || bytes.len() > room || self.get(object_id, &(position..end)).is_some()
+        {
+            return bytes;
         }
+        let bytes = Bytes::copy_from_slice(&bytes);
+        let held = bytes.len();
+        let inside: Vec<_> = self
+            .fetched
+            .entries
+            .range((object_id, position)..(object_id, end))
+            .filter(|((_, start), entry)| start + entry.bytes.len() as u64 <= end)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in inside {
+            self.fetched.remove(&key);
+        }
+        self.fetched
+            .insert((object_id, position), bytes.clone(), held);
+        while self.held() > self.budget && self.fetched.drop_least_recent() {}
+        bytes
     }
 
     /// `range` of the object `object_id`, when one entry holds all of it.
-    fn get(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
-        self.entries.iter().rev().find_map(|(id, position, bytes)| {
-            let start = usize::try_from(range.start.checked_sub(*position)?).ok()?;
-            let end = usize::try_from(range.end.checked_sub(*position)?).ok()?;
-            (*id == object_id && end <= bytes.len()).then(|| bytes.slice(start..end))
-        })
+    fn get(&mut self, object_id: Id, range: &Range<u64>) -> Option<Bytes> {
+        let stored = self
+            .stored
+            .entries
+            .get(&object_id)
+            .and_then(|entry| slice_at(&entry.bytes, 0, range));
+        if let Some(bytes) = stored {
+            self.stored.mark_used(object_id);
+            return Some(bytes);
+        }
+        let (key, bytes) = self
+            .fetched
+            .entries
+            .range((object_id, 0)..=(object_id, range.start))
+            .next_back()
+            .and_then(|(key, entry)| Some((*key, slice_at(&entry.bytes, key.1, range)?)))?;
+        self.fetched.mark_used(key);
+        Some(bytes)
+    }
+}
+
+/// `range` of an object out of `bytes`, which start at `position` of it.
+fn slice_at(bytes: &Bytes, position: u64, range: &Range<u64>) -> Option<Bytes> {
+    let start = usize::try_from(range.start.checked_sub(position)?).ok()?;
+    let end = usize::try_from(range.end.checked_sub(position)?).ok()?;
+    (end <= bytes.len()).then(|| bytes.slice(start..end))
+}
+
+/// `bytes` as the cache keeps them, and the memory they hold.
+///
+/// A buffer that grew by doubling holds up to twice its length. One with no
+/// other owner is kept as it is while its capacity is within `limit`, so
+/// keeping it copies nothing. Any other buffer is copied to its length: one
+/// that is shared can hold more memory than this owner can measure.
+fn held_within(bytes: Bytes, limit: usize) -> (Bytes, usize) {
+    let exact = |bytes: &[u8]| (Bytes::copy_from_slice(bytes), bytes.len());
+    match bytes.try_into_mut() {
+        Ok(unique) if unique.capacity() <= limit => {
+            let held = unique.capacity();
+            (unique.freeze(), held)
+        }
+        Ok(unique) => exact(&unique),
+        Err(shared) => exact(&shared),
+    }
+}
+
+/// What one fetch read of a fresh object.
+#[derive(Default)]
+pub struct FreshReads {
+    object_id: u128,
+    /// Each read with the position it starts at, in the order of the
+    /// positions. No read lies inside another.
+    reads: Vec<(u64, Bytes)>,
+}
+
+impl FreshReads {
+    /// `range` of the object `object_id`, when one read holds all of it.
+    pub(crate) fn get(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
+        if object_id != self.object_id {
+            return None;
+        }
+        let after = self
+            .reads
+            .partition_point(|(position, _)| *position <= range.start);
+        let (position, bytes) = self.reads.get(after.checked_sub(1)?)?;
+        slice_at(bytes, *position, range)
     }
 }
 
@@ -252,10 +440,18 @@ impl RemoteSegments {
         }
     }
 
+    /// Keep at most `budget` bytes of fresh objects in memory.
+    #[cfg(test)]
+    pub(crate) fn set_fresh_cache_bytes(&mut self, budget: usize) {
+        self.fresh = RefCell::new(FreshCache::new(budget));
+    }
+
     /// Keep the bytes of the fresh object `object_id`, which this shard has
-    /// just stored, so that polls of its batches need no fetch.
+    /// just stored, so that polls of its batches need no fetch. Bytes that
+    /// the shard built and no longer shares are kept without a copy, and
+    /// count as the capacity of their buffer.
     pub fn cache_fresh_object(&self, object_id: u128, bytes: Bytes) {
-        self.fresh.borrow_mut().insert(object_id, 0, bytes);
+        self.fresh.borrow_mut().insert_stored(object_id, bytes);
     }
 
     /// The bytes at `range` of the fresh object `object_id`: the blob of one
@@ -269,7 +465,7 @@ impl RemoteSegments {
         object_id: u128,
         range: Range<u64>,
     ) -> Result<Bytes, DiskFault> {
-        let cached = self.fresh.borrow().get(object_id, &range);
+        let cached = self.fresh.borrow_mut().get(object_id, &range);
         if let Some(bytes) = cached {
             return Ok(bytes);
         }
@@ -291,10 +487,10 @@ impl RemoteSegments {
             );
             return Err(DiskFault::Tiered);
         }
-        self.fresh
+        Ok(self
+            .fresh
             .borrow_mut()
-            .insert(object_id, range.start, object.bytes.clone());
-        Ok(object.bytes)
+            .insert(object_id, range.start, object.bytes))
     }
 
     /// The bytes at `range` of the long-term segment object `key`, cut at
@@ -316,10 +512,11 @@ impl RemoteSegments {
     }
 
     /// Fetch the blobs at `ranges` of the fresh object `object_id` that this
-    /// shard does not hold, so that [`Self::read_fresh`] finds them in
-    /// memory. Blobs that sit within [`FRESH_READ_GAP_BYTES`] of each other
-    /// come in one read of at most [`FRESH_READ_BYTES_MAX`], so a poll of
-    /// many batches of one object asks the store once and not once a batch.
+    /// shard does not hold, and return what was read. Blobs that sit within
+    /// [`FRESH_READ_GAP_BYTES`] of each other come in one read of at most
+    /// [`FRESH_READ_BYTES_MAX`], so a poll of many batches of one object asks
+    /// the store once and not once a batch. The poll takes its blobs from the
+    /// returned reads, which the cache may have had no room to keep.
     ///
     /// # Errors
     /// As [`Self::read_fresh`].
@@ -327,9 +524,9 @@ impl RemoteSegments {
         &self,
         object_id: u128,
         ranges: &[Range<u64>],
-    ) -> Result<(), DiskFault> {
+    ) -> Result<FreshReads, DiskFault> {
         let mut missing: Vec<Range<u64>> = {
-            let cache = self.fresh.borrow();
+            let mut cache = self.fresh.borrow_mut();
             ranges
                 .iter()
                 .filter(|range| range.start < range.end && cache.get(object_id, range).is_none())
@@ -349,10 +546,16 @@ impl RemoteSegments {
                 _ => reads.push(range),
             }
         }
+        let mut fetched = FreshReads {
+            object_id,
+            reads: Vec::with_capacity(reads.len()),
+        };
         for read in reads {
-            self.read_fresh(object_id, read).await?;
+            let position = read.start;
+            let bytes = self.read_fresh(object_id, read).await?;
+            fetched.reads.push((position, bytes));
         }
-        Ok(())
+        Ok(fetched)
     }
 
     /// The key of the `object` of the segment that `source` names, in the
@@ -1211,12 +1414,259 @@ mod tests {
         assert_eq!(cache.get(1, &(0..4)), None);
         assert_eq!(cache.get(2, &(0..4)).unwrap(), "bbbb");
         assert_eq!(cache.get(3, &(0..4)).unwrap(), "cccc");
-        assert_eq!(cache.bytes, 8);
+        assert_eq!(cache.held(), 8);
 
         // Larger than the whole budget: not kept, and nothing is dropped for it.
         cache.insert(4, 0, Bytes::from_static(b"dddddddddddd"));
         assert_eq!(cache.get(4, &(0..12)), None);
-        assert_eq!(cache.bytes, 8);
+        assert_eq!(cache.held(), 8);
+    }
+
+    /// A buffer of `len` bytes that holds `capacity` and has no other owner,
+    /// as an object that grew by doubling does.
+    fn grown(len: usize, capacity: usize) -> Bytes {
+        let mut bytes = bytes::BytesMut::with_capacity(capacity);
+        bytes.resize(len, b'x');
+        bytes.freeze()
+    }
+
+    std::thread_local! {
+        static ID_COMPARISONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// An object id that counts how often the cache compares it.
+    #[derive(Clone, Copy, Debug)]
+    struct CountedId(u64);
+
+    impl Ord for CountedId {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            ID_COMPARISONS.with(|comparisons| comparisons.set(comparisons.get() + 1));
+            self.0.cmp(&other.0)
+        }
+    }
+
+    impl PartialOrd for CountedId {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl PartialEq for CountedId {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+
+    impl Eq for CountedId {}
+
+    /// The ids `step` compared.
+    fn comparisons_of<T>(step: impl FnOnce() -> T) -> (T, u64) {
+        ID_COMPARISONS.with(|comparisons| comparisons.set(0));
+        let result = step();
+        (result, ID_COMPARISONS.with(std::cell::Cell::get))
+    }
+
+    #[test]
+    fn given_many_cached_entries_when_looking_one_up_should_not_walk_the_others() {
+        const ENTRIES: u64 = 1 << 16;
+        // A walk of the entries compares an id per entry. The searches of one
+        // lookup or insert compare a few hundred at most.
+        const MOST_COMPARISONS: u64 = ENTRIES / 64;
+        let mut cache = FreshCache::new(usize::MAX);
+        let fetched = |entry: u64| CountedId(ENTRIES + entry);
+        for entry in 0..ENTRIES {
+            let ((), stored) = comparisons_of(|| {
+                cache.insert_stored(CountedId(entry), Bytes::from_static(b"s"));
+            });
+            let (_, range) =
+                comparisons_of(|| cache.insert(fetched(entry), 0, Bytes::from_static(b"f")));
+            assert!(stored.max(range) <= MOST_COMPARISONS, "entry {entry}");
+        }
+
+        for entry in [0, ENTRIES / 2, ENTRIES - 1] {
+            let (stored, compared) = comparisons_of(|| cache.get(CountedId(entry), &(0..1)));
+            assert_eq!(stored.unwrap(), "s");
+            assert!(
+                compared <= MOST_COMPARISONS,
+                "{compared} for a stored object"
+            );
+            let (range, compared) = comparisons_of(|| cache.get(fetched(entry), &(0..1)));
+            assert_eq!(range.unwrap(), "f");
+            assert!(
+                compared <= MOST_COMPARISONS,
+                "{compared} for a fetched range"
+            );
+            let (missing, compared) =
+                comparisons_of(|| cache.get(CountedId(3 * ENTRIES + entry), &(0..1)));
+            assert_eq!(missing, None);
+            assert!(compared <= MOST_COMPARISONS, "{compared} for a miss");
+        }
+    }
+
+    #[test]
+    fn given_a_stored_object_when_old_ranges_are_fetched_past_the_budget_should_keep_it() {
+        let mut cache = FreshCache::new(64);
+        cache.insert_stored(1, Bytes::from_static(b"just stored by this shard"));
+
+        // A consumer far behind reads one old object after another.
+        for old in 100..200 {
+            cache.insert(old, 0, Bytes::from_static(b"0123456789"));
+            assert_eq!(cache.get(old, &(0..10)).unwrap(), "0123456789");
+        }
+
+        assert_eq!(cache.get(1, &(5..11)).unwrap(), "stored");
+        assert_eq!(cache.get(100, &(0..10)), None);
+        assert!(cache.held() <= 64);
+    }
+
+    #[test]
+    fn given_fetched_ranges_in_the_whole_budget_when_storing_objects_should_drop_the_ranges_first()
+    {
+        let mut cache = FreshCache::new(64);
+        for old in 100..106 {
+            cache.insert(old, 0, Bytes::from_static(b"0123456789"));
+        }
+        assert_eq!(cache.held(), 60);
+
+        for stored in 1..=7 {
+            cache.insert_stored(stored, Bytes::from_static(b"abcdefgh"));
+        }
+
+        // The stored objects took all but the part they never take.
+        for stored in 1..=7 {
+            assert_eq!(cache.get(stored, &(0..8)).unwrap(), "abcdefgh");
+        }
+        assert_eq!(cache.stored.held, 56);
+        assert_eq!(cache.fetched.held, 0);
+        // An eighth object takes the place of a stored one, and a read as
+        // large as the part for fetched ranges is still kept.
+        cache.insert_stored(8, Bytes::from_static(b"abcdefgh"));
+        assert_eq!(cache.get(1, &(0..8)), None);
+        cache.insert(200, 0, Bytes::from_static(b"01234567"));
+        assert_eq!(cache.get(200, &(0..8)).unwrap(), "01234567");
+        assert_eq!(cache.held(), 64);
+        // No room is left for a longer one, which is not kept.
+        cache.insert(201, 0, Bytes::from_static(b"012345678"));
+        assert_eq!(cache.get(201, &(0..9)), None);
+        assert_eq!(cache.stored.held, 56);
+    }
+
+    #[test]
+    fn given_an_entry_read_again_when_the_budget_runs_out_should_keep_it_over_one_that_was_not() {
+        let mut cache = FreshCache::new(16);
+        cache.insert(1, 0, Bytes::from_static(b"aaaa"));
+        cache.insert(2, 0, Bytes::from_static(b"bbbb"));
+        cache.insert(3, 0, Bytes::from_static(b"cccc"));
+        cache.insert(4, 0, Bytes::from_static(b"dddd"));
+        assert_eq!(cache.get(1, &(1..3)).unwrap(), "aa");
+        cache.insert(5, 0, Bytes::from_static(b"eeee"));
+
+        assert_eq!(cache.get(1, &(0..4)).unwrap(), "aaaa");
+        assert_eq!(cache.get(2, &(0..4)), None);
+
+        let mut cache = FreshCache::new(16);
+        cache.insert_stored(1, Bytes::from_static(b"aaaaaaa"));
+        cache.insert_stored(2, Bytes::from_static(b"bbbbbbb"));
+        assert_eq!(cache.get(1, &(0..1)).unwrap(), "a");
+        cache.insert_stored(3, Bytes::from_static(b"ccccccc"));
+
+        assert_eq!(cache.get(1, &(0..7)).unwrap(), "aaaaaaa");
+        assert_eq!(cache.get(2, &(0..7)), None);
+        assert_eq!(cache.get(3, &(0..7)).unwrap(), "ccccccc");
+    }
+
+    #[test]
+    fn given_buffers_with_spare_capacity_when_caching_them_should_count_what_they_hold() {
+        let mut cache = FreshCache::new(4800);
+        cache.insert_stored(1, grown(600, 1200));
+        assert_eq!(cache.held(), 1200);
+        cache.insert_stored(2, grown(600, 1200));
+        cache.insert_stored(3, grown(600, 1200));
+        assert_eq!(cache.held(), 3600);
+
+        // By their lengths all four fit. They hold twice that.
+        cache.insert_stored(4, grown(600, 1200));
+        assert_eq!(cache.held(), 3600);
+        assert_eq!(cache.get(1, &(0..600)), None);
+        assert_eq!(cache.get(4, &(0..600)).unwrap().len(), 600);
+
+        // A range read from the store is kept as a copy of its length.
+        cache.insert(9, 0, grown(100, 300));
+        assert_eq!(cache.fetched.held, 100);
+        assert_eq!(cache.held(), 3700);
+    }
+
+    #[test]
+    fn given_a_range_that_views_a_larger_buffer_when_caching_it_should_keep_a_copy_of_only_the_range()
+     {
+        let buffer = Bytes::from(vec![7_u8; 4096]);
+        let spans = buffer.as_ptr_range();
+        let view = buffer.slice(1000..1100);
+        drop(buffer);
+        let mut cache = FreshCache::new(4096);
+
+        let kept = cache.insert(1, 1000, view);
+
+        assert_eq!(kept, vec![7_u8; 100]);
+        assert_eq!(cache.held(), 100);
+        let cached = cache.get(1, &(1000..1100)).unwrap();
+        assert!(
+            !spans.contains(&cached.as_ptr()),
+            "it holds the whole buffer"
+        );
+    }
+
+    #[test]
+    fn given_a_buffer_that_is_shared_or_holds_too_much_when_caching_it_should_keep_a_copy_of_its_length()
+     {
+        let mut cache = FreshCache::new(4096);
+        let shared = grown(600, 1200);
+        cache.insert_stored(1, shared.clone());
+        assert_eq!(cache.held(), 600);
+        assert_eq!(cache.get(1, &(0..600)).unwrap(), shared);
+
+        // Its capacity is past what stored objects may hold, its length is not.
+        let mut cache = FreshCache::new(4096);
+        cache.insert_stored(2, grown(3000, 6000));
+        assert_eq!(cache.held(), 3000);
+        assert_eq!(cache.get(2, &(0..3000)).unwrap().len(), 3000);
+    }
+
+    #[test]
+    fn given_a_range_fetched_around_a_kept_one_when_asking_should_answer_from_the_wider_one() {
+        let mut cache = FreshCache::new(1024);
+        let object: Vec<u8> = (0..=255).collect();
+        cache.insert(7, 100, Bytes::copy_from_slice(&object[100..200]));
+        cache.insert(7, 0, Bytes::copy_from_slice(&object[..250]));
+
+        assert_eq!(cache.get(7, &(200..250)).unwrap(), object[200..250]);
+        assert_eq!(cache.get(7, &(120..180)).unwrap(), object[120..180]);
+        assert_eq!(cache.held(), 250, "the range inside the wider one is gone");
+
+        // A range that an entry already holds is not kept a second time.
+        cache.insert(7, 50, Bytes::copy_from_slice(&object[50..60]));
+        assert_eq!(cache.held(), 250);
+    }
+
+    #[compio::test]
+    async fn given_an_object_this_shard_stored_when_a_consumer_catches_up_should_serve_it_from_memory()
+     {
+        let store = Asked::holding(4096);
+        let mut remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
+        remote.fresh = RefCell::new(FreshCache::new(1024));
+        remote.cache_fresh_object(1, store.object.slice(..512));
+
+        for old in 100..120 {
+            remote.read_fresh(old, 0..128).await.unwrap();
+        }
+        let asked = store.ranges.borrow().len();
+        assert_eq!(asked, 20);
+
+        assert_eq!(
+            remote.read_fresh(1, 10..500).await.unwrap(),
+            store.object.slice(10..500)
+        );
+        assert_eq!(store.ranges.borrow().len(), asked);
     }
 
     #[compio::test]
@@ -1302,6 +1752,29 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_cache_without_room_when_fetching_blobs_should_hand_back_what_it_read() {
+        let store = Asked::holding(4096);
+        let mut remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
+        remote.set_fresh_cache_bytes(0);
+        let blobs = [100..200, 200..300, 1000..1100];
+
+        let fetched = remote.fetch_fresh(7, &blobs).await.unwrap();
+
+        assert_eq!(store.ranges.borrow().len(), 1);
+        assert_eq!(store.ranges.borrow()[0], 100..1100);
+        assert_eq!(remote.fresh.borrow().held(), 0);
+        for blob in blobs {
+            let expected = store
+                .object
+                .slice(usize::try_from(blob.start).unwrap()..usize::try_from(blob.end).unwrap());
+            assert_eq!(fetched.get(7, &blob).unwrap(), expected);
+        }
+        // Another object, and a range the read does not hold.
+        assert_eq!(fetched.get(8, &(100..200)), None);
+        assert_eq!(fetched.get(7, &(50..150)), None);
+    }
+
+    #[compio::test]
     async fn given_blobs_far_apart_or_too_many_bytes_when_fetching_should_ask_for_each_run() {
         let gap = FRESH_READ_GAP_BYTES;
         let far = 100 + gap + 1;
@@ -1340,8 +1813,8 @@ mod tests {
         let remote = RemoteSegments::new(store, KeyLayout::new("iggy").unwrap());
 
         assert_eq!(
-            remote.fetch_fresh(7, &[100..200, 200..300]).await,
-            Err(DiskFault::Tiered)
+            remote.fetch_fresh(7, &[100..200, 200..300]).await.err(),
+            Some(DiskFault::Tiered)
         );
     }
 

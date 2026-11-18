@@ -43,7 +43,10 @@ import org.apache.iggy.system.MetadataChangeGroup;
 import org.apache.iggy.system.MetadataChangeStart;
 import org.apache.iggy.system.MetadataChangesQuery;
 import org.apache.iggy.system.MetadataCurrentPageToken;
+import org.apache.iggy.system.NamedPageQuery;
 import org.apache.iggy.system.OptionsScope;
+import org.apache.iggy.system.PageCursor;
+import org.apache.iggy.system.PageQuery;
 import org.apache.iggy.topic.TopicUpdate;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
@@ -309,6 +312,30 @@ public final class BytesSerializer {
         groups.forEach(group -> payload.writeByte(group.asCode()));
         payload.writeShortLE(token.length);
         payload.writeBytes(token);
+        return payload;
+    }
+
+    /**
+     * A list request: the identifiers of its parents, then the page block {@code [order:u8][descending:u8][limit:u32]}
+     * {@code [cursor_len:u8][cursor][name_len:u8][name]}, where a length of 0 means no cursor or no name. A list without
+     * names sends its {@link PageQuery} as a query without a name. Validate the query first.
+     */
+    public static ByteBuf toPageRequest(NamedPageQuery query, Identifier... parents) {
+        PageQuery page = query.page();
+        byte[] cursor = page.cursor().map(PageCursor::toBytes).orElse(new byte[0]);
+        byte[] name =
+                query.name().map(text -> text.getBytes(StandardCharsets.UTF_8)).orElse(new byte[0]);
+        var payload = Unpooled.buffer();
+        for (Identifier parent : parents) {
+            writeAndRelease(payload, toBytes(parent));
+        }
+        payload.writeByte(page.order().asCode());
+        payload.writeBoolean(page.descending());
+        payload.writeIntLE((int) page.limit());
+        payload.writeByte(cursor.length);
+        payload.writeBytes(cursor);
+        payload.writeByte(name.length);
+        payload.writeBytes(name);
         return payload;
     }
 

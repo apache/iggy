@@ -96,6 +96,35 @@ A stream encryption key is exactly 32 random bytes. Never derive it from a passw
 
 The server stores the key wrapped under its own key and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream, and a server without it keeps the stream plaintext and refuses a client key.
 
+## List pages
+
+`GetStreams`, `GetTopics`, `GetConsumerGroups` and `GetUsers` return a whole list. Each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. Every page keeps the sign-in and the deadline that the call started with. An entity that someone creates or deletes during the walk can appear or not appear. If the `Next` of a page is the cursor that its request sent, the call fails with `ierror.ErrInvalidFormat`.
+
+`GetStreamsPage`, `GetTopicsPage`, `GetPartitionsPage`, `GetConsumerGroupsPage` and `GetUsersPage` return one page. To read the next page, send the same query with the `Next` of the page as its `Cursor`. A page can be empty and still have a `Next`.
+
+```go
+func printStreams(ctx context.Context, cli iggcon.Client) error {
+    query := iggcon.NamedPageQuery{PageQuery: iggcon.NewPageQuery()}
+    for {
+        page, err := cli.GetStreamsPage(ctx, query)
+        if err != nil {
+            return err
+        }
+        for _, stream := range page.Items {
+            log.Printf("%d %s", stream.Id, stream.Name)
+        }
+        if page.Next == nil {
+            return nil
+        }
+        query.Cursor = page.Next
+    }
+}
+```
+
+`Order` selects `PageOrderID` or `PageOrderCreated`, and `Descending` reverses it. The page methods of streams, topics, consumer groups and users take a `NamedPageQuery`: a `PageQuery` with a `Name`. `Name` keeps the entries whose name holds the text, case-sensitive. `GetPartitionsPage` takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with `ierror.ErrInvalidCommand`, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A cursor prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with `ierror.ErrInvalidCommand`.
+
 ## Metadata changes
 
 `GetMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `Next` cursor. The call needs root or the global `manage_servers` permission.
@@ -185,7 +214,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 `SendMessages` returns any placements the server reports. Replicated mutations

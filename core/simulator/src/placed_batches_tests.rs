@@ -248,7 +248,7 @@ fn primary(sim: &Simulator) -> Option<u8> {
                 .partition_shard(namespace())
                 .plane
                 .partitions()
-                .get_by_ns(&namespace())
+                .peek_by_ns(&namespace())
                 .is_some_and(|partition| {
                     let consensus = partition.consensus();
                     consensus.is_primary() && consensus.is_normal()
@@ -584,7 +584,7 @@ fn given_a_replica_in_a_view_change_when_it_sweeps_should_delete_nothing() {
             .partition_shard(namespace())
             .plane
             .partitions()
-            .get_by_ns(&namespace())
+            .peek_by_ns(&namespace())
             .is_some_and(|partition| partition.consensus().is_normal())
     };
     for _ in 0..SETTLE_TICKS {

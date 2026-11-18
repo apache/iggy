@@ -53,7 +53,7 @@ complete partition view changes. The `IGGY-TIERED-SEGMENT-CHAIN-1` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 A partition of a tiered topic keeps a chain file, and its older segments live
 only in the object store. A build from before tiered storage would read such a
-partition as one that lost data, so `IGGY-METADATA-CHANGE-LOG-1` data directories
+partition as one that lost data, so `IGGY-METADATA-CHANGE-LOG-2` data directories
 must be wiped before the upgrade.
 Metadata snapshots now carry the metadata change log and topic creation ops, so
 `IGGY-RESOURCE-OPTIONS-1` data directories must be wiped before the upgrade.
@@ -69,15 +69,19 @@ finalization and the paid-through mark on session retirement. Peers compare a
 replica wire revision at the handshake, so a build from before that change and a
 build after it refuse each other even when both report the same version, for
 example two consecutive `:edge` images. Stop every node and start them all on the
-new build. That change kept `IGGY-METADATA-CHANGE-LOG-1` data directories: older
-metadata snapshots and journal entries read with every partition on every node,
-and older builds refuse the newer snapshot format instead of misreading it.
+new build.
 Topics created without `replication_factor` still go on every node, so clients
 that never send the key, which includes every SDK, connector, benchmark and MCP
 release before the option, keep the old layout. Set `[cluster]
 default_replication_factor` to a number to give those topics fewer copies.
 Topic responses carry each partition's member list and in-sync members, a client
 wire change that SDKs from before this release cannot decode.
+Batched session retirement changes the body of the session finalization
+(op 70). It also raises the replica wire revision to 3, so a build from before
+it and a build after it refuse each other. An older body can be misread as a new
+one, so the storage gate moves to `IGGY-METADATA-CHANGE-LOG-2`. A node refuses an
+`IGGY-METADATA-CHANGE-LOG-1` data directory at boot without changing it, so start
+every replica from fresh storage.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -162,14 +166,44 @@ readiness probes identify responsive replicas, new primaries are assigned only
 to those replicas. Before readiness is known, all configured replicas remain
 eligible. After the responsive replica set
 has been stable for five seconds, the metadata primary balances existing primary
-counts one partition at a time. It confirms the source's committed frontier and
-the target's applied history, then grants the move to the source primary. The
+counts, with up to 512 moves in flight. For each move it confirms the source's
+committed frontier and the target's applied history, then grants the move to
+the source primary. The
 source finishes its accepted writes before it requests a persisted consensus
 view change.
 Recovering partitions are skipped without delaying transfers of other partitions.
 Every replica still stores every partition.
 Balancing primary counts does not balance bytes, throughput or CPU load. A hot
 partition still has one ordering primary.
+
+On the first stop signal, a node of a cluster hands off the partitions it leads
+before it shuts down. Without the handoff, each of them waits for a heartbeat
+timeout before it elects a new primary. Each shard spreads them over the members
+that are in sync and reachable, and the node takes no primaries while it leaves.
+The shutdown waits for every shard to finish, at most
+`sharding.shutdown_primary_handoff_timeout` (15 s by default). `"0 s"` skips
+the handoff, and so do `"disabled"`, `"none"` and `"unlimited"`, which also read
+as zero. A second stop signal ends the handoff. The metadata group has no
+handoff and still waits for the timeout.
+
+When a node fails, each partition it led elects a new primary after a heartbeat
+timeout. Each shard starts at most 4 of these elections per 10 ms tick, and none
+while 128 of its partitions are in a view change. A view change stops counting
+once `cluster.view_change_status_timeout` (5 s by default) passes after its
+replica wrote the new view to disk. Each view change in a row doubles that
+time, up to 16x. Thus partitions that lost their quorum do not stop the
+elections of other partitions.
+`/metrics` reports `partitions_in_view_change`, every partition of a shard in a
+view change, and `partition_view_change_votes_held`, the elections it holds
+back.
+
+The 10 ms tick of a shard visits only the partitions with work. A partition
+with nothing to commit, replicate, persist or repair sleeps until its next
+timeout, and a frame for it or a finished I/O step makes it due on the next
+tick. `/metrics` reports `partition_tick_visits`, the visits of a shard, and
+`partition_missed_wakeups`, the sleeping partitions that a check found with
+work and woke. That check tests a few sleeping partitions per tick. Its
+counter stays at 0 on a correct server, so report a value above 0 as a bug.
 
 A create whose namespace is invalid can receive 58 (`TransientNotAccepted`) while
 any metadata write is pending, even an unrelated one. Under steady unrelated
@@ -234,7 +268,7 @@ Requests queued behind the ones a connection runs are capped at 1024 frames and 
 
 On a multi-replica node, client partition requests require recent metadata quorum
 evidence before namespace lookup and authorization. The evidence lasts
-`K = cluster.heartbeat_timeout + 3 seconds` (8 seconds by default); expired or
+`K = cluster.commit_busy_heartbeat_timeout + 3 seconds` (8 seconds by default); expired or
 absent evidence yields 58. A primary credits answered probes while ready. A
 backup credits only a probe from its current metadata primary whose advertised
 commit covers the adopted view's head and is already applied locally. Commit
@@ -256,7 +290,14 @@ Message and size counters in stream, topic and system stats (`get_stream`,
 `get_topic`, `get_stats` and the list forms) are counted per node. A node that
 is not the partition primary learns of a commit from the next prepare or from
 the periodic commit broadcast. It counts the message only then. While the
-cluster is idle, its counters can lag by up to `cluster.commit_broadcast_interval`.
+cluster is idle, its counters can lag by up to `cluster.commit_busy_heartbeat_interval`.
+
+`GetStats` and the stream, topic, partition, segment and message gauges of
+`/metrics` read node totals. Each metadata change and each partition write
+keeps these totals up to date, so these reads walk no stream. The per-topic
+series of `/metrics` (`topic_size_bytes`, `topic_messages` and
+`topic_max_size_bytes`) still walk every topic on each scrape. On a node with
+many topics, set `[http.metrics] topic_gauges = false` to drop them.
 
 ### Sessions and retry receipts
 
@@ -756,6 +797,30 @@ The primary logs each sweep that rewraps streams, each stream it cannot rewrap, 
 
 A stream created during phase 1 also carries a wrap under the old key until phase 2 drops it. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
 
+## List pages
+
+The binary list commands answer one page at a time: `GetUsers` (32), `GetStreams` (201), `GetTopics` (301), `GetPartitions` (404) and `GetConsumerGroups` (601). Each request ends with a page block. The block holds the order (`id` or `created`), a descending flag and a limit from 1 to 1000. It can also hold a cursor and a name filter. The server refuses a request without the block, or with a value out of range, with `InvalidCommand` (3).
+
+On the command line, `iggy stream list`, `iggy topic list`, `iggy partition list`, `iggy consumer-group list` and `iggy user list` read pages. They take `--desc`, `--limit` and `--after`, and all but `iggy partition list` also take `--sort` and `--name`.
+
+The `created` order sorts by creation time and then by id, so entities created at the same time keep a fixed order. Partitions and consumer groups walk by id in both orders, because their ids follow creation. The name filter keeps the entries whose name holds the text, case-sensitive. A partition has no name, so the server refuses `GetPartitions` with a name.
+
+A page ends at its limit, before its items pass 1 MiB, or after the walk passes 65536 entries. The first item always fits, so every read moves forward. A page can hold fewer items than the limit, or none, and still carry a `next` cursor. Read pages until `next` is absent. Cursors print as `pg1_` tokens. A cursor holds only a position, so send it back with the same order, direction, filter and parent.
+
+Each page is a separate read of one node. An entity that exists during the whole walk and matches the filter appears exactly once. An entity that someone creates or deletes during the walk can appear or not appear, so a walk is not a snapshot. Use `GetMetadataChanges` for an exact copy. If the pages of one walk come from different nodes, a later page can come from an older state. Over HTTP, `consistency=linearizable` sends every page read to the primary.
+
+`GetTopics` for a stream that does not exist answers an empty last page if the request has no cursor. With a cursor, it answers `StreamIdNotFound` (1009), because the stream was deleted during the walk. `GetPartitions` and `GetConsumerGroups` answer the not-found error of the missing stream or topic.
+
+Over HTTP, four routes take the page keys `order`, `descending`, `limit`, `cursor` and `name`, next to `consistency`. They are `GET /streams`, `GET /streams/{stream_id}/topics`, `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups` and `GET /users`. If the query has `limit` or `cursor`, the route returns one page as `{"items": [...], "next": "pg1_..."}`, and the last page has no `next`.
+
+Without `limit` and `cursor`, these four routes return a bare array of every item. The array follows `order` and `descending` and holds only the items that match `name`. The server builds that array from pages of 1000, so it is not one consistent read either. `GET /streams/{stream_id}/topics/{topic_id}/partitions` always returns a page.
+
+The server refuses an unknown, repeated or malformed query key with 400. The list routes of server 0.10.0 ignored an unknown key, for example the cache buster `?_=1699`, so a client that sends one now gets 400.
+
+The cap `MAX_RECORD_REPLY_SIZE` is a little over 64 MB. If the binary reply frame of `GetClients` or of a metadata read passes it, the server answers with `ReplyTooLarge` (97). The metadata reads are those of streams, topics, partitions, consumer groups, users, options, stats and cluster metadata. The connection stays open. A page stays far below that cap. `GetStream`, `GetTopic` and `GetClients` can pass it on a very large catalog.
+
+`GetSnapshot` does not use this cap. It refuses an archive frame above 64 MiB, the frame limit of the message bus, with `SnapshotFileCompletionFailed`. HTTP replies have no such cap.
+
 ## Metadata changes
 
 Each node keeps a bounded log of the public results of committed metadata operations: streams, topics, partition counts, consumer groups and their members, users, personal access tokens and sessions. One operation can produce several records, for example a stream delete followed by the permission updates that pruned grants on it. Refused, denied and no-op operations produce none. Records are produced by the state machine on every replica alike, so a cursor taken on one node continues on another.
@@ -789,7 +854,7 @@ This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a brea
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 15 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
+Metadata snapshot format 16 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The
@@ -887,11 +952,19 @@ If the fence cannot be persisted, the session remains retained and retirement
 retries. Temporary teardown tombstones and state transfer do not qualify as
 permanent failures.
 
-Partition retirement barriers batch up to 128 ended sessions per commit. Each
-session still requires retirement reports covering every allocated partition
-from a common replica quorum before metadata releases its registry slot. Segment
-deletion does not invalidate those reports; changes to partition incarnations
-do. Metadata snapshot format 10 persists that separate revision.
+Each node retires ended sessions in batches. When a walk starts, its watermark
+is the highest end op among the ended sessions. Its batch is every session that
+ended at or below the watermark. The walk visits each partition that the node
+stores. A partition proves the batch once its metadata frontier reaches the
+watermark and no batch session holds an entry or a pending request on it. A
+partition retirement barrier names up to 128 of the sessions that
+still hold entries, and it raises the frontier.
+
+A partition created above the watermark cannot hold a session of the batch, so
+the walk skips it. A topic created or deleted during a walk does not restart
+it. Metadata releases the registry slots of every session at or below the
+lowest watermark among the reports of a replica quorum. A partition whose
+members did not prove the batch owes the retirement, as described above.
 
 A committed partition that has never initialized on this replica can finish
 initialization after a crash, including when all replicas stopped before their

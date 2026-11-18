@@ -50,6 +50,10 @@ it('translates the tiered read failure', () => {
   assert.equal(translateErrorCode(96), 'Tiered data cannot be read from the object store; a retry does not help');
 });
 
+it('translates the reply size refusal', () => {
+  assert.equal(translateErrorCode(97), 'The reply is larger than the reply size limit');
+});
+
 it('translates the shadow stream write refusal', () => {
   assert.equal(
     translateErrorCode(1021),
