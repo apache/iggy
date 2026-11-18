@@ -47,10 +47,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iggy_binary_protocol::placement::PlacedBatch;
 use iggy_object_store::{
-    FreshBatchRow, FreshDirectoryRow, FreshIndex, FreshObjectId, FreshProofRow,
+    FRESH_INDEX_BYTES_MAX, FreshBatchRow, FreshDirectoryRow, FreshIndex, FreshObjectError,
+    FreshObjectId, FreshProofRow, KeyLayout, ObjectStoreError,
 };
 
+use crate::RemoteObjects;
 use crate::proven_batch::{ProvenBatch, ProvenBatchError};
+
+/// The smallest first read of an index, which holds the whole index of an
+/// object of a few hundred batches.
+pub const FRESH_INDEX_READ_MIN: u64 = 16 * 1024;
 
 /// The most proof rows a tail holds. Rows past it are dropped, so a
 /// partition whose floor stopped far below its newest row waits for the
@@ -472,6 +478,47 @@ impl Source {
             source: &self.row,
             batch,
         })
+    }
+}
+
+/// What a read of the index of a fresh object found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshIndexRead {
+    Found(FreshIndex),
+    /// No object is under its key: not stored yet, or deleted.
+    Missing,
+    /// The object is of another format, or its index does not decode.
+    Unreadable(FreshObjectError),
+}
+
+/// Read the index of the fresh object `object_id` under `layout` with one
+/// ranged read of `guess` bytes, at least [`FRESH_INDEX_READ_MIN`], and a
+/// second one only when the index is longer.
+///
+/// # Errors
+/// The store's error for a read that failed in another way than a missing
+/// object.
+pub async fn read_fresh_index(
+    objects: &dyn RemoteObjects,
+    layout: &KeyLayout,
+    object_id: FreshObjectId,
+    guess: u64,
+) -> Result<FreshIndexRead, ObjectStoreError> {
+    let key = layout.fresh_key(object_id.get());
+    let mut end = guess.clamp(FRESH_INDEX_READ_MIN, FRESH_INDEX_BYTES_MAX);
+    loop {
+        let read = match objects.get_range(&key, 0..end).await {
+            Ok(read) => read,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(FreshIndexRead::Missing),
+            Err(error) => return Err(error),
+        };
+        match FreshIndex::decode(&read.bytes, object_id) {
+            Ok(index) => return Ok(FreshIndexRead::Found(index)),
+            Err(FreshObjectError::Incomplete { need, .. }) if need > end && need <= read.size => {
+                end = need;
+            }
+            Err(error) => return Ok(FreshIndexRead::Unreadable(error)),
+        }
     }
 }
 

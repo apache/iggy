@@ -186,6 +186,7 @@ use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
 };
+use crate::peer_fresh::PeerFreshFollower;
 use crate::peer_manifests::{NodePlace, PeerManifestLister};
 use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
@@ -361,6 +362,9 @@ pub struct ReconcilerCtx {
     /// The listings of the geo peers' manifests, which keep the shadow
     /// partitions whose primary this node is up to date. Shard 0 only.
     peer_manifests: PeerManifestLister,
+    /// The follows of the geo peers' fresh objects, which bring the shadow
+    /// partitions here about a second behind their origins. Shard 0 only.
+    peer_fresh: PeerFreshFollower,
     /// When the next pass over the partitions of geo topics may be staged,
     /// in microseconds since the Unix epoch.
     next_topic_object_check_at: Cell<u64>,
@@ -385,6 +389,7 @@ impl ReconcilerCtx {
         let geo_topics = GeoTopics::new(&config.geo);
         let shadow_topics = ShadowTopics::new(&config.geo);
         let peer_manifests = PeerManifestLister::new(&config.geo);
+        let peer_fresh = PeerFreshFollower::new(&config.geo);
         Self {
             shard,
             total_shards,
@@ -407,6 +412,7 @@ impl ReconcilerCtx {
             geo_topics,
             shadow_topics,
             peer_manifests,
+            peer_fresh,
             next_topic_object_check_at: Cell::new(0),
         }
     }
@@ -590,6 +596,7 @@ pub async fn run_reconciler(
     ctx.geo_topics.stop();
     ctx.shadow_topics.stop(&ctx.shard);
     ctx.peer_manifests.stop();
+    ctx.peer_fresh.stop();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -680,15 +687,13 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     ctx.incarnation_deletes.pass(&ctx.shard, now);
     ctx.geo_topics.pass(&ctx.shard, now);
     ctx.shadow_topics.pass(&ctx.shard, now);
-    ctx.peer_manifests.pass(
-        &ctx.shard,
-        now,
-        NodePlace {
-            self_replica_id: ctx.self_replica_id,
-            replica_count: ctx.replica_count,
-            total_shards: ctx.total_shards,
-        },
-    );
+    let place = NodePlace {
+        self_replica_id: ctx.self_replica_id,
+        replica_count: ctx.replica_count,
+        total_shards: ctx.total_shards,
+    };
+    ctx.peer_manifests.pass(&ctx.shard, now, place);
+    ctx.peer_fresh.pass(&ctx.shard, place);
     stage_topic_object_checks(ctx, now);
 
     if counters.total() > 0 {

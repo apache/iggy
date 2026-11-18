@@ -73,6 +73,7 @@ pub(crate) mod geo_topics;
 pub(crate) mod incarnation_deletes;
 pub(crate) mod origin_recovery;
 pub(crate) mod partition_reconciler;
+pub(crate) mod peer_fresh;
 pub(crate) mod peer_manifests;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,

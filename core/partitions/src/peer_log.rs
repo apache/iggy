@@ -293,6 +293,13 @@ impl PeerLog {
         self.prefix
     }
 
+    /// The partition's namespace in the origin's cluster, raw, as the
+    /// origin's fresh objects name it.
+    #[must_use]
+    pub fn origin_namespace(&self) -> u64 {
+        namespace_of(&self.prefix)
+    }
+
     /// What the last applied manifest said, `None` before the first.
     #[must_use]
     pub const fn applied(&self) -> Option<AppliedManifest> {
