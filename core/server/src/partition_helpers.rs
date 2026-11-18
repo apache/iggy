@@ -3130,7 +3130,7 @@ mod tests {
         assert_eq!(
             partition
                 .consumer_offsets
-                .pin()
+                .borrow()
                 .get(&STORED_CONSUMER_ID)
                 .map(|offset| offset.offset.load(Ordering::Relaxed)),
             Some(STORED_OFFSET),

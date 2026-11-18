@@ -114,6 +114,36 @@ pub(super) async fn partition_with_messages_at_revision<B: MessageBus + Clone>(
     (*partition, config)
 }
 
+/// Replica 0 of three as the primary of a view whose superblock write has
+/// not landed yet, as after `start_pending_view`.
+pub(super) fn primary_with_pending_view_write<B: MessageBus>(
+    bus: B,
+    namespace: IggyNamespace,
+    created_revision: u64,
+) -> IggyPartition<B> {
+    const REPLICA_COUNT: u8 = 3;
+    // The first view after view 0 that replica 0 leads.
+    let view = u32::from(REPLICA_COUNT);
+    let mut consensus = VsrConsensus::new(
+        1,
+        0,
+        REPLICA_COUNT,
+        namespace.inner(),
+        bus,
+        LocalPipeline::new(),
+    );
+    consensus.set_view(view);
+    consensus.set_log_view(view);
+    consensus.init();
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        partitions_config().segment_size,
+    );
+    partition.set_created_revision(created_revision);
+    partition
+}
+
 /// Append `payloads` as one batch from the fixture client and commit it.
 /// `request` numbers the batch among the client's requests, and
 /// `metadata_watermark` must reach the partition's metadata fences.

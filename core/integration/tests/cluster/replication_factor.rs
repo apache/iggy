@@ -759,7 +759,7 @@ async fn given_a_factor_of_two_when_its_primary_returns_on_empty_storage_should_
 }
 
 /// Cut off long enough that a primary hearing no member steps down: past the
-/// 5 second `heartbeat_timeout`.
+/// 5 second `commit_busy_heartbeat_timeout`.
 const STEP_DOWN_ISOLATION: Duration = Duration::from_secs(8);
 /// Views the pair goes through before the rebuilt member must have led one.
 const STEP_DOWN_ROUNDS: usize = 6;

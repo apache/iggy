@@ -20,6 +20,7 @@
 
 use iggy::prelude::*;
 use iggy_common::ConsumerOffsetInfo;
+use integration::harness::disk::drop_unpublished_partition_wal_tail;
 use integration::harness::{TestBinaryError, TestHarness};
 use integration::iggy_harness;
 use std::time::Duration;
@@ -93,6 +94,10 @@ async fn given_persisted_messages_when_the_server_crashes_should_keep_the_stored
     drop(client);
 
     harness.kill_node(0).expect("kill the server");
+    // A restart keeps the records that the OS still holds, a replicated offset
+    // store among them, and its replay would hide an early clamp.
+    drop_unpublished_partition_wal_tail(&harness.node(0).data_path())
+        .expect("cut the WAL back to its published frontier");
     harness.restart_node(0).expect("restart the server");
 
     let recovered = wait_for_recovered_offset(harness, &consumer, &stream, &topic, last_offset)

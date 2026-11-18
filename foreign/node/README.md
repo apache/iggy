@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use matching SDK and server builds from the coordinated VSR release, with a minimum binary protocol version of 0.12.1. Older builds are incompatible. This release requires fresh server storage (`IGGY-METADATA-CHANGE-LOG-1`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+Use matching SDK and server builds from the coordinated VSR release, with a minimum binary protocol version of 0.12.1. Older builds are incompatible. This release requires fresh server storage (`IGGY-METADATA-CHANGE-LOG-2`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -391,6 +391,12 @@ try {
   (`prefetchBytes`, `prefetchMessages`). Each effective budget holds at least
   32 full batches, and larger configured budgets still apply. A budget that is
   NaN, infinite or negative is refused with error 3 before anything is sent.
+  The byte budget counts message frame headers, payloads and encoded user
+  headers. It is not a limit on retained memory: payload views keep whole
+  reply buffers alive, including the uncounted 256-byte batch header per
+  record. With one small message per record, retained buffers can occupy
+  several times the byte budget. Decoded objects and in-flight reads also
+  use memory outside this count.
   Without options a read waits up to 5 s. After a refused read, a lost read or
   a failed refresh it waits `retryInterval`, 1 s by default. While a refresh
   of the group assignment fails or gets no answer, the reader reads on under
@@ -459,7 +465,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Mutations share one FIFO lane per partition history, with a separate metadata
