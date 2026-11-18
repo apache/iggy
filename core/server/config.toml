@@ -1360,10 +1360,11 @@ handshake_grace = "10 s"
 # requests in flight.
 #max_concurrent_callouts = 64
 
-# Tiered storage: an object store for the sealed segments of tiered topics.
-# Without this section, the backend is "none" and no topic can turn tiered.
-# Even with a backend, no topic can turn tiered yet: that waits for reads of
-# evicted segments from the store, which this version does not do.
+# Tiered storage: an object store for the sealed segments of tiered topics and
+# for the messages of geo topics. Without this section, the backend is "none":
+# no topic can turn tiered, and no geo topic can be created. With a backend,
+# the cluster takes both only while every node passes the store identity check
+# that 'prefix' describes, and refuses them with FeatureUnavailable until then.
 #[tiered_storage]
 # "none", "fs" (a directory) or "s3" (S3 and stores with its API, such as
 # Ceph RGW and R2).
@@ -1419,9 +1420,9 @@ handshake_grace = "10 s"
 #max_retry_delay = "5 s"
 # The shortest time between the starts of two uploads of fresh objects on one
 # shard, so a shard creates at most one object per interval, plus the objects
-# that fill up to their size before it passes. A send that finds no upload in
-# flight and the last one started at least this long ago is uploaded at once,
-# so a lone producer does not wait. "0" uploads as soon as a slot of
+# that fill to 4 MiB before it passes. A send that finds a free upload slot
+# when the last upload started at least this long ago is uploaded at once, so
+# a lone producer does not wait. "0" uploads as soon as a slot of
 # 'jobs.fresh_uploads' is free. A producer that waits for each answer before
 # its next send completes one send per max(interval, upload + commit). A longer
 # interval means fewer and larger objects, so fewer store requests, and a
@@ -1429,10 +1430,11 @@ handshake_grace = "10 s"
 #fresh_upload_interval = "10 ms"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
-# alone. Only segment uploads and object deletes go through these caps so
-# far, so the fetch caps take no effect yet. They take effect once cold reads
-# go through the tier service. 'fresh_uploads' are the uploads that producers
-# wait for. They have slots of their own and never wait behind 'uploads'.
+# alone. Polls that read from the store are demand fetches. Nothing uses the
+# speculative fetch caps yet. 'fresh_uploads' are the uploads that producers
+# of geo topics wait for. They have slots of their own and never wait behind
+# 'uploads'. Housekeeping jobs, such as sweeps and the merges of long-term
+# segments, start only while no fetch or upload waits.
 #[tiered_storage.jobs]
 #demand_fetches = 16
 #demand_fetch_bytes = "64 MiB"
@@ -1451,7 +1453,8 @@ handshake_grace = "10 s"
 # The name of this cluster. Shadow stream names and the objects that this
 # cluster publishes for its peers carry it. It holds 1 to 32 lowercase
 # letters, digits and '-', starts with a letter and does not end with '-'. A
-# cluster with peers needs it.
+# cluster with peers or geo topics needs it: without it, the cluster publishes
+# no object for its geo topics, and their partitions refuse every send.
 #origin = "dc-a"
 # How long a deleted geo topic keeps its tombstone and its objects in this
 # cluster's [tiered_storage] store. The cluster publishes one object for each

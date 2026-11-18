@@ -1,0 +1,653 @@
+# Geo topics
+
+A geo topic is a topic that several datacenters write at the same time, without any replication
+traffic between them. Every datacenter runs its own Iggy cluster and its own object store bucket.
+Each cluster writes the messages it accepts to its own bucket, and reads the buckets of the other
+datacenters. Nothing is copied from one cluster to another.
+
+This page is for operators. It covers the model, the setup of two clusters, the clients, the
+delays, what fails and what is lost, and the limits of this version. The reference for each
+part of the configuration is in the [server README](../README.md): [tiered
+storage](../README.md#tiered-storage), [geo peers](../README.md#geo-peers), [geo topic
+objects](../README.md#geo-topic-objects) and [shadow streams](../README.md#shadow-streams).
+
+> [!IMPORTANT]
+> **Status in this version.** A cluster writes its geo topics to its bucket, publishes them, and
+> adopts the geo topics of its peers as shadow topics. A shadow topic does not follow its origin's
+> log yet, so it holds no messages, and a poll of a shadow topic returns none. Until that ships,
+> a message written in one datacenter is readable only from the cluster that wrote it. See
+> [What works in this version](#what-works-in-this-version).
+
+## Contents
+
+- [Words used on this page](#words-used-on-this-page)
+- [What a geo topic is](#what-a-geo-topic-is)
+- [What works in this version](#what-works-in-this-version)
+- [How a message moves](#how-a-message-moves)
+- [Prerequisites](#prerequisites)
+- [Configure each cluster](#configure-each-cluster)
+- [Create a geo topic](#create-a-geo-topic)
+- [Produce and consume](#produce-and-consume)
+- [Delays](#delays)
+- [What fails and what is lost](#what-fails-and-what-is-lost)
+- [Failover and failback](#failover-and-failback)
+- [Retire an origin](#retire-an-origin)
+- [Cost](#cost)
+- [Metrics](#metrics)
+- [Tunables](#tunables)
+- [Limits of this version](#limits-of-this-version)
+
+## Words used on this page
+
+- **Datacenter**: a site that runs one Iggy cluster and one bucket.
+- **Bucket**: where a cluster keeps its objects. It is the `[tiered_storage]` store of the
+  cluster: an S3 bucket and key prefix, or a directory and prefix for the `fs` backend.
+- **Origin**: the name of a cluster among the datacenters, `[geo] origin`. The origin of a
+  message is the cluster that accepted it.
+- **Peer**: another cluster whose bucket this cluster reads, one `[[geo.peers]]` table.
+- **Log**: the messages of one partition, with their offsets. Each cluster writes only its own
+  log of a geo topic.
+- **Shadow stream** and **shadow topic**: how a cluster shows the geo topics of a peer. The
+  shadow stream of the peer `dc-a` and its stream `orders` is `__shadow_dc-a_orders`.
+- **Committed**: the message is stored and its cluster acknowledged it to the producer.
+- **Published**: the message is in a long-term segment that the partition's manifest lists. Only
+  published messages are meant to be read by other datacenters.
+
+## What a geo topic is
+
+A geo topic is a topic type, `topic_type = geo`, fixed at creation. A normal topic never becomes
+a geo topic, and a geo topic never becomes a normal topic.
+
+Take two datacenters, `dc-a` and `dc-b`, with the stream `orders` and its geo topic `payments`
+in each cluster:
+
+- A producer connected to `dc-a` sends to `orders/payments` in `dc-a`. Cluster `dc-a` appends the
+  messages to its own log and stores them in its own bucket.
+- A producer connected to `dc-b` sends to `orders/payments` in `dc-b`. Cluster `dc-b` appends them
+  to its own log in its own bucket.
+- Each cluster reads the bucket of the other, and adopts the other's geo topic as a shadow topic.
+  Cluster `dc-b` holds `__shadow_dc-a_orders/payments`, which is built to serve the log of `dc-a`,
+  and cluster `dc-a` holds `__shadow_dc-b_orders/payments` for the log of `dc-b`.
+- A consumer connects to one cluster. It reads that cluster's own topic, and is meant to read the
+  log of each other datacenter from the shadow topic in the same cluster. This version does not
+  fill shadow topics yet.
+
+The two logs are separate. Each one has its own offsets, assigned only by its origin. Offset 0
+in the log of `dc-a` and offset 0 in the log of `dc-b` are two unrelated messages.
+
+### The guarantee
+
+Geo topics are built to give this guarantee: every message acknowledged in one datacenter
+becomes readable in every other, exactly once, in the order its origin wrote it.
+
+A message is stored once, in the log of the cluster that accepted it, and is never written back.
+That is why a message cannot loop between datacenters or appear twice through replication. This
+version delivers the first part, the origin's log in its bucket. It does not deliver the second
+part yet: see the status note at the top.
+
+### What a geo topic is not
+
+- It is not one merged log. A consumer that wants every message reads one log per datacenter.
+- It has no order between datacenters. Messages written in `dc-a` keep the order `dc-a` gave them,
+  and messages written in `dc-b` keep theirs. Nothing orders a message of `dc-a` against a message
+  of `dc-b`.
+- The same key written in two datacenters has no defined order. If `dc-a` and `dc-b` both write
+  key `42`, no reader can tell which write came last.
+- It is not a standby. No cluster is promoted, and no cluster ever writes into the log of another.
+- It shares only geo topics. Users, permissions, normal topics and consumer groups stay in the
+  cluster that holds them. Create them in each cluster.
+
+## What works in this version
+
+| Part                                                                          | In this version |
+| ----------------------------------------------------------------------------- | --------------- |
+| Create a geo topic in mode `geo`                                              | Yes             |
+| Produce to a geo topic: each send is stored in the bucket before it commits   | Yes             |
+| Poll a geo topic in the cluster that wrote it                                 | Yes             |
+| Long-term segments, the partition manifest, merges, retention and deletes     | Yes             |
+| Publish an object for each geo topic in the bucket, and a tombstone on delete | Yes             |
+| Read and verify the bucket of each peer                                       | Yes             |
+| Adopt the geo topics of each peer as shadow streams                           | Yes             |
+| A shadow topic serves the messages of its origin                              | No              |
+| A command that retires an origin that never returns                           | No              |
+| Consumer positions that move between datacenters                              | No              |
+| The `geo_tiered` mode, and a switch between modes                             | No              |
+| Geo topics in encrypted streams                                               | No              |
+| Geo topics through the Kafka gateway                                          | No              |
+
+## How a message moves
+
+1. A producer sends to a partition of a geo topic. The shard that leads the partition adds the
+   messages to its open upload window, which takes the sends of every geo partition of that
+   shard.
+2. The shard stores the window as one **fresh object** in its bucket, under
+   `<prefix>/meta/fresh/`. A window closes when it holds 4 MiB, or when a send finds a free upload
+   slot and `fresh_upload_interval` has passed since the last upload started.
+3. Once the object is stored, the partition commits a placed batch through its consensus: the
+   batch header and where its messages sit in the fresh object, 320 bytes in all. The replicas
+   store this record on their disks. The messages themselves are only in the bucket.
+4. The producer is acknowledged when the placed batch commits. The message is **committed**.
+   Polls in this cluster read it at once, from the bucket, through a cache of 64 MiB per shard.
+5. In the background, the partition's primary rewrites committed messages into **long-term
+   segments** in the bucket, at most 64 MiB each, and commits each one to the partition's
+   long-term log. It then stores the partition's **manifest**,
+   `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`, which lists the
+   long-term segments. The message is **published**.
+6. Once every message of a fresh object is in long-term segments, no record names the object
+   any more. A sweep that runs every minute deletes it 10 minutes after it first finds it so.
+
+The rest of the long-term work runs on the same primary: small segments are merged, the topic's
+retention trims the oldest segments, and the objects that the log no longer lists are deleted
+about an hour later.
+
+## Prerequisites
+
+- **One cluster per datacenter.** Each cluster has its own `[cluster]` configuration. Every node
+  of one cluster gets the same `[tiered_storage]` and `[geo]` sections.
+- **One bucket per datacenter.** Use the `s3` backend for S3 or a store with its API, such as
+  MinIO, Ceph RGW or R2. The `fs` backend takes a directory, which suits tests on one host.
+  Create the bucket before the first start: a missing bucket stops the boot.
+- **The bucket must not share fate with the cluster that writes to it.** A geo topic is exactly
+  as durable as its bucket: the messages are only there, and the replicas hold only where they
+  sit. Use a store that outlives the site, such as a regional cloud object store. The server
+  cannot check this rule.
+- **Credentials.** Each cluster needs read and write access to its own bucket: get, put, list
+  and delete. On S3 that is `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and
+  `s3:ListBucket`. Each cluster needs only read access to the bucket of each peer: `s3:GetObject`
+  and `s3:ListBucket`. The server never writes to a peer's bucket.
+- **No lifecycle rule that expires objects under the prefix.** The cluster deletes what it no
+  longer needs. An object that a rule removes early is lost data.
+- **The segment cleaner stays on.** `[data_maintenance.messages] cleaner_enabled = true` is the
+  default. The cleaner starts the first rewrite of each partition after a node starts, and runs
+  retention and the deletes of long-term objects. With it off, a geo topic publishes nothing and
+  its fresh objects are never deleted.
+- **No server-wide stream encryption.** With `[encryption] enabled = true`, every new stream gets
+  a key, and a geo topic cannot be created in a stream with a key.
+
+## Configure each cluster
+
+Each cluster needs three things: its origin name, its own bucket, and the bucket of each peer.
+
+### Origin
+
+`[geo] origin` names the cluster. It holds 1 to 32 bytes of lowercase letters, digits and `-`,
+starts with a letter, and does not end with `-`. Shadow stream names carry it, so pick it once:
+this version has no procedure to rename an origin.
+
+A cluster needs an origin for its own geo topics, not only for peers. Without an origin, the
+cluster accepts a geo topic but publishes no object for it, and the topic's partitions refuse
+every send with `TransientNotAccepted` (58).
+
+### Own bucket
+
+`[tiered_storage]` names the bucket of this cluster. The [tiered storage
+section](../README.md#tiered-storage) of the server README describes each key, the credential
+sources of the `s3` backend, and the store identity object `<prefix>/meta/identity`, with which
+replica 0 claims the prefix for the cluster. The cluster accepts a geo topic only while every
+node passes that check. Until then a create returns `FeatureUnavailable` (5).
+
+Replica 0 writes the claim only while it is the caught-up metadata primary. If another replica
+leads metadata when the cluster first starts, nothing claims the prefix, and geo topics are
+refused. The README says how to move the lead back to replica 0.
+
+### Peers
+
+Each `[[geo.peers]]` table names one peer: its `origin`, which must equal that cluster's own
+`[geo] origin`, and the keys of that cluster's `[tiered_storage]` section. A cluster reads at most
+16 peers. Two peers cannot name the same bucket and prefix. An `s3` peer takes only static keys:
+web identity and instance roles do not apply to peers. Set the keys in the environment, as
+`IGGY_GEO_PEERS_<n>_ACCESS_KEY_ID` and `IGGY_GEO_PEERS_<n>_SECRET_ACCESS_KEY`, where `<n>` is
+the peer's place in the list, from 0.
+
+A peer that does not answer never stops the boot and never delays local traffic.
+
+### Two-cluster example
+
+Two datacenters: `dc-a` with the bucket `iggy-dc-a` in `eu-central-1`, and `dc-b` with the bucket
+`iggy-dc-b` in `us-east-1`, both on AWS S3.
+
+On every node of `dc-a`, in `config.toml`:
+
+```toml
+[tiered_storage]
+backend = "s3"
+prefix = "iggy"
+bucket = "iggy-dc-a"
+region = "eu-central-1"
+
+[geo]
+origin = "dc-a"
+
+[[geo.peers]]
+origin = "dc-b"
+backend = "s3"
+prefix = "iggy"
+bucket = "iggy-dc-b"
+region = "us-east-1"
+```
+
+On every node of `dc-b`:
+
+```toml
+[tiered_storage]
+backend = "s3"
+prefix = "iggy"
+bucket = "iggy-dc-b"
+region = "us-east-1"
+
+[geo]
+origin = "dc-b"
+
+[[geo.peers]]
+origin = "dc-a"
+backend = "s3"
+prefix = "iggy"
+bucket = "iggy-dc-a"
+region = "eu-central-1"
+```
+
+The credentials go in the environment of each node. On a node of `dc-a`:
+
+```sh
+# Read and write keys for iggy-dc-a. Leave them out to use web identity or the
+# instance role instead.
+export IGGY_TIERED_STORAGE_ACCESS_KEY_ID="..."
+export IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY="..."
+# Read-only keys for iggy-dc-b, the first peer.
+export IGGY_GEO_PEERS_0_ACCESS_KEY_ID="..."
+export IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY="..."
+```
+
+The same settings work from the environment alone, for example `IGGY_GEO_ORIGIN=dc-a`,
+`IGGY_GEO_PEERS_0_ORIGIN=dc-b`, `IGGY_GEO_PEERS_0_BACKEND=s3`, `IGGY_GEO_PEERS_0_BUCKET=iggy-dc-b`
+and `IGGY_GEO_PEERS_0_REGION=us-east-1`.
+
+For a store other than AWS, add its URL as `endpoint`, for example
+`endpoint = "https://minio.dc-b.example.com"`. For an `fs` peer, set `backend = "fs"` and `path`
+to the directory that holds the peer's objects.
+
+### Check the setup
+
+Start both clusters, in any order. Then check on every node:
+
+1. `object_store_identity_verified` is 1. The node can write to its own bucket.
+2. `geo_peer_identity_verified{origin="dc-b"}` is 1 on the nodes of `dc-a`, and
+   `geo_peer_identity_verified{origin="dc-a"}` is 1 on the nodes of `dc-b`. The node reads the
+   peer's bucket.
+
+The gauges are on the HTTP endpoint `/metrics`, which takes a bearer token, such as a personal
+access token:
+
+```sh
+curl -s -H "Authorization: Bearer $IGGY_TOKEN" http://dc-a-node-1:3000/metrics \
+  | grep -E '^(object_store_identity_verified|geo_peer_identity_verified|geo_peer_unreachable)'
+```
+
+The node logs the reason when a check does not pass. The README lists the causes: a prefix
+claimed by another cluster, metadata that was rebuilt, or a peer entry that points at the wrong
+bucket.
+
+## Create a geo topic
+
+Create the stream in each cluster first. Then create the geo topic in each cluster where
+producers write. Adoption creates only the read-only shadow topic in the other clusters, so a
+cluster that takes writes needs its own geo topic, created there.
+
+Choose the partition count and the retention at creation. A geo topic keeps its name, its options
+and its partition count for good.
+
+With the CLI, against a node of `dc-a`:
+
+```sh
+export IGGY_USERNAME=iggy IGGY_PASSWORD="..."
+iggy --tcp-server-address dc-a-node-1:8090 stream create orders
+iggy --tcp-server-address dc-a-node-1:8090 topic create orders payments 3 none 7days \
+  --max-topic-size 500GB --set topic_type=geo
+```
+
+Over HTTP:
+
+```http
+POST /streams/orders/topics
+Content-Type: application/json
+Authorization: Bearer ...
+
+{
+  "name": "payments",
+  "partitions_count": 3,
+  "options": {
+    "topic_type": "geo",
+    "message_expiry": "7 days",
+    "max_topic_size": "500 GB"
+  }
+}
+```
+
+With the Rust SDK:
+
+```rust
+use iggy::prelude::*;
+
+let topic = client
+    .create_topic(
+        &Identifier::named("orders")?,
+        "payments",
+        &TopicCreateOptions {
+            partitions_count: Some(3),
+            topic_type: Some(TopicType::Geo),
+            ..TopicCreateOptions::default()
+        },
+    )
+    .await?;
+```
+
+The other SDKs set the same option keys, `topic_type` and `geo_mode`. `iggy options topic` lists
+every topic option the server takes.
+
+`geo_mode` defaults to `geo` on a geo topic, the only mode clients can pick in this version. The
+server stores `partition_resize_policy` as `fixed` on a geo topic.
+
+### What a create refuses
+
+| Request                                                              | Answer                        |
+| -------------------------------------------------------------------- | ----------------------------- |
+| `topic_type=geo` while a node does not pass the store identity check | `FeatureUnavailable` (5)      |
+| `geo_mode=geo_tiered`                                                | `FeatureUnavailable` (5)      |
+| A geo topic in a stream that has an encryption key                   | `FeatureUnavailable` (5)      |
+| `geo_mode` on a normal topic                                         | `InvalidOptionValue` (4042)   |
+| `tiered_storage=true` on a geo topic                                 | `InvalidOptionValue` (4042)   |
+| `partition_resize_policy` other than `fixed` on a geo topic          | `InvalidOptionValue` (4042)   |
+| Any topic create in a shadow stream                                  | `ShadowStreamReadOnly` (1021) |
+
+After the create, the topic refuses changes:
+
+| Request on a geo topic                 | Answer                           |
+| -------------------------------------- | -------------------------------- |
+| An update of its name or of any option | `OptionNotUpdatable` (4103)      |
+| Adding or deleting partitions          | `PartitionResizeDisabled` (2023) |
+
+A `FeatureUnavailable` from a cluster that is not ready is worth retrying while its nodes pass
+their store identity checks. `object_store_identity_verified` shows when each node does.
+
+### What happens after a create
+
+1. The metadata primary stores the topic's object,
+   `<prefix>/meta/topics/<stream_id>/<topic_id>/<created_revision>`, within about a second.
+2. The primary of each partition reads that object back before it takes messages. Until then the
+   partition refuses sends with `TransientNotAccepted` (58), which the SDKs retry, and logs one
+   warning.
+3. The metadata primary of each peer lists the topic objects of this cluster every 5 seconds. It
+   adopts the new topic into the shadow stream `__shadow_<origin>_<stream>`, with the same topic
+   id, topic name and partition ids.
+
+## Produce and consume
+
+### Producers
+
+A producer writes to the geo topic of the cluster it is connected to. The server has no notion
+of a producer's home datacenter: a message belongs to the log of the cluster that accepted it.
+
+The producer is acknowledged after its messages are stored in the bucket and the placed batch
+commits. When the bucket does not answer, a send is answered with `TransientNotAccepted` (58),
+which the SDKs retry, after at most 3 attempts at the upload within 10 seconds. A shard also
+answers 58 while it holds 32 MiB of sends that wait for the bucket or for their partition.
+
+A send to a shadow topic returns `ShadowStreamReadOnly` (1021).
+
+### Consumers
+
+A consumer connects to the cluster of its own datacenter, and reads:
+
+- the geo topic, for the messages written in this datacenter, for example `orders/payments`;
+- the shadow topic of each peer, for the messages written there, for example
+  `__shadow_dc-b_orders/payments` in `dc-a`.
+
+A shadow topic is read like any other topic, by stream name and topic name or id. It has the
+topic id and the partition ids of its origin's topic, and it is built to serve the origin's
+offsets.
+
+In this version a shadow topic holds no messages. A consumer that needs the messages of another
+datacenter now has to read that datacenter's own geo topic from a client connected to that
+datacenter's cluster.
+
+### Consumer groups and positions
+
+- The topic and each shadow topic are separate topics, so a consumer group keeps one position per
+  log, and all of them are stored in its own cluster.
+- Positions never move between datacenters. A group that moves to another datacenter starts from
+  the positions it has there, if any.
+- The same group name can run in several datacenters. The groups are independent, and each one
+  reads every message it is given.
+- Grant read permissions on each shadow stream as on any other stream.
+
+### Duplicates
+
+A send that was not acknowledged can still have committed. A producer that retries it in another
+datacenter can write it twice, once in each log. Consumers that must not process it twice
+deduplicate on an id of their own, such as the message id that the producer sets.
+
+## Delays
+
+| From                  | To                                 | How long                                                                                                                                              |
+| --------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Send                  | Committed and acknowledged         | One upload of the fresh object and one commit. A busy shard adds up to `fresh_upload_interval`, 10 ms by default, or the wait for a free upload slot. |
+| Committed             | Readable in the origin cluster     | At once.                                                                                                                                              |
+| Committed             | Published                          | The partition's next rewrite, every 250 ms to 10 s, plus the upload and the commit of the segment. The manifest is stored after the commit.           |
+| Published             | Readable in another datacenter     | Not available in this version.                                                                                                                        |
+| Geo topic created     | Shadow topic in each peer          | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                       |
+| Geo topic deleted     | Shadow topic detached in each peer | Up to a minute until the origin writes the tombstone, then up to 30 s until a peer reads it again.                                                    |
+| Shadow topic detached | Shadow topic removed               | `[geo] tombstone_grace` of the cluster that holds the shadow, 24 hours by default, counted from the tombstone's write.                                |
+
+Each partition adjusts its rewrite interval between 250 ms and 10 s, toward the interval at which
+a long-term segment comes out 80% of 64 MiB full. A segment cut at 64 MiB starts the next rewrite
+as soon as it commits. After a node starts, its partitions rewrite nothing until the first pass
+of the segment cleaner, one `[data_maintenance.messages] interval` after the start, 1 minute by
+default.
+
+`partition_long_term_rewrite_lag_messages` shows how far publication trails commits on the
+origin. It is the most committed messages that one partition of the shard holds and no long-term
+segment holds yet.
+
+## What fails and what is lost
+
+| Event                                                   | Effect                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| One node of a cluster fails                             | The partitions elect another primary as for any topic. Nothing is lost.                                                                                                                                                                                                                                      |
+| A cluster's bucket does not answer                      | Its geo topics refuse sends with 58. Polls that need bytes from the bucket get 58, which the SDKs retry. Rewrites wait. Peers mark the shadow topics of that origin stale.                                                                                                                                   |
+| A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. As for any topic, the topic's `durability` decides whether a crash of every node at once can lose acknowledged messages: see [replication factor](../README.md#replication-factor). |
+| A cluster is destroyed with its disks, its bucket stays | The messages it committed and had not published are lost. The fresh objects that hold them do not say whose messages they are or at which offsets. The published long-term segments stay in the bucket, but no cluster can read them in this version.                                                        |
+| A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                 |
+| A peer's bucket does not answer                         | This cluster serves its shadow topics as they are, removes none of them except those whose grace ended, and sets `geo_shadow_topics_stale` for that origin. Local traffic is not affected.                                                                                                                   |
+
+Committed and not yet published is the window that a destroyed cluster loses. Watch
+`partition_long_term_rewrite_lag_messages` to see its size.
+
+## Failover and failback
+
+A datacenter that takes over takes over the traffic, not the log. Nothing is promoted and
+nothing is restored. The steps below assume `dc-a` fails and `dc-b` stays up, and that both
+clusters already have the geo topic `orders/payments`.
+
+### Failover
+
+1. Point the producers of `dc-a` at `dc-b`. They write to `orders/payments` in `dc-b`, which
+   appends to the log of `dc-b`. No setting changes in `dc-b`.
+2. Let the producers retry in `dc-b` every send that `dc-a` did not acknowledge. Such a send may
+   exist in both logs. See [Duplicates](#duplicates).
+3. Start the consumers of `dc-a` in `dc-b`, on `orders/payments`. Their positions in `dc-a` stay
+   in `dc-a`. In `dc-b` each group continues from its own position there, or starts where the
+   consumer is told to start when the group has none.
+4. The messages that `dc-a` acknowledged before it failed stay in the log of `dc-a`. In this
+   version no consumer in `dc-b` can read them while `dc-a` is down.
+
+### Failback
+
+1. Start `dc-a`. It replays its consensus log, and its rewrite publishes the committed messages
+   it had not published yet. There is nothing to reconcile: `dc-b` never wrote into the log of
+   `dc-a`.
+2. Move the producers back to `dc-a`, or leave them in `dc-b`. Either way, each message goes to
+   the log of the cluster that accepts it.
+3. Move the consumers back to `dc-a`. They continue from their positions in `dc-a`, and so read
+   the messages that `dc-a` acknowledged before it failed. In this version, the messages written
+   in `dc-b` during the outage are readable only from `dc-b`.
+
+## Retire an origin
+
+This version has no command to retire an origin that never returns.
+
+What an operator can do: remove the origin's `[[geo.peers]]` entry from every node of each
+surviving cluster and restart those nodes. The nodes then stop reading that bucket. The shadow
+streams of that origin stay as they are, read-only, and nothing in this version removes them. No
+client can delete a shadow stream. Iggy never writes to or deletes from the bucket of a peer, so
+cleaning the retired origin's bucket is the job of the operator.
+
+## Cost
+
+A geo topic is designed so that cross-datacenter traffic is paid only for what consumers in one
+datacenter read from the shadow topics of another. In this version shadow topics read no
+messages, so no message bytes cross between datacenters. The cross-datacenter requests are
+metadata reads, per peer:
+
+- each node reads the peer's store identity object once a minute, and every 5 seconds while the
+  check does not pass;
+- the metadata primary lists the peer's topic objects every 5 seconds, reads each new object,
+  and reads each known object again every 30 seconds.
+
+Requests to a cluster's own bucket:
+
+- one put per fresh object: up to one object per `fresh_upload_interval` on each shard, plus one
+  for each object that fills to 4 MiB first;
+- a get for each poll that misses the shard's 64 MiB cache, and gets for the rewrites and merges,
+  which read the messages back;
+- a put for each long-term segment and its index, and one for each manifest;
+- listings of the replica's fresh objects every minute, and the deletes of fresh and long-term
+  objects.
+
+Storage: a message stays in its fresh object until at least 10 minutes after every message of
+that object is published, and in a long-term segment until retention removes it. Each replica
+keeps 320 bytes per batch on its disk.
+
+## Metrics
+
+All metrics are on the HTTP endpoint `/metrics` of each node, with a `shard` label. Counters carry
+the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
+
+### Buckets and peers
+
+| Metric                           | Meaning                                                             |
+| -------------------------------- | ------------------------------------------------------------------- |
+| `object_store_identity_verified` | 1 while the node passes the store identity check of its own bucket. |
+| `object_store_unreachable`       | 1 while its own bucket does not answer the check.                   |
+| `geo_peer_identity_verified`     | Per `origin`: 1 while the node reads the peer's bucket.             |
+| `geo_peer_unreachable`           | Per `origin`: 1 while the peer's bucket does not answer the check.  |
+| `geo_shadow_topics_stale`        | Per `origin`: stale shadow topics, counted on the metadata primary. |
+
+### Write path
+
+| Metric                      | Kind      | Meaning                                                                              |
+| --------------------------- | --------- | ------------------------------------------------------------------------------------ |
+| `fresh_uploads`             | counter   | Fresh objects the shard stored.                                                      |
+| `fresh_upload_bytes`        | counter   | Bytes of those objects.                                                              |
+| `fresh_upload_retries`      | counter   | Attempts after an attempt that failed.                                               |
+| `fresh_upload_failures`     | counter   | Objects the bucket refused. Their sends were answered as not accepted.               |
+| `fresh_sends_denied`        | counter   | Sends the shard answered as not accepted, for any reason.                            |
+| `fresh_uploads_in_flight`   | gauge     | Uploads that hold one of the shard's `fresh_uploads` slots.                          |
+| `fresh_staged_sends`        | gauge     | Sends whose messages the shard holds and whose record has not reached its partition. |
+| `fresh_window_wait_seconds` | histogram | How long an upload window stayed open after its first send.                          |
+| `fresh_upload_seconds`      | histogram | How long the upload of a fresh object took.                                          |
+| `fresh_commit_seconds`      | histogram | How long a send waited for its answer after its fresh object was stored.             |
+
+### Fresh objects
+
+The first shard of each node sweeps the fresh objects that this replica wrote.
+
+| Metric                            | Kind    | Meaning                                                                                      |
+| --------------------------------- | ------- | -------------------------------------------------------------------------------------------- |
+| `fresh_objects`                   | gauge   | Fresh objects of this replica that the last sweep listed.                                    |
+| `fresh_object_bytes`              | gauge   | Their bytes.                                                                                 |
+| `fresh_object_oldest_age_seconds` | gauge   | Age of the oldest one. It grows when publication stops.                                      |
+| `fresh_objects_unnamed`           | gauge   | Objects that no record names, which wait out their 10 minutes.                               |
+| `fresh_objects_due`               | gauge   | Objects past their 10 minutes that the last sweep left in the bucket.                        |
+| `fresh_listings_truncated`        | gauge   | Listings of the last sweep that stopped at their share of keys. `fresh_objects` is then low. |
+| `fresh_objects_deleted`           | counter | Fresh objects this replica deleted.                                                          |
+
+### Long-term segments
+
+These cover the partitions that the shard leads.
+
+| Metric                                     | Kind    | Meaning                                                                         |
+| ------------------------------------------ | ------- | ------------------------------------------------------------------------------- |
+| `partition_long_term_rewrite_lag_messages` | gauge   | Most committed messages of one partition that no long-term segment holds yet.   |
+| `partition_long_term_segments`             | gauge   | Most segments in the long-term log of one partition, of the 65,536 a log takes. |
+| `partition_long_term_merges`               | counter | Merges of small segments that committed.                                        |
+| `partition_long_term_merged_segments`      | counter | Segments that those merges replaced.                                            |
+| `partition_long_term_trims`                | counter | Trims that retention sent, one per pass until the trim commits.                 |
+| `partition_long_term_dead_objects`         | gauge   | Objects the log no longer lists, which wait to be deleted.                      |
+| `partition_long_term_deleted_objects`      | counter | Long-term objects deleted, the log and the index of a segment counted as one.   |
+| `partition_long_term_unannounced_objects`  | gauge   | Objects in the bucket that the log does not list and may still list later.      |
+
+Alert on these first:
+
+- `object_store_identity_verified` at 0: the node cannot write geo topics.
+- `fresh_upload_failures` or `fresh_sends_denied` that keep growing: producers are refused.
+- `partition_long_term_rewrite_lag_messages` or `fresh_object_oldest_age_seconds` that keep
+  growing: publication stopped, and the window a destroyed cluster would lose grows with them.
+- `partition_long_term_segments` near 65,536: the log stops taking segments when it is full.
+- `geo_peer_identity_verified` at 0 or `geo_shadow_topics_stale` above 0: a peer is not read.
+
+## Tunables
+
+| Key                                      | Default | Meaning                                                                                                                                                                                                                                                                |
+| ---------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[tiered_storage] fresh_upload_interval` | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer. |
+| `[tiered_storage.jobs] fresh_uploads`    | `4`     | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads.                                                                                                                                            |
+| `[geo] tombstone_grace`                  | `24 h`  | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage.                                                                               |
+
+The other `[tiered_storage]` keys apply to geo topics as they do to tiered topics: the timeouts
+and retries of store calls, and the job caps of `[tiered_storage.jobs]`. Each shard runs one tier
+service per peer with the same caps, so a slow peer takes no slot from the cluster's own bucket.
+
+These values are fixed in this version: 4 MiB per fresh object before it closes early, 32 MiB
+of waiting sends per shard, 3 attempts and 10 seconds per fresh object, 64 MiB per long-term
+segment, 10 minutes before an unnamed fresh object is deleted, and 1 hour before an unlisted
+long-term object is deleted.
+
+## Limits of this version
+
+- **Shadow topics hold no messages.** A cluster adopts the geo topics of its peers, but a shadow
+  partition does not follow its origin's manifest yet. Read another datacenter's messages from
+  its own cluster.
+- **Consumer positions stay in their datacenter.** No position moves with a consumer group.
+- **No encrypted streams.** A geo topic in a stream with an encryption key is refused with
+  `FeatureUnavailable` (5), because its sends reach the bucket before the stream's encryption
+  runs.
+- **No Kafka gateway.** The Kafka gateway does not support geo topics or shadow streams.
+- **Frozen partition count and options.** A geo topic keeps its name, its options, including
+  `message_expiry` and `max_topic_size`, and its partition count.
+- **Only the `geo` mode.** `geo_tiered` is refused, and a geo topic cannot change its mode.
+- **No command to retire an origin.** See [Retire an origin](#retire-an-origin).
+- **Each cluster's geo topic is created there.** Adoption creates only shadow topics. Nothing
+  checks that the geo topics of the same name in two clusters have the same partition count or
+  options.
+- **A recreated topic waits for its old shadow.** When a geo topic is deleted and created again
+  with the same name, a peer adopts the new one only after it removes the old shadow topic, which
+  takes `tombstone_grace`.
+- **A cluster with geo topics needs an origin.** Without `[geo] origin`, a geo topic takes no
+  messages.
+- **Peers take static keys only.** An `s3` peer needs `access_key_id` and `secret_access_key`.
+- **Up to 16 peers.** A cluster reads at most 16 peers.
+- **Geo topics do not lock the store identity claim.** Once a topic is tiered, replica 0 never
+  claims the prefix again. A geo topic does not have that effect: replica 0 keeps claiming again
+  after any check that did not pass. With the `fs` backend, keep the mount of the bucket directory
+  reliable, or a dropped mount is claimed as an empty bucket.
+- **Retention works on whole long-term segments.** Retention removes the oldest long-term segments
+  that expired or exceed the size budget, never the last one, and never past the lowest offset
+  that a consumer or consumer group of the origin cluster committed on the partition. The size
+  budget of one partition is at least 64 MiB.
+- **Deleting segments keeps the bucket.** A client's delete of segments on a geo topic does not
+  remove long-term segments. Only retention and a delete of the topic do.
+- **65,536 long-term segments per partition.** Merges keep the count down. A full log takes no new
+  segment until merges or retention free room.
+- **No client tooling for the model yet.** No SDK reads a topic and its shadow topics together, and
+  stream listings do not mark shadow streams. A shadow stream is recognised by its `__shadow_`
+  name prefix.
