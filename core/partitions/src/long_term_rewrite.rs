@@ -376,8 +376,6 @@ pub struct LongTermRewrites {
     ends_at: Option<u64>,
     /// The commit point the last rewrite started at.
     committed_at_start: u64,
-    /// Number of the last rewrite this partition started.
-    jobs: u64,
 }
 
 /// Bytes of the batches a partition committed above its long-term floor,
@@ -507,10 +505,10 @@ where
         };
         let scope = TierScope::new();
         let token = scope.token();
-        rewrites.jobs += 1;
-        let id = rewrites.jobs;
-        rewrites.running = Some((id, scope));
         rewrites.committed_at_start = committed;
+        self.long_term_rewrite_jobs += 1;
+        let id = self.long_term_rewrite_jobs;
+        self.long_term_rewrites.running = Some((id, scope));
         let rewrite = SegmentRewrite {
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             start_offset,

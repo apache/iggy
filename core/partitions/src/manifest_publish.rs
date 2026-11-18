@@ -138,8 +138,6 @@ pub struct ManifestPublishes {
     /// The job in flight: its number, what its manifest holds, and the scope
     /// whose end stops it.
     running: Option<(u64, ManifestProgress, TierScope)>,
-    /// Number of the last job this partition started.
-    jobs: u64,
 }
 
 impl ManifestPublishes {
@@ -228,6 +226,17 @@ where
         self.deletes_objects() || (self.places_batches() && self.state_machines_current())
     }
 
+    /// Whether this replica is the primary of a partition that places its
+    /// batches and no pass ran over it in this view. Until its first publish,
+    /// a reader finds the manifest an earlier primary stored, which may list
+    /// fewer segments than are committed.
+    #[must_use]
+    pub fn manifest_awaits_first_pass(&self) -> bool {
+        self.places_batches()
+            && self.publishes_manifest()
+            && self.manifest_publishes.view != Some(self.consensus().view())
+    }
+
     /// Start the publish of this partition's manifest, when this replica is
     /// the primary, none is in flight, and the manifest differs from the
     /// one this view last stored or is due again. The caller runs it under
@@ -257,9 +266,9 @@ where
         }
         let scope = TierScope::new();
         let token = scope.token();
-        publishes.jobs += 1;
-        let id = publishes.jobs;
-        publishes.running = Some((id, progress, scope));
+        self.manifest_publish_jobs += 1;
+        let id = self.manifest_publish_jobs;
+        self.manifest_publishes.running = Some((id, progress, scope));
         Some((id, manifest, token))
     }
 
