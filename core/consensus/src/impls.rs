@@ -1370,6 +1370,18 @@ impl CommitAnnouncements {
             .is_some_and(|(_, since)| now.saturating_sub(since) >= lag_max)
     }
 
+    /// Whether a replica other than `own` trails the commit point at `now`
+    /// for less than `lag_max` microseconds, so that time alone makes it
+    /// [`Self::lagging`].
+    fn lag_pending(&self, own: u8, now: u64, lag_max: u64) -> bool {
+        self.replicas
+            .iter()
+            .enumerate()
+            .filter(|(replica, _)| *replica != usize::from(own))
+            .filter_map(|(_, progress)| progress.behind)
+            .any(|(_, since)| now.saturating_sub(since) < lag_max)
+    }
+
     fn record_broadcast(&mut self, commit: u64) {
         for progress in &mut self.replicas {
             progress.sent = progress.sent.max(commit);
@@ -2480,6 +2492,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 .filter_map(|node| 1_u32.checked_shl(u32::from(node)))
                 .fold(0, |nodes, bit| nodes | bit)
         })
+    }
+
+    /// Whether [`Self::in_sync_members`] can lose a member with no frame and
+    /// no request: an acting primary has a member that trails its commit
+    /// point for less than `lag_max`.
+    #[must_use]
+    pub fn member_lag_pending(&self, lag_max: Duration) -> bool {
+        self.is_acting_primary()
+            && self.commit_announcements.borrow().lag_pending(
+                self.replica,
+                self.message_bus.monotonic_micros(),
+                u64::try_from(lag_max.as_micros()).unwrap_or(u64::MAX),
+            )
     }
 
     /// The in-sync members as a mask of member indices.
@@ -4257,14 +4282,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// An idle group whose `view` or `commit_min` moved is busy again. Its
     /// next heartbeat goes on the next grid tick, with the busy period.
     fn wake_idle_group(&self) {
-        if !self.group_idle.get() {
-            return;
+        if self.idle_group_moved() {
+            self.arm_first_heartbeat();
         }
-        let current = (self.view.get(), self.commit_min.get());
-        if current == self.heartbeat_activity.get().0 {
-            return;
+    }
+
+    fn idle_group_moved(&self) -> bool {
+        self.group_idle.get()
+            && (self.view.get(), self.commit_min.get()) != self.heartbeat_activity.get().0
+    }
+
+    /// The tick of [`Self::tick_clock`] at which a tick next has timer work,
+    /// provided no frame and no request reaches the group before: the
+    /// earliest timeout deadline, `u64::MAX` when every timeout is stopped.
+    ///
+    /// `None` while the next tick can have work that no timeout announces: a
+    /// heartbeat that waits for its grid tick, an eager Commit, or an idle
+    /// group whose `view` or `commit_min` moved.
+    #[must_use]
+    pub fn next_timer_deadline(&self) -> Option<u64> {
+        if self.heartbeat_due.get() || self.eager_commit.get() || self.idle_group_moved() {
+            return None;
         }
-        self.arm_first_heartbeat();
+        Some(self.timeouts.borrow().earliest_deadline())
     }
 
     /// Ask the next tick to send `commit_min` to the backups instead of waiting

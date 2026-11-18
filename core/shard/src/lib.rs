@@ -2152,6 +2152,9 @@ where
     /// cursor the leading groups would spend the whole budget on every pass and
     /// the tail would never be reached. See [`rotate_sweep_to_cursor`].
     partition_walk_cursor: Cell<Option<IggyNamespace>>,
+    /// Slot that the check for missed wake-ups tested last.
+    partition_sleep_check_cursor: Cell<usize>,
+    partition_missed_wakeup_warn: Cell<WarnPace>,
     primary_handoff: RefCell<primary_rebalance::PrimaryHandoff>,
     replication_replay_cursor: Cell<Option<(u64, u8)>>,
     /// Namespaces whose report to shard 0 changed, oldest first, each once:
@@ -2445,6 +2448,8 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            partition_sleep_check_cursor: Cell::new(0),
+            partition_missed_wakeup_warn: Cell::default(),
             primary_handoff: RefCell::default(),
             replication_replay_cursor: Cell::new(None),
             partition_reports_queued: RefCell::default(),
@@ -3415,6 +3420,8 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            partition_sleep_check_cursor: Cell::new(0),
+            partition_missed_wakeup_warn: Cell::default(),
             primary_handoff: RefCell::default(),
             replication_replay_cursor: Cell::new(None),
             partition_reports_queued: RefCell::default(),
@@ -9877,7 +9884,121 @@ where
         // both planes.
         self.flush_commit_outbox().await;
         self.flush_reply_outbox().await;
+        // After the flushes: a failed send records itself on its partition.
+        self.settle_ticked_partitions(namespace_scratch);
+        namespace_scratch.clear();
         fatal
+    }
+
+    /// Lets each partition that this tick visited sleep until its next
+    /// timeout when it has nothing to do before, and keeps the others awake.
+    /// The next ticks skip a sleeping partition, see
+    /// [`IggyPartitions::due_namespaces`].
+    ///
+    /// The last step of the tick, with no await: it reads every partition as
+    /// the tick leaves it, so it also sees what a task outside the pump
+    /// changed while the tick awaited.
+    fn settle_ticked_partitions(&self, visited: &[IggyNamespace]) {
+        let partitions = self.plane.partitions();
+        for namespace in visited {
+            let quiet_until = partitions
+                .sent_report(namespace)
+                .and_then(|(partition, sent)| {
+                    self.partition_quiet_until(*namespace, partition, sent.get())
+                });
+            partitions.settle(namespace, quiet_until);
+        }
+        self.metrics.set_partition_levels(&partitions.gauge_sums());
+        self.check_sleeping_partitions();
+    }
+
+    /// The tick before which no shard tick has work for `partition`, `None`
+    /// when the next tick can have some.
+    fn partition_quiet_until(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+        sent: SentReport,
+    ) -> Option<u64> {
+        let quiet_until = partition.quiet_until()?;
+        // The sweep reads the fault of a tombstoned partition, and a queued
+        // report waits for its batch.
+        if sent.queued || self.plane.partitions().is_tombstoned(&namespace) {
+            return None;
+        }
+        // The in-sync nodes of the report then change with no frame.
+        if partition
+            .consensus()
+            .member_lag_pending(consensus::MEMBER_LAG_MAX)
+        {
+            return None;
+        }
+        let (view, status, next) = self.next_report(namespace, partition, sent);
+        if view.is_some() || status.is_some() || next != sent {
+            return None;
+        }
+        // Only an acting primary reports counters, once per interval.
+        Some(if sent.primary {
+            let interval =
+                u64::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap_or(u64::MAX);
+            quiet_until.min(sent.checked_at.saturating_add(interval))
+        } else {
+            quiet_until
+        })
+    }
+
+    /// Tests sleeping partitions for work that no wake-up announced. A debug
+    /// build tests all of them on every tick and fails on the first one. A
+    /// release build tests `PARTITION_SLEEP_CHECKS_PER_TICK` in slot order,
+    /// wakes such a partition and counts it.
+    fn check_sleeping_partitions(&self) {
+        let partitions = self.plane.partitions();
+        let slots = partitions.slot_count();
+        let checks = if cfg!(debug_assertions) {
+            slots
+        } else {
+            slots.min(PARTITION_SLEEP_CHECKS_PER_TICK)
+        };
+        let now = self.ticks();
+        let mut slot = self.partition_sleep_check_cursor.get();
+        for _ in 0..checks {
+            slot = if slot + 1 < slots { slot + 1 } else { 0 };
+            let Some(sleeper) = partitions.sleeper(slot, now) else {
+                continue;
+            };
+            let quiet_until = self.partition_quiet_until(
+                sleeper.namespace,
+                sleeper.partition,
+                sleeper.sent_report,
+            );
+            if sleeper.gauge_share_current
+                && quiet_until.is_some_and(|quiet_until| quiet_until >= sleeper.wake_at)
+            {
+                continue;
+            }
+            debug_assert!(
+                false,
+                "partition {} sleeps until tick {} at tick {now} with work: quiet until \
+                 {quiet_until:?}, gauge share current: {}",
+                sleeper.namespace.inner(),
+                sleeper.wake_at,
+                sleeper.gauge_share_current,
+            );
+            self.metrics.record_partition_missed_wakeup();
+            let mut pace = self.partition_missed_wakeup_warn.get();
+            if pace.admit(now) {
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = sleeper.namespace.inner(),
+                    wake_at = sleeper.wake_at,
+                    ?quiet_until,
+                    "a sleeping partition had work that no wake-up announced; waking it"
+                );
+            }
+            self.partition_missed_wakeup_warn.set(pace);
+            partitions.settle(&sleeper.namespace, None);
+        }
+        self.partition_sleep_check_cursor.set(slot);
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -9915,15 +10036,17 @@ where
             }
         }
         let gap_debounce_ticks = self.repair_gap_debounce_ticks.get();
-        // Fan out over every group (each partition's heartbeat/retransmit timer
-        // must advance), so the keyed single-namespace lookup the control-frame
-        // handlers use does not apply here. The namespaces are snapshotted into
-        // the pump's owned scratch (as `process_loopback` does) so no
-        // partitions-plane borrow is held across the tick `.await`. The table
-        // walks in slot order, but the sweep cursor resumes by namespace
-        // order, so the snapshot is sorted.
-        namespace_scratch.extend(partitions.namespaces().copied());
+        // Fan out over every group that is awake or whose timeout came, so the
+        // keyed single-namespace lookup the control-frame handlers use does not
+        // apply here. A quiet group sleeps, see `settle_ticked_partitions`. The
+        // namespaces are snapshotted into the pump's owned scratch (as
+        // `process_loopback` does) so no partitions-plane borrow is held
+        // across the tick `.await`. The table walks in slot order, but the
+        // sweep cursor resumes by namespace order, so the snapshot is sorted.
+        partitions.due_namespaces(self.ticks(), namespace_scratch);
         namespace_scratch.sort_unstable();
+        self.metrics
+            .record_partition_tick_visits(namespace_scratch.len());
         // Resume where the last sweep ran out of walk budget, so the cap below
         // spreads over every group instead of replaying the same prefix.
         rotate_sweep_to_cursor(namespace_scratch, self.partition_walk_cursor.get());
@@ -9942,9 +10065,9 @@ where
             }
         }
 
+        // These counts cover the visited partitions. They are exact, because
+        // a partition in a state that one of them counts never sleeps.
         let mut persistence_metrics = partitions::PersistenceMetrics::default();
-        let mut repair_ring_entries = 0usize;
-        let mut repair_ring_bytes = 0u64;
         let mut untrusted_logs = 0usize;
         // Against `PARTITION_VIEW_CHANGES_INFLIGHT_MAX`. View changes that
         // start in a frame handler show up in the count of the next sweep.
@@ -9971,12 +10094,7 @@ where
                 view_changes += usize::from(consensus.status() == Status::ViewChange);
                 owing_retirement +=
                     usize::from(replication_due && partition.owes_session_retirement());
-                let (entries, bytes) = partition.repair_ring_occupancy();
-                repair_ring_entries += entries;
-                repair_ring_bytes += bytes;
                 if let Some(metrics) = partition.take_persistence_metrics() {
-                    persistence_metrics.disk_bytes += metrics.disk_bytes;
-                    persistence_metrics.retained_bytes += metrics.retained_bytes;
                     persistence_metrics.queued_bytes += metrics.queued_bytes;
                     persistence_metrics.in_flight_bytes += metrics.in_flight_bytes;
                     persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
@@ -9998,8 +10116,6 @@ where
             .record_replica_reads(&self.bus.take_replica_read_stats());
         self.metrics
             .record_replica_link_stats(&self.bus.take_replica_link_stats());
-        self.metrics
-            .set_repair_ring(repair_ring_entries, repair_ring_bytes);
         self.metrics.set_partitions_untrusted_log(untrusted_logs);
         if replication_due {
             // Counted once for the cluster, so a partition whose primary is down
@@ -10042,7 +10158,7 @@ where
         let mut walk_cursor: Option<IggyNamespace> = None;
 
         let mut fatal: Option<FatalCommit> = None;
-        for namespace in namespace_scratch.drain(..) {
+        for &namespace in namespace_scratch.iter() {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 if fatal.is_none() {
                     fatal = partitions
@@ -10698,7 +10814,7 @@ where
         // A stranded key stays until its own store or delete succeeds, so a
         // gauge that never falls is the operator's only signal.
         let mut stranded = [0usize; ConsumerKind::COUNT];
-        for namespace in partitions.namespaces() {
+        for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_by_ns(namespace) {
                 repairs_live += usize::from(partition.repair().is_some());
                 for kind in ConsumerKind::ALL {
@@ -10713,26 +10829,28 @@ where
             self.metrics
                 .set_consumer_offsets_stranded(kind, stranded[kind.index()]);
         }
-        self.publish_partition_views();
+        self.publish_partition_views(namespace_scratch);
 
         fatal
     }
 
-    /// Queue each partition whose report to shard 0 changed, then send the
-    /// retractions of removed partitions and the oldest queued reports, one
+    /// Queue each visited partition whose report to shard 0 changed, then send
+    /// the retractions of removed partitions and the oldest queued reports, one
     /// batch per tick. A batch holds
     /// `PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN` reports, or more when the
     /// shard owns too many partitions for that pace to report them all within
     /// one interval. A full inbox keeps them queued.
-    fn publish_partition_views(&self) {
+    fn publish_partition_views(&self, visited: &[IggyNamespace]) {
         let Some(sender) = self.senders.first() else {
             return;
         };
         let partitions = self.plane.partitions();
         // The sweep leaves many visits early and skips tombstoned partitions,
-        // so one pass after it checks every partition.
-        for (namespace, partition, sent) in partitions.sent_reports() {
-            self.queue_changed_report(*namespace, partition, sent);
+        // so one pass after it checks every visited partition.
+        for namespace in visited {
+            if let Some((partition, sent)) = partitions.sent_report(namespace) {
+                self.queue_changed_report(*namespace, partition, sent);
+            }
         }
         let batch = partitions
             .len()
@@ -14103,6 +14221,11 @@ const PARTITION_VIEW_CHANGES_INFLIGHT_MAX: usize = 128;
 /// `ceil(groups / cap)` ticks however many groups are owed at once.
 const PARTITION_WALKS_PER_TICK_MAX: usize = 16;
 
+/// Sleeping partitions that a release build tests per tick for a missed
+/// wake-up. A shard with a million of them tests each one about every
+/// twenty minutes.
+const PARTITION_SLEEP_CHECKS_PER_TICK: usize = 8;
+
 /// A primary's counters reach shard 0 at most once per interval: the metadata
 /// probes and replies that carry them on run no more often.
 const PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS: u128 =
@@ -14482,7 +14605,7 @@ where
     let normal = consensus.is_normal();
     let transferring = consensus.is_transferring();
     // Residency last, and only once the guards both predicates share already
-    // hold. This runs for every group on the shard on every tick, and the
+    // hold. This runs for every group that a tick visits, and the
     // caught-up steady state (`commit_min == commit_max`) would otherwise pay
     // a journal lookup whose answer both predicates discard.
     //
@@ -19031,6 +19154,12 @@ mod partition_placement_tests {
         namespace
     }
 
+    /// Publish as a sweep that visited every partition.
+    fn publish(shard: &PlacementShard) {
+        let visited: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
+        shard.publish_partition_views(&visited);
+    }
+
     /// Advance the shard clock to `tick`, one tick at a time as the pump does.
     fn advance_to(shard: &PlacementShard, tick: u64) {
         let clock = shard.plane.partitions().tick_clock();
@@ -19056,7 +19185,7 @@ mod partition_placement_tests {
         let clock = shard.plane.partitions().tick_clock();
         while clock.now() < tick {
             clock.advance();
-            shard.publish_partition_views();
+            publish(shard);
             assert!(
                 inbox.try_recv().is_err(),
                 "a report at tick {}",
@@ -19074,7 +19203,7 @@ mod partition_placement_tests {
         let (shard, inbox) = owner(1);
         insert(&shard, 0, 7, 1);
         advance_to(&shard, 1);
-        shard.publish_partition_views();
+        publish(&shard);
         let (reports, statuses) = receive(&inbox);
         assert_eq!(reports.len(), 1);
         assert!(statuses.is_empty(), "a backup reports no status");
@@ -19092,7 +19221,7 @@ mod partition_placement_tests {
 
         partition.consensus().init();
         advance_to(&shard, interval() + 1);
-        shard.publish_partition_views();
+        publish(&shard);
         let (reports, statuses) = receive(&inbox);
         assert_eq!(reports.len(), 1);
         assert_eq!(statuses.len(), 1);
@@ -19109,7 +19238,7 @@ mod partition_placement_tests {
     async fn given_an_acting_primary_when_its_view_or_in_sync_nodes_move_should_report_each_once() {
         let (shard, inbox) = owner(1);
         let namespace = insert(&shard, 0, 7, 0);
-        shard.publish_partition_views();
+        publish(&shard);
         let (_, statuses) = receive(&inbox);
         assert_eq!(statuses[0].in_sync_nodes, 0b111);
 
@@ -19119,7 +19248,7 @@ mod partition_placement_tests {
         let sent = partitions.sent_report(&namespace).unwrap().1.get();
         insert(&shard, 0, 7, 3);
         partitions.sent_report(&namespace).unwrap().1.set(sent);
-        shard.publish_partition_views();
+        publish(&shard);
         let (reports, statuses) = receive(&inbox);
         assert_eq!(
             reports.iter().map(|report| report.view).collect::<Vec<_>>(),
@@ -19144,7 +19273,7 @@ mod partition_placement_tests {
                 .await
                 .is_err()
         );
-        shard.publish_partition_views();
+        publish(&shard);
         let (reports, statuses) = receive(&inbox);
         assert!(reports.is_empty(), "the view did not move");
         assert_eq!(
@@ -19167,7 +19296,7 @@ mod partition_placement_tests {
         for tick in 1..=3 * interval() {
             advance_to(&shard, tick);
             partition.stats.increment_messages_count(1);
-            shard.publish_partition_views();
+            publish(&shard);
             if !inbox.is_empty() {
                 let (_, statuses) = receive(&inbox);
                 reported.extend(statuses.iter().map(|status| (tick, status.messages_count)));
@@ -19193,7 +19322,7 @@ mod partition_placement_tests {
         let namespace = insert(&shard, 0, 7, 0);
         let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
         partition.stats.increment_size_bytes(SIZE_BYTES);
-        shard.publish_partition_views();
+        publish(&shard);
         let (_, statuses) = receive(&inbox);
         let reported = statuses[0];
         assert_quiet_until(&shard, &inbox, 3 * interval());
@@ -19203,7 +19332,7 @@ mod partition_placement_tests {
         let mut statuses = Vec::new();
         for tick in 3 * interval() + 1..=6 * interval() {
             advance_to(&shard, tick);
-            shard.publish_partition_views();
+            publish(&shard);
             if !inbox.is_empty() {
                 statuses.extend(receive(&inbox).1);
             }
@@ -19226,7 +19355,7 @@ mod partition_placement_tests {
             let partitions = shard.plane.partitions();
             let partition = partitions.get_by_ns(&namespace).unwrap();
             partition.stats.increment_messages_count(MESSAGES);
-            shard.publish_partition_views();
+            publish(&shard);
             let (_, statuses) = receive(&inbox);
             let reported = statuses[0];
 
@@ -19240,7 +19369,7 @@ mod partition_placement_tests {
                 }
                 _ => unreachable!(),
             }
-            shard.publish_partition_views();
+            publish(&shard);
             let (reports, statuses) = receive(&inbox);
             assert!(reports.is_empty(), "{exit}");
             assert_eq!(
@@ -19255,7 +19384,7 @@ mod partition_placement_tests {
             if exit == "tombstoned" {
                 shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
                 shard.apply_reconcile_ops();
-                shard.publish_partition_views();
+                publish(&shard);
                 assert!(inbox.try_recv().is_err(), "one retraction per status");
             }
         }
@@ -19303,6 +19432,53 @@ mod partition_placement_tests {
         }
     }
 
+    /// The gauge counts the partitions that a report tick visits, so a
+    /// partition that owes a retirement stays awake to be counted.
+    #[compio::test]
+    async fn given_a_quiet_backup_that_owes_retirement_when_report_ticks_pass_should_stay_counted()
+    {
+        let (shard, inbox) = owner(1);
+        let namespace = insert(&shard, 0, 7, 1);
+        let _ = shard
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .unwrap()
+            .observe_retirement_debt(1);
+        let mut scratch = Vec::new();
+        for _ in 0..2 * interval() {
+            assert!(shard.tick_partitions(&mut scratch).await.is_none());
+            while inbox.try_recv().is_ok() {}
+        }
+        assert_eq!(shard.metrics.partitions_owing_retirement_value(), 1);
+    }
+
+    /// A quiet partition costs a visit per timeout, not a visit per tick.
+    #[compio::test]
+    async fn given_quiet_partitions_when_ticks_run_should_visit_each_once_per_timeout() {
+        const PARTITIONS: usize = 32;
+        const TICKS: u64 = 300;
+        let (shard, inbox) = owner(1);
+        for id in 0..PARTITIONS {
+            // Primaries and backups in turn.
+            insert(&shard, id, 7, u32::from(id % 2 == 1));
+        }
+        let mut scratch = Vec::new();
+        for _ in 0..TICKS {
+            assert!(shard.tick_partitions(&mut scratch).await.is_none());
+            // A full inbox keeps a report queued, and its partition awake.
+            while inbox.try_recv().is_ok() {}
+        }
+
+        let visits = shard.metrics.partition_tick_visits_value();
+        let partitions = u64::try_from(PARTITIONS).unwrap();
+        assert!(visits >= partitions, "every partition has a first visit");
+        assert!(
+            visits <= partitions * TICKS / 10,
+            "{visits} visits of {PARTITIONS} quiet partitions in {TICKS} ticks"
+        );
+    }
+
     #[compio::test]
     async fn given_more_groups_than_one_batch_when_publishing_should_report_each_once_in_bounded_batches()
      {
@@ -19317,7 +19493,7 @@ mod partition_placement_tests {
         let mut observed = Vec::new();
         for tick in 1..=batches {
             advance_to(&shard, tick);
-            shard.publish_partition_views();
+            publish(&shard);
             let (reports, _) = receive(&inbox);
             assert!(reports.len() <= PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN);
             observed.extend(reports.iter().map(|report| report.namespace.partition_id()));
@@ -19343,7 +19519,7 @@ mod partition_placement_tests {
         let mut observed = BTreeSet::new();
         for tick in 1..=interval() {
             advance_to(&shard, tick);
-            shard.publish_partition_views();
+            publish(&shard);
             if !inbox.is_empty() {
                 observed.extend(
                     receive(&inbox)
@@ -19372,7 +19548,7 @@ mod partition_placement_tests {
                 .is_ok()
         );
 
-        shard.publish_partition_views();
+        publish(&shard);
         assert_eq!(inbox.len(), 1, "the full inbox took no report");
         assert!(matches!(
             inbox.try_recv(),
@@ -19382,7 +19558,7 @@ mod partition_placement_tests {
         insert(&shard, 0, 11, 9);
 
         advance_to(&shard, 1);
-        shard.publish_partition_views();
+        publish(&shard);
         let (reports, _) = receive(&inbox);
         assert_eq!(
             reports
@@ -19402,7 +19578,7 @@ mod partition_placement_tests {
             .map(|id| insert(&shard, id, 7, 0))
             .collect();
         for _ in 0..2 {
-            shard.publish_partition_views();
+            publish(&shard);
             receive(&inbox);
         }
         for namespace in namespaces.iter().rev() {
@@ -19417,13 +19593,13 @@ mod partition_placement_tests {
                 .try_send(ShardFrame::lifecycle(LifecycleFrame::MetadataCommitTick))
                 .is_ok()
         );
-        shard.publish_partition_views();
+        publish(&shard);
         assert_eq!(inbox.len(), 1, "the full inbox took no retraction");
         inbox.try_recv().unwrap();
 
         let mut retracted = Vec::new();
         for _ in 0..2 {
-            shard.publish_partition_views();
+            publish(&shard);
             retracted.extend(receive(&inbox).1.iter().map(|status| status.namespace));
         }
         assert_eq!(
@@ -19451,7 +19627,7 @@ mod partition_placement_tests {
                     .begin_view_probe();
             }
         }
-        shard.publish_partition_views();
+        publish(&shard);
         let (reports, _) = receive(&inbox);
         assert_eq!(
             reports

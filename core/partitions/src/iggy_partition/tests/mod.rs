@@ -1918,6 +1918,7 @@ mod offset_reservations;
 mod offset_storage;
 mod offsets;
 mod persistence_checkpoint;
+mod quiet;
 mod remote_poll;
 mod repair;
 mod repair_floor;

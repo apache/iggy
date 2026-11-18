@@ -305,6 +305,27 @@ impl TimeoutManager {
         self.get(kind).fired(self.clock.now())
     }
 
+    /// The earliest deadline of the timeouts, `u64::MAX` when every one is
+    /// stopped. A fired timeout keeps its deadline, so the result is then at
+    /// or before the current tick.
+    #[must_use]
+    pub fn earliest_deadline(&self) -> u64 {
+        [
+            &self.prepare,
+            &self.commit_message,
+            &self.check_quorum,
+            &self.normal_heartbeat,
+            &self.start_view_change_message,
+            &self.do_view_change_message,
+            &self.view_change_status,
+            &self.request_start_view_message,
+        ]
+        .into_iter()
+        .map(|timeout| timeout.deadline)
+        .min()
+        .unwrap_or(STOPPED)
+    }
+
     const fn get(&self, kind: TimeoutKind) -> &Timeout {
         match kind {
             TimeoutKind::Prepare => &self.prepare,

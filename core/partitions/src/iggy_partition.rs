@@ -6570,25 +6570,29 @@ where
                 .shutdown
                 .is_some_and(|phase| phase != PartitionShutdownPhase::Complete);
         }
-        self.io_active.get().is_none()
-            && (self.pending_commit.is_some()
-                || self.materialization.is_some()
-                || self.transition.is_some()
-                || !self.deferred_views.is_empty()
-                || self.superblock_intent.get().is_some()
-                || self.pending_wire_actions.borrow().is_some()
-                || !self.pending_persisted_acks.borrow().is_empty()
-                || !self.no_ack.is_empty()
-                || self.maintenance.flush_through.is_some()
-                || self.maintenance.checkpoint.is_some()
-                || self.maintenance.retention.is_some()
-                || self.maintenance.eviction.is_some()
-                || self.maintenance.tiering.is_some()
-                || self
-                    .maintenance
-                    .shutdown
-                    .is_some_and(|phase| phase != PartitionShutdownPhase::Complete)
-                || self.queued_requests_ready())
+        self.io_active.get().is_none() && self.has_lane_work()
+    }
+
+    /// Work that only a turn of the I/O lane moves.
+    fn has_lane_work(&self) -> bool {
+        self.pending_commit.is_some()
+            || self.materialization.is_some()
+            || self.transition.is_some()
+            || !self.deferred_views.is_empty()
+            || self.superblock_intent.get().is_some()
+            || self.pending_wire_actions.borrow().is_some()
+            || !self.pending_persisted_acks.borrow().is_empty()
+            || !self.no_ack.is_empty()
+            || self.maintenance.flush_through.is_some()
+            || self.maintenance.checkpoint.is_some()
+            || self.maintenance.retention.is_some()
+            || self.maintenance.eviction.is_some()
+            || self.maintenance.tiering.is_some()
+            || self
+                .maintenance
+                .shutdown
+                .is_some_and(|phase| phase != PartitionShutdownPhase::Complete)
+            || self.queued_requests_ready()
     }
 
     #[must_use]
@@ -16339,5 +16343,6 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
         .last()
 }
 
+mod quiet;
 #[cfg(test)]
 pub mod tests;
