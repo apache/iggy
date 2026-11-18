@@ -1247,13 +1247,13 @@ where
         Ok(visibility)
     }
 
-    /// Whether a trim of the partition's peer log dropped the segment that
-    /// `result` started from, see [`partitions::IggyPartition::trimmed_under_peer_read`].
-    fn trimmed_under_read(&self, namespace: IggyNamespace, result: &PollReadResult) -> bool {
+    /// Whether the partition's peer log dropped or replaced a segment that
+    /// `result` walked, see [`partitions::IggyPartition::peer_log_moved_under_read`].
+    fn peer_log_moved_under_read(&self, namespace: IggyNamespace, result: &PollReadResult) -> bool {
         self.plane
             .partitions()
             .with_partition(&namespace, |partition| {
-                partition.trimmed_under_peer_read(result)
+                partition.peer_log_moved_under_read(result)
             })
             .unwrap_or(false)
     }
@@ -1626,9 +1626,9 @@ where
                 return;
             }
         };
-        // Whatever the read found in the store, a trim of the peer log it
-        // covers makes the retry plan from the new front.
-        if self.trimmed_under_read(waiter.namespace, &result) {
+        // Whatever the read found in the store, a trim or a merge in the
+        // peer log it covers makes the retry plan from the new log.
+        if self.peer_log_moved_under_read(waiter.namespace, &result) {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;
         }

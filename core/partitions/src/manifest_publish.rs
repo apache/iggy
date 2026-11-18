@@ -246,6 +246,7 @@ where
             published_at: now.as_micros(),
             floor: listed_up_to.or(trim_point),
             trim_point,
+            segments_keyed_by_both_offsets: false,
             segments,
         })
     }
@@ -259,6 +260,7 @@ where
             published_at: now.as_micros(),
             floor: self.long_term_floor(),
             trim_point: self.long_term_trim_point(),
+            segments_keyed_by_both_offsets: true,
             segments: self.long_term_segments().to_vec(),
         }
     }

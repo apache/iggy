@@ -29,8 +29,8 @@ use crate::persistence::{
     FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
 use crate::poll_plan::{
-    DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
-    PollTier, ResidentTailSnapshot, SegmentSource,
+    DiskReadPlan, DiskSegment, PartitionDirResolution, PeerSegmentRun, PollContext, PollPlan,
+    PollReadResult, PollTier, ResidentTailSnapshot, SegmentSource,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::remote_segments::{IndexFetches, RemoteRange};
@@ -4629,7 +4629,7 @@ where
         if result.context.history != self.poll_history
             || self.fatal.is_some()
             || self.materialization_missing
-            || self.trimmed_under_peer_read(&result)
+            || self.peer_log_moved_under_read(&result)
         {
             return Err(IggyError::TransientNotAccepted);
         }
@@ -6185,6 +6185,7 @@ where
             owner,
             _group_poll: group_poll,
             peer_first_segment: None,
+            peer_segments: None,
         };
         if !self.offset_space.committed_seeded || args.count == 0 {
             return PollPlan {
@@ -6299,7 +6300,10 @@ where
                 .segments()
                 .get(start_segment)
                 .map(|segment| segment.start_offset);
+            context.peer_segments =
+                PeerSegmentRun::of(&self.log.segments()[start_segment..start_segment + walked]);
         }
+        let keyed_by_both_offsets = self.reads_segments_keyed_by_both_offsets();
         let cut = start_segment + walked < self.log.segments().len();
         let segments = self.log.segments()[start_segment..start_segment + walked]
             .iter()
@@ -6317,6 +6321,7 @@ where
                                 start_offset: segment.start_offset,
                                 object: SegmentObject::Log,
                             },
+                            keyed_end_offset: keyed_by_both_offsets.then_some(segment.end_offset),
                             range: 0..segment.size.as_bytes_u64(),
                         })
                     }

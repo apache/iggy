@@ -49,7 +49,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 /// The root of the origin cluster's store.
-const ORIGIN_ROOT: &str = "dc-a";
+pub(super) const ORIGIN_ROOT: &str = "dc-a";
 
 /// The incarnation of the follower's own partition, unlike the origin's.
 const FOLLOWER_REVISION: u64 = 33;
@@ -59,7 +59,7 @@ const FOLLOWER_REVISION: u64 = 33;
 /// offset 4, which no manifest lists yet.
 const ORIGIN_FLOOR: u64 = 3;
 
-fn origin_layout() -> KeyLayout {
+pub(super) fn origin_layout() -> KeyLayout {
     KeyLayout::new(ORIGIN_ROOT).unwrap()
 }
 
@@ -74,7 +74,7 @@ fn object_key(start_offset: u64, object: SegmentObject) -> String {
 /// The origin after every sealed segment went through an upload into
 /// `store` and its floor advance committed, with the manifest it then
 /// stored beside them.
-async fn origin_in(
+pub(super) async fn origin_in(
     store: &FsStore,
 ) -> (
     tempfile::TempDir,
@@ -116,9 +116,18 @@ async fn stored_manifest(store: &impl ObjectStore) -> PartitionManifest {
 
 /// A partition of stream 5 that follows the origin's partition, reading
 /// `objects` under the origin's root.
-fn follower(
+pub(super) fn follower(
     objects: Rc<dyn RemoteObjects>,
 ) -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
+    let (directory, mut partition) = unattached();
+    partition.follow_peer_log(ORIGIN_ROOT, PREFIX).unwrap();
+    partition.set_remote_segments(Rc::new(RemoteSegments::new(objects, origin_layout())));
+    (directory, partition)
+}
+
+/// A partition of stream 5 with a directory and an incarnation of its own,
+/// which follows nothing yet.
+pub(super) fn unattached() -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
     let directory = tempfile::tempdir().unwrap();
     let namespace = IggyNamespace::new(5, 2, 0);
     let consensus = VsrConsensus::new(
@@ -137,12 +146,10 @@ fn follower(
     ));
     partition.set_created_revision(FOLLOWER_REVISION);
     partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-    partition.follow_peer_log(ORIGIN_ROOT, PREFIX).unwrap();
-    partition.set_remote_segments(Rc::new(RemoteSegments::new(objects, origin_layout())));
     (directory, partition)
 }
 
-fn plan<B: MessageBus>(
+pub(super) fn plan<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     strategy: PollingStrategy,
     count: u32,
@@ -152,9 +159,9 @@ fn plan<B: MessageBus>(
 }
 
 /// The offsets of the messages an accepted read returns, and their bytes.
-type Polled = (Option<u64>, u32, Vec<u8>);
+pub(super) type Polled = (Option<u64>, u32, Vec<u8>);
 
-fn accepted<B: MessageBus>(
+pub(super) fn accepted<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     result: PollReadResult,
 ) -> Result<Polled, IggyError> {
@@ -168,7 +175,7 @@ fn accepted<B: MessageBus>(
     Ok((last, count, bytes))
 }
 
-async fn polled<B: MessageBus>(
+pub(super) async fn polled<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     strategy: PollingStrategy,
     count: u32,
@@ -178,7 +185,7 @@ async fn polled<B: MessageBus>(
     accepted(partition, result).unwrap()
 }
 
-fn listed(start_offset: u64, end_offset: u64) -> ManifestSegment {
+pub(super) fn listed(start_offset: u64, end_offset: u64) -> ManifestSegment {
     ManifestSegment {
         start_offset,
         end_offset,
@@ -193,7 +200,7 @@ fn listed(start_offset: u64, end_offset: u64) -> ManifestSegment {
 
 /// A manifest of the origin's incarnation that lists `segments`, by first
 /// and last offset, above `trim_point`.
-fn manifest_of(trim_point: Option<u64>, segments: &[(u64, u64)]) -> PartitionManifest {
+pub(super) fn manifest_of(trim_point: Option<u64>, segments: &[(u64, u64)]) -> PartitionManifest {
     let segments: Vec<_> = segments
         .iter()
         .map(|(start, end)| listed(*start, *end))
@@ -206,6 +213,7 @@ fn manifest_of(trim_point: Option<u64>, segments: &[(u64, u64)]) -> PartitionMan
             .map(|segment| segment.end_offset)
             .or(trim_point),
         trim_point,
+        segments_keyed_by_both_offsets: false,
         segments,
     }
 }
@@ -230,7 +238,7 @@ fn first_segment_trimmed(manifest: &PartitionManifest) -> PartitionManifest {
 
 /// The segments of the log by first and last offset, where they are, and
 /// the offsets a poll sees.
-fn log_shape<B: MessageBus>(
+pub(super) fn log_shape<B: MessageBus>(
     partition: &IggyPartition<B>,
 ) -> (Vec<(u64, u64, SegmentLocation)>, u64, bool) {
     (
@@ -246,10 +254,10 @@ fn log_shape<B: MessageBus>(
 }
 
 /// A store whose first read waits for `release`.
-struct Gated {
-    store: FsStore,
-    gate: RefCell<Option<oneshot::Receiver<()>>>,
-    waiting: Cell<bool>,
+pub(super) struct Gated {
+    pub(super) store: FsStore,
+    pub(super) gate: RefCell<Option<oneshot::Receiver<()>>>,
+    pub(super) waiting: Cell<bool>,
 }
 
 impl RemoteObjects for Gated {
@@ -270,10 +278,10 @@ impl RemoteObjects for Gated {
     }
 }
 
-type InFlight = Pin<Box<dyn Future<Output = PollReadResult>>>;
+pub(super) type InFlight = Pin<Box<dyn Future<Output = PollReadResult>>>;
 
 /// Run `poll` until it waits on the gated store.
-async fn until_gated(gated: &Gated, poll: &mut InFlight) {
+pub(super) async fn until_gated(gated: &Gated, poll: &mut InFlight) {
     while !gated.waiting.get() {
         assert!(futures::poll!(poll.as_mut()).is_pending());
         compio::time::sleep(Duration::from_millis(1)).await;
@@ -581,8 +589,10 @@ async fn given_manifests_that_break_the_log_when_applying_should_refuse_each_and
             PeerManifestRefusal::GoesBack {
                 floor: Some(19),
                 trim_point: Some(9),
+                segments: 1,
                 applied_floor: Some(29),
                 applied_trim_point: Some(9),
+                applied_segments: 2,
             },
         ),
         (
@@ -591,8 +601,10 @@ async fn given_manifests_that_break_the_log_when_applying_should_refuse_each_and
             PeerManifestRefusal::GoesBack {
                 floor: Some(29),
                 trim_point: None,
+                segments: 3,
                 applied_floor: Some(29),
                 applied_trim_point: Some(9),
+                applied_segments: 2,
             },
         ),
         (
@@ -830,6 +842,7 @@ async fn given_no_trim_when_applying_should_name_no_retired_index() {
         PeerManifestApplied {
             appended: 1,
             trimmed: 0,
+            replaced: 0,
             retired_indexes: Vec::new(),
         }
     );

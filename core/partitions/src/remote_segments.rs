@@ -29,7 +29,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -132,10 +132,25 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRange {
     pub key: SegmentKey,
+    /// The segment's last offset when the keys of its objects name it after
+    /// the first one, as the manifest of the cluster that stored them says.
+    /// `None` for objects keyed by the first offset alone.
+    pub keyed_end_offset: Option<u64>,
     pub range: Range<u64>,
 }
 
 impl RemoteRange {
+    /// The name of the file a fetched `.index` of the segment takes in the
+    /// partition directory.
+    ///
+    /// A segment keyed by both offsets carries both here too. One that takes
+    /// the place of several starts where the first of them did, and its
+    /// index must not pass for the index of that one.
+    #[must_use]
+    pub fn index_file_name(&self) -> String {
+        index_file_name(self.key.start_offset, self.keyed_end_offset)
+    }
+
     /// Bytes of segment data the range holds.
     #[must_use]
     pub const fn len(&self) -> u64 {
@@ -146,6 +161,14 @@ impl RemoteRange {
     pub const fn is_empty(&self) -> bool {
         self.range.end == self.range.start
     }
+}
+
+/// See [`RemoteRange::index_file_name`].
+pub fn index_file_name(start_offset: u64, keyed_end_offset: Option<u64>) -> String {
+    keyed_end_offset.map_or_else(
+        || format!("{start_offset:0>20}.index"),
+        |end_offset| format!("{start_offset:0>20}-{end_offset:0>20}.index"),
+    )
 }
 
 /// Bytes of fresh objects a shard keeps in memory for its polls.
@@ -332,6 +355,33 @@ impl RemoteSegments {
         Ok(())
     }
 
+    /// The key of the `object` of the segment that `source` names, in the
+    /// scheme its objects are keyed by.
+    fn object_key(&self, source: &RemoteRange, object: SegmentObject) -> String {
+        let SegmentKey {
+            prefix,
+            start_offset,
+            ..
+        } = source.key;
+        source.keyed_end_offset.map_or_else(
+            || {
+                self.layout.segment_key(&SegmentKey {
+                    prefix,
+                    start_offset,
+                    object,
+                })
+            },
+            |end_offset| {
+                self.layout.long_term_key(&LongTermKey {
+                    prefix,
+                    start_offset,
+                    end_offset,
+                    object,
+                })
+            },
+        )
+    }
+
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
     /// of the segment.
     ///
@@ -343,7 +393,7 @@ impl RemoteSegments {
         position: u64,
         len: usize,
     ) -> Result<Frozen<4096>, DiskFault> {
-        let key = self.layout.segment_key(&source.key);
+        let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
         let end = start + len as u64;
         if end > source.range.end {
@@ -387,10 +437,7 @@ impl RemoteSegments {
         index_path: &str,
         fetch: &IndexFetchTask,
     ) -> Result<(), DiskFault> {
-        let key = self.layout.segment_key(&SegmentKey {
-            object: SegmentObject::Index,
-            ..log.key
-        });
+        let key = self.object_key(log, SegmentObject::Index);
         let staging = format!("{index_path}.fetch{STAGING_SUFFIX}");
         let written = self
             .stage_index(&key, log.len(), start_offset, &staging)
@@ -571,9 +618,12 @@ pub struct IndexFetches {
     /// End offset of the newest segment that retention retired from
     /// `history`.
     retired_through: Cell<Option<u64>>,
-    /// Start offsets of the segments whose fetch task has not ended, so no
+    /// How many times one segment took the place of several in `history`.
+    replaces: Cell<u64>,
+    /// The segments whose fetch task has not ended, by the offsets that
+    /// name their index file (see [`RemoteRange::index_file_name`]), so no
     /// second task writes the same file under the first.
-    running: RefCell<Vec<u64>>,
+    running: RefCell<Vec<(u64, Option<u64>)>>,
     /// The fetches of `history` that polls can join, by start offset. They
     /// live here and not in a segment's read state, which the read cache
     /// replaces while a fetch still runs.
@@ -586,6 +636,7 @@ impl IndexFetches {
             io,
             history: Cell::new(history),
             retired_through: Cell::new(None),
+            replaces: Cell::new(0),
             running: RefCell::default(),
             joinable: RefCell::default(),
         }
@@ -596,6 +647,7 @@ impl IndexFetches {
         IndexFetchFence {
             fetches: Rc::clone(self),
             history: self.history.get(),
+            replaces: self.replaces.get(),
         }
     }
 
@@ -605,6 +657,7 @@ impl IndexFetches {
     pub(crate) fn replace_history(&self, history: PollHistoryId) {
         self.history.set(history);
         self.retired_through.set(None);
+        self.replaces.set(0);
         self.joinable.borrow_mut().clear();
     }
 
@@ -612,6 +665,20 @@ impl IndexFetches {
     pub(crate) fn retire_through(&self, end_offset: u64) {
         self.retired_through
             .set(self.retired_through.get().max(Some(end_offset)));
+    }
+
+    /// One segment took the place of the segments that start in `starts`.
+    ///
+    /// The new segment starts where the first of them did, so a fetch that
+    /// a poll could join under that offset is cancelled here. A plan built
+    /// before this cannot tell which of its segments are gone, so it starts
+    /// and publishes no fetch from here on. Its poll is retried, and the
+    /// retry plans against the segments that are left.
+    pub(crate) fn replace_segments(&self, starts: RangeInclusive<u64>) {
+        self.replaces.set(self.replaces.get() + 1);
+        self.joinable
+            .borrow_mut()
+            .retain(|(start_offset, _)| !starts.contains(start_offset));
     }
 }
 
@@ -621,17 +688,21 @@ impl IndexFetches {
 pub struct IndexFetchFence {
     fetches: Rc<IndexFetches>,
     history: PollHistoryId,
+    /// See [`IndexFetches::replace_segments`].
+    replaces: u64,
 }
 
 impl IndexFetchFence {
     /// Wait for the fetch of the index of the segment at `start_offset`,
-    /// which `start` begins unless one runs.
+    /// which `start` begins unless one runs. `keyed_end_offset` is that of
+    /// the segment's [`RemoteRange`].
     ///
     /// `None` once the plan's partition is retiring or no longer serves the
     /// segment, and while a cancelled fetch of the same file still unwinds.
     pub(crate) fn join<Start: FnOnce(IndexFetchTask) -> IndexFetch>(
         &self,
         start_offset: u64,
+        keyed_end_offset: Option<u64>,
         start: Start,
     ) -> Option<impl Future<Output = Option<Result<(), DiskFault>>> + 'static + use<Start>> {
         if !self.serves(start_offset) {
@@ -645,7 +716,7 @@ impl IndexFetchFence {
         if let Some((_, fetch)) = joinable.iter().find(|(joined, _)| *joined == start_offset) {
             return Some(fetch.wait());
         }
-        let fetch = start(self.begin(start_offset)?);
+        let fetch = start(self.begin_keyed(start_offset, keyed_end_offset)?);
         let wait = fetch.wait();
         joinable.push((start_offset, fetch));
         Some(wait)
@@ -663,23 +734,35 @@ impl IndexFetchFence {
         }
     }
 
+    /// [`Self::begin_keyed`] for a segment keyed by its first offset alone.
+    #[cfg(test)]
+    pub(crate) fn begin(&self, start_offset: u64) -> Option<IndexFetchTask> {
+        self.begin_keyed(start_offset, None)
+    }
+
     /// The right to run the task that fetches the index of the segment at
-    /// `start_offset`.
+    /// `start_offset`, whose [`RemoteRange`] has `keyed_end_offset`.
     ///
     /// `None` while another task fetches it, and once the plan's partition is
     /// retiring or no longer serves the segment.
-    pub(crate) fn begin(&self, start_offset: u64) -> Option<IndexFetchTask> {
+    pub(crate) fn begin_keyed(
+        &self,
+        start_offset: u64,
+        keyed_end_offset: Option<u64>,
+    ) -> Option<IndexFetchTask> {
         let fetches = &*self.fetches;
+        let file = (start_offset, keyed_end_offset);
         if !self.serves(start_offset)
-            || fetches.running.borrow().contains(&start_offset)
+            || fetches.running.borrow().contains(&file)
             || !fetches.io.begin_local_work()
         {
             return None;
         }
-        fetches.running.borrow_mut().push(start_offset);
+        fetches.running.borrow_mut().push(file);
         Some(IndexFetchTask {
             fence: self.clone(),
             start_offset,
+            keyed_end_offset,
             state: Rc::default(),
         })
     }
@@ -688,9 +771,11 @@ impl IndexFetchFence {
         !self.fetches.io.is_retiring() && !self.retired(start_offset)
     }
 
-    /// The plan's history is gone, or retention took the segment from it.
+    /// The plan's history is gone, retention took the segment from it, or
+    /// segments of it were replaced since the plan was built.
     fn retired(&self, start_offset: u64) -> bool {
         self.fetches.history.get() != self.history
+            || self.fetches.replaces.get() != self.replaces
             || self
                 .fetches
                 .retired_through
@@ -710,6 +795,7 @@ impl IndexFetchFence {
 pub struct IndexFetchTask {
     fence: IndexFetchFence,
     start_offset: u64,
+    keyed_end_offset: Option<u64>,
     state: Rc<IndexFetchState>,
 }
 
@@ -743,7 +829,7 @@ impl Drop for IndexFetchTask {
         fetches
             .running
             .borrow_mut()
-            .retain(|start_offset| *start_offset != self.start_offset);
+            .retain(|file| *file != (self.start_offset, self.keyed_end_offset));
         fetches.io.settle_local_work();
     }
 }
@@ -886,6 +972,7 @@ mod tests {
                 start_offset: START_OFFSET,
                 object: SegmentObject::Log,
             },
+            keyed_end_offset: None,
             range: 0..SEGMENT_SIZE,
         }
     }
@@ -997,6 +1084,46 @@ mod tests {
         assert!(fence.begin(START_OFFSET + 1).is_some());
         drop(first);
         assert!(fence.begin(START_OFFSET).is_some());
+    }
+
+    #[test]
+    fn given_a_plan_built_before_segments_were_replaced_when_fetching_should_neither_begin_nor_publish()
+     {
+        let fetches = Rc::new(IndexFetches::new(Rc::default(), PollHistoryId::default()));
+        let before = fetches.fence();
+        let running = before
+            .begin_keyed(START_OFFSET, Some(START_OFFSET + 1))
+            .unwrap();
+        assert!(running.may_publish());
+
+        fetches.replace_segments(START_OFFSET..=START_OFFSET + 3);
+
+        assert!(!running.may_publish());
+        assert!(
+            before
+                .begin_keyed(START_OFFSET + 2, Some(START_OFFSET + 3))
+                .is_none(),
+            "the plan cannot tell whether the segment is one of the replaced"
+        );
+        let after = fetches.fence();
+        assert!(
+            after
+                .begin_keyed(START_OFFSET, Some(START_OFFSET + 1))
+                .is_none(),
+            "the task of the replaced segment still writes its file"
+        );
+        assert!(
+            after
+                .begin_keyed(START_OFFSET, Some(START_OFFSET + 3))
+                .is_some(),
+            "the segment that took their place starts where the first did"
+        );
+        drop(running);
+        assert!(
+            after
+                .begin_keyed(START_OFFSET, Some(START_OFFSET + 1))
+                .is_some()
+        );
     }
 
     #[test]

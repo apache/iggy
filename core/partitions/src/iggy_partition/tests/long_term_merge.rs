@@ -79,7 +79,7 @@ async fn leader_with_segments(
 
 /// Start the best merge, run it, and hand its result back. Returns the
 /// segment it stored, whose command has yet to commit.
-async fn merge_pass(
+pub(super) async fn merge_pass(
     partition: &mut IggyPartition<IggyMessageBus>,
     store: &Rc<MemoryStore>,
     pass: MergePass,
@@ -90,7 +90,10 @@ async fn merge_pass(
 }
 
 /// Send the replace of `merged` as the primary does, and commit it.
-async fn commit_replace(partition: &mut IggyPartition<IggyMessageBus>, merged: &ManifestSegment) {
+pub(super) async fn commit_replace(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    merged: &ManifestSegment,
+) {
     let request = partition.replace_segments_request(merged, 50).unwrap();
     Box::pin(commit_long_term_request(partition, request, false)).await;
 }
