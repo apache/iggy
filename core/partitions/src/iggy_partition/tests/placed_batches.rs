@@ -752,7 +752,9 @@ fn placed_client_request(
             *next = header;
         },
     );
-    server_common::send_messages::place_request(&admitted, 7, request * 4096, 0).unwrap()
+    let blob = server_common::send_messages::admitted_blob(&admitted).unwrap();
+    let placement = Placement::of(7, request * 4096, blob, 0);
+    server_common::send_messages::place_request(&admitted, placement).unwrap()
 }
 
 /// A primary alone in its group, so a request commits without a backup.
@@ -837,16 +839,16 @@ async fn given_a_placing_primary_when_the_placed_entry_gets_another_body_should_
     let mut damaged = placed_client_request(&partition, 1, 1);
     damaged.as_mut_slice()[size_of::<RoutedRequestHeader>() + COMMAND_HEADER_SIZE + 16] ^= 1;
     let elsewhere = IggyNamespace::new(1, 1, 5);
+    let elsewhere_send = checksumless_send_request(elsewhere, 1).transmute_header(
+        |mut header, next: &mut RoutedRequestHeader| {
+            header.group = partition.namespace().inner();
+            *next = header;
+        },
+    );
+    let elsewhere_blob = server_common::send_messages::admitted_blob(&elsewhere_send).unwrap();
     let other_partition = server_common::send_messages::place_request(
-        &checksumless_send_request(elsewhere, 1).transmute_header(
-            |mut header, next: &mut RoutedRequestHeader| {
-                header.group = partition.namespace().inner();
-                *next = header;
-            },
-        ),
-        7,
-        0,
-        0,
+        &elsewhere_send,
+        Placement::of(7, 0, elsewhere_blob, 0),
     )
     .unwrap();
 

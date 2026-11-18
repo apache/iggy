@@ -35,7 +35,7 @@ use partitions::{
     FreshUploadOutcome,
 };
 
-fn layout() -> KeyLayout {
+pub(super) fn layout() -> KeyLayout {
     KeyLayout::new("fresh-test").unwrap()
 }
 
@@ -43,19 +43,19 @@ type MemoryUploader = ExecutorFreshUploader<InlineTierExecutor<MemoryStore>>;
 
 /// An interval long enough that the sends a test submits together after an
 /// upload share one window.
-const LONG_INTERVAL: Duration = Duration::from_millis(500);
+pub(super) const LONG_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Uploads into a memory store, unless told to refuse.
-struct TestUploader {
+pub(super) struct TestUploader {
     uploader: MemoryUploader,
-    refuses: Cell<bool>,
+    pub(super) refuses: Cell<bool>,
     /// The first attempts that fail, in the order they come.
     fails_first: Cell<u32>,
     attempts: Cell<u32>,
 }
 
 impl TestUploader {
-    fn new() -> Rc<Self> {
+    pub(super) fn new() -> Rc<Self> {
         Rc::new(Self {
             uploader: ExecutorFreshUploader::new(
                 InlineTierExecutor::new(MemoryStore::new()),
@@ -67,7 +67,7 @@ impl TestUploader {
         })
     }
 
-    fn store(&self) -> &MemoryStore {
+    pub(super) fn store(&self) -> &MemoryStore {
         self.uploader.executor().store()
     }
 }
@@ -94,7 +94,7 @@ impl FreshObjectUploader for TestUploader {
 /// A shard whose partition [`namespace`] is a single-replica primary on disk
 /// that places its batches.
 #[allow(clippy::future_not_send)]
-async fn placing_owner(directory: &Path) -> IoTestShard {
+pub(super) async fn placing_owner(directory: &Path) -> IoTestShard {
     Box::pin(placing_owner_of_topic(
         directory,
         TopicRuntimeOptions::default(),
@@ -172,7 +172,7 @@ fn place_stuck_partition(owner: &IoTestShard) -> IggyNamespace {
 
 /// Submit one send of a message of `payload_len` bytes, as a producer does.
 /// Returns where its answer arrives.
-fn submit_send(
+pub(super) fn submit_send(
     owner: &IoTestShard,
     request: u64,
     payload_len: usize,
@@ -181,7 +181,7 @@ fn submit_send(
 }
 
 /// [`submit_send`] to `partition`.
-fn submit_send_to(
+pub(super) fn submit_send_to(
     owner: &IoTestShard,
     partition: IggyNamespace,
     request: u64,
@@ -236,7 +236,7 @@ async fn submit_send_to_when_room(
 }
 
 /// Ops the partition `partition` committed.
-fn committed(owner: &IoTestShard, partition: IggyNamespace) -> u64 {
+pub(super) fn committed(owner: &IoTestShard, partition: IggyNamespace) -> u64 {
     owner
         .plane
         .partitions()
@@ -247,14 +247,14 @@ fn committed(owner: &IoTestShard, partition: IggyNamespace) -> u64 {
 }
 
 /// Ops the partition committed and wrote to its segment. Each send is one.
-fn committed_sends(owner: &IoTestShard) -> u64 {
+pub(super) fn committed_sends(owner: &IoTestShard) -> u64 {
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     let written = partition.log.active_segment().size.as_bytes_u64() / PLACED_BATCH_SIZE as u64;
     partition.consensus().commit_min().min(written)
 }
 
 /// The placed batches the partition's segment holds.
-fn stored_placed_batches(directory: &Path) -> Vec<PlacedBatch> {
+pub(super) fn stored_placed_batches(directory: &Path) -> Vec<PlacedBatch> {
     std::fs::read(directory.join("00000000000000000000.log"))
         .unwrap()
         .chunks(PLACED_BATCH_SIZE)
@@ -1817,7 +1817,7 @@ async fn given_sends_to_two_placing_partitions_in_one_window_when_it_closes_shou
 
 /// Make the shard lead `count` partitions that place their batches: the
 /// fixture's own, and single-replica primaries in memory beside them.
-fn place_partitions(owner: &IoTestShard, count: usize) -> Vec<IggyNamespace> {
+pub(super) fn place_partitions(owner: &IoTestShard, count: usize) -> Vec<IggyNamespace> {
     let partitions = owner.plane.partitions();
     (0..count)
         .map(|partition_id| {
@@ -1910,7 +1910,7 @@ async fn given_sends_to_many_placing_partitions_when_they_arrive_within_an_inter
 
 /// Holds every attempt at an upload until the test settles it, so the test
 /// picks the order the uploads end in and which of them the store fails.
-struct GatedUploader {
+pub(super) struct GatedUploader {
     uploader: Rc<MemoryUploader>,
     /// Every attempt in the order it started: its object, and how to end it.
     started: RefCell<
@@ -1922,7 +1922,7 @@ struct GatedUploader {
 }
 
 impl GatedUploader {
-    fn new() -> Rc<Self> {
+    pub(super) fn new() -> Rc<Self> {
         Rc::new(Self {
             uploader: Rc::new(ExecutorFreshUploader::new(
                 InlineTierExecutor::new(MemoryStore::new()),
@@ -1932,7 +1932,7 @@ impl GatedUploader {
         })
     }
 
-    fn started(&self) -> usize {
+    pub(super) fn started(&self) -> usize {
         self.started.borrow().len()
     }
 
@@ -1943,7 +1943,7 @@ impl GatedUploader {
 
     /// End the attempt that started as number `attempt`: the store takes the
     /// object, or fails in a way a retry can get past.
-    fn settle(&self, attempt: usize, stores: bool) {
+    pub(super) fn settle(&self, attempt: usize, stores: bool) {
         let settle = self.started.borrow_mut()[attempt].1.take().unwrap();
         settle.send(stores).unwrap();
     }

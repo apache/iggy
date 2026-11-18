@@ -348,7 +348,12 @@ mod tests {
         .unwrap();
         let positions = source.index.positions();
         let placed = |send: &Message<RoutedRequestHeader>, position: u64, proven_below| {
-            place_request(send, id(4).get(), position, proven_below).unwrap()
+            let blob = admitted_blob(send).unwrap();
+            place_request(
+                send,
+                Placement::of(id(4).get(), position, blob, proven_below),
+            )
+            .unwrap()
         };
         let committed = vec![
             committed(placed(&sends[0], positions[0], 40), 100, NOW + 10),

@@ -148,7 +148,7 @@ const _: () = assert!(
     ) <= FRESH_INDEX_BYTES_MAX
 );
 
-const MAGIC: &[u8; 8] = b"IGGYFRS2";
+pub const MAGIC: &[u8; 8] = b"IGGYFRS2";
 const CONFIRMATION_ONLY: u32 = 1;
 const PRODUCER_PRESENT: u8 = 1;
 

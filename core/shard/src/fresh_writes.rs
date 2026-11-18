@@ -47,6 +47,14 @@
 //! refuses, such as a duplicate, leaves its messages in the object with
 //! nothing that names them.
 //!
+//! An object describes itself: its index names the partition of each batch,
+//! and carries the proof rows of the batches that the partitions this shard
+//! leads committed since the last object, so a reader of the store alone
+//! finds which batches committed and where. The shard builds the index and
+//! the requests that commit the batches when it seals the window, as only
+//! then is the position of each blob known. The rows an object carried that
+//! failed for good go into the next object.
+//!
 //! A send to a partition whose long-term backlog is past its limit waits a
 //! while before the shard takes it, and the later sends to that partition
 //! wait behind it, so none is overtaken. It is delayed and never refused,
@@ -60,16 +68,22 @@ use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, RestorableMetadataStm, Sender, ShardFrame};
 use bytes::Bytes;
 use consensus::PartitionsHandle;
+use iggy_binary_protocol::batch::BatchHeader;
+use iggy_binary_protocol::placement::{self, Placement};
 use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader, RoutedRequestHeader};
 use iggy_common::{IggyError, IggyTimestamp};
-use iggy_object_store::{ErrorClass, FreshObject, FreshObjectId, TierScope};
+use iggy_object_store::{
+    ErrorClass, FRESH_OBJECT_BATCHES_MAX, FRESH_OBJECT_DATA_BYTES_MAX, FRESH_OBJECT_PROOFS_MAX,
+    FreshBatch, FreshObjectHeader, FreshObjectId, FreshPartition, FreshProducer, FreshProofRow,
+    SealedFreshObject, TierScope,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::{FreshObjectUploader, FreshUploadOutcome, IggyPartition};
+use partitions::{FreshObjectUploader, FreshProofs, FreshUploadOutcome, IggyPartition};
 use server_common::Message;
 use server_common::send_messages::{
-    ChecksumMode, admitted_blob, convert_request_message, place_request,
+    ChecksumMode, admitted_batch, admitted_blob, convert_request_message, place_request,
 };
 use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
@@ -78,9 +92,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Bytes of messages at which a window becomes an object without waiting
-/// for the upload interval. A send is never split, so an object is larger
-/// only when one send is.
-pub const FRESH_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
+/// for the upload interval.
+///
+/// It is the most data an object of more than one batch holds. A send is
+/// never split, so an object is larger only when one send is.
+pub const FRESH_OBJECT_BYTES: u64 = FRESH_OBJECT_DATA_BYTES_MAX;
 
 /// The most bytes of messages the shard holds for sends that have not
 /// reached their partitions.
@@ -120,9 +136,11 @@ pub const FRESH_UPLOAD_DEADLINE: Duration = Duration::from_secs(10);
 /// The submit channel a send arrived with.
 type SubmitReply = Sender<Option<Message<GenericHeader>>>;
 
-/// A send whose messages are in a fresh object: the request that commits
-/// where they sit, and where to answer its producer.
+/// A send whose messages go into a fresh object, and where to answer its
+/// producer.
 struct StagedSend {
+    /// The send as admitted, with its messages, until its object is sealed,
+    /// and from then on the request that commits where they sit.
     request: Message<RoutedRequestHeader>,
     reply: SubmitReply,
     /// The number of the object that holds the messages.
@@ -131,6 +149,10 @@ struct StagedSend {
     /// Bytes of the messages, which count against
     /// [`FRESH_PENDING_BYTES_MAX`] until the request leaves.
     bytes: u64,
+    /// The header of its batch, as admitted.
+    batch: BatchHeader,
+    /// XXH3 of its messages, as its placement records it.
+    blob_checksum: u64,
 }
 
 /// A send held back because the rewrites of its partition fell behind.
@@ -162,7 +184,9 @@ pub struct FinishedFreshUpload {
 struct Window {
     id: FreshObjectId,
     sequence: u64,
-    object: FreshObject,
+    /// Bytes of the messages of its sends.
+    bytes: u64,
+    sends: u32,
     /// The partitions with a send in the object.
     partitions: BTreeSet<IggyNamespace>,
     /// The bus's monotonic clock when the first send came.
@@ -173,7 +197,15 @@ struct Window {
 struct ClosedObject {
     id: FreshObjectId,
     bytes: Bytes,
+    /// The partitions with a send in the object, none for one that carries
+    /// proof rows alone.
     partitions: BTreeSet<IggyNamespace>,
+    /// Of each partition whose proof rows it carries, the offset the first
+    /// of them starts at.
+    proofs: Vec<(IggyNamespace, u64)>,
+    /// When the oldest of those rows began to wait, on the bus's monotonic
+    /// clock.
+    proofs_since: Option<u64>,
     opened_at: u64,
     /// Attempts started so far. The object holds an upload slot from its
     /// first attempt until it settles.
@@ -184,6 +216,50 @@ struct ClosedObject {
     running: Option<TierScope>,
     /// When the next attempt starts, after one that failed.
     retry_at: Option<u64>,
+}
+
+/// Where the sealing of one partition stands, in one view of one of its
+/// incarnations.
+struct SealCursor {
+    created_revision: u64,
+    view: u32,
+    /// The offset of the first proof row that no object that is stored or
+    /// uploading carries.
+    next_to_seal: u64,
+    /// The offset the writer expects the next batch it seals to commit at.
+    /// `None` once a send was refused, until the next seal predicts again.
+    next_claim: Option<u64>,
+}
+
+impl SealCursor {
+    fn of<B: MessageBus, SB: SuperblockStore>(partition: &IggyPartition<B, SB>) -> Self {
+        Self {
+            created_revision: partition.created_revision(),
+            view: partition.consensus().view(),
+            next_to_seal: partition
+                .fresh_proofs()
+                .map_or(0, FreshProofs::first_unproven),
+            next_claim: None,
+        }
+    }
+
+    const fn is_of<B: MessageBus, SB: SuperblockStore>(
+        &self,
+        partition: &IggyPartition<B, SB>,
+    ) -> bool {
+        self.created_revision == partition.created_revision()
+            && self.view == partition.consensus().view()
+    }
+}
+
+/// What an object being sealed holds of one partition, besides the blobs.
+struct SealedPartition {
+    namespace: IggyNamespace,
+    created_revision: u64,
+    view: u32,
+    claimed_first_offset: u64,
+    proven_below: u64,
+    proofs: Vec<FreshProofRow>,
 }
 
 /// What a shard keeps for the upload-first produce path.
@@ -226,6 +302,13 @@ pub struct FreshWrites {
     /// may be in no journal yet, so nothing else says that its object is
     /// needed.
     awaited: Rc<RefCell<BTreeMap<u128, usize>>>,
+    /// Of each partition this shard sealed for, where that stands.
+    cursors: RefCell<BTreeMap<IggyNamespace, SealCursor>>,
+    /// The partitions whose proof rows wait for an object, each with when
+    /// the shard learned of them, on the bus's monotonic clock.
+    proofs_waiting: RefCell<BTreeMap<IggyNamespace, u64>>,
+    /// `StoreIdentity::cluster_uid` of the store the objects go to.
+    cluster_uid: Cell<u128>,
 }
 
 impl Default for FreshWrites {
@@ -248,6 +331,9 @@ impl Default for FreshWrites {
             started_at: IggyTimestamp::now().as_micros(),
             undelivered: Rc::default(),
             awaited: Rc::default(),
+            cursors: RefCell::default(),
+            proofs_waiting: RefCell::default(),
+            cluster_uid: Cell::new(0),
         }
     }
 }
@@ -335,30 +421,53 @@ impl FreshWrites {
         }
     }
 
-    /// Move the open window to the closed objects, where it waits for an
-    /// upload slot.
-    fn close_window(&self) -> Option<u64> {
-        let Window {
-            id,
-            sequence,
-            object,
-            partitions,
-            opened_at,
-        } = self.window.borrow_mut().take()?;
-        self.closed.borrow_mut().insert(
-            sequence,
-            ClosedObject {
-                id,
-                bytes: object.into_bytes(),
-                partitions,
-                opened_at,
-                attempts: 0,
-                first_started_at: 0,
-                running: None,
-                retry_at: None,
-            },
-        );
-        Some(sequence)
+    /// The lowest offset of a proof row of `namespace` that no stored object
+    /// carries, for a writer whose next row to seal starts at
+    /// `next_to_seal`: the rows of an object still uploading count as not
+    /// stored.
+    fn unstored_from(&self, namespace: IggyNamespace, next_to_seal: u64) -> u64 {
+        self.closed
+            .borrow()
+            .values()
+            .flat_map(|object| &object.proofs)
+            .filter(|(carried, _)| *carried == namespace)
+            .map(|(_, first)| *first)
+            .fold(next_to_seal, u64::min)
+    }
+
+    /// A send of `namespace` was refused, so the batches sealed after it no
+    /// longer commit where they were expected to.
+    fn forget_claim(&self, namespace: IggyNamespace) {
+        if let Some(cursor) = self.cursors.borrow_mut().get_mut(&namespace) {
+            cursor.next_claim = None;
+        }
+    }
+
+    /// The proof rows of `namespace` from `first` on, which waited since
+    /// `since`, are in no object that may still be stored, so the next one
+    /// carries them.
+    fn reseal_proofs(&self, namespace: IggyNamespace, first: u64, since: u64) {
+        if let Some(cursor) = self.cursors.borrow_mut().get_mut(&namespace) {
+            cursor.next_to_seal = cursor.next_to_seal.min(first);
+        }
+        self.proofs_waiting
+            .borrow_mut()
+            .entry(namespace)
+            .and_modify(|waiting| *waiting = (*waiting).min(since))
+            .or_insert(since);
+    }
+
+    /// The oldest proof row this shard has not stored yet began to wait at,
+    /// on the bus's monotonic clock.
+    fn oldest_unstored_proof(&self) -> Option<u64> {
+        let closed = self.closed.borrow();
+        let sealed = closed.values().filter_map(|object| object.proofs_since);
+        self.proofs_waiting
+            .borrow()
+            .values()
+            .copied()
+            .chain(sealed)
+            .min()
     }
 
     /// When the pump must look at the uploads again without an event: the
@@ -389,6 +498,29 @@ impl FreshWrites {
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// Note the proof rows `partition` has for this shard to seal, if any
+    /// wait since it was last asked.
+    pub(crate) fn note_fresh_proofs(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) {
+        if partition.take_proofs_wanted() {
+            let now = self.bus.monotonic_micros();
+            self.fresh_writes
+                .proofs_waiting
+                .borrow_mut()
+                .entry(namespace)
+                .or_insert(now);
+        }
+    }
+}
+
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
+where
     B: MessageBus + 'static,
     T: ShardsTable,
     SB: SuperblockStore,
@@ -405,6 +537,18 @@ where
     #[must_use]
     pub fn fresh_uploader(&self) -> Option<Rc<dyn FreshObjectUploader>> {
         self.fresh_writes.uploader.borrow().clone()
+    }
+
+    /// Set the `cluster_uid` of the store that this shard's fresh objects go
+    /// to, which each of them names as its writer's.
+    pub fn set_fresh_cluster_uid(&self, cluster_uid: u128) {
+        self.fresh_writes.cluster_uid.set(cluster_uid);
+    }
+
+    /// See [`Self::set_fresh_cluster_uid`]. Zero until it is set.
+    #[must_use]
+    pub const fn fresh_cluster_uid(&self) -> u128 {
+        self.fresh_writes.cluster_uid.get()
     }
 
     /// Set the shortest time between the starts of two uploads that no full
@@ -497,20 +641,25 @@ where
                 return;
             }
         };
-        let Ok(blob) = admitted_blob(&admitted) else {
-            deny(&IggyError::InvalidCommand);
-            return;
+        // Checked here as the seal places it, so that no send in a window
+        // keeps it from being sealed.
+        let admitted_send = admitted_batch(&admitted).and_then(|batch| {
+            let blob = admitted_blob(&admitted)?;
+            Ok((batch, placement::blob_checksum(blob), blob.len() as u64))
+        });
+        let (batch, blob_checksum, bytes) = match admitted_send {
+            Ok(admitted_send) => admitted_send,
+            Err(error) => {
+                deny(&error);
+                return;
+            }
         };
-        let bytes = blob.len() as u64;
         // A send is never split, and one that does not fit starts the next
         // object.
-        if fresh
-            .window
-            .borrow()
-            .as_ref()
-            .is_some_and(|window| window.object.len() + bytes > FRESH_OBJECT_BYTES)
-        {
-            fresh.close_window();
+        if fresh.window.borrow().as_ref().is_some_and(|window| {
+            window.bytes + bytes > FRESH_OBJECT_BYTES || window.sends >= FRESH_OBJECT_BATCHES_MAX
+        }) {
+            self.close_fresh_window();
         }
         let mut slot = fresh.window.borrow_mut();
         if slot.is_none() {
@@ -528,7 +677,8 @@ where
             *slot = Some(Window {
                 id,
                 sequence,
-                object: FreshObject::with_capacity(blob.len()),
+                bytes: 0,
+                sends: 0,
                 partitions: BTreeSet::new(),
                 opened_at: self.bus.monotonic_micros(),
             });
@@ -536,32 +686,339 @@ where
         let Some(window) = slot.as_mut() else {
             return;
         };
-        // The position is where the blob will start, so the request can be
-        // built before the blob is copied in. The shard keeps no proofs, so
-        // it claims none.
-        let placed = match place_request(&admitted, window.id.get(), window.object.len(), 0) {
-            Ok(placed) => placed,
-            Err(error) => {
-                deny(&error);
-                return;
-            }
-        };
-        window.object.push(blob);
+        window.bytes += bytes;
+        window.sends += 1;
         window.partitions.insert(namespace);
-        let full = window.object.len() >= FRESH_OBJECT_BYTES;
+        let full = window.bytes >= FRESH_OBJECT_BYTES || window.sends >= FRESH_OBJECT_BATCHES_MAX;
         fresh.stage_send(
             namespace,
             StagedSend {
-                request: placed,
+                request: admitted,
                 reply,
                 object: window.sequence,
                 object_id: window.id,
                 bytes,
+                batch,
+                blob_checksum,
             },
         );
         drop(slot);
         if full {
-            fresh.close_window();
+            self.close_fresh_window();
+        }
+    }
+
+    /// Seal the open window into an object that waits for an upload slot.
+    /// Returns its number, `None` without a window or when none of its sends
+    /// is left to seal.
+    fn close_fresh_window(&self) -> Option<u64> {
+        let window = self.fresh_writes.window.borrow_mut().take()?;
+        self.seal_fresh_object(
+            window.sequence,
+            window.id,
+            &window.partitions,
+            window.opened_at,
+        )
+        .then_some(window.sequence)
+    }
+
+    /// Seal the object `sequence`: the sends of `sending` that it took, and
+    /// the proof rows that wait of the partitions this shard proves, up to
+    /// what an object holds. Then build the request of each send at the
+    /// position of its blob, and leave the object to wait for an upload
+    /// slot. Returns whether there was anything to seal.
+    fn seal_fresh_object(
+        &self,
+        sequence: u64,
+        id: FreshObjectId,
+        sending: &BTreeSet<IggyNamespace>,
+        opened_at: u64,
+    ) -> bool {
+        let fresh = &self.fresh_writes;
+        let now = self.bus.monotonic_micros();
+        let candidates: BTreeSet<IggyNamespace> = sending
+            .iter()
+            .copied()
+            .chain(fresh.proofs_waiting.borrow().keys().copied())
+            .collect();
+        let mut sealed = Vec::with_capacity(candidates.len());
+        let mut proofs_since = None;
+        let mut proofs_room = FRESH_OBJECT_PROOFS_MAX as usize;
+        for namespace in candidates {
+            let waited = fresh.proofs_waiting.borrow_mut().remove(&namespace);
+            let since = waited.unwrap_or(now);
+            let (partition, more_proofs) =
+                self.seal_partition(sequence, namespace, sending, proofs_room);
+            if more_proofs {
+                fresh.proofs_waiting.borrow_mut().insert(namespace, since);
+            }
+            match partition {
+                Some(partition) => {
+                    if !partition.proofs.is_empty() {
+                        proofs_room -= partition.proofs.len();
+                        proofs_since =
+                            Some(proofs_since.map_or(since, |earlier: u64| earlier.min(since)));
+                    }
+                    sealed.push(partition);
+                }
+                None if sending.contains(&namespace) => self.deny_sends_of(namespace, sequence),
+                None => {}
+            }
+        }
+        if sealed.is_empty() {
+            return false;
+        }
+        let header = FreshObjectHeader {
+            object_id: id,
+            cluster_uid: fresh.cluster_uid.get(),
+            sealed_at: self.bus.realtime_micros(),
+        };
+        let Some(bytes) = self.seal_and_place(sequence, header, &sealed) else {
+            for partition in &sealed {
+                if let Some(first) = partition.proofs.first() {
+                    fresh.reseal_proofs(
+                        partition.namespace,
+                        first.base_offset,
+                        proofs_since.unwrap_or(now),
+                    );
+                }
+                self.deny_sends_of(partition.namespace, sequence);
+            }
+            return false;
+        };
+        let proofs = sealed
+            .iter()
+            .filter_map(|partition| {
+                partition
+                    .proofs
+                    .first()
+                    .map(|first| (partition.namespace, first.base_offset))
+            })
+            .collect();
+        let partitions = sealed
+            .iter()
+            .map(|partition| partition.namespace)
+            .filter(|namespace| sending.contains(namespace))
+            .collect();
+        fresh.closed.borrow_mut().insert(
+            sequence,
+            ClosedObject {
+                id,
+                bytes,
+                partitions,
+                proofs,
+                proofs_since,
+                opened_at,
+                attempts: 0,
+                first_started_at: 0,
+                running: None,
+                retry_at: None,
+            },
+        );
+        true
+    }
+
+    /// What the object `sequence` holds of `namespace`: its sends, if it is
+    /// in `sending`, and up to `proofs_room` of its proof rows from where
+    /// the last object left them, if this replica proves its batches.
+    /// Advances where its sealing stands as if the object were stored.
+    /// `None` for a partition that is gone or that the object holds nothing
+    /// of, with whether rows are left for the next object.
+    fn seal_partition(
+        &self,
+        sequence: u64,
+        namespace: IggyNamespace,
+        sending: &BTreeSet<IggyNamespace>,
+        proofs_room: usize,
+    ) -> (Option<SealedPartition>, bool) {
+        let fresh = &self.fresh_writes;
+        let partitions = self.plane.partitions();
+        let Some(partition) = partitions.get_by_ns(&namespace) else {
+            return (None, false);
+        };
+        let mut cursors = fresh.cursors.borrow_mut();
+        let cursor = cursors
+            .entry(namespace)
+            .or_insert_with(|| SealCursor::of(partition));
+        if !cursor.is_of(partition) {
+            *cursor = SealCursor::of(partition);
+        }
+        let unstored_from = fresh.unstored_from(namespace, cursor.next_to_seal);
+        let proofs: Vec<FreshProofRow> = partition
+            .fresh_proofs()
+            .filter(|_| partition.proves_placed_batches())
+            .map_or_else(Vec::new, |proofs| {
+                proofs
+                    .rows_from(cursor.next_to_seal)
+                    .take(proofs_room)
+                    .copied()
+                    .collect()
+            });
+        let (earlier, sealed) = if sending.contains(&namespace) {
+            self.staged_messages(namespace, sequence)
+        } else {
+            (0, 0)
+        };
+        let more_proofs = |next_to_seal: u64| {
+            partition.proves_placed_batches()
+                && partition
+                    .fresh_proofs()
+                    .is_some_and(|proofs| proofs.rows_from(next_to_seal).next().is_some())
+        };
+        if sealed == 0 && proofs.is_empty() {
+            return (None, more_proofs(cursor.next_to_seal));
+        }
+        let claimed_first_offset = if sealed > 0 {
+            let claim = cursor
+                .next_claim
+                .unwrap_or_else(|| partition.mint_frontier().saturating_add(earlier));
+            cursor.next_claim = Some(claim.saturating_add(sealed));
+            claim
+        } else {
+            0
+        };
+        if let Some(last) = proofs.last() {
+            cursor.next_to_seal = last
+                .base_offset
+                .saturating_add(u64::from(last.message_count));
+        }
+        (
+            Some(SealedPartition {
+                namespace,
+                created_revision: partition.created_revision(),
+                view: partition.consensus().view(),
+                claimed_first_offset,
+                proven_below: partition.proven_below(unstored_from),
+                proofs,
+            }),
+            more_proofs(cursor.next_to_seal),
+        )
+    }
+
+    /// The messages of the waiting sends of `namespace`: those of other
+    /// objects, and those of the object `sequence`.
+    fn staged_messages(&self, namespace: IggyNamespace, sequence: u64) -> (u64, u64) {
+        self.fresh_writes
+            .staged
+            .borrow()
+            .get(&namespace)
+            .into_iter()
+            .flatten()
+            .fold((0, 0), |(earlier, sealed), send| {
+                let messages = u64::from(send.batch.message_count);
+                if send.object == sequence {
+                    (earlier, sealed + messages)
+                } else {
+                    (earlier + messages, sealed)
+                }
+            })
+    }
+
+    /// The bytes of the object `sequence` that holds `partitions`, after
+    /// the request of each of its sends is built at the position of its
+    /// blob. `None` when the object cannot be sealed, which leaves the sends
+    /// as they were.
+    fn seal_and_place(
+        &self,
+        sequence: u64,
+        header: FreshObjectHeader,
+        partitions: &[SealedPartition],
+    ) -> Option<Bytes> {
+        let fresh = &self.fresh_writes;
+        let sealed = {
+            let staged = fresh.staged.borrow();
+            let parts: Vec<FreshPartition<&[u8]>> = partitions
+                .iter()
+                .map(|partition| FreshPartition {
+                    namespace: partition.namespace.inner(),
+                    created_revision: partition.created_revision,
+                    view: partition.view,
+                    claimed_first_offset: partition.claimed_first_offset,
+                    proven_below: partition.proven_below,
+                    batches: sends_of(&staged, partition.namespace, sequence)
+                        .map(|send| FreshBatch {
+                            message_count: send.batch.message_count,
+                            origin_timestamp: send.batch.origin_timestamp,
+                            blob_checksum: send.blob_checksum,
+                            producer: send.batch.producer.map(|producer| FreshProducer {
+                                producer_id: producer.producer_id(),
+                                epoch: producer.epoch(),
+                                base_sequence: producer.base_sequence(),
+                            }),
+                            blob: admitted_blob(&send.request).unwrap_or_default(),
+                        })
+                        .collect(),
+                    proofs: partition.proofs.clone(),
+                })
+                .collect();
+            SealedFreshObject::seal(header, &parts)
+        };
+        let sealed = match sealed {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                tracing::error!(
+                    shard = self.id,
+                    %error,
+                    "a fresh object could not be sealed; its sends are answered as not accepted"
+                );
+                return None;
+            }
+        };
+        let mut staged = fresh.staged.borrow_mut();
+        let mut placed = Vec::with_capacity(sealed.index.batches().len());
+        for row in sealed.index.directory() {
+            let namespace = IggyNamespace::from_raw(row.namespace);
+            let sends = sends_of(&staged, namespace, sequence);
+            for ((position, batch), send) in sealed.index.batches_of(row).zip(sends) {
+                let placement = Placement {
+                    object_id: header.object_id.get(),
+                    position,
+                    length: u64::from(batch.blob_length),
+                    blob_checksum: batch.blob_checksum,
+                    proven_below: row.proven_below,
+                };
+                match place_request(&send.request, placement) {
+                    Ok(request) => placed.push(request),
+                    Err(error) => {
+                        tracing::error!(
+                            shard = self.id,
+                            %error,
+                            "a sealed send could not be placed; the sends of its object are \
+                             answered as not accepted"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        let mut placed = placed.into_iter();
+        for partition in partitions {
+            if let Some(queue) = staged.get_mut(&partition.namespace) {
+                let first = queue.partition_point(|send| send.object < sequence);
+                for send in queue.range_mut(first..) {
+                    if let Some(request) = placed.next() {
+                        send.request = request;
+                    }
+                }
+            }
+        }
+        Some(sealed.bytes)
+    }
+
+    /// Answer the sends of `namespace` in the object `sequence`, the last
+    /// ones of its queue, as not accepted.
+    fn deny_sends_of(&self, namespace: IggyNamespace, sequence: u64) {
+        let denied = self
+            .fresh_writes
+            .staged
+            .borrow_mut()
+            .get_mut(&namespace)
+            .map(|queue| {
+                let first = queue.partition_point(|send| send.object < sequence);
+                queue.split_off(first)
+            });
+        for send in denied.into_iter().flatten() {
+            self.deny_staged_send(namespace, send);
         }
     }
 
@@ -695,12 +1152,17 @@ where
         }
         if fresh.has_free_upload()
             && fresh.interval_passed(now)
-            && let Some(sequence) = fresh.close_window()
+            && let Some(sequence) = self.close_fresh_window()
         {
             self.start_fresh_upload(sequence, now);
         }
         self.metrics
             .set_fresh_load(fresh.uploads_in_flight.get(), fresh.staged_sends.get());
+        self.metrics.set_fresh_proof_lag(Duration::from_micros(
+            fresh
+                .oldest_unstored_proof()
+                .map_or(0, |since| now.saturating_sub(since)),
+        ));
     }
 
     /// Start an attempt at storing the closed object `sequence`.
@@ -850,7 +1312,10 @@ where
         };
         // A consumer at the tail polls these batches next, and this shard
         // holds their messages already.
-        if stored && let Some(remote) = self.plane.partitions().remote_segments() {
+        if stored
+            && !object.partitions.is_empty()
+            && let Some(remote) = self.plane.partitions().remote_segments()
+        {
             remote.cache_fresh_object(object.id.get(), object.bytes);
         }
         for namespace in object.partitions {
@@ -887,6 +1352,12 @@ where
     /// again.
     fn fail_fresh_object(&self, sequence: u64) -> Option<ClosedObject> {
         let object = self.take_settled_fresh_object(sequence, false)?;
+        let since = object
+            .proofs_since
+            .unwrap_or_else(|| self.bus.monotonic_micros());
+        for (namespace, first) in &object.proofs {
+            self.fresh_writes.reseal_proofs(*namespace, *first, since);
+        }
         for namespace in &object.partitions {
             let denied = self
                 .fresh_writes
@@ -1029,6 +1500,7 @@ where
 
     fn deny_staged_send(&self, namespace: IggyNamespace, send: StagedSend) {
         self.release_staged_send(namespace, send.bytes);
+        self.fresh_writes.forget_claim(namespace);
         settle_awaited(&self.fresh_writes.awaited, send.object_id.get());
         self.metrics.record_fresh_send_denied();
         Self::answer_partition_submit_deny(
@@ -1036,6 +1508,17 @@ where
             Some(send.reply),
             &IggyError::TransientNotAccepted,
         );
+    }
+
+    /// The partitions whose proof rows wait for an object.
+    #[cfg(test)]
+    pub(crate) fn fresh_proofs_waiting(&self) -> Vec<IggyNamespace> {
+        self.fresh_writes
+            .proofs_waiting
+            .borrow()
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Bytes of the messages of the waiting sends of `namespace`, and of
@@ -1048,6 +1531,19 @@ where
             fresh.pending_bytes.get(),
         )
     }
+}
+
+/// The sends of `namespace` in the object `sequence`, the last ones of its
+/// queue.
+fn sends_of(
+    staged: &BTreeMap<IggyNamespace, VecDeque<StagedSend>>,
+    namespace: IggyNamespace,
+    sequence: u64,
+) -> impl Iterator<Item = &StagedSend> {
+    staged.get(&namespace).into_iter().flat_map(move |queue| {
+        let first = queue.partition_point(|send| send.object < sequence);
+        queue.range(first..)
+    })
 }
 
 /// One send of `object` was answered.

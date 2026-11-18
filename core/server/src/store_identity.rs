@@ -64,6 +64,7 @@ use shard::Receiver;
 use shard::metrics::ShardMetrics;
 use tracing::{debug, error, info, warn};
 
+use crate::geo_peers::own_cluster_uid;
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 
 /// How long a node waits before it checks again, once its check passed or
@@ -161,7 +162,7 @@ pub async fn run<S: ObjectStore>(
             .metadata()
             .applied_frontier()
             .store_identity_verified();
-        handlers.sync(&shard, verified);
+        handlers.sync(&shard, verified.then(|| own_cluster_uid(&shard)).flatten());
         // `Ok`: the stop fired, or its sender is gone. `Err`: the wait ran
         // out.
         if compio::time::timeout(delay, stop.recv()).await.is_ok() {
@@ -383,13 +384,20 @@ impl TierHandlers {
         }
     }
 
-    /// Hand them to `shard` when its node is `verified`, and take them back
-    /// when not. A job in flight ends on the handler that started it.
-    fn sync<B, MJ, S, SB>(&mut self, shard: &ShellShard<B, MJ, S, SB>, verified: bool)
+    /// Hand them to `shard` when its node is verified as the owner of the
+    /// store, whose `cluster_uid` is `verified`, and take them back when
+    /// not. A job in flight ends on the handler that started it.
+    fn sync<B, MJ, S, SB>(&mut self, shard: &ShellShard<B, MJ, S, SB>, verified: Option<u128>)
     where
         B: ShellBus,
         SB: SuperblockStore,
     {
+        // Every fresh object names the cluster that wrote it, which is the
+        // one the check found in the store.
+        if let Some(cluster_uid) = verified {
+            shard.set_fresh_cluster_uid(cluster_uid);
+        }
+        let verified = verified.is_some();
         if verified == self.held {
             return;
         }
@@ -632,8 +640,8 @@ mod tests {
                 layout(),
             )),
         );
-        let held = |handlers: &mut TierHandlers, verified| {
-            handlers.sync(&shard, verified);
+        let held = |handlers: &mut TierHandlers, verified: bool| {
+            handlers.sync(&shard, verified.then_some(OURS));
             [
                 shard.segment_uploader().is_some(),
                 shard.object_deleter().is_some(),
@@ -647,7 +655,13 @@ mod tests {
         };
 
         assert_eq!(held(&mut handlers, false), [false; 8]);
+        assert_eq!(shard.fresh_cluster_uid(), 0);
         assert_eq!(held(&mut handlers, true), [true; 8]);
+        assert_eq!(
+            shard.fresh_cluster_uid(),
+            OURS,
+            "fresh objects name the cluster the check verified"
+        );
         assert_eq!(held(&mut handlers, true), [true; 8]);
         assert_eq!(held(&mut handlers, false), [false; 8]);
         assert_eq!(held(&mut handlers, true), [true; 8]);

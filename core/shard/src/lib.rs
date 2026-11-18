@@ -10121,6 +10121,7 @@ where
                 .sent_report(namespace)
                 .and_then(|(partition, sent)| {
                     self.pace_placing_primary(*namespace, partition);
+                    self.note_fresh_proofs(*namespace, partition);
                     self.stage_manifest_pass(*namespace, partition, manifest_now);
                     self.partition_quiet_until(*namespace, partition, sent.get())
                 });

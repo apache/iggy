@@ -150,7 +150,9 @@ fn placed_request(
             *next = header;
         },
     );
-    server_common::send_messages::place_request(&admitted, 7, request * 4096, proven_below).unwrap()
+    let blob = server_common::send_messages::admitted_blob(&admitted).unwrap();
+    let placement = Placement::of(7, request * 4096, blob, proven_below);
+    server_common::send_messages::place_request(&admitted, placement).unwrap()
 }
 
 #[compio::test]

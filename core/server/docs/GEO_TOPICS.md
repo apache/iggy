@@ -122,7 +122,10 @@ part yet: see the status note at the top.
    shard.
 2. The shard stores the window as one **fresh object** in its bucket, under
    `<prefix>/meta/fresh/`. A window closes when it holds 4 MiB, or when a send finds a free upload
-   slot and `fresh_upload_interval` has passed since the last upload started.
+   slot and `fresh_upload_interval` has passed since the last upload started. The object starts
+   with an index that names the partition of each batch. It also carries a **proof row** for each
+   batch that committed since the shard's last object: where its messages sit, and the offset and
+   timestamp it committed at. So the bucket alone says which messages committed and where.
 3. Once the object is stored, the partition commits a placed batch through its consensus: the
    batch header and where its messages sit in the fresh object, 320 bytes in all. The replicas
    store this record on their disks. The messages themselves are only in the bucket.
@@ -458,7 +461,7 @@ segment holds yet.
 | One node of a cluster fails                             | The partitions elect another primary as for any topic. Nothing is lost.                                                                                                                                                                                                                                      |
 | A cluster's bucket does not answer                      | Its geo topics refuse sends with 58. Polls that need bytes from the bucket get 58, which the SDKs retry. Rewrites wait. Peers mark the shadow topics of that origin stale.                                                                                                                                   |
 | A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. As for any topic, the topic's `durability` decides whether a crash of every node at once can lose acknowledged messages: see [replication factor](../README.md#replication-factor). |
-| A cluster is destroyed with its disks, its bucket stays | The messages it committed and had not published are lost. The fresh objects that hold them do not say whose messages they are or at which offsets. The published long-term segments stay in the bucket, but no cluster can read them in this version.                                                        |
+| A cluster is destroyed with its disks, its bucket stays | The messages it committed and had not published are lost. The proof rows in its fresh objects say where they committed, but no cluster reads them in this version, and the published long-term segments stay in the bucket unread as well.                                                                   |
 | A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                 |
 | A peer's bucket does not answer                         | This cluster serves its shadow topics as they are, removes none of them except those whose grace ended, and sets `geo_shadow_topics_stale` for that origin. Local traffic is not affected.                                                                                                                   |
 
@@ -567,6 +570,7 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 | `fresh_upload_seconds`               | histogram | How long the upload of a fresh object took.                                          |
 | `fresh_commit_seconds`               | histogram | How long a send waited for its answer after its fresh object was stored.             |
 | `fresh_object_size_bytes`            | histogram | Size of each fresh object the shard stored, in bytes.                                |
+| `fresh_proof_lag_seconds`            | gauge     | How long the oldest proof row of a committed batch has waited for a stored object.   |
 
 ### Fresh objects
 

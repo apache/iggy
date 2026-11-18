@@ -44,6 +44,7 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -506,6 +507,10 @@ pub struct ShardMetrics {
     /// `FRESH_OBJECT_BYTES` under load mean that windows close with few
     /// sends, so the store is asked for more objects than the load needs.
     fresh_object_size: Histogram,
+    /// How long the oldest proof row of a batch that committed has waited
+    /// for a stored object to carry it. Another cluster reads a batch only
+    /// once its row is stored.
+    fresh_proof_lag_seconds: Gauge<f64, AtomicU64>,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -691,6 +696,7 @@ impl ShardMetrics {
             fresh_upload: fresh_latency_histogram(),
             fresh_commit: fresh_latency_histogram(),
             fresh_object_size: fresh_object_size_histogram(),
+            fresh_proof_lag_seconds: Gauge::default(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
@@ -717,6 +723,19 @@ impl ShardMetrics {
     /// An upload window started its upload `wait` after its first send.
     pub(crate) fn record_fresh_window_wait(&self, wait: Duration) {
         self.fresh_window_wait.observe(wait.as_secs_f64());
+    }
+
+    /// The oldest proof row this shard has not stored yet has waited for
+    /// `lag`, zero when none waits.
+    pub(crate) fn set_fresh_proof_lag(&self, lag: Duration) {
+        self.fresh_proof_lag_seconds.set(lag.as_secs_f64());
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_proof_lag_value(&self) -> f64 {
+        self.fresh_proof_lag_seconds.get()
     }
 
     /// The upload of a fresh object of `bytes` ended after `elapsed`, and
@@ -2509,6 +2528,12 @@ impl ShardMetrics {
             "fresh_object_size_bytes",
             "bytes of each fresh object this shard stored",
             self.fresh_object_size.clone(),
+        );
+        registry.register(
+            "fresh_proof_lag_seconds",
+            "how long the oldest proof row of a committed batch has waited for a stored fresh \
+             object to carry it",
+            self.fresh_proof_lag_seconds.clone(),
         );
         registry.register(
             "pump_tick_lateness_seconds",

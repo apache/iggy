@@ -140,10 +140,10 @@ impl FreshObject {
 }
 
 /// Whether `bytes`, the start of an object, are those of a fresh object this
-/// build reads ranges of.
+/// build reads ranges of: this format, or the one that describes itself.
 #[must_use]
 pub fn is_fresh_object(bytes: &[u8]) -> bool {
-    bytes.starts_with(MAGIC)
+    bytes.starts_with(MAGIC) || bytes.starts_with(crate::fresh_index::MAGIC)
 }
 
 #[cfg(test)]
@@ -183,8 +183,13 @@ mod tests {
 
     #[test]
     fn given_another_object_when_asking_should_not_take_it_for_a_fresh_object() {
-        assert!(!is_fresh_object(b"IGGYFRS2 and more"));
+        assert!(!is_fresh_object(b"IGGYFRS3 and more"));
         assert!(!is_fresh_object(b"IGGY"));
+    }
+
+    #[test]
+    fn given_an_object_that_describes_itself_when_asking_should_take_it_for_a_fresh_object() {
+        assert!(is_fresh_object(b"IGGYFRS2 and an index"));
     }
 
     #[test]
