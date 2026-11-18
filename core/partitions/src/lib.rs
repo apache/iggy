@@ -62,7 +62,8 @@ pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOu
 mod manifest_publish;
 mod placed_read;
 pub use manifest_publish::{
-    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
+    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
 };
 pub use segment_chain::object_prefix;
 pub use segment_upload::{

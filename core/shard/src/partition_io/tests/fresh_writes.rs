@@ -834,6 +834,81 @@ async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publ
     assert_eq!(manifest.segments, partition.long_term_segments());
 }
 
+/// Publishes into a memory store, which refuses the first `refused` puts.
+struct RefusingPublisher {
+    publisher: partitions::ExecutorManifestPublisher<InlineTierExecutor<MemoryStore>>,
+    refused: u32,
+    attempts: Cell<u32>,
+}
+
+impl partitions::ManifestPublisher for RefusingPublisher {
+    fn publish(
+        &self,
+        manifest: iggy_object_store::PartitionManifest,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, partitions::ManifestPublishOutcome> {
+        let attempt = self.attempts.get();
+        self.attempts.set(attempt + 1);
+        if attempt < self.refused {
+            Box::pin(std::future::ready(Ok(Err(ObjectStoreError::Unavailable(
+                "503".to_owned(),
+            )))))
+        } else {
+            self.publisher.publish(manifest, scope)
+        }
+    }
+}
+
+/// The rewrite of the partition never ends, so no long-term segment commits
+/// and nothing else asks for its manifest once the first put failed.
+#[compio::test]
+async fn given_a_placing_primary_whose_first_manifest_put_fails_when_nothing_commits_should_store_the_manifest_after_the_retry()
+ {
+    use iggy_object_store::PartitionManifest;
+    use partitions::{ExecutorManifestPublisher, MANIFEST_RETRY_AFTER};
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    owner.set_fresh_uploader(Some(TestUploader::new()));
+    owner.set_long_term_writer(Some(Rc::new(HeldWriter)));
+    let publisher = Rc::new(RefusingPublisher {
+        publisher: ExecutorManifestPublisher::new(
+            InlineTierExecutor::new(MemoryStore::new()),
+            layout(),
+        ),
+        refused: 1,
+        attempts: Cell::new(0),
+    });
+    owner.set_manifest_publisher(Some(publisher.clone()));
+    let store = publisher.publisher.executor().store();
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(
+        namespace(),
+        staged_revision(&owner),
+    ));
+
+    let stored_in = pumped(&owner, async {
+        let started = std::time::Instant::now();
+        let _answer = submit_send(&owner, 1, 100);
+        until(&owner, |owner| {
+            committed_sends(owner) == 1 && paced(owner, namespace())
+        })
+        .await;
+        until(&owner, |_| store.keys().contains(&manifest_key)).await;
+        started.elapsed()
+    })
+    .await;
+
+    assert!(stored_in >= MANIFEST_RETRY_AFTER / 2, "{stored_in:?}");
+    assert_eq!(publisher.attempts.get(), 2, "the refused put and its retry");
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    assert_eq!(partition.long_term_floor(), None, "nothing was rewritten");
+    let size = store.head(&manifest_key).await.unwrap().size;
+    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    assert_eq!(manifest.floor, None);
+    assert_eq!(manifest.segments, []);
+}
+
 /// The segment cleaner stages only the first pass over a partition. The
 /// sends that commit after it are rewritten when the partition's wait is
 /// over, which the pump's tick finds.

@@ -10013,12 +10013,13 @@ where
     /// changed while the tick awaited.
     fn settle_ticked_partitions(&self, visited: &[IggyNamespace]) {
         let partitions = self.plane.partitions();
+        let manifest_now = IggyTimestamp::now();
         for namespace in visited {
             let quiet_until = partitions
                 .sent_report(namespace)
                 .and_then(|(partition, sent)| {
                     self.pace_placing_primary(*namespace, partition);
-                    self.stage_manifest_of_new_primary(*namespace, partition);
+                    self.stage_manifest_pass(*namespace, partition, manifest_now);
                     self.partition_quiet_until(*namespace, partition, sent.get())
                 });
             partitions.settle(namespace, quiet_until);
