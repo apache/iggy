@@ -126,14 +126,19 @@ pub trait Benchmarkable: Send {
             let messages_required_to_save =
                 self.args().messages_required_to_save().map(NonZeroU32::get);
 
+            let topic_type = self.args().topic_type();
+            let tiered_storage = self.args().tiered_storage();
+
             info!(
-                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, durability: {}, messages required to save: {:?}",
+                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, durability: {}, messages required to save: {:?}, topic type: {:?}, tiered storage: {:?}",
                 topic_name,
                 stream_name,
                 max_topic_size,
                 message_expiry,
                 durability,
-                messages_required_to_save
+                messages_required_to_save,
+                topic_type,
+                tiered_storage
             );
 
             client
@@ -149,6 +154,8 @@ pub trait Benchmarkable: Send {
                         durability,
                         consumer_offset_durability: self.args().consumer_offset_durability(),
                         messages_required_to_save,
+                        topic_type,
+                        tiered_storage,
                         ..TopicCreateOptions::default()
                     },
                 )

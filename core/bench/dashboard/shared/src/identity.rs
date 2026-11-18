@@ -107,6 +107,7 @@ pub enum WorkloadField {
     MessagesRequiredToSave,
     MaxTopicSize,
     MessageExpiry,
+    TopicStorage,
     ConsumerOffsetDurability,
     MaxWait,
     MinCount,
@@ -223,6 +224,7 @@ impl WorkloadKey {
             messages_required_to_save,
             max_topic_size,
             message_expiry,
+            storage,
         } = topic;
         let BenchmarkClientOptions {
             warmup_time_us,
@@ -268,6 +270,7 @@ impl WorkloadKey {
                 WorkloadField::MessageExpiry,
                 *message_expiry == other.topic.message_expiry,
             ),
+            (WorkloadField::TopicStorage, *storage == other.topic.storage),
             (
                 WorkloadField::ConsumerOffsetDurability,
                 same_poll_option(consumer, poll, |options| {
@@ -366,7 +369,7 @@ impl KindFamily {
 
 impl WorkloadField {
     /// Every field, in key order.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Kind,
         Self::Transport,
         Self::MessageSize,
@@ -382,6 +385,7 @@ impl WorkloadField {
         Self::MessagesRequiredToSave,
         Self::MaxTopicSize,
         Self::MessageExpiry,
+        Self::TopicStorage,
         Self::ConsumerOffsetDurability,
         Self::MaxWait,
         Self::MinCount,
@@ -425,6 +429,7 @@ impl fmt::Display for WorkloadField {
             Self::MessagesRequiredToSave => "Messages required to save",
             Self::MaxTopicSize => "Max topic size",
             Self::MessageExpiry => "Message expiry",
+            Self::TopicStorage => "Topic storage",
             Self::ConsumerOffsetDurability => "Consumer offset durability",
             Self::MaxWait => "Consumer max wait",
             Self::MinCount => "Consumer min count",
@@ -525,7 +530,9 @@ fn unix_micros(rfc3339: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::test_fixtures::{CLUSTER_RUN, PHASE_1A_RUN, report};
-    use bench_report::options::{BenchmarkMaxTopicSize, BenchmarkMessageExpiry};
+    use bench_report::options::{
+        BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkTopicStorage,
+    };
 
     const COMMIT: &str = "71f29618b";
     const FULL_COMMIT: &str = "91e020636a1b2c3d4e5f60718293a4b5c6d7e8f9";
@@ -698,7 +705,7 @@ mod tests {
     #[test]
     fn given_change_of_option_rate_limit_or_label_when_keyed_should_change_key() {
         let original = params(PHASE_1A_RUN);
-        let changes: [Change<BenchmarkParams>; 15] = [
+        let changes: [Change<BenchmarkParams>; 16] = [
             ("rate limit", |p| p.rate_limit = Some("40.00 MB".to_owned())),
             ("no rate limit", |p| p.rate_limit = None),
             ("workload label", |p| {
@@ -718,6 +725,9 @@ mod tests {
             }),
             ("message expiry", |p| {
                 options(p).topic.message_expiry = BenchmarkMessageExpiry::AfterUs(1_000_000);
+            }),
+            ("topic storage", |p| {
+                options(p).topic.storage = BenchmarkTopicStorage::Geo;
             }),
             ("consumer options", |p| {
                 options(p).consumer =
@@ -817,7 +827,7 @@ mod tests {
     #[test]
     fn given_one_changed_field_when_diffed_should_name_it_down_to_single_option() {
         let original = params(PHASE_1A_RUN);
-        let changes: [FieldChange<BenchmarkParams>; 21] = [
+        let changes: [FieldChange<BenchmarkParams>; 22] = [
             (WorkloadField::Kind, |p| {
                 p.benchmark_kind = BenchmarkKind::BalancedProducer;
             }),
@@ -850,6 +860,9 @@ mod tests {
             }),
             (WorkloadField::MessageExpiry, |p| {
                 options(p).topic.message_expiry = BenchmarkMessageExpiry::ServerDefault;
+            }),
+            (WorkloadField::TopicStorage, |p| {
+                options(p).topic.storage = BenchmarkTopicStorage::Tiered;
             }),
             (WorkloadField::WarmupTime, |p| {
                 options(p).client.warmup_time_us = 5_000_000;

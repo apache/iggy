@@ -13348,6 +13348,18 @@ where
         if self.peer_log.is_some() {
             return SegmentRemoval::default();
         }
+        // A placed batch above the long-term floor is the only record of
+        // where its messages sit in the object store. Removing it would lose
+        // them for the rewrite, and so for every other cluster, whoever
+        // asked: retention, or a client that deletes segments.
+        let up_to_offset = if self.places_batches() {
+            match self.long_term_floor() {
+                Some(floor) => up_to_offset.min(floor),
+                None => return SegmentRemoval::default(),
+            }
+        } else {
+            up_to_offset
+        };
         self.maintenance.retention = Some(
             self.maintenance
                 .retention

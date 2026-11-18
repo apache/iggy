@@ -69,23 +69,7 @@ async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_b
         .expect("the mode is stored");
     assert!(!mode.explicit, "admission derived the mode");
 
-    for index in 0..MESSAGES {
-        let mut messages = vec![
-            IggyMessage::builder()
-                .payload(payload(index).into())
-                .build()
-                .expect("build message"),
-        ];
-        client
-            .send_messages(
-                &stream,
-                &topic,
-                &Partitioning::partition_id(PARTITION_ID),
-                &mut messages,
-            )
-            .await
-            .expect("send messages");
-    }
+    send(&client, &stream, &topic, 0..MESSAGES).await;
     // A placed send is uploaded before it commits, and an uploaded object is
     // deleted only once a long-term segment holds its messages.
     let placed = placed_objects(store.path());
@@ -94,7 +78,34 @@ async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_b
         "no committed send left an object in the store: {:?}",
         files(store.path())
     );
-    assert_reads_every_message(&client, &stream, &topic).await;
+    assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+}
+
+#[tokio::test]
+async fn given_a_geo_topic_when_the_server_restarts_should_read_the_sends_and_take_more() {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    {
+        let client = harness.tcp_root_client().await.expect("tcp root client");
+        client
+            .create_stream(STREAM, &StreamCreateOptions::default())
+            .await
+            .expect("create stream");
+        create_geo_topic(&client, &stream, TOPIC, None)
+            .await
+            .expect("create the geo topic");
+        send(&client, &stream, &topic, 0..MESSAGES).await;
+    }
+
+    harness.restart_server().await.expect("the server restarts");
+
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+    send(&client, &stream, &topic, MESSAGES..2 * MESSAGES).await;
+    assert_reads_every_message(&client, &stream, &topic, 2 * MESSAGES).await;
 }
 
 #[tokio::test]
@@ -237,9 +248,40 @@ async fn wait_until_ready(client: &IggyClient, stream: &Identifier) {
         .expect("delete the probe topic");
 }
 
-async fn assert_reads_every_message(client: &IggyClient, stream: &Identifier, topic: &Identifier) {
+/// Sends one message per index of `indexes`, each in a send of its own.
+async fn send(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    indexes: std::ops::Range<u64>,
+) {
+    for index in indexes {
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload(payload(index).into())
+                .build()
+                .expect("build message"),
+        ];
+        client
+            .send_messages(
+                stream,
+                topic,
+                &Partitioning::partition_id(PARTITION_ID),
+                &mut messages,
+            )
+            .await
+            .expect("send messages");
+    }
+}
+
+async fn assert_reads_every_message(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    count: u64,
+) {
     let mut offset = 0;
-    while offset < MESSAGES {
+    while offset < count {
         let polled = client
             .poll_messages(
                 stream,
