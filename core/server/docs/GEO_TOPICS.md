@@ -581,10 +581,12 @@ The first shard of each node sweeps the fresh objects that this replica wrote.
 | `fresh_objects_due`               | gauge   | Objects past their 10 minutes that the last sweep left in the bucket.                        |
 | `fresh_listings_truncated`        | gauge   | Listings of the last sweep that stopped at their share of keys. `fresh_objects` is then low. |
 | `fresh_objects_deleted`           | counter | Fresh objects this replica deleted.                                                          |
+| `fresh_sweeps_held`               | gauge   | 1 while the last sweep deleted nothing because a shard could not tell what it reads.         |
 
 A sweep deletes nothing while a placing partition of this node is rebuilt or waits for a state
-transfer, since the rebuilt copy still reads those objects. `fresh_objects` and
-`fresh_object_oldest_age_seconds` then grow until the partition is back.
+transfer, since the rebuilt copy still reads those objects. `fresh_sweeps_held` is then 1, and
+`fresh_objects` and `fresh_object_oldest_age_seconds` grow until the partition is back. A hold
+that lasts longer than the 10 minutes of grace is also logged as a warning.
 
 ### Long-term segments
 

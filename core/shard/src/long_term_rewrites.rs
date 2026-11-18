@@ -192,12 +192,12 @@ where
     /// The pump's tick: settle the rewrites whose frame the inbox refused,
     /// look over every partition once after the shard got a writer, hand
     /// the partitions the backlogs their walks counted, act on the
-    /// commands that committed outside a partition I/O step, make the pass
-    /// of a partition past its backlog limit due, start the passes that are
-    /// due, and report how far the rewrites are behind, per partition and
-    /// at worst, the largest backlog, how long the longest long-term log
-    /// is, and how many objects no long-term log accounts for or wait for
-    /// their delete.
+    /// commands that committed outside a partition I/O step, stage the
+    /// manifest passes that no commit asks for, make the pass of a partition
+    /// past its backlog limit due, start the passes that are due, and report
+    /// how far the rewrites are behind, per partition and at worst, the
+    /// largest backlog, how long the longest long-term log is, and how many
+    /// objects no long-term log accounts for or wait for their delete.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
@@ -211,11 +211,12 @@ where
             self.settle_segment_rewrite(finished).await;
         }
         let partitions = self.plane.partitions();
+        let manifest_now = IggyTimestamp::now();
         if self.rewrite_pacing.borrow_mut().take_sweep_wanted() {
             for namespace in partitions.namespaces() {
                 if let Some(partition) = partitions.get_by_ns(namespace) {
                     self.pace_placing_primary(*namespace, partition);
-                    self.stage_manifest_of_new_primary(*namespace, partition);
+                    self.stage_manifest_pass(*namespace, partition, manifest_now);
                 }
             }
         }
@@ -247,11 +248,16 @@ where
             unannounced_objects += partition.long_term_unannounced_objects();
             dead_objects += partition.queued_dead_long_term_objects();
             most_segments = most_segments.max(partition.long_term_segments().len());
-            if partition.take_long_term_changed() {
+            let long_term_changed = partition.take_long_term_changed();
+            if long_term_changed {
                 changed.push((*key, partition.merges_under_pressure()));
             }
             if !partition.consensus().is_primary() {
                 continue;
+            }
+            // A change stages its own pass below.
+            if !long_term_changed {
+                self.stage_manifest_pass(key.0, partition, manifest_now);
             }
             lags.push(LongTermLag {
                 namespace: key.0,

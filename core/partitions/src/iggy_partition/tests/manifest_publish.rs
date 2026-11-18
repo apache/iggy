@@ -22,13 +22,14 @@ use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::tiered_floor::AdvanceTieredFloor;
 use crate::{
-    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
-    upload_segment,
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
+    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher, upload_segment,
 };
 use iggy_object_store::{
     InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PartitionManifest, SegmentKey,
     SegmentObject, TierJobCancelled,
 };
+use std::time::Duration;
 
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops, as
 /// `(first offset, last offset)`.
@@ -414,4 +415,151 @@ async fn given_a_crash_between_a_segment_upload_and_its_manifest_when_the_primar
     assert_eq!(listed(&caught_up), SEALED);
     assert_eq!(caught_up.floor, Some(SEALED[1].1));
     assert_eq!(caught_up.trim_point, None);
+}
+
+/// A replica of a group of three that leads view 0 of a partition that
+/// places its batches.
+async fn placing_leader() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+    let (directory, mut partition) =
+        Box::pin(disk_poll_partition_with_replicas(&repair_config(), 3)).await;
+    partition.set_places_batches(true);
+    assert!(partition.consensus.is_primary());
+    (directory, partition)
+}
+
+const REFUSED: ManifestPublishOutcome = Ok(Err(ObjectStoreError::Unavailable(String::new())));
+
+/// How long after `moment` the partition owes its next pass.
+fn owed_after(partition: &IggyPartition<IggyMessageBus>, moment: IggyTimestamp) -> Duration {
+    let due_at = partition.manifest_pass_due_at().unwrap();
+    Duration::from_micros(due_at.as_micros() - moment.as_micros())
+}
+
+#[compio::test]
+async fn given_a_failed_publish_of_a_placing_primary_when_asking_should_owe_a_pass_only_after_its_backoff()
+ {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let failed_at = IggyTimestamp::now();
+    assert_eq!(partition.manifest_pass_due_at(), None, "no pass ran yet");
+
+    assert!(pass(&mut partition, failed_at, &REFUSED).is_some());
+
+    assert_eq!(owed_after(&partition, failed_at), MANIFEST_RETRY_AFTER);
+    let retried = pass(
+        &mut partition,
+        after(failed_at, MANIFEST_RETRY_AFTER),
+        &STORED,
+    );
+    assert!(retried.is_some(), "the owed pass publishes");
+}
+
+/// The executor of this view dropped the job: the scope the partition holds
+/// was not cancelled, so the put may never have run.
+#[compio::test]
+async fn given_a_job_cancelled_within_its_view_when_asking_should_owe_its_retry() {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let cancelled_at = IggyTimestamp::now();
+
+    assert!(pass(&mut partition, cancelled_at, &Err(TierJobCancelled)).is_some());
+
+    assert_eq!(owed_after(&partition, cancelled_at), MANIFEST_RETRY_AFTER);
+}
+
+#[compio::test]
+async fn given_publishes_that_keep_failing_when_asking_should_double_the_wait_up_to_its_most() {
+    const FAILURES: u32 = 9;
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let mut failed_at = IggyTimestamp::now();
+    let mut waits = Vec::new();
+
+    for _ in 0..FAILURES {
+        assert!(pass(&mut partition, failed_at, &REFUSED).is_some());
+        let wait = owed_after(&partition, failed_at);
+        waits.push(wait);
+        failed_at = after(failed_at, wait);
+    }
+
+    let doubled: Vec<Duration> = (0..FAILURES)
+        .map(|failure| (MANIFEST_RETRY_AFTER * 2_u32.pow(failure)).min(MANIFEST_RETRY_AFTER_MAX))
+        .collect();
+    assert_eq!(waits, doubled);
+    assert_eq!(waits.last(), Some(&MANIFEST_RETRY_AFTER_MAX), "capped");
+}
+
+#[compio::test]
+async fn given_failed_publishes_when_one_stores_should_clear_the_backoff() {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let mut failed_at = IggyTimestamp::now();
+    for _ in 0..3 {
+        assert!(pass(&mut partition, failed_at, &REFUSED).is_some());
+        failed_at = partition.manifest_pass_due_at().unwrap();
+    }
+
+    let stored_at = failed_at;
+    assert!(pass(&mut partition, stored_at, &STORED).is_some());
+
+    assert_eq!(
+        owed_after(&partition, stored_at),
+        MANIFEST_REPEAT_AFTER,
+        "only the repeat is owed"
+    );
+    let repeat_at = after(stored_at, MANIFEST_REPEAT_AFTER);
+    assert!(pass(&mut partition, repeat_at, &REFUSED).is_some());
+    assert_eq!(
+        owed_after(&partition, repeat_at),
+        MANIFEST_RETRY_AFTER,
+        "the next failure waits the shortest time"
+    );
+}
+
+#[compio::test]
+async fn given_a_first_manifest_of_a_placing_primary_when_asking_should_owe_the_repeat_after_its_wait()
+ {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let first = IggyTimestamp::now();
+    assert!(pass(&mut partition, first, &STORED).is_some());
+
+    assert_eq!(owed_after(&partition, first), MANIFEST_REPEAT_AFTER);
+
+    let repeat_at = after(first, MANIFEST_REPEAT_AFTER);
+    assert!(pass(&mut partition, repeat_at, &STORED).is_some());
+    assert_eq!(partition.manifest_pass_due_at(), None, "repeated once");
+}
+
+#[compio::test]
+async fn given_a_publish_in_flight_or_a_backup_when_asking_should_owe_no_pass() {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let now = IggyTimestamp::now();
+    assert!(pass(&mut partition, now, &REFUSED).is_some());
+    let due_at = partition.manifest_pass_due_at().unwrap();
+
+    let (id, _manifest, _scope) = partition.begin_manifest_publish(due_at).unwrap();
+    assert_eq!(partition.manifest_pass_due_at(), None, "a publish runs");
+    partition.finish_manifest_publish(id, &REFUSED, due_at);
+    assert!(partition.manifest_pass_due_at().is_some());
+
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(!partition.consensus.is_primary());
+    assert_eq!(partition.manifest_pass_due_at(), None, "a backup");
+
+    regain_primacy(&mut partition);
+    assert_eq!(
+        partition.manifest_pass_due_at(),
+        None,
+        "a new view owes its first pass instead"
+    );
+    assert!(partition.manifest_awaits_first_pass());
+}
+
+/// The segment cleaner runs the passes of a tiered partition.
+#[compio::test]
+async fn given_a_tiered_partition_when_its_publish_fails_should_owe_no_pass() {
+    let (_directory, mut partition) = Box::pin(partition_with_stored(1)).await;
+    let now = IggyTimestamp::now();
+
+    assert!(pass(&mut partition, now, &REFUSED).is_some());
+    assert_eq!(partition.manifest_pass_due_at(), None);
+    assert!(pass(&mut partition, now, &STORED).is_some());
+    assert_eq!(partition.manifest_pass_due_at(), None);
 }
