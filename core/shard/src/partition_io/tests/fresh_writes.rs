@@ -550,22 +550,73 @@ fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
 /// Rewrite the committed sends of the partition up to `floor`.
 #[allow(clippy::future_not_send)]
 async fn rewrite_up_to(owner: &IoTestShard, floor: u64) {
+    rewrite_partition_up_to(owner, namespace(), floor).await;
+}
+
+/// [`rewrite_up_to`] for `partition`.
+#[allow(clippy::future_not_send)]
+async fn rewrite_partition_up_to(owner: &IoTestShard, partition: IggyNamespace, floor: u64) {
     let partitions = owner.plane.partitions();
-    let revision = partitions
-        .get_by_ns(&namespace())
-        .unwrap()
-        .created_revision();
-    owner.request_rewrite_segments(namespace(), revision);
+    let revision = partitions.get_by_ns(&partition).unwrap().created_revision();
+    owner.request_rewrite_segments(partition, revision);
     until(owner, |owner| {
-        owner
-            .plane
-            .partitions()
-            .get_by_ns(&namespace())
-            .unwrap()
-            .long_term_floor()
-            == Some(floor)
+        long_term_floor(owner, partition) == Some(floor)
     })
     .await;
+}
+
+/// The long-term floor of `partition`.
+fn long_term_floor(owner: &IoTestShard, partition: IggyNamespace) -> Option<u64> {
+    owner
+        .plane
+        .partitions()
+        .get_by_ns(&partition)
+        .unwrap()
+        .long_term_floor()
+}
+
+/// Make the partition beside [`namespace`] place its batches and keep them
+/// in a segment file under `directory`, as [`placing_owner`] does for its
+/// own.
+#[allow(clippy::future_not_send)]
+async fn place_other_partition_on_disk(owner: &IoTestShard, directory: &Path) -> IggyNamespace {
+    let other = IggyNamespace::new(0, 0, 1);
+    let placing = owner.plane.partitions().get_mut_by_ns(&other).unwrap();
+    placing.set_runtime_options(TopicRuntimeOptions {
+        messages_required_to_save: Some(1),
+        places_batches: true,
+        ..Default::default()
+    });
+    attach_segment_files(placing, directory, false).await;
+    placing.register_builtin_state_machines().unwrap();
+    other
+}
+
+/// Take `partition` off the shard the way a delete of it does: the
+/// reconciler fences the namespace, and the pump drops the partition once
+/// its files are gone.
+#[allow(clippy::future_not_send)]
+async fn delete_partition(owner: &IoTestShard, partition: IggyNamespace) {
+    owner.plane.partitions().tombstone(partition);
+    owner.enqueue_reconcile_op(ReconcileOp::ConfirmRemove {
+        namespace: partition,
+    });
+    until(owner, |owner| {
+        owner.plane.partitions().get_io_owner(&partition).is_none()
+    })
+    .await;
+    // The marker of the op leaves the inbox a frame later, and a sweep
+    // asked for while the inbox is full is dropped.
+    compio::time::sleep(TASK_POLL_INTERVAL).await;
+}
+
+/// The object each placed batch of the segment under `directory` names, in
+/// the order of the offsets.
+fn named_objects(directory: &Path) -> Vec<u128> {
+    stored_placed_batches(directory)
+        .iter()
+        .map(|placed| placed.placement.object_id)
+        .collect()
 }
 
 /// Once the rewrite caught up, nothing reads the fresh objects again, and
@@ -607,6 +658,28 @@ async fn given_sends_in_long_term_segments_when_sweeps_run_past_the_grace_should
     assert_eq!(owner.metrics().fresh_objects_deleted_value(), 2);
 }
 
+/// Rewrites through the owner's writer, and ends every segment at `up_to` at
+/// the latest, the way the size cap of a segment ends one before the commit
+/// point. Past `up_to` it rewrites nothing.
+struct CappedWriter {
+    writer: Rc<dyn partitions::LongTermWriter>,
+    up_to: u64,
+}
+
+impl partitions::LongTermWriter for CappedWriter {
+    fn write(
+        &self,
+        mut rewrite: partitions::SegmentRewrite,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, partitions::RewriteOutcome> {
+        if rewrite.start_offset > self.up_to {
+            return Box::pin(std::future::ready(Err(iggy_object_store::TierJobCancelled)));
+        }
+        rewrite.up_to = rewrite.up_to.min(self.up_to);
+        self.writer.write(rewrite, scope)
+    }
+}
+
 /// One object can hold sends that are rewritten and sends that are not. It
 /// stays for as long as one placed batch above the floor names it.
 #[compio::test]
@@ -614,19 +687,28 @@ async fn given_a_send_above_the_long_term_floor_when_sweeps_run_should_keep_its_
     let directory = tempfile::tempdir().unwrap();
     let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
     let store = executor.0.store();
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+    owner.set_long_term_writer(Some(Rc::new(CappedWriter {
+        writer: owner.long_term_writer().unwrap(),
+        up_to: 1,
+    })));
     let now = IggyTimestamp::now();
 
-    let kept = pumped(&owner, async {
-        let _first = submit_send(&owner, 1, 100);
+    let shared = pumped(&owner, async {
+        // Stored at once, so the two sends after it share the next object.
+        let _alone = submit_send(&owner, 1, 100);
         until(&owner, |owner| committed_sends(owner) == 1).await;
-        rewrite_up_to(&owner, 0).await;
-        // The second send stays above the floor: no pass rewrites it.
-        owner.set_long_term_writer(None);
-        let _second = submit_send(&owner, 2, 100);
-        until(&owner, |owner| committed_sends(owner) == 2).await;
+        let _shared = [submit_send(&owner, 2, 100), submit_send(&owner, 3, 100)];
+        until(&owner, |owner| committed_sends(owner) == 3).await;
         let objects = fresh_objects(store);
         assert_eq!(objects.len(), 2);
+        assert_eq!(
+            named_objects(directory.path()),
+            [objects[0], objects[1], objects[1]]
+        );
 
+        // The segment ends between the two sends of the second object.
+        rewrite_up_to(&owner, 1).await;
         sweep(&owner, now).await;
         sweep(&owner, past_grace(now)).await;
         sweep(&owner, past_grace(past_grace(now))).await;
@@ -634,7 +716,130 @@ async fn given_a_send_above_the_long_term_floor_when_sweeps_run_should_keep_its_
     })
     .await;
 
-    assert_eq!(fresh_objects(store), vec![kept]);
+    assert_eq!(long_term_floor(&owner, namespace()), Some(1));
+    assert_eq!(fresh_objects(store), vec![shared]);
+}
+
+/// A delete of a partition takes its placed batches with it, so nothing
+/// names the objects only it named. An object it shared with a partition
+/// that is still there stays, until the topic goes with every partition.
+#[compio::test]
+async fn given_a_deleted_partition_when_sweeps_run_past_the_grace_should_delete_the_fresh_objects_only_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let other_directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let other = Box::pin(place_other_partition_on_disk(
+        &owner,
+        other_directory.path(),
+    ))
+    .await;
+    let store = executor.0.store();
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+    let now = IggyTimestamp::now();
+    let unnamed_since = past_grace(now);
+    let topic_deleted_at = past_grace(unnamed_since);
+
+    let shared = pumped(&owner, async {
+        // Stored at once, so the two sends after it share the next object.
+        let _alone = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let _first = submit_send(&owner, 2, 100);
+        let _second = submit_send_to(&owner, other, 3, 100);
+        until(&owner, |owner| {
+            committed_sends(owner) == 2 && committed(owner, other) == 1
+        })
+        .await;
+        let objects = fresh_objects(store);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(named_objects(directory.path()), objects);
+        assert_eq!(named_objects(other_directory.path()), [objects[1]]);
+        sweep(&owner, now).await;
+
+        delete_partition(&owner, namespace()).await;
+        sweep(&owner, unnamed_since).await;
+        assert_eq!(
+            fresh_objects(store),
+            objects,
+            "the objects of a deleted partition wait out the grace period too"
+        );
+        sweep(&owner, topic_deleted_at).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[1]],
+            "the other partition still names the object they share"
+        );
+
+        for partition in 1..TEST_PARTITIONS {
+            delete_partition(&owner, IggyNamespace::new(0, 0, partition)).await;
+        }
+        sweep(&owner, topic_deleted_at).await;
+        assert_eq!(fresh_objects(store), [objects[1]]);
+        sweep(&owner, past_grace(topic_deleted_at)).await;
+        objects[1]
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new(), "{shared:032x}");
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 2);
+}
+
+/// An object holds the sends of every placing partition of its window, and
+/// each partition's rewrite moves its floor alone. The object stays while
+/// one of them still names it above its floor.
+#[compio::test]
+async fn given_an_object_two_partitions_share_when_one_is_rewritten_should_keep_it_until_both_are()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let other_directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let other = Box::pin(place_other_partition_on_disk(
+        &owner,
+        other_directory.path(),
+    ))
+    .await;
+    let store = executor.0.store();
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+    let now = IggyTimestamp::now();
+    let rewritten_at = past_grace(now);
+
+    pumped(&owner, async {
+        // Stored at once, so the two sends after it share the next object.
+        let _alone = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let _first = submit_send(&owner, 2, 100);
+        let _second = submit_send_to(&owner, other, 3, 100);
+        until(&owner, |owner| {
+            committed_sends(owner) == 2 && committed(owner, other) == 1
+        })
+        .await;
+        let objects = fresh_objects(store);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(named_objects(directory.path()), objects);
+        assert_eq!(named_objects(other_directory.path()), [objects[1]]);
+
+        rewrite_up_to(&owner, 1).await;
+        assert_eq!(long_term_floor(&owner, other), None);
+        sweep(&owner, now).await;
+        sweep(&owner, rewritten_at).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[1]],
+            "the partition that is not rewritten still names the object"
+        );
+
+        rewrite_partition_up_to(&owner, other, 0).await;
+        sweep(&owner, rewritten_at).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[1]],
+            "the grace period starts when the last partition stops naming the object"
+        );
+        sweep(&owner, past_grace(rewritten_at)).await;
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
 }
 
 /// An object whose sends never committed is named by no placed batch. So is
