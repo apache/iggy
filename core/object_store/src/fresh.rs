@@ -25,8 +25,8 @@
 //! A blob is the message frames of one batch. The object does not say where
 //! a blob starts or whose it is: the partition that commits the batch keeps
 //! its position and length, and reads exactly that range. The magic names
-//! the version, so an object that describes itself can follow without a
-//! reader taking one for the other.
+//! the version, so a reader never takes this object for the one that
+//! describes itself, which [`crate::SealedFreshObject`] writes.
 
 use bytes::{Bytes, BytesMut};
 
