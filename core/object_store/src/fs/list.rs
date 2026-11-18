@@ -44,6 +44,7 @@ pub(super) struct Walk {
     after: Option<String>,
     page_len: usize,
     now: SystemTime,
+    removes_scratch: bool,
 }
 
 /// The directories that the last page read, for the page that resumes it.
@@ -79,7 +80,7 @@ enum Child {
 }
 
 impl Walk {
-    pub(super) fn new(root: &Path, request: &ListRequest<'_>) -> Self {
+    pub(super) fn new(root: &Path, request: &ListRequest<'_>, removes_scratch: bool) -> Self {
         // A continuation from another listing can sort before the prefix, and
         // the walk must still start inside it.
         let after = request
@@ -91,6 +92,7 @@ impl Walk {
             after: after.map(str::to_owned),
             page_len: request.page_len(),
             now: SystemTime::now(),
+            removes_scratch,
         }
     }
 
@@ -240,7 +242,7 @@ impl Walk {
                 continue;
             };
             if name.starts_with('.') {
-                if is_scratch(&name) {
+                if self.removes_scratch && is_scratch(&name) {
                     self.remove_if_stale(&entry);
                 }
                 continue;

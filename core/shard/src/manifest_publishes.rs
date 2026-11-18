@@ -28,9 +28,53 @@ use consensus::PartitionsHandle;
 use iggy_common::IggyTimestamp;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use partitions::ManifestPublisher;
+use partitions::{IggyPartition, ManifestPublisher};
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
+
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// Stage a manifest pass for `partition` when this replica leads it, it
+    /// places its batches, this shard has a publisher, and the pass is one
+    /// that nothing else asks for: the first of a normal view, or the one
+    /// [`IggyPartition::manifest_pass_due_at`] owes by `now`. A new primary
+    /// with no segment left to commit, and a publish that failed on an idle
+    /// partition, get no pass otherwise.
+    ///
+    /// The shard tick calls this for every partition it visited, and the
+    /// pump's tick for every partition it paces, awake or not.
+    pub(crate) fn stage_manifest_pass(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+        now: IggyTimestamp,
+    ) {
+        let due = partition.manifest_awaits_first_pass()
+            || partition
+                .manifest_pass_due_at()
+                .is_some_and(|due_at| now.as_micros() >= due_at.as_micros());
+        // A pass over a tombstoned partition starts no publish, so it would
+        // be staged on every tick.
+        if !due
+            || self.manifest_publisher.borrow().is_none()
+            || self.plane.partitions().is_tombstoned(&namespace)
+        {
+            return;
+        }
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        // A refused frame is staged again by the next tick.
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::PublishManifest {
+            namespace,
+            created_revision: partition.created_revision(),
+            now,
+        }));
+    }
+}
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where

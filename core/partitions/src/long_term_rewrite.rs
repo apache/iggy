@@ -459,8 +459,6 @@ pub struct LongTermRewrites {
     planned: Option<ObjectRegistration>,
     /// The commit point the last plan started at.
     committed_at_start: u64,
-    /// Number of the last plan or rewrite this partition started.
-    jobs: u64,
     /// Whether a registration committed on this primary since the last
     /// call to [`IggyPartition::take_long_term_registered`].
     registered: Cell<bool>,
@@ -848,17 +846,20 @@ where
     }
 
     /// Number the next plan or rewrite and take it as in flight. A plan
-    /// also notes the commit point it starts at.
+    /// also notes the commit point it starts at. The numbers go on across
+    /// views, so the late result of an earlier view's plan or rewrite is
+    /// never taken for the one in flight.
     fn start_rewrite_job(&mut self, committed: Option<u64>) -> (u64, TierScopeToken) {
         let scope = TierScope::new();
         let token = scope.token();
+        self.long_term_rewrite_jobs += 1;
+        let id = self.long_term_rewrite_jobs;
         let rewrites = &mut self.long_term_rewrites;
-        rewrites.jobs += 1;
-        rewrites.running = Some((rewrites.jobs, scope));
+        rewrites.running = Some((id, scope));
         if let Some(committed) = committed {
             rewrites.committed_at_start = committed;
         }
-        (rewrites.jobs, token)
+        (id, token)
     }
 
     /// Whether the plan or the rewrite numbered `id` is the one in flight,

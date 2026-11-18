@@ -44,7 +44,7 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use consensus::ReplicationStats;
@@ -52,6 +52,7 @@ use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
 use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
 use partitions::CheckpointTrigger;
+use server_common::sharding::IggyNamespace;
 
 /// Label for `frame_drops_total`.
 ///
@@ -121,6 +122,25 @@ impl From<Command> for FrameCommandLabel {
             command: CommandLabel(command),
         }
     }
+}
+
+/// What one partition that places its batches has yet to rewrite into
+/// long-term segments, as the shard that leads it found at its last tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongTermLag {
+    pub namespace: IggyNamespace,
+    /// Messages it committed that no long-term segment holds.
+    pub messages: u64,
+    /// Bytes of those messages, `None` until its replica counted them.
+    pub bytes: Option<u64>,
+}
+
+/// The lags a shard reported last, and the list of the report before it,
+/// which the next report fills so that a tick allocates none.
+#[derive(Debug, Default)]
+struct LongTermLags {
+    reported: Vec<LongTermLag>,
+    spare: Vec<LongTermLag>,
 }
 
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
@@ -419,8 +439,10 @@ pub struct ShardMetrics {
     fresh_objects_unnamed: Gauge,
     fresh_objects_due: Gauge,
     fresh_listings_truncated: Gauge,
+    fresh_sweeps_held: Gauge,
     fresh_objects_deleted_total: Counter,
     partition_long_term_backlog_bytes: Gauge,
+    partition_long_term_lags: Arc<Mutex<LongTermLags>>,
     partition_long_term_delayed_sends_total: Counter,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
@@ -480,6 +502,10 @@ pub struct ShardMetrics {
     fresh_window_wait: Histogram,
     fresh_upload: Histogram,
     fresh_commit: Histogram,
+    /// Bytes of each fresh object this shard stored. Objects far below
+    /// `FRESH_OBJECT_BYTES` under load mean that windows close with few
+    /// sends, so the store is asked for more objects than the load needs.
+    fresh_object_size: Histogram,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -617,8 +643,10 @@ impl ShardMetrics {
             fresh_objects_unnamed: Gauge::default(),
             fresh_objects_due: Gauge::default(),
             fresh_listings_truncated: Gauge::default(),
+            fresh_sweeps_held: Gauge::default(),
             fresh_objects_deleted_total: Counter::default(),
             partition_long_term_backlog_bytes: Gauge::default(),
+            partition_long_term_lags: Arc::default(),
             partition_long_term_delayed_sends_total: Counter::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
@@ -662,6 +690,7 @@ impl ShardMetrics {
             fresh_window_wait: fresh_latency_histogram(),
             fresh_upload: fresh_latency_histogram(),
             fresh_commit: fresh_latency_histogram(),
+            fresh_object_size: fresh_object_size_histogram(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
@@ -697,6 +726,8 @@ impl ShardMetrics {
         if stored {
             self.fresh_uploads_total.inc();
             self.fresh_upload_bytes_total.inc_by(bytes);
+            #[allow(clippy::cast_precision_loss)]
+            self.fresh_object_size.observe(bytes as f64);
         } else {
             self.fresh_upload_failures_total.inc();
         }
@@ -1549,6 +1580,20 @@ impl ShardMetrics {
             .set(i64::try_from(due).unwrap_or(i64::MAX));
     }
 
+    /// Republished by every sweep of fresh objects that ends with the
+    /// answers of the shards: whether one could not tell which objects it
+    /// needs, so the sweep deleted nothing.
+    pub fn set_fresh_sweeps_held(&self, held: bool) {
+        self.fresh_sweeps_held.set(i64::from(held));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_sweeps_held_value(&self) -> i64 {
+        self.fresh_sweeps_held.get()
+    }
+
     /// Test-only read, mirroring the siblings.
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
@@ -1698,6 +1743,38 @@ impl ShardMetrics {
     pub fn set_long_term_backlog(&self, bytes: u64) {
         self.partition_long_term_backlog_bytes
             .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// An empty list for the pump's tick to fill and hand to
+    /// [`Self::set_long_term_lags`].
+    #[must_use]
+    pub fn long_term_lags_to_fill(&self) -> Vec<LongTermLag> {
+        let mut spare = std::mem::take(&mut self.lock_long_term_lags().spare);
+        spare.clear();
+        spare
+    }
+
+    /// Republished by the pump's tick: the lag of every partition this shard
+    /// leads that places its batches and has a rewrite wait. A scrape sees
+    /// the whole list of one tick or of the next, never a part.
+    pub fn set_long_term_lags(&self, lags: Vec<LongTermLag>) {
+        let mut held = self.lock_long_term_lags();
+        held.spare = std::mem::replace(&mut held.reported, lags);
+    }
+
+    /// What [`Self::set_long_term_lags`] took last.
+    ///
+    /// Not a registered series: a series per partition carries the names of
+    /// its stream and topic, which a shard does not hold.
+    #[must_use]
+    pub fn long_term_lags(&self) -> Vec<LongTermLag> {
+        self.lock_long_term_lags().reported.clone()
+    }
+
+    fn lock_long_term_lags(&self) -> MutexGuard<'_, LongTermLags> {
+        self.partition_long_term_lags
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A send to a partition past its long-term backlog limit waits before
@@ -2165,6 +2242,12 @@ impl ShardMetrics {
             self.fresh_listings_truncated.clone(),
         );
         registry.register(
+            "fresh_sweeps_held",
+            "1 while the last sweep of fresh objects of this replica deleted nothing because \
+             a shard could not tell which objects its partitions need, else 0",
+            self.fresh_sweeps_held.clone(),
+        );
+        registry.register(
             "fresh_objects_deleted",
             "fresh objects this replica deleted",
             self.fresh_objects_deleted_total.clone(),
@@ -2423,6 +2506,11 @@ impl ShardMetrics {
             self.fresh_commit.clone(),
         );
         registry.register(
+            "fresh_object_size_bytes",
+            "bytes of each fresh object this shard stored",
+            self.fresh_object_size.clone(),
+        );
+        registry.register(
             "pump_tick_lateness_seconds",
             "how late each consensus tick of the message pump ran after its timer was due",
             self.pump_tick_lateness.clone(),
@@ -2578,6 +2666,13 @@ fn fresh_latency_histogram() -> Histogram {
         .chain((110..=200).step_by(10))
         .map(|millis| f64::from(millis) / 1_000.0);
     Histogram::new(millis.chain(exponential_buckets(0.3, 1.5, 14)))
+}
+
+/// Buckets for the bytes of a stored fresh object: each twice the one before,
+/// from 1 KiB to 32 MiB. An object closes at 4 MiB, and is larger only when
+/// one send is.
+fn fresh_object_size_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(1024.0, 2.0, 16))
 }
 
 /// The `command` of a request whose code the command table does not hold.
@@ -2966,6 +3061,28 @@ mod tests {
             "fetch_budget_waits_total 1",
             "fetch_quota_refusals_total 1",
             "fetch_fire_to_reply_seconds_count 2",
+        ] {
+            assert!(
+                scrape.lines().any(|line| line == series),
+                "{series} is not in the scrape:\n{scrape}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_fresh_uploads_when_they_settle_should_record_the_size_of_each_stored_object() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_fresh_upload(1_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(3_000_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(500, Duration::from_millis(5), false);
+        let scrape = metrics.scrape();
+        for series in [
+            "fresh_object_size_bytes_count 2",
+            "fresh_object_size_bytes_sum 3001000.0",
+            "fresh_object_size_bytes_bucket{le=\"1024.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"2097152.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"4194304.0\"} 2",
+            "fresh_object_size_bytes_bucket{le=\"33554432.0\"} 2",
         ] {
             assert!(
                 scrape.lines().any(|line| line == series),

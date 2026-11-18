@@ -112,8 +112,9 @@ pub struct TieredStorageConfig {
     /// The key prefix of this cluster's objects in the store. Two clusters
     /// can share a bucket under different prefixes. The cluster claims its
     /// prefix with the object `{prefix}/meta/identity`: replica 0 writes it
-    /// while it is the caught-up metadata primary and no topic is tiered, and
-    /// a node uploads and deletes objects only after it reads that claim back.
+    /// while it is the caught-up metadata primary and no topic keeps data in
+    /// the store, and a node uploads and deletes objects only after it reads
+    /// that claim back.
     #[serde(default = "default_prefix")]
     pub prefix: String,
     /// The directory that holds the objects of the `fs` backend.
@@ -173,8 +174,8 @@ pub struct TieredStorageConfig {
     #[config_env(leaf)]
     pub max_retry_delay: IggyDuration,
     /// The shortest time between the starts of two uploads of fresh objects
-    /// on one shard, unless an object fills first. A send that finds no
-    /// upload in flight and the last one started at least this long ago is
+    /// on one shard, unless an object fills first. A send that finds a free
+    /// upload slot and the last upload started at least this long ago is
     /// uploaded at once. Zero uploads as soon as a slot is free. Up to 10 s.
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_fresh_upload_interval")]
@@ -192,9 +193,9 @@ pub struct TieredStorageConfig {
 /// How many jobs of each class the tier service of one shard runs at once,
 /// and how many bytes they hold.
 ///
-/// Only segment uploads and object deletes go through the tier service so
-/// far, so the fetch caps take no effect yet. They take effect once cold
-/// reads go through it.
+/// Segment uploads, fresh uploads, object deletes, cold reads that a poll
+/// waits for and housekeeping go through the tier service. Speculative
+/// fetches do not yet, so their caps take no effect.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct TierJobsConfig {

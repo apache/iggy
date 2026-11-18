@@ -52,6 +52,15 @@ mod geo_peers;
 // every client write, goes stale with the peer's store, and leaves after its
 // delete.
 mod geo_shadow_fs;
+// Two clusters on fs that read each other's bucket: both take sends to the
+// same geo topic, adopt each other's, stop and return, delete it, and never
+// write to the other's bucket.
+mod geo_two_clusters_fs;
+// A geo topic whose object store goes down: its sends are refused as
+// retryable, a normal topic keeps serving, and nothing refused is stored.
+mod geo_mode_faults_fs;
+// The geo topic scenarios on the `s3` backend, against Floci.
+mod geo_mode_faults_s3;
 pub(crate) mod tiered_storage_fs;
 mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.

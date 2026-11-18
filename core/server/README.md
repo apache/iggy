@@ -501,7 +501,8 @@ The `[tiered_storage]` section of [config.toml](config.toml) names an object
 store for the sealed segments of tiered topics. A topic with `tiered_storage`
 on uploads each sealed segment there, removes the local copy once local
 retention allows it, and reads the segment back from the store when a poll
-asks for it.
+asks for it. Geo topics keep their messages in the same store: see
+[geo topics](docs/GEO_TOPICS.md).
 
 The cluster accepts `tiered_storage` on a topic only while every node has a
 backend and passes the store identity check described below. Until then the
@@ -552,8 +553,10 @@ starts with the `object_store_unreachable` gauge at 1. The store identity check
 judges any other answer.
 
 The store identity object claims the prefix for one cluster. While replica 0 is
-the caught-up metadata primary and no topic is tiered, it writes the object. If
-the key already holds an object, the write fails. Each node reads the object
+the caught-up metadata primary and no topic keeps data in the store, it writes
+the object. A tiered topic keeps data in the store, and so does a topic whose
+partitions place their batches. If the key already holds an object, the write
+fails. Each node reads the object
 back through its own store every minute, or every 5 seconds while the object is
 missing or the store does not answer. While the object names the node's own
 cluster, the node runs uploads and object deletes.
@@ -583,7 +586,7 @@ cluster_uid 0123456789abcdef0011223344556677
 
 `cluster_uid` is 32 lowercase hexadecimal digits. When the result of its check
 changes, each node logs its own `cluster_uid`. No node writes the object again
-once a topic is tiered.
+once a topic keeps data in the store.
 
 With the `fs` backend, the object is the file `<path>/<prefix>/meta/identity`.
 Copy it once a node logs that the object store root belongs to this cluster. If
@@ -609,11 +612,16 @@ A node logs that the object names another cluster when:
 Give every node the same store and the same prefix. The check cannot tell every
 pair of stores apart. For example, replica 0 reaches an empty store, and the
 other nodes reach a store with an earlier claim of the same cluster. Then every
-node passes its check. Until a topic is tiered, replica 0 also claims again
-after any check that did not pass, so if its `fs` mount drops, it claims the
-empty mount point.
+node passes its check. Until a topic keeps data in the store, replica 0 also
+claims again after any check that did not pass, so if its `fs` mount drops, it
+claims the empty mount point.
 
 ### Geo peers
+
+[Geo topics](docs/GEO_TOPICS.md) is the operator guide: what a geo topic
+guarantees, how to set up two clusters, how clients use them, the delays, what
+is lost when a datacenter fails, and the limits of this version. This section
+and the two after it are the reference for the parts it builds on.
 
 The `[geo]` section of `config.toml` names this cluster among the datacenters
 and lists its peers: the other clusters whose stores it reads.
@@ -706,7 +714,9 @@ A shadow stream is named `__shadow_<origin>_<stream>`, after the peer's origin
 and stream name. It holds the geo topics of that peer stream, with the peer's
 topic ids and partition ids. The normal topics of the peer stream do not
 appear. The partitions of a shadow topic keep none of the peer's messages on
-this node's disk. They read the peer's log from the peer's store.
+this node's disk. They read the peer's log from the peer's store. In this
+version a shadow partition does not follow the peer's manifests yet, so it
+holds no messages, and a poll of it returns none.
 
 Every 5 seconds, the caught-up metadata primary lists the topic objects of each
 peer. It reads each new object, and it reads a known object again every 30
@@ -752,7 +762,7 @@ Streams, topics and users take their settings from one option catalog. The binar
 
 Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy`, `replication_factor`, `topic_type`, `geo_mode` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
 
-A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `normal`. A geo topic's partitions upload each send to the object store before they commit it. The cluster accepts a geo topic only while every node passes the store identity check of [tiered storage](#tiered-storage). Until then, the server refuses it with `FeatureUnavailable` (5).
+A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `normal`. A geo topic's partitions upload each send to the object store before they commit it, see [geo topics](docs/GEO_TOPICS.md). The cluster accepts a geo topic only while every node passes the store identity check of [tiered storage](#tiered-storage). Until then, the server refuses it with `FeatureUnavailable` (5).
 
 Only a geo topic has a `geo_mode`: `geo` or `geo_tiered`. A geo topic without one is stored with `geo`. Clients cannot pick `geo_tiered` yet, and the server refuses it with `FeatureUnavailable` (5). The server refuses a normal topic that sets a mode with `InvalidOptionValue` (4042).
 

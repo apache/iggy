@@ -24,8 +24,11 @@
 //! segment to the partition's long-term log through the partition-submit
 //! path every other request takes.
 //!
-//! The segment cleaner stages the first pass over a partition. From then on
-//! the pump's tick starts each pass when the partition's wait is over, and
+//! The shard gives a partition its wait when the pump's tick finds this
+//! replica leading it with committed messages to rewrite, so nothing outside
+//! the shard has to ask for the first pass. The segment cleaner stages one
+//! too, which does nothing for a partition that has a wait. The pump's tick
+//! starts each pass when the partition's wait is over, and
 //! the wait follows how full the stored segments come out. A segment that
 //! ended at its byte cap has more behind it, and the pass for that starts
 //! when the segment's command commits.
@@ -49,6 +52,7 @@
 //! detached task whose count the tick hands back. The pass of a partition
 //! past its backlog limit does not wait out its interval.
 
+use crate::metrics::LongTermLag;
 use crate::rewrite_pacing::{BacklogCount, FinishedPlan, RewriteKey, RewriteResult};
 use crate::shards_table::ShardsTable;
 use crate::{
@@ -68,6 +72,38 @@ use std::rc::Rc;
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// Give `partition` a wait, so the pump's tick runs its rewrite passes,
+    /// when this replica leads it in a normal view, it places its batches,
+    /// messages it committed wait for a rewrite, and this shard has a
+    /// writer. A partition that has a wait keeps it.
+    ///
+    /// The shard tick calls this for every partition it visited.
+    pub(crate) fn pace_placing_primary(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) {
+        if partition.long_term_lag() == 0
+            || !partition.state_machines_current()
+            || self.long_term_writer.borrow().is_none()
+        {
+            return;
+        }
+        let key = (namespace, partition.created_revision());
+        let mut pacing = self.rewrite_pacing.borrow_mut();
+        // A pass over a tombstoned partition drops its wait again.
+        if pacing.paces(&key) || self.plane.partitions().is_tombstoned(&namespace) {
+            return;
+        }
+        pacing.enter(key, self.bus.monotonic_micros());
+    }
+}
+
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
+where
     B: MessageBus + 'static,
     T: ShardsTable,
     SB: SuperblockStore,
@@ -76,6 +112,11 @@ where
     /// with `None`. A rewrite already in flight ends on the writer that
     /// started it.
     pub fn set_long_term_writer(&self, writer: Option<Rc<dyn LongTermWriter>>) {
+        // A partition that slept through the time without a writer has no
+        // wait, and no tick visits it.
+        if writer.is_some() {
+            self.rewrite_pacing.borrow_mut().want_sweep();
+        }
         *self.long_term_writer.borrow_mut() = writer;
     }
 
@@ -168,12 +209,14 @@ where
     }
 
     /// The pump's tick: settle the rewrites whose frame the inbox refused,
-    /// hand the partitions the backlogs their walks counted, act on the
-    /// commands that committed outside a partition I/O step, make the pass
-    /// of a partition past its backlog limit due, start the passes that are
-    /// due, and report how far the rewrites are behind, the largest backlog,
-    /// how long the longest long-term log is, and how many objects no
-    /// long-term log accounts for or wait for their delete.
+    /// look over every partition once after the shard got a writer, hand
+    /// the partitions the backlogs their walks counted, act on the
+    /// commands that committed outside a partition I/O step, stage the
+    /// manifest passes that no commit asks for, make the pass of a partition
+    /// past its backlog limit due, start the passes that are due, and report
+    /// how far the rewrites are behind, per partition and at worst, the
+    /// largest backlog, how long the longest long-term log is, and how many
+    /// objects no long-term log accounts for or wait for their delete.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
@@ -191,6 +234,15 @@ where
             self.settle_segment_plan(plan).await;
         }
         let partitions = self.plane.partitions();
+        let manifest_now = IggyTimestamp::now();
+        if self.rewrite_pacing.borrow_mut().take_sweep_wanted() {
+            for namespace in partitions.namespaces() {
+                if let Some(partition) = partitions.get_by_ns(namespace) {
+                    self.pace_placing_primary(*namespace, partition);
+                    self.stage_manifest_pass(*namespace, partition, manifest_now);
+                }
+            }
+        }
         let counts = self.rewrite_pacing.borrow().take_backlog_counts();
         for BacklogCount { key, walk, bytes } in counts {
             if let Some(partition) = partitions
@@ -208,6 +260,7 @@ where
         let mut registered = Vec::new();
         let mut past_limit = Vec::new();
         let mut largest_backlog = 0;
+        let mut lags = self.metrics.long_term_lags_to_fill();
         for key in self.rewrite_pacing.borrow().paced() {
             let (namespace, created_revision) = key;
             let Some(partition) = partitions
@@ -219,7 +272,8 @@ where
             unannounced_objects += partition.long_term_unannounced_objects();
             dead_objects += partition.queued_dead_long_term_objects();
             most_segments = most_segments.max(partition.long_term_segments().len());
-            if partition.take_long_term_changed() {
+            let long_term_changed = partition.take_long_term_changed();
+            if long_term_changed {
                 changed.push((*key, partition.merges_under_pressure()));
             }
             if partition.take_long_term_registered() {
@@ -228,12 +282,22 @@ where
             if !partition.consensus().is_primary() {
                 continue;
             }
+            // A change stages its own pass below.
+            if !long_term_changed {
+                self.stage_manifest_pass(key.0, partition, manifest_now);
+            }
+            lags.push(LongTermLag {
+                namespace: key.0,
+                messages: partition.long_term_lag(),
+                bytes: partition.long_term_backlog(),
+            });
             let backlog = partition.long_term_backlog().unwrap_or(0);
             largest_backlog = largest_backlog.max(backlog);
             if limit > 0 && backlog > limit {
                 past_limit.push(*key);
             }
         }
+        self.metrics.set_long_term_lags(lags);
         self.metrics
             .set_long_term_unannounced_objects(unannounced_objects);
         self.metrics.set_long_term_dead_objects(dead_objects);

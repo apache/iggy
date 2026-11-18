@@ -181,6 +181,9 @@ pub struct RewritePacing {
     backlog_counts: Rc<RefCell<Vec<BacklogCount>>>,
     /// Ends of segments that plans found since the last tick.
     plans: Rc<RefCell<Vec<FinishedPlan>>>,
+    /// Whether the shard has yet to look over all its partitions for the
+    /// ones to pace. A partition that sleeps is not looked at otherwise.
+    sweep_wanted: bool,
 }
 
 impl Default for RewritePacing {
@@ -190,6 +193,7 @@ impl Default for RewritePacing {
             backlog_limit: LONG_TERM_BACKLOG_LIMIT,
             backlog_counts: Rc::default(),
             plans: Rc::default(),
+            sweep_wanted: false,
         }
     }
 }
@@ -228,6 +232,29 @@ impl RewritePacing {
     #[must_use]
     pub fn paces(&self, key: &RewriteKey) -> bool {
         self.partitions.contains_key(key)
+    }
+
+    /// Give `key` a wait at `now`, after which its first pass is due. A
+    /// partition that has a wait keeps it.
+    ///
+    /// The first pass is not due at once: a segment of the first batch alone
+    /// would say nothing of the load, and lengthen the wait to its longest.
+    pub fn enter(&mut self, key: RewriteKey, now: u64) {
+        if !self.paces(&key) {
+            let pace = self.pace(key);
+            pace.due_at = Some(now.saturating_add(pace.interval_micros));
+        }
+    }
+
+    /// The shard can rewrite again: it looks over all its partitions for
+    /// the ones to pace.
+    pub const fn want_sweep(&mut self) {
+        self.sweep_wanted = true;
+    }
+
+    /// Whether [`Self::want_sweep`] was called since the last call.
+    pub const fn take_sweep_wanted(&mut self) -> bool {
+        std::mem::replace(&mut self.sweep_wanted, false)
     }
 
     /// The partitions whose pass is due at `now`. Each one waits for
@@ -647,6 +674,45 @@ mod tests {
         assert_eq!(pacing.take_due(2_000), [key()]);
         pacing.settle(key(), RewriteResult::Registering, 3_000);
         assert_eq!(pacing.take_due(3_000 + min), [key()]);
+    }
+
+    #[test]
+    fn given_a_partition_without_a_wait_when_entering_should_make_its_first_pass_due_after_the_first_wait()
+     {
+        let mut pacing = RewritePacing::default();
+        let wait = micros(REWRITE_INTERVAL_START);
+
+        pacing.enter(key(), 5_000);
+
+        assert_eq!(pacing.interval(&key()), Some(REWRITE_INTERVAL_START));
+        assert_eq!(pacing.take_due(5_000 + wait - 1), []);
+        assert_eq!(pacing.take_due(5_000 + wait), [key()]);
+    }
+
+    #[test]
+    fn given_a_partition_with_a_wait_when_entering_should_keep_its_wait() {
+        let mut pacing = RewritePacing::default();
+        pacing.settle(key(), stored(TARGET), 1_000);
+        pacing.started(key(), 10);
+
+        pacing.enter(key(), 2_000);
+
+        assert_eq!(pacing.take_due(u64::MAX), [], "its rewrite runs");
+        pacing.settle(key(), stored(TARGET), 3_000);
+        pacing.enter(key(), 4_000);
+        assert_eq!(pacing.take_due(4_000), []);
+        assert_eq!(pacing.take_due(1_003_000), [key()]);
+    }
+
+    #[test]
+    fn given_a_wanted_sweep_when_taking_it_should_give_it_once() {
+        let mut pacing = RewritePacing::default();
+        assert!(!pacing.take_sweep_wanted());
+
+        pacing.want_sweep();
+
+        assert!(pacing.take_sweep_wanted());
+        assert!(!pacing.take_sweep_wanted());
     }
 
     #[test]
