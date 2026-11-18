@@ -74,9 +74,11 @@ pub use fresh_sweep::{
     FreshScanFailed, FreshSettled, FreshSweep, list_fresh_objects,
 };
 mod placed_read;
+mod proven_batch;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
 };
+pub use proven_batch::{ProvenBatch, ProvenBatchError};
 mod topic_object;
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
