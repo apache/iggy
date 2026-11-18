@@ -406,6 +406,8 @@ pub struct ShardMetrics {
     fresh_objects_due: Gauge,
     fresh_listings_truncated: Gauge,
     fresh_objects_deleted_total: Counter,
+    partition_long_term_backlog_bytes: Gauge,
+    partition_long_term_delayed_sends_total: Counter,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -584,6 +586,8 @@ impl ShardMetrics {
             fresh_objects_due: Gauge::default(),
             fresh_listings_truncated: Gauge::default(),
             fresh_objects_deleted_total: Counter::default(),
+            partition_long_term_backlog_bytes: Gauge::default(),
+            partition_long_term_delayed_sends_total: Counter::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -1510,6 +1514,30 @@ impl ShardMetrics {
         self.partition_long_term_rewrite_lag_messages.get()
     }
 
+    /// Republished by the pump's tick: the most bytes of messages one
+    /// partition this shard leads committed that no long-term segment holds
+    /// yet, as far as its replica counted them.
+    pub fn set_long_term_backlog(&self, bytes: u64) {
+        self.partition_long_term_backlog_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// A send to a partition past its long-term backlog limit waits before
+    /// the shard takes it.
+    pub(crate) fn record_long_term_delayed_send(&self) {
+        self.partition_long_term_delayed_sends_total.inc();
+    }
+
+    /// Test-only read: the largest backlog and the delayed sends.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_backlog_value(&self) -> (i64, u64) {
+        (
+            self.partition_long_term_backlog_bytes.get(),
+            self.partition_long_term_delayed_sends_total.get(),
+        )
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1968,6 +1996,18 @@ impl ShardMetrics {
             "most messages one partition this shard leads committed that no long-term \
              segment holds yet, over the partitions that place their batches",
             self.partition_long_term_rewrite_lag_messages.clone(),
+        );
+        registry.register(
+            "partition_long_term_backlog_bytes",
+            "most bytes of messages one partition this shard leads committed that no \
+             long-term segment holds yet, over the partitions that place their batches",
+            self.partition_long_term_backlog_bytes.clone(),
+        );
+        registry.register(
+            "partition_long_term_delayed_sends",
+            "sends this shard delayed because their partition's long-term backlog passed \
+             tiered_storage.long_term_backlog_limit",
+            self.partition_long_term_delayed_sends_total.clone(),
         );
         registry.register(
             "retirement_debts_paid",
