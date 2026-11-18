@@ -19,6 +19,7 @@
 //! only fetch every actor's series, once the reader first opens the section.
 
 use bench_dashboard_shared::BenchmarkReportLight;
+use bench_dashboard_shared::embed::ChartType;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use uuid::Uuid;
 use web_sys::Element;
@@ -29,6 +30,7 @@ use super::chart::{
 };
 use super::fact_group_card;
 use super::facts::server_facts;
+use crate::components::embed::{EmbedButton, EmbedChart};
 use crate::components::page::loadable;
 use crate::state::data::Loadable;
 
@@ -94,17 +96,20 @@ fn views(props: &AdvancedProps) -> Html {
         <>
             <article class="card run-chart-card">
                 <h3>{"Latency of every actor"}</h3>
+                <EmbedButton chart={EmbedChart::IggyBench(ChartType::Latency)} />
                 <ActorLatencyChart {uuid} />
                 <p class="card-note">{ ACTOR_LATENCY_NOTE }</p>
             </article>
             <div class="run-charts">
                 <article class="card run-chart-card">
                     <h3>{"Throughput per actor"}</h3>
+                    <EmbedButton chart={EmbedChart::IggyBench(ChartType::Throughput)} />
                     <SeriesChart {uuid} metric={SeriesMetric::Throughput} scope={SeriesScope::Actors} />
                 </article>
                 if let Some(report) = distribution {
                     <article class="card run-chart-card">
                         <h3>{"Latency distribution"}</h3>
+                        <EmbedButton chart={EmbedChart::IggyBench(ChartType::Distribution)} />
                         <DistributionChart {uuid} {report} />
                         <p class="card-note">{ DISTRIBUTION_NOTE }</p>
                     </article>
