@@ -106,8 +106,9 @@ pub struct TieredStorageConfig {
     /// The key prefix of this cluster's objects in the store. Two clusters
     /// can share a bucket under different prefixes. The cluster claims its
     /// prefix with the object `{prefix}/meta/identity`: replica 0 writes it
-    /// while it is the caught-up metadata primary and no topic is tiered, and
-    /// a node uploads and deletes objects only after it reads that claim back.
+    /// while it is the caught-up metadata primary and no topic keeps data in
+    /// the store, and a node uploads and deletes objects only after it reads
+    /// that claim back.
     #[serde(default = "default_prefix")]
     pub prefix: String,
     /// The directory that holds the objects of the `fs` backend.
