@@ -31,12 +31,13 @@
 //! under a fresh salt, so two clusters with the same name get two ids.
 //!
 //! Replica 0 claims only while it is the caught-up metadata primary and no
-//! topic is tiered, so while another replica leads metadata, nothing claims
-//! the root. Until a topic is tiered, it claims again after any check that
-//! did not pass, so a replica 0 whose `fs` mount drops claims the empty
-//! mount point. The check also cannot tell two stores apart when replica 0
-//! reaches an empty store and the other nodes reach one that holds an
-//! earlier claim of this cluster.
+//! topic keeps data in the store, so while another replica leads metadata,
+//! nothing claims the root. A tiered topic keeps data there, and so does a
+//! topic that places its batches. Until a topic does, replica 0 claims again
+//! after any check that did not pass, so a replica 0 whose `fs` mount drops
+//! claims the empty mount point. The check also cannot tell two stores apart
+//! when replica 0 reaches an empty store and the other nodes reach one that
+//! holds an earlier claim of this cluster.
 //!
 //! A store that stops answering after the check passed is an outage, and the
 //! node still passes: uploads retry. `object_store_unreachable` is 1 while
@@ -182,18 +183,18 @@ impl<S: ObjectStore> IdentityChecker<S> {
         let Some(cluster_uid) = metadata.change_log().read(ChangeLog::log_id).flatten() else {
             return CLUSTER_UID_WAIT;
         };
-        let tiered = metadata.mux_stm.streams().has_tiered_topic();
+        let store_data = metadata.mux_stm.streams().has_topic_with_store_data();
         let claim = may_claim(
             self.claimer,
             self.last,
             metadata.is_caught_up_primary(),
-            tiered,
+            store_data,
         );
         let check = self.check(cluster_uid, claim).await;
         self.record(
             check,
             cluster_uid,
-            tiered,
+            store_data,
             metadata.applied_frontier(),
             shard.metrics(),
         )
@@ -212,13 +213,14 @@ impl<S: ObjectStore> IdentityChecker<S> {
             })
     }
 
-    /// Record what `check` found for `cluster_uid` while a topic was
-    /// `tiered` or not, and return how long to wait before the next check.
+    /// Record what `check` found for `cluster_uid` while a topic kept
+    /// `store_data` or not, and return how long to wait before the next
+    /// check.
     fn record(
         &mut self,
         check: IdentityCheck,
         cluster_uid: u128,
-        tiered: bool,
+        store_data: bool,
         frontier: &AppliedFrontier,
         metrics: &ShardMetrics,
     ) -> Duration {
@@ -251,11 +253,11 @@ impl<S: ObjectStore> IdentityChecker<S> {
                 "the object store root belongs to this cluster, so this node runs its uploads and \
                  object deletes"
             ),
-            IdentityCheck::Missing if tiered => error!(
+            IdentityCheck::Missing if store_data => error!(
                 root,
                 cluster_uid,
                 "the store identity object is missing, and no node claims the root again once a \
-                 topic is tiered. This node runs no uploads or object deletes until an operator \
+                 topic keeps data in the store. This node runs no uploads or object deletes until an operator \
                  restores the object with this cluster_uid, as the server README describes"
             ),
             IdentityCheck::Missing if was_verified => error!(
@@ -268,10 +270,10 @@ impl<S: ObjectStore> IdentityChecker<S> {
                 root,
                 cluster_uid,
                 "no cluster claimed the object store root yet. Replica 0 claims it while it is \
-                 the caught-up metadata primary and no topic is tiered, so while another \
-                 replica leads metadata, restart that replica until replica 0 leads. If replica \
-                 0 claimed it already, this node does not reach the store that replica 0 \
-                 reaches"
+                 the caught-up metadata primary and no topic keeps data in the store, so while \
+                 another replica leads metadata, restart that replica until replica 0 leads. If \
+                 replica 0 claimed it already, this node does not reach the store that replica \
+                 0 reaches"
             ),
             IdentityCheck::Foreign(found) => error!(
                 root,
@@ -336,17 +338,19 @@ impl IdentityCheck {
 }
 
 /// Whether a check may claim the root. Only a caught-up primary knows every
-/// tiered topic: a replica 0 that is behind, or rebuilt empty, could
-/// otherwise claim a new empty store that the other nodes never see. The
-/// check after a pass only reads, and the check after any other result
-/// claims again.
+/// topic that keeps data in the store: a replica 0 that is behind, or rebuilt
+/// empty, could otherwise claim a new empty store that the other nodes never
+/// see. The check after a pass only reads, and the check after any other
+/// result claims again, unless `store_data` says that a topic keeps data in
+/// the store: a root without the claim is then a store that lost it, or
+/// another store, and never a new one.
 const fn may_claim(
     claimer: bool,
     last: Option<Verdict>,
     caught_up_primary: bool,
-    tiered: bool,
+    store_data: bool,
 ) -> bool {
-    claimer && !matches!(last, Some(Verdict::Verified)) && caught_up_primary && !tiered
+    claimer && !matches!(last, Some(Verdict::Verified)) && caught_up_primary && !store_data
 }
 
 impl TierHandlers {
@@ -502,14 +506,22 @@ mod tests {
 
     #[test]
     fn given_each_node_state_when_deciding_to_claim_should_claim_only_as_replica_0_primary() {
-        // (row, claimer, last check, caught-up primary, tiered topic, claims)
-        for (row, claimer, last, primary, tiered, claims) in [
+        // (row, claimer, last check, caught-up primary, data in the store, claims)
+        for (row, claimer, last, primary, store_data, claims) in [
             ("replica 1", false, None, true, false, false),
             ("replica 0 as backup", true, None, false, false, false),
             (
-                "replica 0 primary with a tiered topic",
+                "replica 0 primary with a topic that keeps data in the store",
                 true,
                 None,
+                true,
+                true,
+                false,
+            ),
+            (
+                "replica 0 primary after a missing claim, with data in the store",
+                true,
+                Some(Verdict::Missing),
                 true,
                 true,
                 false,
@@ -547,7 +559,11 @@ mod tests {
                 true,
             ),
         ] {
-            assert_eq!(may_claim(claimer, last, primary, tiered), claims, "{row}");
+            assert_eq!(
+                may_claim(claimer, last, primary, store_data),
+                claims,
+                "{row}"
+            );
         }
     }
 

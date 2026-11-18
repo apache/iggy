@@ -480,6 +480,10 @@ pub struct ShardMetrics {
     fresh_window_wait: Histogram,
     fresh_upload: Histogram,
     fresh_commit: Histogram,
+    /// Bytes of each fresh object this shard stored. Objects far below
+    /// `FRESH_OBJECT_BYTES` under load mean that windows close with few
+    /// sends, so the store is asked for more objects than the load needs.
+    fresh_object_size: Histogram,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -637,6 +641,7 @@ impl ShardMetrics {
             fresh_window_wait: fresh_latency_histogram(),
             fresh_upload: fresh_latency_histogram(),
             fresh_commit: fresh_latency_histogram(),
+            fresh_object_size: fresh_object_size_histogram(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
         }
@@ -669,6 +674,8 @@ impl ShardMetrics {
         if stored {
             self.fresh_uploads_total.inc();
             self.fresh_upload_bytes_total.inc_by(bytes);
+            #[allow(clippy::cast_precision_loss)]
+            self.fresh_object_size.observe(bytes as f64);
         } else {
             self.fresh_upload_failures_total.inc();
         }
@@ -2144,6 +2151,11 @@ impl ShardMetrics {
             self.fresh_commit.clone(),
         );
         registry.register(
+            "fresh_object_size_bytes",
+            "bytes of each fresh object this shard stored",
+            self.fresh_object_size.clone(),
+        );
+        registry.register(
             "pump_tick_lateness_seconds",
             "how late each consensus tick of the message pump ran after its timer was due",
             self.pump_tick_lateness.clone(),
@@ -2284,6 +2296,13 @@ fn fresh_latency_histogram() -> Histogram {
         .chain((110..=200).step_by(10))
         .map(|millis| f64::from(millis) / 1_000.0);
     Histogram::new(millis.chain(exponential_buckets(0.3, 1.5, 14)))
+}
+
+/// Buckets for the bytes of a stored fresh object: each twice the one before,
+/// from 1 KiB to 32 MiB. An object closes at 4 MiB, and is larger only when
+/// one send is.
+fn fresh_object_size_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(1024.0, 2.0, 16))
 }
 
 /// The `command` of a request whose code the command table does not hold.
@@ -2672,6 +2691,28 @@ mod tests {
             "fetch_budget_waits_total 1",
             "fetch_quota_refusals_total 1",
             "fetch_fire_to_reply_seconds_count 2",
+        ] {
+            assert!(
+                scrape.lines().any(|line| line == series),
+                "{series} is not in the scrape:\n{scrape}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_fresh_uploads_when_they_settle_should_record_the_size_of_each_stored_object() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_fresh_upload(1_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(3_000_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(500, Duration::from_millis(5), false);
+        let scrape = metrics.scrape();
+        for series in [
+            "fresh_object_size_bytes_count 2",
+            "fresh_object_size_bytes_sum 3001000.0",
+            "fresh_object_size_bytes_bucket{le=\"1024.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"2097152.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"4194304.0\"} 2",
+            "fresh_object_size_bytes_bucket{le=\"33554432.0\"} 2",
         ] {
             assert!(
                 scrape.lines().any(|line| line == series),

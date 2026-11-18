@@ -228,6 +228,10 @@ where
     pub(crate) long_term_rewrite_jobs: u64,
     /// What this partition committed above its long-term floor.
     pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
+    /// Number of the last manifest publish this partition started. It
+    /// outlives the view, so the late result of an earlier view's publish is
+    /// never taken for the one in flight.
+    pub(crate) manifest_publish_jobs: u64,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1166,6 +1170,7 @@ where
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
             long_term_rewrite_jobs: 0,
             long_term_backlog: Box::default(),
+            manifest_publish_jobs: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),

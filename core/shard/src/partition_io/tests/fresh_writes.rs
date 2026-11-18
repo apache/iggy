@@ -1024,6 +1024,99 @@ async fn given_sends_to_two_placing_partitions_in_one_window_when_it_closes_shou
     assert_eq!(owner.metrics().fresh_uploads_value().0, 2);
 }
 
+/// Make the shard lead `count` partitions that place their batches: the
+/// fixture's own, and single-replica primaries in memory beside them.
+fn place_partitions(owner: &IoTestShard, count: usize) -> Vec<IggyNamespace> {
+    let partitions = owner.plane.partitions();
+    (0..count)
+        .map(|partition_id| {
+            let partition = IggyNamespace::new(0, 0, partition_id);
+            if partition == namespace() {
+                return partition;
+            }
+            if partitions.get_by_ns(&partition).is_none() {
+                let consensus = VsrConsensus::new(
+                    1,
+                    0,
+                    1,
+                    partition.inner(),
+                    Rc::clone(&owner.bus),
+                    LocalPipeline::new(),
+                );
+                consensus.init();
+                partitions.insert(
+                    partition,
+                    IggyPartition::with_in_memory_storage(
+                        Arc::new(PartitionStats::default()),
+                        consensus,
+                        IggyByteSize::from(SEGMENT_BYTES),
+                    ),
+                );
+            }
+            place_partition(owner, partition)
+        })
+        .collect()
+}
+
+/// Every placing partition of the shard writes into the same window, so the
+/// store gets one object per upload interval however many partitions send
+/// within it.
+#[compio::test]
+async fn given_sends_to_many_placing_partitions_when_they_arrive_within_an_interval_should_store_objects_by_window_and_not_by_partition()
+ {
+    const PARTITIONS: usize = 64;
+    const ROUNDS: u64 = 3;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let placing = place_partitions(&owner, PARTITIONS);
+    assert_eq!(placing.len(), PARTITIONS);
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    // Free slots throughout, so only the interval holds an upload back.
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 4);
+
+    pumped(&owner, async {
+        let mut request = 0;
+        for round in 1..=ROUNDS {
+            for partition in &placing {
+                request += 1;
+                // Offered as the pump offers a send it routed. The pump
+                // itself refuses a partition that the fixture's metadata
+                // does not list.
+                owner.offer_fresh_send(sized_send_request(*partition, request, 100), channel(1).0);
+            }
+            until(&owner, |owner| {
+                placing
+                    .iter()
+                    .all(|partition| committed(owner, *partition) == round)
+            })
+            .await;
+        }
+    })
+    .await;
+
+    let objects = uploader.store().keys().len();
+    // The sends of a round arrive together. The first is stored alone when
+    // the shard is idle by then, and the window of the others is one object.
+    let windows = 2 * usize::try_from(ROUNDS).unwrap();
+    assert!(
+        (1..=windows).contains(&objects),
+        "{objects} objects for {PARTITIONS} partitions in {ROUNDS} rounds"
+    );
+    let (stored, refused, bytes) = owner.metrics().fresh_uploads_value();
+    assert_eq!((stored, refused), (objects as u64, 0));
+    let scrape = owner.metrics.scrape();
+    for series in [
+        format!("fresh_object_size_bytes_count {objects}"),
+        format!("fresh_object_size_bytes_sum {bytes}.0"),
+    ] {
+        assert!(
+            scrape.lines().any(|line| line == series),
+            "{series} is not in the scrape:\n{scrape}"
+        );
+    }
+}
+
 /// Holds every attempt at an upload until the test settles it, so the test
 /// picks the order the uploads end in and which of them the store fails.
 struct GatedUploader {

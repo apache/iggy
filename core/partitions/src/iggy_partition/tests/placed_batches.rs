@@ -2160,6 +2160,135 @@ async fn given_a_committed_segment_without_its_manifest_when_primacy_moves_shoul
     );
 }
 
+/// Bytes of the buffer a poll holds one batch of [`whole_and_placed`] in.
+fn held_batch_bytes(whole: &[Vec<u8>]) -> usize {
+    size_of::<PrepareHeader>() + whole[0].len()
+}
+
+/// Poll from `offset` on with `max_bytes` of read buffers, and return the
+/// last offset, the bytes and whether the read was truncated.
+async fn polled_within(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    offset: u64,
+    max_bytes: usize,
+) -> (Option<u64>, Vec<u8>, bool) {
+    let args = PollingArgs::new(iggy_common::PollingStrategy::offset(offset), 10, false);
+    let result = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute_with_limit(max_bytes, usize::MAX)
+        .await;
+    assert_eq!(result.read_error, None);
+    let truncated = result.truncated();
+    let last_matching_offset = result.last_matching_offset;
+    let bytes = partition
+        .complete_poll(result)
+        .unwrap()
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.as_slice().iter().copied())
+        .collect();
+    (last_matching_offset, bytes, truncated)
+}
+
+/// A placing partition that committed [`RECEIVER_OPS`] batches whose
+/// messages its store holds, with the size of the buffer of one batch and
+/// the bytes a partition of whole batches returns for a poll of all of them.
+async fn placing_partition_to_poll() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    usize,
+    Vec<u8>,
+) {
+    let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let (last, expected) = Box::pin(polls_of_whole_batches(&whole))
+        .await
+        .swap_remove(0);
+    assert_eq!(last, Some(RECEIVER_OPS - 1));
+    let (directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    super::remote_poll::attach(&mut partition, Box::pin(store_with(object)).await);
+    (directory, partition, held_batch_bytes(&whole), expected)
+}
+
+/// A poll holds every batch it reads until it answers, so its read buffers
+/// are capped as those of a poll of whole batches are. It stops between two
+/// batches, and the next poll goes on from there.
+#[compio::test]
+async fn given_a_cap_inside_the_run_when_polling_placed_batches_should_return_the_batches_that_fit_and_continue_from_them()
+ {
+    let (_directory, mut partition, held, expected) = Box::pin(placing_partition_to_poll()).await;
+    // Two batches and half of the third.
+    let max_bytes = 2 * held + held / 2;
+
+    let mut polled = Vec::new();
+    let mut polls = Vec::new();
+    let mut offset = 0;
+    while offset < RECEIVER_OPS {
+        let (last, bytes, truncated) =
+            Box::pin(polled_within(&mut partition, offset, max_bytes)).await;
+        let last = last.expect("each poll returns a batch");
+        polls.push((last, truncated));
+        polled.extend(bytes);
+        offset = last + 1;
+    }
+
+    const { assert!(RECEIVER_OPS == 5) };
+    assert_eq!(polls, [(1, true), (3, true), (4, false)]);
+    assert_eq!(
+        polled, expected,
+        "the polls together return every batch once, in order"
+    );
+}
+
+/// The batch that holds the first message of a poll is returned whatever the
+/// cap, or the same poll would return nothing each time it is sent.
+#[compio::test]
+async fn given_a_cap_below_one_batch_when_polling_placed_batches_should_return_one_batch_a_poll() {
+    let (_directory, mut partition, held, expected) = Box::pin(placing_partition_to_poll()).await;
+
+    let mut polled = Vec::new();
+    for offset in 0..RECEIVER_OPS {
+        let (last, bytes, truncated) =
+            Box::pin(polled_within(&mut partition, offset, held - 1)).await;
+        assert_eq!(last, Some(offset));
+        assert_eq!(truncated, offset + 1 < RECEIVER_OPS, "the poll at {offset}");
+        polled.extend(bytes);
+    }
+
+    assert_eq!(polled, expected);
+}
+
+#[compio::test]
+async fn given_a_cap_that_covers_the_run_when_polling_placed_batches_should_return_them_all_untruncated()
+ {
+    let (_directory, mut partition, held, expected) = Box::pin(placing_partition_to_poll()).await;
+    let max_bytes = usize::try_from(RECEIVER_OPS).unwrap() * held;
+
+    let (last, bytes, truncated) = Box::pin(polled_within(&mut partition, 0, max_bytes)).await;
+
+    assert_eq!(last, Some(RECEIVER_OPS - 1));
+    assert!(!truncated);
+    assert_eq!(bytes, expected);
+}
+
+/// The selection of a reply is capped apart from the read buffers, and a
+/// poll that stops at it says so too.
+#[compio::test]
+async fn given_a_reply_that_is_full_when_polling_placed_batches_should_stop_and_report_truncation()
+{
+    let (_directory, mut partition, _held, expected) = Box::pin(placing_partition_to_poll()).await;
+    let args = PollingArgs::new(iggy_common::PollingStrategy::offset(0), 10, false);
+
+    let result = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute_with_limit(usize::MAX, 1)
+        .await;
+
+    assert_eq!(result.read_error, None);
+    assert_eq!(result.last_matching_offset, Some(0));
+    assert!(result.truncated());
+    assert!(result.encoded_bytes() < expected.len());
+}
+
 /// Primacy moved while the messages of a send were on their way to the
 /// store. The object is stored, and the replica that stored it no longer
 /// leads: it prepares nothing for the request, so nothing commits where
