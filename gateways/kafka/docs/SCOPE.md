@@ -311,6 +311,9 @@ below it are still open for the issues that build on top of it.
     request's own wire `timeout_ms` (clamped to `[1s, 30s]`) now bounds the whole handler's
     aggregate bridge work, not just decoded and discarded - a deadline that fires answers every
     topic `REQUEST_TIMED_OUT` rather than continuing to hold the shared lockstep `IggyClient`.
+  - With SASL on, the authenticated principal must hold `manage_topics` - without it every topic
+    in the request fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is created. With SASL off
+    there is no principal to check, and the request is not gated here.
 - [x] Real DeleteTopics ([#3546](https://github.com/apache/iggy/issues/3546)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, deletes the Iggy topic through
       `IggyBridge::delete_kafka_topic`. `src/protocol/handlers/delete_topics.rs`,
@@ -405,8 +408,8 @@ below it are still open for the issues that build on top of it.
     `ControllerApis` does: one `INVALID_REQUEST` result per repeated name with "Duplicate topic
     name.", and nothing grown for it. The wire `timeout_ms` (clamped to `[1s, 30s]`) bounds each
     topic's own bridge work with the deadline checked before each call starts.
-  - With SASL on, the authenticated principal must hold `manage_topics`, as for DeleteTopics
-    and AlterConfigs - without it every topic fails `TOPIC_AUTHORIZATION_FAILED` (29) and
+  - With SASL on, the authenticated principal must hold `manage_topics`, as for CreateTopics,
+    DeleteTopics and AlterConfigs - without it every topic fails `TOPIC_AUTHORIZATION_FAILED` (29) and
     nothing is written.
 - [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion

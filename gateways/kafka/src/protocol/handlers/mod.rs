@@ -132,7 +132,7 @@ pub async fn dispatch(
         API_KEY_API_VERSIONS => api_versions::handle(state, connection, api_version, body).await,
         API_KEY_CREATE_TOPICS => {
             create_topics::handle(state, connection, principal, api_version, body).await
-        },
+        }
         API_KEY_DELETE_TOPICS => {
             delete_topics::handle(state, connection, principal, api_version, body).await
         }
@@ -192,19 +192,20 @@ pub(crate) fn is_transactional(transactional_id: Option<&TransactionalId>) -> bo
     transactional_id.is_some_and(|id| !id.is_empty())
 }
 
-/// Whether `principal` may delete a group or its offsets. `None` means no listener of this gateway
-/// names principals, with nothing to enforce against, as in `DeleteTopics`.
+/// Whether `principal` may manage topics or topic-derived resources (such as consumer groups
+/// or their offsets). `None` means no listener of this gateway names principals, with nothing to
+/// enforce against, as in `DeleteTopics`.
 ///
 /// Kafka asks for `DELETE` on the group. Iggy has no group permission, and lets any reader of a
 /// topic delete a group on it, so the gate asks for what `DeleteTopics` asks for: a global
 /// `manage_topics` or `manage_streams`, which the principal's `manage_topics` stands for.
-fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> bool {
+pub(crate) fn may_manage_topics(principal: Option<&AuthenticatedPrincipal>, api: &str) -> bool {
     let Some(principal) = principal else {
         return true;
     };
     if !principal.permissions_known {
-        // Denying is the fail-closed choice: granting would authorize an irreversible delete off
-        // a value nothing ever actually read.
+        // Denying is the fail-closed choice: granting would authorize an irreversible delete or
+        // create off a value nothing ever actually read.
         tracing::warn!(
             principal = %principal.username,
             "{api} asked on a connection whose permissions were never read; denying"
@@ -213,6 +214,8 @@ fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> b
     }
     principal.permissions.manage_topics
 }
+
+pub(crate) use may_manage_topics as may_delete_groups;
 
 /// The topics a principal may commit offsets to. See [`commit_access`].
 #[derive(Debug, Clone)]

@@ -30,33 +30,49 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{
     Durability, Identifier, IggyByteSize, IggyExpiry, MaxTopicSize, StreamClient, TopicClient,
 };
 use serial_test::serial;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::SemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
-use iggy_gateway_kafka::auth::AuthenticatedPrincipal;
+use iggy_gateway_kafka::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::bridge::topic_settings::replication_factor_of;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
+use iggy_gateway_kafka::listener::SecurityProtocol;
 use iggy_gateway_kafka::protocol::api::{
-    ConnectionState, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
+    API_KEY_CREATE_TOPICS, ConnectionState, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
     ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_topics;
+use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
+use iggy_gateway_kafka::tls::TlsConfig;
+use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
+#[path = "common/certs.rs"]
+mod certs;
 #[path = "common/codec.rs"]
 mod codec;
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
+#[path = "common/server.rs"]
+mod server;
+#[path = "common/tcp.rs"]
+mod tcp;
 
+use certs::TestPki;
 use codec::{Decoder, Encoder};
 use iggy_server::{TestServer, raw_client};
+use server::{listener, spawn_gateway};
+use tcp::{build_request_frame, parse_response_payload, read_response_frame};
 
 const REQUEST_VERSION: i16 = 5;
 const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
@@ -201,8 +217,14 @@ fn decode_first_in_full(body: Bytes) -> (i16, Option<String>, Vec<CreatedConfig>
 
 async fn send(state: &GatewayState, topics: &[TopicSpec<'_>], validate_only: bool) -> (i16, i32) {
     let body = build_request(topics, validate_only);
-    let outcome =
-        create_topics::handle(state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(
+        state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_first_result(resp_body)
 }
@@ -213,8 +235,14 @@ async fn send_all(
     validate_only: bool,
 ) -> Vec<(Option<String>, i16)> {
     let body = build_request(topics, validate_only);
-    let outcome =
-        create_topics::handle(state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(
+        state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_all_results(resp_body)
 }
@@ -361,8 +389,14 @@ async fn create_topics_with_a_config_iggy_cannot_hold_returns_invalid_config_and
             ..TopicSpec::new("orders", 3)
         };
         let body = build_request(&[topic], false);
-        let outcome =
-            create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
+        let outcome = create_topics::handle(
+            &state,
+            &ConnectionState::default(),
+            None,
+            REQUEST_VERSION,
+            body,
+        )
+        .await;
         let (error_code, message, created) =
             decode_first_in_full(outcome.expect_response("CreateTopics answers"));
         assert_eq!(error_code, ERROR_INVALID_CONFIG, "{configs:?}");
@@ -398,8 +432,14 @@ async fn create_topics_stores_the_configs_iggy_holds_and_reports_them() {
         ..TopicSpec::new("orders", 3)
     };
     let body = build_request(&[topic], false);
-    let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let (error_code, _, created) =
         decode_first_in_full(outcome.expect_response("CreateTopics answers"));
     assert_eq!(error_code, ERROR_NONE);
@@ -492,8 +532,14 @@ async fn create_topics_with_compact_keeps_every_record_and_leaves_the_policy_out
         ..TopicSpec::new("connect-configs", 1)
     };
     let body = build_request(&[topic], false);
-    let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let (error_code, message, created) =
         decode_first_in_full(outcome.expect_response("CreateTopics answers"));
     assert_eq!(error_code, ERROR_NONE, "{message:?}");
@@ -542,8 +588,14 @@ async fn create_topics_with_a_small_retention_keeps_one_segment_and_a_flush_pers
         ..TopicSpec::new("small-retention", 3)
     };
     let body = build_request(&[topic], false);
-    let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let (error_code, message, created) =
         decode_first_in_full(outcome.expect_response("CreateTopics answers"));
     assert_eq!(error_code, ERROR_NONE, "{message:?}");
@@ -595,9 +647,14 @@ async fn create_topics_stores_the_replication_factor_up_to_the_node_count() {
         let body = build_request(&[topic], validate_only);
         let state = &state;
         async move {
-            let outcome =
-                create_topics::handle(state, &ConnectionState::default(), None, REQUEST_VERSION, body)
-                    .await;
+            let outcome = create_topics::handle(
+                state,
+                &ConnectionState::default(),
+                None,
+                REQUEST_VERSION,
+                body,
+            )
+            .await;
             decode_first_factor(outcome.expect_response("CreateTopics answers"))
         }
     };
@@ -805,8 +862,14 @@ async fn create_topics_error_message_does_not_repeat_the_topic_name() {
     let bad_name = "has a space";
     let topic = TopicSpec::new(bad_name, 1);
     let body = build_request(&[topic], false);
-    let outcome =
-        create_topics::handle(&state, &ConnectionState::default(), None, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
 
     let mut d = Decoder::new(resp_body);
@@ -938,15 +1001,7 @@ async fn create_topics_with_unauthorized_principal_is_denied() {
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
 
-    let principal = AuthenticatedPrincipal {
-        username: "unauthorized".to_string(),
-        user: None,
-        permissions: PrincipalPermissions {
-            manage_topics: false,
-            ..PrincipalPermissions::default()
-        },
-        permissions_known: true,
-    };
+    let principal = AuthenticatedPrincipal::anonymous();
     let topic = TopicSpec::new("orders", 1);
     let body = build_request(&[topic], false);
     let outcome = create_topics::handle(
@@ -968,4 +1023,79 @@ async fn create_topics_with_unauthorized_principal_is_denied() {
     let raw = raw_client(&server).await;
     let streams = raw.get_streams().await.expect("get_streams call");
     assert!(streams.is_empty(), "unauthorized topic must not be created");
+}
+
+/// Refuses every login: these tests only need a SASL listener to exist beside the one they use.
+#[derive(Debug)]
+struct NoLogins;
+
+#[async_trait]
+impl SaslAuthenticator for NoLogins {
+    async fn authenticate(
+        &self,
+        _credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
+        Err(AuthError::Rejected)
+    }
+}
+
+/// Sends a v5 `CreateTopics` for `topics` over a gateway connection.
+async fn create_over<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    topics: &[TopicSpec<'_>],
+    validate_only: bool,
+) -> Vec<(Option<String>, i16)> {
+    let frame = build_request_frame(
+        API_KEY_CREATE_TOPICS,
+        REQUEST_VERSION,
+        1,
+        Some("anonymous"),
+        &build_request(topics, validate_only),
+    );
+    stream.write_all(&frame).await.expect("write CreateTopics");
+    let payload = read_response_frame(stream, TEST_MAX_FRAME_SIZE).await;
+    let (_, body) = parse_response_payload(API_KEY_CREATE_TOPICS, REQUEST_VERSION, payload);
+    decode_all_results(body)
+}
+
+fn tls_material(pki: &TestPki, dir: &std::path::Path) -> TlsConfig {
+    let (cert_file, key_file) = pki.server_cert("gateway").write(dir, "server");
+    TlsConfig::new(cert_file, key_file)
+}
+
+#[tokio::test]
+#[serial]
+async fn given_a_plaintext_listener_beside_sasl_ssl_should_deny_create_topics_there() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+    let certs_dir = tempfile::tempdir().expect("certs dir");
+    let pki = TestPki::new();
+    let config = GatewayConfig {
+        listeners: vec![
+            listener(SecurityProtocol::Plaintext),
+            listener(SecurityProtocol::SaslSsl),
+        ],
+        tls: Some(tls_material(&pki, certs_dir.path())),
+        ..GatewayConfig::default()
+    };
+    let (addrs, _shutdown) = spawn_gateway(
+        move |config| {
+            KafkaGateway::new(config)
+                .with_bridge(Some(Arc::new(bridge)))
+                .with_authenticator(Arc::new(NoLogins))
+        },
+        config,
+    );
+
+    let mut stream = TcpStream::connect(addrs[0]).await.expect("connect");
+    let topic = TopicSpec::new("orders", 1);
+    assert_eq!(
+        create_over(&mut stream, &[topic], false).await,
+        vec![(Some("orders".to_string()), ERROR_TOPIC_AUTHORIZATION_FAILED)],
+        "the plaintext listener must not bypass what the SASL listener enforces"
+    );
 }

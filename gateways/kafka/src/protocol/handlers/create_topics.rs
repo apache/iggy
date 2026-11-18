@@ -53,7 +53,8 @@ use crate::protocol::handlers::topic_config::{
 };
 use crate::protocol::handlers::{
     another_controller, clamp_request_timeout, decode_guarded, encode_message,
-    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
+    handle_versioned_request, is_supported_version, may_manage_topics, respond_or_close,
+    unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -653,22 +654,11 @@ fn authorize(
     principal: Option<&AuthenticatedPrincipal>,
     topics: &[CreatableTopic],
 ) -> Option<Vec<CreatableTopicResult>> {
-    let principal = principal?;
-    if principal.permissions_known && principal.permissions.manage_topics {
+    if may_manage_topics(principal, "CreateTopics") {
         return None;
     }
-    if !principal.permissions_known {
-        // The permission read failed after a successful login, so this connection holds no real
-        // answer. Denying is the fail-closed choice: granting would authorize a write off a
-        // value nothing ever actually read.
-        tracing::warn!(
-            principal = %principal.username,
-            "CreateTopics asked on a connection whose permissions were never read; denying"
-        );
-    }
-    let message = StrBytes::from_static_str(
-        "the authenticated principal is not authorized to create topics",
-    );
+    let message =
+        StrBytes::from_static_str("the authenticated principal is not authorized to create topics");
     Some(
         topics
             .iter()
@@ -745,7 +735,6 @@ mod tests {
 
     use super::*;
     use crate::bridge::TopicDefaults;
-    use crate::protocol::acl::PrincipalPermissions;
 
     /// The node id of the gateway under test.
     const NODE_ID: i32 = 1;
@@ -1077,18 +1066,6 @@ mod tests {
         assert!(find_duplicate_names(names).is_empty());
     }
 
-    fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            user: None,
-            permissions: PrincipalPermissions {
-                manage_topics,
-                ..PrincipalPermissions::default()
-            },
-            permissions_known,
-        }
-    }
-
     #[test]
     fn no_principal_is_not_gated() {
         assert!(authorize(None, &[creatable_topic(1, 1)]).is_none());
@@ -1096,13 +1073,14 @@ mod tests {
 
     #[test]
     fn a_principal_with_manage_topics_is_allowed() {
-        let principal = principal(true, true);
+        let mut principal = AuthenticatedPrincipal::anonymous();
+        principal.permissions.manage_topics = true;
         assert!(authorize(Some(&principal), &[creatable_topic(1, 1)]).is_none());
     }
 
     #[test]
     fn a_principal_without_manage_topics_is_denied_every_topic() {
-        let principal = principal(false, true);
+        let principal = AuthenticatedPrincipal::anonymous();
         let results = authorize(
             Some(&principal),
             &[
@@ -1123,7 +1101,8 @@ mod tests {
 
     #[test]
     fn a_principal_whose_permissions_were_never_read_is_denied() {
-        let principal = principal(true, false);
+        let mut principal = AuthenticatedPrincipal::anonymous();
+        principal.permissions_known = false;
         let results = authorize(Some(&principal), &[creatable_topic(1, 1)]).expect("denied");
         assert_eq!(results[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
         assert_eq!(
