@@ -78,10 +78,7 @@ where
 {
     /// Give this shard where it reads the fresh objects of each peer, by
     /// origin.
-    pub(crate) fn set_peer_fresh_objects(
-        &self,
-        objects: Vec<PeerFreshObjects>,
-    ) {
+    pub(crate) fn set_peer_fresh_objects(&self, objects: Vec<PeerFreshObjects>) {
         *self.peer_fresh_follows.objects.borrow_mut() = objects;
     }
 

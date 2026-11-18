@@ -348,17 +348,6 @@ impl PeerFreshTail {
         served.into_iter().skip(first).take(count).collect()
     }
 
-    /// The newest timestamp a served batch carries, `None` while the tail
-    /// serves none.
-    #[must_use]
-    pub fn served_timestamp(&self) -> Option<u64> {
-        let last = self.served_end()?;
-        self.rows
-            .range(..=last)
-            .next_back()
-            .map(|(_, row)| row.proof.base_timestamp)
-    }
-
     fn keep_source(&mut self, offered: &PeerFreshRows) {
         if offered.batches.is_empty() || self.sources.contains_key(&offered.object_id) {
             return;
