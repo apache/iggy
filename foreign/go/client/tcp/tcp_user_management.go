@@ -39,12 +39,17 @@ func (c *IggyTcpClient) GetUser(ctx context.Context, identifier iggcon.Identifie
 }
 
 func (c *IggyTcpClient) GetUsers(ctx context.Context) ([]iggcon.UserInfo, error) {
-	buffer, err := c.do(ctx, &command.GetUsers{})
+	return readWholeList(ctx, c, func(ctx context.Context, query iggcon.PageQuery) (*iggcon.Page[iggcon.UserInfo], error) {
+		return c.GetUsersPage(ctx, iggcon.NamedPageQuery{PageQuery: query})
+	})
+}
+
+func (c *IggyTcpClient) GetUsersPage(ctx context.Context, query iggcon.NamedPageQuery) (*iggcon.Page[iggcon.UserInfo], error) {
+	buffer, err := c.do(ctx, &command.GetUsers{Query: query})
 	if err != nil {
 		return nil, err
 	}
-
-	return binaryserialization.DeserializeUsers(buffer)
+	return binaryserialization.DeserializeUsersPage(buffer)
 }
 
 func (c *IggyTcpClient) CreateUser(

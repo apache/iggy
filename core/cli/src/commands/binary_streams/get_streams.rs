@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::commands::binary_streams::get_stream::encryption_source;
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::utils::list_rows::{ListRows, print_next};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
@@ -31,11 +32,12 @@ pub enum GetStreamsOutput {
 
 pub struct GetStreamsCmd {
     output: GetStreamsOutput,
+    rows: ListRows,
 }
 
 impl GetStreamsCmd {
-    pub fn new(output: GetStreamsOutput) -> Self {
-        GetStreamsCmd { output }
+    pub fn new(output: GetStreamsOutput, rows: ListRows) -> Self {
+        GetStreamsCmd { output, rows }
     }
 }
 
@@ -43,6 +45,7 @@ impl Default for GetStreamsCmd {
     fn default() -> Self {
         GetStreamsCmd {
             output: GetStreamsOutput::Table,
+            rows: ListRows::default(),
         }
     }
 }
@@ -63,8 +66,9 @@ impl CliCommand for GetStreamsCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let streams = client
-            .get_streams()
+        let (streams, next) = self
+            .rows
+            .read(|query| async move { client.get_streams_page(&query).await })
             .await
             .with_context(|| String::from("Problem getting list of streams"))?;
 
@@ -115,8 +119,9 @@ impl CliCommand for GetStreamsCmd {
                     );
                 });
             }
-            GetStreamsOutput::Json => print_json(&streams)?,
+            GetStreamsOutput::Json => return self.rows.print_json(streams, next),
         }
+        print_next(next);
 
         Ok(())
     }

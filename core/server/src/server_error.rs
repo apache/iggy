@@ -169,6 +169,11 @@ pub enum ServerError {
         poll: std::time::Duration,
         drain: std::time::Duration,
     },
+    #[error("sharding.shutdown_primary_handoff_timeout must be <= {max:?}; got {value:?}")]
+    InvalidShutdownPrimaryHandoffTimeout {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
     #[error("sharding.shutdown_join_timeout must be <= {max:?}; got {value:?}")]
     InvalidShutdownJoinTimeout {
         value: std::time::Duration,

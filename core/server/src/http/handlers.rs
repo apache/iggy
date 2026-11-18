@@ -34,17 +34,18 @@ use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_METADATA_CHANGES_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
-    POLL_MESSAGES_CODE,
+    GET_PARTITIONS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE, POLL_MESSAGES_CODE,
 };
+use iggy_binary_protocol::primitives::page::WirePageQuery;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
     GetConsumerGroupsRequest,
 };
 use iggy_binary_protocol::requests::partitions::{
-    CreatePartitionsRequest, DeletePartitionsRequest,
+    CreatePartitionsRequest, DeletePartitionsRequest, GetPartitionsRequest,
 };
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
@@ -64,20 +65,20 @@ use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
     UpdatePermissionsRequest,
 };
+use iggy_binary_protocol::responses::PageResponse;
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
+use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
-use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::GetPersonalAccessTokensResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
-use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::{StreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
-use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
-use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
+use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
+use iggy_binary_protocol::responses::users::UserResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
-use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::{Operation, WireDecode, WireEncode, WireIdentifier, WireName};
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
@@ -96,24 +97,26 @@ use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::wire_conversions::{
-    clients_from_wire, consumer_groups_from_wire, identifier_to_wire, option_specs_from_wire,
-    permissions_to_wire, personal_access_tokens_from_wire, streams_from_wire, topics_from_wire,
-    users_from_wire,
+    clients_from_wire, identifier_to_wire, option_specs_from_wire, page_from_wire,
+    permissions_to_wire, personal_access_tokens_from_wire,
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
-    MetadataChanges, MetadataChangesQuery, OptionSpec, OptionStorage, OptionsScope, Partitioning,
-    PersonalAccessTokenInfo, PollMessages, PolledMessages, PollingStrategy, RawPersonalAccessToken,
-    SendMessagesConfirmations, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails,
-    UserInfo, UserInfoDetails, Validatable, descriptors_for, erase_buffer,
+    MetadataChanges, MetadataChangesQuery, NamedPageQuery, OptionSpec, OptionStorage, OptionsScope,
+    Page, PageQuery, Partition, Partitioning, PersonalAccessTokenInfo, PollMessages,
+    PolledMessages, PollingStrategy, RawPersonalAccessToken, SendMessagesConfirmations, Stats,
+    Stream, StreamDetails, TokenInfo, Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
+    descriptors_for, erase_buffer,
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
+use metadata::stm::stream::StreamsInner;
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use shard::metrics::LongTermLag;
 use shard::{
     DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
 };
@@ -127,7 +130,7 @@ use crate::dispatch::partition::{
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
-    ReadError, WriteError,
+    ReadError, WriteError, split_list_query,
 };
 use crate::http::extractor::{
     Authenticated, Credential, Identity, JsonMembers, JsonSendMessages, JsonUpdate,
@@ -136,12 +139,12 @@ use crate::http::forward::{
     FirstAttempt, PartitionEffect, PartitionHop, PartitionRequest, require_local_primary,
     serve_partition,
 };
-use crate::http::metrics::{TopicUsageSample, gauge_value};
+use crate::http::metrics::{LongTermLagSample, TopicUsageSample, gauge_value};
 use crate::http::reads::{
     authorize_data_plane, authorize_read, await_metadata_floor, await_recovery_barrier,
     check_partition_freshness, check_partition_incarnation, gate_local_read, read_local,
-    resolve_gate_stream, resolve_gate_topic, resolve_gate_topic_ids, resolve_gate_user,
-    topic_durability,
+    read_whole_list, resolve_gate_stream, resolve_gate_topic, resolve_gate_topic_ids,
+    resolve_gate_user, topic_durability,
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
@@ -317,28 +320,23 @@ pub(in crate::http) async fn describe_options(
     ))
 }
 
-/// `GET /streams`: list every stream as the same `Vec<Stream>` JSON the legacy
-/// server returns. A consensus-free local STM read via [`read_local`].
+/// `GET /streams`: every stream as the `Vec<Stream>` JSON of the legacy
+/// server, or one page of them. See [`read_list`].
 pub(in crate::http) async fn get_streams(
     State(state): State<HttpState>,
     identity: Identity,
-    Query(query): Query<ConsistencyQuery>,
-) -> Result<Json<Vec<Stream>>, ReadError> {
-    let body = GetStreamsRequest.to_bytes();
-    let bytes = SendWrapper::new(read_local(
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<ListReply<Stream>>, ReadError> {
+    SendWrapper::new(read_list::<StreamResponse, _>(
         &state,
         &identity,
-        query.consistency,
+        &pairs,
         GET_STREAMS_CODE,
-        &body,
+        |page| GetStreamsRequest { page }.to_bytes(),
         Permissioner::get_streams,
+        Stream::try_from,
     ))
-    .await?;
-    let response = GetStreamsResponse::decode_from(&bytes)
-        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
-    Ok(Json(
-        streams_from_wire(response).map_err(ReadError::Rejected)?,
-    ))
+    .await
 }
 
 /// `GET /streams/{stream_id}`: fetch one stream by numeric id or name as the
@@ -380,38 +378,36 @@ pub(in crate::http) async fn get_stream(
     ))
 }
 
-/// `GET /streams/{stream_id}/topics`: list a stream's topics as the same
-/// `Vec<Topic>` JSON the legacy server returns. A consensus-free local STM read
-/// via [`read_local`].
+/// `GET /streams/{stream_id}/topics`: every topic of a stream as the
+/// `Vec<Topic>` JSON of the legacy server, or one page of them. See
+/// [`read_list`].
 pub(in crate::http) async fn get_topics(
     State(state): State<HttpState>,
     identity: Identity,
     Path(stream_id): Path<String>,
-    Query(query): Query<ConsistencyQuery>,
-) -> Result<Json<Vec<Topic>>, ReadError> {
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<ListReply<Topic>>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
-    let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
-    let request = GetTopicsRequest {
-        stream_id: wire_stream_id,
-    };
-    let body = request.to_bytes();
-    let bytes = SendWrapper::new(read_local(
+    let stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
+    SendWrapper::new(read_list::<TopicResponse, _>(
         &state,
         &identity,
-        query.consistency,
+        &pairs,
         GET_TOPICS_CODE,
-        &body,
+        |page| {
+            GetTopicsRequest {
+                stream_id: stream_id.clone(),
+                page,
+            }
+            .to_bytes()
+        },
         |permissioner, uid| {
-            resolve_gate_stream(&state, &request.stream_id)
+            resolve_gate_stream(&state, &stream_id)
                 .map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
         },
+        Topic::try_from,
     ))
-    .await?;
-    let response = GetTopicsResponse::decode_from(&bytes)
-        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
-    Ok(Json(
-        topics_from_wire(response).map_err(ReadError::Rejected)?,
-    ))
+    .await
 }
 
 /// `GET /streams/{stream_id}/topics/{topic_id}`: fetch one topic by numeric id
@@ -453,28 +449,23 @@ pub(in crate::http) async fn get_topic(
     ))
 }
 
-/// `GET /users`: list every user as the same `Vec<UserInfo>` JSON the legacy
-/// server returns. A consensus-free local STM read via [`read_local`].
+/// `GET /users`: every user as the `Vec<UserInfo>` JSON of the legacy server,
+/// or one page of them. See [`read_list`].
 pub(in crate::http) async fn get_users(
     State(state): State<HttpState>,
     identity: Identity,
-    Query(query): Query<ConsistencyQuery>,
-) -> Result<Json<Vec<UserInfo>>, ReadError> {
-    let body = GetUsersRequest.to_bytes();
-    let bytes = SendWrapper::new(read_local(
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<ListReply<UserInfo>>, ReadError> {
+    SendWrapper::new(read_list::<UserResponse, _>(
         &state,
         &identity,
-        query.consistency,
+        &pairs,
         GET_USERS_CODE,
-        &body,
+        |page| GetUsersRequest { page }.to_bytes(),
         Permissioner::get_users,
+        UserInfo::try_from,
     ))
-    .await?;
-    let response = GetUsersResponse::decode_from(&bytes)
-        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
-    Ok(Json(
-        users_from_wire(response).map_err(ReadError::Rejected)?,
-    ))
+    .await
 }
 
 /// `GET /users/{user_id}`: fetch one user by numeric id or name as the same
@@ -523,41 +514,87 @@ pub(in crate::http) async fn get_user(
     ))
 }
 
-/// `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups`: list a topic's
-/// consumer groups as the same `Vec<ConsumerGroup>` JSON the legacy server
-/// returns. A consensus-free local STM read via [`read_local`].
+/// `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups`: every
+/// consumer group of a topic as the `Vec<ConsumerGroup>` JSON of the legacy
+/// server, or one page of them. See [`read_list`].
 pub(in crate::http) async fn get_cgs(
     State(state): State<HttpState>,
     identity: Identity,
     Path((stream_id, topic_id)): Path<(String, String)>,
-    Query(query): Query<ConsistencyQuery>,
-) -> Result<Json<Vec<ConsumerGroup>>, ReadError> {
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<ListReply<ConsumerGroup>>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
-    let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
-    let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
-    let request = GetConsumerGroupsRequest {
-        stream_id: wire_stream_id,
-        topic_id: wire_topic_id,
-    };
-    let body = request.to_bytes();
-    let bytes = SendWrapper::new(read_local(
+    let stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
+    let topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
+    SendWrapper::new(read_list::<ConsumerGroupResponse, _>(
         &state,
         &identity,
-        query.consistency,
+        &pairs,
         GET_CONSUMER_GROUPS_CODE,
-        &body,
+        |page| {
+            GetConsumerGroupsRequest {
+                stream_id: stream_id.clone(),
+                topic_id: topic_id.clone(),
+                page,
+            }
+            .to_bytes()
+        },
         |permissioner, uid| {
-            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+            resolve_gate_topic(&state, &stream_id, &topic_id)
                 .map_or(Ok(()), |(stream_id, topic_id)| {
                     permissioner.get_consumer_groups(uid, stream_id, topic_id)
                 })
         },
+        |group| Ok(ConsumerGroup::from(group)),
     ))
-    .await?;
-    let response = GetConsumerGroupsResponse::decode_from(&bytes)
+    .await
+}
+
+/// The JSON of a list route: the bare array of every item, or one page.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(in crate::http) enum ListReply<T> {
+    Whole(Vec<T>),
+    Page(Page<T>),
+}
+
+/// Serves one of the four list routes. A query with `limit` or `cursor` gets
+/// the one page that its keys name. A query without both gets every item as
+/// the bare array of the legacy server, in the order of its `order` and
+/// `descending` keys and filtered by its `name` key, built from the server's
+/// own pages by [`read_whole_list`]. The query is strict: an unknown,
+/// repeated or malformed key is a 400.
+async fn read_list<W: WireDecode, T>(
+    state: &HttpInner,
+    identity: &Identity,
+    pairs: &[(String, String)],
+    code: u32,
+    request: impl Fn(WirePageQuery) -> Bytes,
+    rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
+    convert: impl FnMut(W) -> Result<T, IggyError>,
+) -> Result<Json<ListReply<T>>, ReadError> {
+    let (consistency, page_pairs) = split_list_query(pairs).map_err(ReadError::Rejected)?;
+    let selects_page = NamedPageQuery::selects_page(&page_pairs);
+    let query = NamedPageQuery::from_http_query(page_pairs).map_err(ReadError::Rejected)?;
+    let page = WirePageQuery::try_from(&query).map_err(ReadError::Rejected)?;
+    if !selects_page {
+        let items =
+            read_whole_list::<W>(state, identity, consistency, code, page, request, rule).await?;
+        return items
+            .into_iter()
+            .map(convert)
+            .collect::<Result<_, _>>()
+            .map(|items| Json(ListReply::Whole(items)))
+            .map_err(ReadError::Rejected);
+    }
+    let body = request(page);
+    let bytes = read_local(state, identity, consistency, code, &body, rule).await?;
+    let page = PageResponse::<W>::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
-    Ok(Json(consumer_groups_from_wire(response)))
+    page_from_wire(page, convert)
+        .map(|page| Json(ListReply::Page(page)))
+        .map_err(ReadError::Rejected)
 }
 
 /// `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}`:
@@ -672,64 +709,30 @@ pub(in crate::http) async fn get_metrics(
         .users()
         .authorize(|permissioner| permissioner.get_stats(identity.user_id))
         .is_ok();
-    let (
-        (streams_count, topics_count, partitions_count, segments_count, messages_count),
-        topic_usage,
-    ) = state
+    let topic_gauges = exports_stats && state.server_config.http.metrics.topic_gauges;
+    let lags = if topic_gauges {
+        state.metrics.shard_long_term_lags()
+    } else {
+        Vec::new()
+    };
+    let (counts, segments_count, messages_count, topic_usage, long_term_lags) = state
         .shard
         .plane
         .metadata()
         .mux_stm
         .streams()
         .read(|streams| {
-            let mut topics_count = 0u64;
-            let mut partitions_count = 0u64;
-            let mut segments_count = 0u64;
-            let mut messages_count = 0u64;
-            let mut topic_usage = if exports_stats {
-                Vec::with_capacity(
-                    streams
-                        .items
-                        .iter()
-                        .map(|(_, stream)| stream.topics.len())
-                        .sum(),
-                )
-            } else {
-                Vec::new()
-            };
-            for (_, stream) in &streams.items {
-                topics_count = topics_count.saturating_add(stream.topics.len() as u64);
-                segments_count = segments_count
-                    .saturating_add(u64::from(stream.stats.segments_count_inconsistent()));
-                messages_count =
-                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                for (_, topic) in &stream.topics {
-                    partitions_count =
-                        partitions_count.saturating_add(topic.partitions.len() as u64);
-                    if !exports_stats {
-                        continue;
-                    }
-                    topic_usage.push(TopicUsageSample {
-                        stream: Arc::clone(&stream.name),
-                        topic: Arc::clone(&topic.name),
-                        size_bytes: topic.stats.size_bytes_inconsistent(),
-                        messages: topic.stats.messages_count_inconsistent(),
-                        max_size_bytes: topic
-                            .resolved
-                            .max_topic_size
-                            .resolve(DEFAULT_MAX_TOPIC_SIZE),
-                    });
-                }
-            }
+            let node = streams.stats_registry.node();
             (
-                (
-                    streams.items.len() as u64,
-                    topics_count,
-                    partitions_count,
-                    segments_count,
-                    messages_count,
-                ),
-                topic_usage,
+                streams.resource_counts(),
+                node.segments_count_inconsistent(),
+                node.messages_count_inconsistent(),
+                if topic_gauges {
+                    topic_usage_samples(streams)
+                } else {
+                    Vec::new()
+                },
+                long_term_lag_samples(streams, &lags),
             )
         });
     let users_count = state
@@ -741,15 +744,57 @@ pub(in crate::http) async fn get_metrics(
         .read(|users| users.items.len() as u64);
 
     let metrics = &state.metrics;
-    metrics.streams.set(gauge_value(streams_count));
-    metrics.topics.set(gauge_value(topics_count));
-    metrics.partitions.set(gauge_value(partitions_count));
+    metrics.streams.set(gauge_value(counts.streams as u64));
+    metrics.topics.set(gauge_value(counts.topics as u64));
+    metrics
+        .partitions
+        .set(gauge_value(counts.partitions as u64));
     metrics.segments.set(gauge_value(segments_count));
     metrics.messages.set(gauge_value(messages_count));
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
     metrics.topic_usage.replace(topic_usage);
+    metrics.long_term_lags.replace(long_term_lags);
     Ok(metrics.formatted_output(exports_stats))
+}
+
+/// One sample per topic for the per-topic series, the only part of a scrape
+/// that walks the topics.
+fn topic_usage_samples(streams: &StreamsInner) -> Vec<TopicUsageSample> {
+    let mut samples = Vec::with_capacity(streams.resource_counts().topics);
+    for (_, stream) in &streams.items {
+        for (_, topic) in &stream.topics {
+            samples.push(TopicUsageSample {
+                stream: Arc::clone(&stream.name),
+                topic: Arc::clone(&topic.name),
+                size_bytes: topic.stats.size_bytes_inconsistent(),
+                messages: topic.stats.messages_count_inconsistent(),
+                max_size_bytes: topic
+                    .resolved
+                    .max_topic_size
+                    .resolve(DEFAULT_MAX_TOPIC_SIZE),
+            });
+        }
+    }
+    samples
+}
+
+/// One sample per lag, named by its stream and topic. A partition whose
+/// topic the metadata does not hold is left out.
+fn long_term_lag_samples(streams: &StreamsInner, lags: &[LongTermLag]) -> Vec<LongTermLagSample> {
+    lags.iter()
+        .filter_map(|lag| {
+            let stream = streams.items.get(lag.namespace.stream_id())?;
+            let topic = stream.topics.get(lag.namespace.topic_id())?;
+            Some(LongTermLagSample {
+                stream: Arc::clone(&stream.name),
+                topic: Arc::clone(&topic.name),
+                partition: lag.namespace.partition_id(),
+                messages: lag.messages,
+                bytes: lag.bytes,
+            })
+        })
+        .collect()
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP
@@ -1096,6 +1141,47 @@ pub(in crate::http) async fn delete_topic(
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /streams/{stream_id}/topics/{topic_id}/partitions`: one page of a
+/// topic's partitions, as `{ "items": [...], "next": "pg1_..." }`. A request
+/// without page keys reads the first page with the default limit. The query
+/// is strict: an unknown, repeated or malformed key is a 400.
+pub(in crate::http) async fn get_partitions(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<Page<Partition>>, ReadError> {
+    let (consistency, page_pairs) = split_list_query(&pairs).map_err(ReadError::Rejected)?;
+    let query = PageQuery::from_http_query(page_pairs).map_err(ReadError::Rejected)?;
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let request = GetPartitionsRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
+        page: WirePageQuery::try_from(&query).map_err(ReadError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    let bytes = SendWrapper::new(read_local(
+        &state,
+        &identity,
+        consistency,
+        GET_PARTITIONS_CODE,
+        &body,
+        |permissioner, uid| {
+            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_topic(uid, stream_id, topic_id)
+                })
+        },
+    ))
+    .await?;
+    let page = PageResponse::<PartitionResponse>::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    page_from_wire(page, |partition| Ok(Partition::from(partition)))
+        .map(Json)
+        .map_err(ReadError::Rejected)
 }
 
 /// `POST /streams/{stream_id}/topics/{topic_id}/partitions`: add partitions to a
@@ -2371,11 +2457,48 @@ mod tests {
         SendMessagesConfirmationResponse, SendMessagesResponse,
     };
     use iggy_common::{OptionInputMap, OptionInputValue, OptionKey, SendMessages};
+    use metadata::stm::stream::{Stream, Topic};
     use serde_json::Value;
+    use server_common::sharding::IggyNamespace;
 
     use crate::http::reply::classify_partition_reply;
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
+
+    #[test]
+    fn given_lags_when_sampling_them_should_name_each_by_its_stream_and_topic_and_drop_the_unknown()
+    {
+        let mut streams = StreamsInner::default();
+        let mut stream = Stream::default();
+        stream.name = Arc::from("orders");
+        let topic_id = stream.topics.insert(Topic {
+            name: Arc::from("eu"),
+            ..Topic::default()
+        });
+        let stream_id = streams.items.insert(stream);
+        let lag = |stream_id, topic_id, partition_id, bytes| LongTermLag {
+            namespace: IggyNamespace::new(stream_id, topic_id, partition_id),
+            messages: 7,
+            bytes,
+        };
+
+        let samples = long_term_lag_samples(
+            &streams,
+            &[
+                lag(stream_id, topic_id, 2, Some(4096)),
+                lag(stream_id, topic_id + 1, 0, None),
+                lag(stream_id + 1, topic_id, 0, None),
+            ],
+        );
+
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        let sample = &samples[0];
+        assert_eq!((&*sample.stream, &*sample.topic), ("orders", "eu"));
+        assert_eq!(
+            (sample.partition, sample.messages, sample.bytes),
+            (2, 7, Some(4096))
+        );
+    }
 
     #[tokio::test]
     async fn given_a_committing_poll_when_sent_as_get_should_refuse_it_and_name_the_post_route() {

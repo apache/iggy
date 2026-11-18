@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::eviction::{reboot, tiered_partition_on_disk};
 use super::floor_eviction::{advance_over, apply};
 use super::remote_poll::layout;
 use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::tiered_floor::AdvanceTieredFloor;
 use crate::{
-    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
+    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher, upload_segment,
 };
 use iggy_object_store::{
-    InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PartitionManifest,
-    TierJobCancelled,
+    InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PartitionManifest, SegmentKey,
+    SegmentObject, TierJobCancelled,
 };
+use std::time::Duration;
 
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops, as
 /// `(first offset, last offset)`.
@@ -80,7 +83,7 @@ fn listed(manifest: &PartitionManifest) -> Vec<(u64, u64)> {
 
 /// Make the replica the primary of a later view, as after primacy moved away
 /// and came back.
-fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
+pub(super) fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
     loop {
         let view = partition.consensus.view() + 1;
         partition.consensus.set_view(view);
@@ -284,6 +287,29 @@ async fn given_a_trim_point_the_manifest_does_not_hold_when_asking_should_make_o
     assert!(partition.object_deletes_await_manifest());
 }
 
+/// A put that outlives its view reports back after the replica leads again.
+/// Taken as the new view's publish, it would let deletes go ahead under a
+/// manifest this view never stored.
+#[compio::test]
+async fn given_a_publish_of_an_earlier_view_when_its_result_arrives_during_the_next_views_publish_should_change_nothing()
+ {
+    let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
+    let now = IggyTimestamp::now();
+    Box::pin(partition.remove_sealed_segments_up_to(SEALED[0].1)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    let (earlier, _manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    regain_primacy(&mut partition);
+    let (id, _manifest, scope) = partition.begin_manifest_publish(now).unwrap();
+
+    partition.finish_manifest_publish(earlier, &STORED, now);
+
+    assert!(partition.object_deletes_await_manifest());
+    assert!(!scope.is_cancelled());
+    assert!(partition.begin_manifest_publish(now).is_none());
+    partition.finish_manifest_publish(id, &STORED, now);
+    assert!(!partition.object_deletes_await_manifest());
+}
+
 #[compio::test]
 async fn given_a_backup_with_a_trim_point_when_asking_should_not_hold_its_delete_pass_back() {
     let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
@@ -314,4 +340,226 @@ async fn given_a_manifest_when_publishing_through_an_executor_should_store_it_un
     let size = store.head(&key).await.unwrap().size;
     let object = store.get_range(&key, 0..size).await.unwrap();
     assert_eq!(PartitionManifest::decode(&object.bytes), Ok(manifest));
+}
+
+/// Store the oldest sealed segment above the floor through `publisher`'s
+/// store, and commit its advance as `op`.
+async fn upload_and_advance(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    publisher: &Publisher,
+    op: u64,
+) {
+    let upload = partition.next_segment_upload().unwrap();
+    upload_segment(publisher.executor().store(), &layout(), &upload)
+        .await
+        .unwrap();
+    let advance = partition.note_segment_uploaded(&upload.record).unwrap();
+    Box::pin(apply(partition, op, advance)).await;
+}
+
+/// One pass that `publisher` stores.
+async fn published_pass(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    publisher: &Publisher,
+    now: IggyTimestamp,
+) {
+    let (id, manifest, scope) = partition.begin_manifest_publish(now).unwrap();
+    let outcome = publisher.publish(manifest, scope).await;
+    partition.finish_manifest_publish(id, &outcome, now);
+    assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+}
+
+async fn manifest_in(store: &MemoryStore) -> PartitionManifest {
+    let key = layout().manifest_key(&PREFIX);
+    let size = store.head(&key).await.unwrap().size;
+    let object = store.get_range(&key, 0..size).await.unwrap();
+    PartitionManifest::decode(&object.bytes).unwrap()
+}
+
+/// The primary stores a segment and commits its advance, then crashes before
+/// the pass that would publish it. The manifest it left behind names only
+/// objects the store holds, and the restarted primary builds the next one
+/// from its chain file, not from the one it finds in the store.
+#[compio::test]
+async fn given_a_crash_between_a_segment_upload_and_its_manifest_when_the_primary_restarts_should_catch_the_manifest_up()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(tiered_partition_on_disk(root.path())).await;
+    let publisher = publisher();
+    let store = publisher.executor().store();
+    let now = IggyTimestamp::now();
+    Box::pin(upload_and_advance(&mut partition, &publisher, 100)).await;
+    Box::pin(published_pass(&mut partition, &publisher, now)).await;
+
+    Box::pin(upload_and_advance(&mut partition, &publisher, 101)).await;
+    drop(partition);
+
+    let behind = manifest_in(store).await;
+    assert_eq!(listed(&behind), [SEALED[0]]);
+    assert_eq!(behind.floor, Some(SEALED[0].1));
+    for segment in &behind.segments {
+        for object in [SegmentObject::Log, SegmentObject::Index] {
+            let key = layout().segment_key(&SegmentKey {
+                prefix: PREFIX,
+                start_offset: segment.start_offset,
+                object,
+            });
+            assert!(store.head(&key).await.is_ok(), "{key} is not stored");
+        }
+    }
+
+    let mut rebooted = Box::pin(reboot(&config)).await;
+    Box::pin(published_pass(&mut rebooted, &publisher, now)).await;
+
+    let caught_up = manifest_in(store).await;
+    assert_eq!(listed(&caught_up), SEALED);
+    assert_eq!(caught_up.floor, Some(SEALED[1].1));
+    assert_eq!(caught_up.trim_point, None);
+}
+
+/// A replica of a group of three that leads view 0 of a partition that
+/// places its batches.
+async fn placing_leader() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+    let (directory, mut partition) =
+        Box::pin(disk_poll_partition_with_replicas(&repair_config(), 3)).await;
+    partition.set_places_batches(true);
+    assert!(partition.consensus.is_primary());
+    (directory, partition)
+}
+
+const REFUSED: ManifestPublishOutcome = Ok(Err(ObjectStoreError::Unavailable(String::new())));
+
+/// How long after `moment` the partition owes its next pass.
+fn owed_after(partition: &IggyPartition<IggyMessageBus>, moment: IggyTimestamp) -> Duration {
+    let due_at = partition.manifest_pass_due_at().unwrap();
+    Duration::from_micros(due_at.as_micros() - moment.as_micros())
+}
+
+#[compio::test]
+async fn given_a_failed_publish_of_a_placing_primary_when_asking_should_owe_a_pass_only_after_its_backoff()
+ {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let failed_at = IggyTimestamp::now();
+    assert_eq!(partition.manifest_pass_due_at(), None, "no pass ran yet");
+
+    assert!(pass(&mut partition, failed_at, &REFUSED).is_some());
+
+    assert_eq!(owed_after(&partition, failed_at), MANIFEST_RETRY_AFTER);
+    let retried = pass(
+        &mut partition,
+        after(failed_at, MANIFEST_RETRY_AFTER),
+        &STORED,
+    );
+    assert!(retried.is_some(), "the owed pass publishes");
+}
+
+/// The executor of this view dropped the job: the scope the partition holds
+/// was not cancelled, so the put may never have run.
+#[compio::test]
+async fn given_a_job_cancelled_within_its_view_when_asking_should_owe_its_retry() {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let cancelled_at = IggyTimestamp::now();
+
+    assert!(pass(&mut partition, cancelled_at, &Err(TierJobCancelled)).is_some());
+
+    assert_eq!(owed_after(&partition, cancelled_at), MANIFEST_RETRY_AFTER);
+}
+
+#[compio::test]
+async fn given_publishes_that_keep_failing_when_asking_should_double_the_wait_up_to_its_most() {
+    const FAILURES: u32 = 9;
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let mut failed_at = IggyTimestamp::now();
+    let mut waits = Vec::new();
+
+    for _ in 0..FAILURES {
+        assert!(pass(&mut partition, failed_at, &REFUSED).is_some());
+        let wait = owed_after(&partition, failed_at);
+        waits.push(wait);
+        failed_at = after(failed_at, wait);
+    }
+
+    let doubled: Vec<Duration> = (0..FAILURES)
+        .map(|failure| (MANIFEST_RETRY_AFTER * 2_u32.pow(failure)).min(MANIFEST_RETRY_AFTER_MAX))
+        .collect();
+    assert_eq!(waits, doubled);
+    assert_eq!(waits.last(), Some(&MANIFEST_RETRY_AFTER_MAX), "capped");
+}
+
+#[compio::test]
+async fn given_failed_publishes_when_one_stores_should_clear_the_backoff() {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let mut failed_at = IggyTimestamp::now();
+    for _ in 0..3 {
+        assert!(pass(&mut partition, failed_at, &REFUSED).is_some());
+        failed_at = partition.manifest_pass_due_at().unwrap();
+    }
+
+    let stored_at = failed_at;
+    assert!(pass(&mut partition, stored_at, &STORED).is_some());
+
+    assert_eq!(
+        owed_after(&partition, stored_at),
+        MANIFEST_REPEAT_AFTER,
+        "only the repeat is owed"
+    );
+    let repeat_at = after(stored_at, MANIFEST_REPEAT_AFTER);
+    assert!(pass(&mut partition, repeat_at, &REFUSED).is_some());
+    assert_eq!(
+        owed_after(&partition, repeat_at),
+        MANIFEST_RETRY_AFTER,
+        "the next failure waits the shortest time"
+    );
+}
+
+#[compio::test]
+async fn given_a_first_manifest_of_a_placing_primary_when_asking_should_owe_the_repeat_after_its_wait()
+ {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let first = IggyTimestamp::now();
+    assert!(pass(&mut partition, first, &STORED).is_some());
+
+    assert_eq!(owed_after(&partition, first), MANIFEST_REPEAT_AFTER);
+
+    let repeat_at = after(first, MANIFEST_REPEAT_AFTER);
+    assert!(pass(&mut partition, repeat_at, &STORED).is_some());
+    assert_eq!(partition.manifest_pass_due_at(), None, "repeated once");
+}
+
+#[compio::test]
+async fn given_a_publish_in_flight_or_a_backup_when_asking_should_owe_no_pass() {
+    let (_directory, mut partition) = Box::pin(placing_leader()).await;
+    let now = IggyTimestamp::now();
+    assert!(pass(&mut partition, now, &REFUSED).is_some());
+    let due_at = partition.manifest_pass_due_at().unwrap();
+
+    let (id, _manifest, _scope) = partition.begin_manifest_publish(due_at).unwrap();
+    assert_eq!(partition.manifest_pass_due_at(), None, "a publish runs");
+    partition.finish_manifest_publish(id, &REFUSED, due_at);
+    assert!(partition.manifest_pass_due_at().is_some());
+
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(!partition.consensus.is_primary());
+    assert_eq!(partition.manifest_pass_due_at(), None, "a backup");
+
+    regain_primacy(&mut partition);
+    assert_eq!(
+        partition.manifest_pass_due_at(),
+        None,
+        "a new view owes its first pass instead"
+    );
+    assert!(partition.manifest_awaits_first_pass());
+}
+
+/// The segment cleaner runs the passes of a tiered partition.
+#[compio::test]
+async fn given_a_tiered_partition_when_its_publish_fails_should_owe_no_pass() {
+    let (_directory, mut partition) = Box::pin(partition_with_stored(1)).await;
+    let now = IggyTimestamp::now();
+
+    assert!(pass(&mut partition, now, &REFUSED).is_some());
+    assert_eq!(partition.manifest_pass_due_at(), None);
+    assert!(pass(&mut partition, now, &STORED).is_some());
+    assert_eq!(partition.manifest_pass_due_at(), None);
 }

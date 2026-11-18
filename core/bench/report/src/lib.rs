@@ -38,9 +38,20 @@ pub fn create_throughput_chart(
     dark: bool,
     strip_title_and_subtext: bool,
 ) -> Chart {
+    create_throughput_chart_with_subtext(report, &report.subtext(), dark, strip_title_and_subtext)
+}
+
+/// [`create_throughput_chart`] with `subtext` in place of the report's own, for a caller that
+/// measures the report's numbers in another way.
+pub fn create_throughput_chart_with_subtext(
+    report: &BenchmarkReport,
+    subtext: &str,
+    dark: bool,
+    strip_title_and_subtext: bool,
+) -> Chart {
     let title = report.title(ChartKind::Throughput);
 
-    let mut chart = IggyChart::new(&title, &report.subtext(), dark, strip_title_and_subtext)
+    let mut chart = IggyChart::new(&title, subtext, dark, strip_title_and_subtext)
         .with_time_x_axis()
         .with_dual_y_axis("Throughput [MB/s]", "Throughput [msg/s]");
 
@@ -107,9 +118,19 @@ pub fn create_latency_chart(
     dark: bool,
     strip_title_and_subtext: bool,
 ) -> Chart {
+    create_latency_chart_with_subtext(report, &report.subtext(), dark, strip_title_and_subtext)
+}
+
+/// [`create_latency_chart`] with `subtext` in place of the report's own.
+pub fn create_latency_chart_with_subtext(
+    report: &BenchmarkReport,
+    subtext: &str,
+    dark: bool,
+    strip_title_and_subtext: bool,
+) -> Chart {
     let title = report.title(ChartKind::Latency);
 
-    let mut chart = IggyChart::new(&title, &report.subtext(), dark, strip_title_and_subtext)
+    let mut chart = IggyChart::new(&title, subtext, dark, strip_title_and_subtext)
         .with_time_x_axis()
         .with_y_axis("Latency [ms]");
 
@@ -153,8 +174,23 @@ pub fn create_latency_distribution_chart(
     dark: bool,
     strip_title_and_subtext: bool,
 ) -> Chart {
+    create_latency_distribution_chart_with_subtext(
+        report,
+        &report.subtext(),
+        dark,
+        strip_title_and_subtext,
+    )
+}
+
+/// [`create_latency_distribution_chart`] with `subtext` in place of the report's own.
+pub fn create_latency_distribution_chart_with_subtext(
+    report: &BenchmarkReport,
+    subtext: &str,
+    dark: bool,
+    strip_title_and_subtext: bool,
+) -> Chart {
     let title = report.title(ChartKind::LatencyDistribution);
-    let chart = IggyChart::new(&title, &report.subtext(), dark, strip_title_and_subtext);
+    let chart = IggyChart::new(&title, subtext, dark, strip_title_and_subtext);
     let groups = report
         .group_metrics
         .iter()

@@ -22,8 +22,13 @@ package org.apache.iggy.client.async.tcp;
 import org.apache.iggy.client.async.PartitionsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -84,5 +89,16 @@ public class PartitionsTcpClient implements PartitionsClient {
             topologyChanged.run();
             return null;
         });
+    }
+
+    @Override
+    public CompletableFuture<Page<Partition>> getPartitionsPage(StreamId streamId, TopicId topicId, PageQuery query) {
+        return PageReads.read(
+                connection(),
+                CommandCode.Partition.GET_ALL,
+                new NamedPageQuery(query),
+                BytesDeserializer::readPartition,
+                streamId,
+                topicId);
     }
 }

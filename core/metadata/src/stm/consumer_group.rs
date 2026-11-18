@@ -561,10 +561,11 @@ impl StateHandler for CreateConsumerGroupRequest {
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
         topic
             .consumer_groups
-            .insert(id, ConsumerGroup::new(id, name.clone()));
+            .insert(id, Box::new(ConsumerGroup::new(id, name.clone())));
         topic.consumer_group_index.insert(name, id);
         let partitions_count = topic.partitions.len() as u32;
         let consumer_groups_count = topic.consumer_groups.len() as u32;
+        state.catalog_counts.consumer_groups += 1;
         let changes = state
             .topic_key(stream_id, topic_id)
             .map(|topic| {
@@ -649,6 +650,8 @@ impl StateHandler for DeleteConsumerGroupRequest {
         };
         topic.consumer_group_index.remove(&group.name);
         let consumer_groups_count = u32::try_from(topic.consumer_groups.len()).ok();
+        state.catalog_counts.consumer_groups =
+            state.catalog_counts.consumer_groups.saturating_sub(1);
         // A finalized deletion applies at its completion op. A sibling group
         // created after the intent can hold a later op than the intent.
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
@@ -2165,6 +2168,51 @@ mod tests {
         assert_eq!(topic.consumer_groups[&0].members[0].partitions, [0, 1]);
         assert!(topic.consumer_groups[&1].assignments.is_empty());
         Streams::from_snapshot(Streams::from(state.clone()).to_snapshot()).unwrap();
+    }
+
+    #[test]
+    fn given_a_deleted_group_when_snapshotted_and_listed_should_hold_ascending_ids() {
+        let mut state = streams_with_topic();
+        for name in ["a", "b", "c", "d", "e"] {
+            assert_eq!(create_group(&mut state, name).code, 0);
+        }
+        let delete = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(2),
+        };
+        let deleted = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(deleted.code, 0);
+        assert_eq!(create_group(&mut state, "f").code, 0);
+        let expected = [0, 1, 3, 4, 5];
+
+        let snapshot = Streams::from(state).to_snapshot();
+        let snapshotted: Vec<u64> = snapshot.items[0].1.topics[0]
+            .1
+            .consumer_groups
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(snapshotted, expected);
+
+        let restored = Streams::from_snapshot(snapshot).unwrap();
+        let listed: Vec<u64> = restored.read(|inner| {
+            inner
+                .items
+                .get(0)
+                .unwrap()
+                .topics
+                .get(0)
+                .unwrap()
+                .consumer_groups_after(None, false)
+                .map(|group| group.id)
+                .collect()
+        });
+        assert_eq!(listed, expected);
     }
 
     #[test]

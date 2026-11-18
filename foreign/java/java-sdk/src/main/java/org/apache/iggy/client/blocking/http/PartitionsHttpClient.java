@@ -23,6 +23,13 @@ import org.apache.hc.core5.http.message.BasicNameValuePair;
 import org.apache.iggy.client.blocking.PartitionsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
+import tools.jackson.core.type.TypeReference;
+
+import java.util.function.Function;
 
 class PartitionsHttpClient implements PartitionsClient {
 
@@ -52,6 +59,16 @@ class PartitionsHttpClient implements PartitionsClient {
                 new BasicNameValuePair("partitions_count", partitionsCount.toString()));
         httpClient.execute(request);
         sendContexts.clear();
+    }
+
+    @Override
+    public Page<Partition> getPartitionsPage(StreamId streamId, TopicId topicId, PageQuery query) {
+        HttpPage<Partition> page = HttpPage.read(
+                httpClient,
+                STREAMS + "/" + streamId + TOPICS + "/" + topicId + PARTITIONS,
+                new NamedPageQuery(query),
+                new TypeReference<>() {});
+        return page.toPage(Function.identity());
     }
 
     private record CreatePartitions(Long partitionsCount) {}

@@ -22,7 +22,7 @@
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode, StorageEntry};
 use server_common::iobuf::Frozen;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path};
@@ -33,6 +33,8 @@ use std::time::Duration;
 /// Each `SimStorage` is an independent filesystem, so writer identities must not
 /// collide between instances the way bare paths would.
 static NEXT_FILESYSTEM: AtomicU64 = AtomicU64::new(0);
+/// Granularity of the pages a failed writeback leaves in the cache.
+const CACHE_PAGE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Crash {
@@ -105,6 +107,9 @@ struct State {
     trace: Vec<StorageOperation>,
     written_bytes: BTreeMap<usize, usize>,
     write_errors: BTreeMap<usize, u64>,
+    /// Pages of an inode that a failed writeback left in the cache, clean and
+    /// not on stable storage. A write to one makes it dirty again.
+    unwritten: BTreeMap<usize, BTreeSet<usize>>,
     fault: Option<(usize, FaultMode)>,
     paused: Option<StorageOperation>,
     waiters: Vec<std::task::Waker>,
@@ -140,6 +145,7 @@ impl SimStorage {
                     Inode::Directory { entries, stable } => entries.clone_from(stable),
                 }
             }
+            state.unwritten.clear();
         }
         state.trace.clear();
         state.fault = None;
@@ -147,9 +153,10 @@ impl SimStorage {
 
     /// Model background writeback without attributing a durability barrier to it.
     pub fn writeback(&self) {
-        for inode in &mut self.state.borrow_mut().inodes {
-            match inode {
-                Inode::File { buffered, stable } => stable.clone_from(buffered),
+        let mut state = self.state.borrow_mut();
+        for inode in 0..state.inodes.len() {
+            match &mut state.inodes[inode] {
+                Inode::File { .. } => state.flush(inode, 0),
                 Inode::Directory { entries, stable } => stable.clone_from(entries),
             }
         }
@@ -164,14 +171,12 @@ impl SimStorage {
     /// Panics if `page_size` is zero.
     pub fn writeback_from_page(&self, page_size: usize, first: usize) {
         assert!(page_size > 0, "page size must be positive");
-        for inode in &mut self.state.borrow_mut().inodes {
-            if let Inode::File { buffered, stable } = inode {
-                let start = first.saturating_mul(page_size);
-                if start >= buffered.len() {
-                    continue;
-                }
-                stable.resize(buffered.len(), 0);
-                stable[start..].copy_from_slice(&buffered[start..]);
+        let mut state = self.state.borrow_mut();
+        let start = first.saturating_mul(page_size);
+        for inode in 0..state.inodes.len() {
+            if matches!(&state.inodes[inode], Inode::File { buffered, .. } if start < buffered.len())
+            {
+                state.flush(inode, start);
             }
         }
     }
@@ -192,8 +197,38 @@ impl SimStorage {
             Inode::File { buffered, stable } => buffered.clone_from(stable),
             Inode::Directory { .. } => return Err(invalid("writeback failure on a directory")),
         }
+        state.unwritten.remove(&inode);
         *state.write_errors.entry(inode).or_default() += 1;
         Ok(())
+    }
+
+    /// Fail every pending writeback the way ext4 and XFS report a failing
+    /// device: a dirty page keeps its new content in the cache and is marked
+    /// clean. Reads still return it, so a restarted process finds bytes that
+    /// are not on stable storage, and a sync writes it only after a new write
+    /// to the page. The handles that were open see the error once, as with
+    /// [`Self::fail_writeback`].
+    pub fn fail_writeback_keeping_cache(&self) {
+        let mut state = self.state.borrow_mut();
+        let state = &mut *state;
+        for (inode, file) in state.inodes.iter().enumerate() {
+            let Inode::File { buffered, stable } = file else {
+                continue;
+            };
+            let dirty: BTreeSet<usize> = buffered
+                .chunks(CACHE_PAGE_SIZE)
+                .enumerate()
+                .filter(|(page, bytes)| {
+                    let start = page * CACHE_PAGE_SIZE;
+                    stable.get(start..start + bytes.len()) != Some(*bytes)
+                })
+                .map(|(page, _)| page)
+                .collect();
+            if !dirty.is_empty() {
+                state.unwritten.entry(inode).or_default().extend(dirty);
+                *state.write_errors.entry(inode).or_default() += 1;
+            }
+        }
     }
 
     pub fn pause_writes(&self) {
@@ -514,6 +549,9 @@ impl DurableFile for SimFile {
             .perform(StorageOperation::Truncate, |state, _| {
                 let length = usize::try_from(length).map_err(|_| invalid("length overflow"))?;
                 state.file_mut(self.inode, self.epoch)?.resize(length, 0);
+                if let Some(pages) = state.unwritten.get_mut(&self.inode) {
+                    pages.retain(|page| page * CACHE_PAGE_SIZE < length);
+                }
                 Ok(())
             })
     }
@@ -534,9 +572,7 @@ impl DurableFile for SimFile {
                         "writeback failed before this handle synced",
                     ));
                 }
-                if let Inode::File { buffered, stable } = &mut state.inodes[self.inode] {
-                    stable.clone_from(buffered);
-                }
+                state.flush(self.inode, 0);
                 Ok(())
             })
     }
@@ -575,6 +611,12 @@ impl SimFile {
                     }
                 }
                 *state.written_bytes.entry(self.inode).or_default() += length;
+                let written = offset / CACHE_PAGE_SIZE..end.div_ceil(CACHE_PAGE_SIZE);
+                if end > offset
+                    && let Some(pages) = state.unwritten.get_mut(&self.inode)
+                {
+                    pages.retain(|page| !written.contains(page));
+                }
                 Ok(())
             })
     }
@@ -589,6 +631,7 @@ impl Default for State {
             trace: Vec::new(),
             written_bytes: BTreeMap::new(),
             write_errors: BTreeMap::new(),
+            unwritten: BTreeMap::new(),
             fault: None,
             paused: None,
             waiters: Vec::new(),
@@ -597,6 +640,23 @@ impl Default for State {
 }
 
 impl State {
+    /// Write the cached bytes of a file to stable storage from `start` on,
+    /// apart from the pages a failed writeback left clean.
+    fn flush(&mut self, inode: usize, start: usize) {
+        let Inode::File { buffered, stable } = &mut self.inodes[inode] else {
+            return;
+        };
+        stable.resize(buffered.len(), 0);
+        let unwritten = self.unwritten.get(&inode);
+        for (page, bytes) in buffered.chunks(CACHE_PAGE_SIZE).enumerate() {
+            let begin = (page * CACHE_PAGE_SIZE).max(start);
+            let end = page * CACHE_PAGE_SIZE + bytes.len();
+            if begin < end && unwritten.is_none_or(|pages| !pages.contains(&page)) {
+                stable[begin..end].copy_from_slice(&buffered[begin..end]);
+            }
+        }
+    }
+
     fn lookup(&self, path: &Path) -> io::Result<usize> {
         let mut inode = 0;
         for name in components(path)? {

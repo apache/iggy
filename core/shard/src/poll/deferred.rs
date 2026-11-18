@@ -336,6 +336,8 @@ struct PartitionStatus {
     /// A fault, a read history that changes, a state transfer, or a status
     /// other than normal.
     unstable: bool,
+    /// The view start is applied and the view is persisted. The quorum check
+    /// that bounds the reads of a cut-off primary waits for that write.
     view_started: bool,
     primary: bool,
     /// The incarnation that the owner of the partition serves.
@@ -356,7 +358,7 @@ impl PartitionStatus {
                 || partition.requires_state_transfer()
                 || !consensus.is_normal()
                 || consensus.is_transferring(),
-            view_started: consensus.applied_view_start(),
+            view_started: consensus.applied_view_start() && !consensus.needs_superblock_persist(),
             primary: consensus.is_primary(),
             incarnation,
         }

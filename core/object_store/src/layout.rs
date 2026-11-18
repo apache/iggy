@@ -27,6 +27,8 @@ const FRESH: &str = "fresh";
 const FRESH_ID_DIGITS: usize = 32;
 /// Hexadecimal digits of the replica in a fresh object's key.
 const FRESH_REPLICA_DIGITS: usize = 2;
+/// Hexadecimal digits of the shard in a fresh object's key.
+const FRESH_SHARD_DIGITS: usize = 4;
 const TOPICS: &str = "topics";
 /// Decimal digits of `u64::MAX`: the most that an id takes, and the width of
 /// a zero-padded offset.
@@ -232,23 +234,32 @@ impl KeyLayout {
     /// with. No id of a stream is `fresh`, so no manifest key is under
     /// [`Self::fresh_prefix`].
     ///
-    /// The key names the replica that wrote the object before the id, which
-    /// names it again. So one listing returns the objects of one replica,
-    /// which is what the replica that deletes them asks for.
+    /// The key names the replica and the shard that wrote the object before
+    /// the id, which names them again. So one listing returns the objects of
+    /// one replica, which is what the replica that deletes them asks for, and
+    /// each shard writes into a directory of its own.
     #[must_use]
     pub fn fresh_key(&self, object_id: u128) -> String {
+        let id = FreshObjectId::from_raw(object_id);
         format!(
             "{}{object_id:0width$x}",
-            self.fresh_replica_prefix(FreshObjectId::from_raw(object_id).replica()),
+            self.fresh_shard_prefix(id.replica(), id.shard()),
             width = FRESH_ID_DIGITS
         )
     }
 
-    /// The listing prefix of the fresh objects that `replica` wrote, with a
-    /// trailing `/`.
+    /// The listing prefix of the fresh objects that `replica` wrote on any
+    /// of its shards, with a trailing `/`.
     #[must_use]
     pub fn fresh_replica_prefix(&self, replica: u8) -> String {
         format!("{}{replica:02x}/", self.fresh_prefix())
+    }
+
+    /// The listing prefix of the fresh objects that `shard` of `replica`
+    /// wrote, with a trailing `/`.
+    #[must_use]
+    pub fn fresh_shard_prefix(&self, replica: u8, shard: u16) -> String {
+        format!("{}{shard:04x}/", self.fresh_replica_prefix(replica))
     }
 
     /// The listing prefix of every fresh object of the root, with a trailing
@@ -264,7 +275,7 @@ impl KeyLayout {
     #[must_use]
     pub fn parse_fresh_key(&self, key: &str) -> Option<u128> {
         let name = key.strip_prefix(self.fresh_prefix().as_str())?;
-        let id = name.get(FRESH_REPLICA_DIGITS + 1..)?;
+        let id = name.get(FRESH_REPLICA_DIGITS + 1 + FRESH_SHARD_DIGITS + 1..)?;
         let lowercase_hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
         let id = (id.len() == FRESH_ID_DIGITS && id.bytes().all(lowercase_hex))
             .then(|| u128::from_str_radix(id, 16).ok())
@@ -504,14 +515,19 @@ mod tests {
 
         assert_eq!(
             key,
-            "tenant/iggy/meta/fresh/00/0000000000000000000000000000001f"
+            "tenant/iggy/meta/fresh/00/0000/0000000000000000000000000000001f"
         );
         assert!(key.starts_with(&layout.fresh_prefix()));
         let written_by_ten = FreshObjectId::new(10, 2, 3, 4).unwrap().get();
         let key_of_ten = layout.fresh_key(written_by_ten);
-        assert!(key_of_ten.starts_with("tenant/iggy/meta/fresh/0a/"));
+        assert!(key_of_ten.starts_with("tenant/iggy/meta/fresh/0a/0002/"));
         assert!(key_of_ten.starts_with(&layout.fresh_replica_prefix(10)));
         assert!(!key_of_ten.starts_with(&layout.fresh_replica_prefix(1)));
+        assert_eq!(
+            layout.fresh_shard_prefix(10, 2),
+            "tenant/iggy/meta/fresh/0a/0002/"
+        );
+        assert!(!key_of_ten.starts_with(&layout.fresh_shard_prefix(10, 3)));
         assert_eq!(layout.parse_fresh_key(&key_of_ten), Some(written_by_ten));
         assert!(validate_key(&key).is_ok());
         assert_eq!(layout.parse_fresh_key(&key), Some(0x1f));
@@ -531,14 +547,17 @@ mod tests {
             layout.identity_key(),
             layout.manifest_key(&PREFIX),
             other_root.fresh_key(1),
-            "tenant/iggy/meta/fresh/00/1f".to_owned(),
+            "tenant/iggy/meta/fresh/00/0000/1f".to_owned(),
             "tenant/iggy/meta/fresh/0000000000000000000000000000001f".to_owned(),
-            "tenant/iggy/meta/fresh/00/0000000000000000000000000000001F".to_owned(),
-            "tenant/iggy/meta/fresh/00/0000000000000000000000000000001f/x".to_owned(),
-            "tenant/iggy/meta/fresh/00/+000000000000000000000000000001f".to_owned(),
+            "tenant/iggy/meta/fresh/00/0000000000000000000000000000001f".to_owned(),
+            "tenant/iggy/meta/fresh/00/0000/0000000000000000000000000000001F".to_owned(),
+            "tenant/iggy/meta/fresh/00/0000/0000000000000000000000000000001f/x".to_owned(),
+            "tenant/iggy/meta/fresh/00/0000/+000000000000000000000000000001f".to_owned(),
             // The id says replica 0 wrote it.
-            "tenant/iggy/meta/fresh/01/0000000000000000000000000000001f".to_owned(),
-            "tenant/iggy/meta/fresh/0A/0000000000000000000000000000001f".to_owned(),
+            "tenant/iggy/meta/fresh/01/0000/0000000000000000000000000000001f".to_owned(),
+            "tenant/iggy/meta/fresh/0A/0000/0000000000000000000000000000001f".to_owned(),
+            // The id says shard 0 wrote it.
+            "tenant/iggy/meta/fresh/00/0001/0000000000000000000000000000001f".to_owned(),
         ] {
             assert_eq!(layout.parse_fresh_key(&key), None, "{key}");
         }

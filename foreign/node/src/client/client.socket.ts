@@ -126,7 +126,8 @@ const READ_COMMANDS = new Set<number>([
   COMMAND_CODE.GetClient, COMMAND_CODE.GetClients, COMMAND_CODE.GetUser, COMMAND_CODE.GetUsers,
   COMMAND_CODE.GetAccessTokens, COMMAND_CODE.GetPartitionRoute, COMMAND_CODE.GetOffset,
   COMMAND_CODE.GetStream, COMMAND_CODE.GetStreams, COMMAND_CODE.GetTopic,
-  COMMAND_CODE.GetTopics, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups, COMMAND_CODE.SyncGroup,
+  COMMAND_CODE.GetTopics, COMMAND_CODE.GetPartitions, COMMAND_CODE.GetGroup, COMMAND_CODE.GetGroups,
+  COMMAND_CODE.SyncGroup,
 ]);
 const OFFSET_COMMANDS = new Set<number>([
   COMMAND_CODE.GetOffset, COMMAND_CODE.StoreOffset, COMMAND_CODE.DeleteConsumerOffset

@@ -41,6 +41,7 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "ConsumerGroupsPage",
     "ConsumerOffsetInfo",
     "DirectProducerConfig",
     "GeoMode",
@@ -95,11 +96,13 @@ __all__ = [
     "OptionError",
     "OptionKey",
     "OptionSpec",
+    "PageOrder",
     "Partition",
     "PartitionContext",
     "PartitionReader",
     "PartitionResizePolicy",
     "Partitioning",
+    "PartitionsPage",
     "PendingOperationError",
     "PendingOperationsConfig",
     "Permissions",
@@ -121,6 +124,7 @@ __all__ = [
     "StreamDetails",
     "StreamOptions",
     "StreamPermissions",
+    "StreamsPage",
     "SystemSnapshotType",
     "TcpConfig",
     "TcpReconnectionConfig",
@@ -130,11 +134,13 @@ __all__ = [
     "TopicOptions",
     "TopicPermissions",
     "TopicType",
+    "TopicsPage",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
     "UserOptions",
     "UserStatus",
+    "UsersPage",
     "WebSocketConfig",
     "WebSocketFramingConfig",
     "WebSocketReconnectionConfig",
@@ -602,6 +608,23 @@ class ConsumerGroupMember:
     def partitions(self) -> builtins.list[builtins.int]:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
+        """
+
+@typing.final
+class ConsumerGroupsPage:
+    r"""
+    One page of a list, as `IggyClient.get_consumer_groups_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[ConsumerGroup]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
         """
 
 @typing.final
@@ -1393,13 +1416,40 @@ class IggyClient:
         """
     def get_users(self) -> collections.abc.Awaitable[list[UserInfo]]:
         r"""
-        Get the info about all the users.
+        Get the info about all the users, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A user that someone creates or deletes during the read can appear or
+        not appear. `get_users_page` reads one page.
 
         Returns:
             An awaitable that resolves to `list[UserInfo]`.
 
         Raises:
             RuntimeError: If the request fails.
+        """
+    def get_users_page(
+        self,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[UsersPage]:
+        r"""
+        Reads one page of the users. `name` matches the username.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules.
+
+        Returns:
+            An awaitable that resolves to `UsersPage`.
+
+        Raises:
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the users gets the unauthorized code.
         """
     def create_user(
         self,
@@ -1613,11 +1663,17 @@ class IggyClient:
         r"""
         Gets stream by id.
         Returns the stream details, or `None` if the stream does not exist.
-        Raises `RuntimeError` on failure.
+        Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+        larger than the reply size limit raises `IggyError` with code 97
+        (`ReplyTooLarge`). `get_topics_page` reads the topics in pages.
         """
     def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
-        Return all streams.
+        Return all streams, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A stream that someone creates or deletes during the read can appear or
+        not appear. `get_streams_page` reads one page.
 
         Returns:
             A list of `Stream` summaries.
@@ -1625,6 +1681,44 @@ class IggyClient:
         Raises:
             RuntimeError: If the client is not authenticated, the user lacks global
                 `read_streams` or `manage_streams` permission, or the request fails.
+        """
+    def get_streams_page(
+        self,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[StreamsPage]:
+        r"""
+        Reads one page of the streams.
+
+        Pass the page's `next` as `cursor`, with the same other arguments, to
+        read the next page. The read ends at the first page whose `next` is
+        `None`. A page can be empty and still have a `next`.
+
+        Args:
+            order: `PageOrder.Id`, the default, or `PageOrder.Created`.
+            descending: Read from the last item to the first.
+            limit: Items per page, 1 to 1000. Defaults to 100.
+            cursor: The `next` of the previous page, `None` for the first page.
+            name: Keep only the items whose name holds this text, case-sensitive.
+                1 to 255 bytes.
+
+        Returns:
+            An awaitable that resolves to `StreamsPage`.
+
+        Raises:
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: If the request fails. A cursor or a query that breaks
+                the page rules raises it with the invalid command code before
+                anything is sent. The server refuses a cursor that it cannot
+                use, such as the cursor of another order, with the same code.
+                Over HTTP, a refusal from the server has code 300 (HTTP response
+                error), and its message holds the server error body. A user
+                without the permission to read the streams gets the
+                unauthorized code.
         """
     def update_stream(
         self,
@@ -1723,13 +1817,19 @@ class IggyClient:
         r"""
         Gets topic by stream and id.
         Returns the topic details, or `None` if the topic does not exist.
-        Raises `RuntimeError` on failure.
+        Raises `RuntimeError` on failure. Over TCP, QUIC and WebSocket, a reply
+        larger than the reply size limit raises `IggyError` with code 97
+        (`ReplyTooLarge`). `get_partitions_page` reads the partitions in pages.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[list[Topic]]:
         r"""
-        Get all topics in a stream.
+        Get all topics in a stream, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A topic that someone creates or deletes during the read can appear or
+        not appear. `get_topics_page` reads one page.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -1739,6 +1839,35 @@ class IggyClient:
 
         Raises:
             RuntimeError: If the identifier is invalid or the request fails.
+        """
+    def get_topics_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[TopicsPage]:
+        r"""
+        Reads one page of the topics of a stream. A missing stream gives an
+        empty page without `next`.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `TopicsPage`.
+
+        Raises:
+            ValueError: If the identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topics gets the unauthorized code.
         """
     def update_topic(
         self,
@@ -1885,6 +2014,37 @@ class IggyClient:
                 `manage_topics`, or per-topic `manage_topic` permission, or the
                 request fails.
         """
+    def get_partitions_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[PartitionsPage]:
+        r"""
+        Reads one page of the partitions of a topic.
+
+        Takes the keyword arguments of `get_streams_page` except `name`,
+        because a partition has no name. The cursor rules are the same.
+        Partition ids follow creation, so `PageOrder.Created` gives the id
+        order too.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `PartitionsPage`.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topic gets the unauthorized code.
+        """
     def delete_segments(
         self,
         stream_id: builtins.str | builtins.int,
@@ -1970,7 +2130,11 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
         r"""
-        Get all consumer groups for the specified stream and topic.
+        Get all consumer groups for the specified stream and topic, in id order.
+
+        The list is read in pages of 1,000, so it is not one consistent read.
+        A group that someone creates or deletes during the read can appear or
+        not appear. `get_consumer_groups_page` reads one page.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -1982,6 +2146,37 @@ class IggyClient:
         Raises:
             ValueError: If an identifier is invalid.
             RuntimeError: If the request fails.
+        """
+    def get_consumer_groups_page(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        *,
+        order: PageOrder | None = None,
+        descending: builtins.bool = False,
+        limit: builtins.int | None = None,
+        cursor: builtins.str | None = None,
+        name: builtins.str | None = None,
+    ) -> collections.abc.Awaitable[ConsumerGroupsPage]:
+        r"""
+        Reads one page of the consumer groups of a topic.
+
+        Takes the keyword arguments of `get_streams_page`, with the same
+        cursor rules. Group ids follow creation, so `PageOrder.Created` gives
+        the id order too.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `ConsumerGroupsPage`.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            OverflowError: If `limit` is outside the unsigned 32-bit range.
+            IggyError: As for `get_streams_page`. A user without the permission
+                to read the topic gets the unauthorized code.
         """
     def delete_consumer_group(
         self,
@@ -3885,6 +4080,16 @@ class OptionSpec:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class PageOrder:
+    r"""
+    The order of a list page: `Id` by id, `Created` by creation time and then
+    by id.
+    """
+
+    Id: typing.ClassVar[PageOrder]
+    Created: typing.ClassVar[PageOrder]
+
+@typing.final
 class Partition:
     @property
     def id(self) -> builtins.int:
@@ -4146,6 +4351,23 @@ class Partitioning:
         Raises:
             ValueError: If the encoded key is empty or exceeds 255 bytes.
             TypeError: If `key` is not `str` or `bytes`.
+        """
+
+@typing.final
+class PartitionsPage:
+    r"""
+    One page of a list, as `IggyClient.get_partitions_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Partition]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
         """
 
 @typing.final
@@ -5210,6 +5432,23 @@ class StreamPermissions:
         """
 
 @typing.final
+class StreamsPage:
+    r"""
+    One page of a list, as `IggyClient.get_streams_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Stream]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
 class SystemSnapshotType:
     r"""
     Type of system data to include in a snapshot.
@@ -5699,6 +5938,23 @@ class TopicType:
     """
 
 @typing.final
+class TopicsPage:
+    r"""
+    One page of a list, as `IggyClient.get_topics_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[Topic]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
+
+@typing.final
 class UserHeaders(dict):
     r"""
     User headers dictionary returned by `ReceiveMessage.user_headers`.
@@ -5841,6 +6097,23 @@ class UserStatus:
     r"""
     The user account is inactive and cannot be used.
     """
+
+@typing.final
+class UsersPage:
+    r"""
+    One page of a list, as `IggyClient.get_users_page` returns it.
+    """
+    @property
+    def items(self) -> builtins.list[UserInfo]:
+        r"""
+        The items of the page, in the order of the query.
+        """
+    @property
+    def next(self) -> builtins.str | None:
+        r"""
+        Pass it as `cursor`, with the same other arguments, to read the
+        next page. `None` on the last page.
+        """
 
 @typing.final
 class WebSocketConfig:

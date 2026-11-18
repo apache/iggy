@@ -784,14 +784,22 @@ impl ClientTable {
         true
     }
 
-    pub fn finalize_session(
-        &mut self,
-        identity: iggy_binary_protocol::requests::system::SessionIdentity,
-    ) -> bool {
-        if !self.ended_sessions().any(|ended| ended == identity) {
-            return false;
+    /// Forget every ended session whose end op is at or below
+    /// `retired_through`, and return how many it forgot.
+    pub fn finalize_sessions_through(&mut self, retired_through: u64) -> usize {
+        let mut finalized = 0;
+        for slot in &mut self.slots {
+            if slot
+                .as_ref()
+                .and_then(|entry| entry.ended_op)
+                .is_some_and(|ended_op| ended_op <= retired_through)
+                && let Some(entry) = slot.take()
+            {
+                self.index.remove(&entry.client_id);
+                finalized += 1;
+            }
         }
-        self.forget_session(identity.client_id, identity.session)
+        finalized
     }
 
     /// Apply the limit carried by the ordered log, independent of local configuration.
@@ -2326,7 +2334,7 @@ mod tests {
                     restored.check_request(CLIENT, EPOCH, 7, Operation::SendMessages),
                     RequestStatus::NoSession
                 ));
-                assert!(restored.finalize_session(ended[0]));
+                assert_eq!(restored.finalize_sessions_through(END), 1);
                 assert_eq!(restored.count(), 0);
             }
         }
@@ -3187,25 +3195,9 @@ mod tests {
                 panic!("the ended session lost its Logout result");
             };
             assert_eq!(cached.into_message().as_slice(), reply.as_slice());
-            let identity = iggy_binary_protocol::requests::system::SessionIdentity {
-                client_id: CLIENT,
-                session: EPOCH,
-                metadata_watermark: END,
-            };
-            assert!(!restored.finalize_session(
-                iggy_binary_protocol::requests::system::SessionIdentity {
-                    session: EPOCH - 1,
-                    ..identity
-                }
-            ));
-            assert!(!restored.finalize_session(
-                iggy_binary_protocol::requests::system::SessionIdentity {
-                    metadata_watermark: END + 1,
-                    ..identity
-                }
-            ));
+            assert_eq!(restored.finalize_sessions_through(END - 1), 0);
             assert_eq!(restored.count(), 1);
-            assert!(restored.finalize_session(identity));
+            assert_eq!(restored.finalize_sessions_through(END), 1);
             restored.set_capacity(20);
             assert_eq!(restored.capacity(), 1);
             restored
