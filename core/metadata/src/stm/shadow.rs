@@ -400,6 +400,7 @@ fn create_stream(
     let inserted = state.items.insert(stream);
     debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
     state.index.insert(name, id);
+    state.created_index.insert((timestamp.as_micros(), id));
     let changes = state
         .items
         .get(id)
@@ -1046,6 +1047,18 @@ mod tests {
         assert_eq!(apply(&mut inner, 13, &remove_stream).code, 0);
         assert!(!inner.items.contains(stream_id as usize));
         assert!(!inner.index.contains_key(SHADOW_NAME));
+    }
+
+    #[test]
+    fn given_a_shadow_stream_when_listing_streams_by_creation_should_list_it() {
+        let (inner, stream_id) = shadowed();
+
+        let listed: Vec<usize> = inner
+            .streams_by_created(None, false)
+            .map(|((_, id), _)| id)
+            .collect();
+
+        assert_eq!(listed, [0, stream_id as usize]);
     }
 
     #[test]

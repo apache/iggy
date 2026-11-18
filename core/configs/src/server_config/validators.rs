@@ -32,7 +32,7 @@ use crate::{ConfigEnvMappings, ConfigurationError};
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
 use server_common::sharding::{
-    CONSUMER_SESSION_REPORT_TIMEOUT, LIST_CLIENTS_GATHER_TIMEOUT,
+    CONSUMER_SESSION_REPORT_TIMEOUT, LIST_CLIENTS_GATHER_TIMEOUT, MIN_COMMIT_BATCH_FRAME_SIZE,
     MIN_CONSUMER_SESSION_HEARTBEAT_SIZE,
 };
 use std::ffi::OsStr;
@@ -294,6 +294,12 @@ impl Validatable<ConfigurationError> for ServerConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if bus_cap < MIN_COMMIT_BATCH_FRAME_SIZE as u64 {
+            eprintln!(
+                "{COMPONENT} message_bus.max_message_size ({bus_cap}) must hold a Commit batch of one entry, at least {MIN_COMMIT_BATCH_FRAME_SIZE} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
 
         // WS frame chain: websocket.max_frame_size <= websocket.max_message_size
         // <= message_bus.max_message_size. The bus's WS / WSS install path takes
@@ -406,10 +412,10 @@ impl Validatable<ConfigurationError> for ServerConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        let cluster_timeout = self.cluster.heartbeat_timeout.get_duration();
+        let cluster_timeout = self.cluster.commit_busy_heartbeat_timeout.get_duration();
         if self.cluster.enabled && session_timeout <= cluster_timeout {
             eprintln!(
-                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed cluster.heartbeat_timeout ({cluster_timeout:?}). Raise heartbeat.interval"
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed cluster.commit_busy_heartbeat_timeout ({cluster_timeout:?}). Raise heartbeat.interval"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -1155,10 +1161,11 @@ mod tests {
     }
 
     #[test]
-    fn given_consumer_heartbeat_frame_limits_when_validating_should_require_one_session() {
+    fn given_replica_frame_limits_when_validating_should_require_one_session_and_one_commit() {
         for (cap, valid) in [
             (MIN_CONSUMER_SESSION_HEARTBEAT_SIZE - 1, false),
-            (MIN_CONSUMER_SESSION_HEARTBEAT_SIZE, true),
+            (MIN_COMMIT_BATCH_FRAME_SIZE - 1, false),
+            (MIN_COMMIT_BATCH_FRAME_SIZE, true),
         ] {
             let config =
                 config_with_override(&format!("[message_bus]\nmax_message_size = \"{cap} B\"\n"));
@@ -1170,12 +1177,12 @@ mod tests {
     fn given_session_timeout_within_cluster_liveness_window_when_validating_should_reject() {
         for interval in ["12500ms", "15s"] {
             let config = config_with_override(&format!(
-                "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"{interval}\"\n"
+                "[cluster]\nenabled = true\ncommit_busy_heartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"{interval}\"\n"
             ));
             assert!(config.validate().is_err(), "accepted {interval}");
         }
         let config = config_with_override(
-            "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"16s\"\n",
+            "[cluster]\nenabled = true\ncommit_busy_heartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"16s\"\n",
         );
         assert!(config.validate().is_ok());
     }

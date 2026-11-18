@@ -621,9 +621,12 @@ impl PollPlan {
                 message_count,
             } => (fragments, last_matching_offset, message_count),
             PollTier::Placed { placed, query } => {
-                match placed.read(query, max_selected_bytes).await {
-                    Ok(batches) => crate::journal::select_resident(&batches, query)
-                        .unwrap_or_else(|| (PollFragments::new(), None, 0)),
+                match placed.read(query, max_bytes, max_selected_bytes).await {
+                    Ok(read) => {
+                        truncated = read.truncated;
+                        crate::journal::select_resident(&read.batches, query)
+                            .unwrap_or_else(|| (PollFragments::new(), None, 0))
+                    }
                     // Fail closed, as a disk read does: an answer without
                     // the batch that failed would skip its messages.
                     Err(fault) => {

@@ -15,36 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::consumer_offset::ConsumerOffset;
+namespace Apache.Iggy.Contracts;
 
-#[derive(Debug, Clone)]
-pub struct ConsumerOffsets(papaya::HashMap<usize, ConsumerOffset>);
-
-impl ConsumerOffsets {
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self(papaya::HashMap::with_capacity(capacity))
-    }
-}
-
-impl<I> From<I> for ConsumerOffsets
-where
-    I: IntoIterator<Item = (usize, ConsumerOffset)>,
+/// <summary>
+///     One page of a list.
+/// </summary>
+/// <remarks>
+///     A page can be short or empty and still have a <see cref="Next" />. A read of a whole list ends at the first
+///     page without one.
+/// </remarks>
+/// <typeparam name="T">The item type of the list.</typeparam>
+public sealed class Page<T>
 {
-    fn from(iter: I) -> Self {
-        Self(papaya::HashMap::from_iter(iter))
-    }
-}
+    /// <summary>The items of the page, in the order of the query.</summary>
+    public required IReadOnlyList<T> Items { get; init; }
 
-impl std::ops::Deref for ConsumerOffsets {
-    type Target = papaya::HashMap<usize, ConsumerOffset>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ConsumerOffsets {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
+    /// <summary>The cursor of the next page, null on the last page.</summary>
+    public PageCursor? Next { get; init; }
 }

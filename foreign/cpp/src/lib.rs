@@ -930,6 +930,65 @@ mod ffi {
         current_page_token: MetadataCurrentPageToken,
     }
 
+    /// The order of a list page. The values are the wire codes.
+    #[repr(u8)]
+    enum PageOrder {
+        Id = 0,
+        Created = 1,
+    }
+
+    /// One list page query. The cursor travels as bytes, so the bridge refuses
+    /// text that is not UTF-8 with InvalidCommand. The flag keeps an absent
+    /// cursor apart from an empty one, which is refused.
+    struct PageQuery {
+        order: PageOrder,
+        descending: bool,
+        limit: u32,
+        has_cursor: bool,
+        cursor: Vec<u8>,
+    }
+
+    /// One page query of a list of named entities: streams, topics, consumer
+    /// groups and users. The name travels as bytes with a flag, as the cursor
+    /// does.
+    struct NamedPageQuery {
+        page: PageQuery,
+        has_name: bool,
+        name: Vec<u8>,
+    }
+
+    /// One page of a list, with one struct for each list. `next` is the
+    /// `pg1_` text of the cursor of the next page when `has_next` is set.
+    struct StreamsPage {
+        items: Vec<Stream>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct TopicsPage {
+        items: Vec<Topic>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct PartitionsPage {
+        items: Vec<Partition>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct ConsumerGroupsPage {
+        items: Vec<ConsumerGroup>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct UsersPage {
+        items: Vec<UserInfo>,
+        has_next: bool,
+        next: String,
+    }
+
     extern "Rust" {
         /// The private part of a batch: the partition context and the reader
         /// stamp of its checkpoints, and its continuation.
@@ -986,6 +1045,13 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
+        /// Reads one page of the streams. An invalid query fails with
+        /// InvalidCommand (3) before anything is sent, as on the other page calls.
+        fn get_streams_page(
+            self: &Client,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<StreamsPage>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(
             self: &Client,
@@ -1005,6 +1071,12 @@ mod ffi {
             topic_id: Identifier,
         ) -> Result<TopicDetails>;
         fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
+        fn get_topics_page(
+            self: &Client,
+            stream_id: Identifier,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<TopicsPage>;
         fn update_topic(
             self: &Client,
             stream_id: Identifier,
@@ -1032,6 +1104,13 @@ mod ffi {
             partitions_count: u32,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
+        fn get_partitions_page(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            query: PageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<PartitionsPage>;
         fn create_consumer_group(
             self: &Client,
             stream_id: Identifier,
@@ -1050,6 +1129,13 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
         ) -> Result<Vec<ConsumerGroup>>;
+        fn get_consumer_groups_page(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<ConsumerGroupsPage>;
         fn delete_consumer_group(
             self: &Client,
             stream_id: Identifier,
@@ -1399,6 +1485,11 @@ mod ffi {
         ) -> Result<()>;
         fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
         fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
+        fn get_users_page(
+            self: &Client,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<UsersPage>;
         #[allow(clippy::too_many_arguments)]
         fn create_user(
             self: &Client,

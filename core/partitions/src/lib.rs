@@ -46,7 +46,7 @@ pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
-pub use repair_memory::RepairMemoryBudget;
+pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
 mod remote_segments;
 pub use remote_segments::{
     ExecutorObjects, FRESH_CACHE_BYTES, RemoteObjects, RemoteRange, RemoteSegments,
@@ -74,7 +74,8 @@ pub use fresh_sweep::{
 };
 mod placed_read;
 pub use manifest_publish::{
-    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
+    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
 };
 mod topic_object;
 pub use segment_chain::object_prefix;
@@ -85,8 +86,8 @@ pub use segment_upload::{
 pub mod long_term;
 mod long_term_rewrite;
 pub use long_term_rewrite::{
-    ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError, RewriteOutcome,
-    SegmentRewrite,
+    BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError,
+    RewriteOutcome, SegmentRewrite,
 };
 pub use topic_object::{
     ExecutorTopicObjects, TOPIC_OBJECT_RETRY, TopicObjectOutcome, TopicObjects, delete_topic,
@@ -116,9 +117,10 @@ pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::{
-    IggyPartition, LocalEnvelope, RetirementDebtStatus, SegmentEviction, SegmentRemoval,
+    BatchRetirement, CheckpointDelays, CheckpointTrigger, IggyPartition, LocalEnvelope,
+    RetirementDebtStatus, SegmentEviction, SegmentRemoval,
 };
-pub use iggy_partitions::IggyPartitions;
+pub use iggy_partitions::{GaugeShare, IggyPartitions, SentReport, Sleeper};
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
@@ -172,10 +174,10 @@ pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessa
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
 pub use stream_keyring::{StreamKeyIdentity, StreamKeyring};
 pub use types::{
-    AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
-    PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
-    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairIngest,
-    RepairSession, SendMessagesResult,
+    AppendResult, COMMIT_WALK_OPS_MAX, ConsumerGroupOffsets, ConsumerOffsets, FatalCommit,
+    Fragment, PartitionOffsets, PartitionPathLayout, PartitionsConfig, PollFragments,
+    PollQueryResult, PollingArgs, PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS,
+    RepairConclusion, RepairIngest, RepairSession, SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.

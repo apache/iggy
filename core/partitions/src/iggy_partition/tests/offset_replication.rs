@@ -78,6 +78,14 @@ async fn primary_with_refused_offset_prepare(
     (partition, replies, header)
 }
 
+/// One tick of a partition outside a table: advance the clock of its group,
+/// then tick the group, as the shard tick does.
+fn advance_and_tick<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<consensus::VsrAction> {
+    let consensus = partition.consensus();
+    consensus.tick_clock().advance();
+    consensus.tick(PlaneKind::Partitions)
+}
+
 fn answer_partition_heartbeat(
     partition: &IggyPartition<RecordingBus>,
     action: &consensus::VsrAction,
@@ -89,20 +97,14 @@ fn answer_partition_heartbeat(
         ..
     } = action
     {
-        let reply = Message::<CommitReplyHeader>::new(HEADER_SIZE).transmute_header(
-            |_, header: &mut CommitReplyHeader| {
-                header.command = Command::CommitReply;
-                header.size = u32::try_from(HEADER_SIZE).unwrap();
-                header.cluster = partition.consensus().cluster();
-                header.view = *view;
-                header.replica = 1;
-                header.group = *group;
-                header.partition_incarnation = partition.consensus().partition_incarnation();
-                header.timestamp_monotonic = *timestamp_monotonic;
-                header.seal();
-            },
+        let reply = CommitReplyEntry::new(
+            *group,
+            partition.consensus().partition_incarnation(),
+            *view,
+            *timestamp_monotonic,
+            1,
         );
-        partition.consensus().handle_commit_reply(reply.header());
+        partition.consensus().handle_commit_reply(&reply);
     }
 }
 
@@ -154,7 +156,7 @@ async fn given_a_wal_still_full_at_the_first_retry_when_capacity_frees_should_re
         if retries == 1 {
             persistence.release_capacity_for_test();
         }
-        for action in partition.consensus().tick(PlaneKind::Partitions) {
+        for action in advance_and_tick(&partition) {
             answer_partition_heartbeat(&partition, &action);
             if let consensus::VsrAction::RetryLocalWrite { op } = action {
                 partition.retry_local_write(op).await;
@@ -200,7 +202,7 @@ async fn given_a_self_ack_queued_in_loopback_when_the_prepare_timeout_keeps_firi
     partition.drive_persistence().await;
 
     for _ in 0..consensus::TimeoutManager::PREPARE_TICKS * 40 {
-        for action in partition.consensus().tick(PlaneKind::Partitions) {
+        for action in advance_and_tick(&partition) {
             answer_partition_heartbeat(&partition, &action);
             if let consensus::VsrAction::RetryLocalWrite { op } = action {
                 partition.retry_local_write(op).await;
@@ -216,6 +218,88 @@ async fn given_a_self_ack_queued_in_loopback_when_the_prepare_timeout_keeps_firi
         1,
         "an undrained self-ack already carries the primary's vote"
     );
+}
+
+/// A group born above view 0 has no durable view, so its primary holds every
+/// self-ack until its first superblock write lands, while its two backups
+/// commit the ops. The write then releases the held acks in one pass.
+#[compio::test]
+async fn given_backups_that_commit_while_the_first_superblock_write_waits_when_it_lands_should_commit_the_held_op()
+ {
+    const PRIMARY: u8 = 1;
+    let directory = tempfile::tempdir().unwrap();
+    let config = repair_config();
+    let (mut partition, _replies) = recording_partition_at(PRIMARY, 3);
+    partition.consensus.restore_view(consensus::ViewRestore {
+        durable_view: None,
+        view_fallback: None,
+        seed_view: Some(u32::from(PRIMARY)),
+    });
+    partition.consensus.join(consensus::JoinMode::Init);
+    partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+    partition.runtime_options.durability = iggy_common::Durability::Replicated;
+    partition.open_persistence().await.unwrap();
+    let store = Rc::new(PingPongSuperblock::open(directory.path()).await.unwrap());
+    partition.set_superblock(store, None);
+    dispatch_io(&partition);
+    assert!(partition.consensus().needs_superblock_persist());
+
+    let capacity = partition
+        .consensus()
+        .with_pipeline(consensus::Pipeline::prepare_queue_max);
+    let last = u64::try_from(capacity).unwrap() + 1;
+    let mut request = checksumless_send_request(partition.namespace(), 1);
+    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+        .copy_from_slice(&build_segment_record(partition.namespace(), 0));
+    for op in 1..=last {
+        let send =
+            request
+                .deep_copy()
+                .transmute_header(|header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.client = u128::from(op);
+                });
+        partition.on_request(send, None).await;
+        let header = partition
+            .consensus()
+            .with_pipeline(|pipeline| pipeline.entry_by_op(op).map(|entry| entry.header))
+            .expect("the primary admitted the send");
+        // The newest two ops keep one backup vote each, so they need the
+        // primary's own: the ack of the first waits in a full queue.
+        let backups: &[u8] = if op + 1 >= last { &[0] } else { &[0, 2] };
+        for &backup in backups {
+            partition
+                .on_ack(backup_prepare_ok(&partition, backup, &header), &config)
+                .await;
+        }
+    }
+    assert_eq!(partition.consensus().commit_min(), last - 2);
+    assert_eq!(
+        partition.pending_persisted_acks.borrow().len(),
+        usize::try_from(last).unwrap()
+    );
+
+    let crate::PartitionIoStep::Ready(plan) = partition.resume_io(&config).await else {
+        panic!("the superblock write must be ready");
+    };
+    assert_eq!(
+        plan.continuation,
+        crate::PartitionIoContinuation::Superblock
+    );
+    execute_partition_io_plan(&mut partition, &config, plan).await;
+    partition.drive_persistence().await;
+
+    assert!(partition.pending_persisted_acks.borrow().is_empty());
+    let mut acknowledgments = Vec::new();
+    partition
+        .consensus()
+        .drain_loopback_into(&mut acknowledgments);
+    for ack in acknowledgments {
+        partition
+            .on_ack(ack.try_into_typed::<PrepareOkHeader>().unwrap(), &config)
+            .await;
+    }
+    assert_eq!(partition.consensus().commit_min(), last);
 }
 
 #[compio::test]
@@ -255,7 +339,7 @@ async fn given_a_wal_that_refused_the_primary_prepare_when_the_prepare_timeout_f
 
     let mut retried = false;
     for _ in 0..=consensus::TimeoutManager::PREPARE_TICKS {
-        for action in partition.consensus().tick(PlaneKind::Partitions) {
+        for action in advance_and_tick(&partition) {
             match action {
                 consensus::VsrAction::RetryLocalWrite { op } => {
                     partition.retry_local_write(op).await;
@@ -351,11 +435,11 @@ async fn given_pending_offset_prepare_when_view_changes_should_rebuild_capacity_
 #[test]
 fn given_phantom_and_eager_offsets_when_snapshotting_should_export_committed_durable_value_only() {
     let (partition, _) = recording_partition();
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         7,
         ConsumerOffset::new(ConsumerKind::Consumer, 7, 9, String::new()),
     );
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         8,
         ConsumerOffset::new(ConsumerKind::Consumer, 8, 11, String::new()),
     );
@@ -520,7 +604,7 @@ async fn on_request_delete_of_missing_offset_replies_typed_deny() {
     assert!(partition.pending_consumer_offset_commits.is_empty());
 
     // Existing offset: the gate passes and the delete enters the pipeline.
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         consumer_id as usize,
         ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, 3, String::new()),
     );

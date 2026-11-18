@@ -120,7 +120,7 @@ after the server refuses those credentials, it does not sign in by itself, and
 a call fails with status 40 until the caller signs in again. A sign-in or
 logout of the caller ends each earlier call that has to wait for a new session:
 with status 40 if it sent nothing, or with `OperationUncertainError` if its
-outcome is unknown. A Next poll that commits nothing, which has no operation ID, ends with status 57 instead, and an auto-commit poll ends with `FetchProgressUncertainError` (see below). A typed send and a group poll can send more than one
+outcome is unknown. A Next poll that commits nothing, which has no operation ID, ends with status 57 instead, and an auto-commit poll ends with `FetchProgressUncertainError` (see below). A typed send, a group poll and a whole-list read can send more than one
 command. If the caller signs in or logs out before the next command of such a
 call, the call fails with status 40. Only a call that waits for the client's own sign-in goes on
 under the new session. If the server refuses that sign-in, the call fails with
@@ -391,6 +391,12 @@ try {
   (`prefetchBytes`, `prefetchMessages`). Each effective budget holds at least
   32 full batches, and larger configured budgets still apply. A budget that is
   NaN, infinite or negative is refused with error 3 before anything is sent.
+  The byte budget counts message frame headers, payloads and encoded user
+  headers. It is not a limit on retained memory: payload views keep whole
+  reply buffers alive, including the uncounted 256-byte batch header per
+  record. With one small message per record, retained buffers can occupy
+  several times the byte budget. Decoded objects and in-flight reads also
+  use memory outside this count.
   Without options a read waits up to 5 s. After a refused read, a lost read or
   a failed refresh it waits `retryInterval`, 1 s by default. While a refresh
   of the group assignment fails or gets no answer, the reader reads on under
@@ -459,7 +465,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Mutations share one FIFO lane per partition history, with a separate metadata
@@ -727,6 +733,31 @@ await client.topic.update({
 ```
 
 Reads return every setting in `options` (keys the client set) and `derivedOptions` (keys the server filled). `u64` values stay `bigint`, so values above 2^53 keep their precision. `system.describeOptions({ scope: OptionsScope.Stream })` lists the keys a server accepts per scope, with `updatable`, `resettable`, `secret`, `readOnly` and `critical`.
+
+### list pages
+
+`stream.list`, `topic.list`, `group.list` and `user.list` return a whole list. Each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the walk can appear or not appear. The walk keeps the sign-in and the deadline that it started with. If the server answers a page request with the cursor that the request sent, the walk fails with a `DeserializeError`.
+
+`stream.listPage`, `topic.listPage`, `partition.listPage`, `group.listPage` and `user.listPage` return one page. To read the next page, send the same query with the `next` of the page as its `cursor`. A page can be empty and still have a `next`.
+
+```ts
+import { Client, type NamedPageQuery } from "apache-iggy";
+
+const printStreams = async (client: Client) => {
+  let query: NamedPageQuery = {};
+  for (;;) {
+    const page = await client.stream.listPage(query);
+    for (const stream of page.items)
+      console.log(stream.id, stream.name);
+    if (!page.next) return;
+    query = { ...query, cursor: page.next };
+  }
+};
+```
+
+A `PageQuery` holds `order`, `descending`, `limit` and `cursor`. `order` selects `PageOrder.Id` or `PageOrder.Created`, and `descending` reverses it. A `NamedPageQuery` is a `PageQuery` with an optional `name`, which keeps the entries whose name holds the text, case-sensitive. `stream.listPage`, `topic.listPage`, `group.listPage` and `user.listPage` take a `NamedPageQuery`. `partition.listPage` takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with error 3 (invalid command), before it sends anything. Examples are a limit outside 1 to 1000, a name that is empty or longer than 255 bytes, and a `partition.listPage` query with a name. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use, and `JSON.stringify` writes it as that text. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with error 3.
 
 ### metadata changes
 

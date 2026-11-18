@@ -19,24 +19,24 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
-import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
@@ -96,15 +96,13 @@ public class StreamsTcpClient implements StreamsClient {
 
     @Override
     public CompletableFuture<List<StreamBase>> getStreams() {
-        return AsyncTcpConnection.mapResponse(
-                connection().send(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER), response -> {
-                    List<StreamBase> streams = new ArrayList<>();
-                    while (response.isReadable()) {
-                        streams.add(readStreamBase(response));
-                    }
-                    response.release();
-                    return streams;
-                });
+        return PageReads.readWholeList(
+                connectionSupplier, CommandCode.Stream.GET_ALL, BytesDeserializer::readStreamBase);
+    }
+
+    @Override
+    public CompletableFuture<Page<StreamBase>> getStreamsPage(NamedPageQuery query) {
+        return PageReads.read(connection(), CommandCode.Stream.GET_ALL, query, BytesDeserializer::readStreamBase);
     }
 
     @Override

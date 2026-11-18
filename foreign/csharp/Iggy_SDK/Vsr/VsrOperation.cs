@@ -103,6 +103,7 @@ internal static class VsrOperations
         CommandCodes.GET_STREAMS_CODE,
         CommandCodes.GET_TOPIC_CODE,
         CommandCodes.GET_TOPICS_CODE,
+        CommandCodes.GET_PARTITIONS_CODE,
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
         CommandCodes.SYNC_CONSUMER_GROUP_CODE,

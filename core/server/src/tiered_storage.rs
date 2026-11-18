@@ -152,6 +152,7 @@ pub fn start(
         config.fresh_upload_interval.get_duration(),
         usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
     );
+    shard.set_long_term_backlog_limit(config.long_term_backlog_limit.as_bytes_u64());
     shard
         .plane
         .partitions()
@@ -404,6 +405,21 @@ mod tests {
         assert_eq!(
             usize::try_from(config.jobs.fresh_uploads).unwrap(),
             shard::FRESH_UPLOADS
+        );
+    }
+
+    #[test]
+    fn given_default_section_when_reading_the_long_term_backlog_limit_should_give_the_shard_default()
+     {
+        assert_eq!(
+            TieredStorageConfig::default()
+                .long_term_backlog_limit
+                .as_bytes_u64(),
+            shard::rewrite_pacing::LONG_TERM_BACKLOG_LIMIT
+        );
+        assert_eq!(
+            configs::tiered_storage::LONG_TERM_BACKLOG_LIMIT_MIN,
+            partitions::LONG_TERM_SEGMENT_BYTES as u64
         );
     }
 

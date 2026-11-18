@@ -29,6 +29,9 @@
 //! later: the put of a deposed primary can reach the store after its job was
 //! cancelled, and would otherwise leave an older manifest there until the
 //! next change.
+//!
+//! A partition that places its batches says when it owes a pass that no
+//! commit asks for, see [`IggyPartition::manifest_pass_due_at`].
 
 use std::time::Duration;
 
@@ -50,6 +53,16 @@ use crate::segment_chain::SegmentRecord;
 /// How long after its first manifest a primary stores the same one again.
 /// Longer than any put of the primary before it can stay in flight.
 pub const MANIFEST_REPEAT_AFTER: Duration = Duration::from_mins(2);
+
+/// How long a partition that places its batches waits to try a failed
+/// publish again.
+///
+/// Doubled for each failure in a row up to [`MANIFEST_RETRY_AFTER_MAX`]:
+/// partitions on a store that keeps failing must not put on every tick.
+pub const MANIFEST_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// The longest wait before a failed publish is tried again.
+pub const MANIFEST_RETRY_AFTER_MAX: Duration = Duration::from_mins(1);
 
 /// The result of a publish: the store's answer, or that the job's scope was
 /// cancelled first.
@@ -138,8 +151,10 @@ pub struct ManifestPublishes {
     /// The job in flight: its number, what its manifest holds, and the scope
     /// whose end stops it.
     running: Option<(u64, ManifestProgress, TierScope)>,
-    /// Number of the last job this partition started.
-    jobs: u64,
+    /// Publishes of this view that failed since one was last stored.
+    failures: u32,
+    /// When the publish that failed last may be tried again.
+    retry_at: Option<IggyTimestamp>,
 }
 
 impl ManifestPublishes {
@@ -149,11 +164,44 @@ impl ManifestPublishes {
                 .first_published_at
                 .is_some_and(|first| now.as_micros() >= repeat_at(first))
     }
+
+    /// When the next pass that no commit asks for is due. A failed publish
+    /// holds the repeat back until its own retry.
+    fn unasked_pass_at(&self) -> Option<IggyTimestamp> {
+        if self.retry_at.is_some() {
+            return self.retry_at;
+        }
+        self.first_published_at
+            .filter(|_| !self.repeated)
+            .map(|first| IggyTimestamp::from(repeat_at(first)))
+    }
+
+    fn note_failure(&mut self, now: IggyTimestamp) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(retry_at(now, self.failures));
+    }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn repeat_at(first_published_at: IggyTimestamp) -> u64 {
-    let wait = u64::try_from(MANIFEST_REPEAT_AFTER.as_micros()).unwrap_or(u64::MAX);
-    first_published_at.as_micros().saturating_add(wait)
+    first_published_at
+        .as_micros()
+        .saturating_add(micros(MANIFEST_REPEAT_AFTER))
+}
+
+/// When a publish that failed at `failed_at`, the last of `failures` in a
+/// row, may be tried again.
+fn retry_at(failed_at: IggyTimestamp, failures: u32) -> IggyTimestamp {
+    let doubling = 1_u64
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    let wait = micros(MANIFEST_RETRY_AFTER)
+        .saturating_mul(doubling)
+        .min(micros(MANIFEST_RETRY_AFTER_MAX));
+    IggyTimestamp::from(failed_at.as_micros().saturating_add(wait))
 }
 
 impl From<&SegmentRecord> for ManifestSegment {
@@ -228,6 +276,33 @@ where
         self.deletes_objects() || (self.places_batches() && self.state_machines_current())
     }
 
+    /// Whether this replica is the primary of a partition that places its
+    /// batches and no pass ran over it in this view. Until its first publish,
+    /// a reader finds the manifest an earlier primary stored, which may list
+    /// fewer segments than are committed.
+    #[must_use]
+    pub fn manifest_awaits_first_pass(&self) -> bool {
+        self.places_batches()
+            && self.publishes_manifest()
+            && self.manifest_publishes.view != Some(self.consensus().view())
+    }
+
+    /// When this replica, the primary of a partition that places its
+    /// batches, owes a manifest pass that no commit asks for: the retry of
+    /// the publish that failed last, or the repeat [`MANIFEST_REPEAT_AFTER`]
+    /// after its first one. `None` while a publish runs, before the first
+    /// pass of the view, and on a replica that does not publish.
+    #[must_use]
+    pub fn manifest_pass_due_at(&self) -> Option<IggyTimestamp> {
+        let publishes = &self.manifest_publishes;
+        let due_at = publishes.unasked_pass_at()?;
+        (publishes.running.is_none()
+            && self.places_batches()
+            && publishes.view == Some(self.consensus().view())
+            && self.publishes_manifest())
+        .then_some(due_at)
+    }
+
     /// Start the publish of this partition's manifest, when this replica is
     /// the primary, none is in flight, and the manifest differs from the
     /// one this view last stored or is due again. The caller runs it under
@@ -257,15 +332,16 @@ where
         }
         let scope = TierScope::new();
         let token = scope.token();
-        publishes.jobs += 1;
-        let id = publishes.jobs;
-        publishes.running = Some((id, progress, scope));
+        self.manifest_publish_jobs += 1;
+        let id = self.manifest_publish_jobs;
+        self.manifest_publishes.running = Some((id, progress, scope));
         Some((id, manifest, token))
     }
 
     /// Take the result of the publish numbered `id`. A result of a job this
     /// partition does not wait for, or one that arrives after primacy moved,
-    /// changes nothing. A publish that failed is repeated by a later pass.
+    /// changes nothing. A publish that failed is repeated by a later pass,
+    /// which [`Self::manifest_pass_due_at`] says when to stage.
     ///
     /// Returns whether the long-term log moved while the manifest was being
     /// stored. No publish starts while one runs, so the caller stages the
@@ -303,6 +379,8 @@ where
                     None => publishes.first_published_at = Some(now),
                 }
                 publishes.published = Some(progress);
+                publishes.failures = 0;
+                publishes.retry_at = None;
                 debug!(
                     namespace_raw,
                     floor = ?progress.floor,
@@ -312,14 +390,21 @@ where
                 long_term_floor.is_some_and(|floor| floor != progress.floor)
             }
             Ok(Err(error)) => {
+                publishes.note_failure(now);
                 warn!(
                     namespace_raw,
                     %error,
+                    failures = publishes.failures,
                     "storing the manifest of the partition failed and is tried again"
                 );
                 false
             }
-            Err(TierJobCancelled) => false,
+            // This view still holds the scope, so the executor dropped the
+            // job unanswered, and the put may never have run.
+            Err(TierJobCancelled) => {
+                publishes.note_failure(now);
+                false
+            }
         }
     }
 

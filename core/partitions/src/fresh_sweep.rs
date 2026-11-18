@@ -31,6 +31,13 @@
 //! holds each of them, and the floor it reads is committed. A replica that
 //! is behind reads a lower floor and keeps the object for longer.
 //!
+//! A replica stops holding a partition it led without a delete of it: its
+//! copy is fenced and rebuilt after it diverged or its files were damaged,
+//! and a state transfer replaces what the copy holds. The group still holds
+//! the placed batches then, and the copy that comes back reads them again.
+//! Until it does, the replica cannot tell which objects it needs, and it
+//! deletes none.
+//!
 //! An object that nothing names waits out a grace period before it is
 //! deleted. A poll that planned a read of it before the floor passed it
 //! ends in that time, and so does a batch that other replicas hold and this
@@ -39,6 +46,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+use consensus::Consensus;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_common::IggyTimestamp;
@@ -48,11 +56,12 @@ use iggy_object_store::{
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
+use server_common::sharding::IggyNamespace;
 use tracing::warn;
 
-use crate::IggyPartition;
 use crate::object_delete::delete_objects;
 use crate::placed_read::PlacedReadPlan;
+use crate::{IggyPartition, IggyPartitions};
 
 /// How long a fresh object that no placed batch names stays in the store.
 pub const FRESH_OBJECT_GRACE: Duration = Duration::from_mins(10);
@@ -507,13 +516,65 @@ where
             floor: self.long_term_floor(),
         })
     }
+
+    /// Whether this copy holds every placed batch that its group committed
+    /// and that names an object of this replica. A copy outside normal
+    /// status may miss some, and so may one that a state transfer is
+    /// replacing or that lost its files and waits for one.
+    fn holds_its_placed_batches(&self) -> bool {
+        let consensus = self.consensus();
+        consensus.is_normal() && !consensus.is_transferring() && !self.requires_state_transfer()
+    }
+}
+
+impl<B, SB> IggyPartitions<B, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// The reads of the fresh objects that the placing partitions of this
+    /// shard name above their long-term floors. `None` when the shard cannot
+    /// tell: a copy is fenced or misses placed batches of its group while
+    /// `committed` says its namespace is still committed. A copy whose
+    /// namespace is not committed was deleted and holds nothing back.
+    #[must_use]
+    pub fn fresh_objects_in_use(
+        &self,
+        committed: impl Fn(&IggyNamespace) -> bool,
+    ) -> Option<Vec<FreshObjectsInUse>> {
+        let mut readable = Vec::new();
+        // Asked of every partition before any read is planned: one that
+        // cannot tell makes all the plans useless.
+        for (namespace, partition) in self.stored() {
+            if !partition.places_batches() {
+                continue;
+            }
+            if !self.is_tombstoned(namespace) && partition.holds_its_placed_batches() {
+                readable.push(partition);
+            } else if committed(namespace) {
+                return None;
+            }
+        }
+        Some(
+            readable
+                .into_iter()
+                .filter_map(IggyPartition::fresh_objects_in_use)
+                .collect(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PartitionsConfig;
     use bytes::Bytes;
+    use consensus::{LocalPipeline, VsrConsensus};
+    use iggy_common::{IggyByteSize, PartitionStats};
     use iggy_object_store::{InlineTierExecutor, MemoryStore, PutBody, PutOptions, TierScope};
+    use message_bus::IggyMessageBus;
+    use server_common::sharding::ShardId;
+    use std::sync::Arc;
 
     const REPLICA: u8 = 1;
 
@@ -986,5 +1047,75 @@ mod tests {
         sweep.forget(&[id(REPLICA, 1)]);
 
         assert_eq!(sweep.len(), 1);
+    }
+
+    fn placing() -> IggyNamespace {
+        IggyNamespace::new(1, 1, 0)
+    }
+
+    /// A shard whose one partition [`placing`] places its batches, a
+    /// single-replica primary in normal status.
+    fn shard_of_one_placing_partition() -> IggyPartitions<IggyMessageBus> {
+        let size = IggyByteSize::from(1024 * 1024);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: size,
+                validate_checksum: false,
+                segment_size: size,
+                preallocate_segments: false,
+                key_context: Arc::default(),
+                path_layout: crate::PartitionPathLayout::default(),
+            },
+        );
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            placing().inner(),
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            size,
+        );
+        partition.set_places_batches(true);
+        partitions.insert(placing(), partition);
+        partitions
+    }
+
+    /// The reads the shard plans while [`placing`] is committed, and once its
+    /// delete committed.
+    fn planned_reads(
+        partitions: &IggyPartitions<IggyMessageBus>,
+    ) -> (Option<usize>, Option<usize>) {
+        (
+            partitions
+                .fresh_objects_in_use(|_| true)
+                .map(|reads| reads.len()),
+            partitions
+                .fresh_objects_in_use(|_| false)
+                .map(|reads| reads.len()),
+        )
+    }
+
+    /// A rebuilt copy whose state transfer waits for a free slot is back in
+    /// the idle stage and normal status, and holds none of its group's
+    /// batches yet.
+    #[test]
+    fn given_a_rebuilt_copy_waiting_for_a_transfer_slot_when_planning_reads_should_not_tell_until_its_delete_commits()
+     {
+        let partitions = shard_of_one_placing_partition();
+        assert_eq!(planned_reads(&partitions), (Some(1), Some(1)));
+
+        let copy = partitions.get_mut_by_ns(&placing()).unwrap();
+        copy.materialization_missing = true;
+        assert!(copy.consensus().is_normal() && !copy.consensus().is_transferring());
+
+        assert_eq!(planned_reads(&partitions), (None, Some(0)));
     }
 }

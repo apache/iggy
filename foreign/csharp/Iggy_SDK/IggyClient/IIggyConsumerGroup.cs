@@ -28,6 +28,12 @@ public interface IIggyConsumerGroup
     /// <summary>
     ///     Retrieves information about all consumer groups for a specified topic.
     /// </summary>
+    /// <remarks>
+    ///     Over TCP the client reads the list in pages of 1000 in id order, so the result is not one consistent read:
+    ///     a group that someone creates or deletes during the read can be in it or not. Every page keeps the sign-in
+    ///     and the call deadline that the read started with. Over HTTP the server returns the whole list in one reply,
+    ///     but it builds that reply from pages of 1000, so it is not one consistent read either.
+    /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
@@ -35,8 +41,31 @@ public interface IIggyConsumerGroup
     ///     A task that represents the asynchronous operation and returns a read-only collection of consumer group
     ///     information.
     /// </returns>
+    /// <exception cref="Exceptions.MalformedResponseException">
+    ///     Over TCP, when the server answers a page with the same cursor that the client sent.
+    /// </exception>
     Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId, Identifier topicId,
         CancellationToken token = default);
+
+    /// <summary>
+    ///     Reads one page of the consumer groups of a topic.
+    /// </summary>
+    /// <remarks>
+    ///     The query is checked before anything is sent. To read the next page, send the same query with the
+    ///     <see cref="Page{T}.Next" /> of this page as its cursor. Consumer groups get their ids in creation order, so
+    ///     both orders read them by id.
+    /// </remarks>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="query">The order, the page size, the cursor and the name filter of the read.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the page.</returns>
+    /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
+    ///     Invalid command (code 3) for a query the page rules refuse, or for a cursor the server cannot use. The
+    ///     stream or topic not found error when one of them does not exist.
+    /// </exception>
+    Task<Page<ConsumerGroupResponse>> GetConsumerGroupsPageAsync(Identifier streamId, Identifier topicId,
+        NamedPageQuery query, CancellationToken token = default);
 
     /// <summary>
     ///     Retrieves detailed information about a specific consumer group.
