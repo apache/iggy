@@ -2036,6 +2036,7 @@ mod floor_eviction;
 mod free_space;
 mod history;
 mod journal_budget;
+mod manifest_history;
 mod manifest_publish;
 mod materialization;
 mod materialization_io;

@@ -5661,6 +5661,96 @@ mod tests {
         assert_eq!(evictions(), Vec::<IggyNamespace>::new());
     }
 
+    /// The delete pass of a tiered partition waits for a manifest that no
+    /// longer lists what it removes, so the cleaner stages the manifest pass
+    /// first. A shard without a publisher drops the pass, so it is staged
+    /// whether or not the node can tier topics.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_cleaner_stages_its_passes_should_stage_the_manifest_ahead_of_the_object_deletes()
+     {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Pass {
+            Manifest(IggyNamespace, u64),
+            Deletes(IggyNamespace, u64),
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "manifest-stream");
+        seed_topic(&mux, 2, 0, "manifest-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let passes = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut passes = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::PublishManifest {
+                        namespace,
+                        created_revision,
+                        ..
+                    }) => passes.push(Pass::Manifest(namespace, created_revision)),
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::DeleteObjects {
+                        namespace,
+                        created_revision,
+                        ..
+                    }) => passes.push(Pass::Deletes(namespace, created_revision)),
+                    _ => {}
+                }
+            }
+            passes
+        };
+        assert_eq!(passes(), [], "a topic that is not tiered has no manifest");
+
+        let explicit: ResourceOptions = std::iter::once((
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(HeaderValue::from(true)),
+        ))
+        .collect();
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &enable))
+            .expect("UpdateTopic apply succeeds");
+        let created_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .expect("the partition has an incarnation");
+
+        let expected = [
+            Pass::Manifest(namespace, created_revision),
+            Pass::Deletes(namespace, created_revision),
+        ];
+        assert!(
+            !shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .tiered_storage_ready()
+        );
+        assert_eq!(passes(), expected);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.set_store_identity_verified(true);
+        frontier.set_tiered_storage_ready(true);
+        assert_eq!(passes(), expected);
+    }
+
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this
     /// time: a wire-valid consensus frame carrying an operation only a newer
     /// release defines must leave an accounted, operator-visible trace instead
