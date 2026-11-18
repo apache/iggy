@@ -19,7 +19,6 @@ package tcp
 
 import (
 	"context"
-	"encoding/binary"
 	"strings"
 	"testing"
 
@@ -133,9 +132,7 @@ func TestUpdateTopic_AcceptsACommittedUpdate(t *testing.T) {
 
 func TestGetTopics_DecodesTheRoster(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	body := binary.LittleEndian.AppendUint32(nil, 2)
-	body = append(body, topicDetailsBody(t, 3)...)
-	body = append(body, topicDetailsBody(t, 5)...)
+	body := pageBody(nil, topicDetailsBody(t, 3), topicDetailsBody(t, 5))
 	serve(serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationNonReplicated, body)
 	})

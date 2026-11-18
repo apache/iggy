@@ -19,6 +19,7 @@ use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::benchmarks::common::{build_consumer_futures, build_producer_futures};
 use crate::utils::ClientFactory;
+use crate::utils::warmup::BenchmarkWarmup;
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -51,8 +52,9 @@ impl Benchmarkable for PinnedProducerAndConsumerBenchmark {
         let args = self.args.clone();
         let mut tasks = JoinSet::new();
 
-        let producer_futures = build_producer_futures(cf, &args);
-        let consumer_futures = build_consumer_futures(cf, &args);
+        let warmup = BenchmarkWarmup::start(args.warmup_time());
+        let producer_futures = build_producer_futures(cf, &args, warmup);
+        let consumer_futures = build_consumer_futures(cf, &args, warmup);
 
         for fut in producer_futures {
             tasks.spawn(fut);

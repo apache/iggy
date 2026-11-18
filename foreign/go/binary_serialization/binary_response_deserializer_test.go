@@ -19,12 +19,14 @@ package binaryserialization
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 func buildFetchPayload(payloadBody []byte) []byte {
@@ -233,26 +235,28 @@ func TestDeserializeToStream_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
 	}
 }
 
-func TestDeserializeStreams_Empty(t *testing.T) {
-	streams, err := DeserializeStreams([]byte{})
+func TestDeserializeStreamsPage_Empty(t *testing.T) {
+	page, err := DeserializeStreamsPage(streamsPage())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(streams) != 0 {
-		t.Fatalf("expected 0 streams, got %d", len(streams))
+	if len(page.Items) != 0 || page.Next != nil {
+		t.Fatalf("expected an empty last page, got %d streams and next %v", len(page.Items), page.Next)
 	}
 }
 
-func TestDeserializeStreams_MultipleStreams(t *testing.T) {
-	var payload []byte
-	payload = append(payload, encodeStream(1, 100, 2, 512, 50, "stream-one")...)
-	payload = append(payload, encodeStream(2, 200, 0, 0, 0, "s2")...)
-	payload = append(payload, encodeStream(3, 300, 1, 1024, 10, "third")...)
+func TestDeserializeStreamsPage_MultipleStreams(t *testing.T) {
+	payload := streamsPage(
+		encodeStream(1, 100, 2, 512, 50, "stream-one"),
+		encodeStream(2, 200, 0, 0, 0, "s2"),
+		encodeStream(3, 300, 1, 1024, 10, "third"),
+	)
 
-	streams, err := DeserializeStreams(payload)
+	page, err := DeserializeStreamsPage(payload)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	streams := page.Items
 	if len(streams) != 3 {
 		t.Fatalf("expected 3 streams, got %d", len(streams))
 	}
@@ -262,39 +266,43 @@ func TestDeserializeStreams_MultipleStreams(t *testing.T) {
 	assertStream(t, "stream[2]", streams[2], 3, 300, 1, 1024, 10, "third")
 }
 
-func TestDeserializeStreams_CorruptedPayload(t *testing.T) {
+func TestDeserializeStreamsPage_CorruptedPayload(t *testing.T) {
 	good := encodeStream(1, 100, 0, 0, 0, "ok")
 	truncated := make([]byte, streamFixedSize-5)
-	payload := append(good, truncated...)
 
-	_, err := DeserializeStreams(payload)
-	if err == nil {
-		t.Fatal("expected error for corrupted payload, got nil")
+	_, err := DeserializeStreamsPage(streamsPage(good, truncated))
+	if !errors.Is(err, ierror.ErrInvalidFormat) {
+		t.Fatalf("expected ErrInvalidFormat for corrupted payload, got %v", err)
 	}
 }
 
 // Regression test for issue #3130: payloads > 64KB produced corrupted
 // stream lists because no bounds checking was performed.
-func TestDeserializeStreams_LargePayloadOver64KB(t *testing.T) {
+func TestDeserializeStreamsPage_LargePayloadOver64KB(t *testing.T) {
 	const targetSize = 70_000
-	var payload []byte
+	var encoded [][]byte
+	var size int
 	var id uint32
 
-	for len(payload) < targetSize {
+	for size < targetSize {
 		id++
 		name := fmt.Sprintf("stream-with-a-longer-name-for-padding-%d", id)
-		payload = append(payload, encodeStream(id, uint64(id)*1000, id%10, uint64(id)*512, uint64(id)*5, name)...)
+		stream := encodeStream(id, uint64(id)*1000, id%10, uint64(id)*512, uint64(id)*5, name)
+		encoded = append(encoded, stream)
+		size += len(stream)
 	}
+	payload := streamsPage(encoded...)
 
 	if len(payload) <= 1<<16 {
 		t.Fatalf("payload size %d is not > 64KB; increase stream count or name length", len(payload))
 	}
 
-	streams, err := DeserializeStreams(payload)
+	page, err := DeserializeStreamsPage(payload)
 	if err != nil {
 		t.Fatalf("unexpected error deserializing %d-byte payload: %v", len(payload), err)
 	}
 
+	streams := page.Items
 	if uint32(len(streams)) != id {
 		t.Fatalf("expected %d streams, got %d", id, len(streams))
 	}
@@ -308,23 +316,34 @@ func TestDeserializeStreams_LargePayloadOver64KB(t *testing.T) {
 	}
 }
 
-func TestDeserializeStreams_MaxLengthName(t *testing.T) {
+func TestDeserializeStreamsPage_MaxLengthName(t *testing.T) {
 	name := make([]byte, 255)
 	for i := range name {
 		name[i] = 'a' + byte(i%26)
 	}
-	payload := encodeStream(1, 999, 3, 4096, 200, string(name))
+	payload := streamsPage(encodeStream(1, 999, 3, 4096, 200, string(name)))
 
-	streams, err := DeserializeStreams(payload)
+	page, err := DeserializeStreamsPage(payload)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	streams := page.Items
 	if len(streams) != 1 {
 		t.Fatalf("expected 1 stream, got %d", len(streams))
 	}
 	if streams[0].Name != string(name) {
 		t.Errorf("Name length = %d, want 255", len(streams[0].Name))
 	}
+}
+
+// streamsPage frames encoded streams as the last page of a GetStreams reply:
+// no next cursor, then the count.
+func streamsPage(streams ...[]byte) []byte {
+	payload := binary.LittleEndian.AppendUint32([]byte{0}, uint32(len(streams)))
+	for _, stream := range streams {
+		payload = append(payload, stream...)
+	}
+	return payload
 }
 
 func TestBoundedCapacity_CapsDeclaredCount(t *testing.T) {

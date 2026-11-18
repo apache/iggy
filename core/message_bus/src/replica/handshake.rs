@@ -65,7 +65,7 @@
 
 use crate::framing;
 use crate::replica::auth::{
-    self, ChannelBinding, HandshakeStatus, LinkPlacement, ReplicaAuth, Transcript,
+    self, ChannelBinding, HandshakeStatus, HeartbeatTimings, LinkPlacement, ReplicaAuth, Transcript,
 };
 use crate::{GenericHeader, Message};
 use compio::io::{AsyncRead, AsyncWrite};
@@ -91,6 +91,8 @@ pub struct ReplicaHandshakeCtx {
     pub cluster_id: u128,
     pub self_id: u8,
     pub replica_count: u8,
+    /// Values that the peer must match, or the handshake fails.
+    pub heartbeat: HeartbeatTimings,
     pub auth: Option<Rc<ReplicaAuth>>,
     pub tls: Option<Rc<ReplicaTlsCtx>>,
 }
@@ -241,12 +243,39 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
         .await;
     }
 
+    if let Some(mismatch) = ctx
+        .heartbeat
+        .first_mismatch(HeartbeatTimings::read(&header.reserved_command))
+    {
+        tracing::error!(replica = peer_id, "rejecting replica link: {mismatch}");
+        // The dialer reads these values to name the option in its own log.
+        let reject = with_timings(
+            build_challenge_message(
+                our_cluster,
+                self_id,
+                HandshakeStatus::HeartbeatMismatch,
+                None,
+            ),
+            ctx.heartbeat,
+        );
+        if let Err(e) = framing::write_message(stream, reject).await {
+            debug!(
+                replica = peer_id,
+                "failed to send replica handshake reject: {e}"
+            );
+        }
+        return Err(IggyError::InvalidCommand);
+    }
+
     let Some(auth) = auth else {
         framing::write_message(
             stream,
-            with_identity(
-                build_challenge_message(our_cluster, self_id, HandshakeStatus::Ok, None),
-                &ctx.binary_identity,
+            with_timings(
+                with_identity(
+                    build_challenge_message(our_cluster, self_id, HandshakeStatus::Ok, None),
+                    &ctx.binary_identity,
+                ),
+                ctx.heartbeat,
             ),
         )
         .await?;
@@ -280,14 +309,17 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     let mac_a = auth.acceptor_mac(&transcript);
     framing::write_message(
         stream,
-        with_identity(
-            build_challenge_message(
-                our_cluster,
-                self_id,
-                HandshakeStatus::Ok,
-                Some((&nonce_a, &mac_a)),
+        with_timings(
+            with_identity(
+                build_challenge_message(
+                    our_cluster,
+                    self_id,
+                    HandshakeStatus::Ok,
+                    Some((&nonce_a, &mac_a)),
+                ),
+                &ctx.binary_identity,
             ),
-            &ctx.binary_identity,
+            ctx.heartbeat,
         ),
     )
     .await?;
@@ -350,7 +382,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
 ///
 /// Returns `Err(())` on any write, read, command, status, or MAC
 /// failure (already logged).
-#[allow(clippy::future_not_send, clippy::similar_names)]
+#[allow(clippy::future_not_send, clippy::similar_names, clippy::too_many_lines)]
 pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
     stream: &mut S,
     ctx: &ReplicaHandshakeCtx,
@@ -373,9 +405,12 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
             return Err(());
         }
     };
-    let hello = with_identity(
-        build_hello_message(cluster_id, self_id, placement, auth.map(|_| &nonce_d)),
-        &ctx.binary_identity,
+    let hello = with_timings(
+        with_identity(
+            build_hello_message(cluster_id, self_id, placement, auth.map(|_| &nonce_d)),
+            &ctx.binary_identity,
+        ),
+        ctx.heartbeat,
     );
     if let Err(e) = framing::write_message(stream, hello).await {
         warn!(replica = peer_id, "handshake write failed: {e}");
@@ -400,6 +435,16 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
     // Read command + status before nonce/MAC: a reject (or garbage) status
     // carries no valid nonce/MAC, so parsing them would be meaningless.
     let status = auth::read_status(&challenge.header().reserved_command);
+    let peer_heartbeat = HeartbeatTimings::read(&challenge.header().reserved_command);
+    if let Some(mismatch) = ctx.heartbeat.first_mismatch(peer_heartbeat)
+        && matches!(
+            status,
+            HandshakeStatus::Ok | HandshakeStatus::HeartbeatMismatch
+        )
+    {
+        tracing::error!(replica = peer_id, "replica link refused: {mismatch}");
+        return Err(());
+    }
     if status != HandshakeStatus::Ok {
         warn!(
             replica = peer_id,
@@ -567,6 +612,16 @@ fn build_finish_message(
     )
 }
 
+fn with_timings(
+    message: Message<GenericHeader>,
+    timings: HeartbeatTimings,
+) -> Message<GenericHeader> {
+    message.transmute_header(|old, new: &mut GenericHeader| {
+        *new = old;
+        timings.write(&mut new.reserved_command);
+    })
+}
+
 fn with_identity(
     message: Message<GenericHeader>,
     identity: &[u8; auth::IDENTITY_LEN],
@@ -664,6 +719,11 @@ mod tests {
                 b"storage-1"
             ),
             "builds that send replicas different encodings refuse each other"
+        );
+        assert_ne!(
+            identity,
+            super::identity_at(1, "release-1", b"storage-1"),
+            "a revision 1 node sends single-group Commit frames"
         );
         assert_ne!(
             binary_identity("release", b"-storage"),

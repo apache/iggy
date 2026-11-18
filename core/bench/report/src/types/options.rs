@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 
 const LEGACY_MAX_WAIT_US: u64 = 1_000_000;
 const LEGACY_MIN_COUNT: u32 = 1;
-const LEGACY_READ_AMPLIFICATION: f32 = 1.05;
 
 /// Every bench flag that changes a result, with the bench defaults applied.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,7 +46,7 @@ pub struct BenchmarkTopicOptions {
     pub message_expiry: BenchmarkMessageExpiry,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BenchmarkConsumerOptions {
     /// A topic option, so it shares the conditions of [`BenchmarkTopicOptions`].
     pub consumer_offset_durability: BenchmarkDurability,
@@ -58,9 +57,6 @@ pub struct BenchmarkConsumerOptions {
     /// size and the protocol header sizes, so it would never match the `legacy` value of
     /// older reports and would split their history.
     pub max_bytes: Option<u32>,
-    /// Multiplier of the consumer rate limit. `None` for the kinds without separate
-    /// producers and consumers.
-    pub read_amplification: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -108,11 +104,6 @@ impl BenchmarkOptions {
     /// day the options arrived. Frozen on purpose, so a later change to a bench default doesn't
     /// move old runs to another workload.
     pub const fn legacy(kind: BenchmarkKind) -> Self {
-        let read_amplification = match kind {
-            BenchmarkKind::PinnedProducerAndConsumer
-            | BenchmarkKind::BalancedProducerAndConsumerGroup => Some(LEGACY_READ_AMPLIFICATION),
-            _ => None,
-        };
         let consumer = match kind {
             BenchmarkKind::PinnedProducer | BenchmarkKind::BalancedProducer => None,
             _ => Some(BenchmarkConsumerOptions {
@@ -120,7 +111,6 @@ impl BenchmarkOptions {
                 max_wait_us: LEGACY_MAX_WAIT_US,
                 min_count: LEGACY_MIN_COUNT,
                 max_bytes: None,
-                read_amplification,
             }),
         };
         Self {

@@ -17,7 +17,8 @@
 
 use std::ops::Deref;
 
-/// Index of a partition within a shard's local partition collection.
+/// Index of a partition within a shard's local partition collection: its
+/// slot, stable from insert to removal and reused by a later insert.
 ///
 /// This is NOT the same as partition_id. A shard may have partitions with
 /// IDs [0, 2, 4] but their local indices would be [0, 1, 2].

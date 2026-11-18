@@ -24,13 +24,14 @@
 //! quorum COMMIT, which for a topic below its flush thresholds means the
 //! batch lives only in the in-memory partition journal
 //! (`PartitionJournalMemStorage`) on each node. Process death never loses a
-//! completed `write()` (the page cache survives the process), but recovery
-//! only trusts what the published WAL frontier covers, and discards the bytes
-//! of a `replicated` partition past it even when they reached the segments.
+//! completed `write()` (the page cache survives the process), and recovery
+//! keeps the records past the published WAL frontier that still verify. Only
+//! a barrier makes them survive a machine crash, and a `replicated` partition
+//! issues none before the ack.
 //!
 //! Single-node-crash tests must hold every ack via the surviving quorum. The
 //! whole-cluster-crash tests must hold what was made durable, and pin that a
-//! `replicated` partition loses the acks past its published frontier.
+//! `replicated` partition keeps the acks that reached its files.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -616,13 +617,13 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
         });
 }
 
-/// The `replicated` twin of the eager-flush test above. A crash rolls a
-/// `replicated` partition back to the last WAL frontier it published, at a
-/// checkpoint, a durable operation or a graceful shutdown, so acks past it are
-/// lost even with every payload already in every node's segment files. Topics
-/// that must survive a whole-cluster crash use `persisted`.
+/// The `replicated` twin of the eager-flush test above. A `replicated`
+/// partition publishes its WAL frontier only at a checkpoint, a durable
+/// operation or a graceful shutdown, so a crash finds acks past it. Their
+/// records and payloads are in every node's files, and recovery keeps them.
+/// The frontier guard proves that no publication covered them before the kill.
 #[iggy_harness(cluster_nodes = 3)]
-async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_should_discard_acks_past_the_published_frontier(
+async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover_acks_past_the_published_frontier(
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
@@ -637,19 +638,20 @@ async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_sho
     let frontiers: Vec<Option<u64>> = (0..harness.cluster_size())
         .map(|node| disk::read_partition_wal_frontier(&harness.node(node).data_path()))
         .collect();
-    // Whichever log the election picks, recovery then keeps the same prefix.
+    // Whichever log the election picks, it then holds the same unpublished tail.
     let frontier = frontiers[0].expect("node 0 published a partition WAL frontier");
     assert!(
         frontiers.iter().all(|other| *other == Some(frontier)),
         "every node must publish the same WAL frontier: {frontiers:?}"
     );
-    let (mut expected, discarded): (Vec<_>, Vec<_>) = acked
+    let unpublished = acked
         .iter()
-        .cloned()
-        .partition(|(offset, _)| *offset < frontier);
+        .filter(|(offset, _)| *offset >= frontier)
+        .count();
     assert!(
-        !discarded.is_empty(),
-        "the published WAL frontier {frontier} covers all {} acks, so the crash pins no loss",
+        unpublished > 0,
+        "the published WAL frontier {frontier} covers all {} acks, so the crash leaves no tail \
+         to recover",
         acked.len()
     );
 
@@ -660,25 +662,24 @@ async fn given_replicated_eager_flush_topic_when_the_whole_cluster_is_killed_sho
 
     let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
     let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
-    // A write that reads back proves the partition serves again, so the
-    // missing acks below are discarded, not still recovering.
+    // A write after the restart must land behind the recovered acks.
     let after_restart = produce_acked_when_serving(&client, CONVERGE_TIMEOUT).await;
+    let mut expected = acked.clone();
     expected.push(after_restart);
     wait_for_acked_readable(&client, &expected, CONVERGE_TIMEOUT)
         .await
         .unwrap_or_else(|state| panic!("the partition should serve after the restart: {state}"));
     let readable = poll_from_start(&client, acked.len() as u32 + 16).await;
     assert_eq!(
-        readable,
-        expected,
-        "a whole-cluster SIGKILL must keep exactly the acks below the published WAL frontier \
-         {frontier} and discard the {} past it",
-        discarded.len()
+        readable, expected,
+        "a whole-cluster SIGKILL must keep every ack, also the {unpublished} past the published \
+         WAL frontier {frontier}"
     );
 }
 
-/// The kill follows the confirmation without waiting for segment installation.
-/// This exercises the prepare WAL rather than graceful shutdown or page-cache flushes.
+/// The kill follows the confirmation without waiting for segment installation,
+/// and every WAL is then cut back to its published frontier. This exercises
+/// the prepare WAL rather than graceful shutdown or page-cache flushes.
 #[iggy_harness(cluster_nodes = 3)]
 async fn given_persisted_topic_when_killed_below_flush_threshold_should_recover_acked_messages(
     harness: &mut TestHarness,
@@ -738,6 +739,11 @@ async fn verify_persisted_restart(harness: &mut TestHarness, durability: Durabil
     }
     let stored_offset = acked.last().unwrap().0;
     harness.kill_cluster().unwrap();
+    // Without the cut a restart keeps the records that the OS still holds,
+    // and the recovery proves nothing about what the acks published.
+    for node in 0..harness.cluster_size() {
+        disk::drop_unpublished_partition_wal_tail(&harness.node(node).data_path()).unwrap();
+    }
     harness.restart_cluster().await.unwrap();
     let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
     let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;

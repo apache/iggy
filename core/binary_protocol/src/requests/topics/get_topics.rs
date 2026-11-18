@@ -15,57 +15,84 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::WireError;
-use crate::WireIdentifier;
 use crate::codec::{WireDecode, WireEncode};
+use crate::primitives::page::{WirePageQuery, decode_trailing_page};
+use crate::{WireError, WireIdentifier};
 use bytes::BytesMut;
 
-/// `GetTopics` request. Wire format: `[stream_id:WireIdentifier]`
+/// `GetTopics` request: one page of the topics of a stream.
+///
+/// Wire format: `[stream_id:WireIdentifier][page]`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetTopicsRequest {
     pub stream_id: WireIdentifier,
+    pub page: WirePageQuery,
 }
 
 impl WireEncode for GetTopicsRequest {
     fn encoded_size(&self) -> usize {
-        self.stream_id.encoded_size()
+        self.stream_id.encoded_size() + self.page.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.stream_id.encode(buf);
+        self.page.encode(buf);
     }
 }
 
 impl WireDecode for GetTopicsRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let (stream_id, consumed) = WireIdentifier::decode(buf)?;
-        Ok((Self { stream_id }, consumed))
+        let (stream_id, stream_size) = WireIdentifier::decode(buf)?;
+        let (page, consumed) = decode_trailing_page(buf, stream_size)?;
+        Ok((Self { stream_id, page }, consumed))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::page::WirePageCursor;
 
     #[test]
-    fn roundtrip_numeric() {
-        let req = GetTopicsRequest {
-            stream_id: WireIdentifier::numeric(42),
+    fn given_a_page_when_round_tripping_should_keep_every_field() {
+        let request = GetTopicsRequest {
+            stream_id: WireIdentifier::named("my-stream").unwrap(),
+            page: WirePageQuery {
+                limit: 3,
+                cursor: Some(WirePageCursor::Id(7)),
+                ..WirePageQuery::default()
+            },
         };
-        let bytes = req.to_bytes();
-        let (decoded, consumed) = GetTopicsRequest::decode(&bytes).unwrap();
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, req);
+        let bytes = request.to_bytes();
+        assert_eq!(bytes.len(), request.encoded_size());
+        assert_eq!(
+            GetTopicsRequest::decode(&bytes).unwrap(),
+            (request, bytes.len())
+        );
     }
 
     #[test]
-    fn roundtrip_named() {
-        let req = GetTopicsRequest {
-            stream_id: WireIdentifier::named("my-stream").unwrap(),
+    fn given_a_first_page_when_encoding_should_pin_the_bytes() {
+        let request = GetTopicsRequest {
+            stream_id: WireIdentifier::numeric(42),
+            page: WirePageQuery::default(),
         };
-        let bytes = req.to_bytes();
-        let (decoded, consumed) = GetTopicsRequest::decode(&bytes).unwrap();
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, req);
+        let mut expected = WireIdentifier::numeric(42).to_bytes().to_vec();
+        expected.extend_from_slice(&[0, 0, 100, 0, 0, 0, 0, 0]);
+        assert_eq!(&request.to_bytes()[..], &expected[..]);
+    }
+
+    #[test]
+    fn given_no_page_or_bytes_after_it_when_decoding_should_refuse() {
+        let stream = WireIdentifier::numeric(42).to_bytes();
+        assert!(GetTopicsRequest::decode(&stream).is_err());
+        let mut bytes = GetTopicsRequest {
+            stream_id: WireIdentifier::numeric(42),
+            page: WirePageQuery::default(),
+        }
+        .to_bytes()
+        .to_vec();
+        bytes.push(0);
+        assert!(GetTopicsRequest::decode(&bytes).is_err());
     }
 }
