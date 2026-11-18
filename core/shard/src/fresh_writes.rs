@@ -82,6 +82,13 @@ pub const FRESH_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
 /// answering costs the shard this much memory and no more.
 pub const FRESH_PENDING_BYTES_MAX: u64 = 8 * FRESH_OBJECT_BYTES;
 
+/// The most of [`FRESH_PENDING_BYTES_MAX`] that the sends of one partition
+/// hold. A partition that stopped draining its requests fills its own share
+/// and leaves the rest of the cap to the other partitions of the shard. A
+/// send larger than the share still gets in while nothing of its partition
+/// waits.
+pub const FRESH_PARTITION_PENDING_BYTES_MAX: u64 = FRESH_PENDING_BYTES_MAX / 4;
+
 /// The upload interval of a shard that was given none.
 pub const FRESH_UPLOAD_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -167,6 +174,8 @@ pub struct FreshWrites {
     awaiting_room: RefCell<BTreeSet<IggyNamespace>>,
     /// Bytes of the messages of every waiting send.
     pending_bytes: Cell<u64>,
+    /// [`Self::pending_bytes`] of each partition that has a waiting send.
+    partition_pending_bytes: RefCell<BTreeMap<IggyNamespace, u64>>,
     staged_sends: Cell<usize>,
     /// Objects that hold an upload slot.
     uploads_in_flight: Cell<usize>,
@@ -198,6 +207,7 @@ impl Default for FreshWrites {
             staged: RefCell::default(),
             awaiting_room: RefCell::default(),
             pending_bytes: Cell::new(0),
+            partition_pending_bytes: RefCell::default(),
             staged_sends: Cell::new(0),
             uploads_in_flight: Cell::new(0),
             uploads_max: Cell::new(FRESH_UPLOADS),
@@ -223,8 +233,8 @@ impl FreshWrites {
         objects
     }
 
-    /// Keep `send` at the end of the queue of `namespace`, and its object
-    /// among the awaited ones.
+    /// Keep `send` at the end of the queue of `namespace`, its bytes in the
+    /// share of its partition, and its object among the awaited ones.
     fn stage_send(&self, namespace: IggyNamespace, send: StagedSend) {
         *self
             .awaited
@@ -233,6 +243,7 @@ impl FreshWrites {
             .or_default() += 1;
         self.pending_bytes
             .set(self.pending_bytes.get() + send.bytes);
+        self.hold_in_share(namespace, send.bytes);
         self.staged_sends.set(self.staged_sends.get() + 1);
         self.staged
             .borrow_mut()
@@ -260,6 +271,37 @@ impl FreshWrites {
 
     const fn has_free_upload(&self) -> bool {
         self.uploads_in_flight.get() < self.uploads_max.get()
+    }
+
+    /// Bytes of the messages of the waiting sends of `namespace`.
+    fn partition_pending(&self, namespace: IggyNamespace) -> u64 {
+        self.partition_pending_bytes
+            .borrow()
+            .get(&namespace)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count `bytes` of a waiting send of `namespace` in the share of its
+    /// partition.
+    fn hold_in_share(&self, namespace: IggyNamespace, bytes: u64) {
+        *self
+            .partition_pending_bytes
+            .borrow_mut()
+            .entry(namespace)
+            .or_default() += bytes;
+    }
+
+    /// Take `bytes` of a send of `namespace` that left out of the share of
+    /// its partition.
+    fn release_from_share(&self, namespace: IggyNamespace, bytes: u64) {
+        let mut partitions = self.partition_pending_bytes.borrow_mut();
+        if let Some(held) = partitions.get_mut(&namespace) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                partitions.remove(&namespace);
+            }
+        }
     }
 
     /// Move the open window to the closed objects, where it waits for an
@@ -387,10 +429,8 @@ where
             return;
         }
         // By the size the request declares, which bounds its messages, so a
-        // shard that is full does not read the messages it turns away. A
-        // send larger than the cap still gets in while nothing else waits.
-        let pending = fresh.pending_bytes.get();
-        if pending > 0 && pending.saturating_add(u64::from(header.size)) > FRESH_PENDING_BYTES_MAX {
+        // shard that is full does not read the messages it turns away.
+        if self.fresh_send_over_pending_bytes(namespace, u64::from(header.size)) {
             deny(&IggyError::TransientNotAccepted);
             return;
         }
@@ -467,6 +507,28 @@ where
             fresh.close_window();
         }
         self.drive_fresh_uploads();
+    }
+
+    /// Whether a send of `size` bytes to `namespace` would take the waiting
+    /// sends of its partition past [`FRESH_PARTITION_PENDING_BYTES_MAX`], or
+    /// those of the shard past [`FRESH_PENDING_BYTES_MAX`]. Counts the bound
+    /// it passes. A send larger than a bound still gets in while nothing
+    /// that counts against it waits.
+    fn fresh_send_over_pending_bytes(&self, namespace: IggyNamespace, size: u64) -> bool {
+        let fresh = &self.fresh_writes;
+        let partition_pending = fresh.partition_pending(namespace);
+        if partition_pending > 0
+            && partition_pending.saturating_add(size) > FRESH_PARTITION_PENDING_BYTES_MAX
+        {
+            self.metrics.record_fresh_send_over_partition_share();
+            return true;
+        }
+        let pending = fresh.pending_bytes.get();
+        if pending > 0 && pending.saturating_add(size) > FRESH_PENDING_BYTES_MAX {
+            self.metrics.record_fresh_send_over_shard_cap();
+            return true;
+        }
+        false
     }
 
     /// When the pump must call [`Self::drive_fresh_uploads`] again without
@@ -680,7 +742,7 @@ where
         // A consumer at the tail polls these batches next, and this shard
         // holds their messages already.
         if stored && let Some(remote) = self.plane.partitions().remote_segments() {
-            remote.cache_fresh_object(object.id.get(), object.bytes.clone());
+            remote.cache_fresh_object(object.id.get(), object.bytes);
         }
         for namespace in object.partitions {
             self.feed_staged_sends(namespace).await;
@@ -727,7 +789,7 @@ where
                     queue.split_off(first)
                 });
             for send in denied.into_iter().flatten() {
-                self.deny_staged_send(send);
+                self.deny_staged_send(*namespace, send);
             }
         }
         Some(object)
@@ -757,7 +819,7 @@ where
                 fresh.awaiting_room.borrow_mut().remove(&namespace);
                 let dropped = fresh.staged.borrow_mut().remove(&namespace);
                 for send in dropped.into_iter().flatten() {
-                    self.deny_staged_send(send);
+                    self.deny_staged_send(namespace, send);
                 }
                 return;
             };
@@ -791,7 +853,7 @@ where
             else {
                 return;
             };
-            self.release_staged_send(bytes);
+            self.release_staged_send(namespace, bytes);
             let (sender, receiver) = consensus::oneshot_channel();
             partitions
                 .on_placed_request_with_reply(request, Some(sender))
@@ -844,19 +906,20 @@ where
         );
     }
 
-    /// A waiting send left: its bytes no longer count.
-    fn release_staged_send(&self, bytes: u64) {
+    /// A waiting send of `namespace` left: its bytes no longer count.
+    fn release_staged_send(&self, namespace: IggyNamespace, bytes: u64) {
         let fresh = &self.fresh_writes;
         fresh
             .pending_bytes
             .set(fresh.pending_bytes.get().saturating_sub(bytes));
+        fresh.release_from_share(namespace, bytes);
         fresh
             .staged_sends
             .set(fresh.staged_sends.get().saturating_sub(1));
     }
 
-    fn deny_staged_send(&self, send: StagedSend) {
-        self.release_staged_send(send.bytes);
+    fn deny_staged_send(&self, namespace: IggyNamespace, send: StagedSend) {
+        self.release_staged_send(namespace, send.bytes);
         settle_awaited(&self.fresh_writes.awaited, send.object_id.get());
         self.metrics.record_fresh_send_denied();
         Self::answer_partition_submit_deny(
@@ -864,6 +927,17 @@ where
             Some(send.reply),
             &IggyError::TransientNotAccepted,
         );
+    }
+
+    /// Bytes of the messages of the waiting sends of `namespace`, and of
+    /// every waiting send.
+    #[cfg(test)]
+    pub(crate) fn fresh_pending_bytes(&self, namespace: IggyNamespace) -> (u64, u64) {
+        let fresh = &self.fresh_writes;
+        (
+            fresh.partition_pending(namespace),
+            fresh.pending_bytes.get(),
+        )
     }
 }
 
