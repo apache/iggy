@@ -1849,3 +1849,92 @@ async fn given_a_replica_that_lost_primacy_when_a_placed_request_arrives_should_
     assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
     assert_eq!(partition.log.active_segment().current_position, 0);
 }
+
+/// A backup whose ring released the body of a committed placed batch still
+/// acknowledges the retransmit of that op. Only the placed batch's own
+/// checksum can tell it from another batch under the same header.
+#[compio::test]
+async fn given_a_released_committed_placed_batch_when_retransmitted_should_ack_only_the_same_prepare()
+ {
+    const LATER_VIEW: u32 = 3;
+
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(placing_backup_with_wal(root.path())).await;
+    let sent = partition.consensus().message_bus().sent_to_replicas.clone();
+    // No room for a body, so only the newest one stays in memory.
+    partition
+        .log
+        .journal()
+        .inner
+        .set_ring_caps(crate::EVICTED_RING_CAPACITY, 1);
+    let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+    let released = placed_segment_prepare(1, 0, 0);
+    let in_memory = placed_segment_prepare(2, released.header().checksum, 1);
+    let mut writer = hold_wal_writer(&persistence);
+    for prepare in [&released, &in_memory] {
+        Box::pin(partition.on_replicate(prepare.clone())).await;
+        writer.await;
+        writer = hold_wal_writer(&persistence);
+        Box::pin(commit_on_heartbeat(
+            &mut partition,
+            &config,
+            prepare.header().op,
+        ))
+        .await;
+        Box::pin(settle_partition_io(&mut partition, &config)).await;
+    }
+    writer.await;
+    let journal = &partition.log.journal().inner;
+    assert!(
+        journal.evicted_header(1).is_some() && journal.repair_entry(1).is_none(),
+        "the ring keeps op 1 as a header only"
+    );
+
+    partition.consensus.set_view(LATER_VIEW);
+    partition.consensus.set_log_view(LATER_VIEW);
+    if !partition.persist_superblock_if_needed().await {
+        persistence
+            .drain_with_timeout(compio::runtime::time::sleep)
+            .await
+            .unwrap();
+    }
+    assert!(partition.persist_superblock_if_needed().await);
+    let resent = |prepare: &Message<PrepareHeader>| {
+        prepare
+            .clone()
+            .transmute_header(|original, header: &mut PrepareHeader| {
+                *header = original;
+                header.view = LATER_VIEW;
+            })
+    };
+    let acknowledged = || -> Vec<(u64, u128)> {
+        sent.borrow_mut()
+            .drain(..)
+            .filter_map(|(_, frame)| {
+                bytemuck::checked::try_from_bytes::<PrepareOkHeader>(frame.as_slice())
+                    .ok()
+                    .filter(|header| header.command == Command::PrepareOk)
+                    .map(|header| (header.op, header.prepare_checksum))
+            })
+            .collect()
+    };
+    sent.borrow_mut().clear();
+
+    for (prepare, body) in [(&in_memory, "in memory"), (&released, "in its segment")] {
+        Box::pin(partition.on_replicate(resent(prepare))).await;
+        assert_eq!(
+            acknowledged(),
+            vec![(prepare.header().op, prepare.header().checksum)],
+            "a committed placed retransmit must be acknowledged when its body is {body}"
+        );
+    }
+
+    let mut other_placement = released.clone();
+    let placement_byte = size_of::<PrepareHeader>() + PLACED_BATCH_SIZE - 1;
+    other_placement.as_mut_slice()[placement_byte] ^= 1;
+    Box::pin(partition.on_replicate(resent(&other_placement))).await;
+    assert!(
+        acknowledged().is_empty(),
+        "a placed batch that fails its checksum must not be acknowledged"
+    );
+}

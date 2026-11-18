@@ -37,6 +37,7 @@
 //! - [`StartViewHeader`] - new primary -> all replicas (header-only)
 
 mod command;
+mod commit_batch;
 mod consumer_session;
 mod error;
 mod header;
@@ -47,6 +48,10 @@ mod request;
 mod segment_delete;
 
 pub use command::Command;
+pub use commit_batch::{
+    COMMIT_BATCH_ENTRIES_MAX, COMMIT_BATCH_FRAME_MAX, COMMIT_REPLY_BATCH_ENTRIES_MAX, CommitEntry,
+    CommitReplyEntry, HeartbeatState, batch_entries, batch_frame_size,
+};
 pub use consumer_session::{
     ConsumerSession, ConsumerSessionHeartbeatHeader, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
 };

@@ -17,37 +17,6 @@
 
 use super::*;
 
-/// A backup on disk at `directory` with a counter machine owning
-/// [`COMMAND_KIND`], its sends and offsets under `durability`.
-async fn backup_with_counter(
-    config: &PartitionsConfig,
-    directory: &std::path::Path,
-    durability: iggy_common::Durability,
-) -> Box<IggyPartition<RecordingBus>> {
-    const BACKUP: u8 = 2;
-    let (backup, _) = recording_partition_at(BACKUP, 3);
-    let mut backup = Box::new(backup);
-    backup.runtime_options.durability = durability;
-    backup.runtime_options.consumer_offset_durability = durability;
-    backup
-        .register_state_machine(Box::new(
-            crate::state_machine::registry::tests::CounterMachine::new(1, &[COMMAND_KIND]),
-        ))
-        .unwrap();
-    backup.set_partition_dir(directory.to_string_lossy().into_owned());
-    set_offset_dirs_under(&mut backup, directory);
-    Box::pin(backup.open_persistence()).await.unwrap();
-    backup.log.retire_front().unwrap();
-    Box::pin(backup.install_empty_segment(config, 0))
-        .await
-        .unwrap();
-    backup.set_io_notifier(
-        Rc::new(|_, _| {}),
-        crate::largest_legal_job_charge().unwrap(),
-    );
-    backup
-}
-
 fn sent_prepare_oks(partition: &IggyPartition<RecordingBus>) -> Vec<u64> {
     partition
         .consensus()

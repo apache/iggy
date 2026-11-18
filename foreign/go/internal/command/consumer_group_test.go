@@ -79,15 +79,15 @@ func TestConsumerGroupCommandsMarshalBinary(t *testing.T) {
 		},
 		{
 			name:    "get groups with numeric identifiers",
-			request: &GetConsumerGroups{StreamId: streamID, TopicId: topicID},
+			request: &GetConsumerGroups{StreamId: streamID, TopicId: topicID, Query: iggcon.NamedPageQuery{PageQuery: iggcon.NewPageQuery()}},
 			code:    601,
-			want:    []byte{1, 4, 4, 3, 2, 1, 1, 4, 8, 7, 6, 5},
+			want:    []byte{1, 4, 4, 3, 2, 1, 1, 4, 8, 7, 6, 5, 0, 0, 100, 0, 0, 0, 0, 0},
 		},
 		{
 			name:    "get groups with named identifiers",
-			request: &GetConsumerGroups{StreamId: namedStreamID, TopicId: namedTopicID},
+			request: &GetConsumerGroups{StreamId: namedStreamID, TopicId: namedTopicID, Query: iggcon.NamedPageQuery{PageQuery: iggcon.NewPageQuery()}},
 			code:    601,
-			want:    []byte{2, 1, 's', 2, 1, 't'},
+			want:    []byte{2, 1, 's', 2, 1, 't', 0, 0, 100, 0, 0, 0, 0, 0},
 		},
 		{
 			name:    "join group",

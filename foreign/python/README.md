@@ -267,6 +267,43 @@ A stream encryption key must be 32 random bytes, given as `bytes` or as their ca
 
 The server never returns the key, only `encryption_key_source`, `encryption_key_fingerprint` and `encryption_kek_fingerprints`. Without a key, a server with encryption enabled generates one for the stream and reports the source `"server"`. An invalid key raises `ValueError` before anything is sent, and no repr or error message contains it.
 
+## List Pages
+
+`get_streams`, `get_topics`, `get_consumer_groups` and `get_users` return a whole list in id order. The list is read in pages of 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the read can appear or not appear.
+
+`get_streams_page`, `get_topics_page`, `get_partitions_page`, `get_consumer_groups_page` and `get_users_page` return one page. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`.
+
+```python
+import asyncio
+
+from apache_iggy import IggyClient, PageOrder
+
+
+async def main():
+    client = IggyClient.from_connection_string("iggy+tcp://iggy:iggy@127.0.0.1:8090")
+    await client.connect()
+
+    cursor = None
+    while True:
+        page = await client.get_streams_page(
+            order=PageOrder.Created, name="orders", cursor=cursor
+        )
+        for stream in page.items:
+            print(stream.id, stream.name)
+        if page.next is None:
+            break
+        cursor = page.next
+
+
+asyncio.run(main())
+```
+
+`order` selects `PageOrder.Id`, the default, or `PageOrder.Created`, and `descending=True` reverses it. `limit` sets the size of a page, from 1 to 1000, and is 100 by default. `name` keeps the entries whose name holds the text, case-sensitive. A partition has no name, so `get_partitions_page` takes no `name`.
+
+A cursor is the `pg1_` text that the HTTP API and the CLI use. Before it sends anything, the client refuses a cursor or a query that breaks the page rules. It raises `IggyError` with the invalid command code (3). Examples are a bad cursor text, a limit of 0 or above 1000, and a name that is empty or longer than 255 bytes. A `limit` outside the unsigned 32-bit range raises `OverflowError` instead.
+
+The server refuses a cursor that it cannot use, such as the cursor of another order, also with invalid command. Over HTTP, a refusal from the server raises `IggyError` with code 300 (HTTP response error), and its message holds the server error body.
+
 ## Metadata Changes
 
 `get_metadata_changes` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manage_servers` permission. A query the server would refuse raises `IggyError` with the invalid command code before anything is sent.
@@ -426,7 +463,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Every error that the Rust SDK reports reaches Python as `IggyError`, a `RuntimeError` subclass. Its `code` is the numeric Iggy error code, the same code that the other SDKs report, and its message is the SDK's error text, so branch on `code` rather than on the message. Three codes tell what happened to a request that did not complete:

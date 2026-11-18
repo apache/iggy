@@ -148,7 +148,7 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapStreams_ReturnsValidStreamsResponses()
+    public void MapPage_OfStreams_ReturnsValidStreamsResponses()
     {
         // Arrange
         var (id1, topicsCount1, sizeBytes, messagesCount, name1, createdAt)
@@ -159,15 +159,14 @@ public sealed class BinaryMapper
         var payload2
             = BinaryFactory.CreateStreamPayload(id2, topicsCount2, name2, sizeBytes2, messagesCount2, createdAt2);
 
-        var combinedPayload = new byte[payload1.Length + payload2.Length];
-        payload1.CopyTo(combinedPayload.AsSpan());
-        payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
+        var combinedPayload = BinaryFactory.CreatePagePayload([], payload1, payload2);
 
         // Act
-        IEnumerable<StreamResponse> responses = Mappers.BinaryMapper.MapStreams(combinedPayload).ToList();
+        var page = Mappers.BinaryMapper.MapPage(combinedPayload, Mappers.BinaryMapper.MapToStream);
+        IEnumerable<StreamResponse> responses = page.Items;
 
         // Assert
-        Assert.NotNull(responses);
+        Assert.Null(page.Next);
         Assert.Equal(2, responses.Count());
 
         var response1 = responses.ElementAt(0);
@@ -232,7 +231,7 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapTopics_ReturnsValidTopicsResponses()
+    public void MapPage_OfTopics_ReturnsValidTopicsResponses()
     {
         // Arrange
         var (id1, partitionsCount1, name1, _, sizeBytesTopic1, messagesCountTopic1, createdAt, _) =
@@ -245,17 +244,14 @@ public sealed class BinaryMapper
             sizeBytesTopic2, messagesCountTopic2, createdAt2,
             BinaryFactory.CreateOptionEntry(2, "compression_algorithm", 2, "gzip"u8.ToArray()));
 
-        // GetTopics replies start with the topics count.
-        var combinedPayload = new byte[4 + payload1.Length + payload2.Length];
-        BinaryPrimitives.WriteUInt32LittleEndian(combinedPayload.AsSpan(0, 4), 2);
-        payload1.CopyTo(combinedPayload.AsSpan(4));
-        payload2.CopyTo(combinedPayload.AsSpan(4 + payload1.Length));
+        var combinedPayload = BinaryFactory.CreatePagePayload([], payload1, payload2);
 
         // Act
-        IReadOnlyList<TopicResponse> responses = Mappers.BinaryMapper.MapTopics(combinedPayload);
+        var page = Mappers.BinaryMapper.MapPage(combinedPayload, Mappers.BinaryMapper.MapToTopic);
+        IReadOnlyList<TopicResponse> responses = page.Items;
 
         // Assert
-        Assert.NotNull(responses);
+        Assert.Null(page.Next);
         Assert.Equal(2, responses.Count());
 
         var response1 = responses.ElementAt(0);
@@ -533,7 +529,7 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapConsumerGroups_ReturnsValidConsumerGroupsResponses()
+    public void MapPage_OfConsumerGroups_ReturnsValidConsumerGroupsResponses()
     {
         // Arrange
         var (id1, membersCount1, partitionsCount1, name) = ConsumerGroupFactory.CreateConsumerGroupResponseFields();
@@ -541,15 +537,14 @@ public sealed class BinaryMapper
         var (id2, membersCount2, partitionsCount2, name2) = ConsumerGroupFactory.CreateConsumerGroupResponseFields();
         var payload2 = BinaryFactory.CreateGroupPayload(id2, membersCount2, partitionsCount2, name2);
 
-        var combinedPayload = new byte[payload1.Length + payload2.Length];
-        payload1.CopyTo(combinedPayload.AsSpan());
-        payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
+        var combinedPayload = BinaryFactory.CreatePagePayload([], payload1, payload2);
 
         // Act
-        List<ConsumerGroupResponse> responses = Mappers.BinaryMapper.MapConsumerGroups(combinedPayload);
+        var page = Mappers.BinaryMapper.MapPage(combinedPayload, Mappers.BinaryMapper.MapToConsumerGroup);
+        IReadOnlyList<ConsumerGroupResponse> responses = page.Items;
 
         // Assert
-        Assert.NotNull(responses);
+        Assert.Null(page.Next);
         Assert.Equal(2, responses.Count);
 
         var response1 = responses[0];
@@ -627,15 +622,13 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapConsumerGroups_MultiByteName_KeepsWalkAligned()
+    public void MapPage_OfConsumerGroupsWithAMultiByteName_KeepsWalkAligned()
     {
         var first = BinaryFactory.CreateGroupPayload(1, 2, 3, "grüppe");
         var second = BinaryFactory.CreateGroupPayload(2, 4, 5, "other");
-        var combined = new byte[first.Length + second.Length];
-        first.CopyTo(combined, 0);
-        second.CopyTo(combined, first.Length);
+        var combined = BinaryFactory.CreatePagePayload([], first, second);
 
-        var responses = Mappers.BinaryMapper.MapConsumerGroups(combined);
+        var responses = Mappers.BinaryMapper.MapPage(combined, Mappers.BinaryMapper.MapToConsumerGroup).Items;
 
         Assert.Equal(2, responses.Count);
         Assert.Equal("grüppe", responses[0].Name);
@@ -1080,12 +1073,13 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapTopics_OversizedTopicsCount_Throws()
+    public void MapPage_OversizedTopicsCount_Throws()
     {
-        var payload = new byte[4];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, uint.MaxValue);
+        var payload = BinaryFactory.CreatePagePayload([]);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1), uint.MaxValue);
 
-        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopics(payload));
+        Assert.Throws<MalformedResponseException>(() =>
+            Mappers.BinaryMapper.MapPage(payload, Mappers.BinaryMapper.MapToTopic));
     }
 
     [Fact]

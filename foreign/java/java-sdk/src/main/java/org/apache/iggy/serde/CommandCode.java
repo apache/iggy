@@ -173,7 +173,8 @@ public interface CommandCode {
 
     enum Partition implements CommandCode {
         CREATE(402),
-        DELETE(403);
+        DELETE(403),
+        GET_ALL(404);
 
         private final int value;
 

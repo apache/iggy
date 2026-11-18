@@ -340,12 +340,12 @@ async fn receipt_checkpoint_excludes_consumer_offsets_and_restores_retry_protect
     partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
     std::fs::create_dir(directory.path().join("prepares-0")).unwrap();
     partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, CONSUMER_ID, 10, 10);
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         CONSUMER_ID as usize,
         ConsumerOffset::new(ConsumerKind::Consumer, CONSUMER_ID, 10, String::new()),
     );
     partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, CONSUMER_ID, 11, 11);
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(CONSUMER_ID as usize),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, CONSUMER_ID, 11, String::new()),
     );

@@ -349,7 +349,7 @@ fn hosted(
         .partition_shard(namespace)
         .plane
         .partitions()
-        .get_by_ns(&namespace)
+        .peek_by_ns(&namespace)
         .filter(|partition| partition.created_revision() == incarnation)
 }
 
@@ -383,7 +383,7 @@ impl CommittedLog {
             .partition_shard(namespace)
             .plane
             .partitions()
-            .get_by_ns(&namespace)?;
+            .peek_by_ns(&namespace)?;
         let journal = &partition.log.journal().inner;
         let mut messages = BTreeMap::new();
         let mut end = 0;

@@ -18,9 +18,11 @@
 //! OpenMessaging Benchmark (OMB) results. OMB measures differently from iggy-bench, so its runs
 //! have their own model, and no iggy-bench type takes an OMB run.
 
+pub mod chart;
 pub mod compare;
 pub mod detail;
 pub mod id;
+pub mod quantile;
 pub mod result;
 pub mod setup;
 pub mod summary;

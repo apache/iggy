@@ -18,6 +18,7 @@
 pub mod create_partitions;
 pub mod create_partitions_with_assignments;
 pub mod delete_partitions;
+pub mod get_partitions;
 pub mod install_consumer_group_owner;
 pub mod retire_consumer_group_owners;
 pub mod transition_partition_history;
@@ -26,6 +27,7 @@ pub use crate::primitives::partition_assignment::CreatedPartitionAssignment;
 pub use create_partitions::CreatePartitionsRequest;
 pub use create_partitions_with_assignments::CreatePartitionsWithAssignmentsRequest;
 pub use delete_partitions::DeletePartitionsRequest;
+pub use get_partitions::GetPartitionsRequest;
 pub use install_consumer_group_owner::InstallConsumerGroupOwnerRequest;
 pub use retire_consumer_group_owners::RetireConsumerGroupOwnersRequest;
 pub use transition_partition_history::TransitionPartitionHistoryRequest;

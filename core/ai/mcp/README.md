@@ -110,7 +110,7 @@ Each tool checks these MCP permissions before forwarding the request. The broker
 
 | Permission | Tools |
 | --- | --- |
-| `read` | `ping`, `get_cluster_metadata`, `get_stream`, `get_streams`, `get_topic`, `get_topics`, `poll_messages`, `get_stats`, `get_me`, `get_client`, `get_clients`, `snapshot`, `get_consumer_group`, `get_consumer_groups`, `get_consumer_offset`, `get_personal_access_tokens`, `get_user`, `get_users` |
+| `read` | `ping`, `get_cluster_metadata`, `get_stream`, `get_streams`, `get_topic`, `get_topics`, `get_partitions`, `poll_messages`, `get_stats`, `get_me`, `get_client`, `get_clients`, `snapshot`, `get_consumer_group`, `get_consumer_groups`, `get_consumer_offset`, `get_personal_access_tokens`, `get_user`, `get_users` |
 | `create` | `create_stream`, `create_topic`, `create_partitions`, `send_messages`, `create_consumer_group`, `create_personal_access_token`, `create_user` |
 | `update` | `update_stream`, `update_topic`, `store_consumer_offset`, `update_user`, `update_permissions`, `change_password` |
 | `delete` | `delete_stream`, `delete_topic`, `delete_partitions`, `delete_segments`, `delete_consumer_group`, `delete_consumer_offset`, `delete_personal_access_token`, `delete_user` |
@@ -118,6 +118,8 @@ Each tool checks these MCP permissions before forwarding the request. The broker
 `poll_messages` additionally requires `update` when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false. For read-only polling, use `offset`, `first`, `last`, or `timestamp` with auto-commit disabled.
 
 The administration tools `get_personal_access_tokens`, `create_personal_access_token`, `delete_personal_access_token`, `get_users`, `get_user`, `create_user`, `update_user`, `delete_user`, `update_permissions`, `change_password` and `snapshot` also require `admin`, which is off by default. They let an agent mint credentials, lock out users or read server diagnostics, so enable `admin` only for a server whose agents administer Iggy.
+
+`get_streams`, `get_topics`, `get_consumer_groups` and `get_users` return the whole list as an array. The array follows `order` and `descending` and holds only the items that match `name`. With `limit` or `cursor`, they return one page as `{items, next}` instead. To read the next page, call the tool again with `next` as `cursor` and the same other parameters. The last page has no `next`. `get_partitions` always returns one page and takes the same page parameters except `name`.
 
 `send_messages` takes UTF-8 payloads, and `poll_messages` returns payloads base64 encoded. A batch with an invalid message, such as an empty payload, is refused and nothing is sent.
 
