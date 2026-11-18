@@ -15,19 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The latency quantile curves of the OMB run and compare pages: the value at every percentile of a
-//! merged histogram, on a log axis, against a percentile axis that counts nines. Both pages draw
-//! them here, so a run's curve has the same axis on both.
+//! The latency quantile curves of OMB runs: the value at every percentile of a merged histogram, on
+//! a log axis, against a percentile axis that counts nines. The run page, the compare page and the
+//! embeds draw them here, so a run's curve has the same axis on each.
 
-use bench_dashboard_shared::omb::result::OmbQuantile;
 use bench_report::plotting::chart::IggyChart;
 use charming::Chart;
 use charming::component::Axis;
 use charming::element::{AxisLabel, AxisPointer, AxisType, JsFunction, Label, SplitLine};
 
-use crate::pages::run::chart::LINE_OPACITY;
+use crate::omb::chart::LINE_OPACITY;
+use crate::omb::result::OmbQuantile;
 
-pub const LATENCY_AXIS_NAME: &str = "Latency [ms]";
 /// The percentile axis counts nines: 1 is P90, 2 is P99, 3 is P99.9. Each step gets a split line
 /// and a label, so the tail gets as much room as the median.
 const NINES_STEP: f64 = 1.0;
@@ -69,10 +68,11 @@ impl QuantileCurve {
     }
 }
 
-/// The curves on a log y axis named `axis_name`. The x axis ends at the first whole nine past the
-/// last point of any curve.
-pub fn quantile_options(axis_name: &str, curves: &[QuantileCurve]) -> Chart {
-    let base = IggyChart::card().with_log_y_axis(axis_name);
+/// The curves on `chart` with a log y axis named `axis_name`, for example
+/// [`crate::omb::chart::LATENCY_AXIS_NAME`]. The x axis ends at the first whole nine past the last
+/// point of any curve.
+pub fn quantile_options(chart: IggyChart, axis_name: &str, curves: &[QuantileCurve]) -> Chart {
+    let base = chart.with_log_y_axis(axis_name);
     let mut chart = IggyChart {
         inner: base.inner.x_axis(nines_axis(axis_end(curves))),
     };
@@ -128,7 +128,7 @@ fn nines_axis(end: f64) -> Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::OMB_RC1_DEFAULT;
+    use crate::omb::test_fixtures::RC1_DEFAULT;
 
     fn curve(name: &str, points: Vec<Vec<f64>>) -> QuantileCurve {
         QuantileCurve {
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn given_fixture_quantiles_when_curved_should_drop_p100_and_zero_and_keep_order() {
-        let detail = OMB_RC1_DEFAULT.detail();
+        let detail = RC1_DEFAULT.detail();
         let publish = &detail.quantiles.publish_latency_ms;
 
         let points = curve_points(publish);
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn given_fixture_curves_when_read_at_two_nines_should_match_aggregated_p99() {
-        let detail = OMB_RC1_DEFAULT.detail();
+        let detail = RC1_DEFAULT.detail();
         let p99_nines = nines(99.0).expect("P99 has nines");
         let at_p99 = |points: &[Vec<f64>]| {
             points
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn given_fixture_curves_when_axis_sized_should_end_on_next_whole_nine_past_last_point() {
-        let detail = OMB_RC1_DEFAULT.detail();
+        let detail = RC1_DEFAULT.detail();
         let curves: Vec<QuantileCurve> = [
             QuantileCurve::new("Publish", &detail.quantiles.publish_latency_ms, None),
             detail

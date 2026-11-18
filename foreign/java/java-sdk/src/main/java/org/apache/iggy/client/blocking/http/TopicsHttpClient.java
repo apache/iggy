@@ -24,6 +24,8 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.partition.Partition;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicOptions;
@@ -60,6 +62,13 @@ class TopicsHttpClient implements TopicsClient {
         var request = httpClient.prepareGetRequest(STREAMS + "/" + streamId + TOPICS);
         List<HttpTopic> topics = httpClient.execute(request, new TypeReference<>() {});
         return topics.stream().map(HttpTopic::toTopic).toList();
+    }
+
+    @Override
+    public Page<Topic> getTopicsPage(StreamId streamId, NamedPageQuery query) {
+        HttpPage<HttpTopic> page =
+                HttpPage.read(httpClient, STREAMS + "/" + streamId + TOPICS, query, new TypeReference<>() {});
+        return page.toPage(HttpTopic::toTopic);
     }
 
     @Override

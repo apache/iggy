@@ -186,7 +186,7 @@ impl fmt::Display for Badge {
 }
 
 /// The actors that `iggy-bench` puts into a group of the report.
-const fn is_member(group: GroupMetricsKind, actor: ActorKind) -> bool {
+pub(crate) const fn is_member(group: GroupMetricsKind, actor: ActorKind) -> bool {
     match group {
         GroupMetricsKind::Producers => matches!(actor, ActorKind::Producer),
         GroupMetricsKind::Consumers => matches!(actor, ActorKind::Consumer),

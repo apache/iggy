@@ -65,6 +65,7 @@ const (
 	DeleteTopicCode           Code = 303
 	CreatePartitionsCode      Code = 402
 	DeletePartitionsCode      Code = 403
+	GetPartitionsCode         Code = 404
 	DeleteSegmentsCode        Code = 503
 	GetGroupCode              Code = 600
 	GetGroupsCode             Code = 601

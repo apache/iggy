@@ -303,5 +303,40 @@ async fn given_failing_superblock_when_persist_gate_runs_should_withhold_and_bac
             partition.consensus().needs_superblock_persist(),
             "{case}: the view stays undurable until a write lands"
         );
+        assert!(
+            partition.view_persist_pending(),
+            "{case}: the view waits for the retry of its write"
+        );
     }
+}
+
+#[compio::test]
+async fn given_an_undurable_view_when_its_superblock_write_passes_the_lane_should_wait_until_it_lands()
+ {
+    let mut partition = partition_at_view(1, 1);
+    partition.set_superblock(Rc::new(RecordingSuperblock::default()), None);
+    partition.set_io_notifier(
+        Rc::new(|_, _| {}),
+        crate::largest_legal_job_charge().unwrap(),
+    );
+    assert!(partition.consensus().needs_superblock_persist());
+    assert!(
+        !partition.view_persist_pending(),
+        "a view that no write was asked for does not wait for local I/O"
+    );
+
+    assert!(!partition.persist_superblock_if_needed().await);
+    assert!(partition.view_persist_pending(), "the write is queued");
+    let config = repair_config();
+    let crate::PartitionIoStep::Ready(plan) = partition.resume_io(&config).await else {
+        panic!("view persistence must be ready");
+    };
+    let captured = partition.capture_io(plan, &config).unwrap().unwrap();
+    assert!(partition.view_persist_pending(), "the write runs");
+
+    let result = captured.job.execute().await;
+    partition.accept_io(captured.identity, result).unwrap();
+    captured.gate.unwrap().release();
+    assert!(!partition.view_persist_pending(), "the write landed");
+    assert!(partition.persist_superblock_if_needed().await);
 }

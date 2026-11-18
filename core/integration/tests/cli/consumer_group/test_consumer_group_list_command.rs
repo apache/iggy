@@ -15,18 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::cli::common::list_runs::{ListRun, execute_list_runs};
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, OutputFormat, TestHelpCmd,
     USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use iggy::prelude::Client;
+use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::StreamCreateOptions;
 use iggy::prelude::TopicCreateOptions;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
+
+const PAGES_STREAM: &str = "pages";
+const PAGES_TOPIC: &str = "events";
+/// The field of the group name in a list mode row.
+const NAME_COLUMN: usize = 1;
 
 struct TestConsumerGroupListCmd {
     stream_name: String,
@@ -205,6 +213,67 @@ pub async fn should_be_successful() {
 
 #[tokio::test]
 #[parallel]
+pub async fn should_print_pages() {
+    execute_list_runs(
+        seed_consumer_groups,
+        NAME_COLUMN,
+        vec![
+            ListRun::new(
+                "consumer-group list pages events -l list",
+                &["pages-g1", "pages-g2", "pages-g3"],
+                false,
+            ),
+            ListRun::new(
+                "consumer-group list pages events -l list --desc --limit 2",
+                &["pages-g3", "pages-g2"],
+                true,
+            ),
+            ListRun::new(
+                "consumer-group list pages events -l list --desc --limit 2 --after {next}",
+                &["pages-g1"],
+                false,
+            ),
+            ListRun::new(
+                "consumer-group list pages events -l list --name g2",
+                &["pages-g2"],
+                false,
+            ),
+        ],
+    )
+    .await;
+}
+
+fn seed_consumer_groups(client: &dyn Client) -> BoxFuture<'_, ()> {
+    Box::pin(async move {
+        let stream_id = Identifier::named(PAGES_STREAM).expect("a stream name");
+        let topic_id = Identifier::named(PAGES_TOPIC).expect("a topic name");
+        client
+            .create_stream(PAGES_STREAM, &StreamCreateOptions::default())
+            .await
+            .expect("create stream");
+        client
+            .create_topic(
+                &stream_id,
+                PAGES_TOPIC,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
+            )
+            .await
+            .expect("create topic");
+        for name in ["pages-g1", "pages-g2", "pages-g3"] {
+            client
+                .create_consumer_group(&stream_id, &topic_id, name)
+                .await
+                .expect("create consumer group");
+        }
+    })
+}
+
+#[tokio::test]
+#[parallel]
 pub async fn should_help_match() {
     let mut iggy_cmd_test = IggyCmdTest::help_message();
 
@@ -222,6 +291,7 @@ Examples:
  iggy consumer-group list stream 2 --list-mode table
  iggy consumer-group list 3 topic -l table
  iggy consumer-group list production sensor -l table
+ iggy consumer-group list production sensor --desc --limit 20
 
 {USAGE_PREFIX} consumer-group list [OPTIONS] <STREAM_ID> <TOPIC_ID>
 
@@ -242,6 +312,28 @@ Options:
 {CLAP_INDENT}
           [default: table]
           [possible values: table, list]
+
+      --sort <SORT>
+          Order of the rows, by ID or by creation time
+{CLAP_INDENT}
+          [default: id]
+          [possible values: id, created]
+
+      --desc
+          Print the rows in descending order
+
+      --limit <N>
+          Print at most N rows
+{CLAP_INDENT}
+          If more rows follow them, the last line is `next: <CURSOR>`. Pass that cursor to --after to print the rows that follow.
+
+      --after <CURSOR>
+          Print the rows after this cursor
+{CLAP_INDENT}
+          The cursor comes from the `next:` line of a list with --limit. Use the same other flags as that list.
+
+      --name <TEXT>
+          Print only the rows whose name holds this text (case-sensitive)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -270,6 +362,11 @@ Arguments:
 
 Options:
   -l, --list-mode <LIST_MODE>  List mode (table or list) [default: table] [possible values: table, list]
+      --sort <SORT>            Order of the rows, by ID or by creation time [default: id] [possible values: id, created]
+      --desc                   Print the rows in descending order
+      --limit <N>              Print at most N rows
+      --after <CURSOR>         Print the rows after this cursor
+      --name <TEXT>            Print only the rows whose name holds this text (case-sensitive)
   -h, --help                   Print help (see more with '--help')
 "#,
             ),

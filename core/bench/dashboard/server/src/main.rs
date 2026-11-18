@@ -208,6 +208,10 @@ async fn main() -> Result<(), std::io::Error> {
             .service(handlers::get_benchmark_report_light)
             .service(handlers::get_benchmark_series)
             .service(handlers::get_test_artifacts_zip)
+            // Only `/embed/omb/chart.png` matches an OMB and an iggy-bench embed route. Both answer
+            // 400 for it, and this order names the missing OMB run id in the error.
+            .service(handlers::omb::embed_omb_chart_png)
+            .service(handlers::omb::embed_omb_chart)
             .service(handlers::embed_chart_png)
             .service(handlers::embed_chart)
             .service(handlers::omb::list_omb_runs)

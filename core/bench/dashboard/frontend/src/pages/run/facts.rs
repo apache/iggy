@@ -18,7 +18,7 @@
 //! The facts that a run's page lists: its conditions, command, parameters, options, environment and
 //! latency percentiles, as text built from the typed fields of the summary and the report.
 
-use std::{fmt, iter};
+use std::iter;
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::delta::Metric;
@@ -199,23 +199,17 @@ pub fn option_groups(params: &BenchmarkParams) -> Vec<FactGroup> {
         ],
     }];
     if let Some(consumer) = &options.consumer {
-        let mut facts = vec![
-            fact(
-                "Offset durability",
-                durability_text(consumer.consumer_offset_durability),
-            ),
-            fact("Max wait", duration_text(consumer.max_wait_us)),
-            fact("Min count", group_digits(consumer.min_count.into())),
-            fact("Max bytes", max_bytes_text(consumer.max_bytes)),
-        ];
-        facts.extend(
-            consumer
-                .read_amplification
-                .map(|factor| fact("Read amplification", amplification_text(factor))),
-        );
         groups.push(FactGroup {
             title: "Consumer",
-            facts,
+            facts: vec![
+                fact(
+                    "Offset durability",
+                    durability_text(consumer.consumer_offset_durability),
+                ),
+                fact("Max wait", duration_text(consumer.max_wait_us)),
+                fact("Min count", group_digits(consumer.min_count.into())),
+                fact("Max bytes", max_bytes_text(consumer.max_bytes)),
+            ],
         });
     }
     groups.push(FactGroup {
@@ -307,9 +301,6 @@ pub fn field_value(field: WorkloadField, key: &WorkloadKey) -> FieldValue {
             size: options.max_bytes.map(u64::from),
             text: max_bytes_text(options.max_bytes),
         }),
-        WorkloadField::ReadAmplification => poll
-            .and_then(|options| options.read_amplification.as_deref())
-            .map_or_else(not_polled, |factor| word(&amplification_text(factor))),
         WorkloadField::WarmupTime => amount(
             key.client.warmup_time_us,
             duration_text(key.client.warmup_time_us),
@@ -602,11 +593,6 @@ fn max_bytes_text(bytes: Option<u32>) -> String {
         || BENCH_DEFAULT.to_owned(),
         |bytes| format_bytes(bytes.into()),
     )
-}
-
-/// The report holds the factor as a number and the workload key as its exact text.
-fn amplification_text(factor: impl fmt::Display) -> String {
-    format!("{factor}x")
 }
 
 const fn yes_no(value: bool) -> &'static str {

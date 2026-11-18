@@ -25,6 +25,8 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 
 import java.util.List;
 import java.util.Map;
@@ -46,6 +48,11 @@ final class StreamsTcpClient implements StreamsClient {
     @Override
     public List<StreamBase> getStreams() {
         return FutureUtil.resolve(delegate.getStreams());
+    }
+
+    @Override
+    public Page<StreamBase> getStreamsPage(NamedPageQuery query) {
+        return FutureUtil.resolve(delegate.getStreamsPage(query));
     }
 
     @Override

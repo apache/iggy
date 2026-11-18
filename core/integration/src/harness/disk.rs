@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
+use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
@@ -645,12 +646,44 @@ pub fn read_partition_superblock_state(data_path: &Path) -> Option<VsrState> {
 }
 
 /// The message offset the single partition's published WAL frontier ends at on
-/// a node: a restart keeps the segment messages below it and discards the rest.
+/// a node: a barrier covers the segment messages below it, and a restart keeps
+/// the ones past it only while their records still verify.
 /// `None` while no frontier owning segment bodies exists. Read it while the
 /// node is down, since a live node keeps publishing. Intended for layouts with
 /// exactly one partition.
 pub fn read_partition_wal_frontier(data_path: &Path) -> Option<u64> {
-    let path = walk(data_path, &mut |path| {
+    let frontier = fs::read(find_partition_wal(data_path)?.join(FRONTIER_FILE_NAME)).ok()?;
+    PartitionPrepareJournal::published_segment_tail(&frontier).map(|tail| tail.next_offset)
+}
+
+/// Cut the single partition's WAL on a stopped node back to its published
+/// frontier.
+///
+/// A killed process leaves the records past the frontier with the OS, and a
+/// restart keeps them. A power loss can take them, and this cut is the most it
+/// takes. The segment bodies stay, as they can after a power loss.
+///
+/// # Errors
+/// Returns an error if no frontier verifies or the WAL cannot be cut.
+pub fn drop_unpublished_partition_wal_tail(data_path: &Path) -> io::Result<()> {
+    let directory = find_partition_wal(data_path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no partition WAL with a frontier")
+    })?;
+    let frontier = fs::read(directory.join(FRONTIER_FILE_NAME))?;
+    let (wal, published) = PartitionPrepareJournal::published_data_file(&directory, &frontier)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no frontier slot verifies"))?;
+    let file = fs::OpenOptions::new().write(true).open(wal)?;
+    // Never extend a shorter file: an open must refuse it.
+    if file.metadata()?.len() > published {
+        file.set_len(published)?;
+    }
+    Ok(())
+}
+
+/// The directory of the single partition's WAL under `data_path`, found by
+/// its frontier file.
+fn find_partition_wal(data_path: &Path) -> Option<PathBuf> {
+    walk(data_path, &mut |path| {
         path.file_name()
             .is_some_and(|name| name == FRONTIER_FILE_NAME)
             && path
@@ -658,9 +691,9 @@ pub fn read_partition_wal_frontier(data_path: &Path) -> Option<u64> {
                 .and_then(Path::file_name)
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(PREPARES_DIR_PREFIX))
-    })?;
-    let frontier = fs::read(path).ok()?;
-    PartitionPrepareJournal::published_segment_tail(&frontier).map(|tail| tail.next_offset)
+    })?
+    .parent()
+    .map(Path::to_path_buf)
 }
 
 fn read_superblock_state_in(dir: &Path, plane: &str) -> Option<VsrState> {

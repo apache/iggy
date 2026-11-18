@@ -41,7 +41,7 @@ use iggy_common::{Identifier, IggyError};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::Streams;
+use metadata::stm::stream::{Streams, StreamsInner};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::{PartitionRead, PartitionReadReply};
@@ -292,15 +292,29 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let resolved_stream = streams
-            .resolve_stream_id(stream_id)
-            .ok_or_else(|| stream_not_found(stream_id))?;
-        streams
-            .resolve_topic_id(resolved_stream, topic_id)
-            .ok_or_else(|| topic_not_found(stream_id, topic_id))?;
-        Ok(())
-    })
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|streams| resolve_topic(streams, stream_id, topic_id).map(|_| ()))
+}
+
+/// The stream and topic ids of an existing topic, or the typed error of
+/// [`ensure_topic_exists`]. A read that walks the topic resolves it in the
+/// same state.
+pub fn resolve_topic(
+    streams: &StreamsInner,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Result<(usize, usize), IggyError> {
+    let resolved_stream = streams
+        .resolve_stream_id(stream_id)
+        .ok_or_else(|| stream_not_found(stream_id))?;
+    let resolved_topic = streams
+        .resolve_topic_id(resolved_stream, topic_id)
+        .ok_or_else(|| topic_not_found(stream_id, topic_id))?;
+    Ok((resolved_stream, resolved_topic))
 }
 
 /// Fence a consumer-group offset commit/delete: a group consumer may only
@@ -406,7 +420,7 @@ where
 /// shape. The identifier only feeds the error message; a wire form with no
 /// domain equivalent (numeric 0 is a live slab id here but not a legacy id)
 /// falls back to the default identifier.
-fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
+pub fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
     IggyError::StreamIdNotFound(Identifier::try_from(stream_id).unwrap_or_default())
 }
 
