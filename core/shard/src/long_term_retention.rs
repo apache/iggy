@@ -26,6 +26,9 @@
 //!
 //! The segments on a replica's disk hold placed batches. Every replica
 //! removes the ones at or below the committed trim point, on the same pass.
+//!
+//! The same pass expires the registrations of segments that no publish or
+//! replace listed in time, so that their objects are deleted.
 
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel};
@@ -71,8 +74,9 @@ where
     /// Run a retention pass over `namespace` on the pump, when its partition
     /// is the incarnation `created_revision`: remove the local segments the
     /// long-term log trimmed, and on the primary send the trim the policy
-    /// asks for now. The same trim goes out on every pass until it commits,
-    /// since only then do the segments it names leave the log.
+    /// asks for now and the expiry of registrations that are due at `now`.
+    /// Both go out on every pass until they commit, since only then does the
+    /// log change.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_retain_long_term(
         &self,
@@ -87,7 +91,7 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        let decision = {
+        let (trim, expiry) = {
             // The policy belongs to `created_revision`. Judged against any
             // other incarnation it would trim a topic that never had it.
             let Some(partition) = self
@@ -115,11 +119,20 @@ where
                 // point, so the rest goes without a second trim.
                 self.request_clean_partition(namespace, now, message_expiry, max_bytes);
             }
-            partition.long_term_retention_end(now, message_expiry, max_bytes)
+            (
+                partition.long_term_retention_end(now, message_expiry, max_bytes),
+                partition.long_term_registrations_expiry(now),
+            )
         };
-        if let Some(up_to_offset) = decision {
+        if let Some(up_to_offset) = trim {
             self.metrics.record_long_term_trim();
             self.trim_segments(namespace, up_to_offset).await;
+        }
+        if let Some(before) = expiry {
+            self.submit_long_term_command(namespace, |partition, number| {
+                partition.expire_registrations_request(before, number)
+            })
+            .await;
         }
     }
 

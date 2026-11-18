@@ -41,13 +41,19 @@
 //! a segment sends its command again and starts no rewrite, so a command
 //! that was refused or lost costs a pass and nothing else.
 //!
+//! A segment is registered before it is stored. A pass without a plan
+//! starts one in a detached task, which reads the headers of the batches to
+//! find where the segment ends. The tick hands that to the partition and
+//! commits the registration, and the pass that its commit makes due starts
+//! the rewrite.
+//!
 //! A pass over a partition whose backlog has no count yet, as after a boot
 //! or an install, also starts a walk of its log that counts it, in a
 //! detached task whose count the tick hands back. The pass of a partition
 //! past its backlog limit does not wait out its interval.
 
 use crate::metrics::LongTermLag;
-use crate::rewrite_pacing::{BacklogCount, RewriteResult};
+use crate::rewrite_pacing::{BacklogCount, FinishedPlan, RewriteKey, RewriteResult};
 use crate::shards_table::ShardsTable;
 use crate::{
     FinishedSegmentRewrite, IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel,
@@ -59,7 +65,7 @@ use iggy_object_store::ManifestSegment;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::{IggyPartition, LONG_TERM_SEGMENT_BYTES, LongTermWriter};
+use partitions::{IggyPartition, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteStart};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
@@ -177,6 +183,9 @@ where
                 partition.merges_under_pressure(),
             );
         }
+        if partition.take_long_term_registered() {
+            self.long_term_registered(&(namespace, partition.created_revision()));
+        }
     }
 
     fn long_term_changed(&self, namespace: IggyNamespace, created_revision: u64, pressed: bool) {
@@ -189,15 +198,25 @@ where
         }
     }
 
+    /// A registration committed to the long-term log of `key`, which leaves
+    /// its manifest as it is. The rewrite or the merge that waited for it
+    /// is due.
+    fn long_term_registered(&self, key: &RewriteKey) {
+        self.rewrite_pacing
+            .borrow_mut()
+            .committed(key, self.bus.monotonic_micros());
+        self.long_term_merge_committed(key, false);
+    }
+
     /// The pump's tick: settle the rewrites whose frame the inbox refused,
     /// look over every partition once after the shard got a writer, hand
     /// the partitions the backlogs their walks counted, act on the
-    /// commands that committed outside a partition I/O step, make the pass
-    /// of a partition past its backlog limit due, start the passes that are
-    /// due, and report how far the rewrites are behind, per partition and
-    /// at worst, the largest backlog, how long the longest long-term log
-    /// is, and how many objects no long-term log accounts for or wait for
-    /// their delete.
+    /// commands that committed outside a partition I/O step, stage the
+    /// manifest passes that no commit asks for, make the pass of a partition
+    /// past its backlog limit due, start the passes that are due, and report
+    /// how far the rewrites are behind, per partition and at worst, the
+    /// largest backlog, how long the longest long-term log is, and how many
+    /// objects no long-term log accounts for or wait for their delete.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
@@ -210,12 +229,17 @@ where
         for finished in undelivered {
             self.settle_segment_rewrite(finished).await;
         }
+        let plans = self.rewrite_pacing.borrow().take_plans();
+        for plan in plans {
+            self.settle_segment_plan(plan).await;
+        }
         let partitions = self.plane.partitions();
+        let manifest_now = IggyTimestamp::now();
         if self.rewrite_pacing.borrow_mut().take_sweep_wanted() {
             for namespace in partitions.namespaces() {
                 if let Some(partition) = partitions.get_by_ns(namespace) {
                     self.pace_placing_primary(*namespace, partition);
-                    self.stage_manifest_of_new_primary(*namespace, partition);
+                    self.stage_manifest_pass(*namespace, partition, manifest_now);
                 }
             }
         }
@@ -233,6 +257,7 @@ where
         let mut dead_objects = 0;
         let mut most_segments = 0;
         let mut changed = Vec::new();
+        let mut registered = Vec::new();
         let mut past_limit = Vec::new();
         let mut largest_backlog = 0;
         let mut lags = self.metrics.long_term_lags_to_fill();
@@ -247,11 +272,19 @@ where
             unannounced_objects += partition.long_term_unannounced_objects();
             dead_objects += partition.queued_dead_long_term_objects();
             most_segments = most_segments.max(partition.long_term_segments().len());
-            if partition.take_long_term_changed() {
+            let long_term_changed = partition.take_long_term_changed();
+            if long_term_changed {
                 changed.push((*key, partition.merges_under_pressure()));
+            }
+            if partition.take_long_term_registered() {
+                registered.push(*key);
             }
             if !partition.consensus().is_primary() {
                 continue;
+            }
+            // A change stages its own pass below.
+            if !long_term_changed {
+                self.stage_manifest_pass(key.0, partition, manifest_now);
             }
             lags.push(LongTermLag {
                 namespace: key.0,
@@ -271,6 +304,9 @@ where
         self.metrics.set_long_term_segments(most_segments);
         for ((namespace, created_revision), pressed) in changed {
             self.long_term_changed(namespace, created_revision, pressed);
+        }
+        for key in registered {
+            self.long_term_registered(&key);
         }
         let now = self.bus.monotonic_micros();
         let due = {
@@ -328,6 +364,10 @@ where
                 .map_or_else(|| Ok(partition.begin_segment_rewrite()), Err);
             let mut pacing = self.rewrite_pacing.borrow_mut();
             match &started {
+                Ok(Some(RewriteStart::Register(_))) => {
+                    pacing.set_lag(key, lag);
+                    pacing.settle(key, RewriteResult::Registering, now);
+                }
                 Ok(Some(_)) => pacing.started(key, lag),
                 // Its result sets when the next pass is due.
                 Ok(None) if partition.segment_rewrite_running() => pacing.started(key, lag),
@@ -361,7 +401,23 @@ where
                 return;
             }
             Ok(None) => return,
-            Ok(Some(started)) => started,
+            Ok(Some(RewriteStart::Register(registration))) => {
+                self.submit_long_term_command(namespace, |partition, number| {
+                    partition.register_object_request(&registration, number)
+                })
+                .await;
+                return;
+            }
+            Ok(Some(RewriteStart::Plan(id, plan))) => {
+                let plans = self.rewrite_pacing.borrow().plans();
+                // Off the pump: the plan reads the partition's segment files.
+                self.bus.spawn(async move {
+                    let outcome = plan.run().await;
+                    plans.borrow_mut().push(FinishedPlan { key, id, outcome });
+                });
+                return;
+            }
+            Ok(Some(RewriteStart::Rewrite(id, rewrite, scope))) => (id, rewrite, scope),
         };
         let undelivered = Rc::clone(&self.undelivered_segment_rewrites);
         // Through the bus, not the runtime directly: the simulator supplies
@@ -432,6 +488,46 @@ where
             .settle(key, result, self.bus.monotonic_micros());
         if let Some(stored) = stored {
             self.publish_segment(finished.namespace, &stored).await;
+        }
+    }
+
+    /// Hand `plan` to the partition that started it, and commit the
+    /// registration of the segment it found. The pass after the
+    /// registration commits starts the rewrite. A plan that failed waits,
+    /// as a failed rewrite does.
+    #[allow(clippy::future_not_send)]
+    async fn settle_segment_plan(&self, plan: FinishedPlan)
+    where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        let (namespace, created_revision) = plan.key;
+        let Some(partition) = self
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .filter(|partition| partition.created_revision() == created_revision)
+        else {
+            self.rewrite_pacing.borrow_mut().forget(&plan.key);
+            return;
+        };
+        let registration =
+            partition.finish_segment_plan(plan.id, plan.outcome, IggyTimestamp::now());
+        let result = if registration.is_some() {
+            RewriteResult::Registering
+        } else {
+            RewriteResult::Unchanged
+        };
+        self.rewrite_pacing
+            .borrow_mut()
+            .settle(plan.key, result, self.bus.monotonic_micros());
+        if let Some(registration) = registration {
+            self.submit_long_term_command(namespace, |partition, number| {
+                partition.register_object_request(&registration, number)
+            })
+            .await;
         }
     }
 

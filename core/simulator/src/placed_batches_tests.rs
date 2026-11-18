@@ -1021,16 +1021,41 @@ fn given_a_primary_change_at_each_step_of_a_rewrite_when_the_next_primary_goes_o
         );
 
         // The command reaches the backups, and the primary stops before it
-        // hears from them. The next primary commits it with its view.
+        // hears from them. The next primary commits it with its view. The
+        // registration of the segment commits before the primary stores it,
+        // so the backups stop answering only after that.
         let committed = send_round(&mut sim);
         let leader = await_primary(&mut sim);
         let backups: Vec<u8> = (0..REPLICAS).filter(|replica| *replica != leader).collect();
+        request_rewrite(&sim, leader);
+        let registered = |sim: &Simulator| {
+            with_partition(sim, leader, |partition| {
+                partition.long_term_log().is_some_and(|log| {
+                    log.registrations()
+                        .iter()
+                        .any(|registration| registration.start_offset == log.next_start())
+                })
+            })
+        };
+        for _ in 0..REWRITE_TICKS {
+            if registered(&sim) {
+                break;
+            }
+            sim.step();
+        }
+        assert!(
+            registered(&sim),
+            "the registration of the segment commits, seed {seed:#x}"
+        );
+        assert!(
+            floors(&sim).iter().all(|floor| *floor < Some(committed)),
+            "nothing is published before the backups stop answering, seed {seed:#x}"
+        );
         for backup in &backups {
             *sim.network
                 .link_drop_packet_fn(ProcessId::Replica(*backup), ProcessId::Replica(leader)) =
                 Some(|packet: &Packet| packet.message.header().command == Command::PrepareOk);
         }
-        request_rewrite(&sim, leader);
         let command_sent = |sim: &Simulator| {
             let op = with_partition(sim, leader, |partition| {
                 partition

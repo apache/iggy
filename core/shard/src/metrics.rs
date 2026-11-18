@@ -439,6 +439,7 @@ pub struct ShardMetrics {
     fresh_objects_unnamed: Gauge,
     fresh_objects_due: Gauge,
     fresh_listings_truncated: Gauge,
+    fresh_sweeps_held: Gauge,
     fresh_objects_deleted_total: Counter,
     partition_long_term_backlog_bytes: Gauge,
     partition_long_term_lags: Arc<Mutex<LongTermLags>>,
@@ -642,6 +643,7 @@ impl ShardMetrics {
             fresh_objects_unnamed: Gauge::default(),
             fresh_objects_due: Gauge::default(),
             fresh_listings_truncated: Gauge::default(),
+            fresh_sweeps_held: Gauge::default(),
             fresh_objects_deleted_total: Counter::default(),
             partition_long_term_backlog_bytes: Gauge::default(),
             partition_long_term_lags: Arc::default(),
@@ -1578,6 +1580,20 @@ impl ShardMetrics {
             .set(i64::try_from(due).unwrap_or(i64::MAX));
     }
 
+    /// Republished by every sweep of fresh objects that ends with the
+    /// answers of the shards: whether one could not tell which objects it
+    /// needs, so the sweep deleted nothing.
+    pub fn set_fresh_sweeps_held(&self, held: bool) {
+        self.fresh_sweeps_held.set(i64::from(held));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_sweeps_held_value(&self) -> i64 {
+        self.fresh_sweeps_held.get()
+    }
+
     /// Test-only read, mirroring the siblings.
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
@@ -2224,6 +2240,12 @@ impl ShardMetrics {
             "listings of the last sweep of fresh objects that stopped at their share of keys, \
              of one per shard and one for the replica",
             self.fresh_listings_truncated.clone(),
+        );
+        registry.register(
+            "fresh_sweeps_held",
+            "1 while the last sweep of fresh objects of this replica deleted nothing because \
+             a shard could not tell which objects its partitions need, else 0",
+            self.fresh_sweeps_held.clone(),
         );
         registry.register(
             "fresh_objects_deleted",

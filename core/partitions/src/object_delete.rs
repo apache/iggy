@@ -50,7 +50,7 @@ use iggy_object_store::{
 };
 use tracing::warn;
 
-use crate::long_term_delete::SweptLongTerm;
+use crate::long_term_delete::{LongTermNames, SweptLongTerm};
 
 /// How long the objects of a removed segment stay in the store after the
 /// primary learned the segment is gone.
@@ -88,9 +88,8 @@ pub enum ObjectDeleteWork {
     /// which a committed delete removed.
     DeleteIncarnation,
     /// List the objects of the incarnation's long-term segments, and sort
-    /// them by `segments`, the first and the last offset of every segment
-    /// of the long-term log in offset order.
-    SweepLongTerm { segments: Vec<(u64, u64)> },
+    /// them by what the long-term `log` names.
+    SweepLongTerm { log: LongTermNames },
     /// Delete the `.index` and then the `.log` of the long-term segments
     /// with these first and last offsets.
     DeleteLongTerm { segments: Vec<(u64, u64)> },
@@ -210,13 +209,13 @@ impl<E: TierExecutor> ObjectDeleter for ExecutorDeleter<E> {
                     },
                 )
                 .boxed_local(),
-            ObjectDeleteWork::SweepLongTerm { segments } => self
+            ObjectDeleteWork::SweepLongTerm { log } => self
                 .executor
                 .submit(
                     TierJobRequest::new(TierJobClass::Housekeeping, scope),
                     move |store| async move {
                         ObjectDeleteDone::LongTermSwept(
-                            sweep_long_term(&*store, &layout, &prefix, &segments).await,
+                            sweep_long_term(&*store, &layout, &prefix, &log).await,
                         )
                     },
                 )
@@ -387,8 +386,7 @@ pub async fn sweep_segments<S: ObjectStore>(
 }
 
 /// List the objects of the long-term segments of `prefix`, and sort them by
-/// `segments`, the first and the last offset of every segment of the
-/// long-term log in offset order.
+/// what the long-term `log` names.
 ///
 /// A segment is found by either of its objects, so one that lost only its
 /// `.index` is still reported.
@@ -400,10 +398,10 @@ pub async fn sweep_long_term<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
     prefix: &ObjectPrefix,
-    segments: &[(u64, u64)],
+    log: &LongTermNames,
 ) -> Result<SweptLongTerm, ObjectStoreError> {
     let listed = list_incarnation(store, layout, prefix).await?;
-    Ok(SweptLongTerm::classified(listed.long_term, segments))
+    Ok(SweptLongTerm::classified(listed.long_term, log))
 }
 
 /// Delete every segment object the store lists for `prefix`, those of
