@@ -19,11 +19,11 @@
 //! node loses its disk, and the cluster rebuilt on empty disks whose replica
 //! 0 the operator tells to recover it.
 //!
-//! The origin writes fresh objects of the format before the self-describing
-//! one, so the test stores the self-describing objects that an origin of
-//! that format leaves: batches above the manifest's floor, the proofs of
-//! some of them, and claims of others, one of which a claim of a higher
-//! view overrides.
+//! The first test stores, beside the objects the origin wrote, the
+//! self-describing objects that an origin leaves when its proofs stop short:
+//! batches above the manifest's floor, the proofs of some of them, and
+//! claims of others, one of which a claim of a higher view overrides. The
+//! second one recovers what the origin's own writer stored and proved.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -210,13 +210,10 @@ async fn given_a_bucket_of_an_origin_that_lost_every_disk_when_a_cluster_with_em
         .collect();
     reasons.sort_unstable();
     assert_eq!(reasons, ["lost_overlap", "past_gap"]);
-    assert!(
-        report["skipped_objects"]
-            .as_array()
-            .expect("skipped objects")
-            .iter()
-            .any(|skipped| skipped["reason"] == "not_self_describing"),
-        "the origin's objects of the format before are reported: {report}"
+    assert_eq!(
+        report["skipped_objects"],
+        serde_json::json!([]),
+        "every object of the origin describes itself: {report}"
     );
 }
 
