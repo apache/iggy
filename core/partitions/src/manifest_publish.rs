@@ -138,8 +138,6 @@ pub struct ManifestPublishes {
     /// The job in flight: its number, what its manifest holds, and the scope
     /// whose end stops it.
     running: Option<(u64, ManifestProgress, TierScope)>,
-    /// Number of the last job this partition started.
-    jobs: u64,
 }
 
 impl ManifestPublishes {
@@ -234,9 +232,9 @@ where
         }
         let scope = TierScope::new();
         let token = scope.token();
-        publishes.jobs += 1;
-        let id = publishes.jobs;
-        publishes.running = Some((id, progress, scope));
+        self.manifest_publish_jobs += 1;
+        let id = self.manifest_publish_jobs;
+        self.manifest_publishes.running = Some((id, progress, scope));
         Some((id, manifest, token))
     }
 
