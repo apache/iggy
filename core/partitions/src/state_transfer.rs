@@ -4666,6 +4666,7 @@ where
             self.log.journal().inner.restore_checkpoint_prepare(
                 install.commit_op,
                 Owned::<4096>::copy_from_slice(&install.offsets_wire.checkpoint_prepare).into(),
+                None,
             );
             self.consensus().note_journal_mutation();
         }

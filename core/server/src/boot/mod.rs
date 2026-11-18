@@ -363,6 +363,7 @@ pub fn bootstrap(
         total_shards,
     )?));
     check_repair_ring_share(&config.partition, total_shards)?;
+    check_wal_reload_share(&config.partition, total_shards)?;
     let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
         usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
             ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
@@ -1280,6 +1281,25 @@ fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Resul
     Ok(())
 }
 
+/// A share of nothing queues a checkpoint for every op, so the node refuses
+/// to start with it.
+fn check_wal_reload_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
+    let share = config.wal_reload_shard_bytes_max(total_shards);
+    if share == 0 {
+        error!(
+            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
+            config.wal_reload_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    info!(
+        "each of {total_shards} shards gets {share} bytes of partition.wal_reload_node_bytes_max"
+    );
+    Ok(())
+}
+
 fn make_metadata_commit_notifier(
     senders: Vec<TaggedSender>,
     metrics: ShardMetrics,
@@ -1457,6 +1477,18 @@ mod tests {
         assert!(check_repair_ring_share(&config(u64::from(SHARDS) - 1), SHARDS).is_err());
         assert!(check_repair_ring_share(&config(u64::from(SHARDS)), SHARDS).is_ok());
         assert!(check_repair_ring_share(&PartitionConfig::default(), SHARDS).is_ok());
+    }
+
+    #[test]
+    fn given_a_reload_budget_below_one_byte_per_shard_when_booting_should_refuse() {
+        const SHARDS: u16 = 32;
+        let config = |bytes: u64| PartitionConfig {
+            wal_reload_node_bytes_max: iggy_common::IggyByteSize::from(bytes),
+            ..PartitionConfig::default()
+        };
+        assert!(check_wal_reload_share(&config(u64::from(SHARDS) - 1), SHARDS).is_err());
+        assert!(check_wal_reload_share(&config(u64::from(SHARDS)), SHARDS).is_ok());
+        assert!(check_wal_reload_share(&PartitionConfig::default(), SHARDS).is_ok());
     }
 
     #[test]

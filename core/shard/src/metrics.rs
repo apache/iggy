@@ -51,6 +51,7 @@ use consensus::ReplicationStats;
 use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
 use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
+use partitions::CheckpointTrigger;
 
 /// Label for `frame_drops_total`.
 ///
@@ -75,6 +76,11 @@ pub struct FrameDropLabel {
 #[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
 pub struct ConsumerOffsetKindLabel {
     pub kind: &'static str,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct CheckpointTriggerLabel {
+    pub trigger: &'static str,
 }
 
 /// Label for `partition_frames_incarnation_mismatch_total`: the dropped
@@ -346,6 +352,8 @@ pub struct ShardMetrics {
     pub(crate) deferred_polls: DeferredPollMetrics,
     partition_wal_disk_bytes: Gauge,
     partition_wal_retained_bytes: Gauge,
+    partition_wal_reload_bytes: Gauge,
+    partition_wal_reload_budget_bytes: Gauge,
     partition_wal_queued_bytes: Gauge,
     partition_wal_in_flight_bytes: Gauge,
     partition_wal_checkpoints_pending: Gauge,
@@ -356,10 +364,22 @@ pub struct ShardMetrics {
     partition_repair_ring_bytes: Gauge,
     partition_repair_ring_budget_bytes: Gauge,
     partition_repair_ring_charged_bytes: Gauge,
+    partition_journal_resident_bytes: Gauge,
+    partition_journal_command_bytes: Gauge,
     partition_repair_ring_floor_bytes: Gauge,
     partition_repair_ring_bodies_released: Counter,
     partition_repair_ring_entries_dropped: Counter,
+    partition_journal_relief_bytes: Gauge,
+    partition_journal_relief_excluded_bytes: Gauge,
+    partition_journal_flushes_asked: Counter,
+    partition_journal_checkpoints_asked: Counter,
+    partition_journal_commands_released: Counter,
     partition_wal_checkpoints: Counter,
+    partition_wal_checkpoint_starts: Family<CheckpointTriggerLabel, Counter>,
+    checkpoint_start_counters: [Counter; CheckpointTrigger::COUNT],
+    partition_checkpoint_queue_length: Gauge,
+    partition_checkpoints_queued_in_flight: Gauge,
+    partition_stop_checkpoints_missed: Counter,
     partition_wal_errors: Counter,
     partition_tick_visits: Counter,
     partition_missed_wakeups: Counter,
@@ -441,6 +461,15 @@ impl ShardMetrics {
                 })
                 .clone()
         });
+        let partition_wal_checkpoint_starts: Family<CheckpointTriggerLabel, Counter> =
+            Family::default();
+        let checkpoint_start_counters = CheckpointTrigger::ALL.map(|trigger| {
+            partition_wal_checkpoint_starts
+                .get_or_create(&CheckpointTriggerLabel {
+                    trigger: trigger.as_str(),
+                })
+                .clone()
+        });
         let partition_consumer_offsets_stranded: Family<ConsumerOffsetKindLabel, Gauge> =
             Family::default();
         let consumer_offset_stranded_gauges = ConsumerKind::ALL.map(|kind| {
@@ -463,6 +492,8 @@ impl ShardMetrics {
             deferred_polls: DeferredPollMetrics::default(),
             partition_wal_disk_bytes: Gauge::default(),
             partition_wal_retained_bytes: Gauge::default(),
+            partition_wal_reload_bytes: Gauge::default(),
+            partition_wal_reload_budget_bytes: Gauge::default(),
             partition_wal_queued_bytes: Gauge::default(),
             partition_wal_in_flight_bytes: Gauge::default(),
             partition_wal_checkpoints_pending: Gauge::default(),
@@ -473,10 +504,22 @@ impl ShardMetrics {
             partition_repair_ring_bytes: Gauge::default(),
             partition_repair_ring_budget_bytes: Gauge::default(),
             partition_repair_ring_charged_bytes: Gauge::default(),
+            partition_journal_resident_bytes: Gauge::default(),
+            partition_journal_command_bytes: Gauge::default(),
             partition_repair_ring_floor_bytes: Gauge::default(),
             partition_repair_ring_bodies_released: Counter::default(),
             partition_repair_ring_entries_dropped: Counter::default(),
+            partition_journal_relief_bytes: Gauge::default(),
+            partition_journal_relief_excluded_bytes: Gauge::default(),
+            partition_journal_flushes_asked: Counter::default(),
+            partition_journal_checkpoints_asked: Counter::default(),
+            partition_journal_commands_released: Counter::default(),
             partition_wal_checkpoints: Counter::default(),
+            partition_wal_checkpoint_starts,
+            checkpoint_start_counters,
+            partition_checkpoint_queue_length: Gauge::default(),
+            partition_checkpoints_queued_in_flight: Gauge::default(),
+            partition_stop_checkpoints_missed: Counter::default(),
             partition_wal_errors: Counter::default(),
             partition_tick_visits: Counter::default(),
             partition_missed_wakeups: Counter::default(),
@@ -687,6 +730,105 @@ impl ShardMetrics {
         self.replication_replayed_prepares_total.get()
     }
 
+    fn register_checkpoints(&self, registry: &mut Registry) {
+        registry.register(
+            "partition_wal_checkpoint_starts",
+            "partition WAL checkpoints that the shard tick started, by trigger: idle and age \
+             come from the checkpoint queue, stop from a graceful stop, demand from the WAL \
+             size, the dirty files or a direct request, reload from the reload budget",
+            self.partition_wal_checkpoint_starts.clone(),
+        );
+        registry.register(
+            "partition_checkpoint_queue_length",
+            "partitions due for a WAL checkpoint that wait in the shard queue",
+            self.partition_checkpoint_queue_length.clone(),
+        );
+        registry.register(
+            "partition_checkpoints_queued_in_flight",
+            "checkpoints that the shard queue requested and that did not end yet",
+            self.partition_checkpoints_queued_in_flight.clone(),
+        );
+        registry.register(
+            "partition_stop_checkpoints_missed",
+            "partitions with committed ops above their checkpoint that a graceful stop did not \
+             checkpoint; a boot loads their ops again",
+            self.partition_stop_checkpoints_missed.clone(),
+        );
+    }
+
+    fn register_journal_budget(&self, registry: &mut Registry) {
+        registry.register(
+            "partition_repair_ring_entries",
+            "committed entries this shard's partitions retain for peer repair",
+            self.partition_repair_ring_entries.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_bytes",
+            "payload bytes this shard's partitions retain for peer repair, excluding allocation overhead",
+            self.partition_repair_ring_bytes.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_budget_bytes",
+            "this shard's share of partition.journal_memory_node_bytes_max",
+            self.partition_repair_ring_budget_bytes.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_charged_bytes",
+            "allocated bytes this shard's repair rings charge to its share, after the shed",
+            self.partition_repair_ring_charged_bytes.clone(),
+        );
+        registry.register(
+            "partition_journal_resident_bytes",
+            "allocated bytes the resident journal entries on this shard charge to its share",
+            self.partition_journal_resident_bytes.clone(),
+        );
+        registry.register(
+            "partition_journal_command_bytes",
+            "allocated bytes the held state machine commands on this shard charge to its share",
+            self.partition_journal_command_bytes.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_floor_bytes",
+            "charged bytes the shed cannot take: the newest entry of every repair ring",
+            self.partition_repair_ring_floor_bytes.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_bodies_released",
+            "repair ring entries whose batch the shard budget sent back to its segment",
+            self.partition_repair_ring_bodies_released.clone(),
+        );
+        registry.register(
+            "partition_repair_ring_entries_dropped",
+            "repair ring entries the shard budget dropped, which peer repair no longer serves",
+            self.partition_repair_ring_entries_dropped.clone(),
+        );
+        registry.register(
+            "partition_journal_relief_bytes",
+            "resident bytes on this shard that asked or pending flushes free in time, so the shard budget drops nothing for them",
+            self.partition_journal_relief_bytes.clone(),
+        );
+        registry.register(
+            "partition_journal_relief_excluded_bytes",
+            "committed resident bytes on this shard whose flush did not come in time, for which the shard budget drops",
+            self.partition_journal_relief_excluded_bytes.clone(),
+        );
+        registry.register(
+            "partition_journal_flushes_asked",
+            "flushes through the commit point that the shard budget asked",
+            self.partition_journal_flushes_asked.clone(),
+        );
+        registry.register(
+            "partition_journal_checkpoints_asked",
+            "partition WAL checkpoints that the shard budget queued, so that held commands can leave memory",
+            self.partition_journal_checkpoints_asked.clone(),
+        );
+        registry.register(
+            "partition_journal_commands_released",
+            "checkpointed state machine commands that the shard budget released, which peer repair no longer serves",
+            self.partition_journal_commands_released.clone(),
+        );
+    }
+
     fn register_persistence(&self, registry: &mut Registry) {
         registry.register(
             "partition_wal_disk_bytes",
@@ -697,6 +839,16 @@ impl ShardMetrics {
             "partition_wal_retained_bytes",
             "retained partition prepare bytes charged to the WAL budget",
             self.partition_wal_retained_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_reload_bytes",
+            "retained partition prepare bytes above the WAL checkpoints, which a boot loads again",
+            self.partition_wal_reload_bytes.clone(),
+        );
+        registry.register(
+            "partition_wal_reload_budget_bytes",
+            "this shard's share of partition.wal_reload_node_bytes_max",
+            self.partition_wal_reload_budget_bytes.clone(),
         );
         registry.register(
             "partition_wal_queued_bytes",
@@ -727,41 +879,6 @@ impl ShardMetrics {
             "partition_wal_group_commit_waits",
             "durable groups that took the optional pre-barrier wait",
             self.partition_wal_group_commit_waits.clone(),
-        );
-        registry.register(
-            "partition_repair_ring_entries",
-            "committed entries this shard's partitions retain for peer repair",
-            self.partition_repair_ring_entries.clone(),
-        );
-        registry.register(
-            "partition_repair_ring_bytes",
-            "payload bytes this shard's partitions retain for peer repair, excluding allocation overhead",
-            self.partition_repair_ring_bytes.clone(),
-        );
-        registry.register(
-            "partition_repair_ring_budget_bytes",
-            "this shard's share of partition.journal_memory_node_bytes_max",
-            self.partition_repair_ring_budget_bytes.clone(),
-        );
-        registry.register(
-            "partition_repair_ring_charged_bytes",
-            "allocated bytes this shard's repair rings charge to its share, after the shed",
-            self.partition_repair_ring_charged_bytes.clone(),
-        );
-        registry.register(
-            "partition_repair_ring_floor_bytes",
-            "charged bytes the shed cannot take: the newest entry of every repair ring",
-            self.partition_repair_ring_floor_bytes.clone(),
-        );
-        registry.register(
-            "partition_repair_ring_bodies_released",
-            "repair ring entries whose batch the shard budget sent back to its segment",
-            self.partition_repair_ring_bodies_released.clone(),
-        );
-        registry.register(
-            "partition_repair_ring_entries_dropped",
-            "repair ring entries the shard budget dropped, which peer repair no longer serves",
-            self.partition_repair_ring_entries_dropped.clone(),
         );
         registry.register(
             "partition_wal_checkpoints",
@@ -832,10 +949,33 @@ impl ShardMetrics {
             .set(i64::try_from(levels.wal_disk_bytes).unwrap_or(i64::MAX));
         self.partition_wal_retained_bytes
             .set(i64::try_from(levels.wal_retained_bytes).unwrap_or(i64::MAX));
+        self.partition_wal_reload_bytes
+            .set(i64::try_from(levels.wal_reload_bytes).unwrap_or(i64::MAX));
         self.partition_repair_ring_entries
             .set(i64::try_from(levels.repair_ring_entries).unwrap_or(i64::MAX));
         self.partition_repair_ring_bytes
             .set(i64::try_from(levels.repair_ring_bytes).unwrap_or(i64::MAX));
+    }
+
+    pub fn set_wal_reload_budget(&self, bytes_max: u64) {
+        self.partition_wal_reload_budget_bytes
+            .set(i64::try_from(bytes_max).unwrap_or(i64::MAX));
+    }
+
+    pub fn record_checkpoint_start(&self, trigger: CheckpointTrigger) {
+        self.checkpoint_start_counters[trigger.index()].inc();
+    }
+
+    pub fn set_checkpoint_queue(&self, length: usize, in_flight: usize) {
+        self.partition_checkpoint_queue_length
+            .set(i64::try_from(length).unwrap_or(i64::MAX));
+        self.partition_checkpoints_queued_in_flight
+            .set(i64::try_from(in_flight).unwrap_or(i64::MAX));
+    }
+
+    pub fn record_stop_checkpoints_missed(&self, partitions: usize) {
+        self.partition_stop_checkpoints_missed
+            .inc_by(u64::try_from(partitions).unwrap_or(u64::MAX));
     }
 
     /// Partitions that one sweep visited.
@@ -865,12 +1005,26 @@ impl ShardMetrics {
             .set(i64::try_from(shed.usage.budget_bytes).unwrap_or(i64::MAX));
         self.partition_repair_ring_charged_bytes
             .set(i64::try_from(shed.usage.charged_bytes).unwrap_or(i64::MAX));
+        self.partition_journal_resident_bytes
+            .set(i64::try_from(shed.usage.resident_bytes).unwrap_or(i64::MAX));
+        self.partition_journal_command_bytes
+            .set(i64::try_from(shed.usage.command_bytes).unwrap_or(i64::MAX));
         self.partition_repair_ring_floor_bytes
             .set(i64::try_from(shed.usage.floor_bytes).unwrap_or(i64::MAX));
         self.partition_repair_ring_bodies_released
             .inc_by(shed.bodies_released as u64);
         self.partition_repair_ring_entries_dropped
             .inc_by(shed.entries_dropped as u64);
+        self.partition_journal_relief_bytes
+            .set(i64::try_from(shed.usage.relief_bytes).unwrap_or(i64::MAX));
+        self.partition_journal_relief_excluded_bytes
+            .set(i64::try_from(shed.usage.relief_excluded_bytes).unwrap_or(i64::MAX));
+        self.partition_journal_flushes_asked
+            .inc_by(shed.flushes_asked as u64);
+        self.partition_journal_checkpoints_asked
+            .inc_by(shed.checkpoints_asked as u64);
+        self.partition_journal_commands_released
+            .inc_by(shed.commands_released as u64);
     }
 
     /// Snapshot of what [`Self::record_repair_ring_shed`] published: the
@@ -884,9 +1038,16 @@ impl ShardMetrics {
         partitions::RepairRingShed {
             bodies_released: counter(&self.partition_repair_ring_bodies_released),
             entries_dropped: counter(&self.partition_repair_ring_entries_dropped),
+            flushes_asked: counter(&self.partition_journal_flushes_asked),
+            checkpoints_asked: counter(&self.partition_journal_checkpoints_asked),
+            commands_released: counter(&self.partition_journal_commands_released),
             usage: partitions::RepairRingUsage {
                 budget_bytes: gauge(&self.partition_repair_ring_budget_bytes),
                 charged_bytes: gauge(&self.partition_repair_ring_charged_bytes),
+                resident_bytes: gauge(&self.partition_journal_resident_bytes),
+                command_bytes: gauge(&self.partition_journal_command_bytes),
+                relief_bytes: gauge(&self.partition_journal_relief_bytes),
+                relief_excluded_bytes: gauge(&self.partition_journal_relief_excluded_bytes),
                 floor_bytes: gauge(&self.partition_repair_ring_floor_bytes),
             },
         }
@@ -1411,6 +1572,8 @@ impl ShardMetrics {
     #[allow(clippy::too_many_lines)]
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        self.register_journal_budget(registry);
+        self.register_checkpoints(registry);
         self.deferred_polls.register(registry);
         registry.register(
             "partition_io_capacity",
@@ -1947,6 +2110,7 @@ mod tests {
         metrics.set_partition_levels(&partitions::GaugeShare {
             wal_disk_bytes: 4096,
             wal_retained_bytes: 65536,
+            wal_reload_bytes: 8192,
             ..Default::default()
         });
         let mut registry = Registry::default();
@@ -1962,6 +2126,11 @@ mod tests {
             buffer
                 .lines()
                 .any(|line| line == "partition_wal_retained_bytes 65536")
+        );
+        assert!(
+            buffer
+                .lines()
+                .any(|line| line == "partition_wal_reload_bytes 8192")
         );
     }
 

@@ -1200,25 +1200,63 @@ evicted_ring_capacity = 65536
 # or RSS.
 evicted_ring_bytes_max = "64 MiB"
 
-# Node-wide budget for the memory that the evicted rings of all partitions
-# allocate: the buffer of each batch they hold in memory, and 288 bytes for
-# each slot of the ops whose batch they released to its segment. A batch
-# counts for its whole buffer, which is a multiple of 4 KiB, so a small batch
-# costs far more here than its length. The count leaves out the index
-# overhead of each ring, so it is a lower bound. Each shard gets an equal
-# share, because a shard can shed only its own rings. Must be > 0, and the
-# share must be at least 1 byte.
-# Past its share, a shard releases batches to their segments, from the rings
-# that grew earliest, until its rings are one eighth under the share. With no
-# batch left to release, it drops the oldest entries of those rings until it
-# is back within the share. A dropped entry sends a lagging replica to state
-# transfer. Every ring keeps its newest entry. When those entries alone
-# exceed the share, every ring holds that entry only, and the server logs a
-# warning.
-# partition_repair_ring_budget_bytes, partition_repair_ring_charged_bytes and
-# partition_repair_ring_floor_bytes report the share of a shard, what its
-# rings charge to it, and what their newest entries take of it.
-journal_memory_node_bytes_max = "4 GiB"
+# Node-wide budget for the journal memory of all partitions. Three holders
+# charge it. The resident journal charges the buffer of each op that waits
+# for its flush, and its index entries. The evicted rings charge the buffer of
+# each batch they hold in memory, and 288 bytes for each slot of the ops whose
+# batch they released to its segment. The held state machine commands charge
+# their buffers, about 4 KiB each. A buffer counts for its whole allocation,
+# which is a multiple of 4 KiB, so a small op costs far more here than its
+# length. The count leaves out the map overhead of the rings, so it is a
+# lower bound. Each shard gets an equal share, because a shard can shed only
+# its own partitions. Must be > 0, and the share must be at least 1 byte.
+# Past its share, a shard sheds in three steps on each tick:
+# 1. The rings that grew earliest release batches to their segments, until
+#    the shard is one eighth under the share.
+# 2. The partitions whose committed ops waited longest get a flush through
+#    their commit point. The flush moves those ops to the ring, where step 1
+#    releases their batches. A flush that cannot start, for example in a view
+#    change, counts as coming for 1,000 shard ticks (10 seconds).
+# 3. For the excess that no such flush covers, the rings drop their oldest
+#    entries. Then the partitions release the commands that a WAL checkpoint
+#    covers, and queue a checkpoint for the others. A dropped entry or command
+#    sends a lagging replica to state transfer.
+# Every ring keeps its newest entry. When those entries alone exceed the
+# share, every ring holds that entry only, and the server logs a warning.
+# partition_repair_ring_budget_bytes reports the share of a shard.
+# partition_repair_ring_charged_bytes, partition_journal_resident_bytes and
+# partition_journal_command_bytes report what each holder charges to it, and
+# partition_repair_ring_floor_bytes what the newest ring entries take of it.
+journal_memory_node_bytes_max = "8 GiB"
+
+# WAL checkpoint policy. A partition with an op above its WAL checkpoint comes
+# due for a checkpoint checkpoint_idle_delay after its last op, or
+# checkpoint_max_delay after its first op since its last checkpoint, whichever
+# comes first. A boot loads only the ops above the checkpoint, so these
+# delays bound what a restart loads again. Each shard queues the due
+# partitions and keeps at most 64 of their checkpoints requested or running
+# at a time. A graceful
+# stop checkpoints the partitions it can reach in half of
+# sharding.shutdown_drain_timeout.
+# partition_checkpoint_queue_length, partition_checkpoints_queued_in_flight,
+# partition_wal_checkpoint_starts_total (by trigger) and
+# partition_stop_checkpoints_missed_total report the queue.
+# Both must be > 0, and checkpoint_idle_delay must not exceed
+# checkpoint_max_delay.
+checkpoint_idle_delay = "30 s"
+checkpoint_max_delay = "5 min"
+
+# Node-wide cap on the partition WAL bytes above the checkpoints. A boot loads
+# these bytes into memory again, so this bounds what a restart reloads. Each
+# shard gets an equal share. Past its share, a shard queues checkpoints for
+# the partitions whose first op since their checkpoint is oldest, until the
+# queued bytes cover the excess. The queue paces these checkpoints like the
+# others. A boot reloads at most the share plus what the partitions write
+# while they wait in the queue. Must be > 0, and the share must be at least
+# 1 byte. partition_wal_reload_bytes reports the bytes of a shard,
+# partition_wal_reload_budget_bytes its share, and
+# partition_wal_checkpoint_starts_total{trigger="reload"} the checkpoints.
+wal_reload_node_bytes_max = "4 GiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core

@@ -597,6 +597,19 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.retained_bytes
     }
 
+    /// The retained bytes above the checkpoint, which a boot loads into
+    /// memory again. The record kept at the checkpoint op stays out: the boot
+    /// restores it as the checkpoint, not as an op to apply.
+    #[must_use]
+    pub fn reload_bytes(&self) -> u64 {
+        let kept: u64 = self
+            .entries
+            .range(..=self.state.checkpoint)
+            .map(|(_, entry)| entry.retained_bytes)
+            .sum();
+        self.retained_bytes.saturating_sub(kept)
+    }
+
     /// Physical write lengths an append occupies in the current storage mode.
     ///
     /// The first return value is the padded number of bytes written to the WAL.
@@ -3137,6 +3150,65 @@ mod tests {
             .map(|prepare| prepare.header().op)
             .collect();
         assert_eq!(recovered, vec![4]);
+    }
+
+    /// A checkpoint takes its ops out of the reload, and the record that the
+    /// rewrite keeps at the checkpoint op does not count. A sparse log whose
+    /// checkpoint op sits in the other log keeps nothing at it.
+    #[compio::test]
+    async fn given_checkpoints_when_measuring_the_reload_should_count_only_the_ops_above_them() {
+        const OTHER_LOG_CHECKSUM: u128 = 0xdead;
+        let directory = tempdir().unwrap();
+        let mut journal = PartitionPrepareJournal::open(directory.path(), 42, 7)
+            .await
+            .unwrap();
+        let first = prepare(1, 0);
+        let second = prepare(2, first.header().checksum);
+        let third = prepare(3, second.header().checksum);
+        let record = |message: &Message<PrepareHeader>| {
+            record_length(message.header().size as usize).unwrap() as u64
+        };
+        for message in [&first, &second, &third] {
+            journal.append(message.clone().into_frozen()).await.unwrap();
+        }
+        assert_eq!(journal.reload_bytes(), journal.retained_bytes());
+
+        journal.checkpoint(2).await.unwrap();
+        assert_eq!(
+            (journal.retained_bytes(), journal.reload_bytes()),
+            (record(&second) + record(&third), record(&third))
+        );
+        journal.checkpoint(3).await.unwrap();
+        assert_eq!(
+            (journal.retained_bytes(), journal.reload_bytes()),
+            (record(&third), 0)
+        );
+
+        let sparse_directory = tempdir().unwrap();
+        let mut sparse = PartitionPrepareJournal::open_with_options(
+            sparse_directory.path(),
+            42,
+            7,
+            DiskStorage,
+            WalOpenOptions {
+                sparse: true,
+                ..WalOpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let fourth = prepare(4, OTHER_LOG_CHECKSUM);
+        sparse.append(first.clone().into_frozen()).await.unwrap();
+        sparse.append(fourth.clone().into_frozen()).await.unwrap();
+        sparse
+            .certify_log_view(1, 3, OTHER_LOG_CHECKSUM)
+            .await
+            .unwrap();
+        sparse.checkpoint_at(3, OTHER_LOG_CHECKSUM).await.unwrap();
+        assert_eq!(
+            (sparse.retained_bytes(), sparse.reload_bytes()),
+            (record(&fourth), record(&fourth))
+        );
     }
 
     #[compio::test]

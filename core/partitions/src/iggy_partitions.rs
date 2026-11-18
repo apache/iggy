@@ -17,8 +17,9 @@
 
 #![allow(dead_code)]
 
+use crate::iggy_partition::ReliefFlush;
 use crate::poll_plan::{PollPlan, PollReadResult};
-use crate::repair_memory::{RepairRingShed, RingTicket};
+use crate::repair_memory::{Relief, RepairRingShed, RingCharge, RingTicket};
 use crate::state_transfer::TransferSlot;
 use crate::stream_keyring::{StreamKeyIdentity, StreamKeyring};
 use crate::types::PartitionsConfig;
@@ -40,7 +41,8 @@ use server_common::send_messages::{ChecksumMode, convert_request_message, encryp
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
@@ -133,6 +135,28 @@ where
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
     repair_memory: Option<Arc<crate::RepairMemoryBudget>>,
     repair_rings: Option<Rc<crate::RepairRingBudget>>,
+    /// The delays of the checkpoint rule. `None` leaves the rule off.
+    checkpoint_delays: Option<crate::CheckpointDelays>,
+    /// Partitions due for a checkpoint, oldest first. One entry per
+    /// partition, see [`IggyPartition::in_checkpoint_queue`]. A due partition
+    /// waits here asleep, so a burst of deadlines does not keep every one of
+    /// them awake until a start slot frees.
+    checkpoint_queue: RefCell<VecDeque<(IggyNamespace, crate::CheckpointTrigger)>>,
+    /// Partitions that the queue requested a checkpoint for, until it ends.
+    /// One entry per partition. Read from their state on every pop, so a
+    /// cancel or a fence cannot leak a slot of
+    /// [`QUEUED_CHECKPOINTS_IN_FLIGHT_MAX`].
+    checkpoints_in_flight: RefCell<Vec<IggyNamespace>>,
+    /// This shard's share of the WAL bytes above the checkpoints. `None`
+    /// leaves the reload budget off.
+    wal_reload_bytes_max: Option<u64>,
+    /// The first-op stamps of the partitions, oldest first, as (namespace,
+    /// tick). An entry whose partition no longer holds that stamp is stale.
+    /// See [`Self::queue_reload_checkpoints`].
+    reload_order: RefCell<VecDeque<(IggyNamespace, u64)>>,
+    /// The partitions in the checkpoint queue or checkpointing that count
+    /// toward the excess of the reload budget.
+    reload_queued: RefCell<Vec<IggyNamespace>>,
     /// Receiving-side transfer sessions alive on this shard. Each holds a
     /// [`TransferSlot`] on this count.
     transfers_inflight: Rc<Cell<usize>>,
@@ -164,6 +188,9 @@ where
     partition: Box<UnsafeCell<IggyPartition<B, SB>>>,
     sent_report: Cell<SentReport>,
     gauge_share: Cell<GaugeShare>,
+    /// The first-op stamp of the partition that the reload order last got,
+    /// held as tick + 1, so that `None` takes no more than 8 B.
+    reload_stamp: Cell<Option<NonZeroU64>>,
 }
 
 /// A sleeping partition, as the check for missed wake-ups reads it.
@@ -185,6 +212,43 @@ const WAKE_NOW: u64 = 0;
 /// A vacant slot. No tick reaches it.
 const WAKE_NEVER: u64 = u64::MAX;
 
+/// Checkpoints that the queue keeps requested or running on one shard. Each
+/// partition has its own WAL writer, so this caps the WAL rewrites and their
+/// syncs that run at the same time.
+pub const QUEUED_CHECKPOINTS_IN_FLIGHT_MAX: usize = 64;
+
+/// Queue entries one tick takes. An entry whose partition has nothing left
+/// to cover costs one lookup and no start, and this bounds the tick when
+/// many entries went stale, after a burst of checkpoints by the WAL size
+/// trigger for example.
+const CHECKPOINT_QUEUE_POPS_PER_TICK_MAX: usize = 256;
+
+/// Partitions that the reload budget counts as queued on one shard: the
+/// running checkpoints and as many waiting. The budget then feeds the queue
+/// as fast as it drains, not with every partition at once.
+const RELOAD_CHECKPOINTS_QUEUED_MAX: usize = 2 * QUEUED_CHECKPOINTS_IN_FLIGHT_MAX;
+
+/// Entries of the reload order that one tick takes, stale ones too.
+const RELOAD_ORDER_POPS_PER_TICK_MAX: usize = 256;
+
+/// Entries of the reload order per partition before a push drops every
+/// stale entry. A partition holds one stamp at a time, so the order then
+/// keeps at most one entry per partition.
+const RELOAD_ORDER_ENTRIES_PER_PARTITION_MAX: usize = 2;
+
+/// Flushes that the journal budget of one shard asks per tick. Each writes a
+/// segment batch of its own.
+const RELIEF_FLUSHES_PER_TICK_MAX: usize = 16;
+
+/// Partitions that one shed visits in a queue of relief or of commands. A
+/// visit that takes nothing costs one lookup, and this bounds the tick when
+/// many partitions cannot flush.
+const SHED_VISITS_PER_TICK_MAX: usize = 256;
+
+/// How long a skipped or asked flush counts as relief, in ticks: one view
+/// change and its retry. After it, the shed drops for that relief.
+pub const RELIEF_WAIT_TICKS: u64 = 2 * consensus::TimeoutManager::VIEW_CHANGE_STATUS_TICKS;
+
 /// What one partition last added to the shard gauges that count sleeping
 /// partitions too.
 ///
@@ -195,6 +259,8 @@ const WAKE_NEVER: u64 = u64::MAX;
 pub struct GaugeShare {
     pub wal_disk_bytes: u64,
     pub wal_retained_bytes: u64,
+    /// The retained bytes above the checkpoints, which a boot loads again.
+    pub wal_reload_bytes: u64,
     pub repair_ring_entries: usize,
     pub repair_ring_bytes: u64,
 }
@@ -205,6 +271,7 @@ impl GaugeShare {
             wal_disk_bytes: self.wal_disk_bytes - old.wal_disk_bytes + new.wal_disk_bytes,
             wal_retained_bytes: self.wal_retained_bytes - old.wal_retained_bytes
                 + new.wal_retained_bytes,
+            wal_reload_bytes: self.wal_reload_bytes - old.wal_reload_bytes + new.wal_reload_bytes,
             repair_ring_entries: self.repair_ring_entries - old.repair_ring_entries
                 + new.repair_ring_entries,
             repair_ring_bytes: self.repair_ring_bytes - old.repair_ring_bytes
@@ -297,6 +364,12 @@ where
             io_notifier: RefCell::new(None),
             repair_memory: None,
             repair_rings: None,
+            checkpoint_delays: None,
+            checkpoint_queue: RefCell::default(),
+            checkpoints_in_flight: RefCell::default(),
+            wal_reload_bytes_max: None,
+            reload_order: RefCell::default(),
+            reload_queued: RefCell::default(),
             transfers_inflight: Rc::default(),
             tick_clock: TickClock::default(),
             loopback_ready: Rc::default(),
@@ -323,6 +396,35 @@ where
         self
     }
 
+    /// Turns on the checkpoint rule with `delays` for the partitions of this
+    /// shard.
+    #[must_use]
+    pub const fn with_checkpoint_delays(mut self, delays: crate::CheckpointDelays) -> Self {
+        self.checkpoint_delays = Some(delays);
+        self
+    }
+
+    /// The delays of the checkpoint rule. `None` leaves the rule off.
+    #[must_use]
+    pub const fn checkpoint_delays(&self) -> Option<crate::CheckpointDelays> {
+        self.checkpoint_delays
+    }
+
+    /// Turns on the reload budget with `bytes_max`, this shard's share of the
+    /// WAL bytes above the checkpoints.
+    #[must_use]
+    pub const fn with_wal_reload_budget(mut self, bytes_max: u64) -> Self {
+        self.wal_reload_bytes_max = Some(bytes_max);
+        self
+    }
+
+    /// This shard's share of the WAL bytes above the checkpoints. `None`
+    /// leaves the reload budget off.
+    #[must_use]
+    pub const fn wal_reload_bytes_max(&self) -> Option<u64> {
+        self.wal_reload_bytes_max
+    }
+
     /// Receiving-side transfer sessions alive on this shard. A partition
     /// removed or tombstoned during its transfer counts until it drops.
     #[must_use]
@@ -342,18 +444,286 @@ where
         &self.tick_clock
     }
 
-    /// Sheds repair ring memory once the shard is past its ring budget, and
-    /// reports what it took. `None` without a budget.
+    /// Puts a partition that came due at the back of the checkpoint queue.
+    /// [`IggyPartition::take_due_checkpoint`] returns the trigger only for a
+    /// partition outside the queue.
+    pub fn enqueue_checkpoint(&self, namespace: IggyNamespace, trigger: crate::CheckpointTrigger) {
+        self.checkpoint_queue
+            .borrow_mut()
+            .push_back((namespace, trigger));
+    }
+
+    /// Requests checkpoints for the partitions at the front of the queue:
+    /// at most `starts_max`, and only while fewer than
+    /// `QUEUED_CHECKPOINTS_IN_FLIGHT_MAX` are in flight. Returns how many it
+    /// requested. A request that waits for its start can come due again, and
+    /// then takes no second slot.
     ///
-    /// First the rings that grew earliest release their oldest bodies to
-    /// segments, down to the low watermark of the budget. Repair still
-    /// serves a released entry, from disk. Then the rings with no body left
-    /// to release drop their oldest entries, only until the shard is back
-    /// within the budget, because a dropped entry sends a lagging replica to
-    /// state transfer. Every ring keeps its newest entry.
+    /// Runs before the tick takes its namespaces. A requested partition is
+    /// woken, so the same tick can start its checkpoint.
+    pub fn request_queued_checkpoints(&self, starts_max: usize) -> usize {
+        let mut in_flight = self.checkpoints_in_flight.borrow_mut();
+        in_flight.retain(|namespace| {
+            self.find(*namespace)
+                .is_some_and(IggyPartition::queued_checkpoint_in_flight)
+        });
+        let mut queue = self.checkpoint_queue.borrow_mut();
+        let mut requested = 0;
+        let mut pops = 0;
+        while requested < starts_max
+            && in_flight.len() < QUEUED_CHECKPOINTS_IN_FLIGHT_MAX
+            && pops < CHECKPOINT_QUEUE_POPS_PER_TICK_MAX
+            && let Some((namespace, trigger)) = queue.pop_front()
+        {
+            pops += 1;
+            if self
+                .find(namespace)
+                .is_some_and(|partition| partition.request_queued_checkpoint(trigger))
+            {
+                self.wake_namespace(namespace);
+                if !in_flight.contains(&namespace) {
+                    in_flight.push(namespace);
+                    requested += 1;
+                }
+            }
+        }
+        requested
+    }
+
+    #[must_use]
+    pub fn checkpoint_queue_len(&self) -> usize {
+        self.checkpoint_queue.borrow().len()
+    }
+
+    #[must_use]
+    pub fn queued_checkpoints_in_flight(&self) -> usize {
+        self.checkpoints_in_flight.borrow().len()
+    }
+
+    /// Queues checkpoints while the WAL bytes above the checkpoints of this
+    /// shard pass its reload budget: for the partitions whose first op since
+    /// their checkpoint is oldest, until the bytes of the queued partitions
+    /// cover the excess. Returns how many it queued, 0 without a budget.
+    ///
+    /// Runs after the settle pass of a tick, so the sums and the shares it
+    /// reads agree. A partition that waits in the queue already counts. One
+    /// with a running checkpoint or with only uncommitted ops is armed again,
+    /// as at its deadline. At most `RELOAD_CHECKPOINTS_QUEUED_MAX` queued
+    /// partitions count.
+    pub fn queue_reload_checkpoints(&self) -> usize {
+        let Some(bytes_max) = self.wal_reload_bytes_max else {
+            return 0;
+        };
+        let mut counted = self.reload_queued.borrow_mut();
+        counted.retain(|namespace| self.reload_checkpoint_pending(*namespace));
+        let mut covered: u64 = counted
+            .iter()
+            .filter_map(|namespace| self.slot(*namespace))
+            .map(|slot| slot.gauge_share.get().wal_reload_bytes)
+            .sum();
+        let excess = self
+            .gauge_sums
+            .get()
+            .wal_reload_bytes
+            .saturating_sub(bytes_max);
+        let now = self.tick_clock.now();
+        let mut queued = 0;
+        for _ in 0..RELOAD_ORDER_POPS_PER_TICK_MAX {
+            let Some((namespace, tick)) = self.reload_order.borrow().front().copied() else {
+                break;
+            };
+            // An entry of this tick waits for the next one, so a partition
+            // armed again here is not taken twice in one pass.
+            if tick >= now {
+                break;
+            }
+            let holder = self
+                .slot(namespace)
+                .filter(|slot| slot.partition().checkpoint_first_op_tick() == Some(tick))
+                .filter(|_| !self.is_tombstoned(&namespace));
+            if holder.is_some()
+                && (covered >= excess || counted.len() >= RELOAD_CHECKPOINTS_QUEUED_MAX)
+            {
+                break;
+            }
+            self.reload_order.borrow_mut().pop_front();
+            let Some(slot) = holder else {
+                continue;
+            };
+            let partition = slot.partition();
+            if let Some(trigger) =
+                partition.queue_stamped_checkpoint(now, crate::CheckpointTrigger::Reload)
+            {
+                self.enqueue_checkpoint(namespace, trigger);
+                queued += 1;
+            }
+            if partition.in_checkpoint_queue() && !counted.contains(&namespace) {
+                counted.push(namespace);
+                covered += slot.gauge_share.get().wal_reload_bytes;
+            }
+            self.track_reload_stamp(slot);
+        }
+        queued
+    }
+
+    /// Whether a partition that the reload budget counts still frees its
+    /// bytes, or its share in the sums is not yet the level it has now. A
+    /// checkpoint that ended leaves the count in the tick that its share
+    /// leaves the sums.
+    fn reload_checkpoint_pending(&self, namespace: IggyNamespace) -> bool {
+        self.find(namespace).is_some_and(|partition| {
+            partition.in_checkpoint_queue() || partition.queued_checkpoint_in_flight()
+        }) || self
+            .slot(namespace)
+            .is_some_and(|slot| slot.gauge_share.get() != slot.partition().gauge_share())
+    }
+
+    /// Puts a new first-op stamp of the partition in `slot` at the back of
+    /// the reload order. Settles run in slot order, so the order can be one
+    /// tick out of stamp order, and only an equal tick names the same stamp.
+    fn track_reload_stamp(&self, slot: &Slot<B, SB>) {
+        if self.wal_reload_bytes_max.is_none() {
+            return;
+        }
+        let stamp = slot.partition().checkpoint_first_op_tick();
+        let held = stamp.map(|tick| NonZeroU64::MIN.saturating_add(tick));
+        if slot.reload_stamp.replace(held) == held {
+            return;
+        }
+        let Some(tick) = stamp else {
+            return;
+        };
+        let mut order = self.reload_order.borrow_mut();
+        order.push_back((slot.namespace, tick));
+        let partitions = self.namespace_to_local.borrow().len();
+        if order.len() > RELOAD_ORDER_ENTRIES_PER_PARTITION_MAX * partitions {
+            order.retain(|(namespace, tick)| {
+                self.find(*namespace)
+                    .is_some_and(|partition| partition.checkpoint_first_op_tick() == Some(*tick))
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reload_order_len(&self) -> usize {
+        self.reload_order.borrow().len()
+    }
+
+    /// The slot of `namespace`, tombstoned or not.
+    fn slot(&self, namespace: IggyNamespace) -> Option<&Slot<B, SB>> {
+        self.slots().get(*self.local_idx(&namespace)?)?.as_ref()
+    }
+
+    /// Keeps the partitions that a graceful stop can still checkpoint, at
+    /// most `reach`, and holds the stop of each one until its checkpoint
+    /// starts. The requests that wait for their start come first, then the
+    /// oldest queue entries. If the queue is shorter, the partitions with a
+    /// committed op above their checkpoint follow, the oldest first op first.
+    /// Returns how many partitions need a checkpoint that the stop cannot
+    /// serve.
+    ///
+    /// Every other partition passes the hold at once, so it does not wait
+    /// for a start that cannot come.
+    pub fn plan_stop_checkpoints(&self, reach: usize) -> usize {
+        let waiting: Vec<IggyNamespace> = self
+            .checkpoints_in_flight
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|namespace| {
+                self.find(*namespace)
+                    .is_some_and(IggyPartition::needs_stop_checkpoint)
+            })
+            .collect();
+        let reach = reach.saturating_sub(waiting.len());
+        let mut queue = self.checkpoint_queue.borrow_mut();
+        // No partition enters the queue again in the stop, so the queue flags
+        // of the dropped entries can stay set.
+        queue.retain(|(namespace, _)| {
+            self.find(*namespace)
+                .is_some_and(IggyPartition::needs_stop_checkpoint)
+        });
+        let dropped = queue.len().saturating_sub(reach);
+        queue.truncate(reach);
+        let mut extra: Vec<_> = self
+            .slots()
+            .iter()
+            .flatten()
+            .filter(|slot| {
+                !self.is_tombstoned(&slot.namespace) && !waiting.contains(&slot.namespace)
+            })
+            .map(|slot| (slot.namespace, slot.partition()))
+            .filter(|(_, partition)| {
+                partition.needs_stop_checkpoint() && !partition.in_checkpoint_queue()
+            })
+            .map(|(namespace, partition)| {
+                (
+                    partition.checkpoint_first_op_tick().unwrap_or(u64::MAX),
+                    namespace,
+                )
+            })
+            .collect();
+        extra.sort_unstable();
+        let room = reach - queue.len();
+        let unserved = dropped + extra.len().saturating_sub(room);
+        extra.truncate(room);
+        for (_, namespace) in extra {
+            if let Some(partition) = self.find(namespace) {
+                partition.join_checkpoint_queue();
+            }
+            queue.push_back((namespace, crate::CheckpointTrigger::Stop));
+        }
+        let served = waiting
+            .iter()
+            .chain(queue.iter().map(|(namespace, _)| namespace));
+        for namespace in served {
+            if let Some(partition) = self.find(*namespace) {
+                partition.hold_shutdown_for_checkpoint();
+            }
+        }
+        unserved
+    }
+
+    /// Ends the stop hold of every queued partition and empties the queue:
+    /// no checkpoint starts for them in this stop. Returns how many still
+    /// held, so their checkpoint did not start.
+    pub fn release_stop_checkpoints(&self) -> usize {
+        let queue = std::mem::take(&mut *self.checkpoint_queue.borrow_mut());
+        let mut released = queue
+            .iter()
+            .filter(|(namespace, _)| {
+                self.find(*namespace)
+                    .is_some_and(IggyPartition::release_checkpoint_hold)
+            })
+            .count();
+        for namespace in self.checkpoints_in_flight.borrow().iter() {
+            released += usize::from(
+                self.find(*namespace)
+                    .is_some_and(IggyPartition::release_checkpoint_hold),
+            );
+        }
+        released
+    }
+
+    /// Sheds journal memory once the shard is past its budget, and reports
+    /// what it took. `None` without a budget.
+    ///
+    /// 1. The rings that grew earliest release their oldest bodies to
+    ///    segments, down to the low watermark of the budget. Repair still
+    ///    serves a released entry, from disk.
+    /// 2. While the asked flushes bring less than the excess, the journals
+    ///    whose committed messages waited longest get a flush through their
+    ///    commit point. It moves those messages to the ring, where step 1
+    ///    releases their bodies.
+    /// 3. For the excess that no counted relief covers, the rings with no
+    ///    body left to release drop their oldest entries, and then the
+    ///    journals whose commands grew earliest release checkpointed
+    ///    commands. Either sends a lagging replica to state transfer. Every
+    ///    ring keeps its newest entry, and every journal the command at its
+    ///    commit point.
     pub fn shed_repair_rings(&self) -> Option<RepairRingShed> {
         let budget = self.repair_rings.as_deref()?;
-        budget.retain_live(|ticket| self.ring_owner(ticket).is_some());
+        budget.retain_live(|ticket| self.ring_charge_of(ticket).map(|charge| charge.relief()));
         let mut bodies_released = 0;
         let mut entries_dropped = 0;
         if budget.excess().is_some() {
@@ -376,29 +746,137 @@ where
                 }
                 budget.pop_grown();
             }
-            while let Some(excess) = budget.excess()
-                && let Some(ticket) = budget.oldest_released()
-            {
-                let visit = self.shed_ring_owner(ticket).map(|partition| {
-                    partition
-                        .log
-                        .journal()
-                        .inner
-                        .drop_ring_entries(excess, partition.pinned_transfer_tail())
-                });
-                entries_dropped += visit.map_or(0, |visit| visit.dropped);
-                if visit.is_some_and(|visit| visit.left) {
-                    break;
-                }
-                budget.pop_released();
-            }
         }
+        self.expire_relief(budget);
+        let flushes_asked = self.ask_relief_flushes(budget);
+        while let Some(excess) = budget.costly_excess()
+            && let Some(ticket) = budget.oldest_released()
+        {
+            let visit = self.shed_ring_owner(ticket).map(|partition| {
+                partition
+                    .log
+                    .journal()
+                    .inner
+                    .drop_ring_entries(excess, partition.pinned_transfer_tail())
+            });
+            entries_dropped += visit.map_or(0, |visit| visit.dropped);
+            if visit.is_some_and(|visit| visit.left) {
+                break;
+            }
+            budget.pop_released();
+        }
+        let (commands_released, checkpoints_asked) = self.release_commands(budget);
         self.report_ring_floor(budget);
         Some(RepairRingShed {
             bodies_released,
             entries_dropped,
+            flushes_asked,
+            checkpoints_asked,
+            commands_released,
             usage: budget.usage(),
         })
+    }
+
+    /// Stops counting the relief of the skips and asks that waited
+    /// [`RELIEF_WAIT_TICKS`].
+    fn expire_relief(&self, budget: &crate::RepairRingBudget) {
+        let now = self.tick_clock.now();
+        while let Some((ticket, stamp)) = budget.pop_expired_stamp(now, RELIEF_WAIT_TICKS) {
+            if let Some(charge) = self.ring_charge_of(ticket) {
+                charge.expire_relief(stamp);
+            }
+        }
+    }
+
+    /// Step 2 of [`Self::shed_repair_rings`]. Returns how many flushes it
+    /// asked.
+    fn ask_relief_flushes(&self, budget: &crate::RepairRingBudget) -> usize {
+        let now = self.tick_clock.now();
+        let mut asked = 0;
+        let mut visits = budget.relief_waiting_len().min(SHED_VISITS_PER_TICK_MAX);
+        while visits > 0
+            && asked < RELIEF_FLUSHES_PER_TICK_MAX
+            && budget.wants_flushes()
+            && let Some(ticket) = budget.pop_relief_waiting()
+        {
+            visits -= 1;
+            let Some(charge) = self.ring_charge_of(ticket) else {
+                continue;
+            };
+            charge.relief_visited();
+            if charge.relief_bytes() == 0 {
+                continue;
+            }
+            let previous = charge.relief();
+            // A partition fenced for delete takes no flush.
+            let flush = self
+                .get_mut_by_ns(&ticket.namespace)
+                .map_or(ReliefFlush::Never, IggyPartition::ask_relief_flush);
+            charge.set_relief(match flush {
+                ReliefFlush::Asked => {
+                    asked += 1;
+                    self.wake_namespace(ticket.namespace);
+                    Relief::Asked(now)
+                }
+                ReliefFlush::Pending => match previous {
+                    Relief::Waiting | Relief::Skipped(_) => Relief::Asked(now),
+                    Relief::Asked(_) | Relief::Excluded => previous,
+                },
+                ReliefFlush::Blocked => {
+                    charge.queue_relief();
+                    match previous {
+                        Relief::Waiting | Relief::Asked(_) => Relief::Skipped(now),
+                        Relief::Skipped(_) | Relief::Excluded => previous,
+                    }
+                }
+                ReliefFlush::Never => Relief::Excluded,
+            });
+        }
+        asked
+    }
+
+    /// Step 3 of [`Self::shed_repair_rings`] for held commands. Returns how
+    /// many it released and how many checkpoints it asked, so that more can
+    /// go.
+    fn release_commands(&self, budget: &crate::RepairRingBudget) -> (usize, usize) {
+        let mut released = 0;
+        let mut checkpoints = 0;
+        let mut visits = budget.commands_grown_len().min(SHED_VISITS_PER_TICK_MAX);
+        while visits > 0
+            && let Some(excess) = budget.costly_excess()
+            && let Some(ticket) = budget.pop_commands_grown()
+        {
+            visits -= 1;
+            let (Some(partition), Some(charge)) =
+                (self.ring_owner(ticket), self.ring_charge_of(ticket))
+            else {
+                continue;
+            };
+            charge.commands_visited();
+            let (count, wants_checkpoint) = partition.release_commands_for(excess);
+            if count > 0 {
+                released += count;
+                self.wake_namespace(ticket.namespace);
+            }
+            if charge.command_bytes() > 0 {
+                charge.queue_commands();
+            }
+            if wants_checkpoint
+                && !partition.in_checkpoint_queue()
+                && !partition.checkpoint_in_progress()
+                && !partition.queued_checkpoint_in_flight()
+            {
+                partition.join_checkpoint_queue();
+                self.enqueue_checkpoint(ticket.namespace, crate::CheckpointTrigger::Demand);
+                checkpoints += 1;
+            }
+        }
+        (released, checkpoints)
+    }
+
+    /// The charge that `ticket` names, while its partition holds it.
+    fn ring_charge_of(&self, ticket: RingTicket) -> Option<Rc<RingCharge>> {
+        self.ring_owner(ticket)?.log.journal().inner.ring_charge()
     }
 
     /// The partition whose ring `ticket` charges, fenced for delete or not:
@@ -651,6 +1129,7 @@ where
         partition
             .consensus()
             .install_tick_clock(self.tick_clock.clone());
+        partition.reset_checkpoint_stamps();
         if let Some(budget) = &self.repair_memory {
             partition.proof_walk_memory = Some(budget.reservation());
         }
@@ -673,6 +1152,7 @@ where
             partition: Box::new(UnsafeCell::new(partition)),
             sent_report: Cell::default(),
             gauge_share: Cell::default(),
+            reload_stamp: Cell::default(),
         });
         // SAFETY: see the `slots` field doc: pump-only, outside any walk, so
         // no other borrow of the array is live. Caller responsibility.
@@ -921,6 +1401,7 @@ where
         let old = slot.gauge_share.replace(share);
         self.gauge_sums
             .set(self.gauge_sums.get().replaced(old, share));
+        self.track_reload_stamp(slot);
         self.wake_at.borrow()[*local_idx].set(quiet_until.unwrap_or(WAKE_NOW));
     }
 
@@ -949,11 +1430,17 @@ where
     /// wake the partition, so an observer cannot hide a missed wake-up.
     #[cfg(any(test, feature = "simulator"))]
     pub fn peek_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B, SB>> {
-        if self.is_tombstoned(namespace) {
+        self.find(*namespace)
+    }
+
+    /// A live partition, without a wake. Only for a read, or for a change
+    /// that wakes the partition itself when it gives the partition work.
+    fn find(&self, namespace: IggyNamespace) -> Option<&IggyPartition<B, SB>> {
+        if self.is_tombstoned(&namespace) {
             return None;
         }
         self.slots()
-            .get(*self.local_idx(namespace)?)?
+            .get(*self.local_idx(&namespace)?)?
             .as_ref()
             .map(Slot::partition)
     }
@@ -2041,6 +2528,10 @@ mod tests {
             crate::RepairRingUsage {
                 budget_bytes: 0,
                 charged_bytes: 2 * body,
+                resident_bytes: 0,
+                command_bytes: 0,
+                relief_bytes: 0,
+                relief_excluded_bytes: 0,
                 floor_bytes: 2 * body,
             }
         );

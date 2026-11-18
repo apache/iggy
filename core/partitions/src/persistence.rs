@@ -125,6 +125,10 @@ impl<S: DurableStorage> Logs<S> {
             .map(PartitionPrepareJournal::retained_bytes)
             .sum()
     }
+
+    fn reload_bytes(&self) -> u64 {
+        self.each().map(PartitionPrepareJournal::reload_bytes).sum()
+    }
 }
 
 impl<S: DurableStorage + Clone> Logs<S> {
@@ -325,6 +329,9 @@ pub struct PartitionPersistence<S: DurableStorage = crate::WalStorage> {
     capacity: u64,
     disk_bytes: Cell<u64>,
     retained_bytes: Cell<u64>,
+    /// The retained bytes above the checkpoint of either log, which a boot
+    /// loads again.
+    reload_bytes: Cell<u64>,
     segment_checkpoint: Cell<Option<SegmentPosition>>,
     queued_bytes: PendingBytes,
     in_flight_bytes: PendingBytes,
@@ -767,6 +774,7 @@ impl<S: DurableStorage + Clone> PartitionPersistence<S> {
         let certified_log_view = logs.certified_log_view();
         let disk_bytes = logs.size_bytes();
         let retained_bytes = logs.retained_bytes();
+        let reload_bytes = logs.reload_bytes();
         let segment_checkpoint = journal.segment_checkpoint();
         let segment_references = journal.written_segment_references(0).collect();
         let persistence = Rc::new(Self {
@@ -793,6 +801,7 @@ impl<S: DurableStorage + Clone> PartitionPersistence<S> {
             capacity,
             disk_bytes: Cell::new(disk_bytes),
             retained_bytes: Cell::new(retained_bytes),
+            reload_bytes: Cell::new(reload_bytes),
             segment_checkpoint: Cell::new(segment_checkpoint),
             segment_references: RefCell::new(segment_references),
             holds_commands: Cell::new(holds_commands),
@@ -1362,6 +1371,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         (self.disk_bytes.get(), self.retained_bytes.get())
     }
 
+    /// The retained bytes above the checkpoint, which a boot loads into
+    /// memory again.
+    #[must_use]
+    pub const fn reload_bytes(&self) -> u64 {
+        self.reload_bytes.get()
+    }
+
     pub fn take_metrics(&self) -> PersistenceMetrics {
         PersistenceMetrics {
             queued_bytes: self.queued_bytes.get(),
@@ -1644,6 +1660,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         drop(references);
         self.disk_bytes.set(logs.size_bytes());
         self.retained_bytes.set(logs.retained_bytes());
+        self.reload_bytes.set(logs.reload_bytes());
         self.segment_checkpoint.set(journal.segment_checkpoint());
         let written_head = logs.written_head();
         let durable_head = logs.durable_head();

@@ -199,7 +199,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
                 .journal_memory_shard_bytes_max(total_shards),
         )
         .unwrap_or(usize::MAX),
-    )));
+    )))
+    .with_checkpoint_delays(partitions::CheckpointDelays::new(
+        config.partition.checkpoint_idle_delay.get_duration(),
+        config.partition.checkpoint_max_delay.get_duration(),
+    ))
+    .with_wal_reload_budget(config.partition.wal_reload_shard_bytes_max(total_shards));
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by
@@ -395,6 +400,9 @@ pub(in crate::boot) async fn build_shard_for_thread(
             .superblock_wedged_fatal_timeout
             .get_duration(),
     );
+    // The other half of the drain budget is for the started checkpoints and
+    // the drain of the writers.
+    shard.set_stop_checkpoint_window(config.sharding.shutdown_drain_timeout.get_duration() / 2);
     shard.set_served_segment_cache_bytes_max(
         config
             .partition
