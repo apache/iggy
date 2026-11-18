@@ -39,7 +39,9 @@ use partitions::{
     ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects, ExecutorTopicObjects,
     ExecutorUploader, RemoteSegments,
 };
-use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
+use shard::tier_service::{
+    ClassLimits, FRESH_FOLLOW_LIMITS, StoreCallPolicy, TierService, TierServiceConfig,
+};
 use shard::{Sender, channel};
 use tracing::{info, warn};
 
@@ -231,6 +233,7 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
         speculative_fetch: limits(jobs.speculative_fetches, Some(jobs.speculative_fetch_bytes)),
         delete: limits(jobs.deletes, None),
         housekeeping: limits(jobs.housekeeping, None),
+        fresh_follow: FRESH_FOLLOW_LIMITS,
         calls: StoreCallPolicy {
             request_timeout: config.request_timeout.get_duration(),
             progress_timeout: config.progress_timeout.get_duration(),

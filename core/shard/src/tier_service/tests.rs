@@ -57,6 +57,7 @@ fn single_slots() -> TierServiceConfig {
         speculative_fetch: one,
         delete: one,
         housekeeping: one,
+        fresh_follow: one,
         calls: StoreCallPolicy::default(),
     }
 }
@@ -418,6 +419,37 @@ async fn given_a_waiting_upload_when_housekeeping_comes_should_hold_it_until_not
         open.send(()).unwrap();
     }
     assert!(waiting_upload.await.is_ok() && sweep.await.is_ok() && delete.await.is_ok());
+}
+
+#[compio::test]
+async fn given_fetches_and_housekeeping_that_wait_when_a_fresh_follow_comes_should_start_it_on_its_own_slot()
+ {
+    let service = service(&single_slots());
+    let scope = TierScope::new();
+    let started = Rc::new(RefCell::new(Vec::new()));
+    let job = |class, name| gated(&service, request(class, &scope), name, &started);
+    let (open_fetch, fetch) = job(TierJobClass::DemandFetch, "fetch");
+    let (open_waiting_fetch, waiting_fetch) = job(TierJobClass::DemandFetch, "waiting fetch");
+    let (open_listing, listing) = job(TierJobClass::Housekeeping, "listing");
+    let (open_probe, probe) = job(TierJobClass::FreshFollow, "probe");
+    let (open_next_probe, next_probe) = job(TierJobClass::FreshFollow, "next probe");
+    until(|| started.borrow().len() == 2).await;
+    settle().await;
+
+    assert_eq!(*started.borrow(), ["fetch", "probe"]);
+    open_probe.send(()).unwrap();
+    assert_eq!(probe.await, Ok("probe"));
+    until(|| started.borrow().len() == 3).await;
+    assert_eq!(*started.borrow(), ["fetch", "probe", "next probe"]);
+    for open in [open_fetch, open_waiting_fetch, open_listing, open_next_probe] {
+        open.send(()).unwrap();
+    }
+    assert!(
+        fetch.await.is_ok()
+            && waiting_fetch.await.is_ok()
+            && listing.await.is_ok()
+            && next_probe.await.is_ok()
+    );
 }
 
 #[compio::test]
