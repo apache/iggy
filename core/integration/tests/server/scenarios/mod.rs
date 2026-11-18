@@ -35,6 +35,7 @@ pub mod delete_segments_scenario;
 pub mod delete_stats_rollback_scenario;
 pub mod encryption_scenario;
 pub mod external_group_offsets_scenario;
+pub mod geo_mode_faults_scenario;
 pub mod invalid_consumer_offset_scenario;
 pub mod list_pages_scenario;
 pub mod log_rotation_scenario;
