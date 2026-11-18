@@ -16,8 +16,8 @@
 // under the License.
 
 //! A geo topic on three nodes that share one `fs` object store, whose every
-//! node loses its disk, and the cluster rebuilt on empty disks that the
-//! operator tells to recover it.
+//! node loses its disk, and the cluster rebuilt on empty disks whose replica
+//! 0 the operator tells to recover it.
 //!
 //! The origin writes fresh objects of the format before the self-describing
 //! one, so the test stores the self-describing objects that an origin of
@@ -114,10 +114,12 @@ async fn given_a_bucket_of_an_origin_that_lost_every_disk_when_a_cluster_with_em
     let written = origin.objects(floor + 1);
     put_objects(store.path(), &written.objects).await;
 
+    // Only replica 0 runs the recovery, so only it is told to. The other
+    // nodes learn which partitions to install from committed metadata.
+    harness
+        .node_mut(0)
+        .add_env("IGGY_GEO_RECOVER_CLUSTER_UID", format!("{retired:032x}"));
     for node in 0..NODES {
-        harness
-            .node_mut(node)
-            .add_env("IGGY_GEO_RECOVER_CLUSTER_UID", format!("{retired:032x}"));
         harness
             .restart_node_from_clean_slate(node)
             .expect("restart the node without its disk");
@@ -156,6 +158,24 @@ async fn given_a_bucket_of_an_origin_that_lost_every_disk_when_a_cluster_with_em
         read.last(),
         Some(&next),
         "the next send goes after the cutover"
+    );
+
+    // Without replica 0, the two nodes that were not told to recover serve
+    // the partition alone, from what they installed.
+    harness.kill_node(0).expect("kill replica 0");
+    let others = harness
+        .root_client_for_node(1)
+        .await
+        .expect("connect a root client to another node");
+    assert_eq!(
+        await_read(&others, &topics, read.len()).await,
+        read,
+        "the nodes without recover_cluster_uid serve the same messages"
+    );
+    assert_eq!(
+        timestamps_from(&others, &topics, floor + 1).await[..timestamps.len()],
+        timestamps[..],
+        "and at the same timestamps"
     );
 
     let objects = bucket.objects().await;

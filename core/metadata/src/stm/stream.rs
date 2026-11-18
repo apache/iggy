@@ -455,6 +455,9 @@ pub struct TopicSnapshot {
     /// The peer's topic incarnation that a shadow topic serves.
     #[serde(default)]
     pub shadow: Option<ShadowTopic>,
+    /// The cluster that lost every disk whose topic this one restores.
+    #[serde(default)]
+    pub recovered_from: Option<u128>,
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +503,10 @@ pub struct Topic {
     pub created_op: u64,
     /// The peer's topic incarnation, for a topic of a shadow stream.
     pub shadow: Option<ShadowTopic>,
+    /// The `cluster_uid` of the cluster that lost every disk, for a geo topic
+    /// that a recovery restored from its store. Every replica that builds
+    /// one of its partitions installs what the recovery took of it first.
+    pub recovered_from: Option<u128>,
 }
 
 impl Default for Topic {
@@ -519,6 +526,7 @@ impl Default for Topic {
             consumer_group_catalog_op: 0,
             created_op: 0,
             shadow: None,
+            recovered_from: None,
         }
     }
 }
@@ -540,6 +548,7 @@ impl Topic {
             consumer_group_catalog_op: 0,
             created_op: 0,
             shadow: None,
+            recovered_from: None,
         }
     }
 
@@ -3665,6 +3674,7 @@ pub(crate) enum FixedTopic {
     Restored {
         topic_id: usize,
         created_revision: u64,
+        retired_cluster_uid: u128,
     },
 }
 
@@ -3679,6 +3689,16 @@ impl FixedTopic {
         match self {
             Self::Shadow { shadow, .. } => Some(shadow),
             Self::Restored { .. } => None,
+        }
+    }
+
+    const fn recovered_from(self) -> Option<u128> {
+        match self {
+            Self::Restored {
+                retired_cluster_uid,
+                ..
+            } => Some(retired_cluster_uid),
+            Self::Shadow { .. } => None,
         }
     }
 }
@@ -3828,6 +3848,7 @@ pub(crate) fn create_topic(
         consumer_group_catalog_op: 0,
         created_op: state.apply_context.metadata_op,
         shadow: fixed.and_then(FixedTopic::shadow),
+        recovered_from: fixed.and_then(FixedTopic::recovered_from),
     };
 
     let inserted = if fixed.is_some() {
@@ -4569,6 +4590,7 @@ impl Snapshotable for Streams {
                                     consumer_group_catalog_op: topic.consumer_group_catalog_op,
                                     created_op: topic.created_op,
                                     shadow: topic.shadow,
+                                    recovered_from: topic.recovered_from,
                                 },
                             )
                         })
@@ -4729,6 +4751,7 @@ impl StreamsInner {
                     consumer_group_catalog_op: topic_snap.consumer_group_catalog_op,
                     created_op: topic_snap.created_op,
                     shadow: topic_snap.shadow,
+                    recovered_from: topic_snap.recovered_from,
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()

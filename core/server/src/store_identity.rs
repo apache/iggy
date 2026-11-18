@@ -46,8 +46,9 @@
 //! A root that another cluster claimed is refused, unless the operator named
 //! that cluster in `[geo] recover_cluster_uid`: replica 0, as the caught-up
 //! metadata primary, then recovers the geo topics of that cluster and claims
-//! the root, see [`crate::origin_recovery`]. Until then every node checks
-//! again every few seconds.
+//! the root, see [`crate::origin_recovery`]. Until then replica 0, and every
+//! node whose metadata holds the topics it restored, checks again every few
+//! seconds.
 
 use std::pin::pin;
 use std::rc::Rc;
@@ -63,6 +64,7 @@ use journal::superblock::SuperblockStore;
 use metadata::AppliedFrontier;
 use metadata::change_log::ChangeLog;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::StreamsInner;
 use partitions::{
     FreshObjectSweeper, FreshObjectUploader, LongTermMerger, LongTermWriter, ManifestPublisher,
     ObjectDeleter, SegmentUploader, TopicObjects,
@@ -230,8 +232,19 @@ impl<S: ObjectStore> IdentityChecker<S> {
         {
             check = self.check(cluster_uid, false).await;
         }
-        let awaits_recovery =
-            matches!(check, IdentityCheck::Foreign(found) if found.is_some() && found == retired);
+        // A node told to recover, or one whose metadata holds topics restored
+        // from the cluster its store names, checks again soon: replica 0
+        // claims the store once it restored them.
+        let awaits_recovery = match check {
+            IdentityCheck::Foreign(Some(found)) => {
+                retired == Some(found)
+                    || metadata
+                        .mux_stm
+                        .streams()
+                        .read(|inner| restores_from(inner, found))
+            }
+            _ => false,
+        };
         let delay = self.record(
             check,
             cluster_uid,
@@ -317,6 +330,7 @@ impl<S: ObjectStore> IdentityChecker<S> {
         let was_verified = frontier.store_identity_verified();
         if let Some(verified) = verified {
             frontier.set_store_identity_verified(verified);
+            frontier.set_store_claimed_by_another(verdict == Verdict::Foreign);
         }
         metrics.set_object_store_identity_verified(frontier.store_identity_verified());
         metrics.set_object_store_unreachable(verdict == Verdict::Unreachable);
@@ -416,6 +430,17 @@ impl IdentityCheck {
             }
         }
     }
+}
+
+/// Whether committed metadata holds a geo topic restored from the store of
+/// `cluster_uid`.
+fn restores_from(inner: &StreamsInner, cluster_uid: u128) -> bool {
+    inner.items.iter().any(|(_, stream)| {
+        stream
+            .topics
+            .iter()
+            .any(|(_, topic)| topic.recovered_from == Some(cluster_uid))
+    })
 }
 
 /// Whether a check may claim the root. Only a caught-up primary knows every
@@ -830,6 +855,85 @@ mod tests {
             IdentityCheck::run(&shared, &layout(), OURS, false).await,
             IdentityCheck::Verified { claimed: false }
         ));
+    }
+
+    #[test]
+    fn given_topics_restored_from_a_cluster_when_its_root_is_checked_should_know_it_is_recovered() {
+        use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+        use iggy_binary_protocol::requests::topics::{
+            CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+        };
+        use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
+        use metadata::stm::StateHandler;
+        use metadata::stm::shadow::{ShadowStream, ShadowTopicRequest, ShadowTopicTarget};
+
+        let mut inner = StreamsInner::new();
+        let source = ShadowStream {
+            origin: "dc-a".to_owned(),
+            cluster_uid: THEIRS,
+            stream_id: 0,
+        };
+        assert!(!restores_from(&inner, THEIRS));
+        let restore_stream = ShadowTopicRequest::RestoreStream {
+            source: source.clone(),
+            name: WireName::new("orders").unwrap(),
+        };
+        let restore_topic = ShadowTopicRequest::RestoreTopic {
+            target: ShadowTopicTarget {
+                stream_id: 0,
+                source,
+                topic_id: 0,
+                created_revision: 5,
+            },
+            create: Box::new(CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("payments").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                    initial_view: 0,
+                    members: Vec::new(),
+                }],
+            }),
+        };
+        let now = iggy_common::IggyTimestamp::now();
+        assert_eq!(restore_stream.apply(&mut inner, now).code, 0);
+        assert_eq!(restore_topic.apply(&mut inner, now).code, 0);
+
+        assert!(restores_from(&inner, THEIRS));
+        assert!(!restores_from(&inner, OURS));
+    }
+
+    #[test]
+    fn given_a_root_of_another_cluster_when_recording_should_mark_it_until_a_check_finds_ours() {
+        let mut checker = IdentityChecker::new(
+            MemoryStore::new(),
+            layout(),
+            false,
+            Duration::from_secs(5),
+            None,
+        );
+        let frontier = AppliedFrontier::new(AppliedFrontier::DEFAULT_READ_BUDGET);
+        let metrics = ShardMetrics::for_shard();
+        let mut claimed = |check| {
+            checker.record(check, OURS, false, &frontier, &metrics);
+            frontier.store_claimed_by_another()
+        };
+
+        assert!(!claimed(IdentityCheck::Missing));
+        assert!(claimed(IdentityCheck::Foreign(Some(THEIRS))));
+        assert!(
+            claimed(IdentityCheck::Unreachable(ObjectStoreError::Transport(
+                "reset".to_owned()
+            ))),
+            "an outage leaves it as it was"
+        );
+        assert!(!claimed(IdentityCheck::Verified { claimed: false }));
     }
 
     /// Each row gives what the frontier records, `object_store_unreachable`,

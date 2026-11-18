@@ -673,7 +673,7 @@ fn restore_topic(
         return ApplyReply::err(ShadowTopicResult::StreamNotFound);
     };
     if let Some(topic) = stream.topics.get(topic_id) {
-        let restored = topic.shadow.is_none()
+        let restored = topic.recovered_from == Some(target.source.cluster_uid)
             && topic
                 .partitions
                 .first()
@@ -690,6 +690,7 @@ fn restore_topic(
         Some(FixedTopic::Restored {
             topic_id,
             created_revision: target.created_revision,
+            retired_cluster_uid: target.source.cluster_uid,
         }),
         create,
         timestamp,
@@ -871,6 +872,7 @@ mod tests {
         assert_eq!(inner.index["orders"], RETIRED_STREAM as usize);
         let topic = stream.topics.get(RETIRED_TOPIC as usize).unwrap();
         assert_eq!(topic.shadow, None);
+        assert_eq!(topic.recovered_from, Some(RETIRED_CLUSTER));
         assert_eq!(&*topic.name, "payments");
         let revisions: Vec<_> = topic
             .partitions
@@ -1432,5 +1434,36 @@ mod tests {
         });
         assert_eq!(shadow, Some(source()));
         assert_eq!(revision, Some(PEER_REVISION));
+    }
+
+    #[test]
+    fn given_a_restored_topic_when_restored_from_a_snapshot_should_keep_its_recovery_marker() {
+        let mut inner = restored_stream();
+        assert_eq!(
+            apply(&mut inner, 3, &restoration(RETIRED_REVISION, 2)).code,
+            0
+        );
+        let streams = Streams::from(inner);
+
+        let restored = Streams::from_snapshot(
+            Streams::from_snapshot(streams.to_snapshot())
+                .unwrap()
+                .to_snapshot(),
+        )
+        .unwrap();
+
+        let (recovered_from, revisions) = restored.read(|inner| {
+            let topic = &inner.items[RETIRED_STREAM as usize].topics[RETIRED_TOPIC as usize];
+            (
+                topic.recovered_from,
+                topic
+                    .partitions
+                    .iter()
+                    .map(|partition| partition.created_revision)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(recovered_from, Some(RETIRED_CLUSTER));
+        assert_eq!(revisions, [RETIRED_REVISION, RETIRED_REVISION]);
     }
 }

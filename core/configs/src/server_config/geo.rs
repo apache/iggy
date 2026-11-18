@@ -73,9 +73,9 @@ pub struct GeoConfig {
     #[config_env(leaf)]
     pub tombstone_grace: IggyDuration,
     /// The `cluster_uid` of a cluster that lost every disk, as 32 hex
-    /// digits, whose geo topics this cluster takes back from its store.
-    /// Empty, the default, takes nothing back: a cluster then refuses a
-    /// store that another cluster claimed.
+    /// digits, whose geo topics this cluster takes back from its store. Only
+    /// replica 0 reads it. Empty, the default, takes nothing back: a cluster
+    /// then refuses a store that another cluster claimed.
     #[serde(default)]
     pub recover_cluster_uid: String,
     /// Whether a recovery also takes the batches that no proof names, at the

@@ -47,10 +47,10 @@
 //! shadow topics of the peer are stale: they serve what they hold, and the
 //! pass removes none of them but those whose grace ended.
 //!
-//! A node told to recover a retired cluster creates no shadow stream before
-//! it passes its own store identity check, which it does once the recovery
-//! restored that cluster's streams: a shadow stream created first could take
-//! a stream id they need.
+//! A node whose own store names another cluster creates no shadow stream:
+//! that cluster may be one that lost every disk, whose streams a recovery
+//! restores under their ids, and a shadow stream created first could take
+//! one of them.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -117,8 +117,6 @@ type PeerSource = Box<dyn Fn(&ServerShard) -> Vec<PeerTopics>>;
 pub struct ShadowTopics {
     /// `None` on a node without geo peers.
     settings: Option<Settings>,
-    /// Whether the node recovers a retired cluster, see the module docs.
-    recovers: bool,
     peers: PeerSource,
     /// Shared with the task of the pass.
     state: Rc<RefCell<State>>,
@@ -200,7 +198,6 @@ impl ShadowTopics {
         });
         Self {
             settings,
-            recovers: config.recovered_cluster_uid().is_some(),
             peers,
             state: Rc::default(),
         }
@@ -215,9 +212,9 @@ impl ShadowTopics {
             return;
         };
         let metadata = shard.plane.metadata();
-        let awaits_recovery =
-            self.recovers && !metadata.applied_frontier().store_identity_verified();
-        if !metadata.is_caught_up_primary() || awaits_recovery {
+        if !metadata.is_caught_up_primary()
+            || metadata.applied_frontier().store_claimed_by_another()
+        {
             self.stop(shard);
             return;
         }

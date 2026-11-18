@@ -558,7 +558,7 @@ recognized.
    node of it that still runs from writing.
 2. Read the lost cluster's `cluster_uid`, the second line of `<prefix>/meta/identity`.
 3. Start the rebuilt cluster on empty disks, with the same `[tiered_storage]` section and the
-   same `[geo] origin` as the lost one, and on every node:
+   same `[geo] origin` as the lost one on every node, and on replica 0 also:
 
    ```toml
    [geo]
@@ -568,20 +568,22 @@ recognized.
    #recover_unproven = false
    ```
 
-   Or `IGGY_GEO_RECOVER_CLUSTER_UID` and `IGGY_GEO_RECOVER_UNPROVEN`. Create no stream
-   before the recovery ends: it restores the streams and topics under the ids they had, and
-   refuses a cluster that holds other streams.
+   Or `IGGY_GEO_RECOVER_CLUSTER_UID` and `IGGY_GEO_RECOVER_UNPROVEN`. The other nodes need
+   neither. Create no stream before the recovery ends: it restores the streams and topics
+   under the ids they had, and refuses a cluster that holds other streams.
 4. Replica 0 recovers once it is the caught-up metadata primary, as it would claim an empty
    bucket. If another replica leads metadata, restart that replica until replica 0 leads.
-   Every node checks the bucket every 5 seconds until the recovery ends.
+   Replica 0 checks the bucket every 5 seconds until the recovery ends, and so does every
+   node once the restored topics reach its metadata.
 5. The recovery is done when `object_store_identity_verified` is 1 on every node, and replica
    0 logs `the retired cluster's geo topics are recovered and this cluster owns the store`.
-   Each node then builds the partitions of the restored topics, which serve their messages
-   and take new sends after the cutover.
+   Each restored topic carries a mark in metadata that names the lost cluster, so every node
+   that builds one of its partitions, now or later, installs what the recovery took of it
+   first, whatever its own configuration says. The partitions then serve their messages and
+   take new sends after the cutover.
 6. Read the report, `<prefix>/meta/recovery/<cluster_uid>/report.json`.
-7. Remove `recover_cluster_uid` from every node. It does nothing once the bucket names the
-   rebuilt cluster, but a node that has it waits for the bucket before it builds a new geo
-   partition.
+7. Remove `recover_cluster_uid` from replica 0. It does nothing once the bucket names the
+   rebuilt cluster.
 
 A recovery that fails logs the reason and runs again at the next check, 5 seconds later.
 Each attempt finds what an earlier one stored and goes on. It refuses a topic of another
@@ -592,11 +594,11 @@ recovered already.
 
 Under `<prefix>/meta/recovery/<cluster_uid>/`, before it claims the bucket:
 
-| Object                                            | Content                                                                                                                                                               |
-| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<stream>-<topic>-<partition>-<created_revision>` | The plan of one partition: its manifest and the batches taken above it. Every node installs it into its empty partition, so every replica starts from the same state. |
-| `record`                                          | The retirement of the lost cluster: the rebuilt cluster's `cluster_uid` and, per partition, where F, P and Q end. Written once, never changed.                        |
-| `report.json`                                     | What each partition took and dropped, for operators.                                                                                                                  |
+| Object                                            | Content                                                                                                                                                                |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<stream>-<topic>-<partition>-<created_revision>` | The plan of one partition: its manifest and the batches taken above it. Every replica installs it into its empty partition, so the replicas start from the same state. |
+| `record`                                          | The retirement of the lost cluster: the rebuilt cluster's `cluster_uid` and, per partition, where F, P and Q end. Written once, never changed.                         |
+| `report.json`                                     | What each partition took and dropped, for operators.                                                                                                                   |
 
 Then it replaces `<prefix>/meta/identity` with the rebuilt cluster's own. A node of the lost
 cluster that comes back finds another cluster there at its next check, within a minute, and
@@ -742,7 +744,7 @@ Alert on these first:
 | `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer.                                                                                       |
 | `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 250 ms after its last. `0` turns this off. Otherwise at least `64 MiB`. |
 | `[tiered_storage.jobs] fresh_uploads`      | `4`     | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads.                                                                                                                                                                                                                                  |
-| `[geo] recover_cluster_uid`                | empty   | The `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                          |
+| `[geo] recover_cluster_uid`                | empty   | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                            |
 | `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                           |
 | `[geo] tombstone_grace`                    | `24 h`  | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage.                                                                                                                                                                     |
 

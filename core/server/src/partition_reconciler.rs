@@ -1134,6 +1134,7 @@ async fn reconcile_target(
         stream_key,
         encryption,
         peer_log,
+        recovered_from,
     }) = fetch_partition_build_inputs(ctx, ns)
     else {
         return Convergence::Pending;
@@ -1222,15 +1223,15 @@ async fn reconcile_target(
 
     // A partition of a geo topic that a recovery restored starts from what
     // the recovery took of it, which every replica installs before it serves
-    // a frame, so the group starts from one state.
-    let plan = if prior_life_on_disk {
-        None
-    } else {
-        match Box::pin(recovery_plan_of(
+    // a frame, so the group starts from one state. Committed metadata says
+    // which partitions those are, so no replica depends on its own config.
+    let plan = match recovered_from.filter(|_| !prior_life_on_disk) {
+        None => None,
+        Some(retired_cluster_uid) => match Box::pin(recovery_plan_of(
             ctx,
             ns,
             created_revision,
-            topic_runtime.geo_topic,
+            retired_cluster_uid,
         ))
         .await
         {
@@ -1245,7 +1246,7 @@ async fn reconcile_target(
                 );
                 return Convergence::Pending;
             }
-        }
+        },
     };
 
     let built = if prior_life_on_disk {
@@ -1362,23 +1363,16 @@ async fn reconcile_target(
     }
 }
 
-/// What the recovery named in `[geo] recover_cluster_uid` took of the
-/// partition `ns` of revision `created_revision`, `None` when the node
-/// recovers nothing, the topic is not a geo topic, or the recovery took
-/// nothing of the partition. `Err` with the reason while the plan cannot be
-/// read, as before the node passes its store identity check.
+/// What the recovery of `retired_cluster_uid` took of the partition `ns` of
+/// revision `created_revision`, `None` when it took nothing of the
+/// partition. `Err` with the reason while the plan cannot be read, as before
+/// the node passes its store identity check.
 async fn recovery_plan_of(
     ctx: &ReconcilerCtx,
     ns: IggyNamespace,
     created_revision: u64,
-    geo_topic: bool,
+    retired_cluster_uid: u128,
 ) -> Result<Option<RecoveryPlan>, String> {
-    let Some(retired_cluster_uid) = ctx.config.geo.recovered_cluster_uid() else {
-        return Ok(None);
-    };
-    if !geo_topic {
-        return Ok(None);
-    }
     let Some(objects) = ctx.shard.topic_objects() else {
         return Err("the node does not pass its store identity check yet".to_owned());
     };
@@ -2094,6 +2088,9 @@ struct PartitionBuildInputs {
     encryption: StreamEncryption,
     /// The peer's log that a partition of a shadow topic follows.
     peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
+    /// The cluster that lost every disk, for a partition of a geo topic that
+    /// a recovery restored from its store.
+    recovered_from: Option<u128>,
 }
 
 /// Everything one namespace's build needs out of committed metadata: the shared
@@ -2141,6 +2138,7 @@ fn fetch_partition_build_inputs(
             },
             encryption: StreamEncryption::from(&stream.options),
             peer_log: peer_log_of(stream, topic, ns),
+            recovered_from: topic.recovered_from,
         })
     })
 }
