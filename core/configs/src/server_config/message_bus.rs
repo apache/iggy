@@ -44,7 +44,7 @@
 //!
 //! Client sockets get no TCP keepalive: SDK clients manage their own
 //! keepalive policy. Replica sockets get keepalive probes, and on Linux
-//! `cluster.heartbeat_timeout` bounds how long they may go unanswered.
+//! `cluster.commit_busy_heartbeat_timeout` bounds how long they may go unanswered.
 //! No keepalive knobs live in this section.
 //!
 //! Construction of the runtime type from this struct happens in the

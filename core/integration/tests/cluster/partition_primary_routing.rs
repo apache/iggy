@@ -146,7 +146,7 @@ const METADATA_CHECKPOINT_REQUESTS: usize = 256;
 // Keep handcrafted requests distinct from the parent SDK session's low IDs.
 const RAW_REQUEST_START: u64 = 1 << 63;
 
-/// Long enough for the backups to miss `cluster.heartbeat_timeout` (5s by
+/// Long enough for the backups to miss `cluster.commit_busy_heartbeat_timeout` (5s by
 /// default) and conclude an election.
 const ELECTION_SETTLE: Duration = Duration::from_secs(15);
 /// Long enough for the restarted node 0 to rejoin at the new view.
@@ -160,7 +160,7 @@ const SEND_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_POLL: Duration = Duration::from_millis(500);
 const REBALANCE_BUDGET: Duration = Duration::from_secs(120);
-/// `cluster.heartbeat_timeout` at its default.
+/// `cluster.commit_busy_heartbeat_timeout` at its default.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long quorum evidence keeps partition admission open past
 /// `HEARTBEAT_TIMEOUT`, as the server sets it.
@@ -1222,7 +1222,7 @@ async fn given_a_partition_primary_backing_up_metadata_when_its_quorum_freezes_s
 /// A partition primary whose quorum peers are frozen gets no fresh metadata
 /// quorum evidence, whether it credits answered probes as the metadata primary
 /// or probes as a backup. It must refuse partition writes with 58 once that
-/// evidence is `heartbeat_timeout + 3s` old, admit nothing it refused, and
+/// evidence is `commit_busy_heartbeat_timeout + 3s` old, admit nothing it refused, and
 /// serve the partition again after the peers resume.
 async fn assert_isolated_primary_fence(harness: &TestHarness, leads_metadata: bool) {
     const ADMITTED: [&str; 2] = ["before-isolation", "after-resume"];

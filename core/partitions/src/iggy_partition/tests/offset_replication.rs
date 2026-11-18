@@ -97,20 +97,14 @@ fn answer_partition_heartbeat(
         ..
     } = action
     {
-        let reply = Message::<CommitReplyHeader>::new(HEADER_SIZE).transmute_header(
-            |_, header: &mut CommitReplyHeader| {
-                header.command = Command::CommitReply;
-                header.size = u32::try_from(HEADER_SIZE).unwrap();
-                header.cluster = partition.consensus().cluster();
-                header.view = *view;
-                header.replica = 1;
-                header.group = *group;
-                header.partition_incarnation = partition.consensus().partition_incarnation();
-                header.timestamp_monotonic = *timestamp_monotonic;
-                header.seal();
-            },
+        let reply = CommitReplyEntry::new(
+            *group,
+            partition.consensus().partition_incarnation(),
+            *view,
+            *timestamp_monotonic,
+            1,
         );
-        partition.consensus().handle_commit_reply(reply.header());
+        partition.consensus().handle_commit_reply(&reply);
     }
 }
 
