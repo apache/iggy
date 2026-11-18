@@ -16,24 +16,25 @@
 // under the License.
 
 use super::placed_batches::{
-    SharedStore, commit_long_term_request, commit_published_segment, long_term_key, long_term_logs,
-    lose_primacy, object_bytes, placing_leader_of_three_with, publish_manifest,
-    read_from_the_bucket_alone, regain_primacy, store_with, whole_and_placed, writer,
+    Registering, SharedStore, begin_registered_rewrite, commit_long_term_request,
+    commit_published_segment, long_term_key, long_term_logs, lose_primacy, object_bytes,
+    placing_leader_of_three_with, publish_manifest, read_from_the_bucket_alone, regain_primacy,
+    store_segment_up_to, store_with, whole_and_placed, writer,
 };
 use super::remote_poll::layout;
 use super::*;
 use crate::long_term::{
-    LONG_TERM_SEGMENTS_MAX, PUBLISH_SEGMENT, PublishSegment, REPLACE_SEGMENTS, ReplaceSegments,
-    concatenated,
+    LONG_TERM_SEGMENTS_MAX, PUBLISH_SEGMENT, PublishSegment, REGISTER_OBJECT, REPLACE_SEGMENTS,
+    RegisterObject, ReplaceSegments, concatenated,
 };
 use crate::state_machine::{Applied, MachineCommand};
 use crate::{
     ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LONG_TERM_SEGMENTS_PRESSURE, LongTermMerger,
-    LongTermWriter, MergeError, MergePass, MergeSettled,
+    LongTermWriter, MergeError, MergePass, MergeSettled, MergeStart, SegmentMerge,
 };
 use iggy_object_store::{
     InlineTierExecutor, ManifestSegment, MemoryStore, ObjectStore, PutBody, PutOptions,
-    SEGMENT_HASH_LEN, SegmentObject, TierJobClass,
+    SEGMENT_HASH_LEN, SegmentObject, TierJobClass, TierScopeToken,
 };
 
 type MemoryMerger = ExecutorLongTermMerger<InlineTierExecutor<SharedStore>>;
@@ -63,10 +64,7 @@ async fn leader_with_segments(
     let (directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
     let mut segments = Vec::new();
     for (request, up_to) in (1..).zip(ends) {
-        let (id, mut rewrite, scope) = partition.begin_segment_rewrite().unwrap();
-        rewrite.up_to = *up_to;
-        let outcome = writer(&store).write(rewrite, scope).await;
-        let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
+        let segment = Box::pin(store_segment_up_to(&mut partition, &store, *up_to)).await;
         let command = partition
             .publish_segment_request(&segment, request)
             .unwrap();
@@ -77,6 +75,55 @@ async fn leader_with_segments(
     (directory, partition, store, segments)
 }
 
+pub(super) fn now() -> IggyTimestamp {
+    IggyTimestamp::now()
+}
+
+/// Take the next merge step, and when it is a registration, commit it as
+/// the primary does and take the step after it, which starts the merge.
+pub(super) async fn begin_merge(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    pass: MergePass,
+) -> Option<(u64, SegmentMerge, TierScopeToken)> {
+    let registration = match partition.begin_segment_merge(pass, now())? {
+        MergeStart::Merge(id, merge, scope) => return Some((id, merge, scope)),
+        MergeStart::Register(registration) => registration,
+    };
+    let request = partition
+        .register_object_request(&registration, 80)
+        .unwrap();
+    Box::pin(commit_long_term_request(partition, request, false)).await;
+    started(partition.begin_segment_merge(pass, now()))
+}
+
+/// [`begin_merge`] on a log whose commands the test applies itself, the
+/// registration as op `op`.
+fn begin_applied_merge(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    pass: MergePass,
+    op: u64,
+) -> Option<(u64, SegmentMerge, TierScopeToken)> {
+    let registration = match partition.begin_segment_merge(pass, now())? {
+        MergeStart::Merge(id, merge, scope) => return Some((id, merge, scope)),
+        MergeStart::Register(registration) => registration,
+    };
+    let payload = RegisterObject(registration).encode();
+    assert_eq!(
+        apply(partition, op, REGISTER_OBJECT, &payload),
+        Applied::Changed
+    );
+    started(partition.begin_segment_merge(pass, now()))
+}
+
+fn started(step: Option<MergeStart>) -> Option<(u64, SegmentMerge, TierScopeToken)> {
+    match step? {
+        MergeStart::Merge(id, merge, scope) => Some((id, merge, scope)),
+        MergeStart::Register(registration) => {
+            panic!("{registration:?} committed, so the merge starts")
+        }
+    }
+}
+
 /// Start the best merge, run it, and hand its result back. Returns the
 /// segment it stored, whose command has yet to commit.
 pub(super) async fn merge_pass(
@@ -84,7 +131,7 @@ pub(super) async fn merge_pass(
     store: &Rc<MemoryStore>,
     pass: MergePass,
 ) -> Option<ManifestSegment> {
-    let (id, merge, scope) = partition.begin_segment_merge(pass)?;
+    let (id, merge, scope) = Box::pin(begin_merge(partition, pass)).await?;
     let outcome = merger(store).merge(merge, scope).await;
     partition.finish_segment_merge(id, outcome)
 }
@@ -200,7 +247,9 @@ async fn given_a_source_whose_object_holds_other_bytes_when_merging_should_store
         Box::pin(leader_with_segments(3, &[0, 1, 3])).await;
     Box::pin(damage_source(&store, &segments[1])).await;
     let keys = store.keys();
-    let (id, merge, scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (id, merge, scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
 
     let outcome = merger(&store).merge(merge, scope).await;
 
@@ -215,13 +264,25 @@ async fn given_a_source_whose_object_holds_other_bytes_when_merging_should_store
     assert_eq!(store.keys(), keys);
     assert_eq!(partition.settle_segment_merge(), MergeSettled::Nothing);
     assert_eq!(partition.segment_merge_reclaim(), None);
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
-    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Drain, now())
+            .is_none()
+    );
 
     // The next view knows nothing of it, and finds it again.
     lose_primacy(&mut partition);
     regain_primacy(&mut partition);
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_some());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_some()
+    );
 }
 
 #[compio::test]
@@ -236,7 +297,9 @@ async fn given_a_source_whose_object_has_another_size_when_merging_should_store_
         .await
         .unwrap();
     let keys = store.keys();
-    let (id, merge, scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (id, merge, scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
     assert_eq!(merge.sources, segments);
 
     let outcome = merger(&store).merge(merge, scope).await;
@@ -260,7 +323,9 @@ async fn given_a_merge_in_flight_when_primacy_moves_should_drop_its_result_and_t
  {
     let (_directory, mut partition, store, segments) =
         Box::pin(leader_with_segments(3, &[0, 1, 3])).await;
-    let (id, merge, scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (id, merge, scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
     let outcome = merger(&store).merge(merge, scope).await;
     let stored = *outcome.as_ref().unwrap().as_ref().unwrap();
     let keys = store.keys();
@@ -269,7 +334,11 @@ async fn given_a_merge_in_flight_when_primacy_moves_should_drop_its_result_and_t
 
     assert_eq!(partition.finish_segment_merge(id, outcome), None);
     assert_eq!(partition.settle_segment_merge(), MergeSettled::Nothing);
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
     assert!(!partition.segment_merge_running());
     assert_eq!(partition.long_term_segments(), segments);
 
@@ -302,12 +371,20 @@ async fn given_a_result_of_an_earlier_view_when_another_merge_runs_should_not_ta
 {
     let (_directory, mut partition, store, _segments) =
         Box::pin(leader_with_segments(3, &[0, 1, 3])).await;
-    let (earlier, merge, scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (earlier, merge, scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
     let outcome = merger(&store).merge(merge, scope).await;
     lose_primacy(&mut partition);
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
     regain_primacy(&mut partition);
-    let (later, _merge, _scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (later, _merge, _scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
     assert_ne!(earlier, later);
 
     assert_eq!(partition.finish_segment_merge(earlier, outcome), None);
@@ -323,9 +400,13 @@ async fn given_a_stored_merge_whose_command_is_not_committed_when_passes_run_sho
  {
     let (_directory, mut partition, store, segments) =
         Box::pin(leader_with_segments(3, &[0, 1, 3])).await;
-    let (id, merge, scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (id, merge, scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
     assert!(
-        partition.begin_segment_merge(MergePass::Scan).is_none(),
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none(),
         "one at a time"
     );
     assert!(partition.segment_merge_running());
@@ -338,8 +419,16 @@ async fn given_a_stored_merge_whose_command_is_not_committed_when_passes_run_sho
             partition.settle_segment_merge(),
             MergeSettled::Waiting(merged)
         );
-        assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
-        assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
+        assert!(
+            partition
+                .begin_segment_merge(MergePass::Scan, now())
+                .is_none()
+        );
+        assert!(
+            partition
+                .begin_segment_merge(MergePass::Drain, now())
+                .is_none()
+        );
         assert_eq!(partition.segment_merge_reclaim(), None);
     }
     assert_eq!(partition.long_term_segments(), segments);
@@ -361,12 +450,19 @@ async fn given_a_stored_merge_whose_command_is_not_committed_when_passes_run_sho
 async fn given_a_trim_under_a_running_merge_when_it_ends_should_retire_its_output() {
     let (_directory, mut partition, store, segments) =
         Box::pin(leader_with_segments(3, &[0, 1, 3])).await;
-    let (id, merge, scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (id, merge, scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
     let outcome = merger(&store).merge(merge, scope).await;
     let trim = partition.trim_segments_request(0, 60).unwrap();
     Box::pin(commit_long_term_request(&mut partition, trim, false)).await;
     assert_eq!(partition.long_term_segments(), &segments[1..]);
-    assert_eq!(partition.queued_dead_long_term_objects(), 1);
+    assert_eq!(
+        partition.queued_dead_long_term_objects(),
+        2,
+        "the trimmed segment, and the merged one its registration named"
+    );
+    assert_eq!(partition.long_term_log().unwrap().registrations(), []);
 
     let merged = partition.finish_segment_merge(id, outcome).unwrap();
 
@@ -375,7 +471,9 @@ async fn given_a_trim_under_a_running_merge_when_it_ends_should_retire_its_outpu
     assert_eq!(partition.queued_dead_long_term_objects(), 2);
     assert_eq!(partition.settle_segment_merge(), MergeSettled::Nothing);
     assert_eq!(partition.long_term_segments(), &segments[1..]);
-    let (_, next, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    let (_, next, _scope) = Box::pin(begin_merge(&mut partition, MergePass::Drain))
+        .await
+        .unwrap();
     assert_eq!(next.sources, &segments[1..]);
 }
 
@@ -428,15 +526,16 @@ async fn given_a_full_long_term_log_when_a_merge_commits_should_take_it_and_then
     );
     assert_eq!(partition.segment_merge_reclaim(), Some((1, 0)));
 
-    let merged = Box::pin(merge_pass(&mut partition, &store, MergePass::Scan))
-        .await
-        .unwrap();
+    let (id, merge, scope) =
+        begin_applied_merge(&mut partition, MergePass::Scan, 101 + full).unwrap();
+    let outcome = merger(&store).merge(merge, scope).await;
+    let merged = partition.finish_segment_merge(id, outcome).unwrap();
     assert_eq!((merged.start_offset, merged.end_offset), (0, 1));
     assert_eq!(merged.size, segments[0].size + segments[1].size);
     let replace = ReplaceSegments(merged).encode();
 
     assert_eq!(
-        apply(&mut partition, 101 + full, REPLACE_SEGMENTS, &replace),
+        apply(&mut partition, 102 + full, REPLACE_SEGMENTS, &replace),
         Applied::Changed
     );
     assert_eq!(
@@ -444,7 +543,7 @@ async fn given_a_full_long_term_log_when_a_merge_commits_should_take_it_and_then
         MergeSettled::Committed { replaced: 2 }
     );
     assert_eq!(
-        apply(&mut partition, 102 + full, PUBLISH_SEGMENT, &waiting),
+        apply(&mut partition, 103 + full, PUBLISH_SEGMENT, &waiting),
         Applied::Changed
     );
     assert_eq!(partition.long_term_segments().len(), LONG_TERM_SEGMENTS_MAX);
@@ -459,11 +558,16 @@ async fn given_a_merge_in_flight_when_a_rewrite_is_due_should_start_the_rewrite_
     let (_directory, mut partition, store, segments) =
         Box::pin(leader_with_segments(3, &[0, 1])).await;
     assert_eq!(partition.long_term_lag(), 2);
-    let (id, merge, scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (id, merge, scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
 
-    let (rewrite_id, rewrite, rewrite_scope) = partition
-        .begin_segment_rewrite()
-        .expect("a rewrite starts while a merge runs");
+    let (rewrite_id, rewrite, rewrite_scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .expect("a rewrite starts while a merge runs");
     assert_eq!((rewrite.start_offset, rewrite.up_to), (2, 3));
 
     let outcome = merger(&store).merge(merge, scope).await;
@@ -499,9 +603,16 @@ async fn given_a_merge_in_flight_when_a_rewrite_is_due_should_start_the_rewrite_
 async fn given_a_rewrite_in_flight_when_a_merge_is_due_should_start_the_merge() {
     let (_directory, mut partition, _store, segments) =
         Box::pin(leader_with_segments(3, &[0, 1])).await;
-    let _rewrite = partition.begin_segment_rewrite().unwrap();
+    let _rewrite = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .unwrap();
 
-    let (_, merge, _scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (_, merge, _scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
 
     assert_eq!(merge.sources, segments);
 }
@@ -523,17 +634,28 @@ async fn given_a_merged_segment_that_came_out_small_when_the_next_one_follows_sh
         partition.settle_segment_merge(),
         MergeSettled::Committed { replaced: 2 }
     );
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .unwrap();
     let outcome = writer(&store).write(rewrite, scope).await;
     let rewritten = partition.finish_segment_rewrite(id, outcome).unwrap();
     let publish = partition.publish_segment_request(&rewritten, 70).unwrap();
     Box::pin(commit_long_term_request(&mut partition, publish, false)).await;
     assert_eq!(partition.long_term_segments(), [merged, rewritten]);
 
-    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Drain, now())
+            .is_none()
+    );
 
     assert_eq!(partition.segment_merge_reclaim(), Some((1, 0)));
-    let (_, merge, _scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (_, merge, _scope) = Box::pin(begin_merge(&mut partition, MergePass::Scan))
+        .await
+        .unwrap();
     assert_eq!(merge.sources, [merged, rewritten]);
 }
 
@@ -545,7 +667,11 @@ async fn given_a_backup_when_a_merge_pass_runs_should_merge_nothing() {
     lose_primacy(&mut partition);
 
     assert_eq!(partition.segment_merge_reclaim(), None);
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
     assert_eq!(partition.settle_segment_merge(), MergeSettled::Nothing);
     assert!(!partition.segment_merge_running());
 }
@@ -570,7 +696,11 @@ async fn given_a_partition_of_whole_batches_when_a_merge_pass_runs_should_merge_
     assert!(partition.partition_dir().is_some());
 
     assert_eq!(partition.segment_merge_reclaim(), None);
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
 }
 
 /// A leader of three whose long-term log holds a segment of one offset for
@@ -641,19 +771,28 @@ async fn given_a_log_one_segment_below_the_pressure_threshold_when_merge_passes_
     assert!(!partition.merges_under_pressure());
     assert_eq!(partition.segment_merge_reclaim(), Some((1, 0)));
 
-    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Scan).unwrap();
+    let (id, merge, _scope) =
+        begin_applied_merge(&mut partition, MergePass::Scan, AFTER_THE_LOG).unwrap();
 
     assert_eq!(merge.class, TierJobClass::Housekeeping);
     assert_eq!(merge.sources, &partition.long_term_segments()[..2]);
-    store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG);
+    store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG + 1);
     assert_eq!(partition.long_term_segments().len(), below - 1);
     assert_eq!(
         partition.segment_merge_reclaim(),
         None,
         "segments that are large enough stay as they are"
     );
-    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Drain, now())
+            .is_none()
+    );
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
 }
 
 /// The pass that finds the log at the threshold is any pass, not only a
@@ -666,7 +805,8 @@ async fn given_a_log_at_the_pressure_threshold_when_a_pass_outside_a_scan_runs_s
     assert!(partition.merges_under_pressure());
     assert_eq!(partition.segment_merge_reclaim(), Some((1, 0)));
 
-    let (_, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    let (_, merge, _scope) =
+        begin_applied_merge(&mut partition, MergePass::Drain, AFTER_THE_LOG).unwrap();
 
     assert_eq!(merge.class, TierJobClass::Upload);
     assert_eq!(
@@ -692,10 +832,17 @@ async fn given_a_log_of_only_healthy_segments_at_the_pressure_threshold_when_mer
     );
 
     let mut merges = 0;
-    while let Some((id, merge, _scope)) = partition.begin_segment_merge(MergePass::Drain) {
+    while let Some((id, merge, _scope)) =
+        begin_applied_merge(&mut partition, MergePass::Drain, AFTER_THE_LOG + 2 * merges)
+    {
         assert_eq!(merge.class, TierJobClass::Upload);
         assert_eq!(merge.sources.len(), 4);
-        let merged = store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG + merges);
+        let merged = store_and_commit(
+            &mut partition,
+            id,
+            &merge.sources,
+            AFTER_THE_LOG + 2 * merges + 1,
+        );
         assert_eq!(merged.size, 4 * LONG_TERM_MERGE_MIN_BYTES);
         merges += 1;
     }
@@ -707,7 +854,11 @@ async fn given_a_log_of_only_healthy_segments_at_the_pressure_threshold_when_mer
     );
     assert!(!partition.merges_under_pressure());
     assert_eq!(partition.segment_merge_reclaim(), None);
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
 }
 
 /// A merged segment that came out small rests until the next scan. A log
@@ -718,15 +869,17 @@ async fn given_a_merged_segment_that_rests_when_the_log_is_at_the_pressure_thres
  {
     let (_directory, mut partition) =
         Box::pin(leader_with_log_of(&[1, 1], LONG_TERM_SEGMENTS_PRESSURE + 1)).await;
-    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
-    let merged = store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG);
+    let (id, merge, _scope) =
+        begin_applied_merge(&mut partition, MergePass::Drain, AFTER_THE_LOG).unwrap();
+    let merged = store_and_commit(&mut partition, id, &merge.sources, AFTER_THE_LOG + 1);
     assert_eq!(merged.size, 2);
     assert_eq!(
         partition.long_term_segments().len(),
         LONG_TERM_SEGMENTS_PRESSURE
     );
 
-    let (_, next, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    let (_, next, _scope) =
+        begin_applied_merge(&mut partition, MergePass::Drain, AFTER_THE_LOG + 2).unwrap();
 
     assert_eq!(next.class, TierJobClass::Upload);
     assert_eq!(next.sources.len(), 4);
@@ -741,9 +894,12 @@ async fn given_a_log_at_the_pressure_threshold_when_a_merge_is_held_back_should_
     let (_directory, mut partition) =
         Box::pin(leader_with_log_of(&[], LONG_TERM_SEGMENTS_PRESSURE)).await;
 
-    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    let (id, merge, _scope) =
+        begin_applied_merge(&mut partition, MergePass::Drain, AFTER_THE_LOG).unwrap();
     assert!(
-        partition.begin_segment_merge(MergePass::Drain).is_none(),
+        partition
+            .begin_segment_merge(MergePass::Drain, now())
+            .is_none(),
         "one at a time"
     );
     assert_eq!(partition.segment_merge_reclaim(), None);
@@ -757,18 +913,25 @@ async fn given_a_log_at_the_pressure_threshold_when_a_merge_is_held_back_should_
         MergeSettled::Waiting(merged)
     );
     assert!(
-        partition.begin_segment_merge(MergePass::Drain).is_none(),
+        partition
+            .begin_segment_merge(MergePass::Drain, now())
+            .is_none(),
         "the command of the stored one has not committed"
     );
     assert_eq!(partition.segment_merge_reclaim(), None);
 
     lose_primacy(&mut partition);
     assert!(!partition.merges_under_pressure());
-    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Drain, now())
+            .is_none()
+    );
     regain_primacy(&mut partition);
     assert!(partition.merges_under_pressure());
 
-    let (id, merge, _scope) = partition.begin_segment_merge(MergePass::Drain).unwrap();
+    let (id, merge, _scope) =
+        begin_applied_merge(&mut partition, MergePass::Drain, AFTER_THE_LOG + 1).unwrap();
     let diverged = merge.sources[1].start_offset;
     assert_eq!(
         partition.finish_segment_merge(
@@ -784,6 +947,14 @@ async fn given_a_log_at_the_pressure_threshold_when_a_merge_is_held_back_should_
         None,
         "every merge that makes the log shorter reads the source"
     );
-    assert!(partition.begin_segment_merge(MergePass::Drain).is_none());
-    assert!(partition.begin_segment_merge(MergePass::Scan).is_none());
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Drain, now())
+            .is_none()
+    );
+    assert!(
+        partition
+            .begin_segment_merge(MergePass::Scan, now())
+            .is_none()
+    );
 }

@@ -45,12 +45,17 @@ use crate::{
     FinishedSegmentMerge, IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel,
 };
 use consensus::PartitionsHandle;
-use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::{PrepareHeader, RoutedRequestHeader};
+use iggy_common::IggyTimestamp;
 use iggy_object_store::{ManifestSegment, TierScopeToken};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::{LongTermMerger, MergePass, MergeSettled, SegmentMerge};
+use partitions::long_term::ObjectRegistration;
+use partitions::state_machine::CommandEncodeError;
+use partitions::{
+    IggyPartition, LongTermMerger, MergePass, MergeSettled, MergeStart, SegmentMerge,
+};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
@@ -189,6 +194,9 @@ fn merge_rank(
 enum MergeStep {
     /// Send the command of the merged segment again.
     Resend(ManifestSegment),
+    /// Commit the registration of what the next merge stores, which a later
+    /// pass starts.
+    Register(ObjectRegistration),
     Start((u64, SegmentMerge, TierScopeToken)),
     /// A merge runs.
     Wait,
@@ -334,8 +342,13 @@ where
                     if let MergeSettled::Committed { replaced } = settled {
                         self.metrics.record_long_term_merge(replaced);
                     }
-                    match partition.begin_segment_merge(pass) {
-                        Some(started) => MergeStep::Start(started),
+                    match partition.begin_segment_merge(pass, IggyTimestamp::now()) {
+                        Some(MergeStart::Merge(id, merge, scope)) => {
+                            MergeStep::Start((id, merge, scope))
+                        }
+                        Some(MergeStart::Register(registration)) => {
+                            MergeStep::Register(registration)
+                        }
                         None if partition.segment_merge_running() => MergeStep::Wait,
                         None => MergeStep::Idle,
                     }
@@ -367,6 +380,17 @@ where
                     .borrow_mut()
                     .hold(key, next_pass);
                 self.replace_segments(namespace, &stored).await;
+                return;
+            }
+            MergeStep::Register(registration) => {
+                self.long_term_merges
+                    .schedule
+                    .borrow_mut()
+                    .hold(key, next_pass);
+                self.submit_long_term_command(namespace, |partition, number| {
+                    partition.register_object_request(&registration, number)
+                })
+                .await;
                 return;
             }
             MergeStep::Start(started) => started,
@@ -461,6 +485,50 @@ where
                             namespace_raw = namespace.inner(),
                             %error,
                             "a merged long-term segment cannot be encoded as a command"
+                        );
+                    })
+                    .ok()
+            });
+        let Some(request) = request else {
+            return;
+        };
+        let (reply, _unread) = channel(1);
+        self.dispatch_partition_submit(request, reply, None, None)
+            .await;
+    }
+
+    /// Commit the command of the long-term log of `namespace` that `request`
+    /// builds under the number it is given, the way a client write is
+    /// committed. Nothing waits for the reply: the pass that sent it reads
+    /// what came of it from the log, and sends it again if need be.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn submit_long_term_command(
+        &self,
+        namespace: IggyNamespace,
+        request: impl FnOnce(
+            &IggyPartition<B, SB>,
+            u64,
+        ) -> Result<Message<RoutedRequestHeader>, CommandEncodeError>,
+    ) where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        let number = self.floor_advance_requests.get().wrapping_add(1);
+        self.floor_advance_requests.set(number);
+        let request = self
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .and_then(|partition| {
+                request(partition, number)
+                    .inspect_err(|error| {
+                        tracing::error!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            %error,
+                            "a long-term command cannot be encoded"
                         );
                     })
                     .ok()

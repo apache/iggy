@@ -23,9 +23,10 @@
 //! [`LongTermObject::classify`]. An object that cannot is dead. At or below
 //! the floor, segments are only joined by a replace or removed from the
 //! front by a trim, so the offsets where segments start and end there only
-//! get fewer, and an object that is dead once stays dead. A primary that
-//! acts on a state the group has moved past therefore deletes nothing a
-//! later state lists.
+//! get fewer, and an object that is dead once stays dead. The object of an
+//! expired registration is dead too: the log never registers or lists it
+//! again. A primary that acts on a state the group has moved past therefore
+//! deletes nothing a later state lists.
 //!
 //! Only the partition primary deletes. It learns of dead objects from the
 //! commands it applies, and from a listing of the incarnation once in its
@@ -49,8 +50,10 @@ use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use tracing::{debug, warn};
 
-use crate::long_term::{REPLACE_SEGMENTS, REPLACE_SOURCES_MAX, ReplaceSegments};
-use crate::long_term::{TRIM_SEGMENTS, TrimSegments};
+use crate::long_term::{
+    EXPIRE_REGISTRATIONS, LongTermLog, ObjectRegistration, PUBLISH_SEGMENT, REPLACE_SEGMENTS,
+    REPLACE_SOURCES_MAX, ReplaceSegments, TRIM_SEGMENTS, TrimSegments,
+};
 use crate::manifest_publish::ManifestProgress;
 use crate::state_machine::MachineCommand;
 use crate::{
@@ -102,9 +105,11 @@ impl SegmentSpan for (u64, u64) {
 pub enum LongTermObject {
     /// The log lists a segment with these offsets.
     Listed,
-    /// Not listed, and a later command can still list it: the output of a
-    /// rewrite whose command has not committed, or one that lost to another
-    /// and still starts and ends where segments do. Never deleted.
+    /// Registered for the command that will list it. Never deleted.
+    Registered,
+    /// Not listed and not registered, and a later command can still list
+    /// it. Every object is registered before it is stored, so a listing
+    /// finds none but those stored while it ran. Never deleted.
     Unannounced,
     /// No later state of the log lists it.
     Dead,
@@ -136,6 +141,57 @@ impl LongTermObject {
             Self::Dead
         }
     }
+
+    /// [`Self::classify`], with the objects the log names besides its
+    /// segments: `registered` ones, and `expired` ones, which no later state
+    /// lists. Both ascending by their offsets.
+    #[must_use]
+    pub fn named<S: SegmentSpan, R: SegmentSpan, X: SegmentSpan>(
+        segments: &[S],
+        registered: &[R],
+        expired: &[X],
+        start_offset: u64,
+        end_offset: u64,
+    ) -> Self {
+        match Self::classify(segments, start_offset, end_offset) {
+            Self::Unannounced if names(registered, start_offset, end_offset) => Self::Registered,
+            Self::Unannounced if names(expired, start_offset, end_offset) => Self::Dead,
+            classified => classified,
+        }
+    }
+}
+
+fn names<S: SegmentSpan>(spans: &[S], start_offset: u64, end_offset: u64) -> bool {
+    spans
+        .binary_search_by_key(&(start_offset, end_offset), |span| {
+            (span.start_offset(), span.end_offset())
+        })
+        .is_ok()
+}
+
+/// The first and the last offset of everything a long-term log names, each
+/// part ascending: its segments, its registered objects, and the objects
+/// whose registration expired.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LongTermNames {
+    pub segments: Vec<(u64, u64)>,
+    pub registered: Vec<(u64, u64)>,
+    pub expired: Vec<(u64, u64)>,
+}
+
+impl LongTermNames {
+    /// What the log these names come from says of an object keyed by two
+    /// offsets.
+    #[must_use]
+    pub fn classify(&self, start_offset: u64, end_offset: u64) -> LongTermObject {
+        LongTermObject::named(
+            &self.segments,
+            &self.registered,
+            &self.expired,
+            start_offset,
+            end_offset,
+        )
+    }
 }
 
 /// What a listing of an incarnation's long-term objects found.
@@ -144,26 +200,25 @@ pub struct SweptLongTerm {
     /// The first and the last offset of the dead objects, ascending, at most
     /// [`LONG_TERM_SWEEP_DEAD_MAX`] of them.
     pub dead: Vec<(u64, u64)>,
-    /// How many objects are neither listed nor dead.
-    pub unannounced: usize,
+    /// The first and the last offset of the objects nothing the log names
+    /// accounts for, ascending, at most [`LONG_TERM_SWEEP_DEAD_MAX`] of them.
+    pub unannounced: Vec<(u64, u64)>,
 }
 
 impl SweptLongTerm {
     /// Sort the objects `listed`, each by its first and last offset and
-    /// ascending, by the `segments` of the long-term log.
+    /// ascending, by what the long-term log `names`.
     #[must_use]
-    pub fn classified<S: SegmentSpan>(
-        listed: impl IntoIterator<Item = (u64, u64)>,
-        segments: &[S],
-    ) -> Self {
+    pub fn classified(listed: impl IntoIterator<Item = (u64, u64)>, names: &LongTermNames) -> Self {
         let mut swept = Self::default();
-        for (start_offset, end_offset) in listed {
-            match LongTermObject::classify(segments, start_offset, end_offset) {
-                LongTermObject::Unannounced => swept.unannounced += 1,
-                LongTermObject::Dead if swept.dead.len() < LONG_TERM_SWEEP_DEAD_MAX => {
-                    swept.dead.push((start_offset, end_offset));
-                }
-                LongTermObject::Listed | LongTermObject::Dead => {}
+        for object in listed {
+            let found = match names.classify(object.0, object.1) {
+                LongTermObject::Unannounced => &mut swept.unannounced,
+                LongTermObject::Dead => &mut swept.dead,
+                LongTermObject::Listed | LongTermObject::Registered => continue,
+            };
+            if found.len() < LONG_TERM_SWEEP_DEAD_MAX {
+                found.push(object);
             }
         }
         swept
@@ -247,7 +302,8 @@ pub struct LongTermDeletes {
     /// When this view last listed the incarnation's objects, in
     /// microseconds.
     swept_at: Option<u64>,
-    /// How many objects that listing found neither listed nor dead.
+    /// How many objects that listing found that nothing the log named
+    /// accounts for once it ended.
     unannounced: usize,
     dead: DeadObjects,
     /// The job in flight: its number, what it does, and the scope whose end
@@ -333,18 +389,22 @@ where
             return None;
         }
         let taken_at = self.long_term_progress();
+        let stored = self.stored_manifest_progress();
+        let names = self.long_term_log().map(LongTermLog::names);
         let deletes = self.long_term_deletes_of_this_view();
+        // An expiry leaves the manifest as it is, so the objects it made
+        // dead wait from the first pass that finds a manifest of the state.
+        if let Some(stored) = stored {
+            deletes.dead.manifest_stored(stored, now);
+        }
         if deletes.running.is_some() {
             return None;
         }
         let (work, running) = if deletes.sweep_due(now) {
-            let segments = self
-                .long_term_segments()
-                .iter()
-                .map(|segment| (segment.start_offset, segment.end_offset))
-                .collect();
             (
-                ObjectDeleteWork::SweepLongTerm { segments },
+                ObjectDeleteWork::SweepLongTerm {
+                    log: names.unwrap_or_default(),
+                },
                 RunningLongTermDelete::Sweep { taken_at },
             )
         } else {
@@ -399,6 +459,18 @@ where
         }
         let namespace_raw = self.namespace().inner();
         let stored = self.stored_manifest_progress();
+        // An object stored after the listing took the log's names is
+        // registered by now.
+        let unannounced = match &outcome {
+            Ok(ObjectDeleteDone::LongTermSwept(Ok(swept))) => swept
+                .unannounced
+                .iter()
+                .filter(|(start_offset, end_offset)| {
+                    self.long_term_object(*start_offset, *end_offset) == LongTermObject::Unannounced
+                })
+                .count(),
+            _ => 0,
+        };
         let deletes = &mut self.long_term_deletes;
         let Some((_, running, _scope)) = deletes.running.take() else {
             return 0;
@@ -417,11 +489,17 @@ where
                     deletes.dead.manifest_stored(stored, now);
                 }
                 deletes.swept_at = Some(now.as_micros());
-                deletes.unannounced = swept.unannounced;
+                deletes.unannounced = unannounced;
+                if unannounced > 0 {
+                    warn!(
+                        namespace_raw,
+                        unannounced, "found long-term objects that no registration names"
+                    );
+                }
                 debug!(
                     namespace_raw,
                     dead = swept.dead.len(),
-                    unannounced = swept.unannounced,
+                    unannounced,
                     queued = deletes.dead.queued(),
                     "listed the long-term objects of the partition"
                 );
@@ -462,17 +540,22 @@ where
         }
     }
 
-    /// The long-term segments that `command` removes from the log if it
-    /// applies, read before it does: the ones a replace holds between its
-    /// offsets, and the ones a trim finds at or below its own. Empty on a
-    /// replica that deletes nothing, and for any other command.
-    pub(crate) fn long_term_segments_at_stake(
+    /// The objects that `command` may make dead if it applies, read before
+    /// it does: the segments a replace holds between its offsets and the
+    /// ones a trim finds at or below its own, and for those two, a publish
+    /// and an expiry, the registered objects. Empty on a replica that
+    /// deletes nothing, and for any other command.
+    pub(crate) fn long_term_objects_at_stake(
         &self,
         command: MachineCommand<'_>,
     ) -> Vec<(u64, u64)> {
         if !self.deletes_long_term_objects() {
             return Vec::new();
         }
+        let registered = || {
+            self.long_term_log()
+                .map(|log| log.registrations().iter().map(ObjectRegistration::key))
+        };
         let (first_offset, last_offset, at_most) = match command.kind {
             REPLACE_SEGMENTS => match ReplaceSegments::try_from(command.payload) {
                 Ok(ReplaceSegments(merged)) => {
@@ -484,36 +567,34 @@ where
                 Ok(trim) => (0, trim.up_to_offset, usize::MAX),
                 Err(_) => return Vec::new(),
             },
+            PUBLISH_SEGMENT | EXPIRE_REGISTRATIONS => {
+                return registered().into_iter().flatten().collect();
+            }
             _ => return Vec::new(),
         };
         let segments = self.long_term_segments();
         let from = segments.partition_point(|segment| segment.start_offset < first_offset);
         let to = segments.partition_point(|segment| segment.end_offset <= last_offset);
-        segments
+        let removed = segments
             .get(from..to)
             .filter(|at_stake| at_stake.len() <= at_most)
-            .map_or_default(|at_stake| {
-                at_stake
-                    .iter()
-                    .map(|segment| (segment.start_offset, segment.end_offset))
-                    .collect()
-            })
+            .unwrap_or_default()
+            .iter()
+            .map(|segment| (segment.start_offset, segment.end_offset));
+        removed.chain(registered().into_iter().flatten()).collect()
     }
 
-    /// Queue the objects of the segments of `at_stake` that the command
-    /// removed, which makes them dead. They wait for a manifest of the log
-    /// as it is now.
+    /// Queue the objects of `at_stake` that the command made dead. They wait
+    /// for a manifest of the log as it is now.
     pub(crate) fn queue_dead_long_term_objects(&mut self, at_stake: &[(u64, u64)]) {
         if at_stake.is_empty() || !self.deletes_long_term_objects() {
             return;
         }
-        let segments = self.long_term_segments();
         let dead: Vec<(u64, u64)> = at_stake
             .iter()
             .copied()
             .filter(|(start_offset, end_offset)| {
-                LongTermObject::classify(segments, *start_offset, *end_offset)
-                    == LongTermObject::Dead
+                self.long_term_object(*start_offset, *end_offset) == LongTermObject::Dead
             })
             .collect();
         let died_at = self.long_term_progress();
@@ -563,11 +644,14 @@ fn micros(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::long_term::{LongTermLog, PUBLISH_SEGMENT, PublishSegment};
+    use crate::long_term::{
+        ExpireRegistrations, LongTermLog, ObjectRegistration, PUBLISH_SEGMENT, PublishSegment,
+        REGISTER_OBJECT, RegisterObject,
+    };
     use crate::state_machine::{Applied, PartitionStateMachine};
     use iggy_object_store::SEGMENT_HASH_LEN;
 
-    use LongTermObject::{Dead, Listed, Unannounced};
+    use LongTermObject::{Dead, Listed, Registered, Unannounced};
 
     fn at(micros: u64) -> IggyTimestamp {
         IggyTimestamp::from(micros)
@@ -694,14 +778,55 @@ mod tests {
         }
 
         fn apply(&mut self, kind: crate::state_machine::CommandKind, payload: &[u8]) {
+            assert_eq!(self.try_apply(kind, payload), Applied::Changed);
+        }
+
+        fn try_apply(
+            &mut self,
+            kind: crate::state_machine::CommandKind,
+            payload: &[u8],
+        ) -> Applied {
             self.op += 1;
-            let applied = self.log.apply(self.op, MachineCommand { kind, payload });
-            assert_eq!(applied, Applied::Changed);
+            self.log.apply(self.op, MachineCommand { kind, payload })
+        }
+
+        /// A run of two to five segments, `None` in a log of fewer than two.
+        fn run(&mut self) -> Option<&[ManifestSegment]> {
+            let count = u64::try_from(self.log.segments().len()).unwrap();
+            if count < 2 {
+                return None;
+            }
+            let first = self.below(count - 1);
+            let last = first + 1 + self.below((count - first - 1).min(4));
+            Some(
+                &self.log.segments()
+                    [usize::try_from(first).unwrap()..=usize::try_from(last).unwrap()],
+            )
+        }
+
+        /// The next segment, of up to four offsets. Half the time the one a
+        /// registration names, as the rewrite that registered it lists it.
+        fn next_end(&mut self) -> u64 {
+            let start_offset = self.log.next_start();
+            let registered: Vec<u64> = self
+                .log
+                .registrations()
+                .iter()
+                .filter(|registration| registration.start_offset == start_offset)
+                .map(|registration| registration.end_offset)
+                .collect();
+            match registered.len() {
+                0 => start_offset + self.below(4),
+                count if self.below(2) == 0 => {
+                    registered[usize::try_from(self.below(count as u64)).unwrap()]
+                }
+                _ => start_offset + self.below(4),
+            }
         }
 
         fn publish(&mut self) {
-            let start_offset = self.log.floor().map_or(0, |floor| floor + 1);
-            let end_offset = start_offset + self.below(4);
+            let start_offset = self.log.next_start();
+            let end_offset = self.next_end();
             if end_offset >= HISTORY_OFFSETS {
                 return;
             }
@@ -719,15 +844,9 @@ mod tests {
         }
 
         fn replace(&mut self) {
-            let segments = self.log.segments();
-            if segments.len() < 2 {
+            let Some(sources) = self.run() else {
                 return;
-            }
-            let count = u64::try_from(segments.len()).unwrap();
-            let first = self.below(count - 1);
-            let last = first + 1 + self.below((count - first - 1).min(4));
-            let sources = &self.log.segments()
-                [usize::try_from(first).unwrap()..=usize::try_from(last).unwrap()];
+            };
             let merged = sources[1..]
                 .iter()
                 .fold(sources[0], |merged, next| ManifestSegment {
@@ -740,7 +859,9 @@ mod tests {
                     ),
                     ..merged
                 });
-            self.apply(REPLACE_SEGMENTS, &ReplaceSegments(merged).encode());
+            let expired = self.expired(merged.start_offset, merged.end_offset);
+            let applied = self.try_apply(REPLACE_SEGMENTS, &ReplaceSegments(merged).encode());
+            assert_eq!(applied == Applied::Refused, expired);
         }
 
         fn trim(&mut self) {
@@ -748,11 +869,49 @@ mod tests {
             self.apply(TRIM_SEGMENTS, &TrimSegments { up_to_offset }.encode());
         }
 
+        /// A merge registers a run, and a rewrite the next segment.
+        fn register(&mut self) {
+            let (start_offset, end_offset) = if self.below(2) == 0 {
+                let Some(sources) = self.run() else {
+                    return;
+                };
+                (
+                    sources[0].start_offset,
+                    sources[sources.len() - 1].end_offset,
+                )
+            } else {
+                let start_offset = self.log.next_start();
+                (start_offset, start_offset + self.below(4))
+            };
+            let registration = ObjectRegistration {
+                start_offset,
+                end_offset,
+                registered_at: self.op,
+            };
+            let expired = self.expired(start_offset, end_offset);
+            let applied = self.try_apply(REGISTER_OBJECT, &RegisterObject(registration).encode());
+            assert_eq!(applied == Applied::Refused, expired);
+        }
+
+        fn expire(&mut self) {
+            let before = self.op.saturating_sub(self.below(16));
+            self.apply(
+                EXPIRE_REGISTRATIONS,
+                &ExpireRegistrations { before }.encode(),
+            );
+        }
+
+        fn expired(&self, start_offset: u64, end_offset: u64) -> bool {
+            self.log.expired().contains(&(start_offset, end_offset))
+        }
+
         fn step(&mut self) {
-            match self.below(8) {
+            match self.below(11) {
                 0..4 => self.publish(),
-                4..7 => self.replace(),
-                _ => self.trim(),
+                4..6 => self.replace(),
+                6 => self.trim(),
+                7..10 => self.register(),
+                _ => self.expire(),
             }
         }
     }
@@ -767,30 +926,41 @@ mod tests {
     /// The delete acts on the log as one primary saw it, which may be a
     /// state the group has moved past. So an object dead in one state must
     /// be dead in every later one, whatever commands came between, or a
-    /// delete could remove what a later manifest lists.
+    /// delete could remove what a later manifest lists. An expired
+    /// registration makes its object dead as a replace or a trim does.
     #[test]
-    fn given_random_publish_replace_and_trim_histories_when_an_object_is_dead_should_stay_dead_in_every_later_state()
-     {
+    fn given_random_histories_when_an_object_is_dead_should_stay_dead_in_every_later_state() {
+        let mut expired_in_some = false;
         for seed in 1..=200 {
             let mut history = History::new(seed);
             let mut dead_before: Vec<(u64, u64)> = Vec::new();
             for step in 0..64 {
                 let before = history.spans();
+                let registered_before: Vec<(u64, u64)> = history
+                    .log
+                    .registrations()
+                    .iter()
+                    .map(ObjectRegistration::key)
+                    .collect();
                 history.step();
+                let log = &history.log;
                 let segments = history.spans();
 
                 for (start_offset, end_offset) in &dead_before {
                     assert_eq!(
-                        LongTermObject::classify(&segments, *start_offset, *end_offset),
+                        log.classify(*start_offset, *end_offset),
                         Dead,
                         "seed {seed} step {step}: {start_offset}..={end_offset} was dead \
-                         and is not in {segments:?}"
+                         and is not in {log:?}"
                     );
                 }
                 for (start_offset, end_offset) in &segments {
+                    assert_eq!(log.classify(*start_offset, *end_offset), Listed);
+                }
+                for registration in log.registrations() {
                     assert_eq!(
-                        LongTermObject::classify(&segments, *start_offset, *end_offset),
-                        Listed
+                        log.classify(registration.start_offset, registration.end_offset),
+                        Registered
                     );
                 }
                 // What a command removed is what the primary queues on its
@@ -798,15 +968,34 @@ mod tests {
                 for (start_offset, end_offset) in &before {
                     if !segments.contains(&(*start_offset, *end_offset)) {
                         assert_eq!(
-                            LongTermObject::classify(&segments, *start_offset, *end_offset),
+                            log.classify(*start_offset, *end_offset),
                             Dead,
                             "seed {seed} step {step}: removed {start_offset}..={end_offset}"
                         );
                     }
                 }
+                for (start_offset, end_offset) in registered_before {
+                    let now = log.classify(start_offset, end_offset);
+                    assert!(
+                        matches!(now, Registered | Listed | Dead),
+                        "seed {seed} step {step}: registered {start_offset}..={end_offset} \
+                         is {now:?}"
+                    );
+                }
+                // A restore refuses what no history reaches, and takes every
+                // state one does.
+                let mut snapshot = Vec::new();
+                log.snapshot_into(&mut snapshot);
+                let mut restored = LongTermLog::default();
+                assert!(
+                    restored.restore(&snapshot).is_ok(),
+                    "seed {seed} step {step}: {log:?}"
+                );
+                assert_eq!(&restored, log);
+                expired_in_some |= !log.expired().is_empty();
                 dead_before = every_object()
                     .filter(|(start_offset, end_offset)| {
-                        LongTermObject::classify(&segments, *start_offset, *end_offset) == Dead
+                        log.classify(*start_offset, *end_offset) == Dead
                     })
                     .collect();
             }
@@ -815,28 +1004,61 @@ mod tests {
                 "seed {seed}: the history replaced or trimmed something"
             );
         }
+        assert!(expired_in_some, "some history expired a registration");
     }
 
     #[test]
-    fn given_listed_objects_when_sorting_a_listing_should_report_the_dead_and_count_the_unannounced()
+    fn given_registered_and_expired_objects_when_classifying_should_keep_the_registered_and_take_the_expired_as_dead()
      {
-        let segments = [(10, 19), (20, 29)];
+        let segments = [(0, 9), (10, 19), (20, 29), (30, 39)];
+        let registered = [(0, 19)];
+        let expired = [(20, 39)];
+        let named = |start_offset, end_offset| {
+            LongTermObject::named(&segments, &registered, &expired, start_offset, end_offset)
+        };
+
+        assert_eq!(named(0, 19), Registered);
+        assert_eq!(named(20, 39), Dead, "no later state lists it");
+        assert_eq!(named(0, 39), Unannounced, "a run nobody registered");
+        assert_eq!(named(10, 19), Listed);
+        assert_eq!(named(40, 49), Unannounced, "what the next publish stores");
+        assert_eq!(named(5, 19), Dead);
+    }
+
+    fn names(segments: &[(u64, u64)]) -> LongTermNames {
+        LongTermNames {
+            segments: segments.to_vec(),
+            ..LongTermNames::default()
+        }
+    }
+
+    #[test]
+    fn given_listed_objects_when_sorting_a_listing_should_report_the_dead_and_count_the_others() {
+        let log = LongTermNames {
+            segments: vec![(10, 19), (20, 29), (30, 39), (40, 49)],
+            registered: vec![(10, 29)],
+            expired: vec![(30, 49)],
+        };
         let listed = [
             (0, 9),
             (10, 14),
             (10, 19),
             (10, 29),
+            (10, 39),
             (15, 19),
             (20, 29),
-            (30, 39),
+            (30, 49),
+            (50, 59),
+            (60, 69),
         ];
 
-        let swept = SweptLongTerm::classified(listed, &segments);
+        let swept = SweptLongTerm::classified(listed, &log);
 
-        assert_eq!(swept.dead, [(0, 9), (10, 14), (15, 19)]);
+        assert_eq!(swept.dead, [(0, 9), (10, 14), (15, 19), (30, 49)]);
         assert_eq!(
-            swept.unannounced, 2,
-            "the replace output and the next segment"
+            swept.unannounced,
+            [(10, 39), (50, 59), (60, 69)],
+            "a run, the next segment and an object past it, none registered"
         );
     }
 
@@ -847,7 +1069,7 @@ mod tests {
         let segments = [(dead_max + 10, dead_max + 19)];
         let listed = (0..dead_max + 5).map(|offset| (offset, offset));
 
-        let swept = SweptLongTerm::classified(listed, &segments);
+        let swept = SweptLongTerm::classified(listed, &names(&segments));
 
         assert_eq!(swept.dead.len(), LONG_TERM_SWEEP_DEAD_MAX);
         assert_eq!(swept.dead.last(), Some(&(dead_max - 1, dead_max - 1)));

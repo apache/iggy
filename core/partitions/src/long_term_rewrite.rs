@@ -31,7 +31,15 @@
 //! lost primacy, is another object when it ends elsewhere. The long-term log
 //! lists the one whose command commits. One that ends at the same offset
 //! holds the same bytes, and the rewrite takes it as its own.
+//!
+//! The long-term log holds the registration of a segment before its object
+//! is stored. A plan reads the headers of the batches to find where the
+//! segment ends, the primary commits the registration of those offsets, and
+//! the rewrite that follows stores exactly them. The object of a primary
+//! that lost primacy before its command committed is then deleted once its
+//! registration expires, whatever the next primary stores.
 
+use std::cell::Cell;
 use std::future;
 use std::io;
 use std::rc::Rc;
@@ -42,6 +50,7 @@ use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::placement::PlacedBatch;
+use iggy_common::IggyTimestamp;
 use iggy_object_store::{
     KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, SegmentObject,
     TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
@@ -54,11 +63,12 @@ use crate::IggyPartition;
 use crate::Partition;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
-use crate::long_term::LONG_TERM_SEGMENTS_MAX;
+use crate::long_term::{LONG_TERM_SEGMENTS_MAX, LongTermLog, ObjectRegistration, REGISTER_OBJECT};
 use crate::placed_read::{BatchPiece, PlacedReadPlan};
 use crate::poll_plan::DiskFault;
 use crate::segment_chain::{HashSource, SegmentHasher, SegmentRecord};
 use crate::segment_upload::{UploadError, memory_body, store_segment};
+use crate::state_machine::CommandKind;
 use crate::state_transfer::ChunkHasher;
 
 /// Bytes of batches at which a rewrite ends its segment. The rewrite holds
@@ -73,9 +83,39 @@ pub struct SegmentRewrite {
     pub prefix: ObjectPrefix,
     /// The first offset of the segment: the long-term floor plus one.
     pub start_offset: u64,
+    /// The last offset of the segment, where its plan found it ends.
+    pub up_to: u64,
+    pub(crate) read: PlacedReadPlan,
+}
+
+/// The plan of a rewrite, as the partition's owner captured it: where the
+/// segment ends, found from the headers of its batches alone.
+pub struct SegmentPlan {
+    /// The first offset of the segment: the long-term floor plus one.
+    pub start_offset: u64,
     /// The last offset the segment may hold: the commit point.
     pub up_to: u64,
     pub(crate) read: PlacedReadPlan,
+}
+
+/// The offsets of the segment a plan found, which name its object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedSegment {
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
+/// What a rewrite pass over a partition starts.
+pub enum RewriteStart {
+    /// Run this plan off the pump, and hand its result to
+    /// [`IggyPartition::finish_segment_plan`] with the number.
+    Plan(u64, SegmentPlan),
+    /// Commit this registration of the segment the rewrite stores. The pass
+    /// after it commits starts the rewrite.
+    Register(ObjectRegistration),
+    /// Run this rewrite under the scope of the token, and hand its result to
+    /// [`IggyPartition::finish_segment_rewrite`] with the number.
+    Rewrite(u64, SegmentRewrite, TierScopeToken),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +126,10 @@ pub enum RewriteError {
     /// The batches read are not the run of offsets the segment needs.
     #[error("the batches read from offset {expected} continue at {found:?}")]
     Gap { expected: u64, found: Option<u64> },
+    /// The batches end elsewhere than the registered segment does, so
+    /// nothing is stored under offsets the log may never list.
+    #[error("the batches end at offset {end_offset}, not where the registered segment ends")]
+    Unregistered { end_offset: u64 },
     #[error(transparent)]
     Upload(UploadError),
 }
@@ -154,17 +198,13 @@ impl SegmentRewrite {
         store: &S,
         layout: &KeyLayout,
     ) -> Result<ManifestSegment, RewriteError> {
-        let query = MessageLookup::Offset {
-            offset: self.start_offset,
-            count: u32::MAX,
-            ceiling: self.up_to,
-        };
-        let placed = self
-            .read
-            .placed_batches(query, LONG_TERM_SEGMENT_BYTES)
-            .await
-            .map_err(RewriteError::Read)?;
+        let placed = placed_batches(&self.read, self.start_offset, self.up_to).await?;
         let built = BuiltSegment::of(self.start_offset, &placed)?;
+        if built.end_offset != self.up_to {
+            return Err(RewriteError::Unregistered {
+                end_offset: built.end_offset,
+            });
+        }
         let mut log = SegmentBytes::<SegmentHasher>::sized(built.size)?;
         self.read
             .read_blobs(&placed, |piece| log.push(piece))
@@ -219,6 +259,41 @@ impl SegmentRewrite {
             hash: record.hash,
         })
     }
+}
+
+impl SegmentPlan {
+    /// Read the headers of the batches from the long-term floor on, and
+    /// find where the segment of the rewrite ends. The messages are not
+    /// read.
+    ///
+    /// # Errors
+    /// Returns an error when the batches cannot be read, or leave a gap.
+    pub async fn run(self) -> Result<PlannedSegment, RewriteError> {
+        let placed = placed_batches(&self.read, self.start_offset, self.up_to).await?;
+        let built = BuiltSegment::of(self.start_offset, &placed)?;
+        Ok(PlannedSegment {
+            start_offset: self.start_offset,
+            end_offset: built.end_offset,
+        })
+    }
+}
+
+/// The batches of a segment from `start_offset` on, up to `up_to` or
+/// [`LONG_TERM_SEGMENT_BYTES`], whichever comes first. The same batches for
+/// the plan and for the rewrite of the offsets it found.
+async fn placed_batches(
+    read: &PlacedReadPlan,
+    start_offset: u64,
+    up_to: u64,
+) -> Result<Vec<PlacedBatch>, RewriteError> {
+    let query = MessageLookup::Offset {
+        offset: start_offset,
+        count: u32::MAX,
+        ceiling: up_to,
+    };
+    read.placed_batches(query, LONG_TERM_SEGMENT_BYTES)
+        .await
+        .map_err(RewriteError::Read)
 }
 
 /// What a run of whole batches makes as one segment.
@@ -379,10 +454,16 @@ pub struct LongTermRewrites {
     /// A segment the store holds that the long-term log does not yet. Its
     /// command is sent again until the log ends with it.
     stored: Option<ManifestSegment>,
-    /// The commit point the last rewrite started at.
+    /// The segment this view's last plan found, registered at the time it
+    /// carries. Its rewrite stores it once the log holds the registration.
+    planned: Option<ObjectRegistration>,
+    /// The commit point the last plan started at.
     committed_at_start: u64,
-    /// Number of the last rewrite this partition started.
+    /// Number of the last plan or rewrite this partition started.
     jobs: u64,
+    /// Whether a registration committed on this primary since the last
+    /// call to [`IggyPartition::take_long_term_registered`].
+    registered: Cell<bool>,
 }
 
 /// Bytes of the batches a partition committed above its long-term floor,
@@ -467,17 +548,22 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    /// Start the rewrite of the committed batches above the long-term
-    /// floor, when this replica is the primary of a partition that places
-    /// its batches, none is in flight, and a batch is there to rewrite. The
-    /// caller runs it under the returned scope and hands the result to
-    /// [`Self::finish_segment_rewrite`] with the returned number.
+    /// Take the next step of the rewrite of the committed batches above the
+    /// long-term floor, when this replica is the primary of a partition that
+    /// places its batches, none is in flight, and a batch is there to
+    /// rewrite.
+    ///
+    /// The first step is a plan, which finds where the segment ends. Its
+    /// registration is the next, and the caller commits it. The rewrite
+    /// starts once the log holds it, and stores exactly the offsets the plan
+    /// found. A log that takes no more registrations gets the rewrite without
+    /// one, so the floor still moves.
     ///
     /// A replica that is not the primary cancels the rewrite it started, so
     /// a pass over a demoted replica is what stops it.
-    pub fn begin_segment_rewrite(&mut self) -> Option<(u64, SegmentRewrite, TierScopeToken)> {
+    pub fn begin_segment_rewrite(&mut self) -> Option<RewriteStart> {
         if !self.places_batches() || !self.state_machines_current() {
-            self.long_term_rewrites = LongTermRewrites::default();
+            *self.long_term_rewrites = LongTermRewrites::default();
             return None;
         }
         // The log refuses a segment past this, and a stored segment whose
@@ -502,19 +588,78 @@ where
         }
         let start_offset = floor.map_or(0, |floor| floor.saturating_add(1));
         let committed = committed.filter(|committed| *committed >= start_offset)?;
-        let scope = TierScope::new();
-        let token = scope.token();
-        rewrites.jobs += 1;
-        let id = rewrites.jobs;
-        rewrites.running = Some((id, scope));
-        rewrites.committed_at_start = committed;
+        // A plan from below the floor named a segment that was published.
+        rewrites.planned = rewrites
+            .planned
+            .filter(|planned| planned.start_offset == start_offset);
+        let Some(planned) = rewrites.planned else {
+            let (id, _token) = self.start_rewrite_job(Some(committed));
+            let plan = SegmentPlan {
+                start_offset,
+                up_to: committed,
+                read: self.placed_read_plan(None),
+            };
+            return Some(RewriteStart::Plan(id, plan));
+        };
+        let log = self.long_term_log()?;
+        let stores = log
+            .registration(planned.start_offset, planned.end_offset)
+            .map_or_else(
+                || log.registrations_full(),
+                // A registration of an earlier view keeps the later time.
+                |held| held.registered_at >= planned.registered_at,
+            );
+        if !stores {
+            return Some(RewriteStart::Register(planned));
+        }
+        let (id, token) = self.start_rewrite_job(None);
         let rewrite = SegmentRewrite {
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             start_offset,
-            up_to: committed,
+            up_to: planned.end_offset,
             read: self.placed_read_plan(None),
         };
-        Some((id, rewrite, token))
+        Some(RewriteStart::Rewrite(id, rewrite, token))
+    }
+
+    /// Take the result of the plan numbered `id`, which ended at `now`, and
+    /// return the registration of the segment it found, which the caller
+    /// commits to the long-term log. A result of a plan this partition does
+    /// not wait for, or one that arrives after primacy moved, changes
+    /// nothing. A plan that failed is repeated by a later pass.
+    pub fn finish_segment_plan(
+        &mut self,
+        id: u64,
+        outcome: Result<PlannedSegment, RewriteError>,
+        now: IggyTimestamp,
+    ) -> Option<ObjectRegistration> {
+        if !self.awaits_rewrite_job(id) {
+            return None;
+        }
+        let next_start = self.long_term_log().map_or(0, LongTermLog::next_start);
+        let namespace_raw = self.namespace().inner();
+        let rewrites = &mut self.long_term_rewrites;
+        rewrites.running = None;
+        match outcome {
+            Ok(planned) if planned.start_offset == next_start => {
+                let registration = ObjectRegistration {
+                    start_offset: planned.start_offset,
+                    end_offset: planned.end_offset,
+                    registered_at: now.as_micros(),
+                };
+                rewrites.planned = Some(registration);
+                Some(registration)
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(
+                    namespace_raw,
+                    %error,
+                    "finding where the partition's next long-term segment ends failed and is tried again"
+                );
+                None
+            }
+        }
     }
 
     /// Take the result of the rewrite numbered `id`, and return the segment
@@ -527,18 +672,7 @@ where
         id: u64,
         outcome: RewriteOutcome,
     ) -> Option<ManifestSegment> {
-        let awaited = self
-            .long_term_rewrites
-            .running
-            .as_ref()
-            .is_some_and(|(running, _)| *running == id);
-        if !awaited {
-            return None;
-        }
-        if !self.state_machines_current()
-            || self.long_term_rewrites.view != Some(self.consensus().view())
-        {
-            self.long_term_rewrites = LongTermRewrites::default();
+        if !self.awaits_rewrite_job(id) {
             return None;
         }
         let namespace_raw = self.namespace().inner();
@@ -557,6 +691,11 @@ where
                 Some(segment)
             }
             Ok(Err(error)) => {
+                // The next pass plans again rather than repeat a rewrite
+                // that cannot store what was registered.
+                if matches!(error, RewriteError::Unregistered { .. }) {
+                    rewrites.planned = None;
+                }
                 warn!(
                     namespace_raw,
                     %error,
@@ -565,6 +704,20 @@ where
                 None
             }
             Err(TierJobCancelled) => None,
+        }
+    }
+
+    /// Whether a registration committed on this primary since the last
+    /// call. The rewrite or the merge that waited for it is due.
+    pub fn take_long_term_registered(&self) -> bool {
+        self.long_term_rewrites.registered.take()
+    }
+
+    /// A command of `kind` changed the long-term log. A registration leaves
+    /// the manifest as it is, so only this says that it committed.
+    pub(crate) fn note_long_term_registration(&self, kind: CommandKind) {
+        if kind == REGISTER_OBJECT && self.consensus().is_primary() {
+            self.long_term_rewrites.registered.set(true);
         }
     }
 
@@ -591,10 +744,10 @@ where
             .is_none_or(|stored| stored.end_offset >= rewrites.committed_at_start)
     }
 
-    /// Whether a rewrite this partition started has yet to hand its result
-    /// back.
+    /// Whether a plan or a rewrite this partition started has yet to hand
+    /// its result back.
     #[must_use]
-    pub const fn segment_rewrite_running(&self) -> bool {
+    pub fn segment_rewrite_running(&self) -> bool {
         self.long_term_rewrites.running.is_some()
     }
 
@@ -686,12 +839,47 @@ where
     fn long_term_rewrites_of_this_view(&mut self) -> &mut LongTermRewrites {
         let view = self.consensus().view();
         if self.long_term_rewrites.view != Some(view) {
-            self.long_term_rewrites = LongTermRewrites {
+            *self.long_term_rewrites = LongTermRewrites {
                 view: Some(view),
                 ..LongTermRewrites::default()
             };
         }
         &mut self.long_term_rewrites
+    }
+
+    /// Number the next plan or rewrite and take it as in flight. A plan
+    /// also notes the commit point it starts at.
+    fn start_rewrite_job(&mut self, committed: Option<u64>) -> (u64, TierScopeToken) {
+        let scope = TierScope::new();
+        let token = scope.token();
+        let rewrites = &mut self.long_term_rewrites;
+        rewrites.jobs += 1;
+        rewrites.running = Some((rewrites.jobs, scope));
+        if let Some(committed) = committed {
+            rewrites.committed_at_start = committed;
+        }
+        (rewrites.jobs, token)
+    }
+
+    /// Whether the plan or the rewrite numbered `id` is the one in flight,
+    /// in the view that started it. A result that arrives after primacy
+    /// moved drops what the view kept.
+    fn awaits_rewrite_job(&mut self, id: u64) -> bool {
+        let awaited = self
+            .long_term_rewrites
+            .running
+            .as_ref()
+            .is_some_and(|(running, _)| *running == id);
+        if !awaited {
+            return false;
+        }
+        if !self.state_machines_current()
+            || self.long_term_rewrites.view != Some(self.consensus().view())
+        {
+            *self.long_term_rewrites = LongTermRewrites::default();
+            return false;
+        }
+        true
     }
 }
 

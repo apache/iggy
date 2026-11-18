@@ -1104,20 +1104,121 @@ pub(super) async fn placing_primary_with(
     (directory, partition)
 }
 
-/// One pass: start a rewrite, run it, hand its result back, and commit the
-/// segment it stored to the long-term log as op `op`.
+/// One pass: plan a rewrite and register what it found as op `op`, run the
+/// rewrite, hand its result back, and commit the segment it stored to the
+/// long-term log as op `op + 1`.
 async fn rewrite_pass(
     partition: &mut IggyPartition<IggyMessageBus>,
     writer: &MemoryWriter,
     op: u64,
 ) -> Option<iggy_object_store::ManifestSegment> {
     use crate::LongTermWriter;
-    let (id, rewrite, scope) = partition.begin_segment_rewrite()?;
+    let (id, rewrite, scope) =
+        Box::pin(begin_registered_rewrite(partition, Registering::AsOp(op))).await?;
     let outcome = writer.write(rewrite, scope).await;
     let segment = partition.finish_segment_rewrite(id, outcome)?;
     assert_eq!(partition.unpublished_segment(), Some(segment));
-    commit_published_segment(partition, &segment, op);
+    commit_published_segment(partition, &segment, op + 1);
     Some(segment)
+}
+
+/// How a test commits the registration of the segment a rewrite stores.
+#[derive(Clone, Copy)]
+pub(super) enum Registering {
+    /// Applied to the machines straight away, as this op.
+    AsOp(u64),
+    /// Through the primary's request path, as the shard sends it.
+    Committed,
+}
+
+/// Commit `registration` to the long-term log.
+pub(super) async fn register_object(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    registration: &crate::long_term::ObjectRegistration,
+    registering: Registering,
+) {
+    match registering {
+        Registering::AsOp(op) => {
+            let payload = crate::long_term::RegisterObject(*registration).encode();
+            let applied = partition
+                .state_machines
+                .apply(
+                    op,
+                    crate::state_machine::MachineCommand {
+                        kind: crate::long_term::REGISTER_OBJECT,
+                        payload: &payload,
+                    },
+                )
+                .unwrap();
+            assert_eq!(applied, crate::state_machine::Applied::Changed);
+        }
+        Registering::Committed => {
+            let request = partition.register_object_request(registration, 90).unwrap();
+            Box::pin(commit_long_term_request(partition, request, false)).await;
+        }
+    }
+}
+
+/// Plan the next rewrite, register the segment the plan found, and start
+/// the rewrite that the registration lets through. `None` when the
+/// partition starts nothing.
+pub(super) async fn begin_registered_rewrite(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    registering: Registering,
+) -> Option<(
+    u64,
+    crate::SegmentRewrite,
+    iggy_object_store::TierScopeToken,
+)> {
+    for _ in 0..3 {
+        match partition.begin_segment_rewrite()? {
+            crate::RewriteStart::Plan(id, plan) => {
+                let outcome = plan.run().await;
+                partition.finish_segment_plan(id, outcome, IggyTimestamp::now())?;
+            }
+            crate::RewriteStart::Register(registration) => {
+                Box::pin(register_object(partition, &registration, registering)).await;
+            }
+            crate::RewriteStart::Rewrite(id, rewrite, scope) => return Some((id, rewrite, scope)),
+        }
+    }
+    panic!("a plan and its registration start the rewrite");
+}
+
+/// Plan the next rewrite as if it stopped at `up_to`, as the byte cap stops
+/// one, and register the segment it found.
+pub(super) async fn plan_up_to(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    up_to: u64,
+    registering: Registering,
+) {
+    let Some(crate::RewriteStart::Plan(id, mut plan)) = partition.begin_segment_rewrite() else {
+        panic!("a pass without a plan starts one");
+    };
+    plan.up_to = up_to;
+    let outcome = plan.run().await;
+    let registration = partition
+        .finish_segment_plan(id, outcome, IggyTimestamp::now())
+        .unwrap();
+    Box::pin(register_object(partition, &registration, registering)).await;
+}
+
+/// Store the segment of the batches above the long-term floor up to
+/// `up_to`, registered through the request path. Its command has yet to
+/// commit.
+pub(super) async fn store_segment_up_to(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    store: &Rc<iggy_object_store::MemoryStore>,
+    up_to: u64,
+) -> iggy_object_store::ManifestSegment {
+    use crate::LongTermWriter;
+    Box::pin(plan_up_to(partition, up_to, Registering::Committed)).await;
+    let (id, rewrite, scope) =
+        Box::pin(begin_registered_rewrite(partition, Registering::Committed))
+            .await
+            .unwrap();
+    let outcome = writer(store).write(rewrite, scope).await;
+    partition.finish_segment_rewrite(id, outcome).unwrap()
 }
 
 /// Commit the command of `segment` to the long-term log as op `op`.
@@ -1226,7 +1327,7 @@ async fn given_batches_committed_after_a_rewrite_when_rewriting_again_should_con
     assert_eq!((first.start_offset, first.end_offset), (0, 2));
 
     Box::pin(commit_records(&mut partition, 4, &placed[3..])).await;
-    let second = Box::pin(rewrite_pass(&mut partition, &writer, 101))
+    let second = Box::pin(rewrite_pass(&mut partition, &writer, 102))
         .await
         .unwrap();
 
@@ -1244,7 +1345,12 @@ async fn given_a_stored_segment_whose_command_is_not_committed_when_a_pass_runs_
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
     let writer = writer(&store);
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::AsOp(100),
+    ))
+    .await
+    .unwrap();
     assert!(partition.begin_segment_rewrite().is_none(), "one at a time");
     let outcome = writer.write(rewrite, scope).await;
 
@@ -1286,7 +1392,12 @@ async fn given_batches_that_cannot_be_read_when_rewriting_should_store_nothing_a
     let store = Rc::new(iggy_object_store::MemoryStore::new());
     let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
     let writer = writer(&store);
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::AsOp(100),
+    ))
+    .await
+    .unwrap();
 
     let outcome = writer.write(rewrite, scope).await;
 
@@ -1305,7 +1416,12 @@ async fn store_segment_of_a_deposed_primary(
 ) {
     use crate::LongTermWriter;
     let (_directory, mut partition) = Box::pin(placing_primary_with(placed, store)).await;
-    let (_, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (_, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::AsOp(100),
+    ))
+    .await
+    .unwrap();
     writer(store).write(rewrite, scope).await.unwrap().unwrap();
 }
 
@@ -1639,16 +1755,12 @@ pub(super) async fn leader_with_three_long_term_segments() -> (
     IggyPartition<IggyMessageBus>,
     [iggy_object_store::ManifestSegment; 3],
 ) {
-    use crate::LongTermWriter;
     let (_whole, placed, object) = whole_and_placed(4);
     let store = Box::pin(store_with(object)).await;
     let (directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
     let mut segments = Vec::new();
     for (request, up_to) in (1..).zip([0, 1, 3]) {
-        let (id, mut rewrite, scope) = partition.begin_segment_rewrite().unwrap();
-        rewrite.up_to = up_to;
-        let outcome = writer(&store).write(rewrite, scope).await;
-        let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
+        let segment = Box::pin(store_segment_up_to(&mut partition, &store, up_to)).await;
         let command = partition
             .publish_segment_request(&segment, request)
             .unwrap();
@@ -1856,6 +1968,51 @@ async fn given_a_trimmed_long_term_log_when_building_the_manifest_should_carry_t
     );
 }
 
+/// A registration leaves the manifest as it is, and the rewrite that waits
+/// for it is due once it commits. Only the primary rewrites.
+#[compio::test]
+async fn given_a_registration_when_it_commits_should_note_it_on_the_primary_alone() {
+    let (_whole, placed, object) = whole_and_placed(2);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+    let registration = crate::long_term::ObjectRegistration {
+        start_offset: 0,
+        end_offset: 1,
+        registered_at: 1,
+    };
+    assert!(!partition.take_long_term_registered());
+
+    Box::pin(register_object(
+        &mut partition,
+        &registration,
+        Registering::Committed,
+    ))
+    .await;
+
+    assert!(partition.take_long_term_registered());
+    assert!(!partition.take_long_term_registered(), "taken once");
+    assert!(
+        !partition.take_long_term_changed(),
+        "no manifest to publish"
+    );
+    let request = partition
+        .register_object_request(
+            &crate::long_term::ObjectRegistration {
+                end_offset: 0,
+                ..registration
+            },
+            91,
+        )
+        .unwrap();
+    Box::pin(commit_long_term_request(&mut partition, request, true)).await;
+    assert!(!partition.take_long_term_registered());
+    assert_eq!(
+        partition.long_term_log().unwrap().registrations().len(),
+        2,
+        "a backup applies it all the same"
+    );
+}
+
 /// The primary publishes the manifest and rewrites, so it is the one that
 /// learns of a commit to the long-term log.
 #[compio::test]
@@ -1864,7 +2021,12 @@ async fn given_a_primary_when_the_command_of_a_segment_commits_should_note_that_
     let (_whole, placed, object) = whole_and_placed(2);
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .unwrap();
     let outcome = writer(&store).write(rewrite, scope).await;
     let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
     assert!(!partition.take_long_term_changed());
@@ -1882,7 +2044,12 @@ async fn given_a_backup_when_the_command_of_a_segment_commits_should_not_note_th
     let (_whole, placed, object) = whole_and_placed(2);
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .unwrap();
     let outcome = writer(&store).write(rewrite, scope).await;
     let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
 
@@ -1944,8 +2111,10 @@ async fn given_a_full_long_term_log_when_a_pass_runs_should_start_no_rewrite_unt
         )
         .unwrap();
     assert_eq!(applied, crate::state_machine::Applied::Changed);
-    let (_, rewrite, _) = partition.begin_segment_rewrite().unwrap();
-    assert_eq!((rewrite.start_offset, rewrite.up_to), (segments, segments));
+    let Some(crate::RewriteStart::Plan(_, plan)) = partition.begin_segment_rewrite() else {
+        panic!("a pass without a plan starts one");
+    };
+    assert_eq!((plan.start_offset, plan.up_to), (segments, segments));
 }
 
 /// A segment that ends before the commit point its rewrite started at has
@@ -1957,17 +2126,35 @@ async fn given_a_segment_that_ends_before_the_commit_point_when_stored_should_sa
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
     let writer = writer(&store);
-    let (id, mut rewrite, scope) = partition.begin_segment_rewrite().unwrap();
-    assert_eq!(rewrite.up_to, 3);
+    let Some(crate::RewriteStart::Plan(id, mut plan)) = partition.begin_segment_rewrite() else {
+        panic!("a pass without a plan starts one");
+    };
+    assert_eq!(plan.up_to, 3);
     // Stands in for the byte cap, which no test reaches.
-    rewrite.up_to = 1;
+    plan.up_to = 1;
+    let outcome = plan.run().await;
+    let registration = partition
+        .finish_segment_plan(id, outcome, IggyTimestamp::now())
+        .unwrap();
+    Box::pin(register_object(
+        &mut partition,
+        &registration,
+        Registering::AsOp(100),
+    ))
+    .await;
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::AsOp(100),
+    ))
+    .await
+    .unwrap();
     let outcome = writer.write(rewrite, scope).await;
     let first = partition.finish_segment_rewrite(id, outcome).unwrap();
     assert_eq!(first.end_offset, 1);
     assert!(!partition.stored_segment_reached_commit());
-    commit_published_segment(&mut partition, &first, 100);
+    commit_published_segment(&mut partition, &first, 101);
 
-    let second = Box::pin(rewrite_pass(&mut partition, &writer, 101))
+    let second = Box::pin(rewrite_pass(&mut partition, &writer, 102))
         .await
         .unwrap();
     assert_eq!(second.end_offset, 3);
@@ -1989,7 +2176,7 @@ async fn given_a_segment_published_during_a_manifest_publish_when_it_ends_should
     let (id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
     assert_eq!(manifest.floor, Some(1));
     Box::pin(commit_records(&mut partition, 3, &placed[2..])).await;
-    Box::pin(rewrite_pass(&mut partition, &writer, 101)).await;
+    Box::pin(rewrite_pass(&mut partition, &writer, 102)).await;
     assert!(
         partition.begin_manifest_publish(now).is_none(),
         "one at a time"
@@ -2081,7 +2268,12 @@ async fn given_committed_placed_batches_when_rewriting_should_write_no_file_of_i
         iggy_object_store::InlineTierExecutor::new(watched.clone()),
         super::remote_poll::layout(),
     );
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::AsOp(100),
+    ))
+    .await
+    .unwrap();
 
     let outcome = writer.write(rewrite, scope).await;
 
@@ -2257,7 +2449,7 @@ async fn given_rewritten_batches_when_reading_the_bucket_alone_should_find_every
     let (_, unchanged, _) = Box::pin(read_from_the_bucket_alone(&store)).await;
     assert_eq!(unchanged, batches);
 
-    Box::pin(rewrite_pass(&mut partition, &writer, 101))
+    Box::pin(rewrite_pass(&mut partition, &writer, 102))
         .await
         .unwrap();
     Box::pin(publish_manifest(&mut partition, &store)).await;
@@ -2332,7 +2524,12 @@ async fn given_a_rewrite_in_flight_when_primacy_moves_should_drop_its_result_and
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
     let writer = writer(&store);
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .unwrap();
     let outcome = writer.write(rewrite, scope).await;
     let stored = *outcome.as_ref().unwrap().as_ref().unwrap();
 
@@ -2346,7 +2543,7 @@ async fn given_a_rewrite_in_flight_when_primacy_moves_should_drop_its_result_and
 
     regain_primacy(&mut partition);
     let mut published = None;
-    for op in 100..103 {
+    for op in (100..106).step_by(2) {
         published = Box::pin(rewrite_pass(&mut partition, &writer, op)).await;
         if published.is_some() {
             break;
@@ -2370,7 +2567,12 @@ async fn given_a_stored_segment_without_its_command_when_primacy_moves_and_retur
     let store = Box::pin(store_with(object)).await;
     let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
     let writer = writer(&store);
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .unwrap();
     let outcome = writer.write(rewrite, scope).await;
     let stored = partition.finish_segment_rewrite(id, outcome).unwrap();
     assert_eq!(partition.unpublished_segment(), Some(stored));
@@ -2389,7 +2591,7 @@ async fn given_a_stored_segment_without_its_command_when_primacy_moves_and_retur
     );
 
     let mut published = None;
-    for op in 100..103 {
+    for op in (100..106).step_by(2) {
         published = Box::pin(rewrite_pass(&mut partition, &writer, op)).await;
         if published.is_some() {
             break;
@@ -2564,10 +2766,16 @@ async fn given_a_counted_backlog_when_a_segment_commits_across_a_view_change_sho
         Box::pin(count_backlog(&mut partition)).await,
         Some(batch_bytes(&whole[..2]))
     );
-    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let (id, rewrite, scope) = Box::pin(begin_registered_rewrite(
+        &mut partition,
+        Registering::Committed,
+    ))
+    .await
+    .unwrap();
     let outcome = writer(&store).write(rewrite, scope).await;
     let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
-    Box::pin(commit_records(&mut partition, 3, &placed[2..])).await;
+    // The registration committed as op 3.
+    Box::pin(commit_records(&mut partition, 4, &placed[2..])).await;
     assert_eq!(partition.long_term_backlog(), Some(batch_bytes(&whole)));
 
     Box::pin(commit_segment_command(&mut partition, &segment, true)).await;
