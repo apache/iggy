@@ -148,6 +148,22 @@ func TestIggyError_TieredReadFailed(t *testing.T) {
 	}
 }
 
+func TestIggyError_ReplyTooLarge(t *testing.T) {
+	err := ReplyTooLarge{}
+	if err.Code() != Code(97) || ReplyTooLargeCode != Code(97) {
+		t.Errorf("Code() = %v, ReplyTooLargeCode = %v, want 97", err.Code(), ReplyTooLargeCode)
+	}
+	if err.Error() != "the reply is larger than the reply size limit" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if ReplyTooLargeCode.String() != "ReplyTooLarge" {
+		t.Errorf("String() = %q", ReplyTooLargeCode.String())
+	}
+	if resolved := FromCode(Code(97)); !errors.Is(resolved, ErrReplyTooLarge) {
+		t.Errorf("FromCode(97) = %v, want ErrReplyTooLarge", resolved)
+	}
+}
+
 func TestFromCode_FallsBackToTheGenericError(t *testing.T) {
 	if resolved := FromCode(Code(0xFFFFFF)); !errors.Is(resolved, ErrError) {
 		t.Errorf("FromCode(unknown) = %v, want ErrError", resolved)

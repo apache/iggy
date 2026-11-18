@@ -1482,6 +1482,9 @@ fn given_state_when_paging_one_item_at_a_time_should_equal_one_page_in_group_and
     );
     let session = harness.register(CLIENT_A, ALICE);
     harness.join(CLIENT_A, session);
+    // A second member makes the walk continue inside the group of its cursor.
+    let second = harness.register(CLIENT_B, ALICE);
+    harness.join(CLIENT_B, second);
     harness.commit(
         ROOT_CALLER,
         Operation::CreatePersonalAccessToken,
@@ -1506,10 +1509,10 @@ fn given_state_when_paging_one_item_at_a_time_should_equal_one_page_in_group_and
     assert_eq!(count(WireMetadataChangeGroup::Topics), 1);
     assert_eq!(count(WireMetadataChangeGroup::Partitions), 1);
     assert_eq!(count(WireMetadataChangeGroup::ConsumerGroups), 2);
-    assert_eq!(count(WireMetadataChangeGroup::ConsumerGroupMembers), 1);
+    assert_eq!(count(WireMetadataChangeGroup::ConsumerGroupMembers), 2);
     assert_eq!(count(WireMetadataChangeGroup::Users), 2);
     assert_eq!(count(WireMetadataChangeGroup::PersonalAccessTokens), 1);
-    assert_eq!(count(WireMetadataChangeGroup::Sessions), 2);
+    assert_eq!(count(WireMetadataChangeGroup::Sessions), 3);
 }
 
 #[test]

@@ -435,6 +435,35 @@ Current pages need the parent groups of every selected group, for example `TOPIC
 
 A cursor's `toString()` is its `mc1_` text, which `MetadataChangeCursor.parse` reads back, so a mirror can store it. A query the rules refuse fails with an `IggyValidationException` for invalid command before anything is sent, and a record of a kind this SDK does not know arrives as `MetadataChangeBody.Unknown` or `MetadataChangeBody.UnknownJson`.
 
+### List Pages
+
+`getStreams`, `getTopics`, `getConsumerGroups` and `getUsers` return a whole list. Over TCP, each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. All pages share the sign-in and the request timeout of the call, so a new sign-in during the walk fails it. An entity that someone creates or deletes during the walk can appear or not appear. The walk fails with `IggyMalformedResponseException` when the server answers the page cursor it was sent.
+
+Over HTTP, they read the whole list in one reply. The server builds that reply from pages of 1,000 items, so it is not one consistent read either.
+
+`getStreamsPage`, `getTopicsPage`, `getPartitionsPage`, `getConsumerGroupsPage` and `getUsersPage` return one page. The page methods of streams, topics, consumer groups and users take a `NamedPageQuery`, which holds a `PageQuery` and an optional name. `getPartitionsPage` takes a `PageQuery`, which has no name. To read the next page, send the same query with the `next()` of the page as its cursor. A page can be empty and still have a `next()`.
+
+```java
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
+import org.apache.iggy.stream.StreamBase;
+
+NamedPageQuery query = new NamedPageQuery(PageQuery.builder().build());
+while (true) {
+    Page<StreamBase> page = client.streams().getStreamsPage(query);
+    page.items().forEach(stream -> System.out.println(stream.id() + " " + stream.name()));
+    if (page.next().isEmpty()) {
+        break;
+    }
+    query = query.withCursor(page.next().get());
+}
+```
+
+`order` selects `PageOrder.ID` or `PageOrder.CREATED`, and `descending` reverses it. The `name` of a `NamedPageQuery` keeps the entries whose name holds the text, case-sensitive. For example, `new NamedPageQuery(PageQuery.builder().build(), Optional.of("orders"))` reads the entries whose name holds `orders`.
+
+The client refuses a query that breaks the page rules with an `IggyValidationException` for invalid command, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with invalid command.
+
 ## Polling
 
 The SDK reads messages at three levels: a poll of one partition, a partition reader that reads many partitions in batches, and a consumer that hands over one message at a time. All three take `PollOptions`, whose `CommitPolicy` decides who stores the consumer offsets.
@@ -608,7 +637,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Replicated mutations serialize within their metadata or partition lane. If a sent mutation's

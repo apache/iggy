@@ -249,6 +249,11 @@ struct Args {
     /// Mean clog duration, in ticks (exponentially distributed).
     #[arg(long)]
     clog_duration_mean: Option<u64>,
+    /// Make every shard tick visit every partition, also the sleeping ones.
+    /// The run must print what the run without the flag prints: a sleeping
+    /// partition has nothing to do.
+    #[arg(long)]
+    visit_every_partition: bool,
 }
 
 /// Named network fault profile: one flag for "how hostile is the network", rather
@@ -878,6 +883,9 @@ fn main() {
     });
 
     let (mut sim, sim_clients, ns) = build_cluster(&args, seed, replicas, clients, network_opts);
+    if args.visit_every_partition {
+        sim.visit_every_partition();
+    }
 
     let mut options = WorkloadOptions::new(seed, replicas, vec![ns]);
     options.client_count = clients;
@@ -959,6 +967,7 @@ fn main() {
     }
 
     print_command_coverage(&sim);
+    println!("executor schedule: {:#018x}", sim.schedule_hash());
     println!("workload-fuzz: OK (seed={seed})");
 }
 

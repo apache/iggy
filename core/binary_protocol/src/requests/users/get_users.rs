@@ -17,37 +17,79 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode};
+use crate::primitives::page::{WirePageQuery, decode_trailing_page};
 use bytes::BytesMut;
 
-/// `GetUsers` request. Wire format: empty.
+/// `GetUsers` request: one page of the users.
+///
+/// Wire format: `[page]`
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetUsersRequest;
+pub struct GetUsersRequest {
+    pub page: WirePageQuery,
+}
 
 impl WireEncode for GetUsersRequest {
     fn encoded_size(&self) -> usize {
-        0
+        self.page.encoded_size()
     }
 
-    fn encode(&self, _buf: &mut BytesMut) {}
+    fn encode(&self, buf: &mut BytesMut) {
+        self.page.encode(buf);
+    }
 }
 
 impl WireDecode for GetUsersRequest {
-    fn decode(_buf: &[u8]) -> Result<(Self, usize), WireError> {
-        Ok((Self, 0))
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let (page, consumed) = decode_trailing_page(buf, 0)?;
+        Ok((Self { page }, consumed))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WireName;
+    use crate::primitives::page::{WirePageCursor, WirePageOrder};
 
     #[test]
-    fn roundtrip() {
-        let req = GetUsersRequest;
-        let bytes = req.to_bytes();
-        assert!(bytes.is_empty());
-        let (decoded, consumed) = GetUsersRequest::decode(&bytes).unwrap();
-        assert_eq!(consumed, 0);
-        assert_eq!(decoded, req);
+    fn given_a_page_when_round_tripping_should_keep_every_field() {
+        let request = GetUsersRequest {
+            page: WirePageQuery {
+                order: WirePageOrder::Created,
+                descending: true,
+                limit: 20,
+                cursor: Some(WirePageCursor::Created {
+                    created_at: 9,
+                    id: 4,
+                }),
+                name: Some(WireName::new("ord").unwrap()),
+            },
+        };
+        let bytes = request.to_bytes();
+        assert_eq!(bytes.len(), request.encoded_size());
+        assert_eq!(
+            GetUsersRequest::decode(&bytes).unwrap(),
+            (request, bytes.len())
+        );
+    }
+
+    #[test]
+    fn given_a_first_page_when_encoding_should_pin_the_bytes() {
+        let request = GetUsersRequest {
+            page: WirePageQuery::default(),
+        };
+        assert_eq!(&request.to_bytes()[..], &[0, 0, 100, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn given_no_page_or_bytes_after_it_when_decoding_should_refuse() {
+        assert!(GetUsersRequest::decode(&[]).is_err());
+        let mut bytes = GetUsersRequest {
+            page: WirePageQuery::default(),
+        }
+        .to_bytes()
+        .to_vec();
+        bytes.push(0);
+        assert!(GetUsersRequest::decode(&bytes).is_err());
     }
 }

@@ -1183,7 +1183,9 @@ mod tests {
     };
     use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
     use iggy_binary_protocol::responses::messages::{FetchMessagesResponse, FetchMessagesSection};
-    use iggy_binary_protocol::{Operation, ReplyHeader, WireConsumer, WireEncode, WireIdentifier};
+    use iggy_binary_protocol::{
+        MAX_RECORD_REPLY_SIZE, Operation, ReplyHeader, WireConsumer, WireEncode, WireIdentifier,
+    };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::{Aes256GcmEncryptor, PollingKind};
     use message_bus::MessageBus;
@@ -3546,6 +3548,7 @@ mod tests {
                     address: None,
                     metadata_watermark: 0,
                 },
+                MAX_RECORD_REPLY_SIZE,
             )
             .await;
         }

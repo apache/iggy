@@ -36,6 +36,8 @@ Commands:
           and stream ID based on the given count. [alias: c]
   delete  Delete partitions for the specified topic ID
           and stream ID based on the given count. [alias: d]
+  list    List partitions for the specified topic ID
+          and stream ID. [alias: l]
   help    Print this message or the help of the given subcommand(s)
 
 Options:

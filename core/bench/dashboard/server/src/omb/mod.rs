@@ -18,6 +18,7 @@
 //! OpenMessaging Benchmark (OMB) runs from `--omb-results-dir`. They have their own cache, watcher
 //! and endpoints, so they never mix with the iggy-bench runs.
 
+pub mod embed;
 mod loader;
 #[cfg(test)]
 pub(crate) mod test_fixtures;

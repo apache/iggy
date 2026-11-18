@@ -16,22 +16,24 @@
 // under the License.
 
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::wire_conversions::{identifier_to_wire, topics_from_wire};
+use crate::wire_conversions::{identifier_to_wire, page_from_wire};
 use crate::{
-    BinaryClient, DEFAULT_PARTITIONS_COUNT, Identifier, IggyError, Topic, TopicClient,
-    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    BinaryClient, DEFAULT_PARTITIONS_COUNT, Identifier, IggyError, NamedPageQuery, Page, Topic,
+    TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_TOPIC_CODE, DELETE_TOPIC_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
 };
+use iggy_binary_protocol::primitives::page::WirePageQuery;
 use iggy_binary_protocol::requests::system::ResourceTarget;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
 };
+use iggy_binary_protocol::responses::PageResponse;
+use iggy_binary_protocol::responses::streams::TopicResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
-use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> TopicClient for B {
@@ -61,22 +63,27 @@ impl<B: BinaryClient> TopicClient for B {
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
+        super::read_whole_list(self, |query| async move {
+            self.get_topics_page(stream_id, &query).await
+        })
+        .await
+    }
+
+    async fn get_topics_page(
+        &self,
+        stream_id: &Identifier,
+        query: &NamedPageQuery,
+    ) -> Result<Page<Topic>, IggyError> {
         fail_if_not_authenticated(self).await?;
-        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let request = GetTopicsRequest {
+            stream_id: identifier_to_wire(stream_id)?,
+            page: WirePageQuery::try_from(query)?,
+        };
         let response = self
-            .send_raw_with_response(
-                GET_TOPICS_CODE,
-                GetTopicsRequest {
-                    stream_id: wire_stream_id,
-                }
-                .to_bytes(),
-            )
+            .send_raw_with_response(GET_TOPICS_CODE, request.to_bytes())
             .await?;
-        if response.is_empty() {
-            return Ok(Vec::new());
-        }
-        let wire_resp = super::decode_response::<GetTopicsResponse>(&response)?;
-        Ok(topics_from_wire(wire_resp)?)
+        let page = super::decode_response::<PageResponse<TopicResponse>>(&response)?;
+        page_from_wire(page, Topic::try_from)
     }
 
     async fn create_topic(

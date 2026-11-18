@@ -26,6 +26,7 @@ using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Messages;
@@ -65,6 +66,58 @@ public sealed class PartitionReaderTests
 
     /// <summary>This many refusals in a row that a quick retry does not change stop a partition.</summary>
     private const int LastingRefusalsBeforeStop = 6;
+
+    [Theory]
+    [InlineData(false, 1077)]
+    [InlineData(true, 1)]
+    [InlineData(false, 1)]
+    public async Task given_message_frames_when_prefetching_should_count_headers_and_free_bytes_on_delivery(
+        bool headers, int payloadBytes)
+    {
+        const uint Budget = 128 * 1024;
+        const uint MaxBytes = 4096;
+        var userHeaders = Enumerable.Range(0, 4).ToDictionary(
+            index => HeaderKey.FromString($"key{index}"), _ => HeaderValue.FromBytes(new byte[255]));
+        const int HeaderBytes = 1076;
+        var frameBytes = BatchWireFormat.FRAME_HEADER_SIZE + payloadBytes + (headers ? HeaderBytes : 0);
+        byte[] Records(ulong offset)
+        {
+            Message[] messages = [new((UInt128)1, new byte[payloadBytes], headers ? userHeaders : null),
+                new((UInt128)2, new byte[payloadBytes], headers ? userHeaders : null)];
+            var buffer = new byte[4096];
+            var written = TcpContracts.CreateMessage(buffer, Stream, Topic, Apache.Iggy.Kinds.Partitioning.None(), messages);
+            var records = buffer[(sizeof(int) + BinaryPrimitives.ReadInt32LittleEndian(buffer))..written];
+            BinaryPrimitives.WriteUInt64LittleEndian(records.AsSpan(8), offset);
+            return records;
+        }
+
+        using var cluster = new ReaderCluster(1)
+        {
+            Limit = 4000,
+            ReportsHead = true,
+            CountLimited = true,
+            FetchRecords = Records
+        };
+        using var client = await cluster.ConnectAsync();
+        await using var reader = await client.Reader(Stream, Topic, Consumer.New(4))
+            .WithPartitions(0).WithStart(PollingStrategy.Offset(0))
+            .WithOptions(new PollOptions
+            {
+                Count = 2,
+                MaxBytes = MaxBytes,
+                MaxWait = TimeSpan.FromMilliseconds(100),
+                Commit = CommitPolicy.Manual
+            })
+            .WithPrefetch(Budget, 4000).BuildAsync(Token);
+
+        await UntilAsync(() => cluster.Fetches.Count * 2 * frameBytes >= Budget - MaxBytes);
+        await Task.Delay(SettleWindow, Token);
+        Assert.True(cluster.Fetches.Count * 2 * frameBytes <= Budget + 2 * MaxBytes,
+            "Queued message frames exceeded the byte budget.");
+        var reads = cluster.Fetches.Count;
+        var delivered = await ReadAsync(reader, reads + 1);
+        Assert.Equal(headers ? HeaderBytes : 0, delivered[0].Messages[0].Header.UserHeadersLength);
+    }
 
     [Fact]
     public async Task given_partitions_of_two_primaries_when_reading_should_fetch_each_primary_on_its_own()

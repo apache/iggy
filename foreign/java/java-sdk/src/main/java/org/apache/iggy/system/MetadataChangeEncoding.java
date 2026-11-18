@@ -28,7 +28,10 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Optional;
 
-/** Little-endian unsigned values and canonical Base64url, the encodings of change cursors and page tokens. */
+/**
+ * Little-endian unsigned values and canonical Base64url, the encodings of change cursors, page tokens and list page
+ * cursors.
+ */
 final class MetadataChangeEncoding {
 
     private MetadataChangeEncoding() {}
