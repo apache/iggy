@@ -1590,6 +1590,35 @@ async fn given_batches_of_one_fresh_object_when_polling_them_should_ask_the_stor
     assert_eq!(counted.reads.get(), 1);
 }
 
+/// The objects a busy shard stored can leave the cache no room for what a
+/// poll fetches. The poll takes its batches from its own read all the same.
+#[compio::test]
+async fn given_a_cache_without_room_when_polling_batches_of_one_fresh_object_should_ask_the_store_once()
+ {
+    let (_whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    let counted = Rc::new(CountedStore {
+        store: Box::pin(store_with(object)).await,
+        reads: std::cell::Cell::new(0),
+    });
+    let mut remote = crate::RemoteSegments::new(
+        Rc::clone(&counted) as Rc<dyn crate::RemoteObjects>,
+        super::remote_poll::layout(),
+    );
+    remote.set_fresh_cache_bytes(0);
+    partition.set_remote_segments(Rc::new(remote));
+
+    let args = PollingArgs::new(iggy_common::PollingStrategy::offset(0), 10, false);
+    let result = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute()
+        .await;
+
+    assert_eq!(result.read_error, None);
+    assert_eq!(u64::from(result.message_count), RECEIVER_OPS);
+    assert_eq!(counted.reads.get(), 1);
+}
+
 /// What a reader with nothing but the bucket finds for the partition: the
 /// offsets of every batch in the segments its manifest lists, and the bytes
 /// of those segments back to back. Each segment and each batch passes the
