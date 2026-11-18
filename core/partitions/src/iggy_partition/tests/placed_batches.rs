@@ -1548,6 +1548,35 @@ async fn given_a_segment_published_during_a_manifest_publish_when_it_ends_should
     );
 }
 
+/// The store may hold a manifest an earlier primary wrote before the last
+/// segments committed. A new primary has one to store as soon as it leads,
+/// with no segment of its own to commit.
+#[compio::test]
+async fn given_committed_long_term_segments_when_the_replica_leads_a_later_view_should_await_a_manifest_pass_that_lists_them()
+ {
+    const STORED: crate::ManifestPublishOutcome = Ok(Ok(()));
+    let (_whole, placed, object) = whole_and_placed(3);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+    let now = IggyTimestamp::now();
+    assert!(partition.manifest_awaits_first_pass());
+    let segment = Box::pin(rewrite_pass(&mut partition, &writer(&store), 100))
+        .await
+        .unwrap();
+    let (id, _manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    partition.finish_manifest_publish(id, &STORED, now);
+    assert!(!partition.manifest_awaits_first_pass());
+
+    lose_primacy(&mut partition);
+    assert!(!partition.manifest_awaits_first_pass(), "a backup");
+    regain_primacy(&mut partition);
+
+    assert!(partition.manifest_awaits_first_pass());
+    let (_id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    assert_eq!(manifest.segments, [segment]);
+    assert!(!partition.manifest_awaits_first_pass(), "its pass ran");
+}
+
 /// Stores in `store`, and notes the files of `directory` at each put.
 #[derive(Clone)]
 struct DirectoryAtPut {

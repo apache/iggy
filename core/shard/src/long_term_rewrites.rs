@@ -208,6 +208,7 @@ where
             for namespace in partitions.namespaces() {
                 if let Some(partition) = partitions.get_by_ns(namespace) {
                     self.pace_placing_primary(*namespace, partition);
+                    self.stage_manifest_of_new_primary(*namespace, partition);
                 }
             }
         }

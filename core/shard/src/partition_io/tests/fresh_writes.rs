@@ -644,6 +644,92 @@ async fn given_a_placing_backup_when_it_becomes_the_primary_should_start_its_pas
     assert!(!backup.partition(namespace()).segment_rewrite_running());
 }
 
+/// The store may hold a manifest the primary before wrote, which lags what
+/// is committed. The candidate that wins the view stores its own once its
+/// view is a normal one, with no segment left to commit, and nothing stages
+/// a pass here.
+#[compio::test]
+async fn given_a_placing_backup_when_it_becomes_the_primary_should_store_the_manifest_of_its_long_term_log()
+ {
+    use super::object_deletes::Shared;
+    use iggy_object_store::PartitionManifest;
+    use partitions::ExecutorManifestPublisher;
+    const NEXT_VIEW: u32 = REPAIR_VIEW + 1;
+    let backup = Box::pin(placing_headless(HEADLESS_BACKUP)).await;
+    let candidate = Box::pin(placing_headless(HEADLESS_CANDIDATE)).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    candidate
+        .owner
+        .set_manifest_publisher(Some(Rc::new(ExecutorManifestPublisher::new(
+            executor.clone(),
+            layout(),
+        ))));
+    let store = executor.0.store();
+    let consensus = |replica: &HeadlessReplica| {
+        let partition = replica.partition(namespace());
+        (
+            partition.consensus().is_primary(),
+            partition.consensus().is_normal(),
+        )
+    };
+    let awaits_pass =
+        |replica: &HeadlessReplica| replica.partition(namespace()).manifest_awaits_first_pass();
+    let mut scratch = Vec::new();
+
+    candidate.step(&mut scratch).await;
+    assert_eq!(consensus(&candidate), (false, true));
+    assert!(!awaits_pass(&candidate), "a backup");
+
+    for (replica, peer) in [(&candidate, HEADLESS_BACKUP), (&backup, HEADLESS_CANDIDATE)] {
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if replica.sent_to(peer, Command::StartViewChange, NEXT_VIEW) {
+                break;
+            }
+            assert!(replica.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+    }
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+        .await;
+    candidate.step(&mut scratch).await;
+    assert_eq!(consensus(&candidate), (true, false));
+    assert!(!awaits_pass(&candidate), "its view has not started");
+    backup
+        .owner
+        .on_message(candidate.take(HEADLESS_BACKUP, Command::StartViewChange))
+        .await;
+    stepped(&backup, "its view change", || {
+        backup.sent_to(HEADLESS_CANDIDATE, Command::DoViewChange, NEXT_VIEW)
+    })
+    .await;
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::DoViewChange))
+        .await;
+    stepped(&candidate, "its view", || {
+        consensus(&candidate) == (true, true)
+    })
+    .await;
+    candidate.step(&mut scratch).await;
+
+    let revision = candidate.partition(namespace()).created_revision();
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
+    assert_eq!(store.keys(), Vec::<String>::new());
+    pumped(&candidate.owner, async {
+        until(&candidate.owner, |_| store.keys().contains(&manifest_key)).await;
+    })
+    .await;
+
+    let size = store.head(&manifest_key).await.unwrap().size;
+    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    let partition = candidate.partition(namespace());
+    assert_eq!(manifest.segments, partition.long_term_segments());
+    assert_eq!(manifest.floor, partition.long_term_floor());
+    assert!(!partition.manifest_awaits_first_pass());
+}
+
 /// A shard gets its writer after its node proved the store is its own. A
 /// partition that committed before then sleeps, so no tick visits it: the
 /// shard looks over all its partitions once. A tombstoned one is left out.
@@ -683,7 +769,8 @@ async fn given_a_primary_that_committed_without_a_writer_when_the_shard_gets_one
 
 /// A reader of the bucket finds a long-term segment through the manifest,
 /// so the commit of the segment's command is what asks for the manifest.
-/// Nothing else asks for one here.
+/// The one this primary stored when its view began lists nothing, and
+/// nothing else asks for one here.
 #[compio::test]
 async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publish_the_manifest() {
     use super::object_deletes::Shared;
@@ -719,17 +806,29 @@ async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publ
     let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
     let store = executor.0.store();
 
+    let stored = async || {
+        let size = store.head(&manifest_key).await.unwrap().size;
+        let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+        PartitionManifest::decode(&object.bytes).unwrap()
+    };
+
     pumped(&owner, async {
         let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
         until(&owner, |owner| committed_sends(owner) == 2).await;
         owner.request_rewrite_segments(namespace(), revision);
         until(&owner, |_| store.keys().contains(&manifest_key)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stored().await.floor != Some(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no manifest lists the segment"
+            );
+            compio::time::sleep(crate::CONSENSUS_TICK_INTERVAL).await;
+        }
     })
     .await;
 
-    let size = store.head(&manifest_key).await.unwrap().size;
-    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
-    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    let manifest = stored().await;
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     assert_eq!(manifest.floor, Some(1));
     assert_eq!(manifest.segments, partition.long_term_segments());

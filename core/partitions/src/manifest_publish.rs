@@ -228,6 +228,17 @@ where
         self.deletes_objects() || (self.places_batches() && self.state_machines_current())
     }
 
+    /// Whether this replica is the primary of a partition that places its
+    /// batches and no pass ran over it in this view. Until its first publish,
+    /// a reader finds the manifest an earlier primary stored, which may list
+    /// fewer segments than are committed.
+    #[must_use]
+    pub fn manifest_awaits_first_pass(&self) -> bool {
+        self.places_batches()
+            && self.publishes_manifest()
+            && self.manifest_publishes.view != Some(self.consensus().view())
+    }
+
     /// Start the publish of this partition's manifest, when this replica is
     /// the primary, none is in flight, and the manifest differs from the
     /// one this view last stored or is due again. The caller runs it under

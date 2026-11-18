@@ -28,9 +28,45 @@ use consensus::PartitionsHandle;
 use iggy_common::IggyTimestamp;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use partitions::ManifestPublisher;
+use partitions::{IggyPartition, ManifestPublisher};
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
+
+impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// Stage a manifest pass for `partition` when this replica leads it in a
+    /// normal view that had no pass yet, it places its batches, and this
+    /// shard has a publisher. Nothing else asks for the manifest of a new
+    /// primary that has no segment left to commit.
+    ///
+    /// The shard tick calls this for every partition it visited.
+    pub(crate) fn stage_manifest_of_new_primary(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) {
+        // A pass over a tombstoned partition starts no publish, so it would
+        // be staged on every tick.
+        if !partition.manifest_awaits_first_pass()
+            || self.manifest_publisher.borrow().is_none()
+            || self.plane.partitions().is_tombstoned(&namespace)
+        {
+            return;
+        }
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        // A refused frame is staged again by the next tick.
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::PublishManifest {
+            namespace,
+            created_revision: partition.created_revision(),
+            now: IggyTimestamp::now(),
+        }));
+    }
+}
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
