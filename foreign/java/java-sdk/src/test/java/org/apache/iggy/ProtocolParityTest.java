@@ -100,6 +100,7 @@ class ProtocolParityTest {
             Map.entry(CommandCode.Topic.DELETE, "DELETE_TOPIC_CODE"),
             Map.entry(CommandCode.Partition.CREATE, "CREATE_PARTITIONS_CODE"),
             Map.entry(CommandCode.Partition.DELETE, "DELETE_PARTITIONS_CODE"),
+            Map.entry(CommandCode.Partition.GET_ALL, "GET_PARTITIONS_CODE"),
             Map.entry(CommandCode.ConsumerGroup.GET, "GET_CONSUMER_GROUP_CODE"),
             Map.entry(CommandCode.ConsumerGroup.GET_ALL, "GET_CONSUMER_GROUPS_CODE"),
             Map.entry(CommandCode.ConsumerGroup.CREATE, "CREATE_CONSUMER_GROUP_CODE"),

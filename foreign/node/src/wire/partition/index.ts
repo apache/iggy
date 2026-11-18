@@ -17,3 +17,4 @@
 
 export * from './create-partition.command.js';
 export * from './delete-partition.command.js';
+export * from './get-partitions.command.js';

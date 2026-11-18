@@ -29,6 +29,10 @@ export * from './user/index.js';
 export * from './command-set.js';
 export { type Id } from './identifier.utils.js';
 export {
+  PAGE_CURSOR_PREFIX, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_CURSOR_SIZE, MAX_PAGE_NAME_SIZE,
+  PageOrder, PageCursor, type PageQuery, type NamedPageQuery, type Page
+} from './page.utils.js';
+export {
   StreamOptionKey, TopicOptionKey, UserOptionKey,
   type OptionEntry, type ParsedOptions
 } from './options.utils.js';
