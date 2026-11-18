@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use crate::{
     actors::{
@@ -108,23 +108,32 @@ where
             self.producer_config.messages_per_batch,
         );
         let mut rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
-        if self.producer_config.warmup_time.get_duration() != Duration::from_millis(0) {
+        let warmup = self.producer_config.warmup;
+        // Only a group member can receive a batch that another actor sent as measured. Without a
+        // group, a late batch is a warmup batch of this actor or of an actor on the same stream,
+        // which leaves this actor more batches than its total.
+        let measures_late_batch = self.consumer_config.consumer_group_id.is_some();
+        let mut late_batch = None;
+        if warmup.is_enabled() {
             self.log_warmup_info();
-            let warmup_end = Instant::now() + self.producer_config.warmup_time.get_duration();
 
             // Warmup sends under the same limiter as the measured phase, so the phase boundary
             // is a step rather than a burst far above the rate being measured.
-            while Instant::now() < warmup_end {
+            while !warmup.is_over() {
                 let mut user_data_bytes = 0;
                 if let Some(batch) = self.producer.produce_batch(&mut batch_generator).await? {
                     user_data_bytes += batch.user_data_bytes;
                 }
                 if let Some(batch) = self
                     .consumer
-                    .consume_batch_until(sleep_until(warmup_end))
+                    .consume_batch_until(sleep_until(warmup.end()))
                     .await?
                 {
-                    user_data_bytes += batch.user_data_bytes;
+                    if measures_late_batch && warmup.is_over() {
+                        late_batch = Some(batch);
+                    } else {
+                        user_data_bytes += batch.user_data_bytes;
+                    }
                 }
                 if let Some(limiter) = &mut rate_limiter {
                     limiter.wait_until_necessary(user_data_bytes).await;
@@ -191,13 +200,16 @@ where
                 }
             }
 
-            if is_consumer
-                && !self.poll_finish_condition.is_done()
-                && let Some(batch) = self
-                    .consumer
+            let polled = if !is_consumer || self.poll_finish_condition.is_done() {
+                None
+            } else if let Some(batch) = late_batch.take() {
+                Some(batch)
+            } else {
+                self.consumer
                     .consume_batch_until(self.poll_finish_condition.wait_until_done())
                     .await?
-            {
+            };
+            if let Some(batch) = polled {
                 uncharged_bytes += batch.user_data_bytes;
                 recv_user_bytes += batch.user_data_bytes;
                 recv_total_bytes += batch.total_bytes;
@@ -282,12 +294,15 @@ where
         if let Some(cg_id) = self.consumer_config.consumer_group_id {
             info!(
                 "ProducingConsumer #{}, part of consumer group #{} → warming up for {}...",
-                self.consumer_config.consumer_id, cg_id, self.consumer_config.warmup_time
+                self.consumer_config.consumer_id,
+                cg_id,
+                self.consumer_config.warmup.duration()
             );
         } else {
             info!(
                 "ProducingConsumer #{} → warming up for {}...",
-                self.consumer_config.consumer_id, self.consumer_config.warmup_time
+                self.consumer_config.consumer_id,
+                self.consumer_config.warmup.duration()
             );
         }
     }
@@ -502,13 +517,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use clap::Parser;
     use tokio::time::{sleep, timeout};
 
     use super::*;
-    use crate::actors::fakes::{FakeConsumer, FakeProducer};
+    use crate::actors::fakes::{FakeConsumer, FakeLateConsumer, FakeProducer};
     use crate::args::common::IggyBenchArgs;
     use crate::utils::finish_condition::BenchmarkFinishConditionMode;
+    use crate::utils::warmup::BenchmarkWarmup;
 
     // Sends and polls each get half of the total, and each fake batch carries 32 bytes.
     const ONE_BATCH_EACH: &str = "64B";
@@ -517,6 +535,7 @@ mod tests {
     const LONG_WARMUP: &str = "1s";
     const STREAM_ID: &str = "bench-stream-1";
     const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+    const SELECT_ORDER_REPEATS: usize = 16;
 
     #[tokio::test(start_paused = true)]
     async fn given_blocked_poll_when_warming_up_should_end_warmup_at_deadline() {
@@ -557,6 +576,26 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn given_batch_received_at_warmup_end_when_in_group_should_count_it_as_measured() {
+        // The batch and the warmup timer are ready together, and `tokio::select!` then picks
+        // either branch. Each repeat has an even chance to take the branch under test.
+        for _ in 0..SELECT_ORDER_REPEATS {
+            let args = bench_args(ONE_BATCH_EACH, LONG_WARMUP);
+            let warmup = BenchmarkWarmup::start(args.warmup_time());
+            let consumer = FakeLateConsumer::new(warmup.end());
+            let actor = producing_consumer_with(&args, consumer, warmup);
+
+            timeout(
+                args.warmup_time().get_duration() + TIMER_RESOLUTION,
+                actor.run(),
+            )
+            .await
+            .expect("a batch received at the warmup end must count toward the poll total")
+            .unwrap();
+        }
+    }
+
     fn bench_args(total_data: &str, warmup_time: &str) -> IggyBenchArgs {
         IggyBenchArgs::parse_from([
             "iggy-bench",
@@ -576,12 +615,21 @@ mod tests {
     fn producing_consumer(
         args: &IggyBenchArgs,
     ) -> BenchmarkProducingConsumer<FakeProducer, FakeConsumer> {
+        let consumer = FakeConsumer {
+            resets: Arc::default(),
+            blocked: true,
+        };
+        producing_consumer_with(args, consumer, BenchmarkWarmup::start(args.warmup_time()))
+    }
+
+    fn producing_consumer_with<C: BenchmarkConsumerClient>(
+        args: &IggyBenchArgs,
+        consumer: C,
+        warmup: BenchmarkWarmup,
+    ) -> BenchmarkProducingConsumer<FakeProducer, C> {
         BenchmarkProducingConsumer::new(
             FakeProducer,
-            FakeConsumer {
-                resets: Arc::default(),
-                blocked: true,
-            },
+            consumer,
             args.kind(),
             BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::SharedHalf),
             BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::SharedHalf),
@@ -594,7 +642,7 @@ mod tests {
                 partitions: 1,
                 messages_per_batch: args.messages_per_batch(),
                 message_size: args.message_size(),
-                warmup_time: args.warmup_time(),
+                warmup,
                 pretty: false,
             },
             BenchmarkConsumerConfig {
@@ -602,7 +650,7 @@ mod tests {
                 consumer_group_id: Some(1),
                 stream_id: STREAM_ID.to_owned(),
                 messages_per_batch: args.messages_per_batch(),
-                warmup_time: args.warmup_time(),
+                warmup,
                 polling_kind: PollingKind::Next,
                 poll_options: args.poll_options(),
                 origin_timestamp_latency_calculation: true,

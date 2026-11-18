@@ -38,7 +38,8 @@ use server_common::sharding::{PartitionLocation, ShardId};
 use crate::poll::completion::PollCompletionLane;
 use crate::poll::test_support::{
     PollTestMetadata, commit_messages, delete_history, install_group_owner,
-    partition_with_messages, partition_with_messages_at_revision, store_consumer_offset,
+    partition_with_messages, partition_with_messages_at_revision, primary_with_pending_view_write,
+    store_consumer_offset,
 };
 use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
 use crate::shards_table::PapayaShardsTable;
@@ -124,7 +125,7 @@ async fn shard_of(
         let op = install_group_owner(partition, &config, installation).await;
         assert!(group.complete_revocation(id, &installation, op));
     }
-    topic.consumer_groups.insert(0, group);
+    topic.consumer_groups.insert(0, Box::new(group));
     stream.topics.insert(topic);
     inner.items.insert(stream);
     let users = Users::default();
@@ -978,6 +979,37 @@ async fn given_a_stale_incarnation_when_checking_primary_should_wait_for_its_rep
 }
 
 #[compio::test]
+async fn given_a_pending_view_write_when_checking_a_primary_poll_should_refuse_until_it_lands() {
+    let owner = owner(&["message"]).await;
+    let request = request(&owner, 1, false, false);
+    let partition =
+        primary_with_pending_view_write(PollTestBus::default(), namespace(), CREATED_REVISION);
+    for landed in [false, true] {
+        if landed {
+            assert!(partition.persist_superblock_if_needed().await);
+        }
+        for primary in [false, true] {
+            let expected = if primary && !landed {
+                Err(IggyError::TransientNotAccepted)
+            } else {
+                Ok(true)
+            };
+            assert_eq!(
+                PartitionStatus::of(&partition, Some(CREATED_REVISION)).check(
+                    namespace(),
+                    primary,
+                    &request.metadata,
+                    request.consumer,
+                    |_| None
+                ),
+                expected,
+                "landed {landed}, primary {primary}"
+            );
+        }
+    }
+}
+
+#[compio::test]
 async fn read_budget_caps_a_resident_reply_after_its_first_message() {
     let owner = owner(&["first", "second"]).await;
     owner.set_deferred_poll_config(DeferredPollConfig {
@@ -1185,7 +1217,7 @@ fn store_offset(owner: &TestShard, consumer: PollingConsumer, offset: u64) {
                     offset,
                     String::new(),
                 );
-                partition.consumer_offsets.pin().insert(id, stored);
+                partition.consumer_offsets.borrow_mut().insert(id, stored);
             }
             PollingConsumer::ConsumerGroup(id, _) => {
                 let stored = ConsumerOffset::new(
@@ -1196,7 +1228,7 @@ fn store_offset(owner: &TestShard, consumer: PollingConsumer, offset: u64) {
                 );
                 partition
                     .consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .insert(ConsumerGroupId(id), stored);
             }
         })

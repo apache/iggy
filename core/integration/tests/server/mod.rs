@@ -48,7 +48,7 @@ mod geo_topic_fs;
 // Geo peers: two verified fs peers and one whose store refuses connections,
 // against a server that keeps serving and writes nothing to a peer.
 mod geo_peers;
-mod tiered_storage_fs;
+pub(crate) mod tiered_storage_fs;
 mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.
 mod topic_metrics_vsr;
@@ -57,6 +57,8 @@ mod topic_metrics_vsr;
 pub(crate) mod http_client;
 // Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
+// Raw-HTTP page keys of the list routes.
+mod http_list_pages;
 // Raw-HTTP wire-contract residue against the server (status codes + typed error
 // bodies); the RBAC matrix lives in permissions_scenario.
 mod http_rbac;
@@ -96,7 +98,10 @@ mod descriptor_exhaustion_vsr;
 // sample picks up writes the server cannot charge.
 mod disk_usage;
 mod general;
+// Boot gives every shard its share of the node repair ring budget, and the
+// shard tick reports it.
 mod partitions_limit_vsr;
+mod repair_ring_budget;
 // The expired-token cleaner deletes under the reserved client id, and later
 // writes must still commit behind that delete.
 mod personal_access_token_cleaner_vsr;

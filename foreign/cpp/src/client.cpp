@@ -175,6 +175,12 @@ std::vector<UserInfo> IggyBlockingClient::GetUsers() {
     });
 }
 
+UsersPage IggyBlockingClient::GetUsersPage(const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &query](ffi::ErrorInfo &error_info) {
+        return UsersPage::FromFfi(Handle()->get_users_page(query.ToFfi(), error_info));
+    });
+}
+
 std::vector<PersonalAccessTokenInfo> IggyBlockingClient::GetPersonalAccessTokens() {
     return RethrowAsIggyException([this] {
         std::vector<PersonalAccessTokenInfo> tokens;
@@ -271,6 +277,12 @@ std::vector<Stream> IggyBlockingClient::GetStreams() {
             streams.push_back(Stream::FromFfi(std::move(stream)));
         }
         return streams;
+    });
+}
+
+StreamsPage IggyBlockingClient::GetStreamsPage(const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &query](ffi::ErrorInfo &error_info) {
+        return StreamsPage::FromFfi(Handle()->get_streams_page(query.ToFfi(), error_info));
     });
 }
 
@@ -398,6 +410,12 @@ std::vector<Topic> IggyBlockingClient::GetTopics(const Identifier &stream) {
     });
 }
 
+TopicsPage IggyBlockingClient::GetTopicsPage(const Identifier &stream, const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &stream, &query](ffi::ErrorInfo &error_info) {
+        return TopicsPage::FromFfi(Handle()->get_topics_page(stream.ToFfi(), query.ToFfi(), error_info));
+    });
+}
+
 TopicDetails IggyBlockingClient::GetTopic(const Identifier &stream, const Identifier &topic) {
     return RethrowAsIggyException(
         [this, &stream, &topic] { return TopicDetails::FromFfi(Handle()->get_topic(stream.ToFfi(), topic.ToFfi())); });
@@ -422,6 +440,15 @@ void IggyBlockingClient::DeletePartitions(const Identifier &stream,
                                           const std::uint32_t partitions_count) {
     RethrowAsIggyException([this, &stream, &topic, partitions_count](ffi::ErrorInfo &error_info) {
         Handle()->delete_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count, error_info);
+    });
+}
+
+PartitionsPage IggyBlockingClient::GetPartitionsPage(const Identifier &stream,
+                                                     const Identifier &topic,
+                                                     const PageQuery &query) {
+    return RethrowAsIggyException([this, &stream, &topic, &query](ffi::ErrorInfo &error_info) {
+        return PartitionsPage::FromFfi(
+            Handle()->get_partitions_page(stream.ToFfi(), topic.ToFfi(), query.ToFfi(), error_info));
     });
 }
 
@@ -461,6 +488,15 @@ std::vector<ConsumerGroup> IggyBlockingClient::GetConsumerGroups(const Identifie
             groups.push_back(ConsumerGroup::FromFfi(std::move(group)));
         }
         return groups;
+    });
+}
+
+ConsumerGroupsPage IggyBlockingClient::GetConsumerGroupsPage(const Identifier &stream,
+                                                             const Identifier &topic,
+                                                             const NamedPageQuery &query) {
+    return RethrowAsIggyException([this, &stream, &topic, &query](ffi::ErrorInfo &error_info) {
+        return ConsumerGroupsPage::FromFfi(
+            Handle()->get_consumer_groups_page(stream.ToFfi(), topic.ToFfi(), query.ToFfi(), error_info));
     });
 }
 

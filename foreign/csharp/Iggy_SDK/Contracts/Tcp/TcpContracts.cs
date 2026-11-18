@@ -42,6 +42,9 @@ internal static class TcpContracts
     /// <summary>Offset mutations always request quorum acknowledgement.</summary>
     private const byte AckQuorum = 1;
 
+    /// <summary>The order, descending, limit, cursor length and name length fields of a page block.</summary>
+    private const int PAGE_BLOCK_FIXED_SIZE = 1 + 1 + 4 + 1 + 1;
+
     /// <summary>The bytes a deferred poll (code 106) appends to the body of code 100.</summary>
     internal const int DEFERRED_POLL_TAIL_SIZE = sizeof(ulong) + sizeof(uint) + sizeof(uint) + sizeof(ulong);
 
@@ -767,11 +770,39 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] GetGroups(Identifier streamId, Identifier topicId)
+    /// <summary>
+    ///     Encodes a validated list request: the identifiers of its parents, then the page block
+    ///     <c>[order:u8][descending:u8][limit:u32][cursor_len:u8][cursor][name_len:u8][name]</c>. A length of 0 means
+    ///     no cursor or no name.
+    /// </summary>
+    internal static byte[] GetPage(NamedPageQuery query, params Identifier[] parents)
     {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-        return bytes.ToArray();
+        var page = query.Page;
+        var cursor = page.Cursor is { } next ? next.Bytes : ReadOnlySpan<byte>.Empty;
+        var nameLength = query.Name is null ? 0 : Encoding.UTF8.GetByteCount(query.Name);
+        var bytes = new byte[parents.Sum(parent => 2 + parent.Length) + PAGE_BLOCK_FIXED_SIZE + cursor.Length
+                             + nameLength];
+        var position = 0;
+        foreach (var parent in parents)
+        {
+            bytes.AsSpan().WriteBytesFromIdentifier(parent, position);
+            position += 2 + parent.Length;
+        }
+
+        bytes[position++] = (byte)page.Order;
+        bytes[position++] = page.Descending ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(position, 4), page.Limit);
+        position += 4;
+        bytes[position++] = (byte)cursor.Length;
+        cursor.CopyTo(bytes.AsSpan(position));
+        position += cursor.Length;
+        bytes[position++] = (byte)nameLength;
+        if (query.Name is not null)
+        {
+            Encoding.UTF8.GetBytes(query.Name, bytes.AsSpan(position));
+        }
+
+        return bytes;
     }
 
     internal static byte[] GetGroup(Identifier streamId, Identifier topicId, Identifier groupId)

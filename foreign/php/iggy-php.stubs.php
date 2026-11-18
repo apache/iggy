@@ -312,6 +312,21 @@ namespace Iggy {
         public static function fromConnectionString(string $connection_string): \Iggy\Client {}
 
         /**
+         * Reads one page of the consumer groups of a topic. Group ids follow creation, so both
+         * orders walk by id. The other arguments are those of getStreamsPage().
+         *
+         * @param mixed $stream_id
+         * @param mixed $topic_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\ConsumerGroupsPage
+         */
+        public function getConsumerGroupsPage(mixed $stream_id, mixed $topic_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\ConsumerGroupsPage {}
+
+        /**
          * Returns the offset stored on `partition_id` for a standalone consumer, or for a consumer
          * group when `group` is true, or null when nothing is stored. In a cluster the node of the
          * connection answers from its own replica, which can lag a store that just returned.
@@ -345,7 +360,26 @@ namespace Iggy {
         public function getMetadataChanges(\Iggy\MetadataChangeStart $start, array $groups = [], mixed $since = null, mixed $until = null, mixed $limit = null): \Iggy\MetadataChanges {}
 
         /**
+         * Reads one page of the partitions of a topic. Partition ids follow creation, so both
+         * orders walk by id. The other arguments are those of getStreamsPage() except `name`,
+         * because a partition has no name.
+         *
+         * @param mixed $stream_id
+         * @param mixed $topic_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @return \Iggy\PartitionsPage
+         */
+        public function getPartitionsPage(mixed $stream_id, mixed $topic_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null): \Iggy\PartitionsPage {}
+
+        /**
          * Gets a stream by id or name.
+         *
+         * Over TCP, QUIC and WebSocket, a stream with too many topics for one reply throws
+         * ReplyTooLarge (97), and the connection stays usable. getTopicsPage() reads its topics
+         * page by page.
          *
          * @param mixed $stream_id
          * @return \Iggy\StreamDetails|null
@@ -353,13 +387,65 @@ namespace Iggy {
         public function getStream(mixed $stream_id): ?\Iggy\StreamDetails {}
 
         /**
+         * Reads one page of the streams.
+         *
+         * `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
+         * 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
+         * page. `name` keeps the streams whose name holds the text, case-sensitive, and is 1 to
+         * 255 bytes. A query outside these ranges, or a cursor text that the client cannot read,
+         * throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor
+         * that does not fit the query with the same error, which HTTP reports as code 300. A
+         * `limit` that is not an integer, or that does not fit an unsigned 32-bit integer, throws
+         * `IggyException` with code 0 from the argument check.
+         *
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\StreamsPage
+         */
+        public function getStreamsPage(?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\StreamsPage {}
+
+        /**
          * Gets a topic by stream and topic id/name.
+         *
+         * Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
+         * ReplyTooLarge (97), and the connection stays usable. getPartitionsPage() reads its
+         * partitions page by page.
          *
          * @param mixed $stream_id
          * @param mixed $topic_id
          * @return \Iggy\TopicDetails|null
          */
         public function getTopic(mixed $stream_id, mixed $topic_id): ?\Iggy\TopicDetails {}
+
+        /**
+         * Reads one page of the topics of a stream. A missing stream gives an empty page without
+         * `next`. The other arguments are those of getStreamsPage().
+         *
+         * @param mixed $stream_id
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\TopicsPage
+         */
+        public function getTopicsPage(mixed $stream_id, ?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\TopicsPage {}
+
+        /**
+         * Reads one page of the users, and `name` matches the username. The other arguments are
+         * those of getStreamsPage().
+         *
+         * @param \Iggy\PageOrder|null $order
+         * @param bool $descending
+         * @param mixed $limit
+         * @param string|null $cursor
+         * @param string|null $name
+         * @return \Iggy\UsersPage
+         */
+        public function getUsersPage(?\Iggy\PageOrder $order = null, bool $descending = false, mixed $limit = null, ?string $cursor = null, ?string $name = null): \Iggy\UsersPage {}
 
         /**
          * Builds a reader of the partitions that a consumer group assigns to this member.
@@ -899,6 +985,46 @@ namespace Iggy {
          * @return string
          */
         public function topic(): string {}
+    }
+
+    /**
+     * One consumer group of a `ConsumerGroupsPage`.
+     */
+    class ConsumerGroup {
+        public readonly int $id;
+
+        public readonly int $members_count;
+
+        public readonly string $name;
+
+        public readonly int $partitions_count;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One page of the consumer groups of a topic, as `Client::getConsumerGroupsPage()` returns it.
+     */
+    class ConsumerGroupsPage {
+        /**
+         * The consumer groups of the page, each an `Iggy\ConsumerGroup`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 
     /**
@@ -2156,6 +2282,14 @@ namespace Iggy {
     }
 
     /**
+     * The order of a list page. Values are the HTTP API names.
+     */
+    enum PageOrder: string {
+      case Id = 'id';
+      case Created = 'created';
+    }
+
+    /**
      * One partition of a topic.
      */
     class Partition {
@@ -2301,6 +2435,31 @@ namespace Iggy {
          * @return void
          */
         public function seek(int $partition_id, \Iggy\PollingStrategy $start): void {}
+    }
+
+    /**
+     * One page of the partitions of a topic, as `Client::getPartitionsPage()` returns it.
+     */
+    class PartitionsPage {
+        /**
+         * The partitions of the page, each an `Iggy\Partition`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 
     /**
@@ -2647,6 +2806,69 @@ namespace Iggy {
         public function __construct() {}
     }
 
+    /**
+     * One stream of a `StreamsPage`.
+     */
+    class Stream {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in, including the read-only encryption projections.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        /**
+         * Fingerprints of the server keys that wrap the stream's key, comma-separated: one
+         * outside a server key rotation. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_kek_fingerprint;
+
+        /**
+         * Fingerprint of the stream's key, 16 lowercase hex characters. Compare it with
+         * `Client::encryptionKeyFingerprint()` of a key you hold. Null for a plaintext stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_fingerprint;
+
+        /**
+         * Who chose the stream's at-rest key: `stream`, `server`, or `none` for a plaintext
+         * stream. A source a newer server reports is returned as its text.
+         *
+         * @var string|null
+         */
+        public readonly ?string $encryption_key_source;
+
+        public readonly int $id;
+
+        public readonly int $messages_count;
+
+        public readonly string $name;
+
+        /**
+         * Options the creating client set, as option name to scalar value. Key material is
+         * never returned.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        public readonly int $size_bytes;
+
+        public readonly int $topics_count;
+
+        public function __construct() {}
+    }
+
     class StreamDetails {
         /**
          * Options the server filled in, including the read-only encryption projections.
@@ -2712,6 +2934,71 @@ namespace Iggy {
       case EncryptionKekFingerprint = 'encryption_kek_fingerprint';
     }
 
+    /**
+     * One page of the streams, as `Client::getStreamsPage()` returns it.
+     */
+    class StreamsPage {
+        /**
+         * The streams of the page, each an `Iggy\Stream`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One topic of a `TopicsPage`.
+     */
+    class Topic {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in from its catalog defaults.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        public readonly int $id;
+
+        public readonly int $messages_count;
+
+        public readonly string $name;
+
+        /**
+         * Options the creating or updating client set, as option name to scalar value.
+         * Integers above `PHP_INT_MAX`, such as never-expire and unlimited
+         * (18446744073709551615), are decimal strings.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        public readonly int $partitions_count;
+
+        public readonly int $size_bytes;
+
+        public function __construct() {}
+    }
+
     class TopicDetails {
         /**
          * Options the server filled in from its catalog defaults.
@@ -2775,6 +3062,95 @@ namespace Iggy {
       case LocalRetentionSize = 'local_retention_size';
       case TopicType = 'topic_type';
       case GeoMode = 'geo_mode';
+    }
+
+    /**
+     * One page of the topics of a stream, as `Client::getTopicsPage()` returns it.
+     */
+    class TopicsPage {
+        /**
+         * The topics of the page, each an `Iggy\Topic`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One user of a `UsersPage`.
+     */
+    class UserInfo {
+        /**
+         * Creation time in microseconds.
+         *
+         * @var int
+         */
+        public readonly int $created_at;
+
+        /**
+         * Options the server filled in.
+         *
+         * @var array
+         */
+        public readonly array $derived_options;
+
+        public readonly int $id;
+
+        /**
+         * Options the creating client set, as option name to scalar value.
+         *
+         * @var array
+         */
+        public readonly array $options;
+
+        /**
+         * `active` or `inactive`.
+         *
+         * @var string
+         */
+        public readonly string $status;
+
+        public readonly string $username;
+
+        public function __construct() {}
+    }
+
+    /**
+     * One page of the users, as `Client::getUsersPage()` returns it.
+     */
+    class UsersPage {
+        /**
+         * The users of the page, each an `Iggy\UserInfo`.
+         *
+         * The items are rebuilt on each getter call, so cache the array in PHP if you read it
+         * more than once.
+         *
+         * @var array
+         */
+        public readonly array $items;
+
+        /**
+         * The `cursor` of the next page of the same query, null on the last page. A page can be
+         * empty and still have one.
+         *
+         * @var string|null
+         */
+        public readonly ?string $next;
+
+        public function __construct() {}
     }
 }
 

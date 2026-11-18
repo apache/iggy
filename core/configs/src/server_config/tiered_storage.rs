@@ -45,6 +45,16 @@ const TIMEOUT_BOUNDS: RangeInclusive<Duration> = Duration::from_secs(1)..=Durati
 const RETRY_DELAY_BOUNDS: RangeInclusive<Duration> =
     Duration::from_millis(1)..=Duration::from_hours(1);
 
+/// The longest `fresh_upload_interval`. A producer waits out the interval
+/// before its messages are stored, so a longer one would only answer late.
+const FRESH_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(10);
+
+/// The smallest `long_term_backlog_limit` other than zero: what one
+/// long-term segment holds at most. A rewrite stores one segment at a time,
+/// so a lower limit would slow the sends to a partition whose rewrites keep
+/// up.
+pub const LONG_TERM_BACKLOG_LIMIT_MIN: u64 = 64 * 1024 * 1024;
+
 /// The object store that tiered storage keeps segments in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,8 +112,9 @@ pub struct TieredStorageConfig {
     /// The key prefix of this cluster's objects in the store. Two clusters
     /// can share a bucket under different prefixes. The cluster claims its
     /// prefix with the object `{prefix}/meta/identity`: replica 0 writes it
-    /// while it is the caught-up metadata primary and no topic is tiered, and
-    /// a node uploads and deletes objects only after it reads that claim back.
+    /// while it is the caught-up metadata primary and no topic keeps data in
+    /// the store, and a node uploads and deletes objects only after it reads
+    /// that claim back.
     #[serde(default = "default_prefix")]
     pub prefix: String,
     /// The directory that holds the objects of the `fs` backend.
@@ -162,6 +173,21 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_max_retry_delay")]
     #[config_env(leaf)]
     pub max_retry_delay: IggyDuration,
+    /// The shortest time between the starts of two uploads of fresh objects
+    /// on one shard, unless an object fills first. A send that finds no
+    /// upload in flight and the last one started at least this long ago is
+    /// uploaded at once. Zero uploads as soon as a slot is free. Up to 10 s.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_fresh_upload_interval")]
+    #[config_env(leaf)]
+    pub fresh_upload_interval: IggyDuration,
+    /// The bytes of messages one partition that stores them in fresh
+    /// objects may have committed that no long-term segment holds yet. Past
+    /// it, the primary delays the sends to that partition. Zero turns the
+    /// delay off. Otherwise at least [`LONG_TERM_BACKLOG_LIMIT_MIN`].
+    #[serde(default = "default_long_term_backlog_limit")]
+    #[config_env(leaf)]
+    pub long_term_backlog_limit: IggyByteSize,
 }
 
 /// How many jobs of each class the tier service of one shard runs at once,
@@ -187,6 +213,10 @@ pub struct TierJobsConfig {
     #[serde(default = "default_upload_bytes")]
     #[config_env(leaf)]
     pub upload_bytes: IggyByteSize,
+    /// Uploads of fresh objects, which producers wait for. They have slots
+    /// of their own, so they never wait behind a segment upload.
+    #[serde(default = "default_fresh_uploads")]
+    pub fresh_uploads: u32,
     /// Readahead that no poll waits for yet.
     #[serde(default = "default_speculative_fetches")]
     pub speculative_fetches: u32,
@@ -219,6 +249,8 @@ impl Default for TieredStorageConfig {
             max_attempts: default_max_attempts(),
             retry_delay: default_retry_delay(),
             max_retry_delay: default_max_retry_delay(),
+            fresh_upload_interval: default_fresh_upload_interval(),
+            long_term_backlog_limit: default_long_term_backlog_limit(),
         }
     }
 }
@@ -230,6 +262,7 @@ impl Default for TierJobsConfig {
             demand_fetch_bytes: default_demand_fetch_bytes(),
             uploads: default_uploads(),
             upload_bytes: default_upload_bytes(),
+            fresh_uploads: default_fresh_uploads(),
             speculative_fetches: default_speculative_fetches(),
             speculative_fetch_bytes: default_speculative_fetch_bytes(),
             deletes: default_deletes(),
@@ -263,7 +296,8 @@ impl Display for TieredStorageConfig {
             f,
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
              url_style: {}, credentials: {}, jobs: {}, request_timeout: {}, \
-             progress_timeout: {}, max_attempts: {}, retry_delay: {}, max_retry_delay: {} }}",
+             progress_timeout: {}, max_attempts: {}, retry_delay: {}, max_retry_delay: {}, \
+             fresh_upload_interval: {}, long_term_backlog_limit: {} }}",
             self.backend,
             self.prefix,
             self.path,
@@ -278,6 +312,8 @@ impl Display for TieredStorageConfig {
             self.max_attempts,
             self.retry_delay,
             self.max_retry_delay,
+            self.fresh_upload_interval,
+            self.long_term_backlog_limit,
         )
     }
 }
@@ -287,12 +323,13 @@ impl Display for TierJobsConfig {
         write!(
             f,
             "{{ demand_fetches: {}, demand_fetch_bytes: {}, uploads: {}, upload_bytes: {}, \
-             speculative_fetches: {}, speculative_fetch_bytes: {}, deletes: {}, \
-             housekeeping: {} }}",
+             fresh_uploads: {}, speculative_fetches: {}, speculative_fetch_bytes: {}, \
+             deletes: {}, housekeeping: {} }}",
             self.demand_fetches,
             self.demand_fetch_bytes,
             self.uploads,
             self.upload_bytes,
+            self.fresh_uploads,
             self.speculative_fetches,
             self.speculative_fetch_bytes,
             self.deletes,
@@ -344,6 +381,7 @@ impl TieredStorageConfig {
         let counts = [
             ("demand_fetches", jobs.demand_fetches),
             ("uploads", jobs.uploads),
+            ("fresh_uploads", jobs.fresh_uploads),
             ("speculative_fetches", jobs.speculative_fetches),
             ("deletes", jobs.deletes),
             ("housekeeping", jobs.housekeeping),
@@ -381,6 +419,19 @@ impl TieredStorageConfig {
         if self.max_retry_delay.get_duration() < self.retry_delay.get_duration() {
             return refuse("max_retry_delay must not be shorter than retry_delay");
         }
+        if self.fresh_upload_interval.get_duration() > FRESH_UPLOAD_INTERVAL_MAX {
+            return refuse(&format!(
+                "fresh_upload_interval must be at most {}",
+                IggyDuration::new(FRESH_UPLOAD_INTERVAL_MAX)
+            ));
+        }
+        let backlog_limit = self.long_term_backlog_limit.as_bytes_u64();
+        if backlog_limit != 0 && backlog_limit < LONG_TERM_BACKLOG_LIMIT_MIN {
+            return refuse(&format!(
+                "long_term_backlog_limit must be 0 or at least {}",
+                IggyByteSize::from(LONG_TERM_BACKLOG_LIMIT_MIN)
+            ));
+        }
         Ok(())
     }
 }
@@ -414,6 +465,14 @@ fn default_max_retry_delay() -> IggyDuration {
     IggyDuration::new_from_secs(5)
 }
 
+fn default_fresh_upload_interval() -> IggyDuration {
+    IggyDuration::new(Duration::from_millis(10))
+}
+
+fn default_long_term_backlog_limit() -> IggyByteSize {
+    IggyByteSize::from(1024 * 1024 * 1024)
+}
+
 const fn default_demand_fetches() -> u32 {
     16
 }
@@ -428,6 +487,10 @@ const fn default_uploads() -> u32 {
 
 fn default_upload_bytes() -> IggyByteSize {
     IggyByteSize::from(2048 * 1024 * 1024)
+}
+
+const fn default_fresh_uploads() -> u32 {
+    4
 }
 
 const fn default_speculative_fetches() -> u32 {
@@ -538,6 +601,13 @@ mod tests {
             },
             ..fs_config()
         };
+        let no_fresh_uploads = TieredStorageConfig {
+            jobs: TierJobsConfig {
+                fresh_uploads: 0,
+                ..TierJobsConfig::default()
+            },
+            ..fs_config()
+        };
         let no_fetch_bytes = TieredStorageConfig {
             jobs: TierJobsConfig {
                 demand_fetch_bytes: IggyByteSize::from(0),
@@ -556,6 +626,7 @@ mod tests {
 
         for config in [
             no_uploads,
+            no_fresh_uploads,
             no_fetch_bytes,
             no_progress_timeout,
             backoff_cap_below_its_start,
@@ -621,6 +692,79 @@ mod tests {
 
         assert!(shortest.validate().is_ok(), "{shortest}");
         assert!(longest.validate().is_ok(), "{longest}");
+    }
+
+    #[test]
+    fn given_no_fresh_upload_keys_when_reading_the_section_should_use_their_defaults() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
+
+        assert_eq!(config.jobs.fresh_uploads, 4);
+        assert_eq!(
+            config.fresh_upload_interval.get_duration(),
+            Duration::from_millis(10)
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_a_fresh_upload_interval_when_validating_should_accept_zero_and_refuse_above_the_most()
+    {
+        let none = TieredStorageConfig {
+            fresh_upload_interval: duration("0"),
+            ..fs_config()
+        };
+        let longest = TieredStorageConfig {
+            fresh_upload_interval: duration("10s"),
+            ..fs_config()
+        };
+        let too_long = TieredStorageConfig {
+            fresh_upload_interval: duration("10001ms"),
+            ..fs_config()
+        };
+
+        assert!(none.validate().is_ok(), "{none}");
+        assert!(longest.validate().is_ok(), "{longest}");
+        assert!(too_long.validate().is_err(), "{too_long}");
+    }
+
+    #[test]
+    fn given_no_long_term_backlog_limit_when_reading_the_section_should_use_its_default() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
+
+        assert_eq!(config.long_term_backlog_limit.as_bytes_u64(), 1 << 30);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_a_long_term_backlog_limit_when_reading_the_section_should_take_it() {
+        let config: TieredStorageConfig = serde_json::from_str(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered", "long_term_backlog_limit": "2 GiB"}"#,
+        )
+        .unwrap();
+        let unreadable = serde_json::from_str::<TieredStorageConfig>(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered", "long_term_backlog_limit": "lots"}"#,
+        );
+
+        assert_eq!(config.long_term_backlog_limit.as_bytes_u64(), 2 << 30);
+        assert!(config.validate().is_ok());
+        assert!(unreadable.is_err());
+    }
+
+    #[test]
+    fn given_a_long_term_backlog_limit_when_validating_should_accept_zero_and_refuse_less_than_a_segment()
+     {
+        let limit = |text: &str| TieredStorageConfig {
+            long_term_backlog_limit: text.parse().unwrap(),
+            ..fs_config()
+        };
+
+        assert_eq!(limit("0").long_term_backlog_limit.as_bytes_u64(), 0);
+        assert!(limit("0").validate().is_ok(), "zero turns the delay off");
+        assert!(limit("64 MiB").validate().is_ok());
+        assert!(limit("1 B").validate().is_err());
+        assert!(limit("67108863 B").validate().is_err());
     }
 
     #[test]

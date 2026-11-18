@@ -17,6 +17,7 @@
 
 use super::benchmark::Benchmarkable;
 use crate::utils::ClientFactory;
+use crate::utils::warmup::BenchmarkWarmup;
 use crate::{
     args::common::IggyBenchArgs,
     benchmarks::common::{build_consumer_futures, build_producer_futures, init_consumer_groups},
@@ -54,8 +55,9 @@ impl Benchmarkable for BalancedProducerAndConsumerGroupBenchmark {
 
         init_consumer_groups(cf, &args).await?;
 
-        let producer_futures = build_producer_futures(cf, &args);
-        let consumer_futures = build_consumer_futures(cf, &args);
+        let warmup = BenchmarkWarmup::start(args.warmup_time());
+        let producer_futures = build_producer_futures(cf, &args, warmup);
+        let consumer_futures = build_consumer_futures(cf, &args, warmup);
 
         for fut in producer_futures {
             tasks.spawn(fut);

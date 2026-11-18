@@ -18,8 +18,10 @@
 //! The charts of the OMB compare page, with one line per run in the run's color: the publish
 //! throughput and the publish P99 over the run, and the latency quantile curves.
 
+use bench_dashboard_shared::omb::chart::{LATENCY_AXIS_NAME, LINE_OPACITY, window_points};
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::quantile::{QuantileCurve, quantile_options};
 use bench_dashboard_shared::omb::result::OmbQuantile;
 use bench_report::plotting::chart::IggyChart;
 use charming::Chart;
@@ -27,9 +29,6 @@ use yew::prelude::*;
 
 use crate::components::chart::{ChartCanvas, SharedChart};
 use crate::components::page::loadable;
-use crate::pages::omb::common::window_points;
-use crate::pages::omb::quantile::{LATENCY_AXIS_NAME, QuantileCurve, quantile_options};
-use crate::pages::run::chart::LINE_OPACITY;
 use crate::state::data::Loadable;
 
 const THROUGHPUT_AXIS_NAME: &str = "Publish throughput [MiB/s]";
@@ -140,7 +139,7 @@ fn quantile_curves<'a>(
 
 /// The run page's quantile chart with every run's curve. `None` without curves.
 fn quantile_chart(curves: &[QuantileCurve]) -> Option<Chart> {
-    (!curves.is_empty()).then(|| quantile_options(LATENCY_AXIS_NAME, curves))
+    (!curves.is_empty()).then(|| quantile_options(IggyChart::card(), LATENCY_AXIS_NAME, curves))
 }
 
 fn detail_of(details: &[OmbRunDetail], id: OmbRunId) -> Option<&OmbRunDetail> {
@@ -167,8 +166,8 @@ fn time_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pages::omb::quantile::curve_points;
     use crate::test_support::{OMB_NO_CONSUMERS, OMB_RC1_DEFAULT, OMB_RC1_PERSISTED};
+    use bench_dashboard_shared::omb::quantile::curve_points;
 
     fn chart_run(detail: &OmbRunDetail, color: &'static str) -> ChartRun {
         ChartRun {

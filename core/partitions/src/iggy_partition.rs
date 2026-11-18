@@ -40,7 +40,8 @@ use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
 };
 use crate::types::{
-    COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairIngest, RepairSession,
+    COMMIT_WALK_OPS_MAX, ConsumerGroupOffsets, ConsumerOffsets, FatalCommit, RepairConclusion,
+    RepairIngest, RepairSession,
 };
 use crate::view_fence::{ViewFence, ViewWindowVerdict, view_window_verdict};
 use crate::{
@@ -55,10 +56,10 @@ use consensus::{
     PlaneKind, Project, RepairEvidence, ReplicaLogContext, RequestLogEvent, Sequencer,
     SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, build_deny_reply_from_request,
     build_reply_from_request, build_reply_message, dvc_header_kind, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repair_session_live,
-    repaired_frontier_update, repaired_prepare_evidence, replicate_frozen_prepare,
-    replicate_preflight, restamp_prepare_view, send_prepare_ok as send_prepare_ok_common,
-    verify_prepare_integrity,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, field_size,
+    repair_session_live, repaired_frontier_update, repaired_prepare_evidence,
+    replicate_frozen_prepare, replicate_preflight, restamp_prepare_view,
+    send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::batch::BatchProducer;
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch, stored_header};
@@ -80,9 +81,8 @@ use iggy_binary_protocol::{
 };
 use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, RoutedRequestHeader};
 use iggy_common::{
-    ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    EncryptorKind, IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
-    TopicRuntimeOptions,
+    ConsumerGroupId, ConsumerKind, ConsumerOffset, EncryptorKind, IggyByteSize, IggyError,
+    IggyExpiry, IggyTimestamp, PartitionStats, PollingKind, TopicRuntimeOptions,
 };
 use iggy_object_store::{SegmentKey, SegmentObject};
 use journal::Journal as _;
@@ -103,10 +103,10 @@ use server_common::{
     sharding::IggyNamespace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map};
 use std::fmt;
-use std::hash::Hash;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -159,14 +159,14 @@ where
     pub offset: Arc<AtomicU64>,
     /// Highest offset assigned to prepares that may still only live in the in-memory journal.
     pub dirty_offset: AtomicU64,
-    pub consumer_offsets: Arc<ConsumerOffsets>,
-    pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
+    pub consumer_offsets: RefCell<ConsumerOffsets>,
+    pub consumer_group_offsets: RefCell<ConsumerGroupOffsets>,
     /// Highest offset this partition has served (polled) to each consumer group.
     /// The cooperative-rebalance reconciler completes a pending revocation once
     /// the source group has committed up to what it was polled
     /// (`committed >= last_polled`), i.e. nothing is in flight. Ephemeral (not
     /// persisted): recovery or a view change leaves prior progress unknown.
-    pub last_polled_offsets: Arc<ConsumerGroupOffsets>,
+    pub last_polled_offsets: RefCell<ConsumerGroupOffsets>,
     pub(crate) consumer_group_owners: BTreeMap<u64, InstalledConsumerGroupOwner>,
     // The flag proves that the owner installed in this view has served nothing.
     pub(crate) consumer_group_polls: BTreeMap<u64, Arc<AtomicBool>>,
@@ -203,6 +203,10 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
+    /// Set when a command of the long-term log applies on the primary, and
+    /// taken by the shard, which publishes the manifest and starts the
+    /// rewrite that waited for the command.
+    pub(crate) long_term_changed: Cell<bool>,
     /// The highest committed truncation watermark a timed pass read from
     /// metadata for this partition. The watermark only rises, so the one
     /// metadata holds now is never below it.
@@ -221,6 +225,16 @@ where
     /// What this replica found of its geo topic's object while it is the
     /// primary.
     pub(crate) topic_object_check: crate::topic_object::TopicObjectCheck,
+    /// Number of the last long-term rewrite this partition started. It
+    /// outlives the view, so the late result of an earlier view's rewrite is
+    /// never taken for the one in flight.
+    pub(crate) long_term_rewrite_jobs: u64,
+    /// What this partition committed above its long-term floor.
+    pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
+    /// Number of the last manifest publish this partition started. It
+    /// outlives the view, so the late result of an earlier view's publish is
+    /// never taken for the one in flight.
+    pub(crate) manifest_publish_jobs: u64,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -260,10 +274,9 @@ where
     pending_persisted_acks: RefCell<BTreeMap<u64, PrepareHeader>>,
     /// Without a WAL, an install must still preserve ops admitted to an ack.
     pub(crate) acknowledged_op: Cell<u64>,
-    /// In-flight journal repair:
-    /// set when the recovery handshake finds this replica behind the group's
-    /// commit frontier, cleared when `RepairDone` completes the walk.
-    pub repair: Option<RepairSession>,
+    /// In-flight journal repair session. Boxed like the other session state of
+    /// this struct, because idle partitions hold none of it.
+    repair: Option<Box<RepairSession>>,
     /// Consecutive shard-sweep ticks this partition has been seen gap-stopped
     /// (committed ops it cannot walk to, because the op at its commit frontier
     /// plus one is missing). Debounces the sweep's level-triggered repair arm,
@@ -318,8 +331,11 @@ where
     pending_commit: Option<PendingCommit>,
     local_request_order: Cell<u64>,
     no_ack: VecDeque<PendingNoAck>,
-    materialization: Option<PendingMaterialization>,
-    maintenance: PendingPartitionMaintenance,
+    materialization: Option<Box<PendingMaterialization>>,
+    maintenance: LazyMaintenance,
+    /// The op the last finished flush covered. Outside `maintenance`, because
+    /// it outlives the flush and would keep that box allocated.
+    flush_completed_through: Option<u64>,
     io_notifier: RefCell<Option<crate::PartitionIoNotifier>>,
     io_bytes_max: Cell<usize>,
     io_sequence: Cell<u64>,
@@ -329,7 +345,7 @@ where
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Entries journaled before this replica adopted the current view, held back
     /// from commit and acknowledgement until proven. See [`Self::fence_view_window`].
-    view_fence: Option<ViewFence>,
+    view_fence: Option<Box<ViewFence>>,
     /// Set at boot when the WAL replayed history: the first view adoption after a
     /// restart fences it even though `log_view` came back unchanged.
     recovered_unproven: bool,
@@ -447,10 +463,10 @@ where
     /// Offsets the append fence claims per superblock write; installed by boot
     /// from `PartitionsConfig`.
     offset_reservation_lease: u64,
-    /// In-flight state transfer for this group (rejoin whose repair floor was
-    /// refused); tail repair takes over at install. See
-    /// [`PartitionTransferSession`].
-    pub transfer: Option<PartitionTransferSession>,
+    /// When this partition comes due for a WAL checkpoint.
+    checkpoint_policy: CheckpointPolicy,
+    /// In-flight state transfer session. Boxed for the same reason as `repair`.
+    transfer: Option<Box<PartitionTransferSession>>,
     /// Consecutive transfer stall rounds WITHIN one recovery attempt. NOT in the
     /// session: three of four metadata arming sites re-minted their session, so
     /// a per-session counter bounded nothing and a permanent failure cycled
@@ -521,6 +537,20 @@ where
     /// describes.
     pub(crate) transfer_plan: RefCell<Option<TransferPlanSlot>>,
 }
+
+// Cold state stays behind one pointer per field. Inline, one of these fields
+// costs every idle partition a few hundred bytes, and the limit of the idle
+// memory test is too coarse to catch that.
+const BOXED_FIELD_BYTES: usize = size_of::<usize>();
+const _: () = {
+    assert!(field_size(|partition: &IggyPartition| &partition.repair) == BOXED_FIELD_BYTES);
+    assert!(field_size(|partition: &IggyPartition| &partition.transfer) == BOXED_FIELD_BYTES);
+    assert!(
+        field_size(|partition: &IggyPartition| &partition.materialization) == BOXED_FIELD_BYTES
+    );
+    assert!(field_size(|partition: &IggyPartition| &partition.view_fence) == BOXED_FIELD_BYTES);
+    assert!(field_size(|partition: &IggyPartition| &partition.maintenance) == BOXED_FIELD_BYTES);
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstalledConsumerGroupOwner {
@@ -803,11 +833,9 @@ struct PendingMaterializationSave {
     written: u64,
 }
 
-#[derive(Default)]
 struct PendingPartitionMaintenance {
     flush_through: Option<u64>,
     flush_drain: Option<crate::PersistenceDrain>,
-    flush_completed_through: Option<u64>,
     transfer_flush: bool,
     shutdown: Option<PartitionShutdownPhase>,
     shutdown_drain: Option<crate::PersistenceDrain>,
@@ -818,6 +846,85 @@ struct PendingPartitionMaintenance {
     removal_trim: Option<u64>,
     eviction: Option<u64>,
     tiering: Option<PendingTiering>,
+}
+
+impl PendingPartitionMaintenance {
+    const IDLE: Self = Self {
+        flush_through: None,
+        flush_drain: None,
+        transfer_flush: false,
+        shutdown: None,
+        shutdown_drain: None,
+        checkpoint: None,
+        retention: None,
+        removing: None,
+        removal_trim: None,
+        eviction: None,
+        tiering: None,
+    };
+
+    /// Destructured, so a new field fails to compile here instead of being
+    /// freed while it still holds work.
+    const fn is_idle(&self) -> bool {
+        let Self {
+            flush_through,
+            flush_drain,
+            transfer_flush,
+            shutdown,
+            shutdown_drain,
+            checkpoint,
+            retention,
+            removing,
+            removal_trim,
+            eviction,
+            tiering,
+        } = self;
+        flush_through.is_none()
+            && flush_drain.is_none()
+            && !*transfer_flush
+            && shutdown.is_none()
+            && shutdown_drain.is_none()
+            && checkpoint.is_none()
+            && retention.is_none()
+            && removing.is_none()
+            && removal_trim.is_none()
+            && eviction.is_none()
+            && tiering.is_none()
+    }
+}
+
+/// Maintenance state, boxed only while an operation in it is pending. A read of
+/// an unboxed state sees [`PendingPartitionMaintenance::IDLE`], and the first
+/// write boxes it. [`Self::release_if_idle`] frees it again.
+#[derive(Default)]
+struct LazyMaintenance(Option<Box<PendingPartitionMaintenance>>);
+
+impl LazyMaintenance {
+    fn release_if_idle(&mut self) {
+        if self
+            .0
+            .as_deref()
+            .is_some_and(PendingPartitionMaintenance::is_idle)
+        {
+            self.0 = None;
+        }
+    }
+}
+
+impl Deref for LazyMaintenance {
+    type Target = PendingPartitionMaintenance;
+
+    fn deref(&self) -> &PendingPartitionMaintenance {
+        static IDLE: PendingPartitionMaintenance = PendingPartitionMaintenance::IDLE;
+        self.0.as_deref().unwrap_or(&IDLE)
+    }
+}
+
+impl DerefMut for LazyMaintenance {
+    fn deref_mut(&mut self) -> &mut PendingPartitionMaintenance {
+        self.0
+            .get_or_insert_with(|| Box::new(PendingPartitionMaintenance::IDLE))
+    }
 }
 
 /// A request to complete the partition's chain, which may still lack the
@@ -860,6 +967,21 @@ struct PendingWireActions {
     actions: Vec<consensus::VsrAction>,
 }
 
+/// What a partition did with a flush that the shard budget asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliefFlush {
+    /// It deferred a flush through its commit point, which the I/O lane
+    /// starts on its next turn.
+    Asked,
+    /// A flush deferred earlier still waits.
+    Pending,
+    /// It cannot flush now: a view change, a commit, a materialization or a
+    /// transition runs, or the WAL lags the commit point.
+    Blocked,
+    /// No flush frees its committed resident messages.
+    Never,
+}
+
 enum PendingCheckpoint {
     /// The receipt table at the checkpoint op. Commits keep advancing while the
     /// checkpoint runs, so it is captured before any other phase.
@@ -880,6 +1002,9 @@ enum PendingCheckpoint {
 enum PartitionShutdownPhase {
     DrainAccepted,
     Flush,
+    /// Waits until the checkpoint starts or the shard ends the hold. A
+    /// started checkpoint finishes in the drain of the writers.
+    CheckpointHold,
     DrainWriters,
     Collapse,
     Complete,
@@ -1021,9 +1146,9 @@ where
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
             dirty_offset: AtomicU64::new(0),
-            consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(1)),
-            consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
-            last_polled_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
+            consumer_offsets: RefCell::default(),
+            consumer_group_offsets: RefCell::default(),
+            last_polled_offsets: RefCell::default(),
             consumer_group_owners: BTreeMap::new(),
             consumer_group_polls: BTreeMap::new(),
             owner_retirement: None,
@@ -1040,12 +1165,16 @@ where
             segment_upload_attempts: 0,
             upload_cursor: None,
             upload_wanted: Cell::new(false),
+            long_term_changed: Cell::new(false),
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
             topic_object_check: crate::topic_object::TopicObjectCheck::default(),
+            long_term_rewrite_jobs: 0,
+            long_term_backlog: Box::default(),
+            manifest_publish_jobs: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -1088,7 +1217,8 @@ where
             local_request_order: Cell::new(0),
             no_ack: VecDeque::new(),
             materialization: None,
-            maintenance: PendingPartitionMaintenance::default(),
+            maintenance: LazyMaintenance::default(),
+            flush_completed_through: None,
             io_notifier: RefCell::new(None),
             io_bytes_max: Cell::new(isize::MAX as usize),
             io_sequence: Cell::new(0),
@@ -1131,6 +1261,7 @@ where
             durable_offset_frontier: Cell::new(0),
             durable_offset_reserved: Cell::new(0),
             offset_reservation_lease: u64::from(crate::DEFAULT_OFFSET_RESERVATION_LEASE),
+            checkpoint_policy: CheckpointPolicy::default(),
             transfer: None,
             transfer_attempts: 0,
             repair_attempts: 0,
@@ -1162,6 +1293,13 @@ where
         self.consensus.set_partition_incarnation(created_revision);
     }
 
+    /// Refuse every request stamped below `created_op`, the metadata op that
+    /// created this incarnation. A session that ended before it then never
+    /// writes here, so no retirement walk has to visit it.
+    pub fn start_at_create_op(&mut self, created_op: u64) {
+        self.required_metadata_frontier = self.required_metadata_frontier.max(created_op);
+    }
+
     /// Metadata creation revision that isolates this incarnation's on-disk
     /// history and consensus frames. Zero only without a metadata row.
     #[must_use]
@@ -1169,21 +1307,58 @@ where
         self.consensus.partition_incarnation()
     }
 
-    /// A report covers an applied retirement barrier or terminal history fence
-    /// on a serving replica. Replay or a checkpoint must restore that proof.
-    /// Retirement barriers require persistence at every durability level.
+    /// Whether this serving replica holds retired every session of `ended`
+    /// that ended at or below `retired_through`, with no pending request of a
+    /// client of `ended`: by a terminal history fence, or by a frontier at
+    /// `retired_through` and no slice entry of those sessions. Replay or a
+    /// checkpoint must restore that proof. Retirement barriers require
+    /// persistence at every durability level.
+    ///
+    /// `ended` is sorted by client id. [`BatchRetirement::Owed`] names every
+    /// session of `ended` with a slice entry here, also one that ended later,
+    /// so that one barrier retires them all.
     #[must_use]
-    pub fn session_retired(&self, identity: SessionIdentity) -> bool {
-        self.fatal.is_none()
+    pub fn sessions_retired(
+        &self,
+        ended: &[SessionIdentity],
+        retired_through: u64,
+    ) -> BatchRetirement {
+        let in_batch = |client_id: u128| {
+            ended
+                .binary_search_by_key(&client_id, |identity| identity.client_id)
+                .ok()
+                .map(|index| ended[index])
+        };
+        let owed: Vec<SessionIdentity> = self
+            .dedup
+            .active_sessions()
+            .filter_map(|(client_id, _, session)| {
+                in_batch(client_id).filter(|identity| identity.session == session)
+            })
+            .collect();
+        let serving = self.fatal.is_none()
             && !self.requires_state_transfer()
             && self.consensus.is_normal()
-            && !self.consensus.is_transferring()
-            && self.consensus.pending_request(identity.client_id).is_none()
-            && (self
-                .history_transition
-                .is_some_and(|history| history.partition_op <= self.consensus.commit_min())
-                || (self.required_metadata_frontier >= identity.metadata_watermark
-                    && self.dedup.get_epoch(identity.client_id) != Some(identity.session)))
+            && !self.consensus.is_transferring();
+        let pending = self.consensus.with_pipeline(|pipeline| {
+            pipeline
+                .pending_client_ids()
+                .any(|client_id| in_batch(client_id).is_some())
+        });
+        let fenced = self
+            .history_transition
+            .is_some_and(|history| history.partition_op <= self.consensus.commit_min());
+        let holds_entry = owed
+            .iter()
+            .any(|identity| identity.metadata_watermark <= retired_through);
+        if serving
+            && !pending
+            && (fenced || (self.required_metadata_frontier >= retired_through && !holds_entry))
+        {
+            BatchRetirement::Retired
+        } else {
+            BatchRetirement::Owed(owed)
+        }
     }
 
     /// Arms the session gate for `debt_op`. Only a normal primary with an
@@ -1379,7 +1554,7 @@ where
             return false;
         };
         self.last_polled_offsets
-            .pin()
+            .borrow()
             .get(&ConsumerGroupId(id as usize))
             .is_some_and(|polled| {
                 self.durable_consumer_offsets
@@ -1482,7 +1657,7 @@ where
         self.consumer_group_polls
             .insert(installation.group_id, Arc::new(AtomicBool::new(true)));
         self.last_polled_offsets
-            .pin()
+            .borrow_mut()
             .remove(&ConsumerGroupId(group_id as usize));
         self.mark_consumer_group_offsets_dirty();
         self.fence_published.set(true);
@@ -1599,7 +1774,7 @@ where
             // Last-polled keys come from u32 group ids only.
             if let Ok(id) = u32::try_from(group_id) {
                 self.last_polled_offsets
-                    .pin()
+                    .borrow_mut()
                     .remove(&ConsumerGroupId(id as usize));
             }
         }
@@ -1950,10 +2125,13 @@ where
         for message in prepares {
             let header = *message.header();
             if header.op == checkpoint {
-                self.log
-                    .journal()
-                    .inner
-                    .restore_checkpoint_prepare(checkpoint, message.into_frozen());
+                self.log.journal().inner.restore_checkpoint_prepare(
+                    checkpoint,
+                    message.into_frozen(),
+                    persistence
+                        .segment_reference(checkpoint)
+                        .map(BodyPosition::from),
+                );
                 continue;
             }
             if header.operation == Operation::SendMessages {
@@ -2105,10 +2283,14 @@ where
     ///
     /// Receipts are captured at `commit_min`, so the checkpoint covers exactly
     /// that op, and only once the WAL holds it.
+    ///
+    /// In a graceful stop, one starts only while the stop holds the
+    /// partition for it: past the hold the exit can cut it.
     fn persistence_checkpoint_through(&self) -> Option<u64> {
         let persistence = self.persistence.as_ref()?;
         let through_op = self.consensus.commit_min();
         (self.fatal.is_none()
+            && (self.maintenance.shutdown.is_none() || self.holds_shutdown_for_checkpoint())
             && self.maintenance.checkpoint.is_none()
             && !self.checkpoint_waits_for_commit()
             && !self.checkpoint_waits_for_advances()
@@ -2118,19 +2300,24 @@ where
         .then_some(through_op)
     }
 
-    pub async fn checkpoint_persistence(&mut self, config: &PartitionsConfig) {
+    /// Starts a checkpoint if one is due. Returns why it started.
+    pub async fn checkpoint_persistence(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Option<CheckpointTrigger> {
         let (Some(through_op), Some(persistence)) = (
             self.persistence_checkpoint_through(),
             self.persistence.clone(),
         ) else {
-            return;
+            return None;
         };
         if self.has_io_dispatcher() {
-            match self.encode_retry_checkpoint(through_op) {
+            return match self.encode_retry_checkpoint(through_op) {
                 Ok(receipts) => {
                     self.maintenance.checkpoint =
                         Some(PendingCheckpoint::Receipts(through_op, receipts));
                     self.notify_io();
+                    Some(self.settle_checkpoint_start(through_op))
                 }
                 Err(error) => {
                     error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
@@ -2139,13 +2326,13 @@ where
                         op: through_op,
                         operation: None,
                     });
+                    None
                 }
-            }
-            return;
+            };
         }
         match self.commit_messages_inner(config, true, through_op).await {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return None,
             Err(error) => {
                 error!(%error, namespace_raw = self.namespace().inner(), "partition checkpoint failed");
                 self.fatal = Some(FatalCommit {
@@ -2153,7 +2340,7 @@ where
                     op: through_op,
                     operation: None,
                 });
-                return;
+                return None;
             }
         }
         let mut barriers = Vec::new();
@@ -2165,7 +2352,7 @@ where
                     op: through_op,
                     operation: None,
                 });
-                return;
+                return None;
             }
             // [`IggyIndexWriter::fsync`] used the original descriptor above.
             // The marker tells [`PartitionPersistence::checkpoint_files`] not
@@ -2179,13 +2366,14 @@ where
                 op: through_op,
                 operation: None,
             });
-            return;
+            return None;
         }
         // Receipt publication already syncs the file and its directory.
         let (files, directories) = self.persistence_checkpoint_files(config);
         persistence.checkpoint_files(through_op, files, directories, barriers);
         self.pending_retry_checkpoint = Some(through_op);
         self.start_persistence();
+        Some(self.settle_checkpoint_start(through_op))
     }
 
     /// Queue original-writer syncs before the install backup is published.
@@ -2628,7 +2816,12 @@ where
             return false;
         }
         self.persist_repaired_prefix();
-        let (op, checksum) = if let Some(fence) = self.view_fence.filter(|_| self.view_fenced()) {
+        let (op, checksum) = if let Some(fence) = self
+            .view_fence
+            .as_deref()
+            .copied()
+            .filter(|_| self.view_fenced())
+        {
             // The certificate covers the whole WAL, so while fenced it may only
             // vouch for a WAL holding nothing above `commit_min`, and only when
             // the window sits below the suffix a `DoViewChange` reports.
@@ -2846,6 +3039,20 @@ where
             reserved: 0,
         })
         .await
+    }
+
+    /// Whether the view state of this replica waits for a superblock write
+    /// that is queued, runs, or is due for a retry. Every view-scoped send of
+    /// the replica waits with it.
+    ///
+    /// Only the local superblock I/O counts. A persist that waits for anything
+    /// else, such as a proof from a peer, is not pending here.
+    #[must_use]
+    pub fn view_persist_pending(&self) -> bool {
+        self.consensus.needs_superblock_persist()
+            && (self.superblock_intent.get().is_some()
+                || self.superblock_running.get().is_some()
+                || self.superblock_write_is_backed_off())
     }
 
     pub fn defer_wire_actions(&self, actions: Vec<consensus::VsrAction>) {
@@ -3371,7 +3578,7 @@ where
         self.required_metadata_frontier = required_metadata_frontier;
         self.retirement_paid_through = retirement_paid_through;
         for (consumer_id, offset) in consumer_offsets {
-            self.consumer_offsets.pin().insert(
+            self.consumer_offsets.borrow_mut().insert(
                 consumer_id as usize,
                 ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, offset, String::new()),
             );
@@ -3383,7 +3590,7 @@ where
             );
         }
         for (group_id, offset) in consumer_group_offsets {
-            self.consumer_group_offsets.pin().insert(
+            self.consumer_group_offsets.borrow_mut().insert(
                 ConsumerGroupId(group_id as usize),
                 ConsumerOffset::new(ConsumerKind::ConsumerGroup, group_id, offset, String::new()),
             );
@@ -3866,6 +4073,28 @@ where
         self.injected_commit_failure = true;
     }
 
+    /// In-flight journal repair:
+    /// set when the recovery handshake finds this replica behind the group's
+    /// commit frontier, cleared when `RepairDone` completes the walk.
+    #[must_use]
+    pub fn repair(&self) -> Option<&RepairSession> {
+        self.repair.as_deref()
+    }
+
+    // A match, because the const `note_repair_floor` calls this and
+    // `Option::as_deref_mut` is not a const fn yet.
+    pub const fn repair_mut(&mut self) -> Option<&mut RepairSession> {
+        match &mut self.repair {
+            Some(session) => Some(session),
+            None => None,
+        }
+    }
+
+    /// Open a repair session, or close the open one with `None`.
+    pub fn set_repair(&mut self, session: Option<RepairSession>) {
+        self.repair = session.map(Box::new);
+    }
+
     /// Burn one repair stall round; `true` once the session spent the budget.
     /// The count then restarts, so the session that the shard opens in its
     /// place gets the whole budget.
@@ -3917,6 +4146,28 @@ where
     pub const fn restart_repair_budget(&mut self) {
         self.repair_attempts = 0;
         self.repair_rotations = 0;
+    }
+
+    /// In-flight state transfer for this group (rejoin whose repair floor was
+    /// refused); tail repair takes over at install. See
+    /// [`PartitionTransferSession`].
+    #[must_use]
+    pub fn transfer(&self) -> Option<&PartitionTransferSession> {
+        self.transfer.as_deref()
+    }
+
+    pub fn transfer_mut(&mut self) -> Option<&mut PartitionTransferSession> {
+        self.transfer.as_deref_mut()
+    }
+
+    /// Open a transfer session, or close the open one with `None`.
+    pub fn set_transfer(&mut self, session: Option<PartitionTransferSession>) {
+        self.transfer = session.map(Box::new);
+    }
+
+    /// Close the transfer session and hand it to the caller.
+    pub fn take_transfer(&mut self) -> Option<PartitionTransferSession> {
+        self.transfer.take().map(|session| *session)
     }
 
     /// Burn one transfer stall round; `true` once the budget is exhausted.
@@ -4123,8 +4374,8 @@ where
         consumer_group_offsets: ConsumerGroupOffsets,
     ) {
         self.invalidate_poll_history();
-        self.consumer_offsets = Arc::new(consumer_offsets);
-        self.consumer_group_offsets = Arc::new(consumer_group_offsets);
+        *self.consumer_offsets.get_mut() = consumer_offsets;
+        *self.consumer_group_offsets.get_mut() = consumer_group_offsets;
         self.consumer_offset_dirs = dirs.map(Some);
     }
 
@@ -4148,11 +4399,13 @@ where
     pub(crate) fn forget_recovered_consumer_offset(&self, kind: ConsumerKind, consumer_id: u32) {
         match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().remove(&(consumer_id as usize));
+                self.consumer_offsets
+                    .borrow_mut()
+                    .remove(&(consumer_id as usize));
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .remove(&ConsumerGroupId(consumer_id as usize));
             }
             // The durable table below is the only store of an external offset.
@@ -4189,8 +4442,8 @@ where
     #[must_use]
     pub fn consumer_offset_map_count(&self, kind: ConsumerKind) -> usize {
         match kind {
-            ConsumerKind::Consumer => self.consumer_offsets.len(),
-            ConsumerKind::ConsumerGroup => self.consumer_group_offsets.len(),
+            ConsumerKind::Consumer => self.consumer_offsets.borrow().len(),
+            ConsumerKind::ConsumerGroup => self.consumer_group_offsets.borrow().len(),
             ConsumerKind::ExternalGroup => self.durable_consumer_offsets.count(kind),
         }
     }
@@ -4720,7 +4973,7 @@ where
         self.index_fetches.replace_history(self.poll_history);
         self.publish_poll_visibility();
         self.discard_queued_auto_commits();
-        self.transfer_plan.borrow_mut().take();
+        self.drop_transfer_plan();
     }
 
     /// The served history and what commits made visible in it. A change of
@@ -5324,11 +5577,11 @@ where
             // the key present. Deletion is idempotent on every replica, while
             // admission still rejects a request for an already absent key.
             (ConsumerKind::Consumer, PendingConsumerOffsetMutation::Delete) => {
-                self.consumer_offsets.pin().remove(&key);
+                self.consumer_offsets.borrow_mut().remove(&key);
             }
             (ConsumerKind::ConsumerGroup, PendingConsumerOffsetMutation::Delete) => {
                 self.consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .remove(&ConsumerGroupId(key));
             }
             // `persist_consumer_offset_commit` already updated the durable
@@ -5367,7 +5620,7 @@ where
     #[allow(clippy::cast_possible_truncation)]
     pub fn consumer_group_offset_ids(&self) -> Vec<u64> {
         self.consumer_group_offsets
-            .pin()
+            .borrow()
             .keys()
             .map(|key| key.0 as u64)
             .collect()
@@ -5446,8 +5699,8 @@ where
     pub fn group_offset_state(&self, group_id: u64) -> (Option<u64>, Option<u64>) {
         let key = ConsumerGroupId(group_id as usize);
         let load = |offset: &ConsumerOffset| offset.offset.load(Ordering::Relaxed);
-        let last_polled = self.last_polled_offsets.pin().get(&key).map(load);
-        let committed = self.consumer_group_offsets.pin().get(&key).map(load);
+        let last_polled = self.last_polled_offsets.borrow().get(&key).map(load);
+        let committed = self.consumer_group_offsets.borrow().get(&key).map(load);
         (last_polled, committed)
     }
 
@@ -5748,10 +6001,10 @@ where
     fn offset_key_exists(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
         let key = || usize::try_from(consumer_id).expect("u32 consumer id must fit usize");
         match kind {
-            ConsumerKind::Consumer => self.consumer_offsets.pin().contains_key(&key()),
+            ConsumerKind::Consumer => self.consumer_offsets.borrow().contains_key(&key()),
             ConsumerKind::ConsumerGroup => self
                 .consumer_group_offsets
-                .pin()
+                .borrow()
                 .contains_key(&ConsumerGroupId(key())),
             ConsumerKind::ExternalGroup => {
                 self.durable_consumer_offsets.contains(kind, consumer_id)
@@ -5914,7 +6167,7 @@ where
         }
 
         if current_view != self.observed_view {
-            self.last_polled_offsets.pin().clear();
+            self.last_polled_offsets.borrow_mut().clear();
             self.consumer_group_polls.clear();
             self.pending_owner_install.set(None);
             self.pending_history_transition.set(None);
@@ -6053,38 +6306,37 @@ where
         }
     }
 
-    fn reclaim_phantom_offset_keys<K: Hash + Eq>(
+    fn reclaim_phantom_offset_keys<K: Ord + Copy>(
         &self,
-        offsets: &papaya::HashMap<K, ConsumerOffset>,
+        offsets: &RefCell<BTreeMap<K, ConsumerOffset>>,
         kind: ConsumerKind,
-        mut remaining: usize,
+        remaining: usize,
         consumer_id: impl Fn(&K) -> Option<u32>,
     ) {
         let capacity = self.consumer_offset_capacity_for(kind);
-        let map = offsets.pin();
-        for (key, _) in &map {
-            if let Some(id) = consumer_id(key)
-                && !capacity.holds(id, &self.durable_consumer_offsets)
-                && map.remove(key).is_some()
-            {
-                capacity.forget_inactive_provisional(id);
-                // This cursor was never durable, so the consumer's next `Next`
-                // poll restarts from offset 0 and redelivers. At-least-once
-                // permits it; an operator should still see it happen.
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = self.namespace().inner(),
-                    ?kind,
-                    consumer_id = id,
-                    "reclaimed a local consumer offset cursor with no durable backing; its next \
-                     poll restarts from offset 0"
-                );
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
-            }
+        // `take` ends the walk at the last key this call needs.
+        let phantoms: Vec<(K, u32)> = offsets
+            .borrow()
+            .keys()
+            .filter_map(|key| Some((*key, consumer_id(key)?)))
+            .filter(|(_, id)| !capacity.holds(*id, &self.durable_consumer_offsets))
+            .take(remaining)
+            .collect();
+        for (key, id) in phantoms {
+            offsets.borrow_mut().remove(&key);
+            capacity.forget_inactive_provisional(id);
+            // This cursor was never durable, so the consumer's next `Next`
+            // poll restarts from offset 0 and redelivers. At-least-once
+            // permits it; an operator should still see it happen.
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                ?kind,
+                consumer_id = id,
+                "reclaimed a local consumer offset cursor with no durable backing; its next \
+                 poll restarts from offset 0"
+            );
         }
     }
 
@@ -6400,12 +6652,12 @@ where
         match consumer {
             PollingConsumer::Consumer(id, _) => self
                 .consumer_offsets
-                .pin()
+                .borrow()
                 .get(&id)
                 .map(|co| co.offset.load(Ordering::Relaxed)),
             PollingConsumer::ConsumerGroup(group_id, _) => self
                 .consumer_group_offsets
-                .pin()
+                .borrow()
                 .get(&ConsumerGroupId(group_id))
                 .map(|co| co.offset.load(Ordering::Relaxed)),
         }
@@ -6505,25 +6757,29 @@ where
                 .shutdown
                 .is_some_and(|phase| phase != PartitionShutdownPhase::Complete);
         }
-        self.io_active.get().is_none()
-            && (self.pending_commit.is_some()
-                || self.materialization.is_some()
-                || self.transition.is_some()
-                || !self.deferred_views.is_empty()
-                || self.superblock_intent.get().is_some()
-                || self.pending_wire_actions.borrow().is_some()
-                || !self.pending_persisted_acks.borrow().is_empty()
-                || !self.no_ack.is_empty()
-                || self.maintenance.flush_through.is_some()
-                || self.maintenance.checkpoint.is_some()
-                || self.maintenance.retention.is_some()
-                || self.maintenance.eviction.is_some()
-                || self.maintenance.tiering.is_some()
-                || self
-                    .maintenance
-                    .shutdown
-                    .is_some_and(|phase| phase != PartitionShutdownPhase::Complete)
-                || self.queued_requests_ready())
+        self.io_active.get().is_none() && self.has_lane_work()
+    }
+
+    /// Work that only a turn of the I/O lane moves.
+    fn has_lane_work(&self) -> bool {
+        self.pending_commit.is_some()
+            || self.materialization.is_some()
+            || self.transition.is_some()
+            || !self.deferred_views.is_empty()
+            || self.superblock_intent.get().is_some()
+            || self.pending_wire_actions.borrow().is_some()
+            || !self.pending_persisted_acks.borrow().is_empty()
+            || !self.no_ack.is_empty()
+            || self.maintenance.flush_through.is_some()
+            || self.maintenance.checkpoint.is_some()
+            || self.maintenance.retention.is_some()
+            || self.maintenance.eviction.is_some()
+            || self.maintenance.tiering.is_some()
+            || self
+                .maintenance
+                .shutdown
+                .is_some_and(|phase| phase != PartitionShutdownPhase::Complete)
+            || self.queued_requests_ready()
     }
 
     #[must_use]
@@ -6580,6 +6836,15 @@ where
         });
         self.notify_io();
         true
+    }
+
+    /// Whether a deferred primary transfer still waits for its drain.
+    #[must_use]
+    pub const fn primary_transfer_pending(&self) -> bool {
+        matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        )
     }
 
     fn primary_transfer_is_current(&self, request: &crate::PreparedPrimaryTransfer) -> bool {
@@ -6700,7 +6965,7 @@ where
 
     /// One complete owner mutation per call. File execution is always separate.
     pub async fn resume_io(&mut self, config: &PartitionsConfig) -> crate::PartitionIoStep {
-        match self.resume_io_inner(config).await {
+        let step = match self.resume_io_inner(config).await {
             Ok(step) => step,
             Err(error) => {
                 self.cancel_primary_transfer();
@@ -6710,7 +6975,11 @@ where
                 }
                 crate::PartitionIoStep::Pending
             }
-        }
+        };
+        // Maintenance work outside this lane notifies it, so the last call of
+        // a run sees the finished state here.
+        self.maintenance.release_if_idle();
+        step
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6972,7 +7241,7 @@ where
             return Ok(self.drive_install_io().await);
         }
         if !self.is_shutting_down()
-            && self.transfer.as_ref().is_some_and(|session| {
+            && self.transfer().is_some_and(|session| {
                 session.target_accepted
                     && (session
                         .scan
@@ -7360,7 +7629,7 @@ where
 
     /// Shutdown closes admission while previously accepted work drains.
     #[must_use]
-    pub const fn is_shutting_down(&self) -> bool {
+    pub fn is_shutting_down(&self) -> bool {
         self.maintenance.shutdown.is_some()
     }
 
@@ -7372,7 +7641,6 @@ where
                     || self.materialization_missing
                     || self.io_active.is_retiring()
                     || self
-                        .maintenance
                         .flush_completed_through
                         .is_some_and(|through| through >= self.shutdown_flush_target())))
                 || (self.io_active.is_deleting()
@@ -7393,12 +7661,12 @@ where
         {
             self.materialization = None;
             self.finish_flush();
-            self.maintenance.flush_completed_through = None;
+            self.flush_completed_through = None;
             let mut plan = self.transfer_plan.borrow_mut();
             if matches!(*plan, Some(TransferPlanSlot::Wanted)) {
-                *plan = Some(TransferPlanSlot::Failed(
+                *plan = Some(TransferPlanSlot::Failed(Box::new(
                     PartitionTransferUnavailable::FlushFailed(error.clone()),
-                ));
+                )));
             }
         } else {
             self.fail_pending_commit(error);
@@ -7441,7 +7709,7 @@ where
 
     fn finish_flush(&mut self) {
         if let Some(through) = self.maintenance.flush_through.take() {
-            self.maintenance.flush_completed_through = Some(through);
+            self.flush_completed_through = Some(through);
         }
         self.maintenance.transfer_flush = false;
         if let Some(drain) = self.maintenance.flush_drain.take()
@@ -7459,6 +7727,17 @@ where
             *self.transfer_plan.borrow(),
             Some(TransferPlanSlot::Pinned(_))
         )
+    }
+
+    /// Empties the transfer plan slot. A pinned plan kept the shard's shed
+    /// out of the repair ring, so the ring queues for the shed again.
+    pub(crate) fn drop_transfer_plan(&self) {
+        if matches!(
+            self.transfer_plan.borrow_mut().take(),
+            Some(TransferPlanSlot::Pinned(_))
+        ) {
+            self.log.journal().inner.queue_ring_shed();
+        }
     }
 
     /// The plan an offer round hashes against, or `None` while the flush that
@@ -7495,7 +7774,7 @@ where
                 *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Pinned(Rc::clone(&plan)));
                 Ok(Some(plan))
             }
-            Some(TransferPlanSlot::Failed(error)) => Err(error),
+            Some(TransferPlanSlot::Failed(error)) => Err(*error),
             Some(TransferPlanSlot::Wanted) | None => {
                 *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Wanted);
                 self.notify_io();
@@ -7531,7 +7810,7 @@ where
         }
         let slot = match self.capture_transfer_plan() {
             Ok(plan) => TransferPlanSlot::Pinned(Rc::new(plan)),
-            Err(error) => TransferPlanSlot::Failed(error),
+            Err(error) => TransferPlanSlot::Failed(Box::new(error)),
         };
         *self.transfer_plan.borrow_mut() = Some(slot);
         true
@@ -7542,13 +7821,13 @@ where
             && matches!(
                 self.maintenance.shutdown,
                 Some(
-                    PartitionShutdownPhase::DrainWriters
+                    PartitionShutdownPhase::CheckpointHold
+                        | PartitionShutdownPhase::DrainWriters
                         | PartitionShutdownPhase::Collapse
                         | PartitionShutdownPhase::Complete
                 )
             )
             && self
-                .maintenance
                 .flush_completed_through
                 .is_none_or(|through| through < self.shutdown_flush_target())
         {
@@ -7568,6 +7847,17 @@ where
             Some(PartitionShutdownPhase::Flush)
                 if self.maintenance.flush_through.is_none() && self.materialization.is_none() =>
             {
+                self.maintenance.shutdown = Some(if self.holds_shutdown_for_checkpoint() {
+                    PartitionShutdownPhase::CheckpointHold
+                } else {
+                    PartitionShutdownPhase::DrainWriters
+                });
+                crate::PartitionIoStep::Progress
+            }
+            Some(PartitionShutdownPhase::CheckpointHold) => {
+                if self.holds_shutdown_for_checkpoint() {
+                    return crate::PartitionIoStep::Pending;
+                }
                 self.maintenance.shutdown = Some(PartitionShutdownPhase::DrainWriters);
                 crate::PartitionIoStep::Progress
             }
@@ -7914,6 +8204,38 @@ where
         self.release_send_space();
     }
 
+    /// Whether this replica answers every client request as not accepted for
+    /// now: it is not a primary in normal status, or it is on its way out.
+    fn refuses_requests(&self) -> bool {
+        let consensus = self.consensus();
+        self.fatal.is_some()
+            || self.maintenance.shutdown.is_some()
+            || self.io_active.is_retiring()
+            || self.transition.is_some()
+            || self.materialization_missing
+            || consensus.is_follower()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+    }
+
+    /// Whether a send may go to the object store for this partition now: the
+    /// partition places its batches, and this replica would not refuse the
+    /// request that commits where they sit. The node's upload path asks
+    /// before it stores a send's messages, and again before it hands the
+    /// request over.
+    #[must_use]
+    pub fn takes_placed_sends(&self) -> bool {
+        self.places_batches() && !self.refuses_requests()
+    }
+
+    /// Whether [`Self::on_placed_request`] has room for one more request. A
+    /// request handed over without room is answered as not accepted.
+    #[must_use]
+    pub fn has_request_room(&self) -> bool {
+        self.consensus()
+            .with_pipeline(|pipeline| !pipeline.request_queue_full())
+    }
+
     /// Whether `message` is a request [`Self::on_placed_request`] takes: a
     /// `SendMessages` whose body is one placed batch for this partition.
     fn is_placed_request(&self, message: &Message<RoutedRequestHeader>) -> bool {
@@ -8027,16 +8349,7 @@ where
                 .await;
                 return;
             }
-            if self.fatal.is_some()
-                || self.maintenance.shutdown.is_some()
-                || self.io_active.is_retiring()
-                || self.transition.is_some()
-                || self.materialization_missing
-                || consensus.is_follower()
-                || !consensus.is_normal()
-                || consensus.is_transferring()
-                || committed_history_pending
-            {
+            if self.refuses_requests() || committed_history_pending {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
@@ -9322,10 +9635,19 @@ where
                 .with_op(header.op),
             );
             // A new primary may still need quorum for an op committed here.
-            // Retained bytes prove its identity; the ack gate proves durability.
-            if let Some(journaled) = self.log.journal().inner.repair_entry(header.op)
-                && journaled_prepare_matches_retransmit(&journaled, &message)
-            {
+            // Retained bytes prove its identity, or the header and the batch
+            // checksum kept for a body that went back to its segment. The ack
+            // gate proves durability.
+            let journal = &self.log.journal().inner;
+            let same_prepare = journal.repair_entry(header.op).map_or_else(
+                || {
+                    journal
+                        .evicted_header(header.op)
+                        .is_some_and(|released| released.matches_retransmit(&message))
+                },
+                |journaled| journaled_prepare_matches_retransmit(&journaled, &message),
+            );
+            if same_prepare {
                 self.send_prepare_ok(&header).await;
             }
             return;
@@ -9431,13 +9753,14 @@ where
             return;
         }
 
-        // A header-only StartView can announce bodies this backup still lacks.
-        // Live same-view retransmits may fill its next verified slot; repair
-        // frames above commit still require the elected canonical headers.
+        // A StartView can announce bodies this backup still lacks. Live
+        // same-view retransmits may fill its next verified slot, unless the
+        // parked log names another prepare there; repair frames above commit
+        // still require the elected canonical headers.
         let is_backup = self.consensus().is_follower();
         if is_backup {
             let fills_announced_gap = header.op <= current_op
-                && !self.consensus().view_log_is_pending()
+                && self.view_log_admits(&header)
                 && self
                     .log
                     .journal()
@@ -9612,6 +9935,12 @@ where
                     self.advance_head_over_journaled_run();
                 }
             }
+            if header.op <= current_op {
+                // A parked log can name its head only by op. The body that
+                // fills that head gives the view-log proof its header, as a
+                // repaired body does.
+                consensus.note_repaired_view_header(header, RepairEvidence::Proven);
+            }
             consensus.observe_prepare_timestamp(header.timestamp);
         }
         if let Err(error) = replicate_frozen_prepare(consensus, frozen_for_forward).await {
@@ -9651,6 +9980,29 @@ where
             return;
         }
         self.send_prepare_ok(&header).await;
+    }
+
+    /// Whether the parked log of the adopted view lets a live prepare fill a
+    /// hole at or below the head.
+    ///
+    /// A backup keeps that log parked until the next view change, so a refusal
+    /// while it is parked leaves every hole to journal repair. The preflight
+    /// matched the view stamp, which only the primary of the view writes. So
+    /// the log refuses only a prepare that it names differently, the rule of
+    /// the repair ingest.
+    fn view_log_admits(&self, header: &PrepareHeader) -> bool {
+        let consensus = self.consensus();
+        let journal = &self.log.journal().inner;
+        let held_at = |op| {
+            journal
+                .header_by_op(op)
+                .map(|held| (held, consensus.view_log_entry_proven(op)))
+        };
+        consensus
+            .with_pending_view_log(|pending| {
+                repaired_prepare_evidence(header, consensus.view(), Some(pending), held_at)
+            })
+            .is_none_or(|evidence| evidence == RepairEvidence::Proven)
     }
 
     /// Whether `header` chains onto the entry this replica holds one op below
@@ -10119,6 +10471,9 @@ where
     async fn journal_append(&self, entry: Frozen<4096>) -> Result<(), IggyError> {
         let appended = self.log.journal().inner.append(entry).await;
         self.consensus.note_journal_mutation();
+        if appended.is_ok() {
+            self.stamp_checkpoint_op();
+        }
         appended.map_err(|_| IggyError::CannotAppendMessage)
     }
 
@@ -10263,6 +10618,8 @@ where
         let view = self.consensus.view();
         let previous = self
             .view_fence
+            .as_deref()
+            .copied()
             .filter(|fence| fence.view == view && fence.through == through);
         let anchor = anchor
             .filter(PrepareHeader::anchors_chain)
@@ -10279,13 +10636,13 @@ where
                 "holding partition entries journaled before this view until its log proves them"
             );
         }
-        self.view_fence = Some(ViewFence {
+        self.view_fence = Some(Box::new(ViewFence {
             view,
             through,
             anchor,
             hole: previous.and_then(|fence| fence.hole),
             unanchored_ticks: previous.map_or(0, |fence| fence.unanchored_ticks),
-        });
+        }));
     }
 
     /// Highest op through which this replica holds every entry above its commit
@@ -10469,7 +10826,7 @@ where
     /// I/O lane, or left for the next proof while other history work holds the
     /// lane, and the entries stay resident until the lane runs it.
     pub async fn prove_view_window(&mut self) -> Option<ViewWindowVerdict> {
-        let fence = self.view_fence?;
+        let fence = self.view_fence.as_deref().copied()?;
         let floor = self.fence_floor();
         if fence.through <= floor {
             self.view_fence = None;
@@ -10771,7 +11128,7 @@ where
         // Nothing is in flight for a cut range, so the next sweep re-requests it
         // instead of waiting out the retry timer.
         if removed > 0
-            && let Some(session) = self.repair.as_mut()
+            && let Some(session) = self.repair_mut()
         {
             session.requested_from = None;
         }
@@ -10829,7 +11186,6 @@ where
             }
             let through = self.consensus.commit_max();
             if self
-                .maintenance
                 .flush_completed_through
                 .is_some_and(|completed| completed >= through)
                 && self.materializable_prefix_len(through) == 0
@@ -10844,7 +11200,7 @@ where
             .as_ref()
             .filter(|persistence| persistence.segment_checkpoint().is_some())
         {
-            // Recovery only keeps segment bytes covered by the published WAL frontier.
+            // A power loss can take segment bytes that the published WAL frontier does not cover.
             persistence.sync();
             self.start_persistence();
             // Shutdown and transfer must finish the flush, but never drain while
@@ -10948,7 +11304,7 @@ where
         if !self.materialization_prefix_is_ready(prefix_len, through_op)? {
             return Ok(false);
         }
-        self.materialization = Some(PendingMaterialization {
+        self.materialization = Some(Box::new(PendingMaterialization {
             index_span_limit,
             incarnation: self.incarnation,
             poll_history: self.poll_history,
@@ -10960,7 +11316,7 @@ where
             save: None,
             checksum: None,
             digest: None,
-        });
+        }));
         Ok(true)
     }
 
@@ -12227,11 +12583,14 @@ where
                         .max(identity.metadata_watermark);
                 }
                 // A finalized session absent from the slice still must not
-                // start writing here, so the frontier covers the whole debt.
+                // start writing here, so the frontier covers the whole debt,
+                // and a walk barrier covers its whole batch.
                 self.retirement_paid_through =
                     self.retirement_paid_through.max(retirement.paid_through);
-                self.required_metadata_frontier =
-                    self.required_metadata_frontier.max(retirement.paid_through);
+                self.required_metadata_frontier = self
+                    .required_metadata_frontier
+                    .max(retirement.paid_through)
+                    .max(retirement.retired_through);
             }
             let reply = match self.commit_receipt(
                 &entry,
@@ -12259,6 +12618,7 @@ where
                 return None;
             }
             self.consensus.advance_commit_min(header.op);
+            self.log.journal().inner.mark_committed(header.op);
             // A lifecycle completion counts only once the reporter commits the
             // fence locally, so the backups must not wait for the heartbeat.
             // Data commits are too frequent to announce one by one.
@@ -12306,20 +12666,76 @@ where
     /// retention caps with nothing checkpointed to drop, ask for the
     /// checkpoint.
     fn release_checkpointed_commands(&self) {
-        let commit_min = self.consensus.commit_min();
-        let checkpoint_op = self
-            .persistence
-            .as_ref()
-            .map_or(commit_min, |persistence| persistence.checkpoint_op())
-            .min(commit_min);
         let over = self
             .log
             .journal()
             .inner
-            .release_checkpointed_commands(checkpoint_op);
+            .release_checkpointed_commands(self.command_release_op());
         if over && let Some(persistence) = &self.persistence {
             persistence.request_checkpoint();
         }
+    }
+
+    /// The highest op whose commands may leave memory: the WAL checkpoint,
+    /// which drops them too, and never past the commit point.
+    fn command_release_op(&self) -> u64 {
+        let commit_min = self.consensus.commit_min();
+        self.persistence
+            .as_ref()
+            .map_or(commit_min, |persistence| persistence.checkpoint_op())
+            .min(commit_min)
+    }
+
+    /// Releases checkpointed commands for `excess` bytes of the shard budget,
+    /// past the retention caps. Returns how many went, and whether committed
+    /// commands wait above the checkpoint, which only a checkpoint lets go.
+    ///
+    /// Keeps the command at the commit point: a view change reads its header
+    /// from memory, and a transfer donor sends its prepare.
+    pub(crate) fn release_commands_for(&self, excess: usize) -> (usize, bool) {
+        let journal = &self.log.journal().inner;
+        let below_commit = self.consensus.commit_min().saturating_sub(1);
+        let released =
+            journal.release_commands_for(self.command_release_op().min(below_commit), excess);
+        let wants_checkpoint = !self.is_shutting_down()
+            && self.persistence.as_ref().is_some_and(|persistence| {
+                journal.commands_in(persistence.checkpoint_op() + 1..=below_commit) > 0
+            });
+        (released, wants_checkpoint)
+    }
+
+    /// Defers a flush through the commit point for the shard budget, only
+    /// when the I/O lane starts it on its next turn. A deferred flush that
+    /// the lane cannot start keeps the history busy, which blocks a transfer.
+    pub(crate) fn ask_relief_flush(&mut self) -> ReliefFlush {
+        if self.fatal.is_some()
+            || self.materialization_missing
+            || self.persistence.is_none()
+            || self.is_shutting_down()
+            || self.io_active.is_retiring()
+        {
+            return ReliefFlush::Never;
+        }
+        if self.maintenance.flush_through.is_some() {
+            return ReliefFlush::Pending;
+        }
+        let commit_min = self.consensus.commit_min();
+        if self.consensus.status() != consensus::Status::Normal
+            || self.pending_commit.is_some()
+            || self.materialization.is_some()
+            || self.transition.is_some()
+            || self.flushable_through(commit_min) < commit_min
+        {
+            return ReliefFlush::Blocked;
+        }
+        // Committed resident messages with no prefix to flush sit above a
+        // hole, which repair or a state transfer closes.
+        if self.materializable_prefix_len(commit_min) == 0 {
+            return ReliefFlush::Never;
+        }
+        self.defer_flush(commit_min);
+        self.notify_io();
+        ReliefFlush::Asked
     }
 
     /// Every replica retains the committed result, so a promoted primary answers
@@ -12597,6 +13013,7 @@ where
         {
             self.offset.store(end_offset, Ordering::Release);
             self.committed_bytes = self.committed_bytes.saturating_add(batch_stats.size_bytes);
+            self.long_term_backlog.add(batch_stats.size_bytes);
             self.stats.set_current_offset(end_offset);
             // Advance the aggregate stats with the visible offset. Disk
             // persistence is threshold-gated in `commit_messages`, which
@@ -13173,16 +13590,16 @@ where
     /// the holder's identity. `None` when nothing has been committed, in which
     /// case there is no deletion barrier. External groups never hold retention.
     fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
-        let consumer_guard = self.consumer_offsets.pin();
-        let group_guard = self.consumer_group_offsets.pin();
-        let consumers = consumer_guard.iter().map(|(_, offset)| {
+        let consumer_guard = self.consumer_offsets.borrow();
+        let group_guard = self.consumer_group_offsets.borrow();
+        let consumers = consumer_guard.values().map(|offset| {
             (
                 offset.offset.load(Ordering::Relaxed),
                 offset.kind,
                 offset.consumer_id,
             )
         });
-        let groups = group_guard.iter().map(|(_, offset)| {
+        let groups = group_guard.values().map(|offset| {
             (
                 offset.offset.load(Ordering::Relaxed),
                 offset.kind,
@@ -13304,6 +13721,7 @@ where
         }
         removal.budget_spent = self.retention_is_ready(up_to_offset);
         self.maintenance.retention = None;
+        self.maintenance.release_if_idle();
         removal
     }
 
@@ -13454,6 +13872,7 @@ where
         }
         eviction.budget_spent = self.eviction_is_ready(through);
         self.maintenance.eviction = None;
+        self.maintenance.release_if_idle();
         eviction
     }
 
@@ -14918,7 +15337,7 @@ where
 
     /// Settle the session floor that a `RangeEvicted` reply reports.
     pub const fn note_repair_floor(&mut self, floor: u64) {
-        if let Some(session) = self.repair.as_mut() {
+        if let Some(session) = self.repair_mut() {
             session.floor = Some(floor);
         }
     }
@@ -14989,7 +15408,7 @@ where
         if self.unproven_drop_from.is_some() {
             return RepairIngest::Handled;
         }
-        let Some(session) = self.repair else {
+        let Some(session) = self.repair().copied() else {
             return RepairIngest::Handled;
         };
         let consensus = self.consensus();
@@ -14998,7 +15417,7 @@ where
         // first inbound frame leaves the coverage scan re-arming every tick over
         // a stream it can never keep.
         if !repair_session_live(consensus) || consensus.view() != session.view {
-            self.repair = None;
+            self.set_repair(None);
             return RepairIngest::Handled;
         }
         if header.op <= consensus.commit_min() || header.op > session.fetch_to_op {
@@ -15047,7 +15466,7 @@ where
         }
         // Any other in-window frame proves the stream is alive; only silence
         // should age the stall counter.
-        if let Some(session) = self.repair.as_mut() {
+        if let Some(session) = self.repair_mut() {
             session.idle_ticks = 0;
         }
         if self.materialization_missing
@@ -15123,13 +15542,13 @@ where
         if self.history_is_busy() {
             return RepairConclusion::InProgress;
         }
-        let Some(mut session) = self.repair else {
+        let Some(mut session) = self.repair().copied() else {
             return RepairConclusion::Done;
         };
         if !consensus::repair_session_live(self.consensus())
             || self.consensus().view() != session.view
         {
-            self.repair = None;
+            self.set_repair(None);
             return RepairConclusion::Done;
         }
         if self.proof_walk_over_budget() {
@@ -15145,7 +15564,7 @@ where
                 node_memory_exhausted,
                 "unproven repair walk is past its memory budget, so state transfer takes the window"
             );
-            self.repair = None;
+            self.set_repair(None);
             return RepairConclusion::FloorRefused {
                 floor: self.consensus().commit_min(),
                 to_op: session.commit_to_op,
@@ -15171,7 +15590,7 @@ where
                 .is_some_and(|persistence| floor > persistence.head())
         {
             self.commit_journal(config).await;
-            self.repair = None;
+            self.set_repair(None);
             return RepairConclusion::FloorRefused {
                 floor,
                 to_op: session.commit_to_op,
@@ -15192,7 +15611,7 @@ where
             // So does any jump past commands, which no machine would apply,
             // while a transfer carries the machines' snapshot.
             if self.consensus().view_log_unproven() || !self.state_machines.is_empty() {
-                self.repair = None;
+                self.set_repair(None);
                 return RepairConclusion::FloorRefused {
                     floor,
                     to_op: session.commit_to_op,
@@ -15282,7 +15701,7 @@ where
             .is_none_or(|persistence| persistence.is_durable_through(session.fetch_to_op));
         let done = commit_min >= session.commit_to_op && fetch_complete && window_durable;
         if done {
-            self.repair = None;
+            self.set_repair(None);
             self.transfer_rearm = None;
         }
         tracing::info!(
@@ -15358,7 +15777,7 @@ where
                 "refusing commit floor: repaired window does not connect \
                  to recovered durable state (needs state transfer)"
             );
-            self.repair = None;
+            self.set_repair(None);
             return Some(RepairConclusion::FloorRefused {
                 floor,
                 to_op: session.commit_to_op,
@@ -15387,7 +15806,7 @@ where
             || self.consensus.has_untrusted_log()
             || self.consensus.view_log_unproven()
             || self.consensus.commit_min() >= self.consensus.commit_max()
-            || self.repair.is_some_and(|session| {
+            || self.repair().is_some_and(|session| {
                 session
                     .floor
                     .is_some_and(|floor| floor > self.consensus.commit_min())
@@ -15405,7 +15824,7 @@ where
     /// same first chunk forever while the rest of the window stays absent.
     #[must_use]
     pub fn repair_pull_from(&self) -> Option<u64> {
-        let session = self.repair.as_ref()?;
+        let session = self.repair()?;
         let commit_min = self.consensus().commit_min();
         let journal = &self.log.journal().inner;
         let Some(floor) = session.floor.filter(|&floor| floor > commit_min) else {
@@ -15427,7 +15846,7 @@ where
     pub fn next_floor_pull(&mut self) -> Option<u64> {
         let commit_min = self.consensus().commit_min();
         let from_op = self.repair_pull_from()?;
-        let session = self.repair.as_mut()?;
+        let session = self.repair_mut()?;
         let floor_pending = session.floor.is_some_and(|floor| floor > commit_min);
         if !floor_pending || from_op > session.fetch_to_op || from_op <= session.floor_pulled_from {
             return None;
@@ -15752,15 +16171,13 @@ pub fn next_consumer_kind(kind: ConsumerKind) -> Option<ConsumerKind> {
 
 /// Automatic commits remain monotone because an earlier poll can commit after
 /// a later one. Explicit stores may intentionally rewind the cursor.
-fn upsert_committed_offset<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_committed_offset<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     auto_commit: bool,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
+) {
     if auto_commit {
         upsert_offset_max(map, key, offset, create_on_miss);
     } else {
@@ -15768,22 +16185,17 @@ fn upsert_committed_offset<K>(
     }
 }
 
-fn upsert_offset<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_offset<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.store(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
-    }
+) {
+    map.borrow_mut()
+        .entry(key)
+        .or_insert_with(create_on_miss)
+        .offset
+        .store(offset, Ordering::Relaxed);
 }
 
 /// Kinds keyed by consumer group, whose offsets go when the group is deleted.
@@ -15794,21 +16206,21 @@ const fn keyed_by_group(kind: ConsumerKind) -> bool {
     }
 }
 
-fn upsert_offset_max<K>(
-    map: &papaya::HashMap<K, ConsumerOffset>,
+fn upsert_offset_max<K: Ord>(
+    map: &RefCell<BTreeMap<K, ConsumerOffset>>,
     key: K,
     offset: u64,
     create_on_miss: impl FnOnce() -> ConsumerOffset,
-) where
-    K: Hash + Eq + Clone + Send + Sync,
-{
-    let guard = map.pin();
-    if let Some(existing) = guard.get(&key) {
-        existing.offset.fetch_max(offset, Ordering::Relaxed);
-    } else {
-        let created = create_on_miss();
-        created.offset.store(offset, Ordering::Relaxed);
-        guard.insert(key, created);
+) {
+    let mut map = map.borrow_mut();
+    match map.entry(key) {
+        btree_map::Entry::Occupied(existing) => {
+            existing.get().offset.fetch_max(offset, Ordering::Relaxed);
+        }
+        btree_map::Entry::Vacant(slot) => {
+            let created = slot.insert(create_on_miss());
+            created.offset.store(offset, Ordering::Relaxed);
+        }
     }
 }
 
@@ -16058,7 +16470,7 @@ fn accumulate_committed_info(
 /// A SEGMENT budget standing in for a time bound, so the margin is filesystem
 /// specific: 16 segments is at most 32 unlinks (log plus index), a few hundred
 /// milliseconds on commodity `NVMe` against the shipped 5 s
-/// `cluster.heartbeat_timeout`, and still under 2 s if each unlink costs a
+/// `cluster.commit_busy_heartbeat_timeout`, and still under 2 s if each unlink costs a
 /// pathological 50 ms on a contended journal. Large enough that steady-state
 /// retention, which reclaims a handful of segments per interval, never reaches
 /// it -- only a backlog does, and that one drains over several passes.
@@ -16068,6 +16480,16 @@ const SEGMENT_REMOVAL_BUDGET_PER_PASS: usize = 16;
 /// without this bound a single commit turn could answer every queued request,
 /// each with an awaited reply send.
 const PROMOTION_DENIALS_MAX: usize = 4;
+
+/// Answer of [`IggyPartition::sessions_retired`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchRetirement {
+    /// Every session of the batch is retired on this replica.
+    Retired,
+    /// Not proven. A barrier through the batch watermark must name these
+    /// sessions, which still hold a slice entry here.
+    Owed(Vec<SessionIdentity>),
+}
 
 /// Answer of [`IggyPartition::observe_retirement_debt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16313,5 +16735,10 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
         .last()
 }
 
+mod checkpoint_policy;
+mod quiet;
 #[cfg(test)]
 pub mod tests;
+
+use checkpoint_policy::CheckpointPolicy;
+pub use checkpoint_policy::{CheckpointDelays, CheckpointTrigger};

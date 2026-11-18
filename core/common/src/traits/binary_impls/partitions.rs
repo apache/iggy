@@ -16,13 +16,18 @@
 // under the License.
 
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::wire_conversions::identifier_to_wire;
-use crate::{BinaryClient, Identifier, IggyError, PartitionClient};
+use crate::wire_conversions::{identifier_to_wire, page_from_wire};
+use crate::{BinaryClient, Identifier, IggyError, Page, PageQuery, Partition, PartitionClient};
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::codes::{CREATE_PARTITIONS_CODE, DELETE_PARTITIONS_CODE};
-use iggy_binary_protocol::requests::partitions::{
-    CreatePartitionsRequest, DeletePartitionsRequest,
+use iggy_binary_protocol::codes::{
+    CREATE_PARTITIONS_CODE, DELETE_PARTITIONS_CODE, GET_PARTITIONS_CODE,
 };
+use iggy_binary_protocol::primitives::page::WirePageQuery;
+use iggy_binary_protocol::requests::partitions::{
+    CreatePartitionsRequest, DeletePartitionsRequest, GetPartitionsRequest,
+};
+use iggy_binary_protocol::responses::PageResponse;
+use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> PartitionClient for B {
@@ -68,5 +73,24 @@ impl<B: BinaryClient> PartitionClient for B {
         )
         .await?;
         Ok(())
+    }
+
+    async fn get_partitions_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &PageQuery,
+    ) -> Result<Page<Partition>, IggyError> {
+        fail_if_not_authenticated(self).await?;
+        let request = GetPartitionsRequest {
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            page: WirePageQuery::try_from(query)?,
+        };
+        let response = self
+            .send_raw_with_response(GET_PARTITIONS_CODE, request.to_bytes())
+            .await?;
+        let page = super::decode_response::<PageResponse<PartitionResponse>>(&response)?;
+        page_from_wire(page, |partition| Ok(Partition::from(partition)))
     }
 }
