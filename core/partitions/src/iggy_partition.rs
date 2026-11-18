@@ -1241,6 +1241,13 @@ where
         self.consensus.set_partition_incarnation(created_revision);
     }
 
+    /// Refuse every request stamped below `created_op`, the metadata op that
+    /// created this incarnation. A session that ended before it then never
+    /// writes here, so no retirement walk has to visit it.
+    pub fn start_at_create_op(&mut self, created_op: u64) {
+        self.required_metadata_frontier = self.required_metadata_frontier.max(created_op);
+    }
+
     /// Metadata creation revision that isolates this incarnation's on-disk
     /// history and consensus frames. Zero only without a metadata row.
     #[must_use]
@@ -1248,21 +1255,58 @@ where
         self.consensus.partition_incarnation()
     }
 
-    /// A report covers an applied retirement barrier or terminal history fence
-    /// on a serving replica. Replay or a checkpoint must restore that proof.
-    /// Retirement barriers require persistence at every durability level.
+    /// Whether this serving replica holds retired every session of `ended`
+    /// that ended at or below `retired_through`, with no pending request of a
+    /// client of `ended`: by a terminal history fence, or by a frontier at
+    /// `retired_through` and no slice entry of those sessions. Replay or a
+    /// checkpoint must restore that proof. Retirement barriers require
+    /// persistence at every durability level.
+    ///
+    /// `ended` is sorted by client id. [`BatchRetirement::Owed`] names every
+    /// session of `ended` with a slice entry here, also one that ended later,
+    /// so that one barrier retires them all.
     #[must_use]
-    pub fn session_retired(&self, identity: SessionIdentity) -> bool {
-        self.fatal.is_none()
+    pub fn sessions_retired(
+        &self,
+        ended: &[SessionIdentity],
+        retired_through: u64,
+    ) -> BatchRetirement {
+        let in_batch = |client_id: u128| {
+            ended
+                .binary_search_by_key(&client_id, |identity| identity.client_id)
+                .ok()
+                .map(|index| ended[index])
+        };
+        let owed: Vec<SessionIdentity> = self
+            .dedup
+            .active_sessions()
+            .filter_map(|(client_id, _, session)| {
+                in_batch(client_id).filter(|identity| identity.session == session)
+            })
+            .collect();
+        let serving = self.fatal.is_none()
             && !self.requires_state_transfer()
             && self.consensus.is_normal()
-            && !self.consensus.is_transferring()
-            && self.consensus.pending_request(identity.client_id).is_none()
-            && (self
-                .history_transition
-                .is_some_and(|history| history.partition_op <= self.consensus.commit_min())
-                || (self.required_metadata_frontier >= identity.metadata_watermark
-                    && self.dedup.get_epoch(identity.client_id) != Some(identity.session)))
+            && !self.consensus.is_transferring();
+        let pending = self.consensus.with_pipeline(|pipeline| {
+            pipeline
+                .pending_client_ids()
+                .any(|client_id| in_batch(client_id).is_some())
+        });
+        let fenced = self
+            .history_transition
+            .is_some_and(|history| history.partition_op <= self.consensus.commit_min());
+        let holds_entry = owed
+            .iter()
+            .any(|identity| identity.metadata_watermark <= retired_through);
+        if serving
+            && !pending
+            && (fenced || (self.required_metadata_frontier >= retired_through && !holds_entry))
+        {
+            BatchRetirement::Retired
+        } else {
+            BatchRetirement::Owed(owed)
+        }
     }
 
     /// Arms the session gate for `debt_op`. Only a normal primary with an
@@ -12237,11 +12281,14 @@ where
                         .max(identity.metadata_watermark);
                 }
                 // A finalized session absent from the slice still must not
-                // start writing here, so the frontier covers the whole debt.
+                // start writing here, so the frontier covers the whole debt,
+                // and a walk barrier covers its whole batch.
                 self.retirement_paid_through =
                     self.retirement_paid_through.max(retirement.paid_through);
-                self.required_metadata_frontier =
-                    self.required_metadata_frontier.max(retirement.paid_through);
+                self.required_metadata_frontier = self
+                    .required_metadata_frontier
+                    .max(retirement.paid_through)
+                    .max(retirement.retired_through);
             }
             let reply = match self.commit_receipt(
                 &entry,
@@ -16037,6 +16084,16 @@ const SEGMENT_REMOVAL_BUDGET_PER_PASS: usize = 16;
 /// without this bound a single commit turn could answer every queued request,
 /// each with an awaited reply send.
 const PROMOTION_DENIALS_MAX: usize = 4;
+
+/// Answer of [`IggyPartition::sessions_retired`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchRetirement {
+    /// Every session of the batch is retired on this replica.
+    Retired,
+    /// Not proven. A barrier through the batch watermark must name these
+    /// sessions, which still hold a slice entry here.
+    Owed(Vec<SessionIdentity>),
+}
 
 /// Answer of [`IggyPartition::observe_retirement_debt`].
 #[derive(Debug, Clone, PartialEq, Eq)]

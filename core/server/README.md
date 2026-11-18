@@ -49,7 +49,7 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-METADATA-CHANGE-LOG-1` storage gate
+complete partition view changes. The `IGGY-METADATA-CHANGE-LOG-2` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 Metadata snapshots now carry the metadata change log and topic creation ops, so
 `IGGY-RESOURCE-OPTIONS-1` data directories must be wiped before the upgrade.
@@ -65,15 +65,19 @@ finalization and the paid-through mark on session retirement. Peers compare a
 replica wire revision at the handshake, so a build from before that change and a
 build after it refuse each other even when both report the same version, for
 example two consecutive `:edge` images. Stop every node and start them all on the
-new build. Their `IGGY-METADATA-CHANGE-LOG-1` data directories are kept: older
-metadata snapshots and journal entries read with every partition on every node,
-and older builds refuse the newer snapshot format instead of misreading it.
+new build.
 Topics created without `replication_factor` still go on every node, so clients
 that never send the key, which includes every SDK, connector, benchmark and MCP
 release before the option, keep the old layout. Set `[cluster]
 default_replication_factor` to a number to give those topics fewer copies.
 Topic responses carry each partition's member list and in-sync members, a client
 wire change that SDKs from before this release cannot decode.
+Batched session retirement changes the body of the session finalization
+(op 70). It also raises the replica wire revision to 3, so a build from before
+it and a build after it refuse each other. An older body can be misread as a new
+one, so the storage gate moves to `IGGY-METADATA-CHANGE-LOG-2`. A node refuses an
+`IGGY-METADATA-CHANGE-LOG-1` data directory at boot without changing it, so start
+every replica from fresh storage.
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -672,7 +676,7 @@ This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a brea
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 15 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
+Metadata snapshot format 16 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The
@@ -686,7 +690,7 @@ Replacing the binary does not migrate old data. Use the offline re-ingestion
 procedure above for an upgrade. A recovery from a backup must use a separately
 verified, compatible backup; copying a format marker is not a migration.
 
-Within compatible `IGGY-METADATA-CHANGE-LOG-1` storage, this release reads superblock
+Within compatible `IGGY-METADATA-CHANGE-LOG-2` storage, this release reads superblock
 envelope versions 1 and 2 and writes version 2. Legacy 66- and 74-byte consensus
 records remain readable. New records atomically retain an adopted view, its
 advertised head and exact prepare headers alongside the existing consensus state.
@@ -759,7 +763,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-METADATA-CHANGE-LOG-1` requires this initialization contract;
+Storage format `IGGY-METADATA-CHANGE-LOG-2` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory
@@ -770,11 +774,19 @@ If the fence cannot be persisted, the session remains retained and retirement
 retries. Temporary teardown tombstones and state transfer do not qualify as
 permanent failures.
 
-Partition retirement barriers batch up to 128 ended sessions per commit. Each
-session still requires retirement reports covering every allocated partition
-from a common replica quorum before metadata releases its registry slot. Segment
-deletion does not invalidate those reports; changes to partition incarnations
-do. Metadata snapshot format 10 persists that separate revision.
+Each node retires ended sessions in batches. When a walk starts, its watermark
+is the highest end op among the ended sessions. Its batch is every session that
+ended at or below the watermark. The walk visits each partition that the node
+stores. A partition proves the batch once its metadata frontier reaches the
+watermark and no batch session holds an entry or a pending request on it. A
+partition retirement barrier names up to 128 of the sessions that
+still hold entries, and it raises the frontier.
+
+A partition created above the watermark cannot hold a session of the batch, so
+the walk skips it. A topic created or deleted during a walk does not restart
+it. Metadata releases the registry slots of every session at or below the
+lowest watermark among the reports of a replica quorum. A partition whose
+members did not prove the batch owes the retirement, as described above.
 
 A committed partition that has never initialized on this replica can finish
 initialization after a crash, including when all replicas stopped before their

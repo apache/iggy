@@ -2157,6 +2157,9 @@ fn materialise_partition(
     let members = streams
         .members_for_namespace(namespace)
         .expect("a committed partition records its members");
+    let created_op = streams
+        .with_committed_partition(namespace, |partition| partition.created_op)
+        .expect("a committed partition records its create op");
     let metadata_consensus = replica.shards[0]
         .plane
         .metadata()
@@ -2237,7 +2240,8 @@ fn materialise_partition(
             persistence,
             PartitionMaterialisation::new(epoch, created_view, first_initialization)
                 .with_consumer_offsets_max(consumer_offsets_max)
-                .with_members(members),
+                .with_members(members)
+                .with_created_op(created_op),
         );
     }
     for shard in &replica.shards {
@@ -4415,13 +4419,17 @@ mod tests {
         }
     }
 
-    #[test]
+    const RETIREMENT_PARTITIONS: usize = 2;
+    const RETIREMENT_BASE_CLIENT: u128 = 100;
+    const RETIREMENT_STEPS: usize = 20_000;
+
+    /// A 3-node shell cluster where each of `session_count` sessions holds a
+    /// committed receipt in every one of [`RETIREMENT_PARTITIONS`] partitions,
+    /// and every replica ended all of them at one metadata op.
     #[allow(clippy::too_many_lines)]
-    fn given_ended_session_batch_when_liveness_sweeps_should_submit_bounded_real_barriers() {
-        const PARTITIONS: usize = 2;
-        const STEPS: usize = 20_000;
-        const BASE_CLIENT: u128 = 100;
-        let session_count = iggy_binary_protocol::requests::system::MAX_SESSIONS_PER_RETIREMENT + 1;
+    fn ended_sessions_with_receipts(session_count: usize) -> (Simulator, SimClient) {
+        const PARTITIONS: usize = RETIREMENT_PARTITIONS;
+        const BASE_CLIENT: u128 = RETIREMENT_BASE_CLIENT;
         let (mut sim, client, _) = consumer_group_disconnect_cluster(3, session_count + 2);
         for partition in 0..PARTITIONS {
             let namespace = IggyNamespace::new(0, 0, partition);
@@ -4534,27 +4542,60 @@ mod tests {
                 assert!(table.end_session(BASE_CLIENT + index as u128, 0, end_op, end_op));
             }
         }
+        (sim, client)
+    }
+
+    /// Step up to `steps` times, with `between` run before each step, until no
+    /// replica keeps an ended session. `client` stays active meanwhile.
+    fn retire_every_ended_session(
+        sim: &mut Simulator,
+        client: &SimClient,
+        steps: usize,
+        mut between: impl FnMut(&mut Simulator, usize),
+    ) -> bool {
+        (0..steps).any(|step| {
+            if step % DISCONNECT_PROGRESS_STEPS == 0 {
+                sim.submit_request(
+                    client.client_id(),
+                    0,
+                    client.get_stream(DISCONNECT_STREAM).into_generic(),
+                );
+            }
+            between(sim, step);
+            sim.step();
+            sim.replicas.iter().all(|replica| {
+                replica.shards[0]
+                    .plane
+                    .metadata()
+                    .client_table
+                    .borrow()
+                    .ended_sessions()
+                    .next()
+                    .is_none()
+            })
+        })
+    }
+
+    /// Committed `FinalizeSession` ops in the metadata log of replica 0.
+    fn committed_finalizations(sim: &Simulator) -> usize {
+        let commit = sim.metadata_consensus(0).unwrap().commit_min();
+        (1..=commit)
+            .filter(|&op| {
+                sim.replicas[0]
+                    .metadata_journal
+                    .header(usize::try_from(op).unwrap())
+                    .is_some_and(|header| header.operation == Operation::FinalizeSession)
+            })
+            .count()
+    }
+
+    #[test]
+    fn given_ended_session_batch_when_liveness_sweeps_should_submit_bounded_real_barriers() {
+        const PARTITIONS: usize = RETIREMENT_PARTITIONS;
+        let session_count = iggy_binary_protocol::requests::system::MAX_SESSIONS_PER_RETIREMENT + 1;
+        let (mut sim, client) = ended_sessions_with_receipts(session_count);
         assert!(
-            (0..STEPS).any(|step| {
-                if step % DISCONNECT_PROGRESS_STEPS == 0 {
-                    sim.submit_request(
-                        client.client_id(),
-                        0,
-                        client.get_stream(DISCONNECT_STREAM).into_generic(),
-                    );
-                }
-                sim.step();
-                sim.replicas.iter().all(|replica| {
-                    replica.shards[0]
-                        .plane
-                        .metadata()
-                        .client_table
-                        .borrow()
-                        .ended_sessions()
-                        .next()
-                        .is_none()
-                })
-            }),
+            retire_every_ended_session(&mut sim, &client, RETIREMENT_STEPS, |_, _| {}),
             "the real sweeper must retire every ended session"
         );
         for partition_id in 0..PARTITIONS {
@@ -4592,11 +4633,104 @@ mod tests {
             retired.dedup();
             assert_eq!(
                 retired,
-                (BASE_CLIENT..BASE_CLIENT + session_count as u128).collect::<Vec<_>>()
+                (RETIREMENT_BASE_CLIENT..RETIREMENT_BASE_CLIENT + session_count as u128)
+                    .collect::<Vec<_>>()
             );
             assert!(barriers.iter().all(|batch| batch.identities.len()
                 <= iggy_binary_protocol::requests::system::MAX_SESSIONS_PER_RETIREMENT));
         }
+    }
+
+    #[test]
+    fn given_sessions_that_ended_together_when_liveness_sweeps_should_finalize_them_in_one_op() {
+        const SESSIONS: usize = 4;
+        let (mut sim, client) = ended_sessions_with_receipts(SESSIONS);
+        assert!(
+            retire_every_ended_session(&mut sim, &client, RETIREMENT_STEPS, |_, _| {}),
+            "the real sweeper must retire every ended session"
+        );
+        assert_eq!(
+            committed_finalizations(&sim),
+            1,
+            "one walk must prove and finalize every session that ended before it started"
+        );
+    }
+
+    /// A topic created after the sessions ended needs no proof, because its
+    /// partitions start their frontier at the create op. So the walk does not
+    /// wait for a node to build them, and they owe no retirement.
+    #[test]
+    fn given_a_topic_created_after_sessions_ended_when_retiring_should_skip_its_partitions() {
+        let (mut sim, client) = ended_sessions_with_receipts(1);
+        complete_metadata_op(
+            &mut sim,
+            &client,
+            client.create_topic(DISCONNECT_STREAM, "created", 1),
+        );
+        let namespace = IggyNamespace::new(0, 1, 0);
+        let (created_revision, created_op) = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .with_committed_partition(namespace, |partition| {
+                (partition.created_revision, partition.created_op)
+            })
+            .expect("the created topic takes the next topic slot");
+        assert!(
+            retire_every_ended_session(&mut sim, &client, RETIREMENT_STEPS, |_, _| {}),
+            "a partition that no node built must not hold back the retirement"
+        );
+        for replica in &sim.replicas {
+            assert_eq!(
+                replica.shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .retirement_debt_for(namespace, created_revision),
+                Some(0)
+            );
+        }
+
+        sim.init_partition(namespace);
+        let ended = [iggy_binary_protocol::requests::system::SessionIdentity {
+            client_id: RETIREMENT_BASE_CLIENT,
+            session: created_op,
+            metadata_watermark: created_op,
+        }];
+        for replica in &sim.replicas {
+            let partitions = replica.partition_shard(namespace).plane.partitions();
+            assert_eq!(
+                partitions
+                    .get_by_ns(&namespace)
+                    .expect("every member builds the created partition")
+                    .sessions_retired(&ended, created_op),
+                partitions::BatchRetirement::Retired,
+                "a built partition starts at its create op"
+            );
+        }
+    }
+
+    #[test]
+    fn given_ended_sessions_when_topics_are_created_during_the_sweep_should_still_finalize_them() {
+        const SESSIONS: usize = 4;
+        // Each create changes the partition set well inside one sweep.
+        const CREATE_EVERY_STEPS: usize = 20;
+        const STEPS: usize = 3_000;
+        let (mut sim, client) = ended_sessions_with_receipts(SESSIONS);
+        assert!(
+            retire_every_ended_session(&mut sim, &client, STEPS, |sim, step| {
+                if step % CREATE_EVERY_STEPS == 0 {
+                    complete_metadata_op(
+                        sim,
+                        &client,
+                        client.create_topic(DISCONNECT_STREAM, &format!("created-{step}"), 1),
+                    );
+                }
+            }),
+            "a stream of topic creates must not hold back the retirement of ended sessions"
+        );
     }
 
     #[test]
