@@ -32,6 +32,7 @@ objects](../README.md#geo-topic-objects) and [shadow streams](../README.md#shado
 - [What fails and what is lost](#what-fails-and-what-is-lost)
 - [Failover and failback](#failover-and-failback)
 - [Retire an origin](#retire-an-origin)
+- [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks)
 - [Cost](#cost)
 - [Metrics](#metrics)
 - [Tunables](#tunables)
@@ -110,6 +111,7 @@ part yet: see the status note at the top.
 | Adopt the geo topics of each peer as shadow streams                           | Yes             |
 | A shadow topic serves the messages of its origin                              | No              |
 | A command that retires an origin that never returns                           | No              |
+| Recover the geo topics of a cluster that lost every disk, from its bucket     | Yes             |
 | Consumer positions that move between datacenters                              | No              |
 | The `geo_tiered` mode, and a switch between modes                             | No              |
 | Geo topics in encrypted streams                                               | No              |
@@ -453,22 +455,22 @@ segment holds yet.
 
 ## What fails and what is lost
 
-| Event                                                   | Effect                                                                                                                                                                                                                                                                                                       |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| One node of a cluster fails                             | The partitions elect another primary as for any topic. Nothing is lost.                                                                                                                                                                                                                                      |
-| A cluster's bucket does not answer                      | Its geo topics refuse sends with 58. Polls that need bytes from the bucket get 58, which the SDKs retry. Rewrites wait. Peers mark the shadow topics of that origin stale.                                                                                                                                   |
-| A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. As for any topic, the topic's `durability` decides whether a crash of every node at once can lose acknowledged messages: see [replication factor](../README.md#replication-factor). |
-| A cluster is destroyed with its disks, its bucket stays | The messages it committed and had not published are lost. The fresh objects that hold them do not say whose messages they are or at which offsets. The published long-term segments stay in the bucket, but no cluster can read them in this version.                                                        |
-| A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                 |
-| A peer's bucket does not answer                         | This cluster serves its shadow topics as they are, removes none of them except those whose grace ended, and sets `geo_shadow_topics_stale` for that origin. Local traffic is not affected.                                                                                                                   |
+| Event                                                   | Effect                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| One node of a cluster fails                             | The partitions elect another primary as for any topic. Nothing is lost.                                                                                                                                                                                                                                                       |
+| A cluster's bucket does not answer                      | Its geo topics refuse sends with 58. Polls that need bytes from the bucket get 58, which the SDKs retry. Rewrites wait. Peers mark the shadow topics of that origin stale.                                                                                                                                                    |
+| A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. As for any topic, the topic's `durability` decides whether a crash of every node at once can lose acknowledged messages: see [replication factor](../README.md#replication-factor).                  |
+| A cluster is destroyed with its disks, its bucket stays | A cluster rebuilt on empty disks takes back its geo topics when an operator asks for it: see [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks). The published messages come back, and so do the committed ones that self-describing fresh objects prove. The other committed messages are lost. |
+| A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                                  |
+| A peer's bucket does not answer                         | This cluster serves its shadow topics as they are, removes none of them except those whose grace ended, and sets `geo_shadow_topics_stale` for that origin. Local traffic is not affected.                                                                                                                                    |
 
 Committed and not yet published is the window that a destroyed cluster loses. Watch
 `partition_long_term_rewrite_lag_messages` to see its size.
 
 A cluster rebuilt on empty disks gets a new cluster id. Its store identity check then
 refuses the old bucket prefix, and its geo topics are refused with `FeatureUnavailable`.
-Give it another prefix, or empty the old one once nothing needs it. No partition is
-restored from the bucket in this version.
+Give it another prefix, empty the old one once nothing needs it, or recover the geo
+topics of the lost cluster from it, as the next sections describe.
 
 ## Failover and failback
 
@@ -508,6 +510,118 @@ surviving cluster and restart those nodes. The nodes then stop reading that buck
 streams of that origin stay as they are, read-only, and nothing in this version removes them. No
 client can delete a shadow stream. Iggy never writes to or deletes from the bucket of a peer, so
 cleaning the retired origin's bucket is the job of the operator.
+
+## Recover an origin that lost its disks
+
+When every node of a cluster lost its disk and its bucket is intact, a cluster rebuilt on
+empty disks can take back the geo topics of the lost one from the bucket. It runs only when
+the operator names the lost cluster: without that, a rebuilt cluster refuses the bucket, as
+[What fails and what is lost](#what-fails-and-what-is-lost) says.
+
+### What comes back
+
+For each partition of each geo topic that the lost cluster held:
+
+- **The published messages**, from the long-term segments that the partition's manifest
+  lists, up to its floor F.
+- **The proven messages.** Each fresh object of the self-describing format carries proof
+  rows, which bind the batches that committed to their offsets and timestamps. The batches
+  that proofs name from F on without a gap come back at exactly those offsets and
+  timestamps, up to P.
+- **The adopted messages**, unless `recover_unproven = false`. A fresh object also names
+  the offsets its writer expected each of its batches to take. The batches that no proof
+  names and that follow P without a gap come back at those offsets, up to the cutover Q.
+  Of two batches that expect one offset, the one written in the higher consensus view wins,
+  then the one of the later writer, then the later object of that writer. A batch that
+  loses one offset is dropped whole, and the first offset that no batch expects ends the
+  adoption. An adopted batch takes the timestamp of the batch before it plus one, or the
+  time its object was written if that is later.
+
+The proven messages come back exactly once. The adopted ones are at least once: one can be
+a send that the lost cluster refused and the producer sent again, and a committed batch can
+be missing when another batch took its offsets. Turn adoption off for at most once. Two
+proofs that bind one offset to different batches end P below that offset, and nothing is
+adopted for that partition.
+
+Fresh objects of the format before (`IGGYFRS1`) say neither whose batches they hold nor
+where those committed, so their messages come back only when they were published. The
+recovery reports each such object.
+
+Nothing else comes back: consumer offsets, consumer groups, users and permissions, normal
+topics, and the idempotent producer state of the published messages are not in the bucket.
+The producers of proven and adopted batches are restored, so their retries are still
+recognized.
+
+### Procedure
+
+1. Stop the lost cluster for good, and revoke its credentials to the bucket. Nothing stops a
+   node of it that still runs from writing.
+2. Read the lost cluster's `cluster_uid`, the second line of `<prefix>/meta/identity`.
+3. Start the rebuilt cluster on empty disks, with the same `[tiered_storage]` section and the
+   same `[geo] origin` as the lost one, and on every node:
+
+   ```toml
+   [geo]
+   origin = "dc-a"
+   recover_cluster_uid = "0123456789abcdef0011223344556677"
+   # Optional: take back only what the bucket proves.
+   #recover_unproven = false
+   ```
+
+   Or `IGGY_GEO_RECOVER_CLUSTER_UID` and `IGGY_GEO_RECOVER_UNPROVEN`. Create no stream
+   before the recovery ends: it restores the streams and topics under the ids they had, and
+   refuses a cluster that holds other streams.
+4. Replica 0 recovers once it is the caught-up metadata primary, as it would claim an empty
+   bucket. If another replica leads metadata, restart that replica until replica 0 leads.
+   Every node checks the bucket every 5 seconds until the recovery ends.
+5. The recovery is done when `object_store_identity_verified` is 1 on every node, and replica
+   0 logs `the retired cluster's geo topics are recovered and this cluster owns the store`.
+   Each node then builds the partitions of the restored topics, which serve their messages
+   and take new sends after the cutover.
+6. Read the report, `<prefix>/meta/recovery/<cluster_uid>/report.json`.
+7. Remove `recover_cluster_uid` from every node. It does nothing once the bucket names the
+   rebuilt cluster, but a node that has it waits for the bucket before it builds a new geo
+   partition.
+
+A recovery that fails logs the reason and runs again at the next check, 5 seconds later.
+Each attempt finds what an earlier one stored and goes on. It refuses a topic of another
+`[geo] origin`, a cluster that already holds streams, and a bucket that another cluster
+recovered already.
+
+### What it writes
+
+Under `<prefix>/meta/recovery/<cluster_uid>/`, before it claims the bucket:
+
+| Object                                            | Content                                                                                                                                                               |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<stream>-<topic>-<partition>-<created_revision>` | The plan of one partition: its manifest and the batches taken above it. Every node installs it into its empty partition, so every replica starts from the same state. |
+| `record`                                          | The retirement of the lost cluster: the rebuilt cluster's `cluster_uid` and, per partition, where F, P and Q end. Written once, never changed.                        |
+| `report.json`                                     | What each partition took and dropped, for operators.                                                                                                                  |
+
+Then it replaces `<prefix>/meta/identity` with the rebuilt cluster's own. A node of the lost
+cluster that comes back finds another cluster there at its next check, within a minute, and
+stops writing. A peer that follows the lost cluster's fresh objects takes its batches only
+below each partition's cutover in the record: from there on the partition's log is the
+rebuilt cluster's.
+
+The report lists, per partition:
+
+| Field                               | Meaning                                                         |
+| ----------------------------------- | --------------------------------------------------------------- |
+| `floor`                             | F, the last published offset. `null` without one.               |
+| `proven_through`                    | P, the last offset that proofs name without a gap from F.       |
+| `cutover_through`                   | Q, the last offset taken. The next send takes the one after it. |
+| `proven_batches`, `adopted_batches` | Batches taken from proofs and from claims.                      |
+| `conflict_at`                       | The first offset two different proofs bind, when there is one.  |
+| `dropped`                           | Each batch left out, with its object, its offsets and why.      |
+
+The reasons a batch is dropped: `lost_overlap` (a batch of a higher view, writer or object
+expected one of its offsets), `past_gap` (an offset before it is not taken),
+`overlaps_proven` (it expected offsets that a proven batch holds), `proven_past_gap` (a
+proof names it past a gap), `invalid_proof` (its proof does not match the batch),
+`proofs_conflict` (two proofs disagree, so nothing is adopted), `adoption_off`, and
+`invalid_producer`. `skipped_objects` lists the fresh objects not read, such as
+`not_self_describing` ones.
 
 ## Cost
 
@@ -628,6 +742,8 @@ Alert on these first:
 | `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer.                                                                                       |
 | `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 250 ms after its last. `0` turns this off. Otherwise at least `64 MiB`. |
 | `[tiered_storage.jobs] fresh_uploads`      | `4`     | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads.                                                                                                                                                                                                                                  |
+| `[geo] recover_cluster_uid`                | empty   | The `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                          |
+| `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                           |
 | `[geo] tombstone_grace`                    | `24 h`  | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage.                                                                                                                                                                     |
 
 The other `[tiered_storage]` keys apply to geo topics as they do to tiered topics: the timeouts
