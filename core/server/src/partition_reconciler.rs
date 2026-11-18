@@ -202,6 +202,7 @@ use iggy_binary_protocol::{
 use iggy_common::{
     ConsumerKind, IggyError, IggyTimestamp, StreamEncryption, check_critical_options,
 };
+use iggy_object_store::{TierJobCancelled, TierScope};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
@@ -213,8 +214,8 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, Segment, StreamKeyIdentity, TOPIC_OBJECT_RETRY, delete_partitions_from_disk,
-    read_created_revision,
+    IggyPartition, RecoveryPlan, Segment, StreamKeyIdentity, TOPIC_OBJECT_RETRY,
+    delete_partitions_from_disk, object_prefix, read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -1133,6 +1134,7 @@ async fn reconcile_target(
         stream_key,
         encryption,
         peer_log,
+        recovered_from,
     }) = fetch_partition_build_inputs(ctx, ns)
     else {
         return Convergence::Pending;
@@ -1219,6 +1221,34 @@ async fn reconcile_target(
         return Convergence::Pending;
     }
 
+    // A partition of a geo topic that a recovery restored starts from what
+    // the recovery took of it, which every replica installs before it serves
+    // a frame, so the group starts from one state. Committed metadata says
+    // which partitions those are, so no replica depends on its own config.
+    let plan = match recovered_from.filter(|_| !prior_life_on_disk) {
+        None => None,
+        Some(retired_cluster_uid) => match Box::pin(recovery_plan_of(
+            ctx,
+            ns,
+            created_revision,
+            retired_cluster_uid,
+        ))
+        .await
+        {
+            Ok(plan) => plan,
+            Err(reason) => {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                debug!(
+                    shard = shard_id,
+                    ns_raw = ns.inner(),
+                    reason,
+                    "the recovery plan of a partition is not read yet; building it later"
+                );
+                return Convergence::Pending;
+            }
+        },
+    };
+
     let built = if prior_life_on_disk {
         load_partition_or_fence(
             ctx.config.as_ref(),
@@ -1233,6 +1263,7 @@ async fn reconcile_target(
             partitions,
         )
         .await
+        .map(|partition| partition.map(Box::new))
     } else {
         build_partition_fresh(
             ctx.config.as_ref(),
@@ -1249,12 +1280,31 @@ async fn reconcile_target(
             Rc::clone(&ctx.shard.bus),
         )
         .await
-        .map(Some)
+        .map(|partition| Some(Box::new(partition)))
     };
+    // Boxed, so that the install's await below holds no whole partition in
+    // this future.
     match built {
         Ok(Some(mut partition)) => {
             partition.set_encryptor(encryptor);
             partition.start_at_create_op(partition_metadata.created_op);
+            if let Some(plan) = &plan
+                && let Err(error) =
+                    Box::pin(partition.install_recovery_plan(partitions.config(), plan)).await
+            {
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    %error,
+                    "a partition of a restored geo topic could not install what the recovery \
+                     took of it, so this node does not serve it; remove its directory and \
+                     restart the node to build it again"
+                );
+                partitions.fence(ns, created_revision);
+                return Convergence::Converged;
+            }
             if let Some((origin, prefix)) = peer_log
                 && let Err(error) = partition.follow_peer_log(origin, prefix)
             {
@@ -1272,7 +1322,7 @@ async fn reconcile_target(
             }
             ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                 namespace: ns,
-                partition: Box::new(partition),
+                partition,
                 epoch: created_revision,
             });
             ctx.record_success(ns, FailureCause::Add);
@@ -1310,6 +1360,34 @@ async fn reconcile_target(
             );
             Convergence::Pending
         }
+    }
+}
+
+/// What the recovery of `retired_cluster_uid` took of the partition `ns` of
+/// revision `created_revision`, `None` when it took nothing of the
+/// partition. `Err` with the reason while the plan cannot be read, as before
+/// the node passes its store identity check.
+async fn recovery_plan_of(
+    ctx: &ReconcilerCtx,
+    ns: IggyNamespace,
+    created_revision: u64,
+    retired_cluster_uid: u128,
+) -> Result<Option<RecoveryPlan>, String> {
+    let Some(objects) = ctx.shard.topic_objects() else {
+        return Err("the node does not pass its store identity check yet".to_owned());
+    };
+    let scope = TierScope::new();
+    match objects
+        .read_recovery_plan(
+            retired_cluster_uid,
+            object_prefix(ns, created_revision),
+            scope.token(),
+        )
+        .await
+    {
+        Ok(Ok(plan)) => Ok(plan),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(TierJobCancelled) => Err("the read of the plan was cancelled".to_owned()),
     }
 }
 
@@ -2010,6 +2088,9 @@ struct PartitionBuildInputs {
     encryption: StreamEncryption,
     /// The peer's log that a partition of a shadow topic follows.
     peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
+    /// The cluster that lost every disk, for a partition of a geo topic that
+    /// a recovery restored from its store.
+    recovered_from: Option<u128>,
 }
 
 /// Everything one namespace's build needs out of committed metadata: the shared
@@ -2057,6 +2138,7 @@ fn fetch_partition_build_inputs(
             },
             encryption: StreamEncryption::from(&stream.options),
             peer_log: peer_log_of(stream, topic, ns),
+            recovered_from: topic.recovered_from,
         })
     })
 }

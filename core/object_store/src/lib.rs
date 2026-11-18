@@ -52,6 +52,7 @@ mod manifest;
 mod memory;
 mod read_only;
 mod recording;
+mod recovery;
 mod resolver;
 pub mod s3;
 mod segment_metadata;
@@ -77,6 +78,9 @@ pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
 pub use read_only::ReadOnlyStore;
 pub use recording::{RecordingStore, StoreCall, StoreCalls};
+pub use recovery::{
+    RECOVERY_PARTITIONS_MAX, RecoveredCutover, RecoveryRead, RecoveryRecord, RecoveryRecordError,
+};
 pub use resolver::ShardResolver;
 pub use segment_metadata::{SEGMENT_HASH_LEN, SegmentMetadata, SegmentMetadataError};
 pub use store::{

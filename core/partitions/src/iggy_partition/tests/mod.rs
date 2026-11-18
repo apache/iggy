@@ -2055,6 +2055,7 @@ mod offset_replication;
 mod offset_reservations;
 mod offset_storage;
 mod offsets;
+mod origin_recovery;
 mod peer_log;
 mod peer_log_merges;
 mod peer_log_skips;

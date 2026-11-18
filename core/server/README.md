@@ -605,7 +605,10 @@ A node logs that the object names another cluster when:
 - This cluster's metadata was rebuilt, which gives it a new `cluster_uid`. The
   objects under the prefix belong to its earlier lifetime. Give the cluster
   another `prefix`, or delete every object under the prefix, and replica 0
-  claims it again.
+  claims it again. A cluster rebuilt after every node lost its disk can
+  instead take back the geo topics of its earlier lifetime with
+  `[geo] recover_cluster_uid`, as [Recover an origin that lost its
+  disks](docs/GEO_TOPICS.md#recover-an-origin-that-lost-its-disks) describes.
 - The object holds bytes that no cluster wrote. Put the `fs` copy back, or
   write the two lines again on `s3`.
 

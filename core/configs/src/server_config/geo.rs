@@ -72,6 +72,16 @@ pub struct GeoConfig {
     #[serde(default = "default_tombstone_grace")]
     #[config_env(leaf)]
     pub tombstone_grace: IggyDuration,
+    /// The `cluster_uid` of a cluster that lost every disk, as 32 hex
+    /// digits, whose geo topics this cluster takes back from its store. Only
+    /// replica 0 reads it. Empty, the default, takes nothing back: a cluster
+    /// then refuses a store that another cluster claimed.
+    #[serde(default)]
+    pub recover_cluster_uid: String,
+    /// Whether a recovery also takes the batches that no proof names, at the
+    /// offsets their writer expected: at least once instead of at most once.
+    #[serde(default = "default_recover_unproven")]
+    pub recover_unproven: bool,
 }
 
 impl Default for GeoConfig {
@@ -80,7 +90,18 @@ impl Default for GeoConfig {
             origin: String::new(),
             peers: Vec::new(),
             tombstone_grace: default_tombstone_grace(),
+            recover_cluster_uid: String::new(),
+            recover_unproven: default_recover_unproven(),
         }
+    }
+}
+
+impl GeoConfig {
+    /// The `cluster_uid` that [`Self::recover_cluster_uid`] names, `None`
+    /// when it is empty or not 32 lowercase hex digits.
+    #[must_use]
+    pub fn recovered_cluster_uid(&self) -> Option<u128> {
+        parse_cluster_uid(&self.recover_cluster_uid)
     }
 }
 
@@ -167,7 +188,11 @@ impl Display for GeoConfig {
             }
             Display::fmt(peer, f)?;
         }
-        write!(f, "], tombstone_grace: {} }}", self.tombstone_grace)
+        write!(
+            f,
+            "], tombstone_grace: {}, recover_cluster_uid: {}, recover_unproven: {} }}",
+            self.tombstone_grace, self.recover_cluster_uid, self.recover_unproven
+        )
     }
 }
 
@@ -204,6 +229,17 @@ impl Validatable<ConfigurationError> for GeoConfig {
         }
         if self.tombstone_grace.is_zero() {
             return refuse("tombstone_grace must be longer than zero");
+        }
+        if !self.recover_cluster_uid.is_empty() {
+            if self.recovered_cluster_uid().is_none() {
+                return refuse(&format!(
+                    "recover_cluster_uid {:?} must be 32 lowercase hex digits",
+                    self.recover_cluster_uid
+                ));
+            }
+            if self.origin.is_empty() {
+                return refuse("origin must be set when recover_cluster_uid is set");
+            }
         }
         if self.peers.is_empty() {
             return Ok(());
@@ -318,6 +354,19 @@ fn check_origin(origin: &str) -> Result<(), &'static str> {
     }
 }
 
+/// 32 lowercase hex digits, as the store identity object writes a
+/// `cluster_uid`.
+fn parse_cluster_uid(text: &str) -> Option<u128> {
+    let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+    (text.len() == 32 && text.bytes().all(hex))
+        .then(|| u128::from_str_radix(text, 16).ok())
+        .flatten()
+}
+
+const fn default_recover_unproven() -> bool {
+    true
+}
+
 fn default_prefix() -> String {
     "iggy".to_owned()
 }
@@ -375,9 +424,47 @@ mod tests {
         assert_eq!(config.tombstone_grace.get_duration().as_secs(), 24 * 3600);
         assert_eq!(GeoConfig::default().tombstone_grace, config.tombstone_grace);
         assert!(
-            config.to_string().ends_with("tombstone_grace: 1day }"),
+            config.to_string().contains("tombstone_grace: 1day,"),
             "{config}"
         );
+    }
+
+    #[test]
+    fn given_no_recovery_keys_when_loading_should_take_nothing_back() {
+        let config: GeoConfig = serde_json::from_str(r#"{"origin":"dc-a"}"#).unwrap();
+
+        assert_eq!(config.recovered_cluster_uid(), None);
+        assert!(config.recover_unproven);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_a_recover_cluster_uid_when_validating_should_take_only_32_lowercase_hex_digits() {
+        let uid = "0123456789abcdef0011223344556677";
+        let config = |recover_cluster_uid: &str| GeoConfig {
+            origin: "dc-a".to_owned(),
+            recover_cluster_uid: recover_cluster_uid.to_owned(),
+            ..GeoConfig::default()
+        };
+
+        assert_eq!(
+            config(uid).recovered_cluster_uid(),
+            Some(0x0123_4567_89ab_cdef_0011_2233_4455_6677)
+        );
+        assert!(config(uid).validate().is_ok());
+        for refused in [
+            "0123456789ABCDEF0011223344556677",
+            "123456789abcdef0011223344556677",
+            "+123456789abcdef0011223344556677",
+            "0123456789abcdef00112233445566770",
+        ] {
+            assert!(config(refused).validate().is_err(), "{refused}");
+        }
+        let without_origin = GeoConfig {
+            origin: String::new(),
+            ..config(uid)
+        };
+        assert!(without_origin.validate().is_err());
     }
 
     #[test]

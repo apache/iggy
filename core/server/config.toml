@@ -1577,6 +1577,21 @@ handshake_grace = "10 s"
 # reads peers also keeps a detached shadow topic this long after the peer wrote
 # its tombstone.
 #tombstone_grace = "24 h"
+# The cluster_uid of a cluster that lost every disk, as the store identity
+# object "<prefix>/meta/identity" names it, whose geo topics this cluster
+# takes back from that store. Only replica 0 reads it: set it there, in the
+# cluster rebuilt on empty disks with the same origin and [tiered_storage]
+# section as the lost cluster, only after that cluster is stopped for good.
+# Replica 0 then retires the lost cluster, restores its geo topics with their
+# ids, and claims the store. The other nodes learn from metadata which
+# partitions to take back. Empty, the default, takes nothing back, and a
+# cluster refuses a store that another cluster claimed. Remove it once the
+# recovery report is written. GEO_TOPICS.md describes the procedure.
+#recover_cluster_uid = ""
+# Whether the recovery also takes the batches that no proof in the store
+# names, at the offsets their writer expected: false takes back exactly the
+# messages the store proves committed and drops the rest.
+#recover_unproven = true
 # One table per peer, at most 16. A peer's store is the [tiered_storage] store
 # of the other cluster, with the same keys. The server only reads it: it never
 # puts, deletes or creates an object there, so read-only credentials are

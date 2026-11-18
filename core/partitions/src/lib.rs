@@ -75,11 +75,17 @@ pub use fresh_sweep::{
     FreshListRequest, FreshListScope, FreshListedScope, FreshListing, FreshObjectSweeper,
     FreshObjectsInUse, FreshScanFailed, FreshSettled, FreshSweep, ProofFloors, list_fresh_objects,
 };
+mod origin_recovery;
 mod placed_read;
 mod proven_batch;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
     MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
+};
+pub use origin_recovery::{
+    DropReason, DroppedBatch, FRESH_INDEX_FIRST_READ, FreshScan, PartitionRecovery,
+    RECOVERY_PLAN_BATCHES_MAX, RecoveryInstallError, RecoveryPlan, RecoveryPlanError, SkipReason,
+    SkippedObject, plan_partition, scan_fresh_objects,
 };
 pub use proven_batch::{ProvenBatch, ProvenBatchError};
 mod topic_object;

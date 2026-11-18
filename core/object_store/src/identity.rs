@@ -92,6 +92,34 @@ impl StoreIdentity {
         }
     }
 
+    /// Write this identity under the identity key of `layout`, over the
+    /// object of the cluster that owned the root before.
+    ///
+    /// Only the recovery of a cluster that lost every disk calls this, once
+    /// it stored the [`crate::RecoveryRecord`] that retires the cluster the
+    /// object names. A store has no conditional replace, so nothing stops a
+    /// cluster that still writes the root: the operator stops the retired
+    /// cluster for good before the recovery runs, and its nodes stop their
+    /// uploads once their next check finds this identity.
+    ///
+    /// # Errors
+    /// Any error of the put.
+    pub async fn replace<S: ObjectStore>(
+        self,
+        store: &S,
+        layout: &KeyLayout,
+    ) -> Result<(), ObjectStoreError> {
+        let body = self.to_string();
+        let options = PutOptions {
+            mode: PutMode::Overwrite,
+            metadata: UserMetadata::default(),
+            crc32c: Some(crc32c::crc32c(body.as_bytes())),
+        };
+        store
+            .put(&layout.identity_key(), PutBody::from_bytes(body), &options)
+            .await
+    }
+
     /// Read the identity object under the identity key of `layout`.
     ///
     /// # Errors
@@ -234,6 +262,21 @@ mod tests {
             block_on(StoreIdentity::read(&store, &layout())).unwrap(),
             IdentityRead::Found(THEIRS)
         );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn given_root_of_a_retired_cluster_when_replacing_should_name_the_successor() {
+        let store = MemoryStore::new();
+        block_on(THEIRS.claim(&store, &layout())).unwrap();
+
+        block_on(OURS.replace(&store, &layout())).unwrap();
+
+        assert_eq!(
+            block_on(StoreIdentity::read(&store, &layout())).unwrap(),
+            IdentityRead::Found(OURS)
+        );
+        assert!(!block_on(THEIRS.claim(&store, &layout())).unwrap());
         assert_eq!(store.len(), 1);
     }
 
