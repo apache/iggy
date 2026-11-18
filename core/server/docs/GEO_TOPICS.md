@@ -52,8 +52,9 @@ objects](../README.md#geo-topic-objects), [shadow streams](../README.md#shadow-s
 - **Shadow stream** and **shadow topic**: how a cluster shows the geo topics of a peer. The
   shadow stream of the peer `dc-a` and its stream `orders` is `__shadow_dc-a_orders`.
 - **Committed**: the message is stored and its cluster acknowledged it to the producer.
-- **Published**: the message is in a long-term segment that the partition's manifest lists. Only
-  published messages are meant to be read by other datacenters.
+- **Published**: the message is in a long-term segment that the partition's manifest lists.
+- **Proven**: a proof row in a stored fresh object binds the committed message to its offset.
+  Other datacenters read published and proven messages.
 
 ## What a geo topic is
 
@@ -100,22 +101,23 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 
 ## What works in this version
 
-| Part                                                                          | In this version |
-| ----------------------------------------------------------------------------- | --------------- |
-| Create a geo topic in mode `geo`                                              | Yes             |
-| Produce to a geo topic: each send is stored in the bucket before it commits   | Yes             |
-| Poll a geo topic in the cluster that wrote it                                 | Yes             |
-| Long-term segments, the partition manifest, merges, retention and deletes     | Yes             |
-| Publish an object for each geo topic in the bucket, and a tombstone on delete | Yes             |
-| Read and verify the bucket of each peer                                       | Yes             |
-| Adopt the geo topics of each peer as shadow streams                           | Yes             |
-| A shadow topic serves the published messages of its origin                    | Yes             |
-| A command that retires an origin that never returns                           | No              |
-| Recover the geo topics of a cluster that lost every disk, from its bucket     | Yes             |
-| Consumer positions that move between datacenters                              | No              |
-| The `geo_tiered` mode, and a switch between modes                             | No              |
-| Geo topics in encrypted streams                                               | No              |
-| Geo topics through the Kafka gateway                                          | No              |
+| Part                                                                           | In this version |
+| ------------------------------------------------------------------------------ | --------------- |
+| Create a geo topic in mode `geo`                                               | Yes             |
+| Produce to a geo topic: each send is stored in the bucket before it commits    | Yes             |
+| Poll a geo topic in the cluster that wrote it                                  | Yes             |
+| Long-term segments, the partition manifest, merges, retention and deletes      | Yes             |
+| Publish an object for each geo topic in the bucket, and a tombstone on delete  | Yes             |
+| Read and verify the bucket of each peer                                        | Yes             |
+| Adopt the geo topics of each peer as shadow streams                            | Yes             |
+| A shadow topic serves the published messages of its origin                     | Yes             |
+| A shadow topic serves the committed messages its origin proved, about 1 s late | Yes             |
+| A command that retires an origin that never returns                            | No              |
+| Recover the geo topics of a cluster that lost every disk, from its bucket      | Yes             |
+| Consumer positions that move between datacenters                               | No              |
+| The `geo_tiered` mode, and a switch between modes                              | No              |
+| Geo topics in encrypted streams                                                | No              |
+| Geo topics through the Kafka gateway                                           | No              |
 
 ## How a message moves
 
@@ -139,7 +141,11 @@ shadow topic. A message becomes readable in another datacenter once its origin p
    long-term log. It then stores the partition's **manifest**,
    `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`, which lists the
    long-term segments. The message is **published**.
-6. Once every message of a fresh object is in long-term segments, no record names the object
+6. Each node of another datacenter that leads a shadow partition of this topic finds the new
+   fresh objects in the bucket, reads their indexes, and serves the batches the proof rows bind,
+   about a second after they committed. Once the manifest lists them, its shadow partitions serve
+   them from the long-term segments instead.
+7. Once every message of a fresh object is in long-term segments, no record names the object
    any more. A sweep that runs every minute deletes it 10 minutes after it first finds it so, once
    the long-term segments also hold every batch its proof rows name.
 
@@ -416,10 +422,16 @@ A shadow topic is read like any other topic, by stream name and topic name or id
 topic id and the partition ids of its origin's topic, and it is built to serve the origin's
 offsets.
 
-A shadow topic serves the messages that its origin published in long-term segments, and reads
-their bytes from the origin's bucket. A message that the origin committed and did not publish yet
-is not in the shadow topic: see [Delays](#delays). Every node of the cluster serves the same
-messages of a shadow partition, also after a restart.
+A shadow topic serves the messages that its origin published in long-term segments, and the
+messages it committed after them that the proof rows of its fresh objects bind to their offsets,
+and reads their bytes from the origin's bucket. A committed message that no stored proof row binds
+yet is not in the shadow topic: see [Delays](#delays).
+
+Every node serves the same published messages of a shadow partition, also after a restart. The
+proven messages above them are what each node found in the bucket itself, so a node serves them
+only once it follows the origin, see [Follow the fresh objects of a peer](#follow-the-fresh-objects-of-a-peer).
+A consumer whose stored position is ahead of what the node it reads from serves waits until the
+node gets there; its position is never moved back.
 
 ### Consumer groups and positions
 
@@ -444,7 +456,8 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | Send                  | Committed and acknowledged         | One upload of the fresh object and one commit. A busy shard adds up to `fresh_upload_interval`, 10 ms by default, or the wait for a free upload slot. A partition past `long_term_backlog_limit` adds 10 ms to 250 ms. |
 | Committed             | Readable in the origin cluster     | At once.                                                                                                                                                                                                               |
 | Committed             | Published                          | The partition's next rewrite, every 250 ms to 10 s, plus the upload and the commit of the segment. The manifest is stored after the commit.                                                                            |
-| Published             | Readable in another datacenter     | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                     |
+| Committed             | Readable in another datacenter     | About a second: the next object of the shard that carries the proof row, at most 250 ms later when no send follows, its upload, then up to 250 ms until the peer's next probe finds the object and reads its index.    |
+| Published             | Read from long-term segments there | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                     |
 | Geo topic created     | Shadow topic in each peer          | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                        |
 | Geo topic deleted     | Shadow topic detached in each peer | Up to a minute until the origin writes the tombstone, then up to 30 s until a peer reads it again.                                                                                                                     |
 | Shadow topic detached | Shadow topic removed               | `[geo] tombstone_grace` of the cluster that holds the shadow, 24 hours by default, counted from the tombstone's write.                                                                                                 |
@@ -459,6 +472,33 @@ default.
 origin. It is the most committed messages that one partition of the shard holds and no long-term
 segment holds yet.
 
+In a test with two single-node clusters on one host and an `fs` bucket, with one send every
+20 ms and the peer listing manifests only every 30 s, a consumer of the shadow topic read each of
+250 messages at most 0.7 s after its send, 0.45 s at the median.
+
+### Follow the fresh objects of a peer
+
+Shard 0 of each node that leads a shadow partition of a peer follows that peer's fresh objects.
+The objects of one writer, a shard of a node of the peer in one run of its process, sit under the
+prefix of its replica and shard and are numbered from 0. So the node:
+
+- probes the next number of each writer with one ranged read of the start of the object, which
+  holds its index. A probe that finds the object reads the index at once, and the node probes the
+  number after it. A probe that finds nothing is tried again 250 ms later;
+- lists the peer's fresh objects every 10 s, from the newest key it read under each writer. That
+  finds a writer that restarted or is new, and the objects after a number the writer never stored;
+- stops probing a writer that stored nothing for a minute, and finds its next object by listing.
+
+A node that starts reads the newest object of each writer only. The proven messages it finds
+above the floor wait until a manifest lists the ones below them, since a shadow partition never
+fills a gap with offsets that a writer only predicted. A node serves fresh messages after it
+started only from then on, one rewrite and one manifest later. Each node rebuilds what it follows
+from the bucket, and nothing of it goes through the consensus of the shadow partition.
+
+A proof row repeats across objects, and a node takes it once. Two different rows for one offset
+mean the origin's log diverged: the shadow partition then serves no fresh message until the node
+restarts, keeps serving the published ones, and `geo_shadow_fresh_conflicts_total` counts it.
+
 ## What fails and what is lost
 
 | Event                                                   | Effect                                                                                                                                                                                                                                                                                                                        |
@@ -469,6 +509,7 @@ segment holds yet.
 | A cluster is destroyed with its disks, its bucket stays | A cluster rebuilt on empty disks takes back its geo topics when an operator asks for it: see [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks). The published messages come back, and so do the committed ones that self-describing fresh objects prove. The other committed messages are lost. |
 | A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                                  |
 | A peer's bucket does not answer                         | This cluster keeps the last manifest that each shadow partition committed, removes no shadow topic except those whose grace ended, and sets `geo_shadow_topics_stale` for that origin. Polls of a shadow topic that need bytes from that bucket get 58, which the SDKs retry. Local traffic is not affected.                  |
+| A peer deleted a fresh object that a shadow poll reads  | The peer deletes a fresh object only after a manifest it stored lists its messages. The poll is refused as one to retry, and the retry reads the long-term segments once this cluster lists that manifest.                                                                                                                    |
 
 What a destroyed cluster loses for certain is what it committed and had not yet proven in a
 stored fresh object. `fresh_proof_lag_seconds` shows how far behind the proofs are. A recovery
@@ -647,6 +688,16 @@ per peer:
 - every `[geo] manifest_poll_interval`, shard 0 of each node lists the manifests of each peer
   stream for which the node leads a shadow partition, and the shard that owns the partition reads
   each manifest that changed;
+- shard 0 of each node that leads a shadow partition of the peer follows the peer's fresh
+  objects: one get per fresh object the peer stores, a second one only for an index longer than
+  1.25 times the writer's last one; one get every 250 ms per writer that stored an object in the
+  last minute, which finds nothing while the writer is idle; and a listing every 10 s of one page
+  per writer and one more. A proof row that names an object the node has not read costs one
+  more get. So the cost grows with the objects the peer writes and the number of its writers, a
+  shard of each of its nodes, and not with the partitions: at the default 10 ms upload interval a
+  peer shard under steady load stores up to 100 objects a second, and every following node reads
+  each one's index. A longer `fresh_upload_interval` on the peer makes fewer and larger objects.
+  The indexes cross datacenters even when no consumer reads the shadow topic;
 - gets for the segments and indexes that polls of the shadow topics read.
 
 Requests to a cluster's own bucket:
@@ -672,20 +723,25 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 
 ### Buckets and peers
 
-| Metric                             | Meaning                                                                            |
-| ---------------------------------- | ---------------------------------------------------------------------------------- |
-| `object_store_identity_verified`   | 1 while the node passes the store identity check of its own bucket.                |
-| `object_store_unreachable`         | 1 while its own bucket does not answer the check.                                  |
-| `geo_peer_identity_verified`       | Per `origin`: 1 while the node reads the peer's bucket.                            |
-| `geo_peer_unreachable`             | Per `origin`: 1 while the peer's bucket does not answer the check.                 |
-| `geo_shadow_topics_stale`          | Per `origin`: stale shadow topics, counted on the metadata primary.                |
-| `geo_peer_manifest_requests_total` | Per `origin` and `request`, `list` or `get`: requests for the peer's manifests.    |
-| `geo_peer_manifest_failures_total` | The same requests that failed.                                                     |
-| `geo_peer_manifests_refused_total` | Per `origin`: manifests that this cluster refused.                                 |
-| `geo_peer_manifest_commands_total` | Per `origin`: commands that committed a manifest to a shadow partition.            |
-| `geo_peer_manifest_listed_seconds` | Per `origin`: Unix time of the last listing that succeeded, on shard 0.            |
-| `geo_shadow_partitions_behind`     | Per `origin`: shadow partitions whose committed manifest is behind the listed one. |
-| `geo_shadow_manifest_lag_seconds`  | Per `origin`: the longest time one of them has been behind.                        |
+| Metric                             | Meaning                                                                                                                                                                    |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `object_store_identity_verified`   | 1 while the node passes the store identity check of its own bucket.                                                                                                        |
+| `object_store_unreachable`         | 1 while its own bucket does not answer the check.                                                                                                                          |
+| `geo_peer_identity_verified`       | Per `origin`: 1 while the node reads the peer's bucket.                                                                                                                    |
+| `geo_peer_unreachable`             | Per `origin`: 1 while the peer's bucket does not answer the check.                                                                                                         |
+| `geo_shadow_topics_stale`          | Per `origin`: stale shadow topics, counted on the metadata primary.                                                                                                        |
+| `geo_peer_manifest_requests_total` | Per `origin` and `request`, `list` or `get`: requests for the peer's manifests.                                                                                            |
+| `geo_peer_manifest_failures_total` | The same requests that failed.                                                                                                                                             |
+| `geo_peer_manifests_refused_total` | Per `origin`: manifests that this cluster refused.                                                                                                                         |
+| `geo_peer_manifest_commands_total` | Per `origin`: commands that committed a manifest to a shadow partition.                                                                                                    |
+| `geo_peer_manifest_listed_seconds` | Per `origin`: Unix time of the last listing that succeeded, on shard 0.                                                                                                    |
+| `geo_shadow_partitions_behind`     | Per `origin`: shadow partitions whose committed manifest is behind the listed one.                                                                                         |
+| `geo_shadow_manifest_lag_seconds`  | Per `origin`: the longest time one of them has been behind.                                                                                                                |
+| `geo_peer_fresh_requests_total`    | Per `origin` and `request`: `probe`, `index`, `list` or `record` requests for the peer's fresh objects. A probe that finds nothing yet counts as a request, not a failure. |
+| `geo_peer_fresh_failures_total`    | The same requests that failed.                                                                                                                                             |
+| `geo_shadow_fresh_lag_messages`    | Per `origin`: the most proven messages one shadow partition found and does not serve yet.                                                                                  |
+| `geo_shadow_fresh_lag_seconds`     | Per `origin`: by the peer's clock, how much older the newest message that partition serves is than the newest one it found proven.                                         |
+| `geo_shadow_fresh_conflicts_total` | Per `origin`: shadow partitions that found two proof rows binding one offset to different batches, and stopped serving fresh messages. Alert on any.                       |
 
 ### Write path
 
@@ -764,6 +820,10 @@ Alert on these first:
   refused. The shadow partitions keep the last manifest they committed.
 - `geo_shadow_manifest_lag_seconds` that keeps growing past a few `manifest_poll_interval`: shadow
   topics fall behind their origin.
+- `geo_shadow_fresh_conflicts_total` above 0: a peer's proof rows disagree, and a shadow partition
+  serves only published messages.
+- `geo_shadow_fresh_lag_seconds` that keeps growing: a shadow partition found proven messages it
+  cannot serve, and waits for a manifest.
 
 ## Tunables
 
@@ -788,8 +848,10 @@ before an unlisted long-term object is deleted.
 
 ## Limits of this version
 
-- **Shadow topics serve only published messages.** A message reaches the shadow topics of the
-  peers after its origin's next rewrite and manifest, not at its commit.
+- **A node serves the proven messages of a peer only while it follows the peer.** A node that
+  leads no shadow partition of a peer does not follow it, and a node that starts to follow it
+  serves proven messages only once a manifest reaches the first ones it found. A message that is
+  committed and not proven reaches the shadow topics only with the next manifest.
 - **Consumer positions stay in their datacenter.** No position moves with a consumer group.
 - **No encrypted streams.** A geo topic in a stream with an encryption key is refused with
   `FeatureUnavailable` (5), because its sends reach the bucket before the stream's encryption
