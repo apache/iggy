@@ -228,8 +228,8 @@ async fn transfer_install_waits_for_captured_writer_before_replacing_history() {
     partition.configure_consumer_offset_storage(
         ["consumers", "groups", "external_groups"]
             .map(|name| directory.path().join(name).to_str().unwrap().to_owned()),
-        ConsumerOffsets::with_capacity(1),
-        ConsumerGroupOffsets::with_capacity(1),
+        ConsumerOffsets::new(),
+        ConsumerGroupOffsets::new(),
     );
     partition.set_io_notifier(
         Rc::new(|_, _| {}),
@@ -309,8 +309,8 @@ async fn installed_offsets_survive_a_materialization_marker_unlink_failure() {
         }
         partition.configure_consumer_offset_storage(
             dirs,
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
+            ConsumerOffsets::new(),
+            ConsumerGroupOffsets::new(),
         );
         partition.materialization_missing = true;
         let marker = directory.path().join(MARKER);
@@ -368,8 +368,8 @@ async fn given_a_fresh_backup_when_the_tick_runs_during_an_install_should_certif
     }
     partition.configure_consumer_offset_storage(
         dirs,
-        ConsumerOffsets::with_capacity(1),
-        ConsumerGroupOffsets::with_capacity(1),
+        ConsumerOffsets::new(),
+        ConsumerGroupOffsets::new(),
     );
     let prepare = checksummed_segment_prepare(1, 0, 8, b"installed");
     let wire = crate::state_transfer::ConsumerOffsetsWire {
@@ -447,8 +447,8 @@ async fn given_old_offsets_when_install_replaces_them_should_keep_cleanup_keys_a
     let consumers = dirs[0].clone();
     partition.configure_consumer_offset_storage(
         dirs,
-        ConsumerOffsets::with_capacity(1),
-        ConsumerGroupOffsets::with_capacity(1),
+        ConsumerOffsets::new(),
+        ConsumerGroupOffsets::new(),
     );
     let old = PendingConsumerOffsetCommit::upsert(ConsumerKind::Consumer, OLD_CONSUMER, 4);
     partition.persist_consumer_offset_commit(old).await.unwrap();

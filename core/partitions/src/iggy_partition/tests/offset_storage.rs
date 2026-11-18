@@ -333,7 +333,7 @@ async fn auto_commit_cold_key_folds_against_file_once() {
 #[compio::test]
 async fn given_dead_group_when_reclaimed_should_keep_capacity_until_replicated_delete() {
     let (mut partition, _) = recording_partition();
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(7),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
     );
@@ -370,7 +370,7 @@ async fn given_known_stranded_group_file_when_reconciling_should_not_submit_dele
     // In the live map, so the reclaim walk actually meets the key and the
     // stranded filter is what keeps it out of the delete log.
     partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 7, 11, 11);
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(7),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
     );
@@ -411,7 +411,7 @@ fn given_local_only_key_when_replicated_should_require_durable_membership_to_del
             .is_err(),
         "a stranded file is not a replicated key"
     );
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(8),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 8, 0, String::new()),
     );
@@ -453,7 +453,7 @@ async fn given_committed_delete_when_unlink_fails_should_preserve_state_and_repo
     let (mut partition, _) = recording_partition();
     partition.consumer_offset_dirs[ConsumerKind::ConsumerGroup.index()] =
         Some(group_dir.to_string_lossy().into_owned());
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(7),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
     );
@@ -504,7 +504,7 @@ async fn given_quorum_store_when_unrelated_dirty_directory_is_gone_should_succee
         .await;
     commit_recorded_loopback(&mut partition).await;
 
-    assert!(partition.consumer_offsets.pin().contains_key(&7));
+    assert!(partition.consumer_offsets.borrow().contains_key(&7));
     assert!(
         partition
             .durable_consumer_offsets
@@ -767,7 +767,7 @@ fn given_a_staged_client_store_when_checking_since_admission_should_report_it_be
 #[test]
 fn given_follower_when_group_is_deleted_should_wait_for_ordered_reclamation() {
     let (partition, _) = recording_partition_at(1, 3);
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(7),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
     );

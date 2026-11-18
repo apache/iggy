@@ -22,7 +22,7 @@ use crate::{
     HistoryCertificate, HistoryRecovery, IgnoreReason, MergeOutcome, MergeQuorums, MergedLog,
     Pipeline, PlaneKind, PrepareLogEvent, Project, RepairEvidence, ReplicaLogContext, ReplicaSet,
     SimEventKind, StoredDvc, ViewChangeLogEvent, ViewChangeReason, VsrState, dvc_count,
-    dvc_header_kind, dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_suffix_decode,
+    dvc_header_kind, dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_suffix_decode,
     emit_replica_event, emit_sim_event, merge_view_change, seal_prepare_checksum,
 };
 use bit_set::BitSet;
@@ -42,7 +42,7 @@ use server_common::Message;
 use server_common::iobuf::Frozen;
 use server_common::poll::AutoCommitReservation;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroU64;
 use std::rc::Rc;
@@ -473,6 +473,7 @@ where
     /// The entry itself, when the request queue is at its depth bound.
     pub fn push_queued_request(&self, mut entry: RequestEntry) -> Result<(), RequestEntry> {
         entry.received_at = self.clock_realtime_micros();
+        self.pipeline_used.set(true);
         self.pipeline.borrow_mut().push_request(entry)
     }
 }
@@ -617,12 +618,21 @@ impl LocalPipeline {
              than a DoViewChange can address (max {})",
             DVC_HEADERS_MAX - 1,
         );
+        // Grown on first use: most partitions of a large node stay idle, and
+        // reserving both queues up front costs about 14 KB per partition.
         Self {
-            prepare_queue: VecDeque::with_capacity(prepare_queue_max),
-            request_queue: VecDeque::with_capacity(request_queue_max),
+            prepare_queue: VecDeque::new(),
+            request_queue: VecDeque::new(),
             prepare_queue_max,
             request_queue_max,
         }
+    }
+
+    /// Gives back the capacity of both queues that holds no entry, so an
+    /// empty pipeline keeps no heap.
+    pub fn shrink_to_fit(&mut self) {
+        self.prepare_queue.shrink_to_fit();
+        self.request_queue.shrink_to_fit();
     }
 
     #[must_use]
@@ -885,9 +895,13 @@ impl LocalPipeline {
 
     /// Clear both queues at view-change completion. New primary rebuilds
     /// prepares from journal; clients retry dropped requests via read-timeout.
+    ///
+    /// The buffers go too. Only a primary fills the queues, and only its
+    /// heartbeat runs [`Self::shrink_to_fit`], so a replica that leaves the
+    /// primary role here would keep them until it restarts.
     pub fn clear(&mut self) {
-        self.prepare_queue.clear();
-        self.request_queue.clear();
+        self.prepare_queue = VecDeque::new();
+        self.request_queue = VecDeque::new();
     }
 
     /// Drop reply senders on all prepare entries; receivers wake with
@@ -1032,6 +1046,10 @@ impl Pipeline for LocalPipeline {
 
     fn request_queue_len(&self) -> usize {
         Self::request_queue_len(self)
+    }
+
+    fn shrink_to_fit(&mut self) {
+        Self::shrink_to_fit(self);
     }
 }
 
@@ -1477,6 +1495,11 @@ where
     last_prepare_checksum: Cell<u128>,
 
     pipeline: RefCell<P>,
+    /// An entry may have entered the pipeline since the last commit heartbeat.
+    /// A pipeline under load is empty between batches, so an empty pipeline
+    /// alone does not show that the group is idle. Kept here, because in the
+    /// pipeline the flag would add 16 B to every partition.
+    pipeline_used: Cell<bool>,
     /// Snapshot of the pipeline's in-flight prepare capacity, taken at
     /// construction. Bounds the loopback queue and the view-change rebuild
     /// range without re-borrowing `pipeline`.
@@ -1611,8 +1634,10 @@ where
     history_certificate_durable: Cell<Option<HistoryCertificate>>,
 
     /// Tracks DVC messages received (only used by primary candidate)
-    /// Stores metadata; actual log comes from message
-    do_view_change_from_all_replicas: RefCell<DvcQuorumArray>,
+    /// Stores metadata; actual log comes from message. Boxed on the first record
+    /// and freed on reset: the table takes 3 KiB, and a group spends almost all
+    /// of its life outside a view change.
+    do_view_change_from_all_replicas: RefCell<Option<Box<DvcQuorumArray>>>,
     /// Whether DVC quorum has been achieved in current view change
     do_view_change_quorum: Cell<bool>,
     /// Whether we've sent our own SVC for current view
@@ -1647,6 +1672,22 @@ where
     /// [`ConsensusClock`].
     clock: ConsensusClock,
 }
+
+/// Size of the field that `projection` returns.
+///
+/// For const asserts on a field that must stay as small as one pointer: the
+/// assert reads the type of the field itself, so it fails the build when the
+/// field holds its state inline again.
+#[must_use]
+pub const fn field_size<T, F>(_projection: fn(&T) -> &F) -> usize {
+    size_of::<F>()
+}
+
+// Inline, the DVC table costs every group 3 KiB outside a view change.
+const _: () = assert!(
+    field_size(|consensus: &VsrConsensus| &consensus.do_view_change_from_all_replicas)
+        == size_of::<RefCell<usize>>()
+);
 
 /// What carried a log that contradicts an op this replica applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2029,6 +2070,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(pipeline),
+            pipeline_used: Cell::new(false),
             prepare_queue_max,
             message_bus,
             loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
@@ -2055,7 +2097,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             view_log_missing_op: Cell::new(None),
             history_certificate: Cell::new(empty_history),
             history_certificate_durable: Cell::new(empty_history),
-            do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
+            do_view_change_from_all_replicas: RefCell::new(None),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
@@ -2600,7 +2642,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Callers that pop or clear should prefer [`Self::pop_committed_prepare`] /
     /// [`Self::clear_pipeline`], which also keep the prepare timeout's
     /// ticking-iff-non-empty invariant. This form does not.
+    ///
+    /// `f` can push, so the call counts as use of the pipeline for the idle
+    /// check of the commit heartbeat.
     pub fn with_pipeline_mut<R>(&self, f: impl FnOnce(&mut P) -> R) -> R {
+        self.pipeline_used.set(true);
         f(&mut self.pipeline.borrow_mut())
     }
 
@@ -2727,6 +2773,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         pipeline.push(entry);
         let pipeline_depth = pipeline.len();
         drop(pipeline);
+        self.pipeline_used.set(true);
 
         let header = message.header();
 
@@ -3325,8 +3372,30 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Reset DVC quorum tracking.
     fn reset_dvc_quorum(&self) {
-        dvc_reset(&mut self.do_view_change_from_all_replicas.borrow_mut());
+        self.clear_dvcs();
         self.do_view_change_quorum.set(false);
+    }
+
+    /// The DVCs recorded for the current view change.
+    fn dvc_quorum(&self) -> Ref<'_, DvcQuorumArray> {
+        static NO_DVCS: DvcQuorumArray = [const { None }; REPLICAS_MAX];
+        Ref::map(self.do_view_change_from_all_replicas.borrow(), |dvcs| {
+            dvcs.as_deref().unwrap_or(&NO_DVCS)
+        })
+    }
+
+    /// Records `dvc`. Returns true if this is a new entry (not duplicate).
+    fn record_dvc(&self, dvc: StoredDvc) -> bool {
+        dvc_record(
+            self.do_view_change_from_all_replicas
+                .borrow_mut()
+                .get_or_insert_with(|| Box::new(dvc_quorum_array_empty())),
+            dvc,
+        )
+    }
+
+    fn clear_dvcs(&self) {
+        self.do_view_change_from_all_replicas.replace(None);
     }
 
     /// Reset view-change state on view transition.
@@ -3856,7 +3925,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let view = self.view.get();
         let primary = self.primary_index(view);
         let awaited_do_view_change: Vec<u8> = if self.is_primary_for_view(view) {
-            let received = self.do_view_change_from_all_replicas.borrow();
+            let received = self.dvc_quorum();
             (0..self.replica_count)
                 .filter(|replica| {
                     *replica != self.replica && received[usize::from(*replica)].is_none()
@@ -4001,6 +4070,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         self.timeouts.borrow_mut().reset(TimeoutKind::CommitMessage);
+        // The heartbeat is the one periodic event of an idle primary, so the
+        // idle check of the pipeline needs no timer of its own. A group that
+        // takes a write in every heartbeat interval keeps its queue buffers.
+        // An idle group gives them back at the second heartbeat after its
+        // last write.
+        if !self.pipeline_used.replace(false) {
+            self.pipeline.borrow_mut().shrink_to_fit();
+        }
 
         vec![self.commit_heartbeat()]
     }
@@ -4171,16 +4248,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     suffix: self.local_dvc_suffix(),
                     untrusted_log: self.untrusted_log.get(),
                 };
-                dvc_record(
-                    &mut self.do_view_change_from_all_replicas.borrow_mut(),
-                    own_dvc,
-                );
+                self.record_dvc(own_dvc);
 
                 // `complete_view_change_as_primary` latches only once the merge
                 // decides, so an undecidable quorum stays open to later DVCs.
                 if !self.do_view_change_quorum.get()
-                    && dvc_count(&self.do_view_change_from_all_replicas.borrow())
-                        >= self.quorum_view_change()
+                    && dvc_count(&self.dvc_quorum()) >= self.quorum_view_change()
                 {
                     actions.extend(self.complete_view_change_as_primary(plane));
                 }
@@ -4384,10 +4457,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 suffix: self.local_dvc_suffix(),
                 untrusted_log: self.untrusted_log.get(),
             };
-            dvc_record(
-                &mut self.do_view_change_from_all_replicas.borrow_mut(),
-                own_dvc,
-            );
+            self.record_dvc(own_dvc);
         }
 
         // Record the received DVC
@@ -4400,15 +4470,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             untrusted_log: header.untrusted_log(),
         };
         // A retransmit changes nothing the last merge did not already see.
-        if !dvc_record(&mut self.do_view_change_from_all_replicas.borrow_mut(), dvc) {
+        if !self.record_dvc(dvc) {
             return actions;
         }
 
         // `complete_view_change_as_primary` latches only once the merge decides,
         // so an undecidable quorum re-merges as each further DVC lands.
         if !self.do_view_change_quorum.get()
-            && dvc_count(&self.do_view_change_from_all_replicas.borrow())
-                >= self.quorum_view_change()
+            && dvc_count(&self.dvc_quorum()) >= self.quorum_view_change()
         {
             actions.extend(self.complete_view_change_as_primary(plane));
         }
@@ -5234,7 +5303,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// re-run costs only the merge.
     fn complete_view_change_as_primary(&self, plane: PlaneKind) -> Vec<VsrAction> {
         let merged = {
-            let dvc_array = self.do_view_change_from_all_replicas.borrow();
+            let dvc_array = self.dvc_quorum();
             merge_view_change(&dvc_array, self.merge_quorums())
         };
 
@@ -5688,7 +5757,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Ordering and self-exclusion are the same for every source list; only the
     /// "can this sender serve the op" predicate differs.
     fn pending_view_sources(&self, serves: impl Fn(&StoredDvc) -> bool) -> Vec<u8> {
-        let quorum = self.do_view_change_from_all_replicas.borrow();
+        let quorum = self.dvc_quorum();
         let mut sources: Vec<(u32, u8)> = dvc_iter(&quorum)
             .filter(|dvc| dvc.replica != self.replica)
             .filter(|dvc| serves(dvc))
@@ -5748,10 +5817,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // primaryship. Nothing reads the array after the view starts: a late
         // same-view DVC returns at the status gate, a higher-view one resets first.
         //
-        // `dvc_reset`, not `reset_dvc_quorum`: the latter also clears the
+        // `clear_dvcs`, not `reset_dvc_quorum`: the latter also clears the
         // `do_view_change_quorum` latch, which from here means "log decided" and is
         // what stops `handle_do_view_change_timeout` retransmitting.
-        dvc_reset(&mut self.do_view_change_from_all_replicas.borrow_mut());
+        self.clear_dvcs();
         self.invalidate_local_dvc_suffix();
 
         self.status.set(Status::Normal);
@@ -6622,6 +6691,31 @@ mod request_queue_tests {
             .prepare_head()
             .expect("prepare must still be there");
         assert_eq!(head.header.op, 7);
+    }
+
+    #[test]
+    fn given_pipeline_with_entries_when_shrinking_should_keep_them_and_free_the_rest() {
+        let mut pipeline = LocalPipeline::new();
+        pipeline.push(PipelineEntry::new(PrepareHeader {
+            op: 1,
+            ..PrepareHeader::default()
+        }));
+        pipeline
+            .push_request(RequestEntry::new(make_request(1, 1)))
+            .unwrap();
+
+        pipeline.shrink_to_fit();
+        assert_eq!(
+            pipeline.prepare_head().map(|entry| entry.header.op),
+            Some(1)
+        );
+        assert_eq!(pipeline.request_queue_len(), 1);
+
+        assert!(pipeline.pop_message().is_some());
+        assert!(pipeline.pop_request().is_some());
+        pipeline.shrink_to_fit();
+        assert_eq!(pipeline.prepare_queue.capacity(), 0);
+        assert_eq!(pipeline.request_queue.capacity(), 0);
     }
 
     // is_full() tracks ONLY prepare_queue, splits "backpressure" signal
@@ -8221,6 +8315,70 @@ mod vsr_consensus_tests {
         assert_eq!(commits(), 0, "the heartbeat consumed the request");
     }
 
+    /// Slots allocated for the prepare queue and for the request queue.
+    fn queue_capacities(consensus: &VsrConsensus<StageNoopBus>) -> (usize, usize) {
+        consensus.with_pipeline(|pipeline| {
+            (
+                pipeline.prepare_queue.capacity(),
+                pipeline.request_queue.capacity(),
+            )
+        })
+    }
+
+    /// One committed write that passed through both queues.
+    fn commit_queued_write(consensus: &VsrConsensus<StageNoopBus>, op: u64) {
+        assert!(
+            consensus
+                .push_queued_request(RequestEntry::new(client_request(u128::from(op))))
+                .is_ok()
+        );
+        assert!(consensus.pop_queued_request().is_some());
+        pipeline(consensus, &projected_prepare(op, 0));
+        commit_acked_head(consensus, op);
+    }
+
+    #[test]
+    fn given_a_primary_that_took_writes_when_a_heartbeat_interval_passes_without_one_should_free_its_queues()
+     {
+        const HEARTBEAT_TICKS: u64 = 2;
+        const BUSY_INTERVALS: u64 = 3;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.set_commit_message_ticks(HEARTBEAT_TICKS);
+        consensus.init();
+        let pass_heartbeat_interval = || {
+            for _ in 0..HEARTBEAT_TICKS {
+                let _ = consensus.tick(PlaneKind::Metadata);
+            }
+        };
+
+        for op in 1..=BUSY_INTERVALS {
+            commit_queued_write(&consensus, op);
+            pass_heartbeat_interval();
+            let (prepares, requests) = queue_capacities(&consensus);
+            assert!(
+                prepares > 0 && requests > 0,
+                "a write in every heartbeat interval keeps both queues"
+            );
+        }
+
+        pass_heartbeat_interval();
+        assert_eq!(queue_capacities(&consensus), (0, 0));
+    }
+
+    #[test]
+    fn given_a_primary_that_took_writes_when_it_adopts_the_next_view_should_free_its_queues() {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        commit_queued_write(&consensus, 1);
+
+        let start_view = test_bus::make_start_view(1, 1, 1, 1, 0);
+        let _ = consensus.handle_start_view(PlaneKind::Metadata, start_view.header(), &[]);
+
+        assert!(!consensus.is_primary(), "replica 1 leads view 1");
+        assert_eq!(queue_capacities(&consensus), (0, 0));
+    }
+
     #[test]
     fn given_a_backup_that_acks_a_committed_op_late_when_the_next_tick_runs_should_send_it_a_commit_covering_the_op()
      {
@@ -9041,7 +9199,7 @@ mod view_source_tests {
 
     use super::*;
     use crate::LocalPipeline;
-    use crate::view_change_quorum::{DvcSuffix, StoredDvc, dvc_record};
+    use crate::view_change_quorum::{DvcSuffix, StoredDvc};
 
     use crate::test_bus::NoopBus;
 
@@ -9073,9 +9231,8 @@ mod view_source_tests {
     }
 
     fn record(consensus: &VsrConsensus<NoopBus, LocalPipeline>, senders: [StoredDvc; 2]) {
-        let mut quorum = consensus.do_view_change_from_all_replicas.borrow_mut();
         for dvc in senders {
-            assert!(dvc_record(&mut quorum, dvc));
+            assert!(consensus.record_dvc(dvc));
         }
     }
 
@@ -10751,7 +10908,7 @@ mod recovery_election_tests {
         let candidate = cluster.replica(LAGGING_BACKUP);
         assert_eq!(candidate.view(), view);
         assert!(
-            candidate.do_view_change_from_all_replicas.borrow()[usize::from(LAGGING_BACKUP)]
+            candidate.dvc_quorum()[usize::from(LAGGING_BACKUP)]
                 .as_ref()
                 .expect("the candidate recorded its own vote")
                 .untrusted_log
@@ -11617,10 +11774,7 @@ mod adopted_view_claim_tests {
             untrusted_log: false,
         };
         for dvc in [dvc_of(&elect), peer] {
-            assert!(dvc_record(
-                &mut elect.do_view_change_from_all_replicas.borrow_mut(),
-                dvc
-            ));
+            assert!(elect.record_dvc(dvc));
         }
         assert!(elect.complete_view_change_as_primary(plane).is_empty());
         assert!(elect.is_primary_elect());
@@ -11688,10 +11842,7 @@ mod adopted_view_claim_tests {
             "the vote cannot name the commit of op {LOST}"
         );
         for dvc in [vote, restarted_without_the_op] {
-            assert!(dvc_record(
-                &mut candidate.do_view_change_from_all_replicas.borrow_mut(),
-                dvc
-            ));
+            assert!(candidate.record_dvc(dvc));
         }
 
         assert!(candidate.complete_view_change_as_primary(plane).is_empty());
@@ -11799,10 +11950,7 @@ mod adopted_view_claim_tests {
             ViewChangeReason::ReceivedStartViewChange,
         );
         for dvc in [dvc_of(&backup), peer] {
-            assert!(dvc_record(
-                &mut backup.do_view_change_from_all_replicas.borrow_mut(),
-                dvc
-            ));
+            assert!(backup.record_dvc(dvc));
         }
         assert!(
             backup
@@ -11876,10 +12024,7 @@ mod adopted_view_claim_tests {
             untrusted_log: false,
         };
         for dvc in [dvc_of(&backup), peer] {
-            assert!(dvc_record(
-                &mut backup.do_view_change_from_all_replicas.borrow_mut(),
-                dvc
-            ));
+            assert!(backup.record_dvc(dvc));
         }
         assert!(backup.complete_view_change_as_primary(plane).is_empty());
         assert!(backup.is_primary_elect());
@@ -11941,6 +12086,33 @@ mod adopted_view_claim_tests {
             started.start_pending_view(plane_of(group));
             assert_eq!(started.log_view(), MERGED_VIEW);
             assert!(!started.view_log_merged());
+        }
+    }
+
+    #[test]
+    fn given_a_merged_view_when_it_starts_or_is_superseded_should_free_the_dvc_table() {
+        for group in [PARTITION_GROUP, METADATA_GROUP] {
+            let started = proven_merge_elect(&history_in(group));
+            assert!(started.do_view_change_from_all_replicas.borrow().is_some());
+            started.start_pending_view(plane_of(group));
+            assert!(
+                started.do_view_change_from_all_replicas.borrow().is_none(),
+                "group {group}: a started view must not hold the DVC table"
+            );
+
+            let superseded = proven_merge_elect(&history_in(group));
+            superseded.enter_view_change(
+                plane_of(group),
+                MERGED_VIEW + 1,
+                ViewChangeReason::ReceivedStartViewChange,
+            );
+            assert!(
+                superseded
+                    .do_view_change_from_all_replicas
+                    .borrow()
+                    .is_none(),
+                "group {group}: a superseded view change must not hold the DVC table"
+            );
         }
     }
 

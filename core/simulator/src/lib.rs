@@ -269,6 +269,9 @@ pub struct Simulator {
     /// routing. Set at construction by [`Simulator::with_shards_shell`].
     shell: bool,
     seed_root: bool,
+    /// Repair ring budget of every shard, `None` for no budget. A restart
+    /// gives the rebuilt shards the same one.
+    repair_ring_bytes_max: Option<usize>,
     consumer_offsets_max: usize,
     // The liveness fence directory survives replica restarts and is removed last.
     _system_directory: Option<tempfile::TempDir>,
@@ -365,6 +368,7 @@ impl Simulator {
             shell,
             Some(data_dir_root),
             true,
+            None,
         )
     }
 
@@ -392,10 +396,15 @@ impl Simulator {
             shell,
             None,
             true,
+            None,
         )
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
     fn build_inner(
         replica_count: usize,
         shards_per_replica: u16,
@@ -404,6 +413,7 @@ impl Simulator {
         shell: bool,
         data_dir_root: Option<&std::path::Path>,
         seed_root: bool,
+        repair_ring_bytes_max: Option<usize>,
     ) -> Self {
         assert!(
             shards_per_replica >= 1,
@@ -544,6 +554,7 @@ impl Simulator {
                     // Fresh boot: `init_partition` seeds later, before any workload.
                     &[],
                     Arc::clone(&metadata_applied_frontier),
+                    repair_ring_bytes_max,
                 );
                 stop_txs.extend(liveness_stops);
                 if shard_idx == 0 {
@@ -615,6 +626,7 @@ impl Simulator {
             seed,
             shell,
             seed_root,
+            repair_ring_bytes_max,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
             _system_directory: system_directory,
         }
@@ -1642,6 +1654,7 @@ impl Simulator {
                 &system_path,
                 &seed_namespaces,
                 Arc::clone(&metadata_applied_frontier),
+                self.repair_ring_bytes_max,
             );
             stop_txs.extend(liveness_stops);
             if shard_idx == 0 {
@@ -2425,6 +2438,7 @@ mod tests {
                 true,
                 None,
                 false,
+                None,
             );
             for node in &sim.replicas {
                 assert!(
@@ -2588,6 +2602,7 @@ mod tests {
             true,
             None,
             false,
+            None,
         );
         let initialization = start_root_initialization(&mut sim, 0, false);
         sim.step();
@@ -2614,6 +2629,7 @@ mod tests {
                 true,
                 None,
                 false,
+                None,
             );
             for backup in [1, 2] {
                 sim.network
@@ -2654,6 +2670,7 @@ mod tests {
                 true,
                 Some(directory.path()),
                 false,
+                None,
             );
             for node in &sim.replicas {
                 for shard in &node.shards {
@@ -3252,7 +3269,7 @@ mod tests {
                         consensus.commit_max(),
                         partition.log.journal().inner.holds_op(fence_op),
                         partition.history_deleted(),
-                        partition.repair,
+                        partition.repair().copied(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -13458,6 +13475,17 @@ mod partition_repair_driver_tests {
         replica_count: u8,
         shards_per_replica: u16,
     ) -> (Simulator, SimClient) {
+        ring_budget_cluster(seed, replica_count, shards_per_replica, None)
+    }
+
+    /// [`sized_cluster`] whose shards each hold their repair rings to
+    /// `repair_ring_bytes_max`, or to no budget.
+    fn ring_budget_cluster(
+        seed: u64,
+        replica_count: u8,
+        shards_per_replica: u16,
+        repair_ring_bytes_max: Option<usize>,
+    ) -> (Simulator, SimClient) {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -13469,11 +13497,15 @@ mod partition_repair_driver_tests {
             seed,
             ..packet::PacketSimulatorOptions::default()
         };
-        let sim = Simulator::with_shards(
+        let sim = Simulator::build_inner(
             replica_count as usize,
             shards_per_replica,
             std::iter::once(CLIENT_ID),
             network_opts,
+            false,
+            None,
+            true,
+            repair_ring_bytes_max,
         );
         (sim, SimClient::new(CLIENT_ID))
     }
@@ -13550,7 +13582,7 @@ mod partition_repair_driver_tests {
             .partitions()
             .get_by_ns(&namespace)
             .is_some_and(|partition| {
-                partition.transfer.is_some()
+                partition.transfer().is_some()
                     || partition.consensus().state_transfer_stage()
                         != consensus::StateTransferStage::Idle
             })
@@ -13577,7 +13609,7 @@ mod partition_repair_driver_tests {
                 .partitions()
                 .get_by_ns(&namespace)
                 .unwrap()
-                .repair
+                .repair()
                 .is_none(),
             "resident operations must not consume a repair session while waiting for the next walk"
         );
@@ -14030,7 +14062,7 @@ mod partition_repair_driver_tests {
                 .plane
                 .partitions()
                 .get_by_ns(&namespace)
-                .is_some_and(|partition| partition.repair.is_some());
+                .is_some_and(|partition| partition.repair().is_some());
             if transfer_armed(&sim, LAGGING, namespace) {
                 break;
             }
@@ -14049,6 +14081,163 @@ mod partition_repair_driver_tests {
             transfer_armed(&sim, LAGGING, namespace),
             "the tick-armed repair session hit an evicted range but never converted \
              to a state transfer (status {status:?})"
+        );
+    }
+
+    /// A backup that missed flushed sends repairs them from the repair rings
+    /// of its peers while the rings hold them. Once the ring budget of a
+    /// shard dropped them, the same lag ends in a state transfer.
+    ///
+    /// The run without a budget is the control: journal repair closes this
+    /// gap, so the transfer of the budgeted run is the work of the shed that
+    /// every shard runs on its tick.
+    ///
+    /// The simulator serves no partition state transfer, so the budgeted run
+    /// ends where the backup asks for one.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_ring_budget_that_dropped_the_missed_ops_when_a_backup_lags_should_convert_to_state_transfer()
+     {
+        /// Sends that reach the flush threshold, so each one leaves the
+        /// journal for the repair ring when it commits. The backup misses
+        /// the first one.
+        const FLUSHED_SENDS: usize = 3;
+        /// Room for two of the flushed sends, which charge about 56 KiB each:
+        /// the third one makes the shed drop the send that the backup missed.
+        const RING_BUDGET_BYTES: usize = 128 * 1024;
+
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
+
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            if withhold_one_prepare(packet) {
+                return true;
+            }
+            let group = GAP_NS.load(Ordering::Relaxed);
+            if let Some(header) = prepare_for(packet, group) {
+                return header.op == WITHHELD_OP.load(Ordering::Relaxed);
+            }
+            is_commit_for(packet, group)
+        }
+
+        /// Where [`LAGGING`] stands once it committed the op it missed or
+        /// asked for a state transfer, and what the primary shed by then.
+        struct Lag {
+            withheld: u64,
+            view: u32,
+            commit_min: u64,
+            transferred: bool,
+            primary_shed: partitions::RepairRingShed,
+            primary_retained_from: Option<u64>,
+        }
+
+        fn lag_behind_flushed_sends(repair_ring_bytes_max: Option<usize>) -> Lag {
+            let (mut sim, client) =
+                ring_budget_cluster(0x5EED_0234, CLUSTER_REPLICAS, 1, repair_ring_bytes_max);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.init_partition(namespace);
+            sim.register_client_with_primary(&client);
+            GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+            WITHHELD_OP.store(0, Ordering::Relaxed);
+
+            produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+            arm_withheld_prepare(&sim);
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+                Some(starve_commit_edge);
+
+            let flush_messages = sim.replicas[0]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .config()
+                .messages_required_to_save;
+            let batch = vec![Bytes::from_static(b"flushed"); flush_messages as usize];
+            for _ in 0..FLUSHED_SENDS {
+                let reply = tests::submit_and_wait_for_reply(
+                    &mut sim,
+                    CLIENT_ID,
+                    0,
+                    client.send_messages(namespace, &batch),
+                );
+                assert_eq!(reply.header().status, 0);
+            }
+            let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+            assert_ne!(
+                withheld, 0,
+                "no partition prepare crossed the primary link, so the fault never armed"
+            );
+
+            // Judged with the blockade standing, so only journal repair can
+            // bring the withheld op to the backup.
+            let mut transferred = false;
+            for _ in 0..STRAND_QUIET_STEPS {
+                sim.step();
+                transferred |= transfer_armed(&sim, LAGGING, namespace);
+                let (_, _, commit_min, _) = group_state(&sim, LAGGING, namespace);
+                if transferred || commit_min >= withheld {
+                    break;
+                }
+            }
+            let (_, view, commit_min, _) = group_state(&sim, LAGGING, namespace);
+            let primary = sim.replicas[0].partition_shard(namespace);
+            Lag {
+                withheld,
+                view,
+                commit_min,
+                transferred,
+                primary_shed: primary.metrics().repair_ring_shed_value(),
+                primary_retained_from: primary
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .and_then(|partition| partition.log.journal().inner.repair_retained_from()),
+            }
+        }
+
+        let unbudgeted = lag_behind_flushed_sends(None);
+        assert_eq!(
+            unbudgeted.view, 0,
+            "a view change closed the gap, so the control proves nothing about repair"
+        );
+        assert!(
+            !unbudgeted.transferred && unbudgeted.commit_min >= unbudgeted.withheld,
+            "without a ring budget the rings hold op {}, yet the backup did not repair it \
+             (commits through {}, transfer armed: {})",
+            unbudgeted.withheld,
+            unbudgeted.commit_min,
+            unbudgeted.transferred
+        );
+
+        let budgeted = lag_behind_flushed_sends(Some(RING_BUDGET_BYTES));
+        let usage = budgeted.primary_shed.usage;
+        assert!(
+            budgeted.primary_shed.entries_dropped > 0
+                && budgeted
+                    .primary_retained_from
+                    .is_some_and(|from| from > budgeted.withheld),
+            "the tick did not shed op {} from the primary's ring: {:?}, serves from {:?}",
+            budgeted.withheld,
+            budgeted.primary_shed,
+            budgeted.primary_retained_from
+        );
+        assert!(
+            usage.floor_bytes <= usage.charged_bytes && usage.charged_bytes <= usage.budget_bytes,
+            "the shed left the primary's rings past the budget: {usage:?}"
+        );
+        assert_eq!(
+            budgeted.view, 0,
+            "a view change armed the recovery instead of the repair session"
+        );
+        assert!(
+            budgeted.transferred && budgeted.commit_min < budgeted.withheld,
+            "the backup lags behind op {}, which the budget dropped, but it did not convert \
+             to a state transfer (commits through {}, transfer armed: {})",
+            budgeted.withheld,
+            budgeted.commit_min,
+            budgeted.transferred
         );
     }
 
@@ -14492,7 +14681,7 @@ mod partition_repair_driver_tests {
                 .get_by_ns(&namespace)
                 .expect("the replica hosts the group");
             assert!(
-                partition.repair.is_none(),
+                partition.repair().is_none(),
                 "a session was already open, so this sweep would arm nothing"
             );
             partition.gap_ticks.set(u32::MAX);
@@ -14505,7 +14694,7 @@ mod partition_repair_driver_tests {
             .get_by_ns(&namespace)
             .expect("the replica hosts the group");
         assert!(
-            partition.repair.is_some(),
+            partition.repair().is_some(),
             "the sweep never opened a session, so the reset below proves nothing"
         );
         assert_eq!(
@@ -18342,7 +18531,7 @@ mod applied_divergence_resync_tests {
         {
             let partitions = shard.plane.partitions();
             let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-            partition.transfer = Some(PartitionTransferSession {
+            partition.set_transfer(Some(PartitionTransferSession {
                 nonce: TRANSFER_NONCE,
                 peer: 0,
                 commit_op: 0,
@@ -18353,7 +18542,7 @@ mod applied_divergence_resync_tests {
                 scan: None,
                 seed: None,
                 pulled_len: 0,
-            });
+            }));
             let consensus = partition.consensus();
             consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
             consensus.set_state_transfer_stage(StateTransferStage::Fetching);

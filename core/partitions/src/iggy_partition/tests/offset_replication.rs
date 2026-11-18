@@ -351,11 +351,11 @@ async fn given_pending_offset_prepare_when_view_changes_should_rebuild_capacity_
 #[test]
 fn given_phantom_and_eager_offsets_when_snapshotting_should_export_committed_durable_value_only() {
     let (partition, _) = recording_partition();
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         7,
         ConsumerOffset::new(ConsumerKind::Consumer, 7, 9, String::new()),
     );
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         8,
         ConsumerOffset::new(ConsumerKind::Consumer, 8, 11, String::new()),
     );
@@ -520,7 +520,7 @@ async fn on_request_delete_of_missing_offset_replies_typed_deny() {
     assert!(partition.pending_consumer_offset_commits.is_empty());
 
     // Existing offset: the gate passes and the delete enters the pipeline.
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         consumer_id as usize,
         ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, 3, String::new()),
     );
