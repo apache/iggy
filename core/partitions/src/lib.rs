@@ -34,8 +34,8 @@ pub mod offset_storage;
 mod partition_storage;
 mod peer_log;
 pub use peer_log::{
-    AppliedManifest, PeerLog, PeerLogError, PeerManifestApplied, PeerManifestRefusal,
-    remove_retired_indexes,
+    AppliedManifest, PeerLog, PeerLogError, PeerManifestApplied, PeerManifestContradiction,
+    PeerManifestRefusal,
 };
 mod persistence;
 mod poll_plan;

@@ -27,10 +27,18 @@
 //!
 //! An origin that places its batches merges small segments into one, which
 //! holds the bytes of its sources back to back under a key of its own. The
-//! log takes such a segment when its fields are what the sources it holds
-//! add up to. The origin keeps the objects of the sources for a while after
-//! the manifest that leaves them out, and a poll that walked one of them is
-//! refused when it completes.
+//! origin keeps the objects of the sources for a while after the manifest
+//! that leaves them out, and a poll that walked one of them is refused when
+//! it completes.
+//!
+//! The origin overwrites its manifest on every change, so a partition sees
+//! only some of them. The manifest alone says which segments exist, and the
+//! log moves to any newer one that agrees with it: every offset where a
+//! listed segment starts or ends, among the offsets the log holds, is one
+//! where a segment of the log starts or ends. A listed segment over segments
+//! of the log has to be what they add up to. One that also holds offsets
+//! past the log's end merges segments the partition never saw, and is held
+//! to what the segments of the log under it can show.
 //!
 //! The log ends with an empty tail that has no files. A commit of a consumer
 //! offset flushes the journal through the last segment of the log, so the
@@ -85,17 +93,35 @@ pub struct AppliedManifest {
 
 /// What applying a manifest changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use = "the fetched indexes of the segments that left the log stay on disk until `remove_retired_indexes` runs"]
 pub struct PeerManifestApplied {
     /// Segments added at the end of the log.
     pub appended: usize,
     /// Segments dropped from the front of the log.
     pub trimmed: usize,
     /// Segments that left the log because a listed one holds their offsets.
+    /// The listed one may hold offsets past theirs too.
     pub replaced: usize,
+    retired_indexes: Vec<String>,
+}
+
+impl PeerManifestApplied {
     /// Where the polls of the dropped and the replaced segments may have
-    /// put a fetched `.index`. Nothing reads these files again, and
-    /// [`remove_retired_indexes`] removes them.
-    pub retired_indexes: Vec<String>,
+    /// put a fetched `.index`. Nothing reads these files again.
+    #[must_use]
+    pub fn retired_indexes(&self) -> &[String] {
+        &self.retired_indexes
+    }
+
+    /// Remove the `.index` files that the polls of dropped and replaced
+    /// segments fetched.
+    /// Best effort: a file that stays is never read again, and the next
+    /// start of the partition sweeps it.
+    pub async fn remove_retired_indexes(self) {
+        for path in &self.retired_indexes {
+            let _ = compio::fs::remove_file(path).await;
+        }
+    }
 }
 
 /// Why a partition did not apply a manifest. A refused manifest changes
@@ -110,7 +136,7 @@ pub enum PeerManifestRefusal {
         found: ObjectPrefix,
     },
     #[error(
-        "the manifest goes back: floor {floor:?}, trim point {trim_point:?} and {segments} segments, after floor {applied_floor:?}, trim point {applied_trim_point:?} and {applied_segments} segments"
+        "the manifest is older than the applied one: floor {floor:?}, trim point {trim_point:?} and {segments} segments, after floor {applied_floor:?}, trim point {applied_trim_point:?} and {applied_segments} segments"
     )]
     GoesBack {
         floor: Option<u64>,
@@ -133,9 +159,26 @@ pub enum PeerManifestRefusal {
     #[error("the manifest's floor {floor:?} is not where its segments end")]
     Floor { floor: Option<u64> },
     #[error(
-        "the manifest lists the segment at offset {start_offset} unlike the manifests before it"
+        "the manifest contradicts the manifests before it at the log's segment at offset {start_offset}: {contradiction}"
     )]
-    Diverged { start_offset: u64 },
+    Diverged {
+        start_offset: u64,
+        contradiction: PeerManifestContradiction,
+    },
+}
+
+/// How a manifest that is not older than the applied one disagrees with the
+/// segments of the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PeerManifestContradiction {
+    #[error("the listed segments do not start where it starts")]
+    StartsOffBoundary,
+    #[error("a listed segment ends inside a segment of the log")]
+    EndsOffBoundary,
+    #[error("the listed segment over it is not what the segments it covers add up to")]
+    DoesNotAddUp,
+    #[error("a segment keyed by its first offset alone cannot take the place of others")]
+    MergesUnderOneKey,
 }
 
 /// Why a partition cannot follow another cluster's log.
@@ -156,19 +199,30 @@ pub enum PeerLogError {
 struct ManifestChange {
     trimmed: usize,
     /// Oldest first.
-    merges: Vec<Merge>,
-    /// The index in the manifest's segments of the first one the log does
-    /// not hold yet.
+    covers: Vec<Cover>,
+    /// The index in the manifest's segments of the first one that holds no
+    /// offset of the log.
     first_new: usize,
 }
 
-/// One listed segment that holds the offsets of several applied ones.
-struct Merge {
+/// One listed segment that holds the offsets of applied ones, which are not
+/// that segment alone.
+struct Cover {
     /// Where the first of the applied segments is in the log, once the
     /// trimmed ones left it.
     at: usize,
     sources: usize,
-    merged: ManifestSegment,
+    listed: ManifestSegment,
+    /// What the listed segment holds past the log's end. Nothing when it
+    /// merges applied segments alone.
+    unseen: Unseen,
+}
+
+/// The part of a listed segment that no applied segment holds.
+#[derive(Clone, Copy, Default)]
+struct Unseen {
+    bytes: u64,
+    messages: u64,
 }
 
 impl PeerLog {
@@ -222,26 +276,73 @@ impl PeerLog {
             .is_some_and(|last| last.end_offset == run.end_offset)
     }
 
-    /// The listed segment `merged` as a merge of the applied segments from
-    /// `first` on, or `None` when it is not one: the keys of the log could
-    /// not tell it from its first source, it does not start with `first` and
-    /// end with a later applied segment, or its fields are not what those
-    /// segments add up to. The hash of the merged bytes is taken as listed,
-    /// which the hashes of the sources cannot give.
-    fn merge_at(&self, first: usize, merged: &ManifestSegment) -> Option<usize> {
-        if !self.keyed_by_both_offsets {
-            return None;
-        }
-        let sources = 1 + self
+    /// The applied segments from `first` on that the listed segment `entry`
+    /// holds, where `entry` starts with the one at `first` and is not that
+    /// one, or how `entry` contradicts them.
+    ///
+    /// An entry that ends where an applied segment ends merges applied
+    /// segments alone, and its fields have to be what they add up to. The
+    /// hash of the merged bytes is taken as listed, which the hashes of the
+    /// sources cannot give.
+    ///
+    /// An entry that ends past the log's end also merges segments that
+    /// earlier manifests listed and this partition never saw. Their sizes and
+    /// checksums are unknown, so the entry is held to what the applied ones
+    /// decide: its first timestamp, and bounds on its size and its newest
+    /// timestamp.
+    fn cover(
+        &self,
+        first: usize,
+        entry: &ManifestSegment,
+    ) -> Result<Cover, PeerManifestContradiction> {
+        let covered: Vec<ManifestSegment> = self
             .segments
             .range(first..)
-            .position(|segment| segment.end_offset >= merged.end_offset)?;
-        let run: Vec<ManifestSegment> = self
-            .segments
-            .range(first..first + sources)
+            .take_while(|segment| segment.end_offset <= entry.end_offset)
             .copied()
             .collect();
-        (sources > 1 && concatenated(&run, merged.hash) == Some(*merged)).then_some(sources)
+        let floor = self.segments.back().map(|segment| segment.end_offset);
+        let Some(last) = covered.last() else {
+            return Err(PeerManifestContradiction::EndsOffBoundary);
+        };
+        let unseen = if last.end_offset == entry.end_offset {
+            // One segment in the place of another alone is other bytes
+            // under the key of the first.
+            if covered.len() == 1 {
+                return Err(PeerManifestContradiction::DoesNotAddUp);
+            }
+            if !self.keyed_by_both_offsets {
+                return Err(PeerManifestContradiction::MergesUnderOneKey);
+            }
+            if concatenated(&covered, entry.hash) != Some(*entry) {
+                return Err(PeerManifestContradiction::DoesNotAddUp);
+            }
+            Unseen::default()
+        } else if Some(last.end_offset) == floor {
+            if !self.keyed_by_both_offsets {
+                return Err(PeerManifestContradiction::MergesUnderOneKey);
+            }
+            let seen = concatenated(&covered, entry.hash)
+                .ok_or(PeerManifestContradiction::DoesNotAddUp)?;
+            if entry.start_timestamp != seen.start_timestamp
+                || entry.size <= seen.size
+                || entry.max_timestamp < seen.max_timestamp
+            {
+                return Err(PeerManifestContradiction::DoesNotAddUp);
+            }
+            Unseen {
+                bytes: entry.size - seen.size,
+                messages: entry.end_offset - seen.end_offset,
+            }
+        } else {
+            return Err(PeerManifestContradiction::EndsOffBoundary);
+        };
+        Ok(Cover {
+            at: first,
+            sources: covered.len(),
+            listed: *entry,
+            unseen,
+        })
     }
 
     /// What `manifest` changes, or why it changes nothing.
@@ -286,25 +387,39 @@ impl PeerLog {
             .iter()
             .take_while(|segment| Some(segment.end_offset) <= manifest.trim_point)
             .count();
-        // A segment that stays has to come back as it was, or inside a
-        // listed segment that merges it with its neighbours. One that ends
+        // The origin trims whole segments and merges whole segments, so the
+        // first segment that stays starts the listed ones. One that ends
         // past the trim point but starts at or below it was cut in two.
-        let mut merges = Vec::new();
+        if let Some(kept) = self.segments.get(trimmed)
+            && manifest.segments.first().map(|entry| entry.start_offset) != Some(kept.start_offset)
+        {
+            return Err(PeerManifestRefusal::Diverged {
+                start_offset: kept.start_offset,
+                contradiction: PeerManifestContradiction::StartsOffBoundary,
+            });
+        }
+        // A segment that stays has to come back as it was, or inside a
+        // listed segment that merges it with its neighbours.
+        let mut covers = Vec::new();
         let mut listed = 0;
         let mut at = trimmed;
         while let Some(kept) = self.segments.get(at) {
-            let diverged = PeerManifestRefusal::Diverged {
+            let diverged = |contradiction| PeerManifestRefusal::Diverged {
                 start_offset: kept.start_offset,
+                contradiction,
             };
-            let entry = manifest.segments.get(listed).ok_or(diverged)?;
+            let entry = manifest
+                .segments
+                .get(listed)
+                .ok_or_else(|| diverged(PeerManifestContradiction::EndsOffBoundary))?;
             let sources = if entry == kept {
                 1
             } else {
-                let sources = self.merge_at(at, entry).ok_or(diverged)?;
-                merges.push(Merge {
+                let cover = self.cover(at, entry).map_err(diverged)?;
+                let sources = cover.sources;
+                covers.push(Cover {
                     at: at - trimmed,
-                    sources,
-                    merged: *entry,
+                    ..cover
                 });
                 sources
             };
@@ -313,7 +428,7 @@ impl PeerLog {
         }
         Ok(ManifestChange {
             trimmed,
-            merges,
+            covers,
             first_new: listed,
         })
     }
@@ -387,15 +502,6 @@ impl PeerSegmentRun {
             end_offset: last.end_offset,
             segments: 1 + more,
         })
-    }
-}
-
-/// Remove the `.index` files that the polls of dropped and replaced segments
-/// fetched.
-/// Best effort: a file that stays is never read again.
-pub async fn remove_retired_indexes(applied: &PeerManifestApplied) {
-    for path in &applied.retired_indexes {
-        let _ = compio::fs::remove_file(path).await;
     }
 }
 
@@ -497,20 +603,29 @@ where
 
     /// Bring the log to what `manifest` lists: drop the segments it trimmed
     /// from the front, put each segment that merges several in their place,
-    /// and add the ones it lists past the log's end.
+    /// and add the ones it lists past the log's end. The manifest may be any
+    /// number of the origin's changes ahead of the applied one.
     ///
     /// A poll already planned keeps the segments it planned, so a grown log
     /// does not disturb it. A poll whose first segment a trim dropped, or
     /// one of whose segments a merge replaced, is refused when it completes,
     /// and its retry plans from the log as it is.
     ///
-    /// A merge changes no count of bytes or messages: the merged segment
-    /// holds what its sources held.
+    /// The counts of bytes and messages grow by what the manifest lists past
+    /// the log's end and by nothing else: a listed segment holds what the
+    /// segments it replaces held.
+    ///
+    /// The polls of the segments that left the log may have fetched their
+    /// `.index`, so remove those files with
+    /// [`PeerManifestApplied::remove_retired_indexes`] after every manifest.
     ///
     /// # Errors
-    /// See [`PeerManifestRefusal`]. A manifest that goes back, names another
-    /// incarnation, keys its segments unlike the ones the log holds, lists a
-    /// segment unlike an earlier manifest, or has a gap changes nothing.
+    /// See [`PeerManifestRefusal`]. A manifest changes nothing when it is
+    /// older than the applied one ([`PeerManifestRefusal::GoesBack`]), when
+    /// it contradicts the segments of the log
+    /// ([`PeerManifestRefusal::Diverged`]), when it names another
+    /// incarnation or keys its segments unlike the ones the log holds, and
+    /// when its own segments are no run of offsets.
     pub fn apply_peer_manifest(
         &mut self,
         manifest: &PartitionManifest,
@@ -536,8 +651,8 @@ where
             self.retire_peer_segment(&segment, peer.keyed_by_both_offsets, &mut applied);
         }
         // Newest first, so the places of the older ones stay as counted.
-        for merge in change.merges.iter().rev() {
-            self.merge_peer_segments(&mut peer, merge, &mut applied);
+        for cover in change.covers.iter().rev() {
+            self.cover_peer_segments(&mut peer, cover, &mut applied);
         }
         if peer.segments.is_empty() {
             peer.keyed_by_both_offsets = manifest.segments_keyed_by_both_offsets;
@@ -615,33 +730,36 @@ where
         applied.trimmed += 1;
     }
 
-    /// Put the segment of `merge` in the place of the segments it merges.
-    fn merge_peer_segments(
+    /// Put the segment of `cover` in the place of the segments it holds.
+    fn cover_peer_segments(
         &mut self,
         peer: &mut PeerLog,
-        merge: &Merge,
+        cover: &Cover,
         applied: &mut PeerManifestApplied,
     ) {
-        let slots = merge.at..merge.at + merge.sources;
+        let slots = cover.at..cover.at + cover.sources;
         let max_size = self.effective_segment_size();
         let replaced = self.log.replace_segments(
             slots.clone(),
-            remote_segment(&merge.merged, max_size),
+            remote_segment(&cover.listed, max_size),
             SegmentStorage::without_messages(None),
         );
         debug_assert!(
-            replaced.len() == merge.sources
+            replaced.len() == cover.sources
                 && replaced
                     .iter()
                     .all(|segment| segment.location == SegmentLocation::Remote),
-            "a merge replaces remote segments of the peer log"
+            "a listed segment replaces remote segments of the peer log"
         );
         peer.segments.drain(slots);
-        peer.segments.insert(merge.at, merge.merged);
-        // The merged segment starts where the first of them did, so a fetch
+        peer.segments.insert(cover.at, cover.listed);
+        // The listed segment starts where the first of them did, so a fetch
         // of that one's index must not pass for a fetch of its own.
         self.index_fetches
-            .replace_segments(merge.merged.start_offset..=merge.merged.end_offset);
+            .replace_segments(cover.listed.start_offset..=cover.listed.end_offset);
+        self.stats.increment_size_bytes(cover.unseen.bytes);
+        self.stats.increment_messages_count(cover.unseen.messages);
+        self.committed_bytes = self.committed_bytes.saturating_add(cover.unseen.bytes);
         for segment in &replaced {
             self.retire_peer_index(segment, peer.keyed_by_both_offsets, applied);
         }
@@ -652,7 +770,7 @@ where
     }
 
     /// Name the fetched `.index` of a segment that left the log, for
-    /// [`remove_retired_indexes`].
+    /// [`PeerManifestApplied::remove_retired_indexes`].
     fn retire_peer_index(
         &self,
         segment: &Segment,

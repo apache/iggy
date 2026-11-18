@@ -1920,6 +1920,7 @@ mod offset_storage;
 mod offsets;
 mod peer_log;
 mod peer_log_merges;
+mod peer_log_skips;
 mod persistence_checkpoint;
 mod placed_batches;
 mod remote_poll;

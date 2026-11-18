@@ -3359,7 +3359,7 @@ fn follow_a_peer_with(
     partition.set_created_revision(CREATED_REVISION);
     partition.set_partition_dir(directory.to_string_lossy().into_owned());
     partition.follow_peer_log("dc-a", ORIGIN_PREFIX).unwrap();
-    partition.apply_peer_manifest(manifest).unwrap();
+    let _ = partition.apply_peer_manifest(manifest).unwrap();
     partitions.set_peer_remote_segments(vec![(
         "dc-a".to_owned(),
         Rc::new(partitions::RemoteSegments::new(
@@ -3403,7 +3403,7 @@ async fn given_a_parked_read_of_a_peer_log_when_a_trim_drops_its_segment_should_
     follow_a_peer(&owner, directory.path());
     let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
 
-    owner
+    let _ = owner
         .plane
         .partitions()
         .get_mut_by_ns(&namespace())

@@ -41,8 +41,8 @@ use super::*;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::long_term::concatenated;
 use crate::{
-    LongTermWriter, MergePass, MergeSettled, PeerLogError, PeerManifestRefusal, RemoteObjects,
-    RemoteSegments, SegmentLocation, remove_retired_indexes, upload_segment,
+    LongTermWriter, MergePass, MergeSettled, PeerLogError, PeerManifestContradiction,
+    PeerManifestRefusal, RemoteObjects, RemoteSegments, SegmentLocation, upload_segment,
 };
 use futures::channel::oneshot;
 use iggy_common::{
@@ -79,7 +79,7 @@ async fn put(store: &FsStore, key: &str, bytes: Vec<u8>) {
         .unwrap();
 }
 
-async fn delete_segments(store: &FsStore, segments: &[ManifestSegment]) {
+pub(super) async fn delete_segments(store: &FsStore, segments: &[ManifestSegment]) {
     let keys: Vec<String> = segments
         .iter()
         .flat_map(|segment| SegmentObject::ALL.map(|object| keyed_object(segment, object)))
@@ -89,19 +89,19 @@ async fn delete_segments(store: &FsStore, segments: &[ManifestSegment]) {
 
 /// An origin whose store holds its sealed segments under keys with both
 /// offsets and under no other key.
-struct KeyedOrigin {
+pub(super) struct KeyedOrigin {
     _directory: tempfile::TempDir,
-    partition: Box<IggyPartition<IggyMessageBus>>,
-    bucket: tempfile::TempDir,
-    store: FsStore,
+    pub(super) partition: Box<IggyPartition<IggyMessageBus>>,
+    pub(super) bucket: tempfile::TempDir,
+    pub(super) store: FsStore,
     /// Segments of [`BATCHES_PER_SEGMENT`] one-message batches, oldest
     /// first.
-    segments: Vec<ManifestSegment>,
+    pub(super) segments: Vec<ManifestSegment>,
 }
 
 /// An origin that committed `ops` one-message batches, the last of which
 /// sits in its active segment.
-async fn keyed_origin(ops: u64) -> KeyedOrigin {
+pub(super) async fn keyed_origin(ops: u64) -> KeyedOrigin {
     let bucket = tempfile::tempdir().unwrap();
     let store = FsStore::new(bucket.path());
     let (directory, origin) = Box::pin(tiered_partition(&segment_records(ops), 0)).await;
@@ -138,7 +138,7 @@ async fn keyed_origin(ops: u64) -> KeyedOrigin {
 }
 
 /// A manifest of an origin that keys its segments by both offsets.
-fn keyed(trim_point: Option<u64>, segments: &[ManifestSegment]) -> PartitionManifest {
+pub(super) fn keyed(trim_point: Option<u64>, segments: &[ManifestSegment]) -> PartitionManifest {
     PartitionManifest {
         prefix: PREFIX,
         published_at: 1,
@@ -153,13 +153,13 @@ fn keyed(trim_point: Option<u64>, segments: &[ManifestSegment]) -> PartitionMani
 }
 
 /// What the origin lists for the segment that holds `sources` back to back.
-fn merged(sources: &[ManifestSegment]) -> ManifestSegment {
+pub(super) fn merged(sources: &[ManifestSegment]) -> ManifestSegment {
     concatenated(sources, [7; SEGMENT_HASH_LEN]).unwrap()
 }
 
 /// Store the segment that holds `sources` back to back, as a merge of the
 /// origin does: one log, and an index of its bytes.
-async fn store_merged(store: &FsStore, sources: &[ManifestSegment]) -> ManifestSegment {
+pub(super) async fn store_merged(store: &FsStore, sources: &[ManifestSegment]) -> ManifestSegment {
     let merged = merged(sources);
     let (mut log, mut index) = (Vec::new(), Vec::new());
     for source in sources {
@@ -195,7 +195,10 @@ async fn store_merged(store: &FsStore, sources: &[ManifestSegment]) -> ManifestS
 
 /// What the polls from every offset up to `last`, and from the first
 /// timestamp, return.
-async fn polls_up_to<B: MessageBus>(partition: &mut IggyPartition<B>, last: u64) -> Vec<Polled> {
+pub(super) async fn polls_up_to<B: MessageBus>(
+    partition: &mut IggyPartition<B>,
+    last: u64,
+) -> Vec<Polled> {
     let mut polls = Vec::new();
     for offset in 0..=last {
         polls.push(Box::pin(polled(partition, PollingStrategy::offset(offset), 100)).await);
@@ -213,7 +216,7 @@ async fn polls_up_to<B: MessageBus>(partition: &mut IggyPartition<B>, last: u64)
 
 /// The bytes and the messages the partition counts, and the bytes a poll may
 /// see.
-fn held<B: MessageBus>(partition: &IggyPartition<B>) -> (u64, u64, u64) {
+pub(super) fn held<B: MessageBus>(partition: &IggyPartition<B>) -> (u64, u64, u64) {
     (
         partition.stats.size_bytes_inconsistent(),
         partition.stats.messages_count_inconsistent(),
@@ -221,11 +224,11 @@ fn held<B: MessageBus>(partition: &IggyPartition<B>) -> (u64, u64, u64) {
     )
 }
 
-fn remote(start: u64, end: u64) -> (u64, u64, SegmentLocation) {
+pub(super) fn remote(start: u64, end: u64) -> (u64, u64, SegmentLocation) {
     (start, end, SegmentLocation::Remote)
 }
 
-fn tail(start: u64) -> (u64, u64, SegmentLocation) {
+pub(super) fn tail(start: u64) -> (u64, u64, SegmentLocation) {
     (start, start, SegmentLocation::Local)
 }
 
@@ -248,7 +251,7 @@ async fn given_manifests_that_key_segments_by_both_offsets_when_a_follower_polls
     let calls = recording.calls();
     let (directory, mut follower) = follower(Rc::new(recording));
 
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &origin.segments))
         .unwrap();
 
@@ -281,7 +284,7 @@ async fn given_manifests_that_key_segments_by_their_first_offset_when_a_follower
     let (directory, mut follower) = follower(Rc::new(recording));
     assert!(!manifest.segments_keyed_by_both_offsets);
 
-    follower.apply_peer_manifest(&manifest).unwrap();
+    let _ = follower.apply_peer_manifest(&manifest).unwrap();
 
     assert!(!follower.peer_log().unwrap().keyed_by_both_offsets());
     assert_eq!(
@@ -309,7 +312,7 @@ async fn given_a_log_that_holds_segments_when_a_manifest_keys_them_the_other_way
         ),
     ] {
         let (_directory, mut follower) = follower(Rc::new(MemoryStore::new()));
-        follower.apply_peer_manifest(&applied).unwrap();
+        let _ = follower.apply_peer_manifest(&applied).unwrap();
         let before = log_shape(&follower);
 
         assert_eq!(
@@ -328,9 +331,9 @@ async fn given_a_log_that_holds_segments_when_a_manifest_keys_them_the_other_way
 
     // A log without a segment holds no key, so it takes either.
     let (_directory, mut follower) = follower(Rc::new(MemoryStore::new()));
-    follower.apply_peer_manifest(&by_both).unwrap();
-    follower.apply_peer_manifest(&keyed(Some(9), &[])).unwrap();
-    follower
+    let _ = follower.apply_peer_manifest(&by_both).unwrap();
+    let _ = follower.apply_peer_manifest(&keyed(Some(9), &[])).unwrap();
+    let _ = follower
         .apply_peer_manifest(&manifest_of(Some(9), &[(10, 19)]))
         .unwrap();
     assert!(!follower.peer_log().unwrap().keyed_by_both_offsets());
@@ -343,7 +346,7 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
     let segments = origin.segments.clone();
     assert_eq!(segments.len(), 5);
     let (directory, mut follower) = follower(Rc::new(FsStore::new(origin.bucket.path())));
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &segments))
         .unwrap();
     let before = Box::pin(polls_up_to(&mut follower, 9)).await;
@@ -381,7 +384,7 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
         segments_counted - 2
     );
     assert_eq!(Box::pin(polls_up_to(&mut follower, 9)).await, before);
-    Box::pin(remove_retired_indexes(&applied)).await;
+    Box::pin(applied.remove_retired_indexes()).await;
     assert!(first_index.exists(), "the first segment stayed");
 
     let front = Box::pin(store_merged(&origin.store, &[segments[0], middle])).await;
@@ -404,7 +407,7 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
         segments_counted - 3
     );
     assert_eq!(Box::pin(polls_up_to(&mut follower, 9)).await, before);
-    Box::pin(remove_retired_indexes(&applied)).await;
+    Box::pin(applied.remove_retired_indexes()).await;
     assert!(
         !first_index.exists(),
         "the index of a replaced segment is retired"
@@ -423,13 +426,12 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
  {
     let [a, b, c, d] = [listed(0, 9), listed(10, 19), listed(20, 29), listed(30, 39)];
     let (_directory, mut follower) = follower(Rc::new(MemoryStore::new()));
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &[a, b, c, d]))
         .unwrap();
     let before = log_shape(&follower);
     let applied_state = follower.peer_log().unwrap().applied();
     let whole = merged(&[b, c]);
-    let unseen = listed(40, 49);
 
     let cases = [
         (
@@ -442,7 +444,7 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
                 },
                 d,
             ],
-            10,
+            PeerManifestContradiction::DoesNotAddUp,
         ),
         (
             "another checksum",
@@ -454,7 +456,7 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
                 },
                 d,
             ],
-            10,
+            PeerManifestContradiction::DoesNotAddUp,
         ),
         (
             "another first timestamp",
@@ -466,7 +468,7 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
                 },
                 d,
             ],
-            10,
+            PeerManifestContradiction::DoesNotAddUp,
         ),
         (
             "another last timestamp",
@@ -478,7 +480,7 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
                 },
                 d,
             ],
-            10,
+            PeerManifestContradiction::DoesNotAddUp,
         ),
         (
             "another newest timestamp",
@@ -490,10 +492,10 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
                 },
                 d,
             ],
-            10,
+            PeerManifestContradiction::DoesNotAddUp,
         ),
         (
-            "a start inside an applied segment",
+            "an end and the next start inside an applied segment",
             vec![
                 a,
                 listed(10, 14),
@@ -503,7 +505,7 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
                 },
                 d,
             ],
-            10,
+            PeerManifestContradiction::EndsOffBoundary,
         ),
         (
             "an end inside an applied segment",
@@ -516,18 +518,16 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
                 listed(25, 29),
                 d,
             ],
-            10,
-        ),
-        (
-            "a merge with a segment the log never held",
-            vec![a, b, c, merged(&[d, unseen])],
-            30,
+            PeerManifestContradiction::EndsOffBoundary,
         ),
     ];
-    for (case, segments, start_offset) in cases {
+    for (case, segments, contradiction) in cases {
         assert_eq!(
             follower.apply_peer_manifest(&keyed(None, &segments)),
-            Err(PeerManifestRefusal::Diverged { start_offset }),
+            Err(PeerManifestRefusal::Diverged {
+                start_offset: 10,
+                contradiction
+            }),
             "{case}"
         );
         assert_eq!(log_shape(&follower), before, "{case}");
@@ -537,9 +537,19 @@ async fn given_a_listed_segment_that_is_no_merge_of_applied_ones_when_applying_s
             "{case}"
         );
     }
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &[a, whole, d]))
         .unwrap();
+
+    // The segment after `d` reached no manifest this partition fetched.
+    let applied = follower
+        .apply_peer_manifest(&keyed(None, &[a, whole, merged(&[d, listed(40, 49)])]))
+        .unwrap();
+    assert_eq!((applied.appended, applied.replaced), (0, 1));
+    assert_eq!(
+        log_shape(&follower).0,
+        [remote(0, 9), remote(10, 29), remote(30, 49), tail(50)]
+    );
 }
 
 /// A segment keyed by its first offset alone has the key of the first
@@ -549,7 +559,7 @@ async fn given_segments_keyed_by_their_first_offset_when_a_manifest_merges_two_s
  {
     let (_directory, mut follower) = follower(Rc::new(MemoryStore::new()));
     let applied = manifest_of(None, &[(0, 9), (10, 19)]);
-    follower.apply_peer_manifest(&applied).unwrap();
+    let _ = follower.apply_peer_manifest(&applied).unwrap();
     let before = log_shape(&follower);
 
     let merging = PartitionManifest {
@@ -557,11 +567,17 @@ async fn given_segments_keyed_by_their_first_offset_when_a_manifest_merges_two_s
         ..applied
     };
 
-    assert_eq!(
-        follower.apply_peer_manifest(&merging),
-        Err(PeerManifestRefusal::Diverged { start_offset: 0 })
-    );
-    assert_eq!(log_shape(&follower), before);
+    let merging_unseen = manifest_of(None, &[(0, 29)]);
+    for manifest in [merging, merging_unseen] {
+        assert_eq!(
+            follower.apply_peer_manifest(&manifest),
+            Err(PeerManifestRefusal::Diverged {
+                start_offset: 0,
+                contradiction: PeerManifestContradiction::MergesUnderOneKey
+            })
+        );
+        assert_eq!(log_shape(&follower), before);
+    }
 }
 
 #[compio::test]
@@ -571,8 +587,8 @@ async fn given_a_manifest_with_more_segments_at_the_same_floor_and_trim_point_wh
     let (_directory, mut follower) = follower(Rc::new(MemoryStore::new()));
     let older = keyed(None, &[a, b, c, d]);
     let newer = keyed(None, &[a, merged(&[b, c]), d]);
-    follower.apply_peer_manifest(&older).unwrap();
-    follower.apply_peer_manifest(&newer).unwrap();
+    let _ = follower.apply_peer_manifest(&older).unwrap();
+    let _ = follower.apply_peer_manifest(&newer).unwrap();
     let before = log_shape(&follower);
 
     assert_eq!(
@@ -654,7 +670,8 @@ async fn given_merges_and_trims_in_any_order_when_applying_should_keep_the_log_o
     // A merge, a trim and a new segment in one manifest: the follower
     // missed the manifests in between.
     let (_directory, mut late) = super::peer_log::follower(Rc::new(MemoryStore::new()));
-    late.apply_peer_manifest(&keyed(None, &[a, b, c, d]))
+    let _ = late
+        .apply_peer_manifest(&keyed(None, &[a, b, c, d]))
         .unwrap();
     let at_once = late
         .apply_peer_manifest(&keyed(Some(9), &[merged(&[b, c, d]), e]))
@@ -682,7 +699,7 @@ async fn given_a_poll_in_flight_when_a_merge_replaces_its_segments_and_the_origi
         waiting: Cell::new(false),
     });
     let (_directory, mut follower) = follower(gated.clone());
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &segments))
         .unwrap();
     let mut poll: InFlight =
@@ -690,7 +707,7 @@ async fn given_a_poll_in_flight_when_a_merge_replaces_its_segments_and_the_origi
     Box::pin(until_gated(&gated, &mut poll)).await;
 
     let whole = Box::pin(store_merged(&origin.store, &segments)).await;
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &[whole]))
         .unwrap();
     Box::pin(delete_segments(&origin.store, &segments)).await;
@@ -725,7 +742,7 @@ async fn given_reads_that_ended_before_a_merge_when_completing_should_refuse_the
     let segments = origin.segments.clone();
     assert_eq!(segments.len(), 3);
     let (_directory, mut follower) = follower(Rc::new(FsStore::new(origin.bucket.path())));
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &segments))
         .unwrap();
     let over_replaced = plan(&mut follower, PollingStrategy::offset(1), 10)
@@ -737,7 +754,7 @@ async fn given_reads_that_ended_before_a_merge_when_completing_should_refuse_the
     assert_eq!(over_replaced.read_error, None);
 
     let front = Box::pin(store_merged(&origin.store, &segments[..2])).await;
-    follower
+    let _ = follower
         .apply_peer_manifest(&keyed(None, &[front, segments[2]]))
         .unwrap();
 
