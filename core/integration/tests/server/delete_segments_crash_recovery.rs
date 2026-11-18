@@ -16,7 +16,7 @@
 // under the License.
 
 //! A crash restart after `delete_segments` removed the segment that the WAL checkpoint cursor
-//! ends must serve the data written past it (apache/iggy#4950).
+//! ends must serve the data written past it.
 
 use bytes::Bytes;
 use iggy::prelude::*;
@@ -153,8 +153,8 @@ async fn wait_until_removed(path: &std::path::Path) {
     }
 }
 
-/// Waits until the restarted server polls every message from the first offset past the deleted
-/// segment up to `last_offset`.
+/// Retries polling from the first offset past the deleted segment until the response
+/// ends at `last_offset`.
 async fn wait_for_offsets(
     harness: &TestHarness,
     stream: &Identifier,
@@ -162,7 +162,7 @@ async fn wait_for_offsets(
     last_offset: u64,
 ) -> Result<Vec<u64>, TestBinaryError> {
     let consumer = Consumer::new(Identifier::numeric(1).expect("consumer identifier"));
-    let count = u32::try_from(last_offset).expect("a small offset");
+    let count = u32::try_from(LATER_BATCHES * LATER_BATCH_SIZE).expect("a small message count");
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
     loop {
         if let Ok(client) = harness.tcp_root_client().await
