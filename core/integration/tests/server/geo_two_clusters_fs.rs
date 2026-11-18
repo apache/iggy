@@ -305,7 +305,6 @@ async fn given_a_geo_topic_that_the_peer_adopted_when_its_origin_deletes_it_shou
 }
 
 #[tokio::test]
-#[ignore = "a shadow partition does not apply its peer's manifests yet"]
 async fn given_the_same_geo_topic_in_both_clusters_when_both_produce_at_once_should_let_consumers_read_the_local_and_the_shadow_topic_once_in_origin_order()
  {
     let mut pair = started_pair().await;
@@ -347,7 +346,6 @@ async fn given_the_same_geo_topic_in_both_clusters_when_both_produce_at_once_sho
 }
 
 #[tokio::test]
-#[ignore = "a shadow partition does not apply its peer's manifests yet"]
 async fn given_a_cluster_that_published_its_messages_when_it_stops_should_let_the_peer_serve_them_from_the_shadow()
  {
     let mut pair = started_pair().await;
@@ -393,7 +391,6 @@ async fn given_a_cluster_that_published_its_messages_when_it_stops_should_let_th
 }
 
 #[tokio::test]
-#[ignore = "a shadow partition does not apply its peer's manifests yet"]
 async fn given_a_stopped_cluster_when_it_returns_should_bring_what_it_took_before_and_after_to_the_peers_shadow()
  {
     let mut pair = started_pair().await;

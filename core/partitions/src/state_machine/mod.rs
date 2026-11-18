@@ -34,7 +34,9 @@ mod snapshot;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use codec::{CommandDecodeError, CommandEncodeError, MachineCommand};
+pub use codec::{
+    CommandDecodeError, CommandEncodeError, MACHINE_COMMAND_HEADER_SIZE, MachineCommand,
+};
 pub(crate) use log::StateMachineLog;
 pub use registry::{
     Applied, CommandKind, MachineId, MachineRestoreError, PartitionStateMachine, RegistrationError,

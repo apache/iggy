@@ -236,6 +236,34 @@ impl PeerLog {
         }
     }
 
+    /// The log that `manifest` lists, for a check of what a later one
+    /// changes. Its origin is unnamed, which no check reads.
+    pub(crate) fn of_manifest(prefix: ObjectPrefix, manifest: Option<&PartitionManifest>) -> Self {
+        let Some(manifest) = manifest else {
+            return Self::new(String::new(), prefix);
+        };
+        Self {
+            origin: String::new(),
+            prefix,
+            applied: Some(AppliedManifest {
+                published_at: manifest.published_at,
+                floor: manifest.floor,
+                trim_point: manifest.trim_point,
+            }),
+            keyed_by_both_offsets: manifest.segments_keyed_by_both_offsets,
+            segments: manifest.segments.iter().copied().collect(),
+        }
+    }
+
+    /// Whether the log takes `manifest`, see
+    /// [`IggyPartition::apply_peer_manifest`].
+    ///
+    /// # Errors
+    /// The refusal the apply would return.
+    pub(crate) fn check(&self, manifest: &PartitionManifest) -> Result<(), PeerManifestRefusal> {
+        self.change(manifest).map(|_| ())
+    }
+
     /// The name of the peer whose store holds the log.
     #[must_use]
     pub fn origin(&self) -> &str {
@@ -535,8 +563,11 @@ where
         if self.is_tiered() || self.pending_tiering().is_some() {
             return Err(PeerLogError::Tiered);
         }
-        if self.offset_space.committed_seeded
-            || self.offset_space.append_live
+        // A partition that committed peer manifests before a restart counts
+        // its offsets from them, and still holds no message of its own.
+        let counts_peer_offsets = self.committed_peer_manifest().is_some();
+        if (!counts_peer_offsets
+            && (self.offset_space.committed_seeded || self.offset_space.append_live))
             || self
                 .log
                 .segments()
@@ -554,7 +585,15 @@ where
         self.stats.increment_segments_count(1);
         self.clear_remote_segments();
         self.peer_log = Some(Box::new(PeerLog::new(origin.into(), prefix)));
+        self.follow_committed_peer_manifest();
         Ok(())
+    }
+
+    /// Take the `.index` files that the polls of segments the committed peer
+    /// manifests took out of the log may have fetched. Nothing reads them
+    /// again, so the owner removes them when it can.
+    pub fn take_retired_peer_indexes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.retired_peer_indexes)
     }
 
     /// The other cluster's log this partition follows, `None` for a partition

@@ -38,6 +38,7 @@ mod long_term_retention;
 mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
+mod peer_manifest_follows;
 pub mod peers;
 mod poll;
 mod primary_rebalance;
@@ -50,6 +51,7 @@ pub mod shards_table;
 mod test_support;
 pub mod tier_service;
 mod topic_object_checks;
+pub use peer_manifest_follows::{FinishedPeerManifestRead, ListedPeerManifest};
 mod upload_pacing;
 
 pub use config::CoordinatorConfig;
@@ -1326,6 +1328,18 @@ pub enum LifecycleFrame {
     /// The result of a read that a [`Self::CheckTopicObjects`] pass started,
     /// sent by the task that ran it.
     TopicObjectCheckFinished(Box<FinishedTopicObjectCheck>),
+    /// Shard 0 hands the shard the manifests that a listing of the geo peer
+    /// `origin` found for the shadow partitions the shard owns. The shard
+    /// reads each one its partition has not committed, on the partitions
+    /// whose primary this replica is.
+    PeerManifestsListed {
+        origin: String,
+        now: IggyTimestamp,
+        manifests: Vec<ListedPeerManifest>,
+    },
+    /// The result of a read that a [`Self::PeerManifestsListed`] pass
+    /// started, sent by the task that ran it.
+    PeerManifestRead(Box<FinishedPeerManifestRead>),
     /// The result of a merge of long-term segments that the pump's tick
     /// started, sent by the task that ran it.
     SegmentMergeFinished(Box<FinishedSegmentMerge>),
@@ -2228,6 +2242,10 @@ where
     /// here.
     topic_object_checks: topic_object_checks::TopicObjectChecks,
 
+    /// What the primaries of shadow partitions here know of their peers'
+    /// manifests.
+    peer_manifest_follows: peer_manifest_follows::PeerManifestFollows,
+
     /// Late-bound stores of the geo peers, empty on a node without peers.
     /// See [`Self::set_peer_stores`].
     peer_stores: RefCell<Rc<peers::PeerStores<B>>>,
@@ -2608,6 +2626,7 @@ where
             undelivered_segment_rewrites: Rc::default(),
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
+            peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
             peer_stores: RefCell::default(),
             long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
@@ -3599,6 +3618,7 @@ where
             undelivered_segment_rewrites: Rc::default(),
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
+            peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
             peer_stores: RefCell::default(),
             long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),

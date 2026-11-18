@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use consensus::PartitionsHandle;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
-use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError, ReadOnlyStore};
+use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError, ReadOnlyStore, TierJobClass};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use partitions::{ExecutorObjects, RemoteObjects, RemoteSegments};
@@ -306,6 +306,18 @@ where
         RemoteSegments::new(Rc::new(self.objects()), self.layout.clone())
     }
 
+    /// Where the primaries of this peer's shadow partitions read its
+    /// manifests: the peer's tier service, in the housekeeping class, so a
+    /// read that a poll waits for never queues behind one.
+    #[must_use]
+    pub fn manifest_objects(&self) -> Rc<dyn RemoteObjects> {
+        Rc::new(PeerObjects {
+            origin: self.origin.clone(),
+            reads: ExecutorObjects::with_class(self.service.clone(), TierJobClass::Housekeeping),
+            status: self.status.clone(),
+        })
+    }
+
     fn objects(&self) -> PeerObjects<B> {
         PeerObjects {
             origin: self.origin.clone(),
@@ -365,6 +377,12 @@ where
             stores
                 .iter()
                 .map(|peer| (peer.origin().to_owned(), Rc::new(peer.remote_segments())))
+                .collect(),
+        );
+        self.set_peer_manifest_objects(
+            stores
+                .iter()
+                .map(|peer| (peer.origin().to_owned(), peer.manifest_objects()))
                 .collect(),
         );
         *self.peer_stores.borrow_mut() = Rc::new(stores);

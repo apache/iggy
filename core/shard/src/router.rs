@@ -1435,6 +1435,16 @@ where
             LifecycleFrame::TopicObjectCheckFinished(finished) => {
                 self.on_topic_object_check_finished(&finished);
             }
+            LifecycleFrame::PeerManifestsListed {
+                origin,
+                now,
+                manifests,
+            } => {
+                self.on_peer_manifests_listed(&origin, now, manifests).await;
+            }
+            LifecycleFrame::PeerManifestRead(finished) => {
+                self.on_peer_manifest_read(*finished).await;
+            }
             LifecycleFrame::SegmentMergeFinished(finished) => {
                 self.on_segment_merge_finished(*finished).await;
             }
