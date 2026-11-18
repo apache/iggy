@@ -44,9 +44,11 @@ use compio::fs::File;
 use compio::io::AsyncReadAtExt;
 use futures::{StreamExt, stream};
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
-use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
+use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
-use iggy_object_store::{LongTermKey, ManifestSegment, ObjectPrefix, SegmentObject};
+use iggy_object_store::{
+    FreshObjectId, FreshProofRow, LongTermKey, ManifestSegment, ObjectPrefix, SegmentObject,
+};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trusted};
 use server_common::yield_to_reactor;
@@ -449,6 +451,96 @@ impl PlacedReadPlan {
             }
         }
         Ok(objects)
+    }
+
+    /// The proof rows of the committed placed batches from `from` to
+    /// `up_to`, the last committed offset, from the segments and the
+    /// journal, without their messages.
+    ///
+    /// The newest committed placement claims every batch below its
+    /// `proven_below` proven, so the read starts there when that is past
+    /// `from`, and reads the placed records of the tail that may lack a
+    /// stored proof rather than every one above the floor.
+    pub(crate) async fn proof_rows(
+        &self,
+        from: u64,
+        up_to: u64,
+    ) -> Result<WalkedProofs, DiskFault> {
+        let claim = self.newest_claim(up_to).await?;
+        let start = from.max(claim);
+        let mut walked = WalkedProofs::starting_at(start, up_to, claim);
+        let directory = match &self.partition_dir {
+            PartitionDirResolution::Resolved(directory) => Some(directory),
+            PartitionDirResolution::NoFiles => None,
+            PartitionDirResolution::Unresolvable => return Err(DiskFault::Retryable),
+        };
+        let segments = self
+            .segments
+            .iter()
+            .filter(|segment| segment.end_offset >= start && segment.start_offset <= up_to);
+        for segment in segments {
+            let Some(directory) = directory else {
+                break;
+            };
+            let path = format!("{directory}/{:0>20}.log", segment.start_offset);
+            let file = File::open(&path).await.map_err(|_| DiskFault::Retryable)?;
+            let count = segment.size / PLACED_BATCH_SIZE as u64;
+            let mut index = first_reaching(&file, count, start).await?;
+            while index < count {
+                let batches = PLACED_PER_READ.min(count - index);
+                for (batch, checksum) in read_placed_records(&file, index, batches).await? {
+                    walked.take(&batch, checksum);
+                }
+                index += batches;
+            }
+        }
+        for entry in &self.resident {
+            let Ok(batch) = decode_prepare_batch_trusted(entry.as_slice()) else {
+                return Err(DiskFault::Unreadable);
+            };
+            if let Some(placement) = batch.placement {
+                walked.take(
+                    &PlacedBatch::new(batch.header, placement),
+                    batch.body_checksum,
+                );
+            }
+        }
+        if walked.broken {
+            return Err(DiskFault::Unreadable);
+        }
+        Ok(walked)
+    }
+
+    /// The `proven_below` of the newest placed batch at or below `up_to`,
+    /// zero when there is none.
+    async fn newest_claim(&self, up_to: u64) -> Result<u64, DiskFault> {
+        for entry in self.resident.iter().rev() {
+            if let Ok(batch) = decode_prepare_batch_trusted(entry.as_slice())
+                && let Some(placement) = batch.placement
+                && batch.header.base_offset <= up_to
+            {
+                return Ok(placement.proven_below);
+            }
+        }
+        let PartitionDirResolution::Resolved(directory) = &self.partition_dir else {
+            return Ok(0);
+        };
+        let newest = self
+            .segments
+            .iter()
+            .rev()
+            .find(|segment| segment.start_offset <= up_to && segment.size > 0);
+        let Some(segment) = newest else {
+            return Ok(0);
+        };
+        let path = format!("{directory}/{:0>20}.log", segment.start_offset);
+        let file = File::open(&path).await.map_err(|_| DiskFault::Retryable)?;
+        let count = segment.size / PLACED_BATCH_SIZE as u64;
+        let last = read_placed(&file, count.saturating_sub(1), 1).await?;
+        Ok(last
+            .first()
+            .filter(|batch| batch.header.base_offset <= up_to)
+            .map_or(0, |batch| batch.placement.proven_below))
     }
 
     /// Add to `counted` the batches of the segments in `directory`.
@@ -931,6 +1023,79 @@ impl CountedBatches {
     }
 }
 
+/// The proof rows a walk of [`PlacedReadPlan::proof_rows`] found: one per
+/// committed placed batch from [`Self::from`] to the last committed offset,
+/// contiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkedProofs {
+    /// Where the rows start.
+    pub(crate) from: u64,
+    up_to: u64,
+    /// One past the last offset of the last row, or `from` without a row.
+    pub(crate) end: u64,
+    pub(crate) rows: Vec<FreshProofRow>,
+    /// The highest `proven_below` among the placements read.
+    pub(crate) highest_claim: u64,
+    /// A batch did not follow the one before it.
+    broken: bool,
+}
+
+impl WalkedProofs {
+    /// What a walk that found `rows`, contiguous, would hand back.
+    #[cfg(test)]
+    pub(crate) fn of(rows: Vec<FreshProofRow>, highest_claim: u64) -> Self {
+        let mut walked = Self::starting_at(0, u64::MAX, highest_claim);
+        for row in rows {
+            walked.from = if walked.rows.is_empty() {
+                row.base_offset
+            } else {
+                walked.from
+            };
+            walked.end = row.base_offset + u64::from(row.message_count);
+            walked.rows.push(row);
+        }
+        walked
+    }
+
+    const fn starting_at(from: u64, up_to: u64, claim: u64) -> Self {
+        Self {
+            from,
+            up_to,
+            end: from,
+            rows: Vec::new(),
+            highest_claim: claim,
+            broken: false,
+        }
+    }
+
+    /// Take `batch`, whose placed record carries `checksum`, when it is in
+    /// the walk's range and not taken already from another source.
+    fn take(&mut self, batch: &PlacedBatch, checksum: u64) {
+        let header = &batch.header;
+        if header.base_offset < self.end || header.base_offset > self.up_to {
+            return;
+        }
+        if self.rows.is_empty() {
+            self.from = header.base_offset;
+        } else if header.base_offset != self.end {
+            self.broken = true;
+            return;
+        }
+        self.end = header
+            .base_offset
+            .saturating_add(u64::from(header.message_count));
+        self.highest_claim = self.highest_claim.max(batch.placement.proven_below);
+        self.rows.push(FreshProofRow {
+            object_id: FreshObjectId::from_raw(batch.placement.object_id),
+            position: batch.placement.position,
+            base_offset: header.base_offset,
+            base_timestamp: header.base_timestamp,
+            message_count: header.message_count,
+            placed_checksum: checksum,
+        });
+    }
+}
+
 /// Bytes of the buffer that holds `batch` once [`PlacedReadPlan::assemble`]
 /// put it back together.
 fn held_bytes(batch: &PlacedBatch) -> usize {
@@ -942,6 +1107,19 @@ fn held_bytes(batch: &PlacedBatch) -> usize {
 /// `count` placed batches of `file`, from the `index`-th one on. Each one
 /// passes its own checksum, or the read fails.
 async fn read_placed(file: &File, index: u64, count: u64) -> Result<Vec<PlacedBatch>, DiskFault> {
+    Ok(read_placed_records(file, index, count)
+        .await?
+        .into_iter()
+        .map(|(batch, _)| batch)
+        .collect())
+}
+
+/// [`read_placed`], each batch with the checksum its record carries.
+async fn read_placed_records(
+    file: &File,
+    index: u64,
+    count: u64,
+) -> Result<Vec<(PlacedBatch, u64)>, DiskFault> {
     let len = usize::try_from(count)
         .ok()
         .and_then(|count| count.checked_mul(PLACED_BATCH_SIZE))
@@ -955,7 +1133,11 @@ async fn read_placed(file: &File, index: u64, count: u64) -> Result<Vec<PlacedBa
         .as_chunks::<PLACED_BATCH_SIZE>()
         .0
         .iter()
-        .map(|placed| PlacedBatch::decode(placed).map_err(|_| DiskFault::Unreadable))
+        .map(|placed| {
+            PlacedBatch::decode(placed)
+                .map(|batch| (batch, placement::checksum_of(placed)))
+                .map_err(|_| DiskFault::Unreadable)
+        })
         .collect()
 }
 

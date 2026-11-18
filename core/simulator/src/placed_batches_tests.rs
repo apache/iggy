@@ -1447,3 +1447,88 @@ fn given_a_primary_cut_off_while_it_uploads_when_a_successor_takes_over_should_p
         }
     }
 }
+
+/// The proof rows `replica` holds, by the offset of their batch, once they
+/// hold every committed batch that may lack a stored proof.
+fn covering_rows(sim: &Simulator, replica: u8) -> Option<BTreeMap<u64, FreshProofRow>> {
+    with_partition(sim, replica, |partition| {
+        let committed_end = partition.offset.load(std::sync::atomic::Ordering::Acquire) + 1;
+        partition
+            .fresh_proofs()
+            .filter(|proofs| proofs.covers(committed_end, partition.long_term_floor()))
+            .map(|proofs| {
+                proofs
+                    .rows_from(0)
+                    .map(|row| (row.base_offset, *row))
+                    .collect()
+            })
+    })
+}
+
+/// The primary restarts with batches it committed whose proofs it may not
+/// have stored, and no commit of them runs again. It rebuilds their rows
+/// from what it holds, the same rows the replicas that stayed up hold, and
+/// once it leads again the store proves every committed batch.
+#[test]
+fn given_a_primary_that_restarts_with_unproven_batches_when_it_leads_again_should_prove_every_committed_batch()
+ {
+    const SENDS: usize = 4;
+    for seed in SCENARIO_SEEDS {
+        let (mut sim, client, store) = placing_cluster(seed);
+        for index in 0..SENDS {
+            send_until_committed(&mut sim, &client, index);
+        }
+        let last = settle_everywhere(&mut sim);
+
+        sim.replica_crash(PRIMARY);
+        restart(&mut sim, PRIMARY, &store);
+        confirm_proofs(&sim);
+        assert!(
+            with_partition(&sim, PRIMARY, |partition| partition
+                .fresh_proofs()
+                .is_none()),
+            "the restart lost the rows, seed {seed:#x}"
+        );
+        assert_eq!(settle_everywhere(&mut sim), last, "seed {seed:#x}");
+        let mut rebuilt = None;
+        for _ in 0..SETTLE_TICKS {
+            rebuilt = covering_rows(&sim, PRIMARY);
+            if rebuilt.is_some() {
+                break;
+            }
+            sim.step();
+        }
+        let rebuilt = rebuilt.expect("the restarted replica rebuilds its rows");
+        let others = (0..REPLICAS)
+            .filter(|replica| *replica != PRIMARY)
+            .filter_map(|replica| covering_rows(&sim, replica));
+        for held in others {
+            for (offset, row) in &rebuilt {
+                if let Some(other) = held.get(offset) {
+                    assert_eq!(row, other, "the batch at {offset}, seed {seed:#x}");
+                }
+            }
+        }
+
+        for replica in (0..REPLICAS).filter(|replica| *replica != PRIMARY) {
+            sim.replica_crash(replica);
+            restart(&mut sim, replica, &store);
+        }
+        confirm_proofs(&sim);
+        await_primary(&mut sim);
+        settle_everywhere(&mut sim);
+        let mut rows = BTreeMap::new();
+        for _ in 0..SETTLE_TICKS {
+            rows = proven(&stored_objects(&store));
+            if rows.len() as u64 > last {
+                break;
+            }
+            sim.step();
+        }
+        assert_eq!(
+            rows.keys().copied().collect::<Vec<_>>(),
+            (0..=last).collect::<Vec<_>>(),
+            "every committed batch is proven, seed {seed:#x}"
+        );
+    }
+}

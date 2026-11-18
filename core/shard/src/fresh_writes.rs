@@ -80,7 +80,9 @@ use iggy_object_store::{
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::{FreshObjectUploader, FreshProofs, FreshUploadOutcome, IggyPartition};
+use partitions::{
+    FreshObjectUploader, FreshProofs, FreshUploadOutcome, IggyPartition, RebuiltProofs,
+};
 use server_common::Message;
 use server_common::send_messages::{
     ChecksumMode, admitted_batch, admitted_blob, convert_request_message, place_request,
@@ -141,6 +143,10 @@ pub const FRESH_UPLOAD_DEADLINE: Duration = Duration::from_secs(10);
 /// writes none.
 pub const FRESH_CONFIRM_AFTER: Duration = Duration::from_millis(250);
 
+/// How long a partition whose walk left proof rows missing waits before it
+/// walks again.
+const PROOF_WALK_RETRY: Duration = Duration::from_secs(1);
+
 /// The submit channel a send arrived with.
 type SubmitReply = Sender<Option<Message<GenericHeader>>>;
 
@@ -179,6 +185,15 @@ impl DelayedSend {
             due_at,
         }
     }
+}
+
+/// What the task that rebuilds the proof rows of a partition hands back to
+/// the pump.
+struct FinishedProofWalk {
+    namespace: IggyNamespace,
+    created_revision: u64,
+    walk: u64,
+    rebuilt: RebuiltProofs,
 }
 
 /// What the task uploading a fresh object hands back to the pump.
@@ -321,6 +336,14 @@ pub struct FreshWrites {
     /// was sealed.
     last_confirmation_at: Cell<Option<u64>>,
     confirm_after_micros: Cell<u64>,
+    /// The partitions whose missing proof rows a walk should rebuild, as the
+    /// tick found them.
+    proof_walks_wanted: RefCell<BTreeSet<IggyNamespace>>,
+    /// The walks that ended, for the next tick.
+    proof_walks: Rc<RefCell<Vec<FinishedProofWalk>>>,
+    /// When a partition whose walk left rows missing may walk again, on the
+    /// bus's monotonic clock.
+    proof_walk_retry_at: RefCell<BTreeMap<IggyNamespace, u64>>,
 }
 
 impl Default for FreshWrites {
@@ -348,6 +371,9 @@ impl Default for FreshWrites {
             cluster_uid: Cell::new(0),
             last_confirmation_at: Cell::new(None),
             confirm_after_micros: Cell::new(micros(FRESH_CONFIRM_AFTER)),
+            proof_walks_wanted: RefCell::default(),
+            proof_walks: Rc::default(),
+            proof_walk_retry_at: RefCell::default(),
         }
     }
 }
@@ -535,19 +561,25 @@ where
     SB: SuperblockStore,
 {
     /// Note the proof rows `partition` has for this shard to seal, if any
-    /// wait since it was last asked.
+    /// wait since it was last asked, and whether it lacks rows that a walk
+    /// should rebuild.
     pub(crate) fn note_fresh_proofs(
         &self,
         namespace: IggyNamespace,
         partition: &IggyPartition<B, SB>,
     ) {
+        let fresh = &self.fresh_writes;
+        let now = self.bus.monotonic_micros();
         if partition.take_proofs_wanted() {
-            let now = self.bus.monotonic_micros();
-            self.fresh_writes
+            fresh
                 .proofs_waiting
                 .borrow_mut()
                 .entry(namespace)
                 .or_insert(now);
+        }
+        let retry_at = fresh.proof_walk_retry_at.borrow().get(&namespace).copied();
+        if retry_at.is_none_or(|retry_at| retry_at <= now) && partition.needs_proof_walk() {
+            fresh.proof_walks_wanted.borrow_mut().insert(namespace);
         }
     }
 }
@@ -1302,7 +1334,66 @@ where
         for namespace in staged {
             self.feed_staged_sends(namespace).await;
         }
+        self.settle_proof_walks();
+        self.start_proof_walks();
         self.drive_fresh_uploads();
+    }
+
+    /// Hand the partitions the rows their walks rebuilt. One whose rows are
+    /// still missing walks again after [`PROOF_WALK_RETRY`].
+    fn settle_proof_walks(&self) {
+        let fresh = &self.fresh_writes;
+        let finished = std::mem::take(&mut *fresh.proof_walks.borrow_mut());
+        let now = self.bus.monotonic_micros();
+        for FinishedProofWalk {
+            namespace,
+            created_revision,
+            walk,
+            rebuilt,
+        } in finished
+        {
+            let partitions = self.plane.partitions();
+            let Some(partition) = partitions
+                .get_mut_by_ns(&namespace)
+                .filter(|partition| partition.created_revision() == created_revision)
+            else {
+                fresh.proof_walk_retry_at.borrow_mut().remove(&namespace);
+                continue;
+            };
+            let mut retry_at = fresh.proof_walk_retry_at.borrow_mut();
+            if partition.finish_proof_walk(walk, rebuilt) {
+                retry_at.remove(&namespace);
+            } else {
+                retry_at.insert(namespace, now.saturating_add(micros(PROOF_WALK_RETRY)));
+            }
+        }
+    }
+
+    /// Start the walks the tick found wanted. Each reads placed records off
+    /// the pump.
+    fn start_proof_walks(&self) {
+        let fresh = &self.fresh_writes;
+        let wanted = std::mem::take(&mut *fresh.proof_walks_wanted.borrow_mut());
+        for namespace in wanted {
+            let partitions = self.plane.partitions();
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            let created_revision = partition.created_revision();
+            let Some((walk, read)) = partition.begin_proof_walk() else {
+                continue;
+            };
+            let finished = Rc::clone(&fresh.proof_walks);
+            self.bus.spawn(async move {
+                let rebuilt = read.run().await;
+                finished.borrow_mut().push(FinishedProofWalk {
+                    namespace,
+                    created_revision,
+                    walk,
+                    rebuilt,
+                });
+            });
+        }
     }
 
     /// Settle an attempt at storing an object: release the sends of a

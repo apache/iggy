@@ -29,11 +29,22 @@
 //! placement claimed, and the rows its long-term segments hold, so it keeps
 //! what may not be proven yet and a new primary proves it with no read of
 //! the store.
+//!
+//! A replica that did not walk some commits, because it booted or installed
+//! a state transfer, rebuilds the rows it lacks from the placed records it
+//! holds, in a walk that its shard runs off the pump.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 
 use iggy_object_store::FreshProofRow;
+use journal::superblock::SuperblockStore;
+use message_bus::MessageBus;
+use tracing::debug;
+
+use crate::IggyPartition;
+use crate::placed_read::{PlacedReadPlan, WalkedProofs};
 
 /// The committed placed batches of a partition whose proof may not be in a
 /// stored object yet, ascending and contiguous.
@@ -52,6 +63,11 @@ pub struct FreshProofs {
     wanted: Cell<bool>,
     /// The view in which the shard last asked.
     asked_in_view: Cell<Option<u32>>,
+    /// Number of the last walk that rebuilds missing rows, so the result of
+    /// an earlier one is never taken for it.
+    walks: u64,
+    /// The walk in flight.
+    walking: Option<u64>,
 }
 
 impl FreshProofs {
@@ -130,6 +146,42 @@ impl FreshProofs {
             .max(done)
     }
 
+    /// Whether the rows hold every committed batch that may lack a stored
+    /// proof, up to `committed_end`, one past the last committed offset.
+    #[must_use]
+    pub fn covers(&self, committed_end: u64, long_term_floor: Option<u64>) -> bool {
+        let done = self.proven_floor.max(long_term_end(long_term_floor));
+        committed_end <= done
+            || (self.complete_from <= done
+                && self.next_offset.is_some_and(|next| next >= committed_end))
+    }
+
+    /// Take the rows a walk rebuilt. They join the rows taken since the walk
+    /// started when the two meet, and the walk's are kept where both hold a
+    /// row: both are of the same committed batches.
+    pub(crate) fn fill(&mut self, walked: WalkedProofs, long_term_floor: Option<u64>) {
+        self.proven_floor = self.proven_floor.max(walked.highest_claim);
+        match self.next_offset {
+            Some(next) if next > walked.end => {
+                if self.complete_from > walked.end {
+                    // A commit went missing since the walk began, and the
+                    // next walk reads it.
+                    self.prune(long_term_floor);
+                    return;
+                }
+                let later = self.rows.iter().filter(|row| row.base_offset >= walked.end);
+                let rows: VecDeque<_> = walked.rows.iter().chain(later).copied().collect();
+                self.rows = rows;
+            }
+            _ => {
+                self.rows = walked.rows.into();
+                self.next_offset = Some(walked.end);
+            }
+        }
+        self.complete_from = walked.from;
+        self.prune(long_term_floor);
+    }
+
     /// Note that a row arrived on the primary.
     pub(crate) fn want(&self) {
         self.wanted.set(true);
@@ -147,6 +199,107 @@ impl FreshProofs {
     pub(crate) fn unwant(&self) {
         self.wanted.set(false);
         self.asked_in_view.set(None);
+    }
+}
+
+/// The read of the committed placed batches whose proof rows a replica
+/// lacks, captured under the partition borrow so it runs without.
+pub struct ProofWalk {
+    plan: PlacedReadPlan,
+    from: u64,
+    up_to: u64,
+}
+
+/// The rows a [`ProofWalk`] rebuilt, for
+/// [`IggyPartition::finish_proof_walk`].
+pub struct RebuiltProofs(pub(crate) Option<WalkedProofs>);
+
+impl ProofWalk {
+    /// Read the placed records. Holds nothing when they could not be read,
+    /// and a later walk reads them again.
+    pub async fn run(self) -> RebuiltProofs {
+        RebuiltProofs(
+            self.plan
+                .proof_rows(self.from, self.up_to)
+                .await
+                .inspect_err(|fault| {
+                    debug!(
+                        from = self.from,
+                        up_to = self.up_to,
+                        ?fault,
+                        "rebuilding proof rows failed and is tried again"
+                    );
+                })
+                .ok(),
+        )
+    }
+}
+
+impl<B, SB> IggyPartition<B, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    /// Whether this replica committed placed batches above its floors whose
+    /// proof rows it does not hold, and no walk for them is in flight.
+    #[must_use]
+    pub fn needs_proof_walk(&self) -> bool {
+        if !self.places_batches() || !self.holds_committed_messages() {
+            return false;
+        }
+        let committed_end = self.offset.load(Ordering::Acquire).saturating_add(1);
+        let long_term_floor = self.long_term_floor();
+        self.fresh_proofs.as_deref().map_or_else(
+            || committed_end > long_term_end(long_term_floor),
+            |proofs| proofs.walking.is_none() && !proofs.covers(committed_end, long_term_floor),
+        )
+    }
+
+    /// Start rebuilding the proof rows this replica lacks, when it
+    /// [needs](Self::needs_proof_walk) to: a walk of its committed placed
+    /// records above its floors, which the caller runs off the pump and
+    /// hands back to [`Self::finish_proof_walk`] with the returned number.
+    pub fn begin_proof_walk(&mut self) -> Option<(u64, ProofWalk)> {
+        if !self.needs_proof_walk() {
+            return None;
+        }
+        let up_to = self.offset.load(Ordering::Acquire);
+        let plan = self.placed_read_plan(None);
+        let from = long_term_end(self.long_term_floor());
+        let proofs = self.fresh_proofs.get_or_insert_default();
+        proofs.walks += 1;
+        proofs.walking = Some(proofs.walks);
+        Some((
+            proofs.walks,
+            ProofWalk {
+                plan,
+                from: from.max(proofs.proven_floor),
+                up_to,
+            },
+        ))
+    }
+
+    /// Take the rows of the walk numbered `walk`. Returns whether the rows
+    /// now hold every committed batch that may lack a stored proof, so the
+    /// caller knows whether to walk again later.
+    pub fn finish_proof_walk(&mut self, walk: u64, rebuilt: RebuiltProofs) -> bool {
+        let long_term_floor = self.long_term_floor();
+        let committed_end = self.offset.load(Ordering::Acquire).saturating_add(1);
+        let primary = self.consensus().is_primary();
+        let Some(proofs) = self.fresh_proofs.as_deref_mut() else {
+            return false;
+        };
+        if proofs.walking != Some(walk) {
+            return false;
+        }
+        proofs.walking = None;
+        if let RebuiltProofs(Some(walked)) = rebuilt {
+            proofs.fill(walked, long_term_floor);
+        }
+        if primary && !proofs.is_empty() {
+            proofs.want();
+        }
+        proofs.covers(committed_end, long_term_floor)
     }
 }
 
@@ -299,6 +452,52 @@ mod tests {
 
         assert_eq!(proofs.proven_below(5, None), 0);
         assert_eq!(proofs.first_unproven(), 0);
+    }
+
+    fn walked(offsets: std::ops::Range<u64>, claim: u64) -> WalkedProofs {
+        WalkedProofs::of(offsets.map(|offset| row(offset * 2, 2)).collect(), claim)
+    }
+
+    /// Rows rebuilt from 0 to 6 meet the rows committed since the walk
+    /// began, from 6 on.
+    #[test]
+    fn given_rows_committed_during_a_walk_when_it_ends_where_they_start_should_join_them() {
+        let mut proofs = FreshProofs::default();
+        proofs.commit(row(6, 2), 0, None);
+        proofs.commit(row(8, 2), 0, None);
+        assert!(!proofs.covers(10, None));
+
+        proofs.fill(walked(0..3, 0), None);
+
+        assert_eq!(offsets(&proofs), [0, 2, 4, 6, 8]);
+        assert!(proofs.covers(10, None));
+        assert_eq!(proofs.proven_below(10, None), 10);
+    }
+
+    /// Rows committed after a commit the walk did not reach leave a hole the
+    /// walk cannot close, so the queue stays as it was until the next one.
+    #[test]
+    fn given_rows_that_start_past_the_end_of_a_walk_when_it_ends_should_keep_the_hole() {
+        let mut proofs = FreshProofs::default();
+        proofs.commit(row(8, 2), 0, None);
+
+        proofs.fill(walked(0..3, 0), None);
+
+        assert_eq!(offsets(&proofs), [8]);
+        assert!(!proofs.covers(10, None));
+        assert_eq!(proofs.proven_below(10, None), 0);
+    }
+
+    /// A walk that started before the highest claim it read drops the rows
+    /// below it.
+    #[test]
+    fn given_a_walk_that_read_a_higher_claim_when_it_ends_should_drop_the_rows_below_it() {
+        let mut proofs = FreshProofs::default();
+
+        proofs.fill(walked(0..4, 4), None);
+
+        assert_eq!(offsets(&proofs), [4, 6]);
+        assert!(proofs.covers(8, None));
     }
 
     #[test]

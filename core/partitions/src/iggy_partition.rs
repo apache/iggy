@@ -246,7 +246,7 @@ where
     pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
     /// The proof rows of the placed batches it committed, `None` until it
     /// commits one.
-    fresh_proofs: Option<Box<crate::fresh_proofs::FreshProofs>>,
+    pub(crate) fresh_proofs: Option<Box<crate::fresh_proofs::FreshProofs>>,
     /// Number of the last manifest publish this partition started. It
     /// outlives the view, so the late result of an earlier view's publish is
     /// never taken for the one in flight.

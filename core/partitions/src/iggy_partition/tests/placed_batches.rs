@@ -34,7 +34,7 @@ fn placed_record(index: u64) -> (Vec<u8>, Placement) {
     (record, placement)
 }
 
-fn placed_records(count: u64) -> (Vec<Vec<u8>>, Vec<Placement>) {
+pub(super) fn placed_records(count: u64) -> (Vec<Vec<u8>>, Vec<Placement>) {
     (0..count).map(placed_record).unzip()
 }
 
@@ -218,7 +218,7 @@ async fn given_a_segment_that_fits_two_placed_batches_when_a_third_commits_shoul
 
 /// A placing partition under `root`, where boot recovery finds its files,
 /// with segments that fit two placed batches and `count` batches committed.
-async fn placing_partition_on_disk(
+pub(super) async fn placing_partition_on_disk(
     root: &Path,
     count: u64,
 ) -> (PartitionsConfig, IggyPartition<IggyMessageBus>) {
@@ -405,7 +405,31 @@ async fn given_a_rebooted_placing_partition_when_more_placed_batches_commit_shou
     let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 3)).await;
     drop(partition);
     let directory = config.get_partition_path(1, 1, 0);
-    let recovered = Box::pin(recover(&config)).await.unwrap();
+    let mut partition = Box::pin(rebooted_placing_partition(&config)).await;
+    assert_eq!(partition.log.active_segment().end_offset, 2);
+
+    // The test partition keeps no WAL, so its ops start over. The offsets
+    // are what the segments carry across the reboot.
+    let (records, _) = placed_records(2);
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
+
+    assert_eq!(partition.offset.load(Ordering::Acquire), 4);
+    let stored: Vec<_> = segment_file_bytes(Path::new(&directory))
+        .iter()
+        .flat_map(|bytes| placed_batches_in(bytes))
+        .map(|placed| placed.header.base_offset)
+        .collect();
+    assert_eq!(stored, [0, 1, 2, 3, 4]);
+}
+
+/// The partition [`placing_partition_on_disk`] left under `config`, after a
+/// boot that recovers its segments and no WAL, so no commit of what they
+/// hold runs again.
+pub(super) async fn rebooted_placing_partition(
+    config: &PartitionsConfig,
+) -> IggyPartition<IggyMessageBus> {
+    let directory = config.get_partition_path(1, 1, 0);
+    let recovered = Box::pin(recover(config)).await.unwrap();
     let mut partition = test_partition_with_replicas(3);
     partition.set_places_batches(true);
     partition.set_partition_dir(directory.clone());
@@ -420,25 +444,12 @@ async fn given_a_rebooted_placing_partition_when_more_placed_batches_commit_shou
     );
     // The server restores the offsets from the recovered segments.
     let recovered_end = partition.log.active_segment().end_offset;
-    assert_eq!(recovered_end, 2);
     partition.offset.store(recovered_end, Ordering::Release);
     partition
         .dirty_offset
         .store(recovered_end, Ordering::Relaxed);
     partition.set_offset_space_used(true);
-
-    // The test partition keeps no WAL, so its ops start over. The offsets
-    // are what the segments carry across the reboot.
-    let (records, _) = placed_records(2);
-    Box::pin(commit_records(&mut partition, 1, &records)).await;
-
-    assert_eq!(partition.offset.load(Ordering::Acquire), 4);
-    let stored: Vec<_> = segment_file_bytes(Path::new(&directory))
-        .iter()
-        .flat_map(|bytes| placed_batches_in(bytes))
-        .map(|placed| placed.header.base_offset)
-        .collect();
-    assert_eq!(stored, [0, 1, 2, 3, 4]);
+    partition
 }
 
 /// A placing partition whose segments fit two placed batches.

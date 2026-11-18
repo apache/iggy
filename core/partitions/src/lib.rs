@@ -64,7 +64,7 @@ pub use object_delete::{
     sweep_long_term, sweep_segments, sweepable,
 };
 mod fresh_proofs;
-pub use fresh_proofs::FreshProofs;
+pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
 mod fresh_sweep;

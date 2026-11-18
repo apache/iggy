@@ -17,7 +17,10 @@
 
 //! The proof rows a placing partition keeps of the batches it commits.
 
-use super::placed_batches::{placing_backup_with_wal, placing_primary, replicate_placed};
+use super::placed_batches::{
+    placed_records, placing_backup_with_wal, placing_partition_of_small_segments,
+    placing_partition_on_disk, placing_primary, rebooted_placing_partition, replicate_placed,
+};
 use super::*;
 use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch, Placement};
@@ -198,4 +201,145 @@ async fn given_a_partition_of_whole_batches_when_batches_commit_should_keep_no_p
 
     assert!(partition.fresh_proofs().is_none());
     assert!(!partition.take_proofs_wanted());
+}
+
+/// Run the walk that rebuilds the proof rows `partition` lacks, as its shard
+/// does, and return whether the rows then hold every batch that may lack a
+/// stored proof.
+async fn rebuild_proof_rows<B: MessageBus>(partition: &mut IggyPartition<B>) -> bool {
+    let (walk, read) = partition
+        .begin_proof_walk()
+        .expect("the replica lacks proof rows");
+    assert!(!partition.needs_proof_walk(), "one walk at a time");
+    let rebuilt = read.run().await;
+    partition.finish_proof_walk(walk, rebuilt)
+}
+
+/// A replica boots with committed batches in its segments whose proofs it
+/// never saw stored, and no commit of them runs again. It rebuilds their
+/// rows from its segments, and the rows of what it commits next follow them.
+#[compio::test]
+async fn given_a_replica_that_boots_with_unproven_batches_when_it_rebuilds_its_rows_should_hold_a_row_of_each_committed_batch()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 3)).await;
+    let before = rows(&partition);
+    assert_eq!(before.len(), 3);
+    drop(partition);
+
+    let mut partition = Box::pin(rebooted_placing_partition(&config)).await;
+    assert!(partition.fresh_proofs().is_none(), "the boot lost the rows");
+    assert!(partition.needs_proof_walk());
+
+    assert!(Box::pin(rebuild_proof_rows(&mut partition)).await);
+
+    assert_eq!(
+        rows(&partition),
+        before,
+        "the rows the boot lost, as they were"
+    );
+    assert!(!partition.needs_proof_walk());
+    let (records, _) = placed_records(2);
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
+    assert_eq!(row_offsets(&partition), [0, 1, 2, 3, 4]);
+    let checksums: Vec<_> = stored_placed(&config.get_partition_path(1, 1, 0))
+        .iter()
+        .map(|bytes| placement::checksum_of(bytes))
+        .collect();
+    assert_eq!(
+        rows(&partition)
+            .iter()
+            .map(|row| row.placed_checksum)
+            .collect::<Vec<_>>(),
+        checksums
+    );
+}
+
+/// A backup restarts, and its first commits after the restart do not follow
+/// the rows it held. It rebuilds the rows before them, and holds a row of
+/// every committed batch again.
+#[compio::test]
+async fn given_a_backup_whose_first_commits_after_a_restart_leave_a_hole_when_it_rebuilds_its_rows_should_close_it()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 3)).await;
+    let before = rows(&partition);
+    drop(partition);
+    let mut partition = Box::pin(rebooted_placing_partition(&config)).await;
+    let (records, _) = placed_records(2);
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
+    assert_eq!(row_offsets(&partition), [3, 4]);
+    assert_eq!(
+        partition.proven_below(u64::MAX),
+        0,
+        "no claim past the hole"
+    );
+
+    assert!(Box::pin(rebuild_proof_rows(&mut partition)).await);
+
+    assert_eq!(row_offsets(&partition), [0, 1, 2, 3, 4]);
+    assert_eq!(rows(&partition)[..3], before[..]);
+    assert_eq!(partition.proven_below(u64::MAX), 5);
+}
+
+/// A replica that installs a state transfer holds the committed batches of
+/// the segments it installed and no row of them. It rebuilds the rows from
+/// those segments.
+#[compio::test]
+async fn given_a_replica_that_installs_a_state_transfer_when_it_rebuilds_its_rows_should_hold_the_rows_of_the_origin()
+ {
+    let (_origin_directory, origin) = Box::pin(placing_partition_of_small_segments()).await;
+    let mut origin = Box::new(origin);
+    let (records, _) = placed_records(5);
+    Box::pin(commit_records(&mut origin, 1, &records)).await;
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    let (_receiver_directory, receiver) = Box::pin(placing_partition_of_small_segments()).await;
+    let mut receiver = Box::new(receiver);
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+    assert!(receiver.fresh_proofs().is_none());
+    assert!(receiver.needs_proof_walk());
+
+    assert!(Box::pin(rebuild_proof_rows(&mut receiver)).await);
+
+    assert_eq!(rows(&receiver), rows(&origin));
+    assert_eq!(row_offsets(&receiver), [0, 1, 2, 3, 4]);
+}
+
+/// The newest committed placement claims the batches below its
+/// `proven_below` proven, so the walk reads only the tail above it.
+#[compio::test]
+async fn given_a_primary_that_lost_its_rows_when_it_rebuilds_them_should_start_at_the_newest_claim()
+{
+    let (_directory, mut partition) = Box::pin(placing_primary()).await;
+    let config = repair_config();
+    for (request, count, proven_below) in [(1, 2, 0), (2, 3, 0), (3, 1, 2)] {
+        let placed = placed_request(&partition, request, count, proven_below);
+        Box::pin(partition.on_placed_request(placed, None)).await;
+        partition.consensus().advance_commit_max(request);
+        Box::pin(settle_partition_io(&mut partition, &config)).await;
+    }
+    let held = rows(&partition);
+    partition.fresh_proofs = None;
+
+    let (walk, read) = partition.begin_proof_walk().unwrap();
+    let rebuilt = read.run().await;
+    let walked = rebuilt.0.as_ref().expect("the walk reads the journal");
+    assert_eq!(
+        walked
+            .rows
+            .iter()
+            .map(|row| row.base_offset)
+            .collect::<Vec<_>>(),
+        [2, 5],
+        "nothing below the newest claim is read"
+    );
+    assert!(partition.finish_proof_walk(walk, rebuilt));
+
+    assert_eq!(rows(&partition), held);
+    assert_eq!(row_offsets(&partition), [2, 5]);
+    assert_eq!(partition.proven_below(u64::MAX), 6);
+    assert!(
+        partition.take_proofs_wanted(),
+        "the primary's shard seals the rebuilt rows"
+    );
 }
