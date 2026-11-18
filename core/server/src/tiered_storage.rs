@@ -148,6 +148,10 @@ pub fn start(
     let backend = store(config, credentials).ok().flatten()?;
     let layout = layout(config).ok()?;
     let service = TierService::new(backend, Rc::clone(bus), &service_config(config));
+    shard.set_fresh_upload_pace(
+        config.fresh_upload_interval.get_duration(),
+        usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
+    );
     shard
         .plane
         .partitions()
@@ -213,6 +217,7 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
     TierServiceConfig {
         demand_fetch: limits(jobs.demand_fetches, Some(jobs.demand_fetch_bytes)),
         upload: limits(jobs.uploads, Some(jobs.upload_bytes)),
+        fresh_upload: limits(jobs.fresh_uploads, None),
         speculative_fetch: limits(jobs.speculative_fetches, Some(jobs.speculative_fetch_bytes)),
         delete: limits(jobs.deletes, None),
         housekeeping: limits(jobs.housekeeping, None),
@@ -385,6 +390,20 @@ mod tests {
         assert_eq!(
             service_config(&TieredStorageConfig::default()),
             TierServiceConfig::default()
+        );
+    }
+
+    #[test]
+    fn given_default_section_when_reading_the_fresh_upload_pace_should_give_the_shard_defaults() {
+        let config = TieredStorageConfig::default();
+
+        assert_eq!(
+            config.fresh_upload_interval.get_duration(),
+            shard::FRESH_UPLOAD_INTERVAL
+        );
+        assert_eq!(
+            usize::try_from(config.jobs.fresh_uploads).unwrap(),
+            shard::FRESH_UPLOADS
         );
     }
 

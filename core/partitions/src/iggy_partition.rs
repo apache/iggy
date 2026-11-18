@@ -206,6 +206,10 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
+    /// Set when a command of the long-term log applies on the primary, and
+    /// taken by the shard, which publishes the manifest and starts the
+    /// rewrite that waited for the command.
+    pub(crate) long_term_changed: Cell<bool>,
     /// The highest committed truncation watermark a timed pass read from
     /// metadata for this partition. The watermark only rises, so the one
     /// metadata holds now is never below it.
@@ -222,8 +226,8 @@ where
     /// segments, while this replica is the primary.
     pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
     /// What this replica found of its geo topic's object while it is the
-    /// primary.
-    pub(crate) topic_object_check: crate::topic_object::TopicObjectCheck,
+    /// primary. Boxed to keep the partition small on the stack.
+    pub(crate) topic_object_check: Box<crate::topic_object::TopicObjectCheck>,
     /// The fetches of remote segments' indexes that polls have in flight.
     pub(crate) index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1044,12 +1048,13 @@ where
             segment_upload_attempts: 0,
             upload_cursor: None,
             upload_wanted: Cell::new(false),
+            long_term_changed: Cell::new(false),
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
-            topic_object_check: crate::topic_object::TopicObjectCheck::default(),
+            topic_object_check: Box::default(),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -7941,6 +7946,38 @@ where
         self.release_send_space();
     }
 
+    /// Whether this replica answers every client request as not accepted for
+    /// now: it is not a primary in normal status, or it is on its way out.
+    fn refuses_requests(&self) -> bool {
+        let consensus = self.consensus();
+        self.fatal.is_some()
+            || self.maintenance.shutdown.is_some()
+            || self.io_active.is_retiring()
+            || self.transition.is_some()
+            || self.materialization_missing
+            || consensus.is_follower()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+    }
+
+    /// Whether a send may go to the object store for this partition now: the
+    /// partition places its batches, and this replica would not refuse the
+    /// request that commits where they sit, which it does while its geo
+    /// topic's object is unread. The node's upload path asks before it
+    /// stores a send's messages, and again before it hands the request over.
+    #[must_use]
+    pub fn takes_placed_sends(&self) -> bool {
+        self.places_batches() && !self.refuses_requests() && self.takes_messages_of_its_topic()
+    }
+
+    /// Whether [`Self::on_placed_request`] has room for one more request. A
+    /// request handed over without room is answered as not accepted.
+    #[must_use]
+    pub fn has_request_room(&self) -> bool {
+        self.consensus()
+            .with_pipeline(|pipeline| !pipeline.request_queue_full())
+    }
+
     /// Whether `message` is a request [`Self::on_placed_request`] takes: a
     /// `SendMessages` whose body is one placed batch for this partition.
     fn is_placed_request(&self, message: &Message<RoutedRequestHeader>) -> bool {
@@ -8063,16 +8100,7 @@ where
                 .await;
                 return;
             }
-            if self.fatal.is_some()
-                || self.maintenance.shutdown.is_some()
-                || self.io_active.is_retiring()
-                || self.transition.is_some()
-                || self.materialization_missing
-                || consensus.is_follower()
-                || !consensus.is_normal()
-                || consensus.is_transferring()
-                || committed_history_pending
-            {
+            if self.refuses_requests() || committed_history_pending {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(

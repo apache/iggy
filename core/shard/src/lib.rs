@@ -24,11 +24,13 @@ mod partition_io;
 pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
 mod fresh_writes;
 pub use fresh_writes::{
-    FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_WINDOW, FinishedFreshUpload, PlacedSend,
+    FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL, FRESH_UPLOADS,
+    FinishedFreshUpload,
 };
 mod fresh_sweeps;
 pub use fresh_sweeps::{
-    FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport, FreshSweeps,
+    FRESH_SWEEP_INTERVAL, FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport,
+    FreshSweeps,
 };
 mod long_term_rewrites;
 mod manifest_publishes;
@@ -1257,8 +1259,8 @@ pub enum LifecycleFrame {
     /// The result of a publish that a [`Self::PublishManifest`] pass started,
     /// sent by the task that ran it.
     ManifestPublishFinished(Box<FinishedManifestPublish>),
-    /// The result of the upload of a fresh object, sent by the task that ran
-    /// it, with the sends that wait for the object.
+    /// The result of an attempt at the upload of a fresh object, sent by the
+    /// task that ran it.
     FreshUploadFinished(Box<FinishedFreshUpload>),
     /// Per-shard pass over a partition that places its batches: rewrite its
     /// committed batches above the long-term floor into a segment, when this
@@ -1274,8 +1276,10 @@ pub enum LifecycleFrame {
     /// started, sent by the task that ran it.
     SegmentRewriteFinished(Box<FinishedSegmentRewrite>),
     /// Start a sweep of the fresh objects of this replica, on its first
-    /// shard: list them, when no sweep is in flight. The timer task stamps
-    /// `now`. Does nothing on another shard or on one without a sweeper.
+    /// shard: list them, when no sweep is in flight. The shard's tick starts
+    /// its sweeps without this frame, which is for a caller that wants one
+    /// at a `now` of its own. Does nothing on another shard or on one
+    /// without a sweeper.
     SweepFreshObjects {
         now: IggyTimestamp,
     },
@@ -1290,8 +1294,8 @@ pub enum LifecycleFrame {
     /// A shard's answer to [`Self::ReportFreshObjects`], sent to the first
     /// shard by the task that read the partitions.
     FreshObjectsReported(Box<FreshObjectsReport>),
-    /// The result of the delete that a sweep started, sent by the task that
-    /// ran it.
+    /// The result of one delete job of a sweep, sent by the task that ran
+    /// it.
     FreshObjectsDeleted(Box<FinishedFreshDelete>),
     /// Per-shard pass over the partitions of geo topics: start the read of
     /// the topic's object on each whose primary this replica is and that

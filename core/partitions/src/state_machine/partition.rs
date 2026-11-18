@@ -241,6 +241,7 @@ where
                 if let Some(advance) = advance {
                     self.note_tiered_advance(advance);
                 }
+                self.note_long_term_command(command.kind);
                 true
             }
             Ok(Applied::Refused) => {
