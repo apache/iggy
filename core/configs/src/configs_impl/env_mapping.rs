@@ -17,22 +17,6 @@
 
 //! Environment variable to config path mapping types.
 
-/// How the environment provider turns a variable's text into a config value.
-///
-/// The text has no type of its own, so the field decides. A field that only
-/// deserializes from a string, such as a `String` or a `DisplayFromStr` leaf,
-/// fails on a number or a bool, while the same text quoted in TOML loads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvValueKind {
-    /// A bool, then an integer, then a float, otherwise a string. `[a, b]` is
-    /// an array of such elements.
-    Inferred,
-    /// The text as one string.
-    Text,
-    /// `[a, b]` as an array of strings, otherwise the text as one string.
-    TextArray,
-}
-
 /// Represents a single environment variable to config path mapping.
 /// Used by the `ConfigEnv` derive macro to generate compile-time mappings.
 #[derive(Debug, Clone, Copy)]
@@ -43,8 +27,6 @@ pub struct EnvVarMapping {
     pub config_path: &'static str,
     /// Whether this field contains secret data
     pub is_secret: bool,
-    /// How the variable's text becomes a config value
-    pub value_kind: EnvValueKind,
 }
 
 /// Compact representation of a configuration environment variable.
@@ -61,8 +43,6 @@ pub struct EnvVarTemplate {
     pub is_secret: bool,
     /// Maximum element count for each `<N>` placeholder, from left to right.
     pub max_elements: &'static [usize],
-    /// How the variable's text becomes a config value.
-    pub value_kind: EnvValueKind,
 }
 
 /// Trait for configuration types that provide environment variable mappings.
@@ -133,7 +113,6 @@ impl EnvVarTemplate {
                 env_name: Box::leak(env_name.into_boxed_str()),
                 config_path: Box::leak(config_path.into_boxed_str()),
                 is_secret: self.is_secret,
-                value_kind: self.value_kind,
             })
             .collect()
     }
@@ -160,7 +139,6 @@ mod tests {
             config_path: "items.<N>.values.<N>",
             is_secret: false,
             max_elements: &[2, 2],
-            value_kind: EnvValueKind::Inferred,
         }]);
 
         assert_eq!(mappings.len(), 4);
@@ -177,7 +155,6 @@ mod tests {
             config_path: "items.<N>",
             is_secret: false,
             max_elements: &[2],
-            value_kind: EnvValueKind::Inferred,
         }]);
     }
 
@@ -190,7 +167,6 @@ mod tests {
             config_path: "items",
             is_secret: false,
             max_elements: &[2],
-            value_kind: EnvValueKind::Inferred,
         }]);
     }
 }

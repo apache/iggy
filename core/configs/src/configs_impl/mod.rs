@@ -24,6 +24,7 @@
 //! - JSON value field handling
 //! - Automatic type conversion and validation
 
+mod display_from_str_or_number;
 mod env_listing;
 mod env_mapping;
 mod error;
@@ -32,14 +33,13 @@ mod parsing;
 mod traits;
 mod typed_env_provider;
 
+pub use display_from_str_or_number::DisplayFromStrOrNumber;
 pub use env_listing::{
     CONNECTORS_CONFIG_PATH_ENV, CONNECTORS_ENV_PATH_ENV, CONNECTORS_RUNTIME_ENV_VARS,
     MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV, MCP_RUNTIME_ENV_VARS, PLUGIN_CONFIG_ENV_SEGMENT,
     print_env_var_names,
 };
-pub use env_mapping::{
-    ConfigEnvMappings, EnvValueKind, EnvVarMapping, EnvVarTemplate, expand_env_templates,
-};
+pub use env_mapping::{ConfigEnvMappings, EnvVarMapping, EnvVarTemplate, expand_env_templates};
 pub use error::ConfigurationError;
 pub(crate) use file_provider::DISPLAY_CONFIG_ENV;
 pub use file_provider::{FileConfigProvider, RelocatedKey, RelocatedTarget};

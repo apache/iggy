@@ -68,12 +68,6 @@ use syn::{DeriveInput, parse_macro_input};
 /// - Use `#[config_env(leaf)]` for value types that shouldn't be recursively expanded
 ///   (e.g., `IggyDuration`, `CompressionAlgorithm`, custom enums)
 ///
-/// # Environment Values
-/// - `String` leaves and leaves read through `#[serde_as(as = "DisplayFromStr")]`
-///   (or `Option<DisplayFromStr>`, ...) take the variable's text as a string, as a
-///   quoted TOML value would. `Vec` leaves of either kind split `[a, b]` into strings.
-/// - Every other leaf takes a guessed type: bool, integer, float, then string.
-///
 /// # Examples
 ///
 /// ## Struct Configuration
