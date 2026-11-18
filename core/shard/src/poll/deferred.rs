@@ -1247,6 +1247,17 @@ where
         Ok(visibility)
     }
 
+    /// Whether a trim of the partition's peer log dropped the segment that
+    /// `result` started from, see [`partitions::IggyPartition::trimmed_under_peer_read`].
+    fn trimmed_under_read(&self, namespace: IggyNamespace, result: &PollReadResult) -> bool {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.trimmed_under_peer_read(result)
+            })
+            .unwrap_or(false)
+    }
+
     fn offset_stored_since(
         &self,
         namespace: IggyNamespace,
@@ -1615,6 +1626,12 @@ where
                 return;
             }
         };
+        // Whatever the read found in the store, a trim of the peer log it
+        // covers makes the retry plan from the new front.
+        if self.trimmed_under_read(waiter.namespace, &result) {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        }
         let result = match result.checked() {
             Ok(result) => result,
             Err(error) => {

@@ -457,11 +457,15 @@ async fn placing_partition_of_small_segments() -> (tempfile::TempDir, IggyPartit
 #[compio::test]
 async fn given_a_placing_origin_when_a_placing_replica_installs_its_offer_should_hold_the_same_placed_batches()
  {
-    let (origin_directory, mut origin) = Box::pin(placing_partition_of_small_segments()).await;
+    // Two partitions on the test's own stack leave too little of it for the
+    // install.
+    let (origin_directory, origin) = Box::pin(placing_partition_of_small_segments()).await;
+    let mut origin = Box::new(origin);
     let (records, placements) = placed_records(5);
     Box::pin(commit_records(&mut origin, 1, &records)).await;
     let offer = Box::pin(serve_offer(&mut origin)).await;
-    let (receiver_directory, mut receiver) = Box::pin(placing_partition_of_small_segments()).await;
+    let (receiver_directory, receiver) = Box::pin(placing_partition_of_small_segments()).await;
+    let mut receiver = Box::new(receiver);
 
     Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
 

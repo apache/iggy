@@ -185,6 +185,9 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// The other cluster's log that this partition serves in place of its
+    /// own, `None` for a partition that holds its own messages.
+    pub(crate) peer_log: Option<Box<crate::peer_log::PeerLog>>,
     /// The floor advances this replica applied that its chain does not record
     /// yet, oldest first. Recorded ones leave from the front.
     pub(crate) pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
@@ -222,13 +225,13 @@ where
     /// primary.
     pub(crate) topic_object_check: crate::topic_object::TopicObjectCheck,
     /// The fetches of remote segments' indexes that polls have in flight.
-    index_fetches: Rc<IndexFetches>,
+    pub(crate) index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
     widest_batch_bytes: Cell<u64>,
     /// See [`PollVisibility::committed_bytes`].
-    committed_bytes: u64,
+    pub(crate) committed_bytes: u64,
     pub created_at: IggyTimestamp,
     pub revision_id: u64,
     pub(crate) offset_space: OffsetSpace,
@@ -1034,6 +1037,7 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            peer_log: None,
             pending_advances: VecDeque::new(),
             local_envelope: None,
             segment_upload: None,
@@ -4004,10 +4008,11 @@ where
 
     /// Whether this partition places its batches: a message prepare carries
     /// the batch header and where the messages sit in the object store, not
-    /// the messages.
+    /// the messages. A partition that follows another cluster's log takes no
+    /// batch at all, whatever its topic's options say.
     #[must_use]
     pub const fn places_batches(&self) -> bool {
-        self.runtime_options.places_batches
+        self.runtime_options.places_batches && self.peer_log.is_none()
     }
 
     /// The batch header of a message prepare this replica did not stamp,
@@ -4018,7 +4023,7 @@ where
         message: &Message<PrepareHeader>,
     ) -> Result<BatchHeader, IggyError> {
         let batch = decode_prepare_batch(message.as_slice())?;
-        if batch.placement.is_some() != self.places_batches() {
+        if batch.placement.is_some() != self.places_batches() || self.peer_log.is_some() {
             return Err(IggyError::CannotAppendMessage);
         }
         Ok(batch.header)
@@ -4608,6 +4613,7 @@ where
         if result.context.history != self.poll_history
             || self.fatal.is_some()
             || self.materialization_missing
+            || self.trimmed_under_peer_read(&result)
         {
             return Err(IggyError::TransientNotAccepted);
         }
@@ -6100,14 +6106,27 @@ where
         self.build_poll_plan_within(consumer, args, validate_checksum, usize::MAX)
     }
 
-    /// Hand polls the store that holds this partition's remote segments.
+    /// Hand polls the store that holds this partition's remote segments: the
+    /// node's own store, or the peer's for a partition that follows another
+    /// cluster's log.
     pub fn set_remote_segments(&mut self, remote: Rc<crate::RemoteSegments>) {
         self.remote_segments = Some(remote);
+    }
+
+    /// Forget the store this partition read remote segments from, so the
+    /// shard hands it the right one again.
+    pub(crate) fn clear_remote_segments(&mut self) {
+        self.remote_segments = None;
     }
 
     #[must_use]
     pub const fn has_remote_segments(&self) -> bool {
         self.remote_segments.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn remote_segments(&self) -> Option<&Rc<crate::RemoteSegments>> {
+        self.remote_segments.as_ref()
     }
 
     /// [`Self::build_poll_plan`] for a poll whose reply holds at most
@@ -6143,12 +6162,13 @@ where
             )),
             _ => None,
         };
-        let context = PollContext {
+        let mut context = PollContext {
             history: self.poll_history,
             consumer,
             auto_commit: args.auto_commit,
             owner,
             _group_poll: group_poll,
+            peer_first_segment: None,
         };
         if !self.offset_space.committed_seeded || args.count == 0 {
             return PollPlan {
@@ -6251,12 +6271,19 @@ where
         // segment carries its shared read-state handle so the off-borrow read
         // reuses (or fills) the cached fd; only a sealed one also resolves its
         // start byte from the shared sparse index.
-        let object_prefix = self.object_prefix();
+        let object_prefix = self.read_prefix();
         let walked = walked_segments(
             &self.log.segments()[start_segment..],
             args.count,
             byte_budget,
         );
+        if self.peer_log.is_some() {
+            context.peer_first_segment = self
+                .log
+                .segments()
+                .get(start_segment)
+                .map(|segment| segment.start_offset);
+        }
         let cut = start_segment + walked < self.log.segments().len();
         let segments = self.log.segments()[start_segment..start_segment + walked]
             .iter()
@@ -8012,16 +8039,25 @@ where
             }
             // A partition takes what its segments hold. One that places its
             // batches gets them from the node's upload path, and a send that
-            // reached it any other way was stored nowhere.
-            if placed
-                != (self.places_batches() && message.header().operation == Operation::SendMessages)
+            // reached it any other way was stored nowhere. One that follows
+            // another cluster's log holds what the origin's manifests list
+            // and nothing else.
+            let sends = message.header().operation == Operation::SendMessages;
+            let refusal = if placed != (self.places_batches() && sends)
                 || (placed && !self.is_placed_request(&message))
             {
+                Some("send does not carry what the partition's segments hold")
+            } else if self.peer_log.is_some() && sends {
+                Some("send to a partition that follows another cluster's log")
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
                 Self::send_partition_deny_or_log(
                     consensus,
                     message.header(),
                     IggyError::FeatureUnavailable.as_code(),
-                    "send does not carry what the partition's segments hold",
+                    refusal,
                     reply.take(),
                 )
                 .await;
@@ -13208,8 +13244,9 @@ where
         // A tiered partition's retention is one decision for the local and
         // the remote segments together, which the primary commits as a
         // truncation. A replica that expired segments by itself could drop
-        // one that was never uploaded.
-        if self.is_tiered() {
+        // one that was never uploaded. The origin's manifests alone trim the
+        // log of a partition that follows another cluster's.
+        if self.is_tiered() || self.peer_log.is_some() {
             return SegmentRemoval::default();
         }
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
@@ -13279,6 +13316,10 @@ where
     /// return an empty result. Only an idle partition without a dispatcher removes
     /// files inline and returns their counts.
     pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
+        // Its segments leave when a manifest of the origin trims them.
+        if self.peer_log.is_some() {
+            return SegmentRemoval::default();
+        }
         self.maintenance.retention = Some(
             self.maintenance
                 .retention
@@ -13501,7 +13542,12 @@ where
     }
 
     /// A request already under way keeps its progress and its retry delay.
+    /// A partition that follows another cluster's log keeps no chain, so it
+    /// never starts one.
     fn request_tiering(&mut self, prefix: iggy_object_store::ObjectPrefix) {
+        if self.peer_log.is_some() {
+            return;
+        }
         if self
             .maintenance
             .tiering
@@ -16138,7 +16184,7 @@ pub struct LocalEnvelope {
 
 /// Counter shortfalls from removing one segment, reported with its offset range.
 #[derive(Debug, Default, Clone, Copy)]
-struct CleanupShortfall {
+pub struct CleanupShortfall {
     size_bytes: u64,
     segments: u32,
     messages: u64,
@@ -16147,7 +16193,7 @@ struct CleanupShortfall {
 impl CleanupShortfall {
     /// Report one removed segment's shortfall and offset range. Silent when the
     /// counters covered its rollback.
-    fn report(self, namespace: IggyNamespace, removed_offsets: Option<(u64, u64)>) {
+    pub fn report(self, namespace: IggyNamespace, removed_offsets: Option<(u64, u64)>) {
         if self.size_bytes == 0 && self.segments == 0 && self.messages == 0 {
             return;
         }
@@ -16174,7 +16220,10 @@ impl CleanupShortfall {
 /// likeliest source of a clamped rollback: a partition on its way out keeps
 /// serving cleanup passes after the delete already settled its counters into
 /// the parents.
-fn settle_cleaned_segment(stats: &PartitionStats, segment: &Segment) -> (u64, CleanupShortfall) {
+pub fn settle_cleaned_segment(
+    stats: &PartitionStats,
+    segment: &Segment,
+) -> (u64, CleanupShortfall) {
     // The removal loop only reaches sealed segments, which always hold at least
     // one message, so the count is inclusive start..=end. A one-message sealed
     // segment has `start_offset == end_offset`, so the `+ 1` is required (a

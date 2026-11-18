@@ -3284,3 +3284,145 @@ async fn empty_read_before_the_retained_offsets_moves_to_the_first_one() {
     assert!(fragments.is_empty());
     assert_eq!(next_offset, Some(2));
 }
+
+/// The origin's partition incarnation that a follower reads.
+const ORIGIN_PREFIX: iggy_object_store::ObjectPrefix = iggy_object_store::ObjectPrefix {
+    stream_id: 3,
+    topic_id: 1,
+    partition_id: 0,
+    created_revision: 12,
+};
+
+/// A manifest of [`ORIGIN_PREFIX`] that lists `segments`, by first and last
+/// offset, above `trim_point`.
+fn origin_manifest(
+    trim_point: Option<u64>,
+    segments: &[(u64, u64)],
+) -> iggy_object_store::PartitionManifest {
+    let segments: Vec<_> = segments
+        .iter()
+        .map(
+            |&(start_offset, end_offset)| iggy_object_store::ManifestSegment {
+                start_offset,
+                end_offset,
+                start_timestamp: start_offset,
+                end_timestamp: end_offset,
+                max_timestamp: end_offset,
+                size: (end_offset - start_offset + 1) * 64,
+                crc32c: 0,
+                hash: [0; iggy_object_store::SEGMENT_HASH_LEN],
+            },
+        )
+        .collect();
+    iggy_object_store::PartitionManifest {
+        prefix: ORIGIN_PREFIX,
+        published_at: 1,
+        floor: segments
+            .last()
+            .map(|segment| segment.end_offset)
+            .or(trim_point),
+        trim_point,
+        segments,
+    }
+}
+
+/// Put in place of the fixture's partition one that follows another
+/// cluster's log of two segments, read from a store that holds none of
+/// their objects.
+fn follow_a_peer(owner: &TestShard, directory: &std::path::Path) {
+    let partitions = owner.plane.partitions();
+    drop(partitions.remove(&namespace()));
+    let consensus = consensus::VsrConsensus::new(
+        1,
+        0,
+        3,
+        namespace().inner(),
+        owner.bus.clone(),
+        consensus::LocalPipeline::new(),
+    );
+    consensus.init();
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(iggy_common::PartitionStats::default()),
+        consensus,
+        IggyByteSize::from(1 << 20),
+    );
+    partition.set_created_revision(CREATED_REVISION);
+    partition.set_partition_dir(directory.to_string_lossy().into_owned());
+    partition.follow_peer_log("dc-a", ORIGIN_PREFIX).unwrap();
+    partition
+        .apply_peer_manifest(&origin_manifest(None, &[(0, 1), (2, 3)]))
+        .unwrap();
+    partitions.set_peer_remote_segments(vec![(
+        "dc-a".to_owned(),
+        Rc::new(partitions::RemoteSegments::new(
+            Rc::new(iggy_object_store::MemoryStore::new()),
+            iggy_object_store::KeyLayout::new("dc-a").unwrap(),
+        )),
+    )]);
+    partitions.insert(namespace(), partition);
+}
+
+/// A parked poll of the follower whose read of the store failed: the read
+/// that its spawned task makes.
+async fn parked_failed_read(owner: &TestShard) -> (Receiver<PartitionReadReply>, PollReadResult) {
+    let request = request(owner, 4, false, false);
+    let (consumer, args) = (request.consumer, request.args.clone());
+    let replies = submit(owner, request).await;
+    assert_eq!(
+        owner.bus.spawned_tasks.borrow().len(),
+        1,
+        "a read of the store"
+    );
+    owner.bus.spawned_tasks.borrow_mut().clear();
+    let failed = owner
+        .plane
+        .partitions()
+        .build_poll_snapshot(&namespace(), consumer, &args)
+        .unwrap()
+        .execute()
+        .await;
+    assert_eq!(
+        failed.tiered_read_failure(),
+        Some(IggyError::TieredReadFailed)
+    );
+    (replies, failed)
+}
+
+#[compio::test]
+async fn given_a_parked_read_of_a_peer_log_when_a_trim_drops_its_segment_should_ask_for_a_retry() {
+    let owner = owner(&["seed"]).await;
+    let directory = tempfile::tempdir().unwrap();
+    follow_a_peer(&owner, directory.path());
+    let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
+
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .apply_peer_manifest(&origin_manifest(Some(1), &[(2, 3)]))
+        .unwrap();
+    owner.on_deferred_poll_completed(1, failed).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+}
+
+#[compio::test]
+async fn given_a_parked_read_of_a_peer_log_that_failed_without_a_trim_should_report_the_failure() {
+    let owner = owner(&["seed"]).await;
+    let directory = tempfile::tempdir().unwrap();
+    follow_a_peer(&owner, directory.path());
+    let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
+
+    owner.on_deferred_poll_completed(1, failed).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(IggyError::TieredReadFailed))
+    ));
+}

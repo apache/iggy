@@ -126,6 +126,9 @@ where
     /// Where the partitions here read their remote segments from. `None` on a
     /// shard without an object store.
     remote_segments: RefCell<Option<Rc<crate::RemoteSegments>>>,
+    /// Where the partitions that follow another cluster's log read it from,
+    /// by the peer's origin name.
+    peer_remote_segments: RefCell<Vec<(String, Rc<crate::RemoteSegments>)>>,
     repair_memory: Option<Arc<crate::RepairMemoryBudget>>,
     loopback_ready: Rc<LoopbackReady>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
@@ -174,6 +177,7 @@ where
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             remote_segments: RefCell::new(None),
+            peer_remote_segments: RefCell::default(),
             repair_memory: None,
             loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
@@ -198,6 +202,7 @@ where
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             remote_segments: RefCell::new(None),
+            peer_remote_segments: RefCell::default(),
             repair_memory: None,
             loopback_ready: Rc::default(),
             #[cfg(debug_assertions)]
@@ -275,6 +280,14 @@ where
         *self.remote_segments.borrow_mut() = Some(remote);
     }
 
+    /// Give the partitions here that follow another cluster's log the store
+    /// of their peer, by origin name, in place of the stores they had. A
+    /// partition here already takes its peer's store the next time the pump
+    /// reaches for it, as [`Self::set_remote_segments`] says.
+    pub fn set_peer_remote_segments(&self, peers: Vec<(String, Rc<crate::RemoteSegments>)>) {
+        *self.peer_remote_segments.borrow_mut() = peers;
+    }
+
     /// [`Self::get_mut_by_ns`] for work that reads the partition's remote
     /// data: a poll, or the rewrite of its placed batches. A partition that
     /// was here before the shard got its store takes the store now.
@@ -285,14 +298,33 @@ where
         &self,
         namespace: &IggyNamespace,
     ) -> Option<&mut IggyPartition<B, SB>> {
-        let remote = self.remote_segments.borrow().clone();
         let partition = self.get_mut_by_ns(namespace)?;
         if !partition.has_remote_segments()
-            && let Some(remote) = remote
+            && let Some(remote) = self.remote_segments_for(partition)
         {
             partition.set_remote_segments(remote);
         }
         Some(partition)
+    }
+
+    /// The store `partition` reads its remote segments from: its peer's, for
+    /// a partition that follows another cluster's log, and the node's own for
+    /// any other. A peer's partition never gets the node's own store, whose
+    /// root holds other objects under the same prefix.
+    fn remote_segments_for(
+        &self,
+        partition: &IggyPartition<B, SB>,
+    ) -> Option<Rc<crate::RemoteSegments>> {
+        partition.peer_log().map_or_else(
+            || self.remote_segments.borrow().clone(),
+            |peer| {
+                self.peer_remote_segments
+                    .borrow()
+                    .iter()
+                    .find(|(origin, _)| origin == peer.origin())
+                    .map(|(_, remote)| Rc::clone(remote))
+            },
+        )
     }
 
     /// The store the partitions here read their remote data from, `None` on
@@ -457,8 +489,8 @@ where
         if let Some(budget) = &self.repair_memory {
             partition.proof_walk_memory = Some(budget.reservation());
         }
-        if let Some(remote) = self.remote_segments.borrow().as_ref() {
-            partition.set_remote_segments(Rc::clone(remote));
+        if let Some(remote) = self.remote_segments_for(&partition) {
+            partition.set_remote_segments(remote);
         }
         self.install_loopback_notifier(namespace, &partition);
         partition.publish_current_offset();
@@ -1190,6 +1222,74 @@ mod tests {
                 .unwrap()
                 .has_remote_segments()
         );
+    }
+
+    /// The origin's partition incarnation that a follower reads.
+    const ORIGIN_PREFIX: iggy_object_store::ObjectPrefix = iggy_object_store::ObjectPrefix {
+        stream_id: 3,
+        topic_id: 1,
+        partition_id: 0,
+        created_revision: 12,
+    };
+
+    fn holds(
+        partition: &IggyPartition<IggyMessageBus>,
+        remote: &Rc<crate::RemoteSegments>,
+    ) -> bool {
+        partition
+            .remote_segments()
+            .is_some_and(|held| Rc::ptr_eq(held, remote))
+    }
+
+    #[test]
+    fn given_a_partition_that_follows_a_peer_when_inserted_and_polled_should_read_only_its_peers_store()
+     {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let partitions = partitions();
+        let own = remote_segments();
+        partitions.set_remote_segments(Rc::clone(&own));
+        let mut follower = build_partition();
+        follower.follow_peer_log("dc-b", ORIGIN_PREFIX).unwrap();
+
+        partitions.insert(namespace, follower);
+
+        assert!(
+            !partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .has_remote_segments(),
+            "the node's own store holds other objects under the same keys"
+        );
+
+        let (dc_b, dc_c) = (remote_segments(), remote_segments());
+        partitions.set_peer_remote_segments(vec![
+            ("dc-c".to_owned(), Rc::clone(&dc_c)),
+            ("dc-b".to_owned(), Rc::clone(&dc_b)),
+        ]);
+        let plan = partitions.build_poll_snapshot(
+            &namespace,
+            PollingConsumer::Consumer(7, 0),
+            &PollingArgs::new(PollingStrategy::next(), 1, false),
+        );
+
+        assert!(plan.is_some());
+        let follower = partitions.get_by_ns(&namespace).unwrap();
+        assert!(holds(follower, &dc_b));
+        assert!(!holds(follower, &dc_c) && !holds(follower, &own));
+    }
+
+    #[test]
+    fn given_peer_stores_when_a_partition_of_this_cluster_is_inserted_should_hand_it_the_nodes_store()
+     {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let partitions = partitions();
+        let own = remote_segments();
+        partitions.set_remote_segments(Rc::clone(&own));
+        partitions.set_peer_remote_segments(vec![("dc-b".to_owned(), remote_segments())]);
+
+        partitions.insert(namespace, build_partition());
+
+        assert!(holds(partitions.get_by_ns(&namespace).unwrap(), &own));
     }
 
     fn build_partition() -> IggyPartition<IggyMessageBus> {
