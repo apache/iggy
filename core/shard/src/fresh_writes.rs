@@ -708,7 +708,7 @@ where
         // A consumer at the tail polls these batches next, and this shard
         // holds their messages already.
         if stored && let Some(remote) = self.plane.partitions().remote_segments() {
-            remote.cache_fresh_object(object.id.get(), object.bytes.clone());
+            remote.cache_fresh_object(object.id.get(), object.bytes);
         }
         for namespace in object.partitions {
             self.feed_staged_sends(namespace).await;

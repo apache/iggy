@@ -42,6 +42,7 @@ use server_common::send_messages::decode_prepare_batch_trusted;
 use crate::RemoteSegments;
 use crate::journal::MessageLookup;
 use crate::poll_plan::{DiskFault, PartitionDirResolution};
+use crate::remote_segments::FreshReads;
 
 const PREPARE_HEADER_SIZE: usize = size_of::<PrepareHeader>();
 
@@ -97,45 +98,44 @@ impl PlacedReadPlan {
                 wanted.take(PlacedBatch::new(batch.header, placement), &mut placed);
             }
         }
-        self.fetch_blobs(&placed).await?;
+        let same_object = |one: &PlacedBatch, other: &PlacedBatch| {
+            one.placement.object_id == other.placement.object_id
+        };
         let mut batches = Vec::with_capacity(placed.len());
-        for placed in &placed {
-            batches.push(self.assemble(placed).await?);
+        for run in placed.chunk_by(same_object) {
+            let fetched = self.fetch_blobs(run).await?;
+            for placed in run {
+                batches.push(self.assemble(placed, &fetched).await?);
+            }
         }
         Ok(batches)
     }
 
-    /// Fetch the blobs of `placed` object by object, so the batches that
-    /// follow each other in one fresh object cost one read of the store and
-    /// not one each. A batch alone in its object is left to
-    /// [`Self::assemble`], which reads it the same way.
-    async fn fetch_blobs(&self, placed: &[PlacedBatch]) -> Result<(), DiskFault> {
-        let Some(remote) = self.remote.as_deref() else {
-            return Ok(());
+    /// Fetch the blobs of `run`, batches of one fresh object, so the batches
+    /// that follow each other in it cost one read of the store and not one
+    /// each. A batch alone in its object is left to [`Self::assemble`], which
+    /// reads it the same way.
+    async fn fetch_blobs(&self, run: &[PlacedBatch]) -> Result<FreshReads, DiskFault> {
+        let (Some(remote), [first, _, ..]) = (self.remote.as_deref(), run) else {
+            return Ok(FreshReads::default());
         };
-        let same_object = |one: &PlacedBatch, other: &PlacedBatch| {
-            one.placement.object_id == other.placement.object_id
-        };
-        for run in placed.chunk_by(same_object).filter(|run| run.len() > 1) {
-            let blobs: Vec<_> = run
-                .iter()
-                .filter_map(|placed| {
-                    let placement = placed.placement;
-                    let end = placement.position.checked_add(placement.length)?;
-                    Some(placement.position..end)
-                })
-                .collect();
-            let fetch = remote.fetch_fresh(run[0].placement.object_id, &blobs);
-            let now = Instant::now();
-            match self.deadline {
-                None => fetch.await,
-                Some(deadline) if deadline <= now => Err(DiskFault::Retryable),
-                Some(deadline) => compio::time::timeout(deadline - now, fetch)
-                    .await
-                    .unwrap_or(Err(DiskFault::Retryable)),
-            }?;
+        let blobs: Vec<_> = run
+            .iter()
+            .filter_map(|placed| {
+                let placement = placed.placement;
+                let end = placement.position.checked_add(placement.length)?;
+                Some(placement.position..end)
+            })
+            .collect();
+        let fetch = remote.fetch_fresh(first.placement.object_id, &blobs);
+        let now = Instant::now();
+        match self.deadline {
+            None => fetch.await,
+            Some(deadline) if deadline <= now => Err(DiskFault::Retryable),
+            Some(deadline) => compio::time::timeout(deadline - now, fetch)
+                .await
+                .unwrap_or(Err(DiskFault::Retryable)),
         }
-        Ok(())
     }
 
     async fn collect_from_segments(
@@ -171,8 +171,13 @@ impl PlacedReadPlan {
     }
 
     /// The whole batch of `placed`: its header with the batch checksum it
-    /// has over its messages, and the messages its placement names.
-    async fn assemble(&self, placed: &PlacedBatch) -> Result<Frozen<4096>, DiskFault> {
+    /// has over its messages, and the messages its placement names, out of
+    /// `fetched` when they are there.
+    async fn assemble(
+        &self,
+        placed: &PlacedBatch,
+        fetched: &FreshReads,
+    ) -> Result<Frozen<4096>, DiskFault> {
         // A shard that has not connected its store yet cannot read the
         // messages now, and can once it has.
         let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
@@ -181,15 +186,20 @@ impl PlacedReadPlan {
             .position
             .checked_add(placement.length)
             .ok_or(DiskFault::Unreadable)?;
-        let fetch = remote.read_fresh(placement.object_id, placement.position..end);
-        let now = Instant::now();
-        let blob = match self.deadline {
-            None => fetch.await,
-            Some(deadline) if deadline <= now => return Err(DiskFault::Retryable),
-            Some(deadline) => compio::time::timeout(deadline - now, fetch)
-                .await
-                .unwrap_or(Err(DiskFault::Retryable)),
-        }?;
+        let range = placement.position..end;
+        let blob = if let Some(blob) = fetched.get(placement.object_id, &range) {
+            blob
+        } else {
+            let fetch = remote.read_fresh(placement.object_id, range);
+            let now = Instant::now();
+            match self.deadline {
+                None => fetch.await,
+                Some(deadline) if deadline <= now => return Err(DiskFault::Retryable),
+                Some(deadline) => compio::time::timeout(deadline - now, fetch)
+                    .await
+                    .unwrap_or(Err(DiskFault::Retryable)),
+            }?
+        };
         if !placement.matches(&blob) {
             return Err(DiskFault::Tiered);
         }
