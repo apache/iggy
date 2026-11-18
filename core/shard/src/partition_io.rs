@@ -623,6 +623,7 @@ where
                 tracing::error!(namespace_raw = token.identity.namespace.inner(), %error, "partition I/O acceptance failed");
             }
             self.stage_wanted_upload(token.identity.namespace, partition);
+            self.stage_long_term_change(token.identity.namespace, partition);
             if matches!(
                 token.identity.continuation,
                 partitions::PartitionIoContinuation::Retention
@@ -667,6 +668,7 @@ where
         };
         let step = partition.resume_io(partitions.config()).await;
         self.stage_wanted_upload(namespace, partition);
+        self.stage_long_term_change(namespace, partition);
         if let Some(token) = self.partition_io.retained(namespace, incarnation)
             && !partition.retains_io_reservation(token.identity)
         {
@@ -674,10 +676,11 @@ where
         }
         match step {
             partitions::PartitionIoStep::WireActions(actions) => {
-                crate::dispatch_partition_wire_actions::<B, _, MJ, _>(
+                crate::dispatch_partition_wire_actions_batched::<B, _, MJ, _>(
                     partition.consensus(),
                     partition,
                     actions,
+                    Some(&self.commit_outbox),
                 )
                 .await;
                 self.partition_io.continue_ready(namespace, incarnation);
@@ -803,9 +806,9 @@ mod tests {
     use std::time::Duration;
 
     use consensus::{
-        ArtifactProgress, Consensus, DvcSuffix, LocalPipeline, PartitionsHandle, Pipeline, Plane,
-        REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer, StateArtifact, StateTransferStage,
-        TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
+        ArtifactProgress, Consensus, DvcSuffix, HeartbeatSchedule, LocalPipeline, PartitionsHandle,
+        Pipeline, Plane, PlaneKind, REPLICATION_BATCH_BYTES_MAX, ReplicationSend, Sequencer,
+        StateArtifact, StateTransferStage, TimeoutManager, VsrAction, VsrConsensus, artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -816,21 +819,21 @@ mod tests {
     use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
     use iggy_binary_protocol::{
-        AckLevel, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-        Operation, PrepareHeader, PrepareOkHeader, RepairRangeReplyHeader, ReplyHeader,
-        RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-        RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-        StateChunkHeader, StateTransferTargetHeader, WireEncode, WireIdentifier, WireName,
-        WireOptions,
+        AckLevel, Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader,
+        ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, HeartbeatState, Operation,
+        PrepareHeader, PrepareOkHeader, RepairRangeReplyHeader, ReplyHeader, RequestPreparesHeader,
+        RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+        RoutedRequestHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+        StateTransferTargetHeader, WireEncode, WireIdentifier, WireName, WireOptions,
     };
     use iggy_common::{
-        ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
-        IggyTimestamp, PartitionStats, TopicRuntimeOptions, variadic,
+        ConsumerKind, Durability, IggyByteSize, IggyTimestamp, PartitionStats, TopicRuntimeOptions,
+        variadic,
     };
     use journal::Journal;
     use journal::prepare_journal::PrepareJournal;
     use journal::superblock::{SuperblockContents, SuperblockStore};
-    use message_bus::{IggyMessageBus, MessageBus};
+    use message_bus::{IggyMessageBus, MessageBus, SendError};
     use metadata::stm::stream::{Partition, Stream, Streams, StreamsInner, Topic};
     use metadata::stm::user::{Users, UsersInner};
     use metadata::{IggyMetadata, MuxStateMachine};
@@ -839,8 +842,9 @@ mod tests {
         StagedSegmentMeta, TransferArtifact,
     };
     use partitions::{
-        IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionPathLayout,
-        PartitionsConfig, REPAIR_MAX_STALL_RETRIES, RepairConclusion, RepairSession, Segment,
+        ConsumerGroupOffsets, ConsumerOffsets, IggyIndexWriter, IggyPartition, IggyPartitions,
+        MessagesWriter, PartitionPathLayout, PartitionsConfig, REPAIR_MAX_STALL_RETRIES,
+        RepairConclusion, RepairSession, Segment,
     };
     use prometheus_client::registry::Registry;
     use server_common::iobuf::Owned;
@@ -850,14 +854,16 @@ mod tests {
     use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
     use server_common::{Message, MessageBag, SegmentStorage};
 
+    use crate::commit_batch::{QueuedCommit, encode_commit_batch};
     use crate::host::NoopHost;
-    use crate::metrics::ShardMetrics;
+    use crate::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
     use crate::shards_table::{PapayaShardsTable, ShardsTable};
-    use crate::test_support::connect_replica_on;
+    use crate::test_support::{advance_and_tick, connect_replica_on};
     use crate::{
-        IggyShard, LifecycleFrame, PARTITION_REPAIRS_INFLIGHT_MAX, PartitionConsensusConfig,
-        REPAIR_GAP_DEBOUNCE_TICKS_MIN, Receiver, ReconcileOp, ReplicaTopology, ShardFrame,
-        ShardIdentity, TaggedSender, channel, shard_channel,
+        IggyShard, LifecycleFrame, PARTITION_REPAIRS_INFLIGHT_MAX,
+        PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX, PARTITION_VIEW_CHANGES_INFLIGHT_MAX,
+        PartitionConsensusConfig, REPAIR_GAP_DEBOUNCE_TICKS_MIN, Receiver, ReconcileOp,
+        ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
     };
 
     const SEGMENT_BYTES: u64 = 1024 * 1024;
@@ -883,34 +889,30 @@ mod tests {
                 let mut partition =
                     repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
                 partition.set_created_revision(INCARNATION);
-                partition.repair = None;
+                partition.set_repair(None);
                 partitions.insert(namespace, partition);
                 let message = if command == Command::Commit {
                     MessageBag::Commit(
-                        Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-                            |_, header: &mut CommitHeader| {
-                                header.command = Command::Commit;
-                                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-                                header.cluster = 1;
-                                header.group = namespace.inner();
-                                header.replica = REPAIR_PRIMARY;
-                                header.view = REPAIR_VIEW;
-                                header.commit = NEXT_COMMIT;
-                                header.seal();
-                            },
-                        ),
+                        encode_commit_batch(
+                            1,
+                            REPAIR_PRIMARY,
+                            &[CommitEntry::new(
+                                namespace.inner(),
+                                incoming,
+                                REPAIR_VIEW,
+                                NEXT_COMMIT,
+                                0,
+                                HeartbeatState::Busy,
+                                REPAIR_PRIMARY,
+                            )],
+                        )
+                        .unwrap(),
                     )
                 } else {
                     view_control_message(namespace, command, REPAIR_VIEW + 3, REPAIR_PRIMARY)
                 };
                 let message = match message {
-                    MessageBag::Commit(message) => MessageBag::Commit(message.transmute_header(
-                        |old, header: &mut CommitHeader| {
-                            *header = old;
-                            header.partition_incarnation = incoming;
-                            header.seal();
-                        },
-                    )),
+                    MessageBag::Commit(message) => MessageBag::Commit(message),
                     MessageBag::StartViewChange(message) => MessageBag::StartViewChange(
                         message.transmute_header(|old, header: &mut StartViewChangeHeader| {
                             *header = old;
@@ -1012,6 +1014,7 @@ mod tests {
                     commit: 0,
                     group,
                     timestamp_monotonic: 1,
+                    heartbeat_state: HeartbeatState::Busy,
                     target: None,
                 },
             ];
@@ -1247,10 +1250,11 @@ mod tests {
         let bus = Rc::new(IggyMessageBus::new(0));
         let targets = record_transfer_targets(&bus);
         connect_replica_on(&bus, TRANSFER_REQUESTER, 1);
-        let (mut owner, _sender) = test_owner_with_repair_memory(
+        let (mut owner, _sender) = test_owner_with_repair_budgets(
             &bus,
             None,
             Some(Arc::new(partitions::RepairMemoryBudget::new(BUDGET))),
+            None,
         );
         owner.partition_consensus.replica_count = TRANSFER_REQUESTER + 1;
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -1289,7 +1293,9 @@ mod tests {
                 "snapshot tail lost op {op}"
             );
         }
-        owner.ticks.set(9);
+        for _ in 0..9 {
+            partitions.tick_clock().advance();
+        }
         let repair = Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
             .transmute_header(|_, header: &mut RequestPreparesHeader| {
                 header.command = Command::RequestPrepares;
@@ -1707,7 +1713,7 @@ mod tests {
                 let mut partition =
                     repairing_replica(&bus, namespace, (REPAIR_PRIMARY, 3), REQUESTER, 0, 0);
                 partition.set_created_revision(INCARNATION);
-                partition.repair = None;
+                partition.set_repair(None);
                 partitions.insert(namespace, partition);
                 macro_rules! request {
                     ($header:ty, $variant:ident $(, $field:ident = $value:expr)*) => {
@@ -1796,7 +1802,7 @@ mod tests {
                     repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
                 partition.set_created_revision(INCARNATION);
                 if matches!(command, Command::StateTransferTarget | Command::StateChunk) {
-                    partition.repair = None;
+                    partition.set_repair(None);
                     partition
                         .consensus()
                         .set_state_transfer_stage(StateTransferStage::AwaitingTarget);
@@ -1805,7 +1811,7 @@ mod tests {
                             .consensus()
                             .set_state_transfer_stage(StateTransferStage::Fetching);
                     }
-                    partition.transfer = Some(PartitionTransferSession {
+                    partition.set_transfer(Some(PartitionTransferSession {
                         nonce: NONCE,
                         peer: REPAIR_PRIMARY,
                         commit_op: 0,
@@ -1823,7 +1829,8 @@ mod tests {
                         scan: None,
                         seed: None,
                         pulled_len: 0,
-                    });
+                        slot: partitions.transfer_slot(),
+                    }));
                 }
                 partitions.insert(namespace, partition);
                 macro_rules! response {
@@ -1873,13 +1880,13 @@ mod tests {
                 let partition = partitions.get_by_ns(&namespace).unwrap();
                 if incoming == INCARNATION {
                     match command {
-                        Command::RepairDone => assert!(partition.repair.is_none()),
+                        Command::RepairDone => assert!(partition.repair().is_none()),
                         Command::RangeEvicted => {
-                            assert_eq!(partition.repair.as_ref().unwrap().floor, Some(1));
+                            assert_eq!(partition.repair().unwrap().floor, Some(1));
                         }
-                        Command::StateTransferTarget => assert!(partition.transfer.is_none()),
+                        Command::StateTransferTarget => assert!(partition.transfer().is_none()),
                         Command::StateChunk => assert_eq!(
-                            partition.transfer.as_ref().unwrap().artifacts[0]
+                            partition.transfer().unwrap().artifacts[0]
                                 .pending()
                                 .unwrap()
                                 .buf,
@@ -1896,9 +1903,9 @@ mod tests {
                         "foreign {command:?} sent a follow-up"
                     );
                     if matches!(command, Command::RepairDone | Command::RangeEvicted) {
-                        assert_eq!(partition.repair.as_ref().unwrap().floor, None);
+                        assert_eq!(partition.repair().unwrap().floor, None);
                     } else {
-                        let transfer = partition.transfer.as_ref().unwrap();
+                        let transfer = partition.transfer().unwrap();
                         assert_eq!(transfer.idle_ticks, IDLE_TICKS);
                         assert_eq!(transfer.artifacts[0].pending().unwrap().buf, [] as [u8; 0]);
                     }
@@ -1910,7 +1917,9 @@ mod tests {
     fn control_frame_incarnation(frame: &[u8]) -> u64 {
         let message = Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame)).unwrap();
         let offset = match message.header().command {
-            Command::Commit => std::mem::offset_of!(CommitHeader, partition_incarnation),
+            Command::Commit => {
+                HEADER_SIZE + std::mem::offset_of!(CommitEntry, partition_incarnation)
+            }
             Command::StartViewChange => {
                 std::mem::offset_of!(StartViewChangeHeader, partition_incarnation)
             }
@@ -2051,8 +2060,8 @@ mod tests {
         }
         partition.configure_consumer_offset_storage(
             dirs,
-            ConsumerOffsets::with_capacity(1),
-            ConsumerGroupOffsets::with_capacity(1),
+            ConsumerOffsets::new(),
+            ConsumerGroupOffsets::new(),
         );
         partition.stats.increment_messages_count(1);
         partition.set_runtime_options(TopicRuntimeOptions {
@@ -2262,8 +2271,8 @@ mod tests {
             }
             partition.configure_consumer_offset_storage(
                 dirs,
-                ConsumerOffsets::with_capacity(1),
-                ConsumerGroupOffsets::with_capacity(1),
+                ConsumerOffsets::new(),
+                ConsumerGroupOffsets::new(),
             );
             partition.stats.increment_messages_count(1);
             store_request(namespace, AckLevel::NoAck)
@@ -2927,13 +2936,13 @@ mod tests {
                 } else {
                     partition.begin_shutdown_io();
                 }
-                assert!(!owner.arm_partition_transfer(partition, 0, 0).await);
-                assert!(partition.transfer.is_none());
+                owner.arm_partition_transfer(partition, 0).await;
+                assert!(partition.transfer().is_none());
                 assert!(partition.transfer_rearm.is_none());
                 partition
                     .consensus()
                     .set_state_transfer_stage(StateTransferStage::Fetching);
-                partition.transfer = Some(PartitionTransferSession {
+                partition.set_transfer(Some(PartitionTransferSession {
                     nonce: NONCE,
                     peer: 0,
                     commit_op: offer.commit_op,
@@ -2947,7 +2956,8 @@ mod tests {
                     scan: None,
                     seed: None,
                     pulled_len: 0,
-                });
+                    slot: partitions.transfer_slot(),
+                }));
 
                 owner
                     .on_partition_transfer_progress(namespace.inner())
@@ -2958,7 +2968,7 @@ mod tests {
                     partition.consensus().state_transfer_stage(),
                     StateTransferStage::Fetching
                 );
-                let transfer = partition.transfer.as_ref().unwrap();
+                let transfer = partition.transfer().unwrap();
                 assert_eq!(transfer.nonce, NONCE);
                 assert_eq!(transfer.artifacts[0].pending().unwrap().buf, *bytes);
                 assert!(
@@ -3045,7 +3055,7 @@ mod tests {
                     .unwrap();
                 let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
                 owner.partition_io.dispatch(slot, captured, &captured_bus);
-                partition.repair = Some(RepairSession {
+                partition.set_repair(Some(RepairSession {
                     nonce: 1,
                     view: 1,
                     from_op: 1,
@@ -3056,7 +3066,7 @@ mod tests {
                     idle_ticks: 0,
                     floor_pulled_from: 0,
                     requested_from: Some(1),
-                });
+                }));
                 let reply =
                     Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
                         .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
@@ -3119,7 +3129,7 @@ mod tests {
         owner.partition_io.dispatch(slot, captured, &captured_bus);
         let partitions = owner.plane.partitions();
         let partition = partitions.get_mut_by_ns(&namespace).unwrap();
-        partition.repair = Some(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: 1,
             view: partition.consensus().view(),
             from_op: 1,
@@ -3130,12 +3140,12 @@ mod tests {
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(1),
-        });
+        }));
         assert_eq!(
             partition.complete_repair(partitions.config()).await,
             RepairConclusion::InProgress
         );
-        assert!(partition.repair.is_some());
+        assert!(partition.repair().is_some());
         let task = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
         task.await;
         assert_eq!(
@@ -3150,7 +3160,7 @@ mod tests {
             partition.complete_repair(partitions.config()).await,
             RepairConclusion::Done
         );
-        assert!(partition.repair.is_none());
+        assert!(partition.repair().is_none());
         assert_eq!(partition.consensus().commit_min(), 0);
         assert_eq!(owner.partition_io.charged.get(), 0);
     }
@@ -3768,7 +3778,7 @@ mod tests {
                 peer: 0,
                 after_ticks: u32::from(repair_finished),
             });
-            partition.repair = repair_finished.then_some(partitions::RepairSession {
+            partition.set_repair(repair_finished.then_some(partitions::RepairSession {
                 nonce: 1,
                 view: 0,
                 from_op: 1,
@@ -3779,14 +3789,14 @@ mod tests {
                 floor_pulled_from: 0,
                 idle_ticks: 0,
                 requested_from: Some(1),
-            });
+            }));
             owner.plane.partitions().insert(namespace, partition);
 
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
 
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             assert_eq!(partition.consensus().is_transferring(), commit_max > 0);
-            assert_eq!(partition.transfer.is_some(), commit_max > 0);
+            assert_eq!(partition.transfer().is_some(), commit_max > 0);
             assert!(partition.transfer_rearm.is_none());
         }
     }
@@ -3809,7 +3819,7 @@ mod tests {
         for _ in 0..=REPAIR_MAX_STALL_RETRIES {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
-            peers.push(partition.repair.map(|session| session.peer));
+            peers.push(partition.repair().map(|session| session.peer));
         }
 
         let mut expected = vec![Some(REPAIR_PRIMARY); REPAIR_MAX_STALL_RETRIES as usize];
@@ -3877,7 +3887,7 @@ mod tests {
             let partition = partitions.get_by_ns(&namespace).unwrap();
             assert_eq!(partition.consensus().commit_min(), 0);
             assert_eq!(
-                partition.repair.map(|session| session.peer),
+                partition.repair().map(|session| session.peer),
                 Some(REPAIR_PRIMARY),
                 "round {round} rotated a served session away while its own walk was paused"
             );
@@ -3916,10 +3926,7 @@ mod tests {
         let mut served = Message::<PrepareHeader>::new(frozen.len());
         served.as_mut_slice().copy_from_slice(frozen.as_slice());
         let mut backup = repairing_backup(&bus, namespace, 0, 0);
-        backup.repair = Some(RepairSession {
-            fetch_to_op: FETCH_TO_OP,
-            ..backup.repair.unwrap()
-        });
+        backup.repair_mut().unwrap().fetch_to_op = FETCH_TO_OP;
         backup.on_replicate(served).await;
         assert!(backup.log.journal().inner.holds_op(1));
         assert_eq!(backup.consensus().commit_max(), 0);
@@ -3929,7 +3936,7 @@ mod tests {
         for _ in 0..=REPAIR_MAX_STALL_RETRIES {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let partition = partitions.get_by_ns(&namespace).unwrap();
-            peers.push(partition.repair.map(|session| session.peer));
+            peers.push(partition.repair().map(|session| session.peer));
         }
 
         let budget = REPAIR_MAX_STALL_RETRIES as usize;
@@ -4204,7 +4211,7 @@ mod tests {
         partitions.remove(&namespace).unwrap();
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition.set_created_revision(INCARNATION);
         partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
         partition
@@ -4213,7 +4220,7 @@ mod tests {
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::Fetching);
-        partition.transfer = Some(PartitionTransferSession {
+        partition.set_transfer(Some(PartitionTransferSession {
             nonce: NONCE,
             peer: REPAIR_PRIMARY,
             commit_op: 0,
@@ -4236,7 +4243,8 @@ mod tests {
                 read: LocalWork::default(),
             }),
             pulled_len: 0,
-        });
+            slot: partitions.transfer_slot(),
+        }));
         partitions.insert(namespace, partition);
         let bound = RETRY_TICKS * crate::STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE
             / crate::LOCAL_WORK_WAIT_DIVISOR;
@@ -4251,8 +4259,7 @@ mod tests {
             let Some(PrefixSeed::Reading { read, .. }) = &partitions
                 .get_by_ns(&namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
                 .seed
             else {
@@ -4316,8 +4323,7 @@ mod tests {
         let session = partitions
             .get_by_ns(&namespace)
             .unwrap()
-            .transfer
-            .as_ref()
+            .transfer()
             .unwrap();
         assert!(
             matches!(session.artifacts[0], TransferArtifact::Staged(_)),
@@ -4345,14 +4351,14 @@ mod tests {
         partitions.remove(&namespace).unwrap();
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::AwaitingTarget);
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::Fetching);
-        partition.transfer = Some(PartitionTransferSession {
+        partition.set_transfer(Some(PartitionTransferSession {
             nonce: 1,
             peer: REPAIR_PRIMARY,
             commit_op: 0,
@@ -4372,7 +4378,8 @@ mod tests {
                 },
             }),
             pulled_len: 0,
-        });
+            slot: partitions.transfer_slot(),
+        }));
         partitions.insert(namespace, partition);
         partitions.set_io_notifier(
             owner.partition_io.notifier(),
@@ -4390,8 +4397,7 @@ mod tests {
             partitions
                 .get_by_ns(&namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
                 .seed
                 .is_none(),
@@ -4424,8 +4430,7 @@ mod tests {
             partitions
                 .get_by_ns(&receiver.namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
         };
 
         stall_rounds(&receiver.owner, receiver.namespace, bound as usize).await;
@@ -4509,8 +4514,7 @@ mod tests {
         *partitions
             .get_by_ns(&receiver.namespace)
             .unwrap()
-            .transfer
-            .as_ref()
+            .transfer()
             .unwrap()
             .scan
             .as_ref()
@@ -4540,8 +4544,7 @@ mod tests {
             partitions
                 .get_by_ns(&receiver.namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
                 .artifacts[0],
             TransferArtifact::Staged(_)
@@ -4560,8 +4563,7 @@ mod tests {
             partitions
                 .get_by_ns(&receiver.namespace)
                 .unwrap()
-                .transfer
-                .as_ref()
+                .transfer()
                 .unwrap()
         };
 
@@ -4625,10 +4627,9 @@ mod tests {
         type Setup = fn(&mut IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>);
         let cases: [(&str, u64, Setup); 4] = [
             ("an uncommitted suffix", LAGGING_COMMIT_MIN, |partition| {
-                partition.repair = partition.repair.map(|session| RepairSession {
-                    fetch_to_op: session.commit_to_op + SUFFIX_OPS,
-                    ..session
-                });
+                if let Some(session) = partition.repair_mut() {
+                    session.fetch_to_op = session.commit_to_op + SUFFIX_OPS;
+                }
             }),
             ("a scheduled re-arm", LAGGING_COMMIT_MAX, |partition| {
                 partition.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
@@ -4640,7 +4641,7 @@ mod tests {
                 partition.consensus().begin_state_transfer_await();
             }),
             ("a transfer session", LAGGING_COMMIT_MAX, |partition| {
-                partition.transfer = Some(PartitionTransferSession {
+                partition.set_transfer(Some(PartitionTransferSession {
                     nonce: TRANSFER_NONCE,
                     peer: REPAIR_PRIMARY,
                     commit_op: 0,
@@ -4651,12 +4652,13 @@ mod tests {
                     scan: None,
                     seed: None,
                     pulled_len: 0,
-                });
+                    slot: partitions::state_transfer::TransferSlot::new(&Rc::default()),
+                }));
             }),
         ];
         let transfer_state = |partition: &IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>| {
             (
-                partition.transfer.as_ref().map(|session| session.nonce),
+                partition.transfer().map(|session| session.nonce),
                 partition.consensus().state_transfer_stage(),
                 partition.transfer_rearm.is_some(),
             )
@@ -4730,9 +4732,9 @@ mod tests {
         let recovery = |namespace: &IggyNamespace| {
             let partition = partitions.get_by_ns(namespace).unwrap();
             (
-                partition.transfer.as_ref().map(|session| session.peer),
+                partition.transfer().map(|session| session.peer),
                 partition.transfer_rearm.is_some(),
-                partition.repair.map(|session| session.peer),
+                partition.repair().map(|session| session.peer),
                 partition.consensus().state_transfer_stage(),
             )
         };
@@ -4765,6 +4767,79 @@ mod tests {
             (cap, LAGGING_GROUPS - cap, true),
             "(armed, deferred, deferred groups unchanged a round later) per group: {spent:?}"
         );
+    }
+
+    /// Every path that ends a session frees its transfer slot, a partition
+    /// removed during its transfer included. So the count matches a scan of
+    /// the table, and a group deferred at the cap arms once a slot frees.
+    #[compio::test]
+    async fn given_full_transfer_slots_when_sessions_end_should_free_their_slots() {
+        let cap = <IoTestShard>::PARTITION_TRANSFERS_INFLIGHT_MAX;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespaces: Vec<_> = (0..=cap)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        for &namespace in &namespaces {
+            partitions.insert(
+                namespace,
+                repairing_replica(
+                    &bus,
+                    namespace,
+                    (PAIR_BACKUP, 2),
+                    REPAIR_PRIMARY,
+                    LAGGING_COMMIT_MIN,
+                    LAGGING_COMMIT_MAX,
+                ),
+            );
+        }
+        let counted = || {
+            let sessions = namespaces
+                .iter()
+                .filter_map(|namespace| partitions.get_by_ns(namespace))
+                .filter(|partition| partition.transfer().is_some())
+                .count();
+            (partitions.transfers_inflight(), sessions)
+        };
+        for &namespace in &namespaces {
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            partition.consensus().begin_state_transfer_await();
+            owner
+                .arm_partition_transfer(partition, REPAIR_PRIMARY)
+                .await;
+        }
+        let deferred = namespaces[cap];
+        assert!(
+            partitions
+                .get_by_ns(&deferred)
+                .unwrap()
+                .transfer()
+                .is_none()
+        );
+        assert_eq!(counted(), (cap, cap));
+
+        let failed = partitions.get_mut_by_ns(&namespaces[0]).unwrap();
+        owner
+            .abandon_or_rearm_partition_transfer(failed, REPAIR_PRIMARY)
+            .await;
+        assert_eq!(counted(), (cap - 1, cap - 1));
+        assert!(partitions.remove(&namespaces[1]).is_some());
+        assert_eq!(counted(), (cap - 2, cap - 2));
+
+        let partition = partitions.get_mut_by_ns(&deferred).unwrap();
+        partition.consensus().begin_state_transfer_await();
+        owner
+            .arm_partition_transfer(partition, REPAIR_PRIMARY)
+            .await;
+        assert!(
+            partitions
+                .get_by_ns(&deferred)
+                .unwrap()
+                .transfer()
+                .is_some()
+        );
+        assert_eq!(counted(), (cap - 1, cap - 1));
     }
 
     /// A session that the ring drops without a successor leaves the gap to
@@ -4859,7 +4934,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let applied = usize::try_from(APPLIED).unwrap();
         let mut backup = repairing_backup(&bus, namespace, 0, 0);
-        backup.repair = None;
+        backup.set_repair(None);
         for prepare in &prepares[..applied] {
             backup.on_replicate(prepare.clone()).await;
         }
@@ -4869,7 +4944,7 @@ mod tests {
             .await;
         assert_eq!(backup.consensus().commit_min(), APPLIED);
         backup.consensus().advance_commit_max(HEAD);
-        backup.repair = Some(RepairSession {
+        backup.set_repair(Some(RepairSession {
             nonce: NONCE,
             view: REPAIR_VIEW,
             from_op: APPLIED + 1,
@@ -4880,7 +4955,7 @@ mod tests {
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(APPLIED + 1),
-        });
+        }));
         owner.plane.partitions().remove(&namespace).unwrap();
         owner.plane.partitions().insert(namespace, backup);
 
@@ -4906,8 +4981,7 @@ mod tests {
         let transfer_nonce = {
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             partition
-                .transfer
-                .as_ref()
+                .transfer()
                 .expect("the floor the peer evicted past arms a transfer")
                 .nonce
         };
@@ -4928,7 +5002,7 @@ mod tests {
             .await;
         {
             let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
-            assert!(partition.transfer.is_none());
+            assert!(partition.transfer().is_none());
             assert!(partition.transfer_rearm.is_some());
             for prepare in &prepares[applied..] {
                 partition.on_replicate(prepare.clone()).await;
@@ -5091,7 +5165,7 @@ mod tests {
 
         let mut observed = Vec::with_capacity(expected.len());
         for _ in 0..expected.len() {
-            let holds_session = partitions.get_by_ns(&namespace).unwrap().repair.is_some();
+            let holds_session = partitions.get_by_ns(&namespace).unwrap().repair().is_some();
             owner
                 .partition_repairs_inflight
                 .set(OTHER_SESSIONS + usize::from(holds_session));
@@ -5128,7 +5202,7 @@ mod tests {
         let waiting = partitions
             .get_mut_by_ns(&namespaces[PARTITION_REPAIRS_INFLIGHT_MAX])
             .unwrap();
-        waiting.repair = None;
+        waiting.set_repair(None);
         // Past its debounce, so only the ceiling holds it back.
         waiting.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
         // The tally that arming the inserted sessions would have published.
@@ -5138,7 +5212,7 @@ mod tests {
         let session_peers = || {
             namespaces
                 .iter()
-                .filter_map(|namespace| partitions.get_by_ns(namespace).unwrap().repair)
+                .filter_map(|namespace| partitions.get_by_ns(namespace).unwrap().repair().copied())
                 .map(|session| session.peer)
                 .collect::<Vec<_>>()
         };
@@ -5186,7 +5260,7 @@ mod tests {
                     after_ticks: REARM_BACKOFF_TICKS,
                 });
             } else {
-                backup.repair = None;
+                backup.set_repair(None);
                 backup.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
             }
             partitions.insert(namespace, backup);
@@ -5200,7 +5274,7 @@ mod tests {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let live = namespaces
                 .iter()
-                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair.is_some())
+                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair().is_some())
                 .count();
             assert_eq!(
                 owner.partition_repairs_inflight.get(),
@@ -5211,7 +5285,7 @@ mod tests {
                 live <= PARTITION_REPAIRS_INFLIGHT_MAX,
                 "sweep {sweep}: {live}"
             );
-            waiting_armed |= partitions.get_by_ns(&waiting).unwrap().repair.is_some();
+            waiting_armed |= partitions.get_by_ns(&waiting).unwrap().repair().is_some();
         }
         assert!(
             waiting_armed,
@@ -5239,7 +5313,7 @@ mod tests {
                     assert!(!backup.burn_repair_attempt());
                 }
             } else {
-                backup.repair = None;
+                backup.set_repair(None);
                 backup.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
             }
             partitions.insert(namespace, backup);
@@ -5251,7 +5325,7 @@ mod tests {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let live = namespaces
                 .iter()
-                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair.is_some())
+                .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair().is_some())
                 .count();
             assert_eq!(live, PARTITION_REPAIRS_INFLIGHT_MAX, "sweep {sweep}");
             assert_eq!(
@@ -5270,11 +5344,160 @@ mod tests {
                 let peer = partitions
                     .get_by_ns(namespace)
                     .unwrap()
-                    .repair
+                    .repair()
                     .map(|session| session.peer);
                 assert_eq!(peer, expected, "sweep {sweep}, group {index}");
             }
         }
+    }
+
+    /// Every backup stops hearing its primary on the same tick, as after the
+    /// death of a node. The sweep casts the votes a few per tick and reports the
+    /// rest as held.
+    #[compio::test]
+    async fn given_more_timed_out_backups_than_the_tick_limit_when_sweeping_should_cast_a_few_votes_per_sweep()
+     {
+        const ROUNDS: usize = 3;
+        const GROUPS: usize = ROUNDS * PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX;
+        // Past the sweeps that cast the votes, so no backup starts a second
+        // round of them.
+        const HEARTBEAT_TICKS: u64 = 2 * ROUNDS as u64;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespaces: Vec<_> = (0..GROUPS)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        for &namespace in &namespaces {
+            partitions.insert(namespace, quiet_backup(&bus, namespace, HEARTBEAT_TICKS));
+        }
+
+        let mut voters = 0;
+        let mut rounds = Vec::new();
+        for _ in 0..HEARTBEAT_TICKS + ROUNDS as u64 {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            let voted = namespaces
+                .iter()
+                .filter(|namespace| {
+                    let consensus = partitions.get_by_ns(namespace).unwrap().consensus();
+                    consensus.votes_to_leave_view()
+                })
+                .count();
+            if voted > voters {
+                let (_, held) = owner.metrics().partition_view_changes_value();
+                rounds.push((voted - voters, held));
+                voters = voted;
+            }
+        }
+
+        let cast = PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX;
+        let expected: Vec<_> = (1..=ROUNDS)
+            .map(|round| (cast, i64::try_from(GROUPS - round * cast).unwrap()))
+            .collect();
+        assert_eq!(
+            rounds, expected,
+            "(votes cast, votes held) of each sweep that cast a vote"
+        );
+    }
+
+    /// A view change counts against the limit however it started. At the limit
+    /// no backup casts its heartbeat vote, and the first sweep below the limit
+    /// casts it.
+    #[compio::test]
+    async fn given_view_changes_at_the_inflight_limit_when_a_backup_times_out_should_hold_its_vote_until_one_ends()
+     {
+        const HEARTBEAT_TICKS: u64 = 2;
+        const HELD_SWEEPS: u64 = 3 * HEARTBEAT_TICKS;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespaces: Vec<_> = (0..=PARTITION_VIEW_CHANGES_INFLIGHT_MAX)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        let (&waiting, changing) = namespaces.split_last().unwrap();
+        for &namespace in changing {
+            partitions.insert(
+                namespace,
+                backup_in_view_change(&bus, namespace, HEARTBEAT_TICKS),
+            );
+        }
+        partitions.insert(waiting, quiet_backup(&bus, waiting, HEARTBEAT_TICKS));
+        let waiting_votes = || {
+            let consensus = partitions.get_by_ns(&waiting).unwrap().consensus();
+            consensus.votes_to_leave_view()
+        };
+
+        for sweep in 1..=HELD_SWEEPS {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            assert!(!waiting_votes(), "sweep {sweep}");
+        }
+        let limit = i64::try_from(PARTITION_VIEW_CHANGES_INFLIGHT_MAX).unwrap();
+        assert_eq!(
+            owner.metrics().partition_view_changes_value(),
+            (limit, 1),
+            "(partitions in view change, votes held) at the limit"
+        );
+
+        partitions.remove(&changing[0]).unwrap();
+        assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+
+        assert!(waiting_votes());
+        assert_eq!(
+            owner.metrics().partition_view_changes_value(),
+            (limit - 1, 0),
+            "(partitions in view change, votes held) below the limit"
+        );
+    }
+
+    /// A view change that lost its quorum never ends. Once its status timeout
+    /// fires it waits for its peers, not for the I/O lane, so the held vote
+    /// leaves while the gauge still reports the stalled view changes.
+    #[compio::test]
+    async fn given_view_changes_stalled_past_their_status_timeout_when_a_backup_times_out_should_cast_its_vote()
+     {
+        const HEARTBEAT_TICKS: u64 = 2;
+        // The stalled groups vote for the next view on the sweep their status
+        // timeout fires, which spends the vote limit of that sweep.
+        const SWEEPS_PAST_TIMEOUT: u64 = 2;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespaces: Vec<_> = (0..=PARTITION_VIEW_CHANGES_INFLIGHT_MAX)
+            .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
+            .collect();
+        let (&waiting, stalled) = namespaces.split_last().unwrap();
+        for &namespace in stalled {
+            partitions.insert(
+                namespace,
+                backup_in_view_change(&bus, namespace, HEARTBEAT_TICKS),
+            );
+        }
+        partitions.insert(waiting, quiet_backup(&bus, waiting, HEARTBEAT_TICKS));
+        let waiting_votes = || {
+            let consensus = partitions.get_by_ns(&waiting).unwrap().consensus();
+            consensus.votes_to_leave_view()
+        };
+
+        let mut voted_on = None;
+        for sweep in 1..=TimeoutManager::VIEW_CHANGE_STATUS_TICKS + SWEEPS_PAST_TIMEOUT {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+            if waiting_votes() {
+                voted_on = Some(sweep);
+                break;
+            }
+        }
+
+        let voted_on = voted_on.expect("the held vote never left");
+        assert!(
+            voted_on > TimeoutManager::VIEW_CHANGE_STATUS_TICKS,
+            "voted on sweep {voted_on}, before the status timeout"
+        );
+        let limit = i64::try_from(PARTITION_VIEW_CHANGES_INFLIGHT_MAX).unwrap();
+        assert_eq!(
+            owner.metrics().partition_view_changes_value(),
+            (limit, 0),
+            "(partitions in view change, votes held) once the vote left"
+        );
     }
 
     /// A transfer abandoned at the session ceiling schedules a re-arm and opens
@@ -5303,19 +5526,18 @@ mod tests {
             let mut backup =
                 repairing_backup(&bus, transferring, LAGGING_COMMIT_MIN, LAGGING_COMMIT_MAX);
             backup.consensus().begin_state_transfer_await();
-            assert!(
-                owner
-                    .arm_partition_transfer(&mut backup, REPAIR_PRIMARY, 0)
-                    .await
-            );
+            owner
+                .arm_partition_transfer(&mut backup, REPAIR_PRIMARY)
+                .await;
+            assert!(backup.transfer().is_some());
             for _ in 0..consensus::STATE_TRANSFER_MAX_STALL_RETRIES {
                 assert!(!backup.burn_transfer_attempt());
             }
-            backup.transfer.as_mut().unwrap().idle_ticks = retry_ticks - 1;
+            backup.transfer_mut().unwrap().idle_ticks = retry_ticks - 1;
             partitions.insert(transferring, backup);
             let waiting = namespaces[PARTITION_REPAIRS_INFLIGHT_MAX];
             let mut late = repairing_backup(&bus, waiting, LAGGING_COMMIT_MIN, LAGGING_COMMIT_MAX);
-            late.repair = None;
+            late.set_repair(None);
             late.gap_ticks.set(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
             partitions.insert(waiting, late);
             owner.partition_repairs_inflight.set(OTHER_SESSIONS);
@@ -5324,7 +5546,7 @@ mod tests {
                 assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
                 let live = namespaces
                     .iter()
-                    .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair.is_some())
+                    .filter(|namespace| partitions.get_by_ns(namespace).unwrap().repair().is_some())
                     .count();
                 assert_eq!(
                     live, PARTITION_REPAIRS_INFLIGHT_MAX,
@@ -5338,9 +5560,9 @@ mod tests {
                 let abandoned = partitions.get_by_ns(&transferring).unwrap();
                 assert_eq!(
                     (
-                        abandoned.repair.is_some(),
+                        abandoned.repair().is_some(),
                         abandoned.transfer_rearm.is_some(),
-                        partitions.get_by_ns(&waiting).unwrap().repair.is_some(),
+                        partitions.get_by_ns(&waiting).unwrap().repair().is_some(),
                     ),
                     (false, true, true),
                     "(abandoned group repairs, its re-arm waits, waiting group repairs) at \
@@ -5368,20 +5590,19 @@ mod tests {
             assert!(!backup.burn_repair_attempt());
         }
         backup.note_repair_rotation();
-        backup.repair.as_mut().unwrap().peer = REPAIR_NEXT_PEER;
+        backup.repair_mut().unwrap().peer = REPAIR_NEXT_PEER;
         backup.consensus().begin_state_transfer_await();
 
-        assert!(
-            owner
-                .arm_partition_transfer(&mut backup, REPAIR_PRIMARY, 0)
-                .await
-        );
-        assert!(backup.repair.is_none());
+        owner
+            .arm_partition_transfer(&mut backup, REPAIR_PRIMARY)
+            .await;
+        assert!(backup.transfer().is_some());
+        assert!(backup.repair().is_none());
         assert_eq!(backup.repair_rotations(), 0);
         owner
             .abandon_or_rearm_partition_transfer(&mut backup, REPAIR_PRIMARY)
             .await;
-        assert!(backup.repair.is_none());
+        assert!(backup.repair().is_none());
         let rearm = backup.transfer_rearm.as_mut().unwrap();
         rearm.after_ticks = REARM_BACKOFF_TICKS;
         let rearm_peer = rearm.peer;
@@ -5435,7 +5656,7 @@ mod tests {
             (
                 journal.resident_count(),
                 journal.last_op(),
-                partition.transfer.is_some(),
+                partition.transfer().is_some(),
             )
         };
         let converted = recovery();
@@ -5453,7 +5674,7 @@ mod tests {
         for refusal in 1..=REFUSALS {
             let (peer, nonce) = {
                 let partition = partitions.get_by_ns(&namespace).unwrap();
-                let transfer = partition.transfer.as_ref().unwrap();
+                let transfer = partition.transfer().unwrap();
                 (transfer.peer, transfer.nonce)
             };
             owner
@@ -5482,7 +5703,12 @@ mod tests {
                     floor += FRAMES_ABOVE_FLOOR;
                     serve_above_floor(&owner, namespace, request, floor, &prepares).await;
                 }
-                if partitions.get_by_ns(&namespace).unwrap().transfer.is_some() {
+                if partitions
+                    .get_by_ns(&namespace)
+                    .unwrap()
+                    .transfer()
+                    .is_some()
+                {
                     break;
                 }
                 assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
@@ -5525,7 +5751,7 @@ mod tests {
         let partitions = owner.plane.partitions();
         let transfer = {
             let partition = partitions.get_by_ns(&namespace).unwrap();
-            let transfer = partition.transfer.as_ref().unwrap();
+            let transfer = partition.transfer().unwrap();
             (transfer.peer, transfer.nonce)
         };
         owner
@@ -5585,7 +5811,7 @@ mod tests {
         owner.set_repair_gap_debounce_ticks(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
         let namespace = IggyNamespace::new(0, 0, 0);
         let mut backup = repairing_backup(&bus, namespace, 0, HEAD);
-        backup.repair = None;
+        backup.set_repair(None);
         backup.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
             peer: REPAIR_PRIMARY,
             after_ticks: REARM_BACKOFF_TICKS,
@@ -5636,7 +5862,12 @@ mod tests {
         let partitions = owner.plane.partitions();
         partitions.remove(&namespace).unwrap();
         partitions.insert(namespace, repairing_backup(bus, namespace, 0, commit_max));
-        let session = partitions.get_by_ns(&namespace).unwrap().repair.unwrap();
+        let session = partitions
+            .get_by_ns(&namespace)
+            .unwrap()
+            .repair()
+            .copied()
+            .unwrap();
         serve_above_floor(
             &owner,
             namespace,
@@ -5646,7 +5877,11 @@ mod tests {
         )
         .await;
         assert!(
-            partitions.get_by_ns(&namespace).unwrap().transfer.is_some(),
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .transfer()
+                .is_some(),
             "the evicted floor arms a transfer"
         );
         (owner, sender)
@@ -5801,7 +6036,7 @@ mod tests {
         let [served, backed_up, next] =
             [0, 1, 2].map(|partition_id| IggyNamespace::new(0, 0, partition_id));
         let mut backup = repairing_backup(&bus, backed_up, 0, 0);
-        backup.repair = None;
+        backup.set_repair(None);
         owner.plane.partitions().insert(backed_up, backup);
         serve_partition_offer(&owner, served.inner(), false);
         let request =
@@ -6372,17 +6607,20 @@ mod tests {
         }
         consensus.sequencer().set_sequence(HEAD);
         assert!(consensus.local_dvc_suffix_stale());
-        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-            |_, header: &mut CommitHeader| {
-                header.command = Command::Commit;
-                header.cluster = 1;
-                header.group = METADATA_GROUP;
-                header.replica = 2;
-                header.view = VIEW - 1;
-                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-                header.seal();
-            },
-        );
+        let heartbeat = encode_commit_batch(
+            1,
+            2,
+            &[CommitEntry::new(
+                METADATA_GROUP,
+                0,
+                VIEW - 1,
+                0,
+                0,
+                HeartbeatState::Busy,
+                2,
+            )],
+        )
+        .unwrap();
 
         owner.on_commit(&heartbeat).await;
 
@@ -6864,7 +7102,7 @@ mod tests {
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut partition = repairing_replica(&bus, namespace, (REPAIR_PRIMARY, 3), 0, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition.set_created_revision(INCARNATION);
         crate::refresh_partition_dvc_suffix(&partition);
         for prepare in &prepares {
@@ -6882,18 +7120,20 @@ mod tests {
         owner.plane.partitions().remove(&namespace).unwrap();
         owner.plane.partitions().insert(namespace, partition);
         sent.borrow_mut().clear();
-        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-            |_, header: &mut CommitHeader| {
-                header.command = Command::Commit;
-                header.cluster = 1;
-                header.group = namespace.inner();
-                header.partition_incarnation = INCARNATION;
-                header.replica = 0;
-                header.view = REPAIR_VIEW - 1;
-                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-                header.seal();
-            },
-        );
+        let heartbeat = encode_commit_batch(
+            1,
+            0,
+            &[CommitEntry::new(
+                namespace.inner(),
+                INCARNATION,
+                REPAIR_VIEW - 1,
+                0,
+                0,
+                HeartbeatState::Busy,
+                0,
+            )],
+        )
+        .unwrap();
 
         owner.on_commit(&heartbeat).await;
 
@@ -6949,7 +7189,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -6980,7 +7220,7 @@ mod tests {
         while partition.consensus().view_log_unproven() {
             let request = requests.borrow_mut().pop().unwrap_or_else(|| {
                 panic!("missing repair request after {rounds} rounds; hole={:?}, session={:?}, transfer={:?}",
-                    partition.consensus().view_log_repair_op(), partition.repair,
+                    partition.consensus().view_log_repair_op(), partition.repair(),
                     partition.consensus().state_transfer_stage());
             });
             let request = request.header();
@@ -7035,7 +7275,7 @@ mod tests {
                 );
                 owner.on_repair_range_reply(&foreign_reply).await;
                 assert_eq!(partition.consensus().commit_min(), before);
-                assert_eq!(partition.repair.unwrap().floor, None);
+                assert_eq!(partition.repair().copied().unwrap().floor, None);
                 assert_eq!(
                     requests.borrow().len(),
                     requested,
@@ -7122,7 +7362,7 @@ mod tests {
                 0,
                 0,
             );
-            partition.repair = None;
+            partition.set_repair(None);
             if let Some((directory, store)) = persisted {
                 partition.set_partition_dir(directory.to_str().unwrap().to_owned());
                 Box::pin(partition.open_persistence()).await.unwrap();
@@ -7232,7 +7472,7 @@ mod tests {
         // proof settled. Its own vote stays unsent, and the vote of the candidate
         // completes its quorum.
         let backup_heartbeat_voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
-            .flat_map(|_| backup_consensus().tick(consensus::PlaneKind::Partitions))
+            .flat_map(|_| advance_and_tick(backup_consensus(), consensus::PlaneKind::Partitions))
             .any(|action| {
                 matches!(
                     action,
@@ -7449,7 +7689,7 @@ mod tests {
             .await
             .expect("dropping the held op must prove the adopted log");
         let partition = backup.partition(namespace);
-        assert!(partition.repair.is_none());
+        assert!(partition.repair().is_none());
         assert_eq!(
             partition.log.journal().inner.last_op(),
             (!head_committed).then_some(ADOPTED_HEAD)
@@ -7561,7 +7801,7 @@ mod tests {
         assert!(elect_partition().consensus().is_primary_elect());
         // The IO lane truncates the replaced op, then the elect fetches the merged one.
         let truncating = async {
-            while elect_partition().repair.is_none() {
+            while elect_partition().repair().is_none() {
                 elect.step(&mut scratch).await;
             }
         };
@@ -7896,7 +8136,7 @@ mod tests {
             .await;
         assert!(elect_consensus().is_primary_elect());
         let fetching = async {
-            while elect_partition().repair.is_none() {
+            while elect_partition().repair().is_none() {
                 elect.step(&mut scratch).await;
             }
         };
@@ -7969,7 +8209,7 @@ mod tests {
             .await;
 
         let merging = async {
-            while backup.partition(namespace).repair.is_none() {
+            while backup.partition(namespace).repair().is_none() {
                 backup.step(&mut scratch).await;
             }
         };
@@ -8018,7 +8258,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8045,7 +8285,7 @@ mod tests {
         let proof_op = {
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             assert!(
-                partition.repair.is_none(),
+                partition.repair().is_none(),
                 "the ceiling must refuse the edge arm"
             );
             assert_eq!(partition.consensus().commit_min(), APPLIED);
@@ -8065,7 +8305,7 @@ mod tests {
         );
         let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert_eq!(
-            partition.repair.map(|session| session.from_op),
+            partition.repair().map(|session| session.from_op),
             Some(proof_op)
         );
     }
@@ -8080,7 +8320,7 @@ mod tests {
     ) {
         let mut partition =
             repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8309,7 +8549,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in &prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8584,7 +8824,7 @@ mod tests {
     ) {
         let mut partition =
             repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8648,7 +8888,7 @@ mod tests {
             let prepares = primary_prepares(&bus, namespace, LOCAL_HEAD).await;
             let mut partition =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            partition.repair = None;
+            partition.set_repair(None);
             for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
                 partition.on_replicate(prepare.clone()).await;
             }
@@ -8729,7 +8969,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in prepares.iter().take(usize::try_from(FIRST_HEAD).unwrap()) {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -8920,7 +9160,7 @@ mod tests {
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut donor = repairing_replica(&bus, namespace, (DONOR, REPLICAS), REPAIR_PRIMARY, 0, 0);
-        donor.repair = None;
+        donor.set_repair(None);
         for prepare in prepares {
             donor.on_replicate(prepare).await;
         }
@@ -9385,7 +9625,7 @@ mod tests {
         let prepares = primary_prepares(&bus, namespace, HEAD).await;
         let mut donor =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        donor.repair = None;
+        donor.set_repair(None);
         let directory = tempfile::tempdir().unwrap();
         let (first_path, _) = attach_segment_files(&mut donor, directory.path(), false).await;
         for prepare in &prepares {
@@ -9434,6 +9674,96 @@ mod tests {
                 .chain([(Command::RepairDone, HEAD)])
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Past the ring budget of its shard, the tick releases the bodies that
+    /// segments hold, and the gauges report where it left the budget. A
+    /// backup that asks for the released ops still gets each one, read back
+    /// from the segment file.
+    #[compio::test]
+    async fn given_rings_past_the_shard_budget_when_the_shard_ticks_should_release_bodies_and_serve_them_from_segments()
+     {
+        const HEAD: u64 = 4;
+        /// Partitions whose ring holds ops `1..=HEAD`.
+        const WRITTEN: usize = 2;
+        /// The buffer of a one-message prepare, which a ring charges for its
+        /// body.
+        const BODY_BUFFER_BYTES: usize = 4096;
+        /// Room for the newest body of each ring and the headers of the
+        /// released ones, not for one more body.
+        const RING_BUDGET_BYTES: usize = (WRITTEN + 1) * BODY_BUFFER_BYTES;
+        /// The second tick finds the shard within its budget.
+        const TICKS: usize = 2;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = capture_sent_frames(&bus);
+        connect_replica_on(&bus, REPAIR_PRIMARY, 1);
+        let budget = Rc::new(partitions::RepairRingBudget::new(RING_BUDGET_BYTES));
+        let (owner, _sender) =
+            test_owner_with_repair_budgets(&bus, None, None, Some(Rc::clone(&budget)));
+        let directory = tempfile::tempdir().unwrap();
+        let mut written = Vec::with_capacity(WRITTEN);
+        for partition_id in 0..WRITTEN {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            let prepares = primary_prepares(&bus, namespace, HEAD).await;
+            let segment_directory = directory.path().join(partition_id.to_string());
+            std::fs::create_dir(&segment_directory).unwrap();
+            let (backup, log_path) =
+                journaling_backup(&bus, namespace, &prepares, &segment_directory).await;
+            let positions = write_bodies_to_segment(&log_path, &prepares);
+            backup
+                .log
+                .journal()
+                .inner
+                .evict_prefix_located(prepares.len(), |op| first_segment_body(&positions, op));
+            owner.plane.partitions().remove(&namespace).unwrap();
+            owner.plane.partitions().insert(namespace, backup);
+            written.push((namespace, prepares));
+        }
+        let grown = budget.usage();
+        assert!(
+            grown.charged_bytes > grown.budget_bytes,
+            "the rings must start past the budget: {grown:?}"
+        );
+
+        for _ in 0..TICKS {
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+        }
+
+        let shed = owner.metrics.repair_ring_shed_value();
+        assert_eq!(
+            shed.usage,
+            budget.usage(),
+            "the gauges report the budget as the tick left it"
+        );
+        assert!(
+            shed.usage.charged_bytes <= shed.usage.budget_bytes.max(shed.usage.floor_bytes),
+            "the tick left the rings past the budget: {:?}",
+            shed.usage
+        );
+        assert_eq!(
+            shed.entries_dropped, 0,
+            "the shed dropped an entry while a body was left to release"
+        );
+        let mut released = 0;
+        for (namespace, prepares) in &written {
+            let partition = owner.plane.partitions().get_by_ns(namespace).unwrap();
+            let journal = &partition.log.journal().inner;
+            released += (1..=HEAD)
+                .filter(|&op| {
+                    journal.repair_entry(op).is_none() && journal.evicted_header(op).is_some()
+                })
+                .count();
+            assert_eq!(
+                repair_answers(&owner, &sent, *namespace, 1, prepares).await,
+                (1..=HEAD)
+                    .map(|op| (Command::RepairPrepare, op))
+                    .chain([(Command::RepairDone, HEAD)])
+                    .collect::<Vec<_>>(),
+                "partition {namespace:?} serves every op, released or not"
+            );
+        }
+        assert!(released > 0, "no ring holds an op without its body");
+        assert_eq!(shed.bodies_released, released);
     }
 
     /// Asks `owner` for ops `from_op..` of `prepares` as the primary of
@@ -9530,7 +9860,7 @@ mod tests {
             let prepares = sized_primary_prepares(&bus, namespace, HEAD, payload_bytes).await;
             let mut donor =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            donor.repair = None;
+            donor.set_repair(None);
             for prepare in &prepares {
                 donor.on_replicate(prepare.clone()).await;
             }
@@ -9632,7 +9962,7 @@ mod tests {
             0,
             0,
         );
-        backup.repair = None;
+        backup.set_repair(None);
         let partitions = backup_owner.plane.partitions();
         partitions.remove(&namespace).unwrap();
         partitions.insert(namespace, backup);
@@ -9702,7 +10032,7 @@ mod tests {
             "a round that brought ops below the hole pulls the next window at once"
         );
         assert!(backup.log.journal().inner.holds_op(hole));
-        assert!(backup.transfer.is_none());
+        assert!(backup.transfer().is_none());
         assert_eq!(
             backup.consensus().state_transfer_stage(),
             consensus::StateTransferStage::Idle
@@ -9746,27 +10076,14 @@ mod tests {
         #[allow(clippy::future_not_send)]
         async fn new(head: u64) -> Self {
             let bus = Rc::new(IggyMessageBus::new(0));
-            let sent = Rc::new(RefCell::new(Vec::new()));
-            let captured = Rc::clone(&sent);
-            bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
-                captured.borrow_mut().push(
-                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
-                        .unwrap(),
-                );
-                Ok(())
-            }));
+            let sent = capture_sent_frames(&bus);
             connect_replica_on(&bus, REPAIR_PRIMARY, 1);
             let (owner, sender) = test_owner(&bus, None);
             let namespace = IggyNamespace::new(0, 0, 0);
             let prepares = primary_prepares(&bus, namespace, head).await;
-            let mut donor =
-                repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            donor.repair = None;
             let directory = tempfile::tempdir().unwrap();
-            let (log_path, _) = attach_segment_files(&mut donor, directory.path(), false).await;
-            for prepare in &prepares {
-                donor.on_replicate(prepare.clone()).await;
-            }
+            let (donor, log_path) =
+                journaling_backup(&bus, namespace, &prepares, directory.path()).await;
             let positions = release_bodies_to_segment(&donor, &log_path, &prepares);
             owner.plane.partitions().remove(&namespace).unwrap();
             owner.plane.partitions().insert(namespace, donor);
@@ -9796,12 +10113,57 @@ mod tests {
         }
     }
 
+    /// Every frame the shard on `bus` sends to a claimed replica.
+    fn capture_sent_frames(bus: &IggyMessageBus) -> Rc<RefCell<Vec<Message<GenericHeader>>>> {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap(),
+            );
+            Ok(())
+        }));
+        sent
+    }
+
+    /// A backup of [`REPAIR_VIEW`] that journaled `prepares` over segment
+    /// files in `directory`, with the path of its log file.
+    #[allow(clippy::future_not_send)]
+    async fn journaling_backup(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        prepares: &[Message<PrepareHeader>],
+        directory: &Path,
+    ) -> (IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>, PathBuf) {
+        let mut backup =
+            repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        backup.set_repair(None);
+        let (log_path, _) = attach_segment_files(&mut backup, directory, false).await;
+        for prepare in prepares {
+            backup.on_replicate(prepare.clone()).await;
+        }
+        (backup, log_path)
+    }
+
     /// Writes the bodies of `prepares`, which `donor` journaled, back to back
     /// into the log file of the first segment at `log_path`, and releases
     /// them there with [`release_bodies`]. Returns the position of each body
     /// in the file.
     fn release_bodies_to_segment(
         donor: &IggyPartition<Rc<IggyMessageBus>, HeldSuperblock>,
+        log_path: &Path,
+        prepares: &[Message<PrepareHeader>],
+    ) -> BTreeMap<u64, u64> {
+        let positions = write_bodies_to_segment(log_path, prepares);
+        release_bodies(donor, prepares, |op| first_segment_body(&positions, op));
+        positions
+    }
+
+    /// Writes the bodies of `prepares` back to back into the log file of the
+    /// first segment at `log_path`, and returns the position of each body in
+    /// the file.
+    fn write_bodies_to_segment(
         log_path: &Path,
         prepares: &[Message<PrepareHeader>],
     ) -> BTreeMap<u64, u64> {
@@ -9812,15 +10174,20 @@ mod tests {
             segment.extend_from_slice(&prepare.as_slice()[size_of::<PrepareHeader>()..]);
         }
         std::fs::write(log_path, &segment).unwrap();
-        release_bodies(donor, prepares, |op| {
-            positions
-                .get(&op)
-                .map(|&position| partitions::BodyPosition {
-                    segment_start: 0,
-                    position,
-                })
-        });
         positions
+    }
+
+    /// Where the log file of the first segment holds the body of `op`.
+    fn first_segment_body(
+        positions: &BTreeMap<u64, u64>,
+        op: u64,
+    ) -> Option<partitions::BodyPosition> {
+        positions
+            .get(&op)
+            .map(|&position| partitions::BodyPosition {
+                segment_start: 0,
+                position,
+            })
     }
 
     /// Moves `prepares`, which `donor` journaled, into its evicted ring with
@@ -9871,7 +10238,7 @@ mod tests {
             "the abandoned op committed"
         );
         assert!(!partition.log.journal().inner.holds_op(STALE_SHAPE_OP));
-        let session = partition.repair.unwrap();
+        let session = partition.repair().copied().unwrap();
         assert_eq!(session.peer, STALE_SHAPE_PRIMARY);
         assert_ne!(session.nonce, STALE_SHAPE_NONCE);
         let request = requests.borrow_mut().pop().expect("a re-request");
@@ -9901,7 +10268,7 @@ mod tests {
         let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert_eq!(
             partition
-                .repair
+                .repair()
                 .map(|standing| (standing.peer, standing.nonce)),
             Some((session.peer, session.nonce))
         );
@@ -9937,7 +10304,7 @@ mod tests {
             .await;
         assert_eq!(partition.consensus().commit_min(), STALE_SHAPE_COMMITTED);
         assert!(!partition.log.journal().inner.holds_op(STALE_SHAPE_OP));
-        let session = partition.repair.unwrap();
+        let session = partition.repair().copied().unwrap();
         assert_eq!(
             (session.peer, session.nonce),
             (STALE_SHAPE_PRIMARY, STALE_SHAPE_NONCE)
@@ -9978,7 +10345,7 @@ mod tests {
         let checksum = |prepare: Message<PrepareHeader>| Some(prepare.header().checksum);
         let mut partition =
             repairing_replica(&bus, namespace, (REQUESTER, REPLICAS), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         for op in 1..=APPLIED {
             partition.on_replicate(canonical(op)).await;
         }
@@ -10000,7 +10367,7 @@ mod tests {
             .await;
         let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
         assert!(partition.consensus().view_log_unproven());
-        let session = partition.repair.as_mut().unwrap();
+        let session = partition.repair_mut().unwrap();
         session.peer = OLD_PEER;
         session.nonce = OLD_NONCE;
         requests.borrow_mut().clear();
@@ -10026,7 +10393,7 @@ mod tests {
         assert_eq!(held(4), checksum(branch(4)));
         assert_eq!(held(5), None);
         assert_eq!(held(HEAD), None);
-        let session = partition.repair.unwrap();
+        let session = partition.repair().copied().unwrap();
         assert_eq!(session.peer, PRIMARY);
         assert_ne!(session.nonce, OLD_NONCE);
         // The branch's op 4 is held below the hole, so the window starts above it.
@@ -10045,7 +10412,7 @@ mod tests {
             .await;
         assert_eq!(
             partition
-                .repair
+                .repair()
                 .map(|standing| (standing.peer, standing.nonce)),
             Some((session.peer, session.nonce))
         );
@@ -10235,7 +10602,7 @@ mod tests {
         let prepares = primary_prepares(bus, namespace, head).await;
         let mut partition =
             repairing_replica(bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         if journaled {
             for prepare in &prepares {
                 partition.on_replicate(prepare.clone()).await;
@@ -10296,7 +10663,7 @@ mod tests {
             let prepare = prepares.into_iter().next().unwrap();
             let mut partition =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-            partition.repair = None;
+            partition.set_repair(None);
             if held {
                 partition.on_replicate(prepare.clone()).await;
             }
@@ -10344,6 +10711,53 @@ mod tests {
                 .await;
             assert_eq!(partition.consensus().commit_min(), HEAD);
         }
+    }
+
+    /// The primary retransmits an op until the backup acknowledges it. Journal
+    /// repair can take minutes to reach one partition of a busy node. So the
+    /// retransmit of a missing head must prove the log of the view, as its
+    /// repaired copy does.
+    #[compio::test]
+    async fn given_a_hole_at_a_blank_start_view_head_when_its_retransmit_arrives_should_prove_the_view_log()
+     {
+        const HEAD: u64 = 1;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let prepare = prepares.into_iter().next().unwrap();
+        let mut partition =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.set_repair(None);
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                HEAD,
+                HEAD,
+                &[consensus::dvc_blank(HEAD)],
+            ))
+            .await;
+        let retransmit = consensus::restamp_prepare_view(prepare.into_frozen(), NEW_VIEW).unwrap();
+        let retransmit =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(retransmit.as_slice()))
+                .unwrap();
+
+        owner.on_message(MessageBag::Prepare(retransmit)).await;
+
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert!(
+            partition.log.journal().inner.holds_op(HEAD),
+            "the retransmit must fill the hole at the head"
+        );
+        assert!(
+            !partition.consensus().view_log_unproven(),
+            "the filled head must prove the log of the view"
+        );
+        assert_eq!(partition.consensus().commit_min(), HEAD);
     }
 
     fn start_view_suffix(
@@ -10445,7 +10859,7 @@ mod tests {
             0,
             0,
         );
-        partition.repair = None;
+        partition.set_repair(None);
         for prepare in &prepares {
             partition.on_replicate(prepare.clone()).await;
         }
@@ -10470,7 +10884,7 @@ mod tests {
         assert_eq!(partition.consensus().commit_min(), STALE_SHAPE_COMMITTED);
         assert!(!partition.consensus().view_log_unproven());
         partition.consensus().advance_commit_max(STALE_SHAPE_OP);
-        partition.repair = Some(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: STALE_SHAPE_NONCE,
             view: STALE_SHAPE_VIEW,
             from_op: STALE_SHAPE_OP,
@@ -10481,7 +10895,7 @@ mod tests {
             requested_from: Some(STALE_SHAPE_OP),
             peer,
             idle_ticks: 0,
-        });
+        }));
         (abandoned, committed)
     }
 
@@ -10606,13 +11020,32 @@ mod tests {
         bus: &B,
         store: Option<&Rc<HeldSuperblock>>,
     ) -> (IoTestShard<B>, TaggedSender) {
-        test_owner_with_repair_memory(bus, store, None)
+        test_owner_with_repair_budgets(bus, store, None, None)
     }
 
-    fn test_owner_with_repair_memory<B: MessageBus + Clone + 'static>(
+    fn test_owner_with_repair_budgets<B: MessageBus + Clone + 'static>(
         bus: &B,
         store: Option<&Rc<HeldSuperblock>>,
         repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
+        repair_rings: Option<Rc<partitions::RepairRingBudget>>,
+    ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_of_topic(
+            bus,
+            store,
+            repair_memory,
+            repair_rings,
+            TopicRuntimeOptions::default(),
+        )
+    }
+
+    /// [`test_owner_with_repair_budgets`] whose committed topic resolves to
+    /// the options `runtime`.
+    fn test_owner_of_topic<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
+        repair_rings: Option<Rc<partitions::RepairRingBudget>>,
+        runtime: TopicRuntimeOptions,
     ) -> (IoTestShard<B>, TaggedSender) {
         let shard_id = ShardId::new(0);
         let config = PartitionsConfig {
@@ -10624,14 +11057,18 @@ mod tests {
             key_context: Arc::default(),
             path_layout: PartitionPathLayout::default(),
         };
-        let partitions = match repair_memory {
-            Some(budget) => IggyPartitions::with_repair_memory(shard_id, config, 0, budget),
-            None => IggyPartitions::new(shard_id, config),
-        };
+        let mut partitions = IggyPartitions::new(shard_id, config);
+        if let Some(budget) = repair_memory {
+            partitions = partitions.with_repair_memory(budget);
+        }
+        if let Some(budget) = repair_rings {
+            partitions = partitions.with_repair_rings(budget);
+        }
         let routes = PapayaShardsTable::new();
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
         let mut topic = Topic::default();
+        topic.resolved.runtime = runtime;
         for partition_id in 0..TEST_PARTITIONS {
             let namespace = IggyNamespace::new(0, 0, partition_id);
             let consensus = VsrConsensus::new(
@@ -10688,6 +11125,59 @@ mod tests {
         (owner, sender)
     }
 
+    /// A backup of a 3-replica group in [`REPAIR_VIEW`] that never hears its
+    /// primary, so its heartbeat timer fires after `heartbeat_ticks`.
+    fn quiet_backup(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        heartbeat_ticks: u64,
+    ) -> IggyPartition<Rc<IggyMessageBus>, HeldSuperblock> {
+        let mut consensus = VsrConsensus::new(
+            1,
+            REPAIR_BACKUP,
+            3,
+            namespace.inner(),
+            Rc::clone(bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(REPAIR_VIEW);
+        consensus.set_log_view(REPAIR_VIEW);
+        consensus.set_normal_heartbeat_ticks(heartbeat_ticks);
+        consensus.init();
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(SEGMENT_BYTES),
+        )
+    }
+
+    /// A [`quiet_backup`] that joined the vote of its primary to leave
+    /// [`REPAIR_VIEW`]. The next primary never answers, so the view change
+    /// does not end.
+    fn backup_in_view_change(
+        bus: &Rc<IggyMessageBus>,
+        namespace: IggyNamespace,
+        heartbeat_ticks: u64,
+    ) -> IggyPartition<Rc<IggyMessageBus>, HeldSuperblock> {
+        let partition = quiet_backup(bus, namespace, heartbeat_ticks);
+        let MessageBag::StartViewChange(vote) = view_control_message(
+            namespace,
+            Command::StartViewChange,
+            REPAIR_VIEW + 1,
+            REPAIR_PRIMARY,
+        ) else {
+            unreachable!()
+        };
+        let _ = partition
+            .consensus()
+            .handle_start_view_change(PlaneKind::Partitions, vote.header());
+        assert_eq!(
+            partition.consensus().status(),
+            consensus::Status::ViewChange
+        );
+        partition
+    }
+
     /// A backup in [`REPAIR_VIEW`] whose repair session for
     /// `(commit_min, commit_max]` is pinned to the primary.
     fn repairing_backup(
@@ -10735,7 +11225,7 @@ mod tests {
             consensus,
             IggyByteSize::from(SEGMENT_BYTES),
         );
-        partition.repair = Some(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: 1,
             view: REPAIR_VIEW,
             from_op: commit_min + 1,
@@ -10746,7 +11236,7 @@ mod tests {
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(commit_min + 1),
-        });
+        }));
         partition
     }
 
@@ -10895,7 +11385,7 @@ mod tests {
         partitions.remove(&namespace).unwrap();
         let mut partition =
             repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
-        partition.repair = None;
+        partition.set_repair(None);
         partition.set_created_revision(SCANNING_INCARNATION);
         partition.set_partition_dir(directory.path().to_str().unwrap().to_owned());
         partition
@@ -10904,7 +11394,7 @@ mod tests {
         partition
             .consensus()
             .set_state_transfer_stage(StateTransferStage::Fetching);
-        partition.transfer = Some(PartitionTransferSession {
+        partition.set_transfer(Some(PartitionTransferSession {
             nonce: SCANNING_NONCE,
             peer: REPAIR_PRIMARY,
             commit_op: 0,
@@ -10928,7 +11418,8 @@ mod tests {
             scan: Some(LocalWork::default()),
             seed: None,
             pulled_len: 0,
-        });
+            slot: partitions.transfer_slot(),
+        }));
         partitions.insert(namespace, partition);
         ScanningReceiver {
             owner,
@@ -10949,7 +11440,7 @@ mod tests {
                 .plane
                 .partitions()
                 .get_by_ns(&namespace)
-                .and_then(|partition| partition.transfer.as_ref())
+                .and_then(|partition| partition.transfer())
                 .is_some_and(|session| session.spill.is_some());
             if !pending {
                 return;
@@ -10975,8 +11466,8 @@ mod tests {
             assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
             let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
             observed.push((
-                partition.repair.map(|session| session.peer),
-                partition.transfer.as_ref().map(|session| session.peer),
+                partition.repair().map(|session| session.peer),
+                partition.transfer().map(|session| session.peer),
             ));
         }
         observed
@@ -11407,6 +11898,504 @@ mod tests {
         fn read_latest(&self) -> impl Future<Output = io::Result<SuperblockContents>> {
             std::future::ready(Ok(SuperblockContents::Empty))
         }
+    }
+
+    /// Frames the shard sent to peer nodes, as `(peer, frame)`.
+    type SentFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
+
+    /// A shard that hosts a 3-member metadata group as member `replica` in
+    /// `view`. Its bus records each frame for the peer nodes, and refuses each
+    /// frame for the peer in `refused`.
+    fn batch_owner(
+        replica: u8,
+        view: u32,
+        refused: &Rc<Cell<Option<u8>>>,
+    ) -> (IoTestShard, SentFrames) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent: SentFrames = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        let refused = Rc::clone(refused);
+        bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
+            if refused.get() == Some(peer) {
+                return Err(SendError::ReplicaNotConnected(peer));
+            }
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            captured.borrow_mut().push((peer, message));
+            Ok(())
+        }));
+        for peer in (0..3).filter(|peer| *peer != replica) {
+            crate::test_support::connect_replica_on(&bus, peer, 1);
+        }
+        let (mut owner, _sender) = test_owner(&bus, None);
+        let mut consensus = VsrConsensus::new(
+            1,
+            replica,
+            3,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(view);
+        consensus.set_log_view(view);
+        consensus.mark_superblock_durable(view, view);
+        owner.plane.inner_mut().0.consensus = Some(consensus);
+        (owner, sent)
+    }
+
+    fn metadata_consensus(owner: &IoTestShard) -> &VsrConsensus<Rc<IggyMessageBus>> {
+        owner.plane.inner().0.consensus.as_ref().unwrap()
+    }
+
+    fn metadata_commit(view: u32, timestamp: u64, state: u8, replica: u8) -> CommitEntry {
+        let mut entry = CommitEntry::new(
+            METADATA_GROUP,
+            0,
+            view,
+            0,
+            timestamp,
+            HeartbeatState::Busy,
+            replica,
+        );
+        entry.heartbeat_state = state;
+        entry
+    }
+
+    /// The entries of each batch of `command` in `sent`, as `(peer, entries)`.
+    fn sent_batches<E: bytemuck::Pod>(sent: &SentFrames, command: Command) -> Vec<(u8, Vec<E>)> {
+        sent.borrow()
+            .iter()
+            .filter(|(_, message)| message.header().command == command)
+            .map(|(peer, message)| {
+                let size = message.header().size as usize;
+                let body = &message.as_slice()[HEADER_SIZE..size];
+                (*peer, iggy_binary_protocol::batch_entries(body).collect())
+            })
+            .collect()
+    }
+
+    #[compio::test]
+    async fn given_a_batch_with_an_unknown_heartbeat_state_when_received_should_reject_only_that_entry()
+     {
+        const VIEW: u32 = 1;
+        let (owner, sent) = batch_owner(0, VIEW, &Rc::new(Cell::new(None)));
+        metadata_consensus(&owner).init();
+        let entries = [
+            metadata_commit(VIEW, 5, 9, 1),
+            metadata_commit(VIEW, 6, HeartbeatState::Busy as u8, 1),
+        ];
+
+        owner
+            .on_commit(&encode_commit_batch(1, 1, &entries).unwrap())
+            .await;
+        owner.flush_reply_outbox().await;
+
+        let replies = sent_batches::<CommitReplyEntry>(&sent, Command::CommitReply);
+        assert_eq!(replies.len(), 1, "one reply batch for the primary node");
+        let (peer, replies) = &replies[0];
+        assert_eq!(*peer, 1);
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.timestamp_monotonic)
+                .collect::<Vec<_>>(),
+            [6],
+            "only the valid entry gets a reply"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_stale_commit_when_received_should_not_restart_the_heartbeat_timeout() {
+        const VIEW: u32 = 1;
+        const TIMEOUT: u64 = 10;
+        let busy = HeartbeatState::Busy as u8;
+        let cases = [
+            (
+                "a member that is not the primary",
+                metadata_commit(VIEW, 20, busy, 2),
+                true,
+            ),
+            (
+                "an older view",
+                metadata_commit(VIEW - 1, 20, busy, 0),
+                true,
+            ),
+            (
+                "an older timestamp",
+                metadata_commit(VIEW, 5, busy, 1),
+                true,
+            ),
+            ("the primary", metadata_commit(VIEW, 20, busy, 1), false),
+        ];
+        for (source, late, should_fire) in cases {
+            let (owner, _sent) = batch_owner(0, VIEW, &Rc::new(Cell::new(None)));
+            let consensus = metadata_consensus(&owner);
+            consensus.init();
+            consensus.set_heartbeat_schedule(HeartbeatSchedule {
+                busy_timeout_ticks: TIMEOUT,
+                ..HeartbeatSchedule::default()
+            });
+            let first = metadata_commit(VIEW, 10, busy, 1);
+            owner
+                .on_commit(&encode_commit_batch(1, 1, &[first]).unwrap())
+                .await;
+            for _ in 0..TIMEOUT - 4 {
+                advance_and_tick(consensus, PlaneKind::Metadata);
+            }
+            owner
+                .on_commit(&encode_commit_batch(1, late.replica, &[late]).unwrap())
+                .await;
+            let fired = (0..4).any(|_| {
+                advance_and_tick(consensus, PlaneKind::Metadata)
+                    .iter()
+                    .any(|action| matches!(action, VsrAction::SendStartViewChange { .. }))
+            });
+            assert_eq!(fired, should_fire, "Commit from {source}");
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_corrupt_or_revision_one_batch_when_routed_should_drop_the_whole_frame() {
+        let (owner, _sent) = batch_owner(0, 1, &Rc::new(Cell::new(None)));
+        let unparsable = || {
+            owner
+                .metrics
+                .frame_drop_count(frame_drop_variant::CONSENSUS, frame_drop_reason::UNPARSABLE)
+        };
+        let commit = encode_commit_batch(
+            1,
+            1,
+            &[metadata_commit(1, 1, HeartbeatState::Busy as u8, 1)],
+        )
+        .unwrap();
+        let reply = crate::commit_batch::encode_commit_reply_batch(
+            1,
+            1,
+            &[CommitReplyEntry::new(METADATA_GROUP, 0, 1, 1, 1)],
+        )
+        .unwrap();
+        let flip_body = |message: Message<GenericHeader>| {
+            let mut bytes = message.as_slice().to_vec();
+            bytes[HEADER_SIZE] ^= 1;
+            Message::<GenericHeader>::try_from(Owned::copy_from_slice(&bytes)).unwrap()
+        };
+        let reply_count_mismatch = forge::<CommitReplyHeader>(reply.as_slice(), |header| {
+            header.entry_count = 2;
+        });
+        // Revision 1 put the group of a lone Commit in the header and sent no
+        // body. Its header-only frame cannot match any entry count.
+        let revision_one_commit =
+            forge::<CommitHeader>(&commit.as_slice()[..HEADER_SIZE], |header| {
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+            });
+        let revision_one_reply =
+            forge::<CommitReplyHeader>(&reply.as_slice()[..HEADER_SIZE], |header| {
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+            });
+        let frames = [
+            flip_body(commit.clone().into_generic()),
+            flip_body(reply.clone().into_generic()),
+            reply_count_mismatch,
+            revision_one_commit,
+            revision_one_reply,
+        ];
+        let dropped = frames.len() as u64;
+
+        for frame in frames {
+            owner.dispatch(frame);
+        }
+
+        assert_eq!(unparsable(), dropped);
+        assert_eq!(owner.metrics.commit_batch_counts()[2], 0);
+        assert_eq!(owner.metrics.commit_reply_batch_counts()[2], 0);
+        owner.dispatch(commit.into_generic());
+        owner.dispatch(reply.into_generic());
+        assert_eq!(unparsable(), dropped, "valid frames pass");
+        assert_eq!(owner.metrics.commit_batch_counts()[2], 1);
+        assert_eq!(owner.metrics.commit_reply_batch_counts()[2], 1);
+    }
+
+    /// A copy of `bytes` with an edited and sealed header of type `H`. The
+    /// typed checks do not run, so the frame can break them.
+    fn forge<H>(bytes: &[u8], edit: impl FnOnce(&mut H)) -> Message<GenericHeader>
+    where
+        H: ConsensusHeader + bytemuck::CheckedBitPattern + bytemuck::NoUninit,
+    {
+        let mut bytes = bytes.to_vec();
+        let header: &mut H = bytemuck::checked::from_bytes_mut(&mut bytes[..size_of::<H>()]);
+        edit(header);
+        header.seal();
+        Message::<GenericHeader>::try_from(Owned::copy_from_slice(&bytes)).unwrap()
+    }
+
+    #[compio::test]
+    async fn given_manual_ticks_when_a_group_starts_should_send_heartbeats_on_the_grid_and_eager_commits_at_once()
+     {
+        const START_TICK: u64 = 3;
+        let (owner, sent) = batch_owner(0, 0, &Rc::new(Cell::new(None)));
+        let schedule = HeartbeatSchedule::default();
+        let mut scratch = Vec::new();
+        // The shard ticks that sent metadata Commit entries, and those entries.
+        let mut commits_by_tick: Vec<(u64, Vec<CommitEntry>)> = Vec::new();
+        let consensus = metadata_consensus(&owner);
+        consensus.set_commit_message_ticks(schedule.busy_interval_ticks);
+        for tick in 1..=START_TICK {
+            shard_tick(&owner, &mut scratch).await;
+            take_metadata_commits(&sent, tick, &mut commits_by_tick);
+        }
+        consensus.init();
+        let first_grid = START_TICK.next_multiple_of(schedule.grid_ticks);
+        let second = first_grid + schedule.busy_interval_ticks;
+        for tick in START_TICK + 1..=second {
+            shard_tick(&owner, &mut scratch).await;
+            take_metadata_commits(&sent, tick, &mut commits_by_tick);
+        }
+        assert_eq!(
+            commits_by_tick
+                .iter()
+                .map(|(tick, entries)| (*tick, entries[0].heartbeat_state()))
+                .collect::<Vec<_>>(),
+            [
+                (first_grid, Ok(HeartbeatState::Busy)),
+                (second, Ok(HeartbeatState::Busy)),
+            ],
+            "first heartbeat on the next grid tick, the next one period later"
+        );
+
+        let prepare = metadata_prepares(1, 0).remove(0);
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        let _ = consensus.handle_prepare_ok(
+            PlaneKind::Metadata,
+            &PrepareOkHeader {
+                command: Command::PrepareOk,
+                replica: 1,
+                view: 0,
+                op: 1,
+                prepare_checksum: prepare.header().checksum,
+                ..Default::default()
+            },
+        );
+        consensus.advance_commit_max(1);
+        assert_eq!(consensus.pop_committed_prepare().unwrap().header.op, 1);
+        consensus.advance_commit_min(1);
+        consensus.request_eager_commit();
+        commits_by_tick.clear();
+        let eager_tick = second + 1;
+        assert!(!schedule.is_grid_tick(eager_tick));
+        shard_tick(&owner, &mut scratch).await;
+        take_metadata_commits(&sent, eager_tick, &mut commits_by_tick);
+        assert_eq!(
+            commits_by_tick
+                .iter()
+                .map(|(tick, entries)| (*tick, entries[0].heartbeat_state(), entries[0].commit))
+                .collect::<Vec<_>>(),
+            [(eager_tick, Ok(HeartbeatState::Eager), 1)],
+            "an eager Commit leaves in the batch of the same shard tick"
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn shard_tick(owner: &IoTestShard, scratch: &mut Vec<IggyNamespace>) {
+        owner.tick_metadata().await;
+        let _ = owner.tick_partitions(scratch).await;
+    }
+
+    /// Move the metadata Commit entries sent to node 1 out of `sent`, and
+    /// record them for shard tick `tick`.
+    fn take_metadata_commits(
+        sent: &SentFrames,
+        tick: u64,
+        commits_by_tick: &mut Vec<(u64, Vec<CommitEntry>)>,
+    ) {
+        let entries: Vec<CommitEntry> = sent_batches::<CommitEntry>(sent, Command::Commit)
+            .into_iter()
+            .filter(|(peer, _)| *peer == 1)
+            .flat_map(|(_, entries)| entries)
+            .filter(|entry| entry.group == METADATA_GROUP)
+            .collect();
+        sent.borrow_mut().clear();
+        if !entries.is_empty() {
+            commits_by_tick.push((tick, entries));
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_refused_reply_batch_when_flushed_should_drop_it_and_reply_again_on_the_next_commit()
+     {
+        const VIEW: u32 = 1;
+        let refused = Rc::new(Cell::new(Some(1)));
+        let (owner, sent) = batch_owner(0, VIEW, &refused);
+        metadata_consensus(&owner).init();
+        let busy = HeartbeatState::Busy as u8;
+
+        owner
+            .on_commit(&encode_commit_batch(1, 1, &[metadata_commit(VIEW, 1, busy, 1)]).unwrap())
+            .await;
+        owner.flush_reply_outbox().await;
+        assert!(
+            owner.reply_outbox.is_empty(),
+            "the refused batch is dropped"
+        );
+        assert_eq!(owner.metrics.commit_reply_batch_counts()[0], 0);
+
+        refused.set(None);
+        owner.flush_reply_outbox().await;
+        assert!(
+            sent.borrow().is_empty(),
+            "the dropped batch is not sent again"
+        );
+        owner
+            .on_commit(&encode_commit_batch(1, 1, &[metadata_commit(VIEW, 2, busy, 1)]).unwrap())
+            .await;
+        owner.flush_reply_outbox().await;
+        let replies = sent_batches::<CommitReplyEntry>(&sent, Command::CommitReply);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].1.len(), 1);
+        assert_eq!(
+            replies[0].1[0].timestamp_monotonic, 2,
+            "a new reply for the new Commit"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_commit_replayed_between_ticks_when_the_shard_ticks_should_send_one_batch_per_peer()
+     {
+        const START_TICK: u64 = 3;
+        const REPLAYED_GROUP: u64 = 42;
+        let (owner, sent) = batch_owner(0, 0, &Rc::new(Cell::new(None)));
+        let schedule = HeartbeatSchedule::default();
+        let mut scratch = Vec::new();
+        let consensus = metadata_consensus(&owner);
+        consensus.set_commit_message_ticks(schedule.busy_interval_ticks);
+        for _ in 1..=START_TICK {
+            shard_tick(&owner, &mut scratch).await;
+        }
+        consensus.init();
+        let first_grid = START_TICK.next_multiple_of(schedule.grid_ticks);
+        for _ in START_TICK + 1..first_grid {
+            shard_tick(&owner, &mut scratch).await;
+        }
+        sent.borrow_mut().clear();
+
+        // The pump replays a deferred Commit between two shard ticks.
+        let replayed = CommitEntry::new(REPLAYED_GROUP, 0, 0, 0, 0, HeartbeatState::Busy, 0);
+        for peer in [1, 2] {
+            owner.commit_outbox.push(
+                consensus.cluster(),
+                consensus.node_id(),
+                peer,
+                QueuedCommit {
+                    entry: replayed,
+                    member: peer,
+                },
+            );
+        }
+        shard_tick(&owner, &mut scratch).await;
+
+        let batches = sent_batches::<CommitEntry>(&sent, Command::Commit);
+        for peer in [1, 2] {
+            let to_peer: Vec<&Vec<CommitEntry>> = batches
+                .iter()
+                .filter(|(to, _)| *to == peer)
+                .map(|(_, entries)| entries)
+                .collect();
+            assert_eq!(to_peer.len(), 1, "one Commit batch for node {peer}");
+            let groups: Vec<u64> = to_peer[0].iter().map(|entry| entry.group).collect();
+            assert!(
+                groups.contains(&REPLAYED_GROUP) && groups.contains(&METADATA_GROUP),
+                "the batch for node {peer} holds the replayed entry and the heartbeat"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_bus_cap_of_two_commits_when_five_are_queued_for_one_peer_should_send_three_frames_in_order()
+     {
+        const PEER: u8 = 1;
+        const QUEUED: u64 = 5;
+        let cap = HEADER_SIZE + 2 * size_of::<CommitEntry>();
+        let (owner, sent) = batch_owner(0, 0, &Rc::new(Cell::new(None)));
+        owner.set_bus_max_message_size(cap);
+        let consensus = metadata_consensus(&owner);
+        let groups: Vec<u64> = (1..=QUEUED).collect();
+        for &group in &groups {
+            owner.commit_outbox.push(
+                consensus.cluster(),
+                consensus.node_id(),
+                PEER,
+                QueuedCommit {
+                    entry: CommitEntry::new(group, 0, 0, 0, 0, HeartbeatState::Busy, 0),
+                    member: PEER,
+                },
+            );
+        }
+
+        owner.flush_commit_outbox().await;
+
+        for (_, frame) in sent.borrow().iter() {
+            assert!(
+                frame.header().size as usize <= cap,
+                "frame above the bus cap"
+            );
+        }
+        let batches = sent_batches::<CommitEntry>(&sent, Command::Commit);
+        assert!(batches.iter().all(|(peer, _)| *peer == PEER));
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(_, entries)| entries.len())
+                .collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        let sent_groups: Vec<u64> = batches
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|entry| entry.group))
+            .collect();
+        assert_eq!(sent_groups, groups);
+    }
+
+    #[compio::test]
+    async fn given_a_bus_cap_of_two_replies_when_five_are_queued_for_one_peer_should_send_three_frames_in_order()
+     {
+        const PEER: u8 = 1;
+        const QUEUED: u64 = 5;
+        let cap = HEADER_SIZE + 2 * size_of::<CommitReplyEntry>();
+        let (owner, sent) = batch_owner(0, 0, &Rc::new(Cell::new(None)));
+        owner.set_bus_max_message_size(cap);
+        let consensus = metadata_consensus(&owner);
+        let groups: Vec<u64> = (1..=QUEUED).collect();
+        for &group in &groups {
+            owner.reply_outbox.push(
+                consensus.cluster(),
+                consensus.node_id(),
+                PEER,
+                CommitReplyEntry::new(group, 0, 0, 0, 0),
+            );
+        }
+
+        owner.flush_reply_outbox().await;
+
+        for (_, frame) in sent.borrow().iter() {
+            assert!(
+                frame.header().size as usize <= cap,
+                "frame above the bus cap"
+            );
+        }
+        let batches = sent_batches::<CommitReplyEntry>(&sent, Command::CommitReply);
+        assert!(batches.iter().all(|(peer, _)| *peer == PEER));
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(_, entries)| entries.len())
+                .collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        let sent_groups: Vec<u64> = batches
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|entry| entry.group))
+            .collect();
+        assert_eq!(sent_groups, groups);
     }
 
     mod fresh_writes;

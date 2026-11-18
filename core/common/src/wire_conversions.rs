@@ -28,9 +28,9 @@ use crate::{
     HeaderKind, HeaderValue, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyError,
     OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE, OPTION_FLAG_SECRET,
     OPTION_FLAG_UPDATABLE, OptionKey, OptionSpec, OptionValue, OptionsProvenance, OptionsScope,
-    Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions,
-    Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions,
-    TransportEndpoints, UserInfo, UserInfoDetails, UserStatus, descriptors_for,
+    Page, PageCursor, Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken,
+    ResourceOptions, Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails,
+    TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus, descriptors_for,
 };
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
@@ -46,24 +46,22 @@ use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::C
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
     ConsumerGroupDetailsResponse, ConsumerGroupMemberResponse,
 };
-use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::consumer_offsets::get_consumer_offset::ConsumerOffsetResponse;
+use iggy_binary_protocol::responses::page::PageResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::create_personal_access_token::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse,
 };
 use iggy_binary_protocol::responses::streams::StreamResponse;
-use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
-use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
 use iggy_binary_protocol::responses::system::get_stats::{CacheMetricEntry, StatsResponse};
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
-use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
+use iggy_binary_protocol::responses::users::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
-use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
 use iggy_binary_protocol::{WireConsumer, WireIdentifier, WireUserHeaderIterator};
 use std::collections::{BTreeMap, HashMap};
 
@@ -116,24 +114,34 @@ impl TryFrom<GetStreamResponse> for StreamDetails {
     }
 }
 
-pub fn streams_from_wire(w: GetStreamsResponse) -> Result<Vec<Stream>, IggyError> {
-    let mut streams: Vec<Stream> = w
-        .streams
-        .into_iter()
-        .map(Stream::try_from)
-        .collect::<Result<_, _>>()?;
-    streams.sort_by_key(|s| s.id);
-    Ok(streams)
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+/// A wire page with each item converted by `convert`. The items keep the
+/// order of the server.
+pub fn page_from_wire<W, T>(
+    page: PageResponse<W>,
+    convert: impl FnMut(W) -> Result<T, IggyError>,
+) -> Result<Page<T>, IggyError> {
+    Ok(Page {
+        items: page
+            .items
+            .into_iter()
+            .map(convert)
+            .collect::<Result<_, _>>()?,
+        next: page.next.map(PageCursor::from),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Topics
 // ---------------------------------------------------------------------------
 
-impl TryFrom<TopicHeader> for Topic {
+impl TryFrom<TopicResponse> for Topic {
     type Error = IggyError;
 
-    fn try_from(w: TopicHeader) -> Result<Self, Self::Error> {
+    fn try_from(w: TopicResponse) -> Result<Self, Self::Error> {
         let options = resource_options_from_wire_split(&w.options, &w.derived_options)?;
         Ok(Self {
             id: w.id,
@@ -184,16 +192,6 @@ impl TryFrom<GetTopicResponse> for TopicDetails {
     }
 }
 
-pub fn topics_from_wire(w: GetTopicsResponse) -> Result<Vec<Topic>, IggyError> {
-    let mut topics: Vec<Topic> = w
-        .topics
-        .into_iter()
-        .map(Topic::try_from)
-        .collect::<Result<_, _>>()?;
-    topics.sort_by_key(|t| t.id);
-    Ok(topics)
-}
-
 // ---------------------------------------------------------------------------
 // Users
 // ---------------------------------------------------------------------------
@@ -227,16 +225,6 @@ impl TryFrom<UserDetailsResponse> for UserInfoDetails {
             options: user.options,
         })
     }
-}
-
-pub fn users_from_wire(w: GetUsersResponse) -> Result<Vec<UserInfo>, IggyError> {
-    let mut users: Vec<UserInfo> = w
-        .users
-        .into_iter()
-        .map(UserInfo::try_from)
-        .collect::<Result<_, _>>()?;
-    users.sort_by_key(|u| u.id);
-    Ok(users)
 }
 
 impl From<IdentityResponse> for IdentityInfo {
@@ -354,12 +342,6 @@ impl From<ConsumerGroupDetailsResponse> for ConsumerGroupDetails {
             members,
         }
     }
-}
-
-pub fn consumer_groups_from_wire(w: GetConsumerGroupsResponse) -> Vec<ConsumerGroup> {
-    let mut groups: Vec<ConsumerGroup> = w.groups.into_iter().map(ConsumerGroup::from).collect();
-    groups.sort_by_key(|g| g.id);
-    groups
 }
 
 // ---------------------------------------------------------------------------

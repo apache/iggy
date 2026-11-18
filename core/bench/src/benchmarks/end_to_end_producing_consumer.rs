@@ -18,6 +18,7 @@
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::common::build_producing_consumers_futures;
 use crate::utils::ClientFactory;
+use crate::utils::warmup::BenchmarkWarmup;
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -52,7 +53,8 @@ impl Benchmarkable for EndToEndProducingConsumerBenchmark {
         let args = self.args.clone();
         let mut tasks = JoinSet::new();
 
-        let futures = build_producing_consumers_futures(cf, args);
+        let warmup = BenchmarkWarmup::start(args.warmup_time());
+        let futures = build_producing_consumers_futures(cf, args, warmup);
         for fut in futures {
             tasks.spawn(fut);
         }

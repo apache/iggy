@@ -89,21 +89,3 @@ export const deserializeConsumerGroup = (r: Buffer, pos = 0): ConsumerGroupDeser
     }
   }
 };
-
-/**
- * Deserializes multiple consumer groups from a buffer.
- *
- * @param r - Buffer containing serialized consumer groups data
- * @param pos - Starting position in the buffer
- * @returns Array of deserialized consumer groups
- */
-export const deserializeConsumerGroups = (r: Buffer, pos = 0) => {
-  const end = r.length;
-  const cgroups = [];
-  while (pos < end) {
-    const { bytesRead, data } = deserializeConsumerGroup(r, pos);
-    cgroups.push(data);
-    pos += bytesRead;
-  }
-  return cgroups;
-};

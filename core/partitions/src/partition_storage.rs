@@ -34,10 +34,13 @@ use crate::segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,
 };
 use crate::state_transfer::OFFSET_PERSIST_CONCURRENCY;
-use crate::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig, Segment};
+use crate::{
+    ConsumerGroupOffsets, ConsumerOffsets, IggyIndexWriter, IggyPartition, MessagesWriter,
+    PartitionsConfig, Segment,
+};
 use compio::fs::create_dir_all;
 use compio::io::AsyncWriteAtExt;
-use iggy_common::{ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError};
+use iggy_common::{ConsumerKind, ConsumerOffset, IggyError};
 use journal::durable_storage::{DiskStorage, DurableStorage};
 use message_bus::MessageBus;
 use server_common::SegmentStorage;
@@ -264,13 +267,10 @@ pub async fn recover_consumer_offsets_with_storage<S: DurableStorage, B: Message
         partition_id,
     )
     .await?;
-    let consumer_offsets = ConsumerOffsets::with_capacity(recovered_consumers.entries.len());
-    {
-        let guard = consumer_offsets.pin();
-        for offset in recovered_consumers.entries {
-            seed_recovered_offset(partition, ConsumerKind::Consumer, &offset);
-            guard.insert(offset.consumer_id as usize, offset);
-        }
+    let mut consumer_offsets = ConsumerOffsets::new();
+    for offset in recovered_consumers.entries {
+        seed_recovered_offset(partition, ConsumerKind::Consumer, &offset);
+        consumer_offsets.insert(offset.consumer_id as usize, offset);
     }
 
     let recovered_groups = load_partition_group_offsets(
@@ -282,14 +282,10 @@ pub async fn recover_consumer_offsets_with_storage<S: DurableStorage, B: Message
         partition_id,
     )
     .await?;
-    let consumer_group_offsets =
-        ConsumerGroupOffsets::with_capacity(recovered_groups.entries.len());
-    {
-        let guard = consumer_group_offsets.pin();
-        for (group_id, offset) in recovered_groups.entries {
-            seed_recovered_offset(partition, ConsumerKind::ConsumerGroup, &offset);
-            guard.insert(group_id, offset);
-        }
+    let mut consumer_group_offsets = ConsumerGroupOffsets::new();
+    for (group_id, offset) in recovered_groups.entries {
+        seed_recovered_offset(partition, ConsumerKind::ConsumerGroup, &offset);
+        consumer_group_offsets.insert(group_id, offset);
     }
 
     // A partition made before this kind existed has no directory for it. The checkpoint syncs
@@ -468,8 +464,8 @@ async fn clamp_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
     let last_offset = offset_frontier.checked_sub(1);
     // Collected first, so no map guard is held across the file writes.
     let past_space: Vec<ConsumerOffset> = {
-        let consumers = partition.consumer_offsets.pin();
-        let groups = partition.consumer_group_offsets.pin();
+        let consumers = partition.consumer_offsets.borrow();
+        let groups = partition.consumer_group_offsets.borrow();
         consumers
             .values()
             .chain(groups.values())

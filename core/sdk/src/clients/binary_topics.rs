@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use iggy_common::TopicClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    Identifier, IggyError, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    Identifier, IggyError, NamedPageQuery, Page, Topic, TopicCreateOptions, TopicDetails,
+    TopicUpdateOptions,
 };
 
 #[async_trait]
@@ -35,6 +36,14 @@ impl TopicClient for IggyClient {
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
         super::with_client!(self, client => client.get_topics(stream_id).await)
+    }
+
+    async fn get_topics_page(
+        &self,
+        stream_id: &Identifier,
+        query: &NamedPageQuery,
+    ) -> Result<Page<Topic>, IggyError> {
+        super::with_client!(self, client => client.get_topics_page(stream_id, query).await)
     }
 
     async fn create_topic(

@@ -133,6 +133,7 @@ impl Default for HttpMetricsConfig {
         HttpMetricsConfig {
             enabled: SERVER_CONFIG.http.metrics.enabled,
             endpoint: SERVER_CONFIG.http.metrics.endpoint.parse().unwrap(),
+            topic_gauges: SERVER_CONFIG.http.metrics.topic_gauges,
         }
     }
 }

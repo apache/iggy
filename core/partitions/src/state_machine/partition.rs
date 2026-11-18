@@ -236,11 +236,14 @@ where
         let advance = (command.kind == crate::tiered_floor::ADVANCE_TIERED_FLOOR)
             .then(|| crate::tiered_floor::AdvanceTieredFloor::try_from(command.payload).ok())
             .flatten();
+        let long_term_floor = self.long_term_floor();
         match self.state_machines.apply(header.op, command) {
             Ok(Applied::Changed) => {
                 if let Some(advance) = advance {
                     self.note_tiered_advance(advance);
                 }
+                self.note_long_term_command(command.kind);
+                self.note_long_term_advance(long_term_floor);
                 true
             }
             Ok(Applied::Refused) => {
@@ -314,6 +317,8 @@ where
         snapshot: Option<&StateMachineSnapshot>,
         op: u64,
     ) -> Result<(), StateMachineError> {
+        // The long-term floor and the log under it may both change here.
+        self.long_term_backlog.forget();
         let Some(snapshot) = snapshot else {
             self.state_machines.reset();
             self.state_machines.advance_applied(op);

@@ -18,7 +18,7 @@
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
 use crate::primitives::partition_history::PartitionContext;
-use crate::responses::streams::get_stream::TopicHeader;
+use crate::responses::streams::get_stream::TopicResponse;
 use bytes::{BufMut, BytesMut};
 
 /// Partition details within a `GetTopic` response.
@@ -124,13 +124,13 @@ impl WireDecode for PartitionResponse {
 ///
 /// Wire format:
 /// ```text
-/// [TopicHeader][PartitionResponse]*
+/// [TopicResponse][PartitionResponse]*
 /// ```
 ///
 /// The number of partitions must match `topic.partitions_count`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetTopicResponse {
-    pub topic: TopicHeader,
+    pub topic: TopicResponse,
     pub partitions: Vec<PartitionResponse>,
 }
 
@@ -154,7 +154,7 @@ impl WireEncode for GetTopicResponse {
 
 impl WireDecode for GetTopicResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let (topic, mut pos) = TopicHeader::decode(buf)?;
+        let (topic, mut pos) = TopicResponse::decode(buf)?;
         // Count-driven so the element stays delimited even when embedded in a
         // larger payload; the header's variable-length options blocks removed
         // the old "everything after the header is partitions" property.
@@ -178,8 +178,8 @@ mod tests {
     use crate::{WireName, WireOptions};
     use std::fmt::Write;
 
-    fn sample_topic(partitions_count: u32) -> TopicHeader {
-        TopicHeader {
+    fn sample_topic(partitions_count: u32) -> TopicResponse {
+        TopicResponse {
             id: 1,
             created_at: 1_710_000_000_000,
             partitions_count,
