@@ -158,7 +158,7 @@ async fn given_empty_partition_when_storing_an_external_group_offset_should_skip
         partition.durable_consumer_offset_count(ConsumerKind::ExternalGroup),
         1
     );
-    assert!(partition.consumer_group_offsets.pin().is_empty());
+    assert!(partition.consumer_group_offsets.borrow().is_empty());
 }
 
 /// The reconciler deletes a bounded number of dead keys per pass. Ordered
@@ -169,7 +169,7 @@ async fn given_dead_keys_of_both_kinds_when_listed_should_order_them_by_group_id
     let (partition, _) = recording_partition();
     for group_id in [1, 2, 3] {
         partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, group_id, 11, 11);
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(group_id as usize),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, group_id, 11, String::new()),
         );

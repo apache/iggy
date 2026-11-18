@@ -75,6 +75,15 @@ impl PeerReplication {
         let outstanding = self.outstanding().saturating_add(queued);
         outstanding == 0 || outstanding.saturating_add(size) <= REPLICATION_BATCH_BYTES_MAX
     }
+
+    /// [`ReplicationFlow::work`] finds nothing for this peer at any time,
+    /// until a send, a failed send or a reply changes it.
+    const fn is_idle(&self) -> bool {
+        self.checkpoint.is_none()
+            && self.outstanding() == 0
+            && self.replay_from.is_none()
+            && !self.busy
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -418,6 +427,24 @@ where
             self.sequencer().current_sequence(),
             self.message_bus().monotonic_micros(),
         )
+    }
+
+    /// Whether [`Self::replication_work`] finds nothing for any peer however
+    /// much time passes. Only a send, a failed send, a progress reply or a
+    /// change of role, view or log trust ends that.
+    #[must_use]
+    pub fn replication_is_idle(&self) -> bool {
+        if !self.is_acting_primary()
+            || self.has_observed_newer_view()
+            || self.is_transferring()
+            || self.has_untrusted_log()
+        {
+            return true;
+        }
+        let flow = self.replication.borrow();
+        // A flow of another epoch resets every peer at its next use.
+        flow.epoch != Some((self.view(), self.partition_incarnation()))
+            || flow.peers.iter().all(PeerReplication::is_idle)
     }
 
     /// Send the probe of a [`ReplicationWork::Probe`] behind every frame

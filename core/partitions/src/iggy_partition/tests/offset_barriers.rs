@@ -87,7 +87,7 @@ async fn queued_delete_observes_held_no_ack_store_success_and_failures() {
             assert!(
                 !partition
                     .consumer_offsets
-                    .pin()
+                    .borrow()
                     .contains_key(&(CONSUMER as usize))
             );
             assert!(matches!(
@@ -106,7 +106,7 @@ async fn queued_delete_observes_held_no_ack_store_success_and_failures() {
             assert_eq!(
                 partition
                     .consumer_offsets
-                    .pin()
+                    .borrow()
                     .contains_key(&(CONSUMER as usize)),
                 !fail_write
             );
@@ -163,7 +163,7 @@ async fn queued_delete_observes_held_no_ack_store_success_and_failures() {
             assert!(
                 !partition
                     .consumer_offsets
-                    .pin()
+                    .borrow()
                     .contains_key(&(CONSUMER as usize))
             );
             assert_eq!(
