@@ -75,7 +75,8 @@ pub use fresh_sweep::{
 };
 mod placed_read;
 pub use manifest_publish::{
-    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
+    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
 };
 mod topic_object;
 pub use segment_chain::object_prefix;

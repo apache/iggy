@@ -37,20 +37,28 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    /// Stage a manifest pass for `partition` when this replica leads it in a
-    /// normal view that had no pass yet, it places its batches, and this
-    /// shard has a publisher. Nothing else asks for the manifest of a new
-    /// primary that has no segment left to commit.
+    /// Stage a manifest pass for `partition` when this replica leads it, it
+    /// places its batches, this shard has a publisher, and the pass is one
+    /// that nothing else asks for: the first of a normal view, or the one
+    /// [`IggyPartition::manifest_pass_due_at`] owes by `now`. A new primary
+    /// with no segment left to commit, and a publish that failed on an idle
+    /// partition, get no pass otherwise.
     ///
-    /// The shard tick calls this for every partition it visited.
-    pub(crate) fn stage_manifest_of_new_primary(
+    /// The shard tick calls this for every partition it visited, and the
+    /// pump's tick for every partition it paces, awake or not.
+    pub(crate) fn stage_manifest_pass(
         &self,
         namespace: IggyNamespace,
         partition: &IggyPartition<B, SB>,
+        now: IggyTimestamp,
     ) {
+        let due = partition.manifest_awaits_first_pass()
+            || partition
+                .manifest_pass_due_at()
+                .is_some_and(|due_at| now.as_micros() >= due_at.as_micros());
         // A pass over a tombstoned partition starts no publish, so it would
         // be staged on every tick.
-        if !partition.manifest_awaits_first_pass()
+        if !due
             || self.manifest_publisher.borrow().is_none()
             || self.plane.partitions().is_tombstoned(&namespace)
         {
@@ -63,7 +71,7 @@ where
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::PublishManifest {
             namespace,
             created_revision: partition.created_revision(),
-            now: IggyTimestamp::now(),
+            now,
         }));
     }
 }
