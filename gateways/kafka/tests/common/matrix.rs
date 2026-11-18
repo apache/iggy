@@ -31,7 +31,6 @@
 //! [`facts_from_events`] turns those into facts (`tests/common/facts.rs`) that are the same on
 //! every broker that behaves like Kafka: counts, per-partition offset ranges, committed offsets,
 //! whether every record came back intact and in order. Nothing broker-chosen is recorded.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

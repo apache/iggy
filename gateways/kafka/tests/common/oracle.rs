@@ -15,19 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real Kafka brokers as oracles for the gateway, and a wire client that talks to all of them.
+//! Apache Kafka as the oracle for the gateway, and a wire client that talks to it.
 //!
-//! Two oracles, each a black box behind the Kafka wire:
-//!
-//! - Apache Kafka in its official container, `KRaft` single node ([`KafkaOracle`]). The default,
-//!   and the one CI runs on every pull request.
-//! - Redpanda in its official container ([`RedpandaOracle`]). Opt-in with
-//!   `KAFKA_ORACLE_REDPANDA=1`, which the nightly job sets. Redpanda's source is BSL: only its
-//!   container is used, never its code.
+//! [`KafkaOracle`] runs Apache Kafka in its official container, `KRaft` single node. It is a
+//! black box behind the Kafka wire: only its container is used, never its code.
 //!
 //! [`WireClient`] encodes requests with `kafka-protocol`'s client half and negotiates each API's
 //! version down to what the target advertises, so one scenario runs unchanged on every target.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -43,17 +37,13 @@ use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, Str
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// The Apache Kafka oracle image. Pinned; CI pulls every `*_IMAGE` constant under `tests/`.
+/// The Apache Kafka oracle image. Pinned; CI pulls every client image under `tests/`.
 pub const KAFKA_ORACLE_IMAGE: &str = "apache/kafka:4.3.1";
-
-/// The Redpanda oracle image. Deliberately not named `*_IMAGE`: pull requests do not pull it,
-/// only the nightly job does.
-pub const REDPANDA_ORACLE_TAG: &str = "redpandadata/redpanda:v26.1.18";
 
 /// Client id every oracle request carries, so broker logs can tell harness traffic apart.
 pub const CLIENT_ID: &str = "iggy-oracle";
 
-/// Prefix of every container, topic, group and transactional id the harness creates.
+/// Prefix of every container, topic and group the harness creates.
 pub const RESOURCE_PREFIX: &str = "iggy-oracle-";
 
 /// Budget for a container broker to answer Metadata with a broker in it.
@@ -72,7 +62,6 @@ static NEXT_CONTAINER: AtomicUsize = AtomicUsize::new(0);
 pub enum TargetKind {
     Gateway,
     Kafka,
-    Redpanda,
 }
 
 impl TargetKind {
@@ -81,7 +70,6 @@ impl TargetKind {
         match self {
             Self::Gateway => "gateway",
             Self::Kafka => "kafka",
-            Self::Redpanda => "redpanda",
         }
     }
 }
@@ -317,70 +305,6 @@ impl KafkaOracle {
     }
 }
 
-/// Redpanda in dev-container mode, one shard, on loopback.
-pub struct RedpandaOracle {
-    pub target: Target,
-    _container: Container,
-}
-
-impl RedpandaOracle {
-    pub async fn start() -> Result<Self, Unavailable> {
-        if !env_flag("KAFKA_ORACLE_REDPANDA") {
-            return Err(Unavailable::Skipped(
-                "Redpanda runs nightly; set KAFKA_ORACLE_REDPANDA=1".to_string(),
-            ));
-        }
-        image_ready(REDPANDA_ORACLE_TAG).map_err(Unavailable::Failed)?;
-        let port = free_port();
-        let rpc = free_port();
-        let proxy = free_port();
-        let registry = free_port();
-        let admin = free_port();
-        let address = format!("127.0.0.1:{port}");
-        let args: Vec<String> = [
-            "redpanda".to_string(),
-            "start".to_string(),
-            "--mode".to_string(),
-            "dev-container".to_string(),
-            "--smp".to_string(),
-            "1".to_string(),
-            "--memory".to_string(),
-            "1G".to_string(),
-            "--overprovisioned".to_string(),
-            "--node-id".to_string(),
-            "0".to_string(),
-            "--kafka-addr".to_string(),
-            format!("PLAINTEXT://{address}"),
-            "--advertise-kafka-addr".to_string(),
-            format!("PLAINTEXT://{address}"),
-            "--rpc-addr".to_string(),
-            format!("127.0.0.1:{rpc}"),
-            "--advertise-rpc-addr".to_string(),
-            format!("127.0.0.1:{rpc}"),
-            "--pandaproxy-addr".to_string(),
-            format!("127.0.0.1:{proxy}"),
-            "--schema-registry-addr".to_string(),
-            format!("127.0.0.1:{registry}"),
-            // No spaces: the image's entrypoint splits its arguments again.
-            "--set".to_string(),
-            format!(r#"redpanda.admin=[{{"address":"127.0.0.1","port":{admin}}}]"#),
-        ]
-        .into();
-        let container = Container::start(REDPANDA_ORACLE_TAG, "redpanda", &[], &args)
-            .map_err(Unavailable::Failed)?;
-        wait_for_broker(&address, &container)
-            .await
-            .map_err(Unavailable::Failed)?;
-        Ok(Self {
-            target: Target {
-                kind: TargetKind::Redpanda,
-                address,
-            },
-            _container: container,
-        })
-    }
-}
-
 #[must_use]
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -434,12 +358,6 @@ impl WireClient {
             .map(|key| (key.api_key, (key.min_version, key.max_version)))
             .collect();
         Ok(client)
-    }
-
-    /// The advertised `(min, max)` of every key.
-    #[must_use]
-    pub const fn advertised(&self) -> &BTreeMap<i16, (i16, i16)> {
-        &self.versions
     }
 
     /// `preferred`, lowered to what the target advertises; `None` when it does not serve `key`.

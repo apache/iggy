@@ -21,9 +21,9 @@
 //! `produce.first.base_offset = 0`. Normalisation is the choice of what to record: node ids,
 //! hosts, cluster ids, throttle times and broker-chosen producer ids are never recorded, so they
 //! cannot differ. Every fact the gateway and an oracle disagree on is a difference, and every
-//! difference must be declared in `tests/oracle/allowed_differences.toml` with the issue that owns
-//! it. A declared difference that no longer occurs is reported too, so the file cannot go stale.
-#![allow(dead_code)]
+//! difference must be declared in `tests/clients/allowed_differences.toml` with the issue that
+//! owns it. A declared difference that no longer occurs is reported too, so the file cannot go
+//! stale.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Write as _};

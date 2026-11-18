@@ -16,49 +16,9 @@
 # under the License.
 
 # Every intended difference between what a real client observed on the gateway and what it
-# observed on Apache Kafka, read by client_matrix_tests.rs. Same format as
-# tests/oracle/allowed_differences.toml: an undeclared difference fails the run, and so does an
-# entry here that no longer occurs. `scenario` is `client/<client>` as the matrix names it;
-# `issue` is the apache/iggy issue that owns the gap.
-
-[[difference]]
-scenario = "client/connect-debezium"
-fact = "start.ready"
-issue = "#4508"
-reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), #4508. Every later step is then absent."
-
-[[difference]]
-scenario = "client/connect-debezium"
-fact = "snapshot.registered"
-issue = "#4508"
-reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), #4508. Every later step is then absent."
-
-[[difference]]
-scenario = "client/connect-debezium"
-fact = "snapshot.ids"
-issue = "#4508"
-reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), #4508. Every later step is then absent."
-
-[[difference]]
-scenario = "client/connect-debezium"
-fact = "stream.ids"
-issue = "#4508"
-reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), #4508. Every later step is then absent."
-
-[[difference]]
-scenario = "client/connect-debezium"
-fact = "restart.ready"
-issue = "#4508"
-reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), #4508. Every later step is then absent."
-
-[[difference]]
-scenario = "client/connect-debezium"
-fact = "restart.ids"
-issue = "#4508"
-reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), #4508. Every later step is then absent."
-
-[[difference]]
-scenario = "client/connect-debezium"
-fact = "restart.task_state"
-issue = "#4508"
-reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), #4508. Every later step is then absent."
+# observed on Apache Kafka, read by client_matrix_tests.rs. An undeclared difference fails the
+# run, and so does an entry here that no longer occurs. `scenario` is `client/<client>` as the
+# matrix names it; `issue` is the apache/iggy issue number that owns the gap, or a `KW-` plan
+# task where no issue exists yet.
+#
+# No differences are declared at present: every client in the matrix matches Apache Kafka.

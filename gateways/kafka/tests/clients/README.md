@@ -84,10 +84,12 @@ summary and uploads it as the `client-matrix` artifact.
 ```bash
 cargo build -p server --bin iggy-server
 # Podman: KAFKA_ORACLE_CONTAINER_CLI=podman, or a `docker` shim on PATH.
-for image in $(grep -rhoP '^pub const [A-Z0-9_]*_IMAGE: &str = "\K[^"]+' gateways/kafka/tests/client_matrix_tests.rs) apache/kafka:4.3.1; do docker pull "$image"; done
+# The smoke images are enough for a pull-request run; the _NIGHTLY ones are
+# only needed for the full matrix.
+for image in $(grep -rhoP '^pub const [A-Z0-9_]+_(?:IMAGE|NIGHTLY): &str = "\K[^"]+' gateways/kafka/tests/client_matrix_tests.rs) apache/kafka:4.3.1; do docker pull "$image"; done
 KAFKA_CLIENT_MATRIX_DIR=$PWD/target/client-matrix \
   cargo nextest run -p iggy-gateway-kafka --test client_matrix_tests
-# The nightly clients as well (pull the *_NIGHTLY images first):
+# The nightly clients as well:
 KAFKA_CLIENT_MATRIX_FULL=1 cargo nextest run -p iggy-gateway-kafka --test client_matrix_tests
 ```
 

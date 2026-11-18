@@ -67,11 +67,11 @@ jobs:
         shell: bash
 
       # The suites run their containers with `--pull never`, so every image has
-      # to be here first. Read the tags out of the suites so a bump in a test
-      # cannot desync from the pull.
+      # to be here first, nightly clients included. Read the tags out of the
+      # suites so a bump in a test cannot desync from the pull.
       - name: Pull client images
         run: |
-          grep -rhoP '^pub const [A-Z0-9_]+_IMAGE: &str = "\K[^"]+' \
+          grep -rhoP '^pub const [A-Z0-9_]+_(?:IMAGE|NIGHTLY): &str = "\K[^"]+' \
             gateways/kafka/tests/client_matrix_tests.rs \
             gateways/kafka/tests/common/oracle.rs | sort -u |
           while read -r image; do
