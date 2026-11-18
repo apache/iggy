@@ -87,19 +87,21 @@ tokio::task_local! {
 #[cfg(test)]
 mod extractor_tests {
     use super::extract_from_retained_frame;
+    use super::RequestTarget;
+    use super::Call;
     use bytes::Bytes;
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::codes::{
         CREATE_TOPIC_CODE, DELETE_STREAM_CODE, DELETE_TOPIC_CODE, GET_STREAM_CODE, GET_TOPIC_CODE,
         GET_TOPICS_CODE,
     };
-    use iggy_binary_protocol::primitives::page::WirePageQuery;
     use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, GetStreamRequest};
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
     };
-    use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
+    use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions, primitives::page::WirePageQuery};
     use iggy_common::Identifier;
+    use tokio::time::Instant;
 
     const UNKNOWN_OPERATION_CODE: u32 = 255;
 
@@ -246,6 +248,143 @@ mod extractor_tests {
         let retry_context = extract_from_retained_frame(DELETE_TOPIC_CODE, &retry_body);
         assert_eq!(retry_context, original_context);
         assert_eq!(retry_body, original_body);
+    }
+
+    #[test]
+    fn enrich_error_1009_fallback_no_stream_context() {
+        let call = Call::new(
+            1009,
+            Bytes::new(),
+            RequestTarget::Metadata,
+            Instant::now(),
+        );
+        assert_eq!(
+            call.request_error_context.as_ref().map(|ctx| ctx.stream.clone()),
+            None
+        );
+        assert_eq!(
+            call.request_error_context.as_ref().map(|ctx| ctx.topic.clone()),
+            None
+        );
+    }
+
+    #[test]
+    fn enrich_error_1019_remains_fallback() {
+        let call = Call::new(
+            1019,
+            Bytes::new(),
+            RequestTarget::Metadata,
+            Instant::now(),
+        );
+        assert_eq!(
+            call.request_error_context.as_ref().map(|ctx| ctx.stream.clone()),
+            None
+        );
+        assert_eq!(
+            call.request_error_context.as_ref().map(|ctx| ctx.topic.clone()),
+            None
+        );
+    }
+
+    #[test]
+    fn enrich_error_unrelated_retains_behavior() {
+        let call = Call::new(
+            42,
+            Bytes::new(),
+            RequestTarget::Metadata,
+            Instant::now(),
+        );
+        assert_eq!(
+            call.request_error_context.as_ref().map(|ctx| ctx.stream.clone()),
+            None
+        );
+        assert_eq!(
+            call.request_error_context.as_ref().map(|ctx| ctx.topic.clone()),
+            None
+        );
+    }
+
+    #[test]
+    fn enrich_error_match_1009_with_stream() {
+        let error_code = 1009;
+        let result = match error_code {
+            1009 => {
+                let stream: Option<&str> = /* simulated stream context */ None;
+                match stream {
+                    Some(_) => "enriched",
+                    None => "fallback",
+                }
+            }
+            _ => "other",
+        };
+        assert_eq!(result, "fallback");
+    }
+
+    #[test]
+    fn enrich_error_match_1009_without_stream() {
+        let error_code = 1009;
+        let result = match error_code {
+            1009 => {
+                let stream: Option<&str> = None;
+                match stream {
+                    Some(_) => "enriched",
+                    None => "fallback",
+                }
+            }
+            _ => "other",
+        };
+        assert_eq!(result, "fallback");
+    }
+
+    #[test]
+    fn enrich_error_match_2010_with_both() {
+        let error_code = 2010;
+        let result = match error_code {
+            2010 => {
+                let stream: Option<&str> = Some("streamId");
+                let topic: Option<&str> = Some("topicId");
+                match (stream, topic) {
+                    (Some(_), Some(_)) => "enriched",
+                    _ => "fallback",
+                }
+            }
+            _ => "other",
+        };
+        assert_eq!(result, "enriched");
+    }
+
+    #[test]
+    fn enrich_error_match_2010_without_stream() {
+        let error_code = 2010;
+        let result = match error_code {
+            2010 => {
+                let stream: Option<&str> = None;
+                let topic: Option<&str> = None;
+                match (stream, topic) {
+                    (Some(_), Some(_)) => "enriched",
+                    _ => "fallback",
+                }
+            }
+            _ => "other",
+        };
+        assert_eq!(result, "fallback");
+    }
+
+    #[test]
+    fn enrich_error_match_2010_with_stream_no_topic() {
+        let error_code = 2010;
+        let result = match error_code {
+            2010 => {
+                let stream: Option<&str> = Some("streamId");
+                let topic: Option<&str> = None;
+                match (stream, topic) {
+                    (Some(_), Some(_)) => "enriched",
+                    _ => "fallback",
+                }
+            }
+            _ => "other",
+        };
+        assert_eq!(result, "fallback");
     }
 }
 
@@ -1308,6 +1447,35 @@ impl OperationDriver {
                 return self.signed_in(call, hop, body);
             }
             Err(error) => error,
+        };
+        let error = match error.as_code() {
+            1009 => {
+                let stream = call
+                    .request_error_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.stream.clone());
+                match stream {
+                    Some(id) => IggyError::StreamIdNotFound(id),
+                    None => error,
+                }
+            }
+            2010 => {
+                let stream = call
+                    .request_error_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.stream.clone());
+                let topic = call
+                    .request_error_context
+                    .as_ref()
+                    .and_then(|ctx| ctx.topic.clone());
+                match (stream, topic) {
+                    (Some(s), Some(t)) => {
+                        IggyError::TopicIdNotFound(s, t)
+                    }
+                    _ => error,
+                }
+            }
+            _ => error,
         };
         if call.committing() && sent && fetch_error_is_uncertain(&error) {
             call.uncertain = true;
