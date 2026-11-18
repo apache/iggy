@@ -79,8 +79,8 @@ pub use segment_upload::{
 pub mod long_term;
 mod long_term_rewrite;
 pub use long_term_rewrite::{
-    ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError, RewriteOutcome,
-    SegmentRewrite,
+    BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError,
+    RewriteOutcome, SegmentRewrite,
 };
 mod segment_recovery;
 pub mod state_machine;

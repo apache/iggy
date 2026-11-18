@@ -328,25 +328,49 @@ impl<Id: Ord + Copy> FreshCache<Id> {
     }
 
     /// `range` of the object `object_id`, when one entry holds all of it.
+    /// That entry becomes the one used last.
     fn get(&mut self, object_id: Id, range: &Range<u64>) -> Option<Bytes> {
+        let (entry, bytes) = self.find(object_id, range)?;
+        match entry {
+            CacheEntry::Stored => self.stored.mark_used(object_id),
+            CacheEntry::Fetched(position) => self.fetched.mark_used((object_id, position)),
+        }
+        Some(bytes)
+    }
+
+    /// As [`Self::get`], but the entry keeps its place in the order the
+    /// cache drops them in.
+    fn peek(&self, object_id: Id, range: &Range<u64>) -> Option<Bytes> {
+        self.find(object_id, range).map(|(_, bytes)| bytes)
+    }
+
+    fn find(&self, object_id: Id, range: &Range<u64>) -> Option<(CacheEntry, Bytes)> {
         let stored = self
             .stored
             .entries
             .get(&object_id)
             .and_then(|entry| slice_at(&entry.bytes, 0, range));
         if let Some(bytes) = stored {
-            self.stored.mark_used(object_id);
-            return Some(bytes);
+            return Some((CacheEntry::Stored, bytes));
         }
-        let (key, bytes) = self
-            .fetched
+        self.fetched
             .entries
             .range((object_id, 0)..=(object_id, range.start))
             .next_back()
-            .and_then(|(key, entry)| Some((*key, slice_at(&entry.bytes, key.1, range)?)))?;
-        self.fetched.mark_used(key);
-        Some(bytes)
+            .and_then(|((_, position), entry)| {
+                Some((
+                    CacheEntry::Fetched(*position),
+                    slice_at(&entry.bytes, *position, range)?,
+                ))
+            })
     }
+}
+
+/// The entry of a [`FreshCache`] that holds a range.
+enum CacheEntry {
+    Stored,
+    /// The fetched range that starts at this position.
+    Fetched(u64),
 }
 
 /// `range` of an object out of `bytes`, which start at `position` of it.
@@ -446,6 +470,34 @@ impl RemoteSegments {
         if let Some(bytes) = cached {
             return Ok(bytes);
         }
+        let bytes = self.read_fresh_from_store(object_id, range.clone()).await?;
+        Ok(self
+            .fresh
+            .borrow_mut()
+            .insert(object_id, range.start, bytes))
+    }
+
+    /// `range` of the fresh object `object_id` when this shard holds it in
+    /// memory. The entry keeps its place in the order the cache drops them
+    /// in: a rewrite reads each blob once, and what it read is held by its
+    /// long-term segment from then on.
+    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
+        self.fresh.borrow().peek(object_id, range)
+    }
+
+    /// The bytes at `range` of the fresh object `object_id` from the store,
+    /// which this shard does not keep.
+    ///
+    /// A rewrite that fell behind reads what no consumer at the tail asks
+    /// for. Kept, those bytes would push out the ones the tail reads.
+    ///
+    /// # Errors
+    /// As [`Self::read_fresh`].
+    pub(crate) async fn read_fresh_from_store(
+        &self,
+        object_id: u128,
+        range: Range<u64>,
+    ) -> Result<Bytes, DiskFault> {
         let key = self.layout.fresh_key(object_id);
         let object = self
             .objects
@@ -464,10 +516,7 @@ impl RemoteSegments {
             );
             return Err(DiskFault::Tiered);
         }
-        Ok(self
-            .fresh
-            .borrow_mut()
-            .insert(object_id, range.start, object.bytes))
+        Ok(object.bytes)
     }
 
     /// The bytes at `range` of the segment object `key`, cut at the end of
@@ -1446,6 +1495,29 @@ mod tests {
         assert_eq!(cache.get(1, &(0..7)).unwrap(), "aaaaaaa");
         assert_eq!(cache.get(2, &(0..7)), None);
         assert_eq!(cache.get(3, &(0..7)).unwrap(), "ccccccc");
+    }
+
+    #[test]
+    fn given_an_entry_a_rewrite_read_when_the_budget_runs_out_should_drop_it_in_its_turn() {
+        let mut cache = FreshCache::new(16);
+        cache.insert(1, 0, Bytes::from_static(b"aaaa"));
+        cache.insert(2, 0, Bytes::from_static(b"bbbb"));
+        cache.insert(3, 0, Bytes::from_static(b"cccc"));
+        cache.insert(4, 0, Bytes::from_static(b"dddd"));
+        assert_eq!(cache.peek(1, &(1..3)).unwrap(), "aa");
+        cache.insert(5, 0, Bytes::from_static(b"eeee"));
+
+        assert_eq!(cache.get(1, &(0..4)), None);
+        assert_eq!(cache.get(2, &(0..4)).unwrap(), "bbbb");
+
+        let mut cache = FreshCache::new(16);
+        cache.insert_stored(1, Bytes::from_static(b"aaaaaaa"));
+        cache.insert_stored(2, Bytes::from_static(b"bbbbbbb"));
+        assert_eq!(cache.peek(1, &(0..1)).unwrap(), "a");
+        cache.insert_stored(3, Bytes::from_static(b"ccccccc"));
+
+        assert_eq!(cache.get(1, &(0..7)), None);
+        assert_eq!(cache.get(2, &(0..7)).unwrap(), "bbbbbbb");
     }
 
     #[test]

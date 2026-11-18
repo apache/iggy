@@ -222,6 +222,8 @@ where
     /// The rewrite of this partition's placed batches into long-term
     /// segments, while this replica is the primary.
     pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
+    /// What this partition committed above its long-term floor.
+    pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
     /// The fetches of remote segments' indexes that polls have in flight.
     index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1158,6 +1160,7 @@ where
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
+            long_term_backlog: Box::default(),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -12979,6 +12982,7 @@ where
         {
             self.offset.store(end_offset, Ordering::Release);
             self.committed_bytes = self.committed_bytes.saturating_add(batch_stats.size_bytes);
+            self.long_term_backlog.add(batch_stats.size_bytes);
             self.stats.set_current_offset(end_offset);
             // Advance the aggregate stats with the visible offset. Disk
             // persistence is threshold-gated in `commit_messages`, which
