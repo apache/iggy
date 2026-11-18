@@ -192,7 +192,10 @@ endpoint = "/metrics"
 
 # Export the per-topic series (`topic_size_bytes`, `topic_messages` and
 # `topic_max_size_bytes`). Each scrape walks every topic to build them, which
-# costs time and memory on a node with many topics.
+# costs time and memory on a node with many topics. The same switch exports
+# the per-partition series of the geo topics this node leads
+# (`topic_partition_long_term_lag_messages` and
+# `topic_partition_long_term_lag_bytes`).
 # `true` exports them to users who may read the server stats.
 # `false` exports only the node totals.
 topic_gauges = true
@@ -1467,16 +1470,16 @@ handshake_grace = "10 s"
 # The key prefix of this cluster's objects. Two clusters can share a bucket
 # under different prefixes, but never under the same one. The cluster claims
 # its prefix with the object "<prefix>/meta/identity". Replica 0 writes it
-# while it is the caught-up metadata primary and no topic is tiered. While
-# another replica leads metadata, nothing claims the prefix: restart the
-# leader until replica 0 leads. A node uploads and deletes objects only while
-# it reads that claim back through its own store, which the gauge
-# object_store_identity_verified shows. Give every node the same store and
-# prefix: the check cannot tell two stores apart when replica 0 reaches an
-# empty one and the other nodes reach one that holds an earlier claim of this
-# cluster. At boot the server reads the claim once, and only a missing bucket
-# or rejected credentials stop the boot. The server README says how to keep
-# and restore the claim.
+# while it is the caught-up metadata primary and no topic keeps data in the
+# store. While another replica leads metadata, nothing claims the prefix:
+# restart the leader until replica 0 leads. A node uploads and deletes
+# objects only while it reads that claim back through its own store, which
+# the gauge object_store_identity_verified shows. Give every node the same
+# store and prefix: the check cannot tell two stores apart when replica 0
+# reaches an empty one and the other nodes reach one that holds an earlier
+# claim of this cluster. At boot the server reads the claim once, and only a
+# missing bucket or rejected credentials stop the boot. The server README
+# says how to keep and restore the claim.
 #prefix = "iggy"
 # The fs backend: the directory that holds the objects.
 #path = "/var/lib/iggy-tiered"
