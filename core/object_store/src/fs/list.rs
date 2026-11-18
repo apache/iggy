@@ -84,7 +84,7 @@ impl Walk {
         // A continuation from another listing can sort before the prefix, and
         // the walk must still start inside it.
         let after = request
-            .continuation
+            .resumes_after()
             .filter(|after| *after >= request.prefix);
         Self {
             root: root.to_path_buf(),

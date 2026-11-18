@@ -177,7 +177,7 @@ impl ObjectStore for MemoryStore {
         validate_prefix(request.prefix)?;
         // A continuation from another listing can sort before the prefix,
         // and the scan must still start inside it.
-        let start = match request.continuation {
+        let start = match request.resumes_after() {
             Some(after) if after >= request.prefix => Bound::Excluded(after),
             _ => Bound::Included(request.prefix),
         };
