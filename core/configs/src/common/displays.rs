@@ -72,8 +72,8 @@ impl Display for HttpMetricsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, endpoint: {} }}",
-            self.enabled, self.endpoint
+            "{{ enabled: {}, endpoint: {}, topic_gauges: {} }}",
+            self.enabled, self.endpoint, self.topic_gauges
         )
     }
 }

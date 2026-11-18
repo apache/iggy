@@ -81,11 +81,13 @@ struct ResponseVectorTests {
         expectSampleTopic(details.topics[0], id: 1, name: "topic-a")
         expectSampleTopic(details.topics[1], id: 2, name: "topic-b")
 
-        let streams = try Responses.streams(body("response.get_streams"))
-        #expect(streams.map(\.id) == [1, 2])
-        #expect(streams.map(\.topicsCount) == [2, 0])
-        #expect(streams.allSatisfy { $0.options == details.options && $0.encryptionKeySource == .stream })
-        #expect(try Responses.streams([]).isEmpty)
+        let streams = try Responses.page(body("response.get_streams"), item: Responses.stream(from:))
+        #expect(streams.items.map(\.id) == [1, 2])
+        #expect(streams.items.map(\.topicsCount) == [2, 0])
+        #expect(streams.items.allSatisfy { $0.options == details.options && $0.encryptionKeySource == .stream })
+        #expect(streams.next == PageCursor.id(2))
+        // Every list reply is a page, so an empty body is malformed.
+        #expect(throws: IggyError(.invalidCommand)) { try Responses.page([], item: Responses.stream(from:)) }
     }
 
     @Test func topics() throws {
@@ -115,9 +117,14 @@ struct ResponseVectorTests {
         #expect(fencedPartitions[2].messagesCount == 8)
         #expect(fencedPartitions[2].members == [2, 0, 1])
 
-        let topics = try Responses.topics(body("response.get_topics"))
-        #expect(topics.map(\.name) == ["events", "logs"])
-        #expect(try Responses.topics(body("response.get_topics.empty")).isEmpty)
+        let topics = try Responses.page(body("response.get_topics"), item: Responses.topic(from:))
+        #expect(topics.items.map(\.name) == ["events", "logs"])
+        #expect(topics.next == PageCursor.created(at: createdAt.microseconds, id: 2))
+        #expect(try Responses.page(body("response.get_topics.empty"), item: Responses.topic(from:)) == Page(items: [], next: nil))
+
+        let partitions = try Responses.page(body("response.get_partitions"), item: Responses.partition(from:))
+        #expect(partitions.items == details.partitions)
+        #expect(partitions.next == PageCursor.id(2))
     }
 
     @Test func partitionNodeLists() throws {
@@ -173,9 +180,10 @@ struct ResponseVectorTests {
         #expect(details.partitionsCount == 6)
         #expect(details.members.map(\.partitions) == [[0, 1, 2], [3, 4, 5]])
 
-        let groups = try Responses.consumerGroups(body("response.get_consumer_groups"))
-        #expect(groups.map(\.name) == ["group-a", "group-b"])
-        #expect(groups.map(\.membersCount) == [2, 0])
+        let groups = try Responses.page(body("response.get_consumer_groups"), item: Responses.consumerGroup(from:))
+        #expect(groups.items.map(\.name) == ["group-a", "group-b"])
+        #expect(groups.items.map(\.membersCount) == [2, 0])
+        #expect(groups.next == nil)
 
         let assignment = try Responses.consumerGroupAssignment(body("response.sync_consumer_group"))
         #expect(assignment == ConsumerGroupAssignment(generation: 7, partitions: [0, 2, 4]))
@@ -260,10 +268,11 @@ struct ResponseVectorTests {
         let plain = try Responses.userDetails(body("response.user_details.no_permissions"))
         #expect(plain.permissions == nil)
 
-        let users = try Responses.users(body("response.get_users"))
-        #expect(users.map(\.username) == ["admin", "alice"])
-        #expect(users.map(\.status) == [.active, .inactive])
-        #expect(users.allSatisfy { $0.options.isEmpty })
+        let users = try Responses.page(body("response.get_users"), item: Responses.user(from:))
+        #expect(users.items.map(\.username) == ["admin", "alice"])
+        #expect(users.items.map(\.status) == [.active, .inactive])
+        #expect(users.items.allSatisfy { $0.options.isEmpty })
+        #expect(users.next == nil)
     }
 
     @Test func loginAndIdentity() throws {

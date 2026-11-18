@@ -44,9 +44,9 @@ func consumerGroupBody(id, partitions, members uint32, name string) []byte {
 
 func TestGetConsumerGroups_DecodesTheRoster(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	body := append(
+	body := pageBody(nil,
 		consumerGroupBody(1, 3, 2, "billing"),
-		consumerGroupBody(2, 1, 0, "audit")...)
+		consumerGroupBody(2, 1, 0, "audit"))
 	serve(serverConn, func(_ int, _ request) []byte {
 		return replyFrame(vsr.OperationNonReplicated, body)
 	})

@@ -172,8 +172,10 @@ func (g *GetTopic) MarshalBinary() ([]byte, error) {
 	return iggcon.MarshalIdentifiers(g.StreamId, g.TopicId)
 }
 
+// GetTopics asks for one page of the topics of a stream.
 type GetTopics struct {
 	StreamId iggcon.Identifier
+	Query    iggcon.NamedPageQuery
 }
 
 func (g *GetTopics) Code() Code {
@@ -181,7 +183,11 @@ func (g *GetTopics) Code() Code {
 }
 
 func (g *GetTopics) MarshalBinary() ([]byte, error) {
-	return g.StreamId.MarshalBinary()
+	streamId, err := g.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return g.Query.AppendBinary(streamId)
 }
 
 type DeleteTopic struct {

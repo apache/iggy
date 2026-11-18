@@ -23,106 +23,208 @@
 //! of every placing partition the shard leads, so the number of uploads
 //! follows the windows and not the partitions.
 //!
-//! The window closes once it is old or large enough, and the shard stores
-//! its object. Only then do the kept requests reach their partitions, in the
-//! order the sends came, and each producer is answered when its own request
-//! commits. A send whose object the store refused is answered as not
-//! accepted, so the producer sends it again.
+//! A window becomes an object when it reaches [`FRESH_OBJECT_BYTES`], or
+//! when the upload interval has passed since the last upload started and an
+//! upload slot is free. So a send that finds the shard idle is stored at
+//! once, a busy shard starts at most one object per interval plus the ones
+//! that fill, and the windows grow with the load. Several objects upload at
+//! the same time. An upload the store fails for a passing reason is tried
+//! again under the same id, which names the same bytes for good.
 //!
-//! One upload runs at a time. The sends that arrive meanwhile fill the next
-//! window, which is what keeps the requests of a partition in order and
-//! makes the windows grow with the load.
+//! The kept requests reach their partitions only after their object is
+//! stored, and each producer is answered when its own request commits.
+//! Objects can finish in any order, so the requests of a partition wait in
+//! one queue, in the order the sends came. The head of the queue leaves once
+//! its object is stored and the partition has room for a request, and no
+//! request leaves ahead of the head. When the store refuses an object for
+//! good, its sends and the later sends of the same partitions are answered
+//! as not accepted, so the producers send them again and no later send of a
+//! partition commits ahead of an earlier one. The same answer goes to every
+//! waiting send of a partition that stopped being a primary in normal
+//! status.
 //!
-//! The partition checks a request only after its object is stored. A send
-//! it then refuses, such as a duplicate or one that arrived after primacy
-//! moved, leaves its messages in the object with nothing that names them.
+//! The partition checks a request again when it gets it. A send it then
+//! refuses, such as a duplicate, leaves its messages in the object with
+//! nothing that names them.
+//!
+//! A send to a partition whose long-term backlog is past its limit waits a
+//! while before the shard takes it, and the later sends to that partition
+//! wait behind it, so none is overtaken. It is delayed and never refused,
+//! since a producer answered as not accepted sends all its messages again.
+//! Its bytes count as pending, in the cap of the shard and in the share of
+//! its partition, only once the shard takes it, which is when it is checked
+//! against both.
 
+use crate::rewrite_pacing::backlog_delay;
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, RestorableMetadataStm, Sender, ShardFrame};
 use bytes::Bytes;
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader, RoutedRequestHeader};
 use iggy_common::{IggyError, IggyTimestamp};
-use iggy_object_store::{FreshObject, FreshObjectId, TierScope};
+use iggy_object_store::{ErrorClass, FreshObject, FreshObjectId, TierScope};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::{FreshObjectUploader, FreshUploadOutcome};
+use partitions::{FreshObjectUploader, FreshUploadOutcome, IggyPartition};
 use server_common::Message;
 use server_common::send_messages::{
     ChecksumMode, admitted_blob, convert_request_message, place_request,
 };
 use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// How long a window stays open after its first send.
-pub const FRESH_WINDOW: Duration = Duration::from_millis(50);
-
-/// Bytes of messages at which a window closes without waiting out
-/// [`FRESH_WINDOW`].
+/// Bytes of messages at which a window becomes an object without waiting
+/// for the upload interval. A send is never split, so an object is larger
+/// only when one send is.
 pub const FRESH_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Bytes of messages the open window may hold while an upload runs. A send
-/// past it is answered as not accepted, so a store that stopped answering
-/// costs the shard this much memory and no more.
+/// The most bytes of messages the shard holds for sends that have not
+/// reached their partitions.
+///
+/// They are in the open window, in the objects that upload or wait to, and
+/// stored for a partition that has no room yet. A send past the cap is
+/// answered as not accepted, so a store or a partition that stopped
+/// answering costs the shard this much memory and no more.
 pub const FRESH_PENDING_BYTES_MAX: u64 = 8 * FRESH_OBJECT_BYTES;
+
+/// The most of [`FRESH_PENDING_BYTES_MAX`] that the sends of one partition
+/// hold. A partition that stopped draining its requests fills its own share
+/// and leaves the rest of the cap to the other partitions of the shard. A
+/// send larger than the share still gets in while nothing of its partition
+/// waits.
+pub const FRESH_PARTITION_PENDING_BYTES_MAX: u64 = FRESH_PENDING_BYTES_MAX / 4;
+
+/// The upload interval of a shard that was given none.
+pub const FRESH_UPLOAD_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The uploads a shard that was given no number runs at once.
+pub const FRESH_UPLOADS: usize = 4;
+
+/// The most attempts at storing one object, the first one included.
+const FRESH_UPLOAD_ATTEMPTS: u32 = 3;
+
+/// The wait before the second attempt at an object, doubled for each one
+/// after it.
+const FRESH_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// How long an object may take from the start of its first attempt. An
+/// attempt that runs past it is cancelled, and none starts past it. The
+/// producers wait through the window, the upload and the commit, so this
+/// stays well below the 30 s after which a client gives a request up.
+pub const FRESH_UPLOAD_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The submit channel a send arrived with.
 type SubmitReply = Sender<Option<Message<GenericHeader>>>;
 
 /// A send whose messages are in a fresh object: the request that commits
 /// where they sit, and where to answer its producer.
-pub struct PlacedSend {
+struct StagedSend {
     request: Message<RoutedRequestHeader>,
     reply: SubmitReply,
+    /// The number of the object that holds the messages.
+    object: u64,
+    object_id: FreshObjectId,
+    /// Bytes of the messages, which count against
+    /// [`FRESH_PENDING_BYTES_MAX`] until the request leaves.
+    bytes: u64,
+}
+
+/// A send held back because the rewrites of its partition fell behind.
+struct DelayedSend {
+    request: Message<RoutedRequestHeader>,
+    reply: SubmitReply,
+    /// The bus's monotonic clock when the shard takes it.
+    due_at: u64,
+}
+
+impl DelayedSend {
+    const fn new(request: Message<RoutedRequestHeader>, reply: SubmitReply, due_at: u64) -> Self {
+        Self {
+            request,
+            reply,
+            due_at,
+        }
+    }
 }
 
 /// What the task uploading a fresh object hands back to the pump.
 pub struct FinishedFreshUpload {
-    pub object_id: FreshObjectId,
-    /// The object's bytes, which the shard keeps for its polls once the
-    /// store holds them.
-    pub bytes: Bytes,
-    pub sends: Vec<PlacedSend>,
+    /// The number of the object.
+    pub sequence: u64,
     pub outcome: FreshUploadOutcome,
-    /// Bytes of the object.
-    pub size: u64,
-    /// The bus's monotonic clock when the upload started.
-    pub started_at: u64,
 }
 
-/// The sends that wait for one fresh object.
+/// The object that takes the sends that arrive.
 struct Window {
     id: FreshObjectId,
+    sequence: u64,
     object: FreshObject,
-    sends: Vec<PlacedSend>,
+    /// The partitions with a send in the object.
+    partitions: BTreeSet<IggyNamespace>,
     /// The bus's monotonic clock when the first send came.
     opened_at: u64,
+}
+
+/// An object that takes no more sends and is not stored yet.
+struct ClosedObject {
+    id: FreshObjectId,
+    bytes: Bytes,
+    partitions: BTreeSet<IggyNamespace>,
+    opened_at: u64,
+    /// Attempts started so far. The object holds an upload slot from its
+    /// first attempt until it settles.
+    attempts: u32,
+    /// The bus's monotonic clock when the first attempt started.
+    first_started_at: u64,
+    /// The scope of the attempt that runs. Dropping it ends the attempt.
+    running: Option<TierScope>,
+    /// When the next attempt starts, after one that failed.
+    retry_at: Option<u64>,
 }
 
 /// What a shard keeps for the upload-first produce path.
 pub struct FreshWrites {
     uploader: RefCell<Option<Rc<dyn FreshObjectUploader>>>,
     window: RefCell<Option<Window>>,
-    /// Whether an upload is in flight.
-    uploading: Cell<bool>,
+    /// The objects that wait for an upload slot, upload, or wait to be
+    /// tried again, by their number.
+    closed: RefCell<BTreeMap<u64, ClosedObject>>,
+    /// The sends of each partition that have not reached it, in the order
+    /// they came.
+    staged: RefCell<BTreeMap<IggyNamespace, VecDeque<StagedSend>>>,
+    /// The partitions whose first waiting send has its object stored and
+    /// found no room in the partition.
+    awaiting_room: RefCell<BTreeSet<IggyNamespace>>,
+    /// The sends of each partition held back for its rewrite backlog, in
+    /// the order they came. None of their bytes count as pending yet.
+    delayed: RefCell<BTreeMap<IggyNamespace, VecDeque<DelayedSend>>>,
+    /// Bytes of the messages of every waiting send.
+    pending_bytes: Cell<u64>,
+    /// [`Self::pending_bytes`] of each partition that has a waiting send.
+    partition_pending_bytes: RefCell<BTreeMap<IggyNamespace, u64>>,
+    staged_sends: Cell<usize>,
+    /// Objects that hold an upload slot.
+    uploads_in_flight: Cell<usize>,
+    uploads_max: Cell<usize>,
+    interval_micros: Cell<u64>,
+    /// The bus's monotonic clock when the last object started to upload.
+    last_upload_started_at: Cell<Option<u64>>,
     /// The next object's number.
     sequence: Cell<u64>,
     /// When this shard started, which keeps its ids apart from those of its
     /// earlier life.
     started_at: u64,
-    /// Never cancelled. An upload belongs to the sends of many partitions,
-    /// and each of them is checked again once the object is stored.
-    scope: TierScope,
     /// Results of uploads whose frame the inbox refused, for the next tick.
     undelivered: Rc<RefCell<Vec<FinishedFreshUpload>>>,
-    /// The objects that a send still waits on, each with how many: from the
-    /// start of its upload until every request it carries is answered. A
-    /// request in between may be in no journal yet, so nothing else says
-    /// that its object is needed.
+    /// The objects that hold the messages of a send that is not answered,
+    /// each with how many such sends: from the moment a send joins the open
+    /// window until it is refused or its request commits. A send in between
+    /// may be in no journal yet, so nothing else says that its object is
+    /// needed.
     awaited: Rc<RefCell<BTreeMap<u128, usize>>>,
 }
 
@@ -131,10 +233,19 @@ impl Default for FreshWrites {
         Self {
             uploader: RefCell::new(None),
             window: RefCell::new(None),
-            uploading: Cell::new(false),
+            closed: RefCell::default(),
+            staged: RefCell::default(),
+            awaiting_room: RefCell::default(),
+            delayed: RefCell::default(),
+            pending_bytes: Cell::new(0),
+            partition_pending_bytes: RefCell::default(),
+            staged_sends: Cell::new(0),
+            uploads_in_flight: Cell::new(0),
+            uploads_max: Cell::new(FRESH_UPLOADS),
+            interval_micros: Cell::new(micros(FRESH_UPLOAD_INTERVAL)),
+            last_upload_started_at: Cell::new(None),
             sequence: Cell::new(0),
             started_at: IggyTimestamp::now().as_micros(),
-            scope: TierScope::new(),
             undelivered: Rc::default(),
             awaited: Rc::default(),
         }
@@ -142,20 +253,137 @@ impl Default for FreshWrites {
 }
 
 impl FreshWrites {
-    /// The fresh objects that a send of this shard still waits on.
+    /// The fresh objects of this shard that the sweep must keep whatever
+    /// the partitions name: the open window, every object that is not
+    /// stored yet, and every object with a send that is not answered,
+    /// whether the send waits for its partition or for its commit.
     pub(crate) fn awaited_objects(&self) -> BTreeSet<u128> {
-        self.awaited.borrow().keys().copied().collect()
+        let mut objects: BTreeSet<u128> = self.awaited.borrow().keys().copied().collect();
+        objects.extend(self.window.borrow().as_ref().map(|window| window.id.get()));
+        objects.extend(self.closed.borrow().values().map(|object| object.id.get()));
+        objects
     }
-}
 
-/// One send of `object` was answered.
-fn settle_awaited(awaited: &RefCell<BTreeMap<u128, usize>>, object: u128) {
-    let mut awaited = awaited.borrow_mut();
-    if let Some(sends) = awaited.get_mut(&object) {
-        *sends -= 1;
-        if *sends == 0 {
-            awaited.remove(&object);
+    /// Keep `send` at the end of the queue of `namespace`, its bytes in the
+    /// share of its partition, and its object among the awaited ones.
+    fn stage_send(&self, namespace: IggyNamespace, send: StagedSend) {
+        *self
+            .awaited
+            .borrow_mut()
+            .entry(send.object_id.get())
+            .or_default() += 1;
+        self.pending_bytes
+            .set(self.pending_bytes.get() + send.bytes);
+        self.hold_in_share(namespace, send.bytes);
+        self.staged_sends.set(self.staged_sends.get() + 1);
+        self.staged
+            .borrow_mut()
+            .entry(namespace)
+            .or_default()
+            .push_back(send);
+    }
+
+    /// Whether the object `sequence` still takes sends or is not stored.
+    fn is_unsettled(&self, sequence: u64) -> bool {
+        self.closed.borrow().contains_key(&sequence)
+            || self
+                .window
+                .borrow()
+                .as_ref()
+                .is_some_and(|window| window.sequence == sequence)
+    }
+
+    /// Whether the upload interval has passed since the last upload started.
+    fn interval_passed(&self, now: u64) -> bool {
+        self.last_upload_started_at
+            .get()
+            .is_none_or(|started_at| now.saturating_sub(started_at) >= self.interval_micros.get())
+    }
+
+    const fn has_free_upload(&self) -> bool {
+        self.uploads_in_flight.get() < self.uploads_max.get()
+    }
+
+    /// Bytes of the messages of the waiting sends of `namespace`.
+    fn partition_pending(&self, namespace: IggyNamespace) -> u64 {
+        self.partition_pending_bytes
+            .borrow()
+            .get(&namespace)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count `bytes` of a waiting send of `namespace` in the share of its
+    /// partition.
+    fn hold_in_share(&self, namespace: IggyNamespace, bytes: u64) {
+        *self
+            .partition_pending_bytes
+            .borrow_mut()
+            .entry(namespace)
+            .or_default() += bytes;
+    }
+
+    /// Take `bytes` of a send of `namespace` that left out of the share of
+    /// its partition.
+    fn release_from_share(&self, namespace: IggyNamespace, bytes: u64) {
+        let mut partitions = self.partition_pending_bytes.borrow_mut();
+        if let Some(held) = partitions.get_mut(&namespace) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                partitions.remove(&namespace);
+            }
         }
+    }
+
+    /// Move the open window to the closed objects, where it waits for an
+    /// upload slot.
+    fn close_window(&self) -> Option<u64> {
+        let Window {
+            id,
+            sequence,
+            object,
+            partitions,
+            opened_at,
+        } = self.window.borrow_mut().take()?;
+        self.closed.borrow_mut().insert(
+            sequence,
+            ClosedObject {
+                id,
+                bytes: object.into_bytes(),
+                partitions,
+                opened_at,
+                attempts: 0,
+                first_started_at: 0,
+                running: None,
+                retry_at: None,
+            },
+        );
+        Some(sequence)
+    }
+
+    /// When the pump must look at the uploads again without an event: the
+    /// open window comes due, an object is tried again, an attempt runs out
+    /// of time, or a delayed send is due. On the bus's monotonic clock.
+    fn next_deadline(&self) -> Option<u64> {
+        let window_due = (self.window.borrow().is_some() && self.has_free_upload())
+            .then(|| self.last_upload_started_at.get())
+            .flatten()
+            .map(|started_at| started_at.saturating_add(self.interval_micros.get()));
+        let closed = self.closed.borrow();
+        let objects = closed.values().filter_map(|object| {
+            object.retry_at.or_else(|| {
+                object.running.is_some().then(|| {
+                    object
+                        .first_started_at
+                        .saturating_add(micros(FRESH_UPLOAD_DEADLINE))
+                })
+            })
+        });
+        let delayed = self.delayed.borrow();
+        let delayed = delayed
+            .values()
+            .filter_map(|sends| sends.front().map(|send| send.due_at));
+        objects.chain(window_due).chain(delayed).min()
     }
 }
 
@@ -179,6 +407,14 @@ where
         self.fresh_writes.uploader.borrow().clone()
     }
 
+    /// Set the shortest time between the starts of two uploads that no full
+    /// object forces, and how many uploads run at once. Fewer than one
+    /// upload counts as one.
+    pub fn set_fresh_upload_pace(&self, interval: Duration, uploads: usize) {
+        self.fresh_writes.interval_micros.set(micros(interval));
+        self.fresh_writes.uploads_max.set(uploads.max(1));
+    }
+
     /// Whether `request` is a send that goes to the object store before its
     /// partition: a `SendMessages` for a partition here that places its
     /// batches and that this replica leads. A backup answers such a send
@@ -196,23 +432,64 @@ where
 
     /// Add the messages of `request` to the open window, and keep the
     /// request that commits where they sit. Answers the producer here when
-    /// the send cannot be taken.
+    /// the send cannot be taken, and holds the send back a while when the
+    /// rewrites of its partition fell behind.
     pub(crate) fn offer_fresh_send(
         &self,
         request: Message<RoutedRequestHeader>,
         reply: SubmitReply,
     ) {
+        self.admit_fresh_send(request, reply, true);
+        self.drive_fresh_uploads();
+    }
+
+    /// [`Self::offer_fresh_send`] without starting an upload. `may_delay` is
+    /// false for a send that was held back once already.
+    fn admit_fresh_send(
+        &self,
+        request: Message<RoutedRequestHeader>,
+        reply: SubmitReply,
+        may_delay: bool,
+    ) {
         let header = *request.header();
         let deny = |error: &IggyError| {
+            self.metrics.record_fresh_send_denied();
             Self::answer_partition_submit_deny(&header, Some(reply.clone()), error);
         };
-        if self.fresh_writes.uploader.borrow().is_none() {
+        let fresh = &self.fresh_writes;
+        if fresh.uploader.borrow().is_none() {
             // The node does not pass the store identity check, which it may
             // pass again.
             deny(&IggyError::TransientNotAccepted);
             return;
         }
         let namespace = IggyNamespace::from_raw(header.group);
+        // Asked before any work on the messages: the partition would refuse
+        // the request after the upload, and the producer would have waited
+        // for an object that nothing names.
+        if !self
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(IggyPartition::takes_placed_sends)
+        {
+            deny(&IggyError::TransientNotAccepted);
+            return;
+        }
+        // Held before the share of its partition and the cap of the shard are
+        // checked, so its messages count in neither while it waits. Never
+        // refused: a producer answered as not accepted sends all of them
+        // again.
+        if may_delay && let Some(due_at) = self.fresh_send_due_at(namespace) {
+            self.hold_fresh_send(namespace, DelayedSend::new(request, reply, due_at));
+            return;
+        }
+        // By the size the request declares, which bounds its messages, so a
+        // shard that is full does not read the messages it turns away.
+        if self.fresh_send_over_pending_bytes(namespace, u64::from(header.size)) {
+            deny(&IggyError::TransientNotAccepted);
+            return;
+        }
         let admitted = match convert_request_message(namespace, request, ChecksumMode::Skip) {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -224,30 +501,35 @@ where
             deny(&IggyError::InvalidCommand);
             return;
         };
-        let mut slot = self.fresh_writes.window.borrow_mut();
-        if slot
+        let bytes = blob.len() as u64;
+        // A send is never split, and one that does not fit starts the next
+        // object.
+        if fresh
+            .window
+            .borrow()
             .as_ref()
-            .is_some_and(|window| window.object.len() + blob.len() as u64 > FRESH_PENDING_BYTES_MAX)
+            .is_some_and(|window| window.object.len() + bytes > FRESH_OBJECT_BYTES)
         {
-            deny(&IggyError::TransientNotAccepted);
-            return;
+            fresh.close_window();
         }
+        let mut slot = fresh.window.borrow_mut();
         if slot.is_none() {
-            let sequence = self.fresh_writes.sequence.get();
+            let sequence = fresh.sequence.get();
             let Some(id) = FreshObjectId::new(
                 self.partition_consensus.self_replica_id,
                 self.id,
-                self.fresh_writes.started_at,
+                fresh.started_at,
                 sequence,
             ) else {
                 deny(&IggyError::TransientNotAccepted);
                 return;
             };
-            self.fresh_writes.sequence.set(sequence + 1);
+            fresh.sequence.set(sequence + 1);
             *slot = Some(Window {
                 id,
-                object: FreshObject::new(),
-                sends: Vec::new(),
+                sequence,
+                object: FreshObject::with_capacity(blob.len()),
+                partitions: BTreeSet::new(),
                 opened_at: self.bus.monotonic_micros(),
             });
         }
@@ -264,75 +546,204 @@ where
             }
         };
         window.object.push(blob);
-        window.sends.push(PlacedSend {
-            request: placed,
-            reply,
-        });
+        window.partitions.insert(namespace);
+        let full = window.object.len() >= FRESH_OBJECT_BYTES;
+        fresh.stage_send(
+            namespace,
+            StagedSend {
+                request: placed,
+                reply,
+                object: window.sequence,
+                object_id: window.id,
+                bytes,
+            },
+        );
         drop(slot);
-        self.upload_fresh_window_if_due();
+        if full {
+            fresh.close_window();
+        }
     }
 
-    /// Start the upload of the open window when it is old or large enough
-    /// and no upload runs. The pump calls it on its tick, after a send, and
-    /// when an upload ends.
-    pub(crate) fn upload_fresh_window_if_due(&self) {
-        if self.fresh_writes.uploading.get() {
-            return;
-        }
-        let Some(uploader) = self.fresh_writes.uploader.borrow().clone() else {
-            return;
-        };
-        let window_micros = u64::try_from(FRESH_WINDOW.as_micros()).unwrap_or(u64::MAX);
+    /// When the shard takes a send to `namespace` that arrives now, if not
+    /// at once: after the sends to it that are held already, so none is
+    /// overtaken, and after the delay its rewrite backlog asks for.
+    fn fresh_send_due_at(&self, namespace: IggyNamespace) -> Option<u64> {
         let now = self.bus.monotonic_micros();
-        let due = self
+        let behind = self
             .fresh_writes
-            .window
+            .delayed
             .borrow()
-            .as_ref()
-            .is_some_and(|window| {
-                window.object.len() >= FRESH_OBJECT_BYTES
-                    || now.saturating_sub(window.opened_at) >= window_micros
-            });
-        if !due {
-            return;
-        }
-        // Looked up first: an upload that cannot report back is not started.
-        let Some(sender) = self.senders.get(self.id as usize).cloned() else {
-            return;
-        };
-        let Some(window) = self.fresh_writes.window.borrow_mut().take() else {
-            return;
-        };
-        self.fresh_writes.uploading.set(true);
-        let scope = self.fresh_writes.scope.token();
-        let undelivered = Rc::clone(&self.fresh_writes.undelivered);
-        let Window {
-            id,
-            object,
-            sends,
-            opened_at,
-        } = window;
+            .get(&namespace)
+            .and_then(|sends| sends.back().map(|send| send.due_at));
+        let backlog = self
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .and_then(IggyPartition::long_term_backlog)
+            .unwrap_or(0);
+        let delayed = backlog_delay(backlog, self.rewrite_pacing.borrow().backlog_limit())
+            .map(|delay| now.saturating_add(micros(delay)));
+        behind.max(delayed)
+    }
+
+    fn hold_fresh_send(&self, namespace: IggyNamespace, send: DelayedSend) {
         self.fresh_writes
-            .awaited
+            .delayed
             .borrow_mut()
-            .insert(id.get(), sends.len());
+            .entry(namespace)
+            .or_default()
+            .push_back(send);
+        self.metrics.record_long_term_delayed_send();
+    }
+
+    /// Take the held sends whose delay is over, in the order they came to
+    /// each partition.
+    fn release_delayed_fresh_sends(&self, now: u64) {
+        let released = {
+            let mut delayed = self.fresh_writes.delayed.borrow_mut();
+            let mut released = Vec::new();
+            delayed.retain(|_, sends| {
+                while sends.front().is_some_and(|send| send.due_at <= now) {
+                    released.extend(sends.pop_front());
+                }
+                !sends.is_empty()
+            });
+            released
+        };
+        for DelayedSend { request, reply, .. } in released {
+            self.admit_fresh_send(request, reply, false);
+        }
+    }
+
+    /// Whether a send of `size` bytes to `namespace` would take the waiting
+    /// sends of its partition past [`FRESH_PARTITION_PENDING_BYTES_MAX`], or
+    /// those of the shard past [`FRESH_PENDING_BYTES_MAX`]. Counts the bound
+    /// it passes. A send larger than a bound still gets in while nothing
+    /// that counts against it waits.
+    fn fresh_send_over_pending_bytes(&self, namespace: IggyNamespace, size: u64) -> bool {
+        let fresh = &self.fresh_writes;
+        let partition_pending = fresh.partition_pending(namespace);
+        if partition_pending > 0
+            && partition_pending.saturating_add(size) > FRESH_PARTITION_PENDING_BYTES_MAX
+        {
+            self.metrics.record_fresh_send_over_partition_share();
+            return true;
+        }
+        let pending = fresh.pending_bytes.get();
+        if pending > 0 && pending.saturating_add(size) > FRESH_PENDING_BYTES_MAX {
+            self.metrics.record_fresh_send_over_shard_cap();
+            return true;
+        }
+        false
+    }
+
+    /// When the pump must call [`Self::drive_fresh_uploads`] again without
+    /// an event, on the bus's monotonic clock.
+    pub(crate) fn fresh_uploads_deadline(&self) -> Option<u64> {
+        self.fresh_writes.next_deadline()
+    }
+
+    /// Start every upload that is due and has a slot: the objects that wait
+    /// to be tried again, then the closed objects in their order, then the
+    /// open window once the upload interval has passed. Gives up the objects
+    /// whose attempt ran out of time. Takes the held sends that are due
+    /// first. The pump calls it after a send, when an upload ends, at
+    /// [`Self::fresh_uploads_deadline`] and on its tick.
+    pub(crate) fn drive_fresh_uploads(&self) {
+        let fresh = &self.fresh_writes;
+        let now = self.bus.monotonic_micros();
+        self.release_delayed_fresh_sends(now);
+        let mut starts = Vec::new();
+        let mut expired = Vec::new();
+        for (sequence, object) in fresh.closed.borrow_mut().iter_mut() {
+            if object.retry_at.is_some_and(|retry_at| retry_at <= now) {
+                object.retry_at = None;
+                starts.push(*sequence);
+            } else if object.running.is_some()
+                && now.saturating_sub(object.first_started_at) >= micros(FRESH_UPLOAD_DEADLINE)
+            {
+                expired.push(*sequence);
+            }
+        }
+        for sequence in expired {
+            tracing::warn!(
+                shard = self.id,
+                "storing a fresh object took too long; its sends are answered as not accepted"
+            );
+            // Dropping the object drops the scope of its attempt, which
+            // cancels the attempt and frees its slot in the tier service.
+            // The producers are answered here and not when the cancelled
+            // attempt reports, which an uploader may never do.
+            self.fail_fresh_object(sequence);
+        }
+        let free = fresh
+            .uploads_max
+            .get()
+            .saturating_sub(fresh.uploads_in_flight.get());
+        starts.extend(
+            fresh
+                .closed
+                .borrow()
+                .iter()
+                .filter(|(_, object)| object.attempts == 0)
+                .take(free)
+                .map(|(sequence, _)| *sequence),
+        );
+        for sequence in starts {
+            self.start_fresh_upload(sequence, now);
+        }
+        if fresh.has_free_upload()
+            && fresh.interval_passed(now)
+            && let Some(sequence) = fresh.close_window()
+        {
+            self.start_fresh_upload(sequence, now);
+        }
         self.metrics
-            .record_fresh_window_wait(Duration::from_micros(now.saturating_sub(opened_at)));
-        let size = object.len();
+            .set_fresh_load(fresh.uploads_in_flight.get(), fresh.staged_sends.get());
+    }
+
+    /// Start an attempt at storing the closed object `sequence`.
+    fn start_fresh_upload(&self, sequence: u64, now: u64) {
+        let fresh = &self.fresh_writes;
+        let uploader = fresh.uploader.borrow().clone();
+        let sender = self.senders.get(self.id as usize).cloned();
+        let (Some(uploader), Some(sender)) = (uploader, sender) else {
+            // Without the uploader the node lost the store identity check,
+            // and an upload that cannot report back must not start.
+            self.fail_fresh_object(sequence);
+            return;
+        };
+        let scope = TierScope::new();
+        let token = scope.token();
+        let (id, bytes) = {
+            let mut closed = fresh.closed.borrow_mut();
+            let Some(object) = closed.get_mut(&sequence) else {
+                return;
+            };
+            if object.attempts == 0 {
+                object.first_started_at = now;
+                fresh
+                    .uploads_in_flight
+                    .set(fresh.uploads_in_flight.get() + 1);
+                fresh.last_upload_started_at.set(Some(now));
+                self.metrics.record_fresh_window_wait(Duration::from_micros(
+                    now.saturating_sub(object.opened_at),
+                ));
+            }
+            object.attempts += 1;
+            object.running = Some(scope);
+            (object.id, object.bytes.clone())
+        };
+        let undelivered = Rc::clone(&fresh.undelivered);
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
         self.bus.spawn(async move {
-            let bytes = object.into_bytes();
             let finished = Box::new(FinishedFreshUpload {
-                object_id: id,
-                bytes: bytes.clone(),
-                sends,
-                outcome: uploader.upload(id, bytes, scope).await,
-                size,
-                started_at: now,
+                sequence,
+                outcome: uploader.upload(id, bytes, token).await,
             });
             let frame = ShardFrame::lifecycle(LifecycleFrame::FreshUploadFinished(finished));
-            // The producers of the window wait for this result, so a refused
+            // The producers of the object wait for this result, so a refused
             // frame must not lose it.
             if let Err(
                 crossfire::TrySendError::Full(frame) | crossfire::TrySendError::Disconnected(frame),
@@ -345,7 +756,10 @@ where
     }
 
     /// The pump's tick: settle the uploads whose frame the inbox refused,
-    /// and close the window when it is due.
+    /// look at every partition with waiting sends, and start the uploads
+    /// that are due. Everything here also runs on its own event, so the
+    /// tick only catches what an event missed, such as a partition that
+    /// lost primacy while its sends wait for an upload.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_fresh_writes(&self)
     where
@@ -358,11 +772,17 @@ where
         for finished in undelivered {
             self.on_fresh_upload_finished(finished).await;
         }
-        self.upload_fresh_window_if_due();
+        let staged: Vec<_> = self.fresh_writes.staged.borrow().keys().copied().collect();
+        for namespace in staged {
+            self.feed_staged_sends(namespace).await;
+        }
+        self.drive_fresh_uploads();
     }
 
-    /// Hand the sends of a stored object to their partitions, in the order
-    /// they came, or answer every producer of an object the store refused.
+    /// Settle an attempt at storing an object: release the sends of a
+    /// stored object to their partitions, start the next attempt at one the
+    /// store failed for a passing reason, or answer every producer of an
+    /// object that failed for good.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_fresh_upload_finished(&self, finished: FinishedFreshUpload)
     where
@@ -371,53 +791,185 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        self.fresh_writes.uploading.set(false);
-        let stored = match &finished.outcome {
-            Ok(Ok(())) => true,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    shard = self.id,
-                    sends = finished.sends.len(),
-                    %error,
-                    "storing a fresh object failed; its sends are answered as not accepted"
-                );
-                false
+        let fresh = &self.fresh_writes;
+        let sequence = finished.sequence;
+        let now = self.bus.monotonic_micros();
+        let stored = {
+            let mut closed = fresh.closed.borrow_mut();
+            let Some(object) = closed.get_mut(&sequence) else {
+                return;
+            };
+            object.running = None;
+            match &finished.outcome {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => {
+                    let delay = micros(FRESH_UPLOAD_RETRY_DELAY)
+                        .saturating_mul(1_u64 << object.attempts.saturating_sub(1).min(16));
+                    let retry_at = now.saturating_add(delay);
+                    if error.class() == ErrorClass::Transient
+                        && object.attempts < FRESH_UPLOAD_ATTEMPTS
+                        && retry_at.saturating_sub(object.first_started_at)
+                            < micros(FRESH_UPLOAD_DEADLINE)
+                    {
+                        tracing::debug!(
+                            shard = self.id,
+                            attempt = object.attempts,
+                            %error,
+                            "storing a fresh object failed; trying again under the same id"
+                        );
+                        object.retry_at = Some(retry_at);
+                        self.metrics.record_fresh_upload_retry();
+                        return;
+                    }
+                    tracing::warn!(
+                        shard = self.id,
+                        attempts = object.attempts,
+                        %error,
+                        "storing a fresh object failed; its sends are answered as not accepted"
+                    );
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        shard = self.id,
+                        attempts = object.attempts,
+                        "the upload of a fresh object was cancelled; its sends are answered \
+                         as not accepted"
+                    );
+                    false
+                }
             }
-            Err(_) => false,
         };
-        self.metrics.record_fresh_upload(
-            finished.size,
-            Duration::from_micros(
-                self.bus
-                    .monotonic_micros()
-                    .saturating_sub(finished.started_at),
-            ),
-            stored,
-        );
+        let Some(object) = (if stored {
+            self.take_settled_fresh_object(sequence, true)
+        } else {
+            self.fail_fresh_object(sequence)
+        }) else {
+            return;
+        };
         // A consumer at the tail polls these batches next, and this shard
         // holds their messages already.
         if stored && let Some(remote) = self.plane.partitions().remote_segments() {
-            remote.cache_fresh_object(finished.object_id.get(), finished.bytes);
+            remote.cache_fresh_object(object.id.get(), object.bytes);
         }
-        let object = finished.object_id.get();
-        for PlacedSend { request, reply } in finished.sends {
-            if !stored {
-                settle_awaited(&self.fresh_writes.awaited, object);
-                Self::answer_partition_submit_deny(
-                    request.header(),
-                    Some(reply),
-                    &IggyError::TransientNotAccepted,
-                );
-                continue;
+        for namespace in object.partitions {
+            self.feed_staged_sends(namespace).await;
+        }
+        self.drive_fresh_uploads();
+    }
+
+    /// Take the closed object `sequence` out, give its upload slot back and
+    /// count its upload.
+    fn take_settled_fresh_object(&self, sequence: u64, stored: bool) -> Option<ClosedObject> {
+        let fresh = &self.fresh_writes;
+        let object = fresh.closed.borrow_mut().remove(&sequence)?;
+        if object.attempts > 0 {
+            fresh
+                .uploads_in_flight
+                .set(fresh.uploads_in_flight.get().saturating_sub(1));
+            self.metrics.record_fresh_upload(
+                object.bytes.len() as u64,
+                Duration::from_micros(
+                    self.bus
+                        .monotonic_micros()
+                        .saturating_sub(object.first_started_at),
+                ),
+                stored,
+            );
+        }
+        Some(object)
+    }
+
+    /// Give the object `sequence` up: answer its sends as not accepted, and
+    /// with them the later sends of the same partitions. A later send that
+    /// committed would sit ahead of the earlier one its producer sends
+    /// again.
+    fn fail_fresh_object(&self, sequence: u64) -> Option<ClosedObject> {
+        let object = self.take_settled_fresh_object(sequence, false)?;
+        for namespace in &object.partitions {
+            let denied = self
+                .fresh_writes
+                .staged
+                .borrow_mut()
+                .get_mut(namespace)
+                .map(|queue| {
+                    let first = queue.partition_point(|send| send.object < sequence);
+                    queue.split_off(first)
+                });
+            for send in denied.into_iter().flatten() {
+                self.deny_staged_send(*namespace, send);
             }
+        }
+        Some(object)
+    }
+
+    /// Hand the waiting sends of `namespace` to its partition, in the order
+    /// they came: each one whose object is stored, while the partition has
+    /// room for a request. Answers them all as not accepted when the
+    /// partition no longer takes placed sends.
+    #[allow(clippy::future_not_send)]
+    async fn feed_staged_sends(&self, namespace: IggyNamespace)
+    where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        let fresh = &self.fresh_writes;
+        loop {
+            let partitions = self.plane.partitions();
+            let room = partitions.get_by_ns(&namespace).and_then(|partition| {
+                partition
+                    .takes_placed_sends()
+                    .then(|| partition.has_request_room())
+            });
+            let Some(room) = room else {
+                fresh.awaiting_room.borrow_mut().remove(&namespace);
+                let dropped = fresh.staged.borrow_mut().remove(&namespace);
+                for send in dropped.into_iter().flatten() {
+                    self.deny_staged_send(namespace, send);
+                }
+                return;
+            };
+            let send = {
+                let mut staged = fresh.staged.borrow_mut();
+                let head = staged
+                    .get(&namespace)
+                    .and_then(|queue| queue.front().map(|send| send.object));
+                let Some(object) = head else {
+                    staged.remove(&namespace);
+                    fresh.awaiting_room.borrow_mut().remove(&namespace);
+                    return;
+                };
+                if fresh.is_unsettled(object) {
+                    fresh.awaiting_room.borrow_mut().remove(&namespace);
+                    return;
+                }
+                if !room {
+                    fresh.awaiting_room.borrow_mut().insert(namespace);
+                    return;
+                }
+                staged.get_mut(&namespace).and_then(VecDeque::pop_front)
+            };
+            let Some(StagedSend {
+                request,
+                reply,
+                object_id,
+                bytes,
+                ..
+            }) = send
+            else {
+                return;
+            };
+            self.release_staged_send(namespace, bytes);
             let (sender, receiver) = consensus::oneshot_channel();
-            self.plane
-                .partitions()
+            partitions
                 .on_placed_request_with_reply(request, Some(sender))
                 .await;
             // Awaited off the pump, as for any other submit: the commit that
             // fires the receiver needs the pump to keep draining acks.
-            let awaited = Rc::clone(&self.fresh_writes.awaited);
+            let awaited = Rc::clone(&fresh.awaited);
+            let object = object_id.get();
             let commit_latency = self.metrics.fresh_commit_latency();
             let handed_at = Instant::now();
             self.bus.spawn(async move {
@@ -426,7 +978,88 @@ where
                 settle_awaited(&awaited, object);
                 let _ = reply.try_send(committed);
             });
+            // An object can hold thousands of sends, and the tasks and
+            // timers of the shard must not wait for all of them.
+            self.cooperate().await;
         }
-        self.upload_fresh_window_if_due();
     }
+
+    /// Hand over the sends of the partitions that had no room, where room
+    /// came since. The pump calls it after every event, because the commit
+    /// that frees a partition's room is one.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn feed_fresh_sends_awaiting_room(&self)
+    where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        if self.fresh_writes.awaiting_room.borrow().is_empty() {
+            return;
+        }
+        let awaiting: Vec<_> = self
+            .fresh_writes
+            .awaiting_room
+            .borrow()
+            .iter()
+            .copied()
+            .collect();
+        for namespace in awaiting {
+            self.feed_staged_sends(namespace).await;
+        }
+        self.metrics.set_fresh_load(
+            self.fresh_writes.uploads_in_flight.get(),
+            self.fresh_writes.staged_sends.get(),
+        );
+    }
+
+    /// A waiting send of `namespace` left: its bytes no longer count.
+    fn release_staged_send(&self, namespace: IggyNamespace, bytes: u64) {
+        let fresh = &self.fresh_writes;
+        fresh
+            .pending_bytes
+            .set(fresh.pending_bytes.get().saturating_sub(bytes));
+        fresh.release_from_share(namespace, bytes);
+        fresh
+            .staged_sends
+            .set(fresh.staged_sends.get().saturating_sub(1));
+    }
+
+    fn deny_staged_send(&self, namespace: IggyNamespace, send: StagedSend) {
+        self.release_staged_send(namespace, send.bytes);
+        settle_awaited(&self.fresh_writes.awaited, send.object_id.get());
+        self.metrics.record_fresh_send_denied();
+        Self::answer_partition_submit_deny(
+            send.request.header(),
+            Some(send.reply),
+            &IggyError::TransientNotAccepted,
+        );
+    }
+
+    /// Bytes of the messages of the waiting sends of `namespace`, and of
+    /// every waiting send.
+    #[cfg(test)]
+    pub(crate) fn fresh_pending_bytes(&self, namespace: IggyNamespace) -> (u64, u64) {
+        let fresh = &self.fresh_writes;
+        (
+            fresh.partition_pending(namespace),
+            fresh.pending_bytes.get(),
+        )
+    }
+}
+
+/// One send of `object` was answered.
+fn settle_awaited(awaited: &RefCell<BTreeMap<u128, usize>>, object: u128) {
+    let mut awaited = awaited.borrow_mut();
+    if let Some(sends) = awaited.get_mut(&object) {
+        *sends -= 1;
+        if *sends == 0 {
+            awaited.remove(&object);
+        }
+    }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }

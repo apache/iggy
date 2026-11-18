@@ -25,6 +25,7 @@ publish = false
 [dependencies]
 bench-report = { workspace = true }
 blake3 = { workspace = true }
+charming = { workspace = true }
 chrono = { workspace = true }
 human-repr = { workspace = true }
 semver = { workspace = true }
