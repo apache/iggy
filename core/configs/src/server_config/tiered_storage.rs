@@ -49,6 +49,12 @@ const RETRY_DELAY_BOUNDS: RangeInclusive<Duration> =
 /// before its messages are stored, so a longer one would only answer late.
 const FRESH_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(10);
 
+/// The smallest `long_term_backlog_limit` other than zero: what one
+/// long-term segment holds at most. A rewrite stores one segment at a time,
+/// so a lower limit would slow the sends to a partition whose rewrites keep
+/// up.
+pub const LONG_TERM_BACKLOG_LIMIT_MIN: u64 = 64 * 1024 * 1024;
+
 /// The object store that tiered storage keeps segments in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +180,13 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_fresh_upload_interval")]
     #[config_env(leaf)]
     pub fresh_upload_interval: IggyDuration,
+    /// The bytes of messages one partition that stores them in fresh
+    /// objects may have committed that no long-term segment holds yet. Past
+    /// it, the primary delays the sends to that partition. Zero turns the
+    /// delay off. Otherwise at least [`LONG_TERM_BACKLOG_LIMIT_MIN`].
+    #[serde(default = "default_long_term_backlog_limit")]
+    #[config_env(leaf)]
+    pub long_term_backlog_limit: IggyByteSize,
 }
 
 /// How many jobs of each class the tier service of one shard runs at once,
@@ -236,6 +249,7 @@ impl Default for TieredStorageConfig {
             retry_delay: default_retry_delay(),
             max_retry_delay: default_max_retry_delay(),
             fresh_upload_interval: default_fresh_upload_interval(),
+            long_term_backlog_limit: default_long_term_backlog_limit(),
         }
     }
 }
@@ -282,7 +296,7 @@ impl Display for TieredStorageConfig {
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
              url_style: {}, credentials: {}, jobs: {}, request_timeout: {}, \
              progress_timeout: {}, max_attempts: {}, retry_delay: {}, max_retry_delay: {}, \
-             fresh_upload_interval: {} }}",
+             fresh_upload_interval: {}, long_term_backlog_limit: {} }}",
             self.backend,
             self.prefix,
             self.path,
@@ -298,6 +312,7 @@ impl Display for TieredStorageConfig {
             self.retry_delay,
             self.max_retry_delay,
             self.fresh_upload_interval,
+            self.long_term_backlog_limit,
         )
     }
 }
@@ -409,6 +424,13 @@ impl TieredStorageConfig {
                 IggyDuration::new(FRESH_UPLOAD_INTERVAL_MAX)
             ));
         }
+        let backlog_limit = self.long_term_backlog_limit.as_bytes_u64();
+        if backlog_limit != 0 && backlog_limit < LONG_TERM_BACKLOG_LIMIT_MIN {
+            return refuse(&format!(
+                "long_term_backlog_limit must be 0 or at least {}",
+                IggyByteSize::from(LONG_TERM_BACKLOG_LIMIT_MIN)
+            ));
+        }
         Ok(())
     }
 }
@@ -444,6 +466,10 @@ fn default_max_retry_delay() -> IggyDuration {
 
 fn default_fresh_upload_interval() -> IggyDuration {
     IggyDuration::new(Duration::from_millis(10))
+}
+
+fn default_long_term_backlog_limit() -> IggyByteSize {
+    IggyByteSize::from(1024 * 1024 * 1024)
 }
 
 const fn default_demand_fetches() -> u32 {
@@ -699,6 +725,45 @@ mod tests {
         assert!(none.validate().is_ok(), "{none}");
         assert!(longest.validate().is_ok(), "{longest}");
         assert!(too_long.validate().is_err(), "{too_long}");
+    }
+
+    #[test]
+    fn given_no_long_term_backlog_limit_when_reading_the_section_should_use_its_default() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
+
+        assert_eq!(config.long_term_backlog_limit.as_bytes_u64(), 1 << 30);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_a_long_term_backlog_limit_when_reading_the_section_should_take_it() {
+        let config: TieredStorageConfig = serde_json::from_str(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered", "long_term_backlog_limit": "2 GiB"}"#,
+        )
+        .unwrap();
+        let unreadable = serde_json::from_str::<TieredStorageConfig>(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered", "long_term_backlog_limit": "lots"}"#,
+        );
+
+        assert_eq!(config.long_term_backlog_limit.as_bytes_u64(), 2 << 30);
+        assert!(config.validate().is_ok());
+        assert!(unreadable.is_err());
+    }
+
+    #[test]
+    fn given_a_long_term_backlog_limit_when_validating_should_accept_zero_and_refuse_less_than_a_segment()
+     {
+        let limit = |text: &str| TieredStorageConfig {
+            long_term_backlog_limit: text.parse().unwrap(),
+            ..fs_config()
+        };
+
+        assert_eq!(limit("0").long_term_backlog_limit.as_bytes_u64(), 0);
+        assert!(limit("0").validate().is_ok(), "zero turns the delay off");
+        assert!(limit("64 MiB").validate().is_ok());
+        assert!(limit("1 B").validate().is_err());
+        assert!(limit("67108863 B").validate().is_err());
     }
 
     #[test]

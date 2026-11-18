@@ -27,8 +27,10 @@ use crate::dispatch::reads::{
 use crate::shell::ServerShard;
 use bytes::Bytes;
 use consensus::MetadataHandle;
-use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codes::GET_STATS_CODE;
+use iggy_binary_protocol::primitives::page::{MAX_PAGE_LIMIT, WirePageQuery};
+use iggy_binary_protocol::responses::PageResponse;
+use iggy_binary_protocol::{WireDecode, WireIdentifier};
 use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{Identifier, IggyError};
 use message_bus::MessageBus;
@@ -36,6 +38,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use send_wrapper::SendWrapper;
 use server_common::sharding::IggyNamespace;
+use server_common::yield_to_reactor;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -152,6 +155,58 @@ pub(in crate::http) async fn read_local(
     {
         NonReplicatedResponse::Empty => Err(ReadError::NotFound),
         NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
+    }
+}
+
+/// Every item of a list route for a request without `limit` and `cursor`:
+/// the bare array of the legacy server, read from the page builder in pages
+/// of [`MAX_PAGE_LIMIT`]. `first` is the page block of the request, with its
+/// order, direction and name filter. `request` builds the body of one page
+/// read.
+///
+/// The gates run once, as for [`read_local`]. Between two pages the task hands
+/// the core back to the reactor, so a long list does not hold the shard
+/// thread. The rule then runs again, because the account and its grants can
+/// change during that await (see [`authorize_read`]). The reply is not one
+/// consistent read.
+pub(in crate::http) async fn read_whole_list<W: WireDecode>(
+    state: &HttpInner,
+    identity: &Identity,
+    consistency: Consistency,
+    code: u32,
+    first: WirePageQuery,
+    request: impl Fn(WirePageQuery) -> Bytes,
+    rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
+) -> Result<Vec<W>, ReadError> {
+    gate_local_read(state, identity, consistency, code, &rule).await?;
+    let mut page = WirePageQuery {
+        limit: MAX_PAGE_LIMIT,
+        ..first
+    };
+    let mut items = Vec::new();
+    loop {
+        let NonReplicatedResponse::Bytes(bytes) = build_non_replicated_response(
+            &state.shard,
+            code,
+            &request(page.clone()),
+            Some(identity.user_id),
+            &state.roster,
+            identity.client_ip,
+            0,
+        )
+        .map_err(ReadError::Rejected)?
+        else {
+            return Err(ReadError::NotFound);
+        };
+        let reply = PageResponse::<W>::decode_from(&bytes)
+            .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+        items.extend(reply.items);
+        let Some(next) = reply.next else {
+            return Ok(items);
+        };
+        page.cursor = Some(next);
+        yield_to_reactor().await;
+        authorize_read(state, identity, consistency, &rule)?;
     }
 }
 
@@ -587,9 +642,9 @@ pub(in crate::http) mod tests {
     use hyper::service::Service as _;
     use hyper_util::service::TowerToHyperService;
     use iggy_binary_protocol::codes::{
-        DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-        GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-        GET_USER_CODE, GET_USERS_CODE,
+        DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PARTITIONS_CODE,
+        GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+        GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
     };
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
@@ -1561,6 +1616,7 @@ pub(in crate::http) mod tests {
             GET_STREAM_CODE,
             GET_TOPICS_CODE,
             GET_TOPIC_CODE,
+            GET_PARTITIONS_CODE,
             GET_USERS_CODE,
             GET_USER_CODE,
             GET_CONSUMER_GROUPS_CODE,

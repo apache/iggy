@@ -243,6 +243,7 @@ cc_test(
         ],
     }),
     data = [
+        "tests/fixtures/list_pages.json",
         "tests/fixtures/metadata_changes.json",
         "tests/fixtures/resource_options.json",
     ],

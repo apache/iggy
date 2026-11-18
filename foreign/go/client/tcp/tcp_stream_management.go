@@ -27,12 +27,17 @@ import (
 )
 
 func (c *IggyTcpClient) GetStreams(ctx context.Context) ([]iggcon.Stream, error) {
-	buffer, err := c.do(ctx, &command.GetStreams{})
+	return readWholeList(ctx, c, func(ctx context.Context, query iggcon.PageQuery) (*iggcon.Page[iggcon.Stream], error) {
+		return c.GetStreamsPage(ctx, iggcon.NamedPageQuery{PageQuery: query})
+	})
+}
+
+func (c *IggyTcpClient) GetStreamsPage(ctx context.Context, query iggcon.NamedPageQuery) (*iggcon.Page[iggcon.Stream], error) {
+	buffer, err := c.do(ctx, &command.GetStreams{Query: query})
 	if err != nil {
 		return nil, err
 	}
-
-	return binaryserialization.DeserializeStreams(buffer)
+	return binaryserialization.DeserializeStreamsPage(buffer)
 }
 
 func (c *IggyTcpClient) GetStream(ctx context.Context, streamId iggcon.Identifier) (*iggcon.StreamDetails, error) {

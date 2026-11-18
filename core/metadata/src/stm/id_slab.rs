@@ -30,6 +30,7 @@
 //! occupied set, which is exactly what a snapshot carries. Restored and live
 //! arenas agree by construction.
 
+use crate::stm::walk::Directed;
 use std::collections::BTreeSet;
 use std::ops::{Index, IndexMut};
 
@@ -155,6 +156,27 @@ impl<T> IdSlab<T> {
         Iter { inner }
     }
 
+    /// Occupied keys below `key`, ascending; `.rev()` walks them descending.
+    #[must_use]
+    pub fn iter_before(&self, key: usize) -> Iter<'_, T> {
+        Iter {
+            inner: self.entries[..key.min(self.entries.len())]
+                .iter()
+                .enumerate(),
+        }
+    }
+
+    /// Occupied entries after `after` in one direction. An id page walks this.
+    #[must_use]
+    pub fn walk(&self, after: Option<usize>, descending: bool) -> Directed<Iter<'_, T>> {
+        let iter = match after {
+            None => self.iter(),
+            Some(key) if descending => self.iter_before(key),
+            Some(key) => self.iter_from(key.saturating_add(1)),
+        };
+        Directed::new(iter, descending)
+    }
+
     /// Ascending by key.
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
@@ -175,6 +197,17 @@ impl<'a, T> Iterator for Iter<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let (key, slot) = self.inner.next()?;
+            if let Some(value) = slot {
+                return Some((key, value));
+            }
+        }
+    }
+}
+
+impl<T> DoubleEndedIterator for Iter<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            let (key, slot) = self.inner.next_back()?;
             if let Some(value) = slot {
                 return Some((key, value));
             }
@@ -309,6 +342,38 @@ mod tests {
         assert_eq!(keys(3), [3]);
         assert_eq!(keys(4), [] as [usize; 0]);
         assert_eq!(keys(usize::MAX), [] as [usize; 0]);
+    }
+
+    #[test]
+    fn given_gaps_when_walking_after_a_key_should_yield_occupied_keys_past_it_in_both_directions() {
+        let mut slab: IdSlab<char> = IdSlab::new();
+        for value in ['a', 'b', 'c', 'd', 'e', 'f'] {
+            slab.insert(value);
+        }
+        slab.remove(0);
+        slab.remove(3);
+
+        let walk = |after, descending| {
+            slab.walk(after, descending)
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(walk(None, false), [1, 2, 4, 5]);
+        assert_eq!(walk(None, true), [5, 4, 2, 1]);
+        assert_eq!(walk(Some(3), false), [4, 5], "a vacant key still splits");
+        assert_eq!(walk(Some(3), true), [2, 1]);
+        assert_eq!(walk(Some(1), true), [] as [usize; 0]);
+        assert_eq!(walk(Some(5), false), [] as [usize; 0]);
+        assert_eq!(walk(Some(usize::MAX), false), [] as [usize; 0]);
+        assert_eq!(walk(Some(usize::MAX), true), [5, 4, 2, 1]);
+        for after in 0..8 {
+            let mut ascending = walk(Some(after), false);
+            ascending.extend(walk(Some(after), true));
+            ascending.extend(slab.get(after).map(|_| after));
+            ascending.sort_unstable();
+            assert_eq!(ascending, walk(None, false), "after {after}");
+        }
     }
 
     /// The property the type exists for. `Slab` fails it: LIFO reuse makes the

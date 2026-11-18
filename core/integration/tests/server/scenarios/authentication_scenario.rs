@@ -290,6 +290,10 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                     .delete_partitions(&ctx.stream_id, &ctx.topic_id, 1)
                     .await
             }
+            GET_PARTITIONS_CODE => client
+                .get_partitions_page(&ctx.stream_id, &ctx.topic_id, &PageQuery::default())
+                .await
+                .map(|_| ()),
 
             // Messages
             GET_PARTITION_ROUTE_CODE => client

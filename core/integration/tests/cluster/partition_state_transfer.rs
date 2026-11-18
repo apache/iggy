@@ -92,7 +92,7 @@ const ABANDON_MARKER: &str =
 /// The second route off a dead transfer peer. A replica parked in
 /// `AwaitingTarget` re-arms the moment it adopts a StartView, and with the
 /// stock config that beats the stall budget every time: the budget needs six
-/// rounds of `repair_retry_interval` (~6s) while `heartbeat_timeout` elects
+/// rounds of `repair_retry_interval` (~6s) while `commit_busy_heartbeat_timeout` elects
 /// the new primary in 5s. Both routes prove the same thing - the replica did
 /// not retry into the corpse - so a spec that pins one is asserting on
 /// scheduler luck.

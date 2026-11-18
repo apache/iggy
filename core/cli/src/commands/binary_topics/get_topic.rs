@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::commands::binary_partitions::get_partitions::partitions_table;
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -133,32 +134,9 @@ fn topic_table(topic: &TopicDetails) -> Table {
     ]);
 
     if !topic.partitions.is_empty() {
-        let mut partitions_table = Table::new();
-        partitions_table.load_style(ASCII_NO_BORDERS);
-        partitions_table.set_header(vec![
-            "Partition id",
-            "Created",
-            "Segments count",
-            "Current offset",
-            "Size",
-            "Messages count",
-            "Members",
-            "In sync",
-        ]);
-
-        for partition in &topic.partitions {
-            partitions_table.add_row(vec![
-                partition.id.to_string(),
-                partition.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
-                partition.segments_count.to_string(),
-                partition.current_offset.to_string(),
-                partition.size.to_string(),
-                partition.messages_count.to_string(),
-                node_list(&partition.members),
-                node_list(&partition.in_sync_members),
-            ]);
-        }
-        table.add_row(vec!["Partitions", partitions_table.to_string().as_str()]);
+        let mut partitions = partitions_table(&topic.partitions);
+        partitions.load_style(ASCII_NO_BORDERS);
+        table.add_row(vec!["Partitions", partitions.to_string().as_str()]);
     }
 
     if !topic.options.is_empty() {
@@ -181,18 +159,6 @@ fn topic_table(topic: &TopicDetails) -> Table {
     }
 
     table
-}
-
-/// Node ids as `0,2,4`, or `-` for none.
-fn node_list(nodes: &[u8]) -> String {
-    if nodes.is_empty() {
-        return "-".to_owned();
-    }
-    nodes
-        .iter()
-        .map(u8::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 #[cfg(test)]

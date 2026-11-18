@@ -28,7 +28,7 @@ The package installation and API examples target server/SDK 0.9.0. For source bu
 from the same checkout. The SDK targets .NET 8 and .NET 10. Repository examples require .NET 10.
 `0.9.0` includes the independent message and consumer-offset durability options.
 
-This checkout uses binary protocol 0.12.2. Servers and applicable SDKs must deploy together. Mixed versions and
+This checkout uses binary protocol 0.12.3. Servers and applicable SDKs must deploy together. Mixed versions and
 rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
 without modification. `--fresh` deletes existing data in the configured directory.
 See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
@@ -293,7 +293,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Within one call deadline, the SDK retries an unresolved replicated mutation using its original session,
@@ -1020,6 +1020,37 @@ Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `X
 
 Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`,
 `All`.
+
+### List Pages
+
+`GetStreamsAsync`, `GetTopicsAsync`, `GetConsumerGroupsAsync` and `GetUsersAsync` return a whole list. Over TCP, each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the walk can appear or not appear. Every page keeps the sign-in and the call deadline that the walk started with. If the server answers a page with the same cursor that the client sent, the walk fails with a `MalformedResponseException`.
+
+Over HTTP, they read the whole list in one reply. The server builds that reply from pages of 1,000 items, so it is not one consistent read either.
+
+`GetStreamsPageAsync`, `GetTopicsPageAsync`, `GetPartitionsPageAsync`, `GetConsumerGroupsPageAsync` and `GetUsersPageAsync` return one page. To read the next page, send the same query with the `Next` of the page as its cursor. A page can be empty and still have a `Next`.
+
+```c#
+var query = new NamedPageQuery();
+while (true)
+{
+    var page = await client.GetStreamsPageAsync(query);
+    foreach (var stream in page.Items)
+    {
+        Console.WriteLine($"{stream.Id} {stream.Name}");
+    }
+
+    if (page.Next is null)
+    {
+        break;
+    }
+
+    query = query with { Page = query.Page with { Cursor = page.Next } };
+}
+```
+
+A `PageQuery` holds `Order`, `Descending`, `Limit` and `Cursor`. `Order` selects `PageOrder.Id` or `PageOrder.Created`, and `Descending` reverses it. The stream, topic, consumer group and user page methods take a `NamedPageQuery`, which holds a `PageQuery` as `Page` and an optional `Name`. `Name` keeps the entries whose name holds the text, case-sensitive. `GetPartitionsPageAsync` takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with an `IggyInvalidStatusCodeException` for invalid command (code 3), before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with invalid command.
 
 ### Metadata Changes
 

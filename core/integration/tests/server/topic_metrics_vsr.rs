@@ -268,6 +268,64 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
     );
 }
 
+/// With the per-topic series off, a scrape walks no topic, and the totals
+/// still come from the counters the server keeps.
+#[iggy_harness(cluster_nodes = 1, server(http.metrics.topic_gauges = false))]
+async fn given_topic_gauges_off_when_scraping_metrics_should_keep_only_the_totals(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    create_topic(&client, MaxTopicSize::from(2 * 1024 * 1024 * 1024u64)).await;
+    let stream_id = Identifier::from_str_value(STREAM).expect("stream identifier");
+    let topic_id = Identifier::from_str_value(TOPIC).expect("topic identifier");
+    let mut messages: Vec<IggyMessage> = (0..10)
+        .map(|index| {
+            IggyMessage::builder()
+                .payload(format!("message-{index}").into())
+                .build()
+                .expect("build message")
+        })
+        .collect();
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    let exposition = scrape(harness).await;
+
+    for (name, expected) in [
+        ("streams", 1),
+        ("topics", 1),
+        ("partitions", 1),
+        ("messages", 10),
+    ] {
+        assert_eq!(
+            gauge(&exposition, name),
+            Some(expected),
+            "the {name} total must stay on:\n{exposition}"
+        );
+    }
+    for name in TOPIC_SERIES {
+        assert!(
+            !exposition
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}{{"))),
+            "the switch must drop every {name} series:\n{exposition}"
+        );
+    }
+    assert!(
+        exposition
+            .lines()
+            .any(|line| line.starts_with(DISK_COUNTER)),
+        "the switch must leave the disk series alone:\n{exposition}"
+    );
+}
+
 async fn create_topic(client: &IggyClient, max_topic_size: MaxTopicSize) {
     client
         .create_stream(STREAM, &StreamCreateOptions::default())

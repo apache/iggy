@@ -290,7 +290,7 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace);
+                    .peek_by_ns(&namespace);
                 let _ = writeln!(
                     report,
                     "      {namespace:?}: {:?}",
@@ -950,7 +950,7 @@ fn assert_retired_owners_removed(
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace)
+                    .peek_by_ns(&namespace)
                     .map(|partition| (replica, partition))
             })
             .collect();
@@ -1018,7 +1018,7 @@ fn assert_partition_offsets_agree(
                 .partition_shard(namespace)
                 .plane
                 .partitions()
-                .get_by_ns(&namespace)
+                .peek_by_ns(&namespace)
             else {
                 continue;
             };

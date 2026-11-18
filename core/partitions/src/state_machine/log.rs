@@ -90,10 +90,16 @@ impl StateMachineLog {
         self.commands.is_empty()
     }
 
-    #[cfg(test)]
+    /// Memory the held prepares take, their padded allocations included.
     #[must_use]
     pub const fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Memory the command held at `op` takes, zero when none is held.
+    #[must_use]
+    pub fn bytes_at(&self, op: u64) -> u64 {
+        self.commands.get(&op).map_or(0, memory_bytes)
     }
 
     /// Drop the held commands in `ops`, returning how many went. They stay

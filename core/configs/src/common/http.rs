@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
+use crate::common::defaults::SERVER_CONFIG;
+
 /// Every `http.jwt.algorithm` the server can sign and verify with, and the
 /// `jsonwebtoken` algorithm each names.
 ///
@@ -107,6 +109,14 @@ pub struct HttpJwtConfig {
 pub struct HttpMetricsConfig {
     pub enabled: bool,
     pub endpoint: String,
+    /// Export the per-topic series. A scrape walks every topic to build them,
+    /// so a node with many topics can turn them off.
+    #[serde(default = "default_topic_gauges")]
+    pub topic_gauges: bool,
+}
+
+fn default_topic_gauges() -> bool {
+    SERVER_CONFIG.http.metrics.topic_gauges
 }
 
 #[derive(Debug)]

@@ -15,8 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use ext_php_rs::{boxed::ZBox, exception::PhpResult, php_class, php_impl, types::ZendHashTable};
-use iggy::prelude::{Partition as RustPartition, TopicDetails as RustTopicDetails};
+use iggy::prelude::{
+    Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
+};
 
 use crate::options::options_array;
 
@@ -83,9 +87,75 @@ impl TopicDetails {
     }
 }
 
+/// One topic of a `TopicsPage`.
+#[php_class]
+#[php(name = "Iggy\\Topic")]
+#[derive(Clone)]
+pub struct Topic {
+    // The Rust type is not Clone, and each read of the page's items copies the topic.
+    inner: Arc<RustTopic>,
+}
+
+impl From<RustTopic> for Topic {
+    fn from(topic: RustTopic) -> Self {
+        Self {
+            inner: Arc::new(topic),
+        }
+    }
+}
+
+#[php_impl]
+impl Topic {
+    #[php(getter)]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    /// Creation time in microseconds.
+    #[php(getter, change_case = "snake_case")]
+    pub fn created_at(&self) -> u64 {
+        self.inner.created_at.as_micros()
+    }
+
+    #[php(getter)]
+    pub fn name(&self) -> String {
+        self.inner.name.clone()
+    }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn size_bytes(&self) -> u64 {
+        self.inner.size.as_bytes_u64()
+    }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn messages_count(&self) -> u64 {
+        self.inner.messages_count
+    }
+
+    #[php(getter, change_case = "snake_case")]
+    pub fn partitions_count(&self) -> u32 {
+        self.inner.partitions_count
+    }
+
+    /// Options the creating or updating client set, as option name to scalar value.
+    /// Integers above `PHP_INT_MAX`, such as never-expire and unlimited
+    /// (18446744073709551615), are decimal strings.
+    #[php(getter)]
+    pub fn options(&self) -> PhpResult<ZBox<ZendHashTable>> {
+        options_array(&self.inner.options, true)
+    }
+
+    /// Options the server filled in from its catalog defaults.
+    #[php(getter, change_case = "snake_case")]
+    pub fn derived_options(&self) -> PhpResult<ZBox<ZendHashTable>> {
+        options_array(&self.inner.options, false)
+    }
+}
+
 /// One partition of a topic.
 #[php_class]
 #[php(name = "Iggy\\Partition")]
+#[derive(Clone)]
 pub struct Partition {
     pub(crate) inner: RustPartition,
 }

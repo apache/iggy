@@ -28,6 +28,7 @@ actix-files = { workspace = true }
 actix-web = { workspace = true }
 bench-dashboard-shared = { workspace = true }
 bench-report = { workspace = true }
+blake3 = { workspace = true }
 charming = { workspace = true, features = ["ssr", "ssr-raster"] }
 chrono = { workspace = true }
 clap = { workspace = true }

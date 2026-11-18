@@ -93,9 +93,9 @@ const SEGMENT_DAMAGE_MARKERS: [&str; 2] = [
 /// Infix of the directory the refusal path renames a partition's segment files
 /// into (`partitions::state_transfer::quarantine_partition_files`).
 const FENCED_DIR_MARKER: &str = ".fenced.";
-/// WAL-owned recovery discards unpublished segment bytes before rebuilding the index.
-const UNPUBLISHED_TAIL_MARKER: &str =
-    "discarding unpublished segment bytes beyond the durable WAL frontier";
+/// WAL recovery discards the unpublished records it cannot vouch for, here the
+/// ones whose bodies are gone, before the index is rebuilt.
+const UNPUBLISHED_TAIL_MARKER: &str = "discarding unpublished partition WAL records";
 const PARTITION_WAL_REFUSAL_MARKER: &str = "prepare WAL at";
 
 async fn create_stream_and_topic(client: &IggyClient, durability: Durability) {
@@ -960,7 +960,8 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
             )
         });
 
-        // WAL recovery discards unpublished bytes; peer repair can immediately refill them.
+        // WAL recovery keeps the unpublished records whose bodies survived and
+        // discards the rest; peer repair can immediately refill them.
         // Read the index first so a log still at the cut proves it cannot describe later bytes.
         //
         // The rebuild's stride is its own, so the entry COUNT is not the spec.
@@ -995,8 +996,8 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
         let fenced = fenced_segment_paths(&backup_data);
         assert!(
             fenced.is_empty(),
-            "the unpublished tail must be discarded for peer repair, \
-             without quarantining the segment chain: {fenced:?}"
+            "the unpublished records whose bodies are gone must be discarded for peer \
+             repair, without quarantining the segment chain: {fenced:?}"
         );
         // `fenced_segment_paths` walks past unreadable directories, so an empty
         // result alone could be vacuous: the files must still be where boot found
@@ -1021,7 +1022,7 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
                 harness
                     .node(backup)
                     .stdout_contains(UNPUBLISHED_TAIL_MARKER),
-                "boot must discard the unpublished tail using the durable WAL frontier \
+                "boot must discard the unpublished WAL records whose bodies are gone \
                  ({UNPUBLISHED_TAIL_MARKER:?}); recovery took another path"
             );
         }
