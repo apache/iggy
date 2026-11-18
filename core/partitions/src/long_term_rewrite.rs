@@ -19,11 +19,11 @@
 //! segment, by its primary.
 //!
 //! A rewrite reads the batches above the long-term floor the way a poll
-//! does, so it gets them whole, with the messages their placements name. It
-//! writes them back to back into a `.log`, with an `.index` beside it, in the
-//! layout of a tiered segment, and stores both under the partition's own
-//! prefix. A reader of the bucket then needs no placement and no fresh
-//! object to read the partition.
+//! does, with the messages their placements name. It puts them back to back
+//! as a `.log`, with an `.index` beside it, in the layout of a tiered
+//! segment, and stores both from memory under the partition's own prefix. A
+//! reader of the bucket then needs no placement and no fresh object to read
+//! the partition.
 //!
 //! The segment ends where the rewrite stops: at the commit point, or once
 //! it holds [`LONG_TERM_SEGMENT_BYTES`]. Another primary can have stored a
@@ -32,13 +32,14 @@
 //! where that one ends, so the next attempt ends there too and writes the
 //! same bytes.
 
-use std::io;
+use std::future;
 use std::rc::Rc;
 
-use compio::io::AsyncWriteAtExt;
+use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
-use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
+use iggy_binary_protocol::placement::PlacedBatch;
 use iggy_object_store::{
     KeyLayout, ManifestSegment, ObjectPrefix, ObjectStore, SegmentKey, SegmentMetadata,
     SegmentObject, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope,
@@ -46,8 +47,6 @@ use iggy_object_store::{
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use server_common::iobuf::Frozen;
-use server_common::send_messages::decode_prepare_batch_trusted;
 use tracing::{debug, warn};
 
 use crate::IggyPartition;
@@ -55,11 +54,11 @@ use crate::Partition;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
 use crate::long_term::LONG_TERM_SEGMENTS_MAX;
-use crate::placed_read::PlacedReadPlan;
+use crate::placed_read::{BatchPiece, PlacedReadPlan};
 use crate::poll_plan::DiskFault;
-use crate::segment_chain::{HashSource, SegmentRecord, hash_segment_file};
-use crate::segment_upload::{SegmentUpload, UploadError, upload_segment};
-use crate::state_transfer::STAGING_SUFFIX;
+use crate::segment_chain::{HashSource, SegmentHasher, SegmentRecord};
+use crate::segment_upload::{UploadError, memory_body, store_segment};
+use crate::state_transfer::ChunkHasher;
 
 /// Bytes of batches at which a rewrite ends its segment. The rewrite holds
 /// the batches of one segment in memory while it writes them.
@@ -78,7 +77,6 @@ pub struct SegmentRewrite {
     pub up_to: u64,
     /// Whether the segment must end exactly at `up_to`.
     pub ends_at_up_to: bool,
-    pub partition_dir: String,
     pub(crate) read: PlacedReadPlan,
 }
 
@@ -90,8 +88,6 @@ pub enum RewriteError {
     /// The batches read are not the run of offsets the segment needs.
     #[error("the batches read from offset {expected} continue at {found:?}")]
     Gap { expected: u64, found: Option<u64> },
-    #[error("cannot write the segment: {0}")]
-    Io(#[from] io::Error),
     /// The store holds a segment from the same offset that ends at
     /// `end_offset`, which another primary stored.
     #[error("the store holds a segment from the same offset that ends at {end_offset}")]
@@ -153,8 +149,12 @@ impl<E: TierExecutor> LongTermWriter for ExecutorLongTermWriter<E> {
 }
 
 impl SegmentRewrite {
-    /// Read the batches, write the segment's two files beside the
-    /// partition's own, store them, and remove the files again.
+    /// Read the batches into the segment's bytes, summing them as they are
+    /// copied, and store the segment and its index from memory.
+    ///
+    /// Nothing is written to the disk. A stored segment whose command is
+    /// lost is found again in the store by the rewrite that repeats it, so
+    /// a local copy would guard nothing.
     async fn run<S: ObjectStore>(
         self,
         store: &S,
@@ -165,42 +165,28 @@ impl SegmentRewrite {
             count: u32::MAX,
             ceiling: self.up_to,
         };
-        let batches = self
+        let placed = self
             .read
-            .read(query, LONG_TERM_SEGMENT_BYTES)
+            .placed_batches(query, LONG_TERM_SEGMENT_BYTES)
             .await
             .map_err(RewriteError::Read)?;
-        let built = BuiltSegment::of(self.start_offset, &batches)?;
+        let built = BuiltSegment::of(self.start_offset, &placed)?;
         if self.ends_at_up_to && built.end_offset != self.up_to {
             return Err(RewriteError::Gap {
                 expected: self.up_to.saturating_add(1),
                 found: Some(built.end_offset.saturating_add(1)),
             });
         }
-        let stem = format!("{}/{:0>20}.rewrite", self.partition_dir, self.start_offset);
-        let log_path = format!("{stem}.log{STAGING_SUFFIX}");
-        let index_path = format!("{stem}.index{STAGING_SUFFIX}");
-        let stored = self
-            .store(store, layout, &built, &batches, &log_path, &index_path)
-            .await;
-        // Left behind, the files are swept at the next boot.
-        let _ = compio::fs::remove_file(&log_path).await;
-        let _ = compio::fs::remove_file(&index_path).await;
-        stored
-    }
-
-    async fn store<S: ObjectStore>(
-        &self,
-        store: &S,
-        layout: &KeyLayout,
-        built: &BuiltSegment,
-        batches: &[Frozen<4096>],
-        log_path: &str,
-        index_path: &str,
-    ) -> Result<ManifestSegment, RewriteError> {
-        write_log(log_path, batches).await?;
-        write_file(index_path, built.index.clone()).await?;
-        let hashes = hash_segment_file(log_path, built.size).await?;
+        let mut log = SegmentBytes::<SegmentHasher>::sized(built.size)?;
+        self.read
+            .read_blobs(&placed, |piece| log.push(piece))
+            .await
+            .map_err(RewriteError::Read)?;
+        drop(placed);
+        if log.bytes.len() as u64 != built.size {
+            return Err(RewriteError::Read(DiskFault::Unreadable));
+        }
+        let hashes = log.hasher.finalize();
         let record = SegmentRecord {
             start_offset: self.start_offset,
             end_offset: built.end_offset,
@@ -211,15 +197,21 @@ impl SegmentRewrite {
             incarnation: 0,
             hash: hashes.blake3,
             crc32c: hashes.crc32c,
-            source: HashSource::Disk,
+            source: HashSource::CommitPath,
         };
-        let upload = SegmentUpload {
-            prefix: self.prefix,
-            record,
-            log_path: log_path.to_owned(),
-            index_path: index_path.to_owned(),
-        };
-        match upload_segment(store, layout, &upload).await {
+        let log = Bytes::from(log.bytes);
+        let index = Bytes::from(built.index);
+        let stored = store_segment(
+            store,
+            layout,
+            self.prefix,
+            &record,
+            future::ready(Ok(memory_body(&log))),
+            future::ready(Ok(memory_body(&index))),
+            crc32c::crc32c(&index),
+        )
+        .await;
+        match stored {
             Ok(()) => Ok(ManifestSegment {
                 start_offset: record.start_offset,
                 end_offset: record.end_offset,
@@ -278,16 +270,19 @@ struct BuiltSegment {
 impl BuiltSegment {
     /// The segment of `batches`, which must hold every offset from
     /// `start_offset` on without a gap.
-    fn of(start_offset: u64, batches: &[Frozen<4096>]) -> Result<Self, RewriteError> {
+    fn of(start_offset: u64, batches: &[PlacedBatch]) -> Result<Self, RewriteError> {
         let mut next_offset = start_offset;
         let mut built: Option<Self> = None;
         let mut position = 0u64;
         let mut indexed_at: Option<u64> = None;
         let mut index = Vec::new();
         for batch in batches {
-            let header = decode_prepare_batch_trusted(batch.as_slice())
-                .map_err(|_| RewriteError::Read(DiskFault::Unreadable))?
-                .header;
+            let header = &batch.header;
+            // The bytes of the segment are sized by the headers and filled
+            // by the placements, so the two have to agree.
+            if header.batch_length != BATCH_HEADER_SIZE as u64 + batch.placement.length {
+                return Err(RewriteError::Read(DiskFault::Unreadable));
+            }
             if header.base_offset != next_offset || header.message_count == 0 {
                 return Err(RewriteError::Gap {
                     expected: next_offset,
@@ -332,26 +327,36 @@ impl BuiltSegment {
     }
 }
 
-/// Write the batches of `batches` back to back into a new file at `path`,
-/// without the prepare header each one carries, and sync it.
-async fn write_log(path: &str, batches: &[Frozen<4096>]) -> io::Result<()> {
-    let mut file = compio::fs::File::create(path).await?;
-    let mut position = 0u64;
-    for batch in batches {
-        let body = batch.as_slice()[size_of::<PrepareHeader>()..].to_vec();
-        let len = body.len() as u64;
-        let compio::BufResult(written, _) = file.write_all_at(body, position).await;
-        written?;
-        position += len;
-    }
-    file.sync_all().await
+/// The bytes of a segment as its batches are put back together, and the
+/// sums of those bytes, taken from each piece as it is copied in.
+struct SegmentBytes<H> {
+    bytes: Vec<u8>,
+    hasher: H,
 }
 
-async fn write_file(path: &str, bytes: Vec<u8>) -> io::Result<()> {
-    let mut file = compio::fs::File::create(path).await?;
-    let compio::BufResult(written, _) = file.write_all_at(bytes, 0).await;
-    written?;
-    file.sync_all().await
+impl<H: ChunkHasher + Default> SegmentBytes<H> {
+    /// An empty segment with room for `size` bytes, so that no batch moves
+    /// the ones before it.
+    fn sized(size: u64) -> Result<Self, RewriteError> {
+        let size = usize::try_from(size).map_err(|_| RewriteError::Read(DiskFault::Unreadable))?;
+        Ok(Self {
+            bytes: Vec::with_capacity(size),
+            hasher: H::default(),
+        })
+    }
+
+    /// Append `piece` of the next batch.
+    fn push(&mut self, piece: BatchPiece<'_>) {
+        let start = self.bytes.len();
+        match piece {
+            BatchPiece::Header(header) => {
+                self.bytes.resize(start + BATCH_HEADER_SIZE, 0);
+                header.encode_into(&mut self.bytes[start..]);
+            }
+            BatchPiece::Messages(messages) => self.bytes.extend_from_slice(messages),
+        }
+        self.hasher.update(&self.bytes[start..]);
+    }
 }
 
 /// What a replica keeps of its rewrites while it is the primary of a
@@ -403,7 +408,6 @@ where
         let committed = self
             .holds_committed_messages()
             .then_some(offsets.commit_offset);
-        let partition_dir = self.partition_dir()?;
         let rewrites = self.long_term_rewrites_of_this_view();
         if rewrites
             .stored
@@ -435,7 +439,6 @@ where
             start_offset,
             up_to,
             ends_at_up_to,
-            partition_dir,
             read: self.placed_read_plan(None),
         };
         Some((id, rewrite, token))
@@ -556,5 +559,73 @@ where
             };
         }
         &mut self.long_term_rewrites
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::batch::BatchHeader;
+    use iggy_binary_protocol::placement::Placement;
+
+    /// Counts the bytes it is fed.
+    #[derive(Default)]
+    struct FedBytes(usize);
+
+    impl ChunkHasher for FedBytes {
+        fn update(&mut self, bytes: &[u8]) {
+            self.0 += bytes.len();
+        }
+    }
+
+    fn batch(base_offset: u64, blob: &[u8]) -> PlacedBatch {
+        let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + blob.len()) as u64, 1);
+        header.base_offset = base_offset;
+        PlacedBatch::new(header, Placement::of(1, 0, blob))
+    }
+
+    #[test]
+    fn given_batches_when_putting_a_segment_together_should_sum_each_byte_once_and_move_none() {
+        let blobs = [vec![1_u8; 700], vec![2; 3], vec![3; 4096]];
+        let placed: Vec<_> = (0..)
+            .zip(&blobs)
+            .map(|(at, blob)| batch(at, blob))
+            .collect();
+        let built = BuiltSegment::of(0, &placed).unwrap();
+        let mut log = SegmentBytes::<FedBytes>::sized(built.size).unwrap();
+        let (start, capacity) = (log.bytes.as_ptr(), log.bytes.capacity());
+
+        for (placed, blob) in placed.iter().zip(&blobs) {
+            log.push(BatchPiece::Header(&placed.header));
+            for messages in blob.chunks(500) {
+                log.push(BatchPiece::Messages(messages));
+            }
+        }
+
+        assert_eq!(log.bytes.len() as u64, built.size);
+        assert_eq!(log.hasher.0, log.bytes.len());
+        assert_eq!(
+            (log.bytes.as_ptr(), log.bytes.capacity()),
+            (start, capacity)
+        );
+        let mut expected = Vec::new();
+        for (placed, blob) in placed.iter().zip(&blobs) {
+            let mut header = [0; BATCH_HEADER_SIZE];
+            placed.header.encode_into(&mut header);
+            expected.extend_from_slice(&header);
+            expected.extend_from_slice(blob);
+        }
+        assert_eq!(log.bytes, expected);
+    }
+
+    #[test]
+    fn given_a_placement_of_another_length_than_its_header_when_building_should_refuse_it() {
+        let mut placed = batch(0, &[7; 100]);
+        placed.placement.length += 1;
+
+        assert!(matches!(
+            BuiltSegment::of(0, &[placed]),
+            Err(RewriteError::Read(DiskFault::Unreadable))
+        ));
     }
 }

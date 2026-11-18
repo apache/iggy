@@ -1170,6 +1170,7 @@ async fn given_committed_placed_batches_when_rewriting_should_store_the_segment_
     );
     assert_eq!(segment.size, expected_log.len() as u64);
     assert_eq!(segment.crc32c, crc32c::crc32c(&expected_log));
+    assert_eq!(segment.hash, *blake3::hash(&expected_log).as_bytes());
     assert_eq!(
         Box::pin(object_bytes(
             &store,
@@ -1545,6 +1546,91 @@ async fn given_a_segment_published_during_a_manifest_publish_when_it_ends_should
         !partition.finish_manifest_publish(id, &STORED, now),
         "the log stood still"
     );
+}
+
+/// Stores in `store`, and notes the files of `directory` at each put.
+#[derive(Clone)]
+struct DirectoryAtPut {
+    store: Rc<iggy_object_store::MemoryStore>,
+    directory: std::path::PathBuf,
+    files: Rc<std::cell::RefCell<Vec<Vec<std::ffi::OsString>>>>,
+}
+
+fn files_of(directory: &Path) -> Vec<std::ffi::OsString> {
+    let mut files: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    files.sort();
+    files
+}
+
+impl iggy_object_store::ObjectStore for DirectoryAtPut {
+    async fn put(
+        &self,
+        key: &str,
+        body: iggy_object_store::PutBody,
+        options: &iggy_object_store::PutOptions,
+    ) -> Result<(), iggy_object_store::ObjectStoreError> {
+        self.files.borrow_mut().push(files_of(&self.directory));
+        self.store.put(key, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<iggy_object_store::ObjectRange, iggy_object_store::ObjectStoreError> {
+        self.store.get_range(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<iggy_object_store::ObjectMeta, iggy_object_store::ObjectStoreError> {
+        self.store.head(key).await
+    }
+
+    async fn delete(
+        &self,
+        keys: &[String],
+    ) -> Result<iggy_object_store::DeleteOutcome, iggy_object_store::ObjectStoreError> {
+        self.store.delete(keys).await
+    }
+
+    async fn list(
+        &self,
+        request: &iggy_object_store::ListRequest<'_>,
+    ) -> Result<iggy_object_store::ListPage, iggy_object_store::ObjectStoreError> {
+        self.store.list(request).await
+    }
+}
+
+/// The segment goes to the store from memory. A copy on the disk would be
+/// written, synced and read back for nothing.
+#[compio::test]
+async fn given_committed_placed_batches_when_rewriting_should_write_no_file_of_its_own() {
+    use crate::LongTermWriter;
+    let (_whole, placed, object) = whole_and_placed(3);
+    let store = Box::pin(store_with(object)).await;
+    let (directory, mut partition) = Box::pin(placing_primary_with(&placed, &store)).await;
+    let before = files_of(directory.path());
+    let watched = DirectoryAtPut {
+        store: Rc::clone(&store),
+        directory: directory.path().to_owned(),
+        files: Rc::default(),
+    };
+    let writer = crate::ExecutorLongTermWriter::new(
+        iggy_object_store::InlineTierExecutor::new(watched.clone()),
+        super::remote_poll::layout(),
+    );
+    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+
+    let outcome = writer.write(rewrite, scope).await;
+
+    assert!(partition.finish_segment_rewrite(id, outcome).is_some());
+    assert_eq!(*watched.files.borrow(), [before.clone(), before.clone()]);
+    assert_eq!(files_of(directory.path()), before);
 }
 
 /// Reads `store`, and counts the reads.
