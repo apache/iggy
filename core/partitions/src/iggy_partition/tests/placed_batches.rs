@@ -2053,3 +2053,186 @@ async fn given_a_released_committed_placed_batch_when_retransmitted_should_ack_o
         "a placed batch that fails its checksum must not be acknowledged"
     );
 }
+
+/// Bytes of the whole batches `records`, which is what each one's header
+/// states as its length.
+fn batch_bytes(records: &[Vec<u8>]) -> u64 {
+    records.iter().map(|record| record.len() as u64).sum()
+}
+
+/// Count the backlog of `partition` the way a pass does, when it has none.
+async fn count_backlog(partition: &mut IggyPartition<IggyMessageBus>) -> Option<u64> {
+    let (id, walk) = partition.begin_backlog_walk().unwrap();
+    partition.finish_backlog_walk(id, walk.run().await);
+    partition.long_term_backlog()
+}
+
+/// The walk counts what was committed when it started, and the commits that
+/// come while it reads are added to that, so no byte counts twice or not
+/// at all.
+#[compio::test]
+async fn given_batches_that_commit_while_the_backlog_is_counted_when_the_walk_ends_should_count_each_byte_once()
+ {
+    let (whole, placed, object) = whole_and_placed(3);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) =
+        Box::pin(placing_leader_of_three_with(&placed[..2], &store)).await;
+    assert_eq!(partition.long_term_backlog(), None, "nothing counted yet");
+    let (id, walk) = partition.begin_backlog_walk().unwrap();
+    assert!(
+        partition.begin_backlog_walk().is_none(),
+        "one walk at a time"
+    );
+
+    Box::pin(commit_records(&mut partition, 3, &placed[2..])).await;
+    partition.finish_backlog_walk(id, walk.run().await);
+
+    assert_eq!(partition.long_term_backlog(), Some(batch_bytes(&whole)));
+    assert!(partition.begin_backlog_walk().is_none(), "counted once");
+}
+
+/// The command of a segment commits on a replica that lost primacy in the
+/// meantime. The bytes of the segment leave its backlog all the same, and
+/// the replica keeps the count when it leads again.
+#[compio::test]
+async fn given_a_counted_backlog_when_a_segment_commits_across_a_view_change_should_take_its_bytes()
+{
+    use crate::LongTermWriter;
+    let (whole, placed, object) = whole_and_placed(3);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) =
+        Box::pin(placing_leader_of_three_with(&placed[..2], &store)).await;
+    assert_eq!(
+        Box::pin(count_backlog(&mut partition)).await,
+        Some(batch_bytes(&whole[..2]))
+    );
+    let (id, rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+    let outcome = writer(&store).write(rewrite, scope).await;
+    let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
+    Box::pin(commit_records(&mut partition, 3, &placed[2..])).await;
+    assert_eq!(partition.long_term_backlog(), Some(batch_bytes(&whole)));
+
+    Box::pin(commit_segment_command(&mut partition, &segment, true)).await;
+
+    assert!(!partition.consensus().is_primary());
+    assert_eq!(segment.size, batch_bytes(&whole[..2]));
+    assert_eq!(
+        partition.long_term_backlog(),
+        Some(batch_bytes(&whole[2..]))
+    );
+    regain_primacy(&mut partition);
+    assert_eq!(
+        partition.long_term_backlog(),
+        Some(batch_bytes(&whole[2..]))
+    );
+    assert!(
+        partition.begin_backlog_walk().is_none(),
+        "no walk is needed"
+    );
+    // The same command sent again applies without moving the floor.
+    partition.note_long_term_advance(partition.long_term_floor());
+    assert_eq!(
+        partition.long_term_backlog(),
+        Some(batch_bytes(&whole[2..]))
+    );
+}
+
+/// A rebooted partition holds its batches in segment files, and its
+/// long-term log as its checkpoint left it. The walk reads only the batches
+/// above the floor, and starts again once the log is restored anew.
+#[compio::test]
+async fn given_a_rebooted_placing_partition_when_counting_its_backlog_should_count_the_batches_above_the_floor()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 5)).await;
+    drop(partition);
+    let directory = config.get_partition_path(1, 1, 0);
+    let recovered = Box::pin(recover(&config)).await.unwrap();
+    let mut partition = test_partition_with_replicas(3);
+    partition.register_builtin_state_machines().unwrap();
+    partition.set_places_batches(true);
+    partition.set_partition_dir(directory.clone());
+    partition.runtime_options.segment_size = Some(placed_segment_size());
+    partition.log.retire_front().unwrap();
+    crate::partition_storage::hydrate_partition_log(&mut partition, &directory, 1, 1, 0, recovered)
+        .await
+        .unwrap();
+    let recovered_end = partition.log.active_segment().end_offset;
+    assert_eq!(recovered_end, 4);
+    partition.offset.store(recovered_end, Ordering::Release);
+    partition
+        .dirty_offset
+        .store(recovered_end, Ordering::Relaxed);
+    partition.set_offset_space_used(true);
+    // The long-term log as the checkpoint restores it: a segment that ends
+    // inside the second segment file.
+    let payload = crate::long_term::PublishSegment(iggy_object_store::ManifestSegment {
+        start_offset: 0,
+        end_offset: 2,
+        start_timestamp: 0,
+        end_timestamp: 0,
+        max_timestamp: 0,
+        size: 1,
+        crc32c: 0,
+        hash: [0; iggy_object_store::SEGMENT_HASH_LEN],
+    })
+    .encode();
+    partition
+        .state_machines
+        .apply(
+            100,
+            crate::state_machine::MachineCommand {
+                kind: crate::long_term::PUBLISH_SEGMENT,
+                payload: &payload,
+            },
+        )
+        .unwrap();
+    let stored: Vec<_> = segment_file_bytes(Path::new(&directory))
+        .iter()
+        .flat_map(|bytes| placed_batches_in(bytes))
+        .map(|placed| (placed.header.base_offset, placed.header.batch_length))
+        .collect();
+    assert_eq!(stored.len(), 5);
+    let above = |floor: u64| -> u64 {
+        stored
+            .iter()
+            .filter(|(offset, _)| *offset > floor)
+            .map(|(_, length)| length)
+            .sum()
+    };
+
+    assert_eq!(
+        Box::pin(count_backlog(&mut partition)).await,
+        Some(above(2))
+    );
+
+    partition.restore_machines(None, 101).unwrap();
+    assert_eq!(partition.long_term_floor(), None);
+    assert_eq!(partition.long_term_backlog(), None);
+    let all: u64 = stored.iter().map(|(_, length)| length).sum();
+    assert_eq!(Box::pin(count_backlog(&mut partition)).await, Some(all));
+}
+
+/// A walk that could not read the log counts nothing, and a later pass
+/// starts another. The count of a walk from before the log was restored
+/// is dropped.
+#[compio::test]
+async fn given_a_failed_or_outdated_walk_when_it_ends_should_leave_the_backlog_to_the_next_walk() {
+    let (whole, placed, object) = whole_and_placed(2);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+
+    let (failed, _) = partition.begin_backlog_walk().unwrap();
+    partition.finish_backlog_walk(failed, None);
+    assert_eq!(partition.long_term_backlog(), None);
+    let (outdated, walk) = partition.begin_backlog_walk().unwrap();
+    let outdated_count = walk.run().await;
+    partition.restore_machines(None, 100).unwrap();
+    let (current, walk) = partition.begin_backlog_walk().unwrap();
+    partition.finish_backlog_walk(outdated, outdated_count);
+    assert_eq!(partition.long_term_backlog(), None);
+
+    partition.finish_backlog_walk(current, walk.run().await);
+
+    assert_eq!(partition.long_term_backlog(), Some(batch_bytes(&whole)));
+}

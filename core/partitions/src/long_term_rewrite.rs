@@ -380,6 +380,83 @@ pub struct LongTermRewrites {
     jobs: u64,
 }
 
+/// Bytes of the batches a partition committed above its long-term floor,
+/// as their headers state them: what its rewrites have yet to store.
+///
+/// A walk of the log above the floor counts them once. From then on the
+/// commits add to the count and the floor advances take from it, on a
+/// backup as on the primary, so a new primary has the count already.
+#[derive(Debug, Default)]
+pub struct LongTermBacklog {
+    /// `None` until a walk counted the backlog.
+    bytes: Option<u64>,
+    /// What commits added and floor advances took since the running walk
+    /// took its snapshot.
+    walk: Option<BacklogChanges>,
+    /// Number of the last walk, so the count of one started before a reset
+    /// is dropped.
+    walks: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BacklogChanges {
+    added: u64,
+    taken: u64,
+}
+
+impl LongTermBacklog {
+    /// A batch of `bytes` committed.
+    pub(crate) const fn add(&mut self, bytes: u64) {
+        if let Some(backlog) = &mut self.bytes {
+            *backlog = backlog.saturating_add(bytes);
+        } else if let Some(walk) = &mut self.walk {
+            walk.added = walk.added.saturating_add(bytes);
+        }
+    }
+
+    /// The floor moved past a segment of `bytes`.
+    const fn take(&mut self, bytes: u64) {
+        if let Some(backlog) = &mut self.bytes {
+            *backlog = backlog.saturating_sub(bytes);
+        } else if let Some(walk) = &mut self.walk {
+            walk.taken = walk.taken.saturating_add(bytes);
+        }
+    }
+
+    /// Drop the count and the walk that runs, so the next walk counts again.
+    pub(crate) const fn forget(&mut self) {
+        self.bytes = None;
+        self.walk = None;
+    }
+}
+
+/// A count of the bytes of a partition's committed batches above its
+/// long-term floor, as the partition's owner captured it.
+pub struct BacklogWalk {
+    from: u64,
+    up_to: u64,
+    read: PlacedReadPlan,
+}
+
+impl BacklogWalk {
+    /// Read the headers of the batches and add up their lengths. `None` when
+    /// the log could not be read.
+    pub async fn run(self) -> Option<u64> {
+        self.read
+            .batch_bytes(self.from, self.up_to)
+            .await
+            .inspect_err(|fault| {
+                debug!(
+                    from = self.from,
+                    up_to = self.up_to,
+                    ?fault,
+                    "counting the long-term backlog failed and is tried again"
+                );
+            })
+            .ok()
+    }
+}
+
 impl<B, SB> IggyPartition<B, SB>
 where
     B: MessageBus,
@@ -546,6 +623,71 @@ where
             .long_term_floor()
             .map_or(0, |floor| floor.saturating_add(1));
         committed.saturating_sub(rewritten)
+    }
+
+    /// Bytes of the batches this partition committed above its long-term
+    /// floor, `None` until a walk counted them.
+    #[must_use]
+    pub fn long_term_backlog(&self) -> Option<u64> {
+        self.long_term_backlog.bytes
+    }
+
+    /// Start counting [`Self::long_term_backlog`] on a partition that places
+    /// its batches and has no count: a walk of the committed batches above
+    /// the floor, which the caller runs off the pump and hands back to
+    /// [`Self::finish_backlog_walk`] with the returned number. What commits
+    /// and floor advances change meanwhile is added to the walk's count.
+    pub fn begin_backlog_walk(&mut self) -> Option<(u64, BacklogWalk)> {
+        let backlog = &self.long_term_backlog;
+        if !self.places_batches() || backlog.bytes.is_some() || backlog.walk.is_some() {
+            return None;
+        }
+        let from = self
+            .long_term_floor()
+            .map_or(0, |floor| floor.saturating_add(1));
+        let committed = self
+            .holds_committed_messages()
+            .then_some(self.offsets().commit_offset)
+            .filter(|committed| *committed >= from);
+        let Some(up_to) = committed else {
+            self.long_term_backlog.bytes = Some(0);
+            return None;
+        };
+        let read = self.placed_read_plan(None);
+        let backlog = &mut self.long_term_backlog;
+        backlog.walks += 1;
+        backlog.walk = Some(BacklogChanges::default());
+        Some((backlog.walks, BacklogWalk { from, up_to, read }))
+    }
+
+    /// Take the count of the walk numbered `id`: `None` for a walk that could
+    /// not read the log, which a later pass starts again. The count of a
+    /// walk this partition does not wait for changes nothing.
+    pub fn finish_backlog_walk(&mut self, id: u64, counted: Option<u64>) {
+        let backlog = &mut self.long_term_backlog;
+        if id != backlog.walks {
+            return;
+        }
+        let Some(changes) = backlog.walk.take() else {
+            return;
+        };
+        backlog.bytes = counted.map(|counted| {
+            counted
+                .saturating_add(changes.added)
+                .saturating_sub(changes.taken)
+        });
+    }
+
+    /// A command applied to the long-term log, which ended at `floor`
+    /// before it. When the floor moved, the bytes of the segment it moved
+    /// past leave the backlog.
+    pub(crate) fn note_long_term_advance(&mut self, floor: Option<u64>) {
+        if self.long_term_floor() <= floor {
+            return;
+        }
+        if let Some(size) = self.long_term_segments().last().map(|segment| segment.size) {
+            self.long_term_backlog.take(size);
+        }
     }
 
     /// The rewrite state of the current view. What an earlier view left is

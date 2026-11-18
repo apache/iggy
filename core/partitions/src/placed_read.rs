@@ -226,6 +226,32 @@ impl PlacedReadPlan {
         Ok(())
     }
 
+    /// Bytes of the whole batches whose first offset is from `from` to
+    /// `up_to`, as their headers state them, read from the segments and the
+    /// journal without their messages. A batch that both hold counts once.
+    pub(crate) async fn batch_bytes(&self, from: u64, up_to: u64) -> Result<u64, DiskFault> {
+        let mut counted = CountedBatches {
+            next_offset: from,
+            up_to,
+            bytes: 0,
+        };
+        match &self.partition_dir {
+            PartitionDirResolution::Resolved(directory) => {
+                self.count_in_segments(directory, &mut counted).await?;
+            }
+            PartitionDirResolution::NoFiles => {}
+            PartitionDirResolution::Unresolvable => return Err(DiskFault::Retryable),
+        }
+        for entry in &self.resident {
+            if let Ok(batch) = decode_prepare_batch_trusted(entry.as_slice())
+                && batch.placement.is_some()
+            {
+                counted.take(&batch.header);
+            }
+        }
+        Ok(counted.bytes)
+    }
+
     /// The placed batches `wanted` takes from the segments and the journal.
     async fn collect_placed(&self, wanted: &mut Wanted) -> Result<Vec<PlacedBatch>, DiskFault> {
         let mut placed = Vec::new();
@@ -330,6 +356,41 @@ impl PlacedReadPlan {
                 let batches = PLACED_PER_READ.min(count - index);
                 for batch in read_placed(&file, index, batches).await? {
                     wanted.take(batch, placed);
+                }
+                index += batches;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add to `counted` the batches of the segments in `directory`.
+    async fn count_in_segments(
+        &self,
+        directory: &str,
+        counted: &mut CountedBatches,
+    ) -> Result<(), DiskFault> {
+        let (from, up_to) = (counted.next_offset, counted.up_to);
+        let start = Wanted::new(
+            MessageLookup::Offset {
+                offset: from,
+                count: u32::MAX,
+                ceiling: up_to,
+            },
+            usize::MAX,
+        );
+        let segments = self
+            .segments
+            .iter()
+            .filter(|segment| segment.end_offset >= from && segment.start_offset <= up_to);
+        for segment in segments {
+            let path = format!("{directory}/{:0>20}.log", segment.start_offset);
+            let file = File::open(&path).await.map_err(|_| DiskFault::Retryable)?;
+            let count = segment.size / PLACED_BATCH_SIZE as u64;
+            let mut index = start.first_index(&file, count).await?;
+            while index < count {
+                let batches = PLACED_PER_READ.min(count - index);
+                for batch in read_placed(&file, index, batches).await? {
+                    counted.take(&batch.header);
                 }
                 index += batches;
             }
@@ -707,6 +768,28 @@ impl Wanted {
     }
 }
 
+/// The bytes of the batches a count of [`PlacedReadPlan::batch_bytes`] took
+/// so far.
+struct CountedBatches {
+    /// The offset after the last batch counted, so a batch that two sources
+    /// hold counts once.
+    next_offset: u64,
+    up_to: u64,
+    bytes: u64,
+}
+
+impl CountedBatches {
+    fn take(&mut self, header: &BatchHeader) {
+        if header.base_offset < self.next_offset || header.base_offset > self.up_to {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(header.batch_length);
+        self.next_offset = header
+            .base_offset
+            .saturating_add(u64::from(header.message_count.max(1)));
+    }
+}
+
 /// `count` placed batches of `file`, from the `index`-th one on. Each one
 /// passes its own checksum, or the read fails.
 async fn read_placed(file: &File, index: u64, count: u64) -> Result<Vec<PlacedBatch>, DiskFault> {
@@ -1043,5 +1126,62 @@ mod tests {
             blobs_of(&plan, &placed).await.unwrap(),
             expected(&[(object, placed)])
         );
+    }
+
+    /// The journal entry of `placed`.
+    fn journal_entry(placed: &PlacedBatch) -> Frozen<4096> {
+        let total = PREPARE_HEADER_SIZE + PLACED_BATCH_SIZE;
+        let mut prepare = Owned::<4096>::zeroed(total);
+        let bytes = prepare.as_mut_slice();
+        placed.encode_into(&mut bytes[PREPARE_HEADER_SIZE..]);
+        let header =
+            bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut bytes[..PREPARE_HEADER_SIZE]);
+        header.command = Command::Prepare;
+        header.operation = Operation::SendMessages;
+        header.size = u32::try_from(total).unwrap();
+        prepare.into()
+    }
+
+    /// Six batches of one message each, of different lengths: offsets 0 to
+    /// 3 in a segment file, and 3 to 5 in the journal, which the segment
+    /// has yet to drop. Only the lengths of 1 to 4 count.
+    #[compio::test]
+    async fn given_batches_in_a_segment_and_in_the_journal_when_counting_their_bytes_should_count_each_one_once()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let placed: Vec<_> = (0..6_u64)
+            .map(|offset| {
+                let length = 10 * (offset + 1);
+                let mut header = BatchHeader::new(0, 0, BATCH_HEADER_SIZE as u64 + length, 1);
+                header.base_offset = offset;
+                let blob = vec![0; usize::try_from(length).unwrap()];
+                PlacedBatch::new(header, Placement::of(1, 0, &blob))
+            })
+            .collect();
+        let mut log = vec![0; 4 * PLACED_BATCH_SIZE];
+        for (record, placed) in log.chunks_mut(PLACED_BATCH_SIZE).zip(&placed) {
+            placed.encode_into(record);
+        }
+        std::fs::write(directory.path().join(format!("{:020}.log", 0)), &log).unwrap();
+        let store = Rc::new(Objects::default());
+        let plan = PlacedReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(
+                directory.path().to_string_lossy().into_owned(),
+            ),
+            segments: vec![PlacedSegment {
+                start_offset: 0,
+                end_offset: 3,
+                max_timestamp: 0,
+                size: log.len() as u64,
+            }],
+            resident: placed[3..].iter().map(journal_entry).collect(),
+            ..plan(&store)
+        };
+        let lengths: u64 = placed[1..5]
+            .iter()
+            .map(|placed| placed.header.batch_length)
+            .sum();
+
+        assert_eq!(plan.batch_bytes(1, 4).await, Ok(lengths));
     }
 }
