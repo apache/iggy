@@ -37,25 +37,29 @@
 //! sweep deletes all that are due, one delete job after another, and each
 //! job's result passes through the pump's inbox before the next starts.
 //!
-//! A shard answers that it cannot tell while one of its placing partitions
-//! is not in normal status, such as during a view change or a state
-//! transfer: that partition may be missing batches its group holds. The
-//! sweep then deletes nothing.
+//! A shard answers that it cannot tell while a placing partition that is
+//! still committed may be missing batches its group holds: one outside
+//! normal status, one a state transfer is replacing or waits to replace,
+//! one fenced for a rebuild, and one this shard should hold and does not.
+//! The sweep then deletes nothing. A partition whose delete committed holds
+//! no sweep back.
 //!
 //! Every step reports back as a frame, and a frame the inbox refused loses
 //! the sweep it belongs to and nothing else. The next sweep lists again.
 
-use crate::shards_table::ShardsTable;
+use crate::shards_table::{ShardsTable, calculate_shard_assignment};
 use crate::{IggyShard, LifecycleFrame, ShardFrame};
-use consensus::{Consensus, PartitionsHandle};
+use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::IggyTimestamp;
 use iggy_object_store::TierScope;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
+use metadata::impls::metadata::StreamsFrontend;
 use partitions::{
     FRESH_DELETES_PER_BATCH, FRESH_OBJECT_GRACE, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome,
     FreshListOutcome, FreshListing, FreshObjectSweeper, FreshSweep,
 };
+use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
@@ -323,7 +327,10 @@ where
 
     /// Answer the first shard with the fresh objects the partitions of this
     /// shard still need.
-    pub(crate) fn on_report_fresh_objects(&self, sweep: u64) {
+    pub(crate) fn on_report_fresh_objects(&self, sweep: u64)
+    where
+        M: StreamsFrontend,
+    {
         let Some(sender) = self.senders.first().cloned() else {
             return;
         };
@@ -332,25 +339,16 @@ where
         // pump: a send that is answered after this is in its partition's
         // journal by then or names nothing.
         let awaited = self.fresh_writes.awaited_objects();
-        let partitions = self.plane.partitions();
-        let placing: Vec<_> = partitions
-            .namespaces()
-            .filter_map(|namespace| partitions.get_by_ns(namespace))
-            .filter(|partition| partition.places_batches())
-            .collect();
-        // Asked of every partition before any read is planned: one that is
-        // not normal makes all the plans useless.
-        let certain = placing
-            .iter()
-            .all(|partition| partition.consensus().is_normal());
-        let mut reads = Vec::new();
-        if certain {
-            reads.extend(
-                placing
-                    .iter()
-                    .filter_map(|partition| partition.fresh_objects_in_use()),
-            );
-        }
+        let streams = self.plane.metadata().mux_stm.streams();
+        let reads = if self.holds_committed_placing_partitions() {
+            self.plane.partitions().fresh_objects_in_use(|namespace| {
+                streams.created_revision_for_namespace(*namespace).is_some()
+            })
+        } else {
+            None
+        };
+        let certain = reads.is_some();
+        let reads = reads.unwrap_or_default();
         self.bus.spawn(async move {
             let mut in_use = certain.then_some(awaited);
             for read in reads {
@@ -371,6 +369,36 @@ where
                 report,
             )));
         });
+    }
+
+    /// Whether this shard holds a copy, fenced or not, of every committed
+    /// placing partition that this node stores and that belongs on this
+    /// shard. The group of one it lacks may hold placed batches that name
+    /// this replica's objects.
+    fn holds_committed_placing_partitions(&self) -> bool
+    where
+        M: StreamsFrontend,
+    {
+        let partitions = self.plane.partitions();
+        let replica = self.partition_consensus.self_replica_id;
+        let replicas = self.partition_consensus.replica_count;
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner.items.iter().all(|(_, stream)| {
+                stream
+                    .topics
+                    .iter()
+                    .filter(|(_, topic)| topic.resolved.runtime.places_batches)
+                    .all(|(topic_id, topic)| {
+                        topic.partitions.iter().all(|partition| {
+                            let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
+                            partition.replica_set(replicas).member(replica).is_none()
+                                || calculate_shard_assignment(&namespace, self.shard_count)
+                                    != self.id
+                                || partitions.contains(&namespace)
+                        })
+                    })
+            })
+        })
     }
 
     /// Take a shard's answer. With the last one, delete the objects that

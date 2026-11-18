@@ -95,8 +95,19 @@ impl FreshObjectUploader for TestUploader {
 /// that places its batches.
 #[allow(clippy::future_not_send)]
 async fn placing_owner(directory: &Path) -> IoTestShard {
+    Box::pin(placing_owner_of_topic(
+        directory,
+        TopicRuntimeOptions::default(),
+    ))
+    .await
+}
+
+/// [`placing_owner`] whose committed topic resolves to the options
+/// `committed`.
+#[allow(clippy::future_not_send)]
+async fn placing_owner_of_topic(directory: &Path, committed: TopicRuntimeOptions) -> IoTestShard {
     let bus = Rc::new(IggyMessageBus::new(0));
-    let (owner, _sender) = test_owner(&bus, None);
+    let (owner, _sender) = test_owner_of_topic(&bus, None, None, None, committed);
     let partitions = owner.plane.partitions();
     partitions.set_io_notifier(
         owner.partition_io.notifier(),
@@ -489,12 +500,29 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
 /// and the sweeps, all through one executor.
 #[allow(clippy::future_not_send)]
 async fn swept_owner(directory: &Path) -> (IoTestShard, super::object_deletes::Shared) {
+    with_swept_store(Box::pin(placing_owner(directory)).await)
+}
+
+/// [`swept_owner`] whose committed topic places its batches, as the topic
+/// of a placing partition does outside these fixtures.
+#[allow(clippy::future_not_send)]
+async fn swept_owner_of_placing_topic(
+    directory: &Path,
+) -> (IoTestShard, super::object_deletes::Shared) {
+    let committed = TopicRuntimeOptions {
+        places_batches: true,
+        ..Default::default()
+    };
+    with_swept_store(Box::pin(placing_owner_of_topic(directory, committed)).await)
+}
+
+/// Give `owner` the one store of [`swept_owner`].
+fn with_swept_store(owner: IoTestShard) -> (IoTestShard, super::object_deletes::Shared) {
     use super::object_deletes::Shared;
     use partitions::{
         ExecutorFreshSweeper, ExecutorLongTermWriter, ExecutorObjects, RemoteSegments,
     };
 
-    let owner = Box::pin(placing_owner(directory)).await;
     let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
     owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
         executor.clone(),
@@ -2542,6 +2570,288 @@ async fn given_a_placing_partition_that_is_not_normal_when_a_sweep_runs_past_the
     assert_eq!(owner.fresh_sweeps_settled(), 1);
     assert_eq!(sweeper.deletes.get(), 0);
     assert_eq!(fresh_objects(store).len(), 1);
+}
+
+/// Ask for a sweep at `now` that a shard which cannot tell ends, and give it
+/// the time a sweep takes to settle and delete.
+#[allow(clippy::future_not_send)]
+async fn sweep_that_cannot_settle(owner: &IoTestShard, now: IggyTimestamp) {
+    owner.request_sweep_fresh_objects(now);
+    compio::time::sleep(Duration::from_millis(200)).await;
+}
+
+/// Commit one send to the partition and run the sweep that first finds its
+/// object named. Returns the object.
+#[allow(clippy::future_not_send)]
+async fn commit_a_named_object(
+    owner: &IoTestShard,
+    store: &MemoryStore,
+    now: IggyTimestamp,
+) -> u128 {
+    let _send = submit_send(owner, 1, 100);
+    until(owner, |owner| committed_sends(owner) == 1).await;
+    let objects = fresh_objects(store);
+    assert_eq!(objects.len(), 1);
+    sweep(owner, now).await;
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+    objects[0]
+}
+
+/// A partition fenced for a rebuild keeps its slot behind the tombstone
+/// until its files are quarantined. Its group still holds the placed batches
+/// that name this replica's objects, and the copy that comes back reads them
+/// again, so the shard cannot tell and the sweep deletes nothing.
+#[compio::test]
+async fn given_a_placing_partition_fenced_for_a_rebuild_when_sweeps_run_past_the_grace_should_keep_the_objects_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let object = pumped(&owner, async {
+        let object = commit_a_named_object(&owner, store, now).await;
+
+        owner.plane.partitions().tombstone(namespace());
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        let kept = fresh_objects(store);
+        // The pump does not stop while it holds a partition tombstoned
+        // without a teardown.
+        drop_fenced_partition(&owner, namespace()).await;
+        assert_eq!(kept, vec![object]);
+        object
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![object]);
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// The rebuild drops the fenced partition before the reconciler builds the
+/// next copy, and a build that fails leaves the namespace without one for
+/// as long as it keeps failing. The committed topic still places its
+/// batches there, so the shard cannot tell until a copy is back.
+#[compio::test]
+async fn given_a_committed_placing_partition_this_shard_does_not_hold_when_sweeps_run_past_the_grace_should_keep_the_objects_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let object = pumped(&owner, async {
+        let object = commit_a_named_object(&owner, store, now).await;
+
+        drop_for_a_rebuild(&owner).await;
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        object
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![object]);
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// The copy that a rebuild builds holds no placed batch until a state
+/// transfer installs those of its group, and its status is normal while it
+/// waits.
+#[compio::test]
+async fn given_a_rebuilt_placing_partition_awaiting_a_state_transfer_when_sweeps_run_past_the_grace_should_keep_the_objects_its_group_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let object = pumped(&owner, async {
+        let object = commit_a_named_object(&owner, store, now).await;
+
+        drop_for_a_rebuild(&owner).await;
+        insert_copy_awaiting_a_state_transfer(&owner).await;
+        let partitions = owner.plane.partitions();
+        let consensus = partitions.get_by_ns(&namespace()).unwrap().consensus();
+        assert!(consensus.is_normal() && consensus.is_transferring());
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        object
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![object]);
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// Fence the partition for a rebuild, as a replica does when its copy
+/// diverged from the view, and wait for the pump to drop the fenced copy.
+#[allow(clippy::future_not_send)]
+async fn drop_for_a_rebuild(owner: &IoTestShard) {
+    let partitions = owner.plane.partitions();
+    let partition = partitions.get_mut_by_ns(&namespace()).unwrap();
+    owner.fence_partition_for_rebuild(namespace(), partition, partition.offset_frontier());
+    until(owner, |owner| {
+        let partitions = owner.plane.partitions();
+        !partitions.contains(&namespace()) && !partitions.is_tombstoned(&namespace())
+    })
+    .await;
+}
+
+/// Hand the pump the next copy of the partition, as the reconciler does
+/// after a rebuild: it places its batches, holds none, and waits for a state
+/// transfer.
+#[allow(clippy::future_not_send)]
+async fn insert_copy_awaiting_a_state_transfer(owner: &IoTestShard) {
+    use consensus::MetadataHandle;
+    use metadata::impls::metadata::StreamsFrontend;
+
+    let consensus = VsrConsensus::new(
+        1,
+        0,
+        1,
+        namespace().inner(),
+        Rc::clone(&owner.bus),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    let mut copy = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        IggyByteSize::from(SEGMENT_BYTES),
+    );
+    copy.set_runtime_options(TopicRuntimeOptions {
+        places_batches: true,
+        ..Default::default()
+    });
+    copy.register_builtin_state_machines().unwrap();
+    copy.consensus().begin_state_transfer_await();
+    let epoch = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .created_revision_for_namespace(namespace())
+        .unwrap();
+    owner.enqueue_reconcile_op(ReconcileOp::InsertOwned {
+        namespace: namespace(),
+        partition: Box::new(copy),
+        epoch,
+    });
+    until(owner, |owner| {
+        owner.plane.partitions().contains(&namespace())
+    })
+    .await;
+}
+
+/// A delete commits the removal of the partition before the reconciler
+/// fences its copy. No committed partition is left to read the placed
+/// batches of that copy, so it holds back no sweep, fenced or not.
+#[compio::test]
+async fn given_a_fenced_placing_partition_that_committed_metadata_dropped_when_sweeps_run_past_the_grace_should_delete_the_objects_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+    let unnamed_since = past_grace(now);
+
+    pumped(&owner, async {
+        commit_a_named_object(&owner, store, now).await;
+
+        delete_committed_topic(&owner);
+        owner.plane.partitions().tombstone(namespace());
+        sweep(&owner, unnamed_since).await;
+        assert_eq!(fresh_objects(store).len(), 1);
+        sweep(&owner, past_grace(unnamed_since)).await;
+        let left = fresh_objects(store);
+        drop_fenced_partition(&owner, namespace()).await;
+        assert_eq!(left, Vec::<u128>::new());
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 1);
+}
+
+/// Drop the fenced `partition` from the shard, as the pump does once the
+/// files of the copy are gone or quarantined.
+#[allow(clippy::future_not_send)]
+async fn drop_fenced_partition(owner: &IoTestShard, partition: IggyNamespace) {
+    owner.enqueue_reconcile_op(ReconcileOp::ConfirmRemove {
+        namespace: partition,
+    });
+    until(owner, |owner| {
+        !owner.plane.partitions().contains(&partition)
+    })
+    .await;
+}
+
+/// Commit the delete of the fixture's topic in the shard's metadata, with
+/// the fence every partition of it installs before the topic goes.
+fn delete_committed_topic(owner: &IoTestShard) {
+    use consensus::MetadataHandle;
+    use iggy_binary_protocol::WireIdentifier;
+    use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
+    use metadata::impls::metadata::StreamsFrontend;
+    use metadata::stm::StateMachine;
+    use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+
+    let body = DeleteTopicRequest {
+        stream_id: WireIdentifier::numeric(0),
+        topic_id: WireIdentifier::numeric(0),
+    }
+    .to_bytes();
+    let message = metadata_prepare(100, Operation::DeleteTopic, &body);
+    let metadata = &owner.plane.metadata().mux_stm;
+    assert_eq!(metadata.update(message).unwrap().code, 0);
+    for intent in metadata.streams().pending_lifecycles() {
+        for target in intent.partitions {
+            let completion = CompleteLifecycleRequest::new(
+                intent.context.metadata_op,
+                intent.stream_id,
+                vec![LifecycleCompletion {
+                    topic_id: target.topic_id,
+                    partition_id: target.partition_id,
+                    partition_op: 1,
+                }],
+            )
+            .unwrap();
+            metadata
+                .update(metadata_prepare(
+                    intent.context.metadata_op,
+                    Operation::CompleteLifecycle,
+                    &completion.to_bytes(),
+                ))
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        owner
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace()),
+        None
+    );
+}
+
+/// The prepare of the metadata op `op` that carries `body`.
+fn metadata_prepare(op: u64, operation: Operation, body: &[u8]) -> Message<PrepareHeader> {
+    let size = size_of::<PrepareHeader>() + body.len();
+    let mut message = Message::<PrepareHeader>::new(size);
+    let header = PrepareHeader {
+        command: Command::Prepare,
+        op,
+        operation,
+        size: u32::try_from(size).unwrap(),
+        ..Default::default()
+    };
+    message.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(body);
+    message.transmute_header::<PrepareHeader>(|_, target| *target = header)
 }
 
 /// One sweep at a time: a sweep asked for while a listing or a delete of
