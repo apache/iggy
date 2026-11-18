@@ -286,6 +286,29 @@ async fn given_a_trim_point_the_manifest_does_not_hold_when_asking_should_make_o
     assert!(partition.object_deletes_await_manifest());
 }
 
+/// A put that outlives its view reports back after the replica leads again.
+/// Taken as the new view's publish, it would let deletes go ahead under a
+/// manifest this view never stored.
+#[compio::test]
+async fn given_a_publish_of_an_earlier_view_when_its_result_arrives_during_the_next_views_publish_should_change_nothing()
+ {
+    let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
+    let now = IggyTimestamp::now();
+    Box::pin(partition.remove_sealed_segments_up_to(SEALED[0].1)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    let (earlier, _manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    regain_primacy(&mut partition);
+    let (id, _manifest, scope) = partition.begin_manifest_publish(now).unwrap();
+
+    partition.finish_manifest_publish(earlier, &STORED, now);
+
+    assert!(partition.object_deletes_await_manifest());
+    assert!(!scope.is_cancelled());
+    assert!(partition.begin_manifest_publish(now).is_none());
+    partition.finish_manifest_publish(id, &STORED, now);
+    assert!(!partition.object_deletes_await_manifest());
+}
+
 #[compio::test]
 async fn given_a_backup_with_a_trim_point_when_asking_should_not_hold_its_delete_pass_back() {
     let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
