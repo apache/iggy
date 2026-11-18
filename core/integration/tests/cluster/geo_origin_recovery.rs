@@ -33,8 +33,9 @@ use iggy::prelude::*;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch, Placement};
 use iggy_object_store::{
-    FreshBatch, FreshObjectHeader, FreshObjectId, FreshPartition, FreshProofRow, FsStore,
-    KeyLayout, ObjectStore, PutBody, PutOptions, RecoveryRecord, SealedFreshObject, StoreIdentity,
+    FreshBatch, FreshIndex, FreshObjectHeader, FreshObjectId, FreshPartition, FreshProofRow,
+    FsStore, KeyLayout, ObjectStore, PutBody, PutOptions, RecoveryRecord, SealedFreshObject,
+    StoreIdentity,
 };
 use server_common::send_messages::{
     IggyMessage as StoredMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
@@ -217,6 +218,167 @@ async fn given_a_bucket_of_an_origin_that_lost_every_disk_when_a_cluster_with_em
             .any(|skipped| skipped["reason"] == "not_self_describing"),
         "the origin's objects of the format before are reported: {report}"
     );
+}
+
+/// Sends of the real-writer test in one round, before it checks whether the
+/// bucket proves batches the manifest does not list yet.
+const ROUND_SENDS: u64 = 20;
+/// Rounds the real-writer test sends at most.
+const ROUNDS: u64 = 10;
+
+#[tokio::test]
+async fn given_a_geo_topic_that_a_real_writer_proved_when_every_disk_is_lost_and_a_rebuilt_cluster_recovers_it_should_serve_every_proven_message_once_in_order()
+ {
+    let store = store_on_disk();
+    let bucket = Bucket::Fs(store.path().to_owned());
+    let mut harness = cluster_with_fs_store(store.path());
+    harness.start().await.expect("the cluster boots");
+    await_store_claim(&mut harness, store.path()).await;
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client");
+    let topics = Topics::create(&client, "geo-real-recovery").await;
+    let (stream_id, topic_id) = topics.geo_prefix_ids(&client).await;
+    let namespace = IggyNamespace::new(
+        usize::try_from(stream_id).unwrap(),
+        usize::try_from(topic_id).unwrap(),
+        PARTITION_ID as usize,
+    );
+    let layout = KeyLayout::new(STORE_PREFIX).expect("the default prefix");
+    let mut ledger = Ledger::default();
+    for _ in 0..ROUND_SENDS {
+        assert_eq!(
+            ledger
+                .send(&client, &topics.stream, &topics.geo, MESSAGE_BYTES)
+                .await,
+            Answer::Acked
+        );
+    }
+    bucket
+        .await_rewritten(stream_id, topic_id, ROUND_SENDS - 1)
+        .await;
+    let mut proven = Proven::default();
+    for _ in 0..ROUNDS {
+        for _ in 0..ROUND_SENDS {
+            assert_eq!(
+                ledger
+                    .send(&client, &topics.stream, &topics.geo, MESSAGE_BYTES)
+                    .await,
+                Answer::Acked
+            );
+        }
+        let sent = ledger.count(Answer::Acked) as u64;
+        proven = await_proven(&bucket, &layout, namespace, stream_id, topic_id, sent).await;
+        if proven.above_floor > 0 {
+            break;
+        }
+    }
+    let sent = ledger.count(Answer::Acked) as u64;
+    eprintln!(
+        "{sent} sends, the manifest lists {} of them and proofs alone the other {}",
+        sent - proven.above_floor,
+        proven.above_floor
+    );
+    assert!(
+        proven.above_floor > 0 && proven.above_floor < sent,
+        "the manifest lists some sends and the proofs alone the others: {proven:?} of {sent}"
+    );
+    harness.kill_cluster().expect("kill every node");
+    let retired = proven.cluster_uid;
+
+    harness
+        .node_mut(0)
+        .add_env("IGGY_GEO_RECOVER_CLUSTER_UID", format!("{retired:032x}"));
+    for node in 0..NODES {
+        harness
+            .restart_node_from_clean_slate(node)
+            .expect("restart the node without its disk");
+    }
+    let successor = await_recovery(&mut harness, &bucket, &layout, retired).await;
+    assert_ne!(successor, retired);
+
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client");
+    let read = await_read(&client, &topics, usize::try_from(sent).unwrap()).await;
+    assert_eq!(
+        read,
+        (0..sent).collect::<Vec<_>>(),
+        "every acknowledged send, which the bucket proved, once and in order"
+    );
+    ledger.assert_read(&read);
+    let record = RecoveryRecord::decode(&bucket.objects().await[&layout.recovery_key(retired)])
+        .expect("the recovery record decodes");
+    let [cutover] = record.partitions.as_slice() else {
+        panic!("one partition: {record:?}");
+    };
+    assert_eq!(
+        (cutover.proven_end, cutover.cutover),
+        (sent, sent),
+        "the proofs alone take back the sends above the floor"
+    );
+}
+
+/// What the bucket proves of the geo partition.
+#[derive(Debug, Default)]
+struct Proven {
+    /// The cluster whose objects hold the proofs.
+    cluster_uid: u128,
+    /// Sends above the floor of the manifest that proofs bind to offsets.
+    above_floor: u64,
+}
+
+/// Waits until the manifest and the proof rows of the fresh objects in the
+/// bucket together bind every offset below `sent`, and returns how many of
+/// them the proofs alone bind.
+async fn await_proven(
+    bucket: &Bucket,
+    layout: &KeyLayout,
+    namespace: IggyNamespace,
+    stream_id: u64,
+    topic_id: u64,
+    sent: u64,
+) -> Proven {
+    let deadline = Instant::now() + RECOVERY_DEADLINE;
+    loop {
+        let objects = bucket.objects().await;
+        let published_end = geo_manifest(&objects, stream_id, topic_id)
+            .and_then(|manifest| manifest.floor)
+            .map_or(0, |floor| floor + 1);
+        let mut rows = std::collections::BTreeMap::new();
+        let mut cluster_uid = 0;
+        for (key, bytes) in &objects {
+            let Some(id) = layout.parse_fresh_key(key).map(FreshObjectId::from_raw) else {
+                continue;
+            };
+            let Ok(index) = FreshIndex::decode(bytes, id) else {
+                continue;
+            };
+            cluster_uid = index.header().cluster_uid;
+            if let Some(row) = index.partition(namespace.inner()) {
+                for proof in index.proofs_of(row) {
+                    rows.insert(proof.base_offset, proof.message_count);
+                }
+            }
+        }
+        let mut next = published_end;
+        while let Some(count) = rows.get(&next) {
+            next += u64::from(*count);
+        }
+        if next >= sent {
+            return Proven {
+                cluster_uid,
+                above_floor: sent.saturating_sub(published_end),
+            };
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bucket binds offsets below {next} of {sent}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Waits until the store names a cluster other than `retired`, restarting
