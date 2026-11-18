@@ -68,7 +68,9 @@ impl CliCommand for GetConsumerGroupCmd {
 
         let consumer_group = consumer_group.unwrap();
 
-        let consumer = Consumer::group(self.group_id.clone());
+        // The lookup id can be a name. Offset reads stay on the group this
+        // reply returned, even if that name is recreated before they run.
+        let consumer = Consumer::group(Identifier::numeric(consumer_group.id)?);
         let mut owners = HashMap::with_capacity(
             consumer_group
                 .members
@@ -237,10 +239,12 @@ fn log_consumer_group(
     if let Some(members) = members {
         table.add_row(vec!["Members", members.to_string().as_str()]);
     }
-    if let Some(partitions) = partitions {
-        table.add_row(vec!["Partitions", partitions.to_string().as_str()]);
-    }
+    // The members cell lists every assigned partition. A partition table in
+    // the same property table would pad each of its rows out to that width.
     event!(target: PRINT_TARGET, Level::INFO, "{table}");
+    if let Some(partitions) = partitions {
+        event!(target: PRINT_TARGET, Level::INFO, "{partitions}");
+    }
 }
 
 #[cfg(test)]
@@ -287,13 +291,15 @@ mod tests {
         /// `(current_offset, stored_offset)` returned for every partition.
         offset: Option<(u64, u64)>,
         members: Vec<ConsumerGroupMember>,
+        /// Numeric id returned by `get_consumer_group`.
+        group_id: u32,
+        /// Consumers passed to `get_consumer_offset`, in call order.
+        offset_consumers: Mutex<Vec<Identifier>>,
     }
 
     struct LogBuffer(Arc<Mutex<Vec<u8>>>);
 
-    struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for LogWriter {
+    impl Write for LogBuffer {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.lock().expect("log buffer").extend_from_slice(buf);
             Ok(buf.len())
@@ -305,10 +311,10 @@ mod tests {
     }
 
     impl<'a> MakeWriter<'a> for LogBuffer {
-        type Writer = LogWriter;
+        type Writer = LogBuffer;
 
         fn make_writer(&'a self) -> Self::Writer {
-            LogWriter(Arc::clone(&self.0))
+            LogBuffer(Arc::clone(&self.0))
         }
     }
 
@@ -722,11 +728,15 @@ mod tests {
 
         async fn get_consumer_offset(
             &self,
-            _consumer: &Consumer,
+            consumer: &Consumer,
             _stream_id: &Identifier,
             _topic_id: &Identifier,
             _partition_id: Option<u32>,
         ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
+            self.offset_consumers
+                .lock()
+                .expect("offset consumers")
+                .push(consumer.id.clone());
             if self.offset_fails
                 || self
                     .offset_fails_for
@@ -774,7 +784,7 @@ mod tests {
             _group_id: &Identifier,
         ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
             Ok(Some(ConsumerGroupDetails {
-                id: 3,
+                id: self.group_id,
                 name: "group".to_owned(),
                 partitions_count: self.partitions_count,
                 members_count: u32::try_from(self.members.len()).unwrap(),
@@ -863,6 +873,8 @@ mod tests {
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -879,6 +891,8 @@ mod tests {
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -896,6 +910,8 @@ mod tests {
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -916,6 +932,8 @@ mod tests {
                 partitions_count: 1,
                 partitions: vec![3],
             }],
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -937,14 +955,22 @@ mod tests {
                 partitions_count: 2,
                 partitions: vec![4, 3],
             }],
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
-        let row_3 = output
-            .find("  3         | 17")
+        let rows = output
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
+        let row_3 = rows
+            .iter()
+            .position(|row| row.contains("3 | 17"))
             .unwrap_or_else(|| panic!("partition 3 missing\n{output}"));
-        let row_4 = output
-            .find("  4         | 17")
+        let row_4 = rows
+            .iter()
+            .position(|row| row.contains("4 | 17"))
             .unwrap_or_else(|| panic!("partition 4 missing\n{output}"));
         assert!(row_3 < row_4, "{output}");
     }
@@ -958,6 +984,8 @@ mod tests {
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -970,35 +998,21 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn should_print_the_group_when_one_offset_read_fails() {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_level(false)
-            .with_writer(LogBuffer(Arc::clone(&logs)))
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let mut cmd = command();
-        let error = cmd
-            .execute_cmd(&ScriptedClient {
+        let (output, error) = printed_error(&ScriptedClient {
+            partitions_count: 2,
+            topic: TopicReply::Partitions(vec![partition(0), partition(1)]),
+            offset_fails: false,
+            offset_fails_for: Some(1),
+            offset: Some((20, 5)),
+            members: vec![ConsumerGroupMember {
+                id: 17,
                 partitions_count: 2,
-                topic: TopicReply::Partitions(vec![partition(0), partition(1)]),
-                offset_fails: false,
-                offset_fails_for: Some(1),
-                offset: Some((20, 5)),
-                members: vec![ConsumerGroupMember {
-                    id: 17,
-                    partitions_count: 2,
-                    partitions: vec![0, 1],
-                }],
-            })
-            .await
-            .expect_err("one offset read fails");
-        drop(_guard);
-        let output =
-            String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8");
+                partitions: vec![0, 1],
+            }],
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
+        })
+        .await;
 
         assert!(
             error
@@ -1026,6 +1040,8 @@ mod tests {
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await
         .expect("a topic can grow past one create request");
@@ -1043,6 +1059,8 @@ mod tests {
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -1067,6 +1085,8 @@ mod tests {
             offset_fails_for: None,
             offset: Some((4, 10)),
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -1091,6 +1111,8 @@ mod tests {
             offset_fails_for: None,
             offset: Some((20, 5)),
             members: Vec::new(),
+            group_id: 3,
+            offset_consumers: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -1099,5 +1121,35 @@ mod tests {
             !output.contains("30") && !output.contains("| 25"),
             "lag uses the offset reply, got {output}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_read_offsets_for_the_returned_group_id() {
+        let client = ScriptedClient {
+            partitions_count: 2,
+            topic: TopicReply::Partitions(vec![partition(0), partition(1)]),
+            offset_fails: false,
+            offset_fails_for: None,
+            offset: Some((20, 5)),
+            members: Vec::new(),
+            group_id: 9,
+            offset_consumers: Mutex::new(Vec::new()),
+        };
+        let mut cmd = GetConsumerGroupCmd::new(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+            Identifier::named("group").unwrap(),
+        );
+        cmd.execute_cmd(&client)
+            .await
+            .expect("consumer group get should read offsets by numeric id");
+
+        let seen = client
+            .offset_consumers
+            .lock()
+            .expect("offset consumers")
+            .clone();
+        let expected = Identifier::numeric(9).unwrap();
+        assert_eq!(seen, vec![expected.clone(), expected]);
     }
 }
