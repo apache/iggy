@@ -917,6 +917,18 @@ fn describe(proposal: &ShadowTopicRequest) -> String {
                 target.topic_id, target.stream_id
             )
         }
+        ShadowTopicRequest::RestoreStream { source, name } => format!(
+            "restore stream {} as {}",
+            describe_source(source),
+            name.as_str()
+        ),
+        ShadowTopicRequest::RestoreTopic { target, create } => format!(
+            "restore topic {} ({}) of {} at revision {}",
+            target.topic_id,
+            create.request.name.as_str(),
+            describe_source(&target.source),
+            target.created_revision
+        ),
     }
 }
 

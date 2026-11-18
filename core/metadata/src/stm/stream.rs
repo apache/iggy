@@ -30,7 +30,7 @@ use crate::stm::partition_directory::PartitionDirectory;
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
     DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, DeletedResource,
-    TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
+    ShadowTopicResult, TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
 use crate::stm::shadow::{ShadowStream, ShadowTopic, ShadowTopicRequest, is_shadow_stream_name};
 use crate::stm::snapshot::{SnapshotError, Snapshotable};
@@ -3650,14 +3650,46 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
     }
 }
 
+/// Where a topic goes whose create does not pick its id.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FixedTopic {
+    /// A shadow topic: at the peer's topic id, serving the peer's
+    /// incarnation.
+    Shadow {
+        topic_id: usize,
+        shadow: ShadowTopic,
+    },
+    /// A geo topic taken back from the store of a cluster that lost every
+    /// disk: at that cluster's topic id, with its partitions at that
+    /// cluster's revision, so their objects keep their keys.
+    Restored {
+        topic_id: usize,
+        created_revision: u64,
+    },
+}
+
+impl FixedTopic {
+    const fn topic_id(self) -> usize {
+        match self {
+            Self::Shadow { topic_id, .. } | Self::Restored { topic_id, .. } => topic_id,
+        }
+    }
+
+    const fn shadow(self) -> Option<ShadowTopic> {
+        match self {
+            Self::Shadow { shadow, .. } => Some(shadow),
+            Self::Restored { .. } => None,
+        }
+    }
+}
+
 /// Create the topic that `request` describes in the stream `stream_id`: at
-/// the lowest free topic id, or for a shadow topic at the peer's topic id and
-/// with the peer's incarnation.
+/// the lowest free topic id, or where `fixed` says.
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 pub(crate) fn create_topic(
     state: &mut StreamsInner,
     stream_id: usize,
-    shadow: Option<(usize, ShadowTopic)>,
+    fixed: Option<FixedTopic>,
     request: &CreateTopicWithAssignmentsRequest,
     timestamp: IggyTimestamp,
 ) -> ApplyReply {
@@ -3672,12 +3704,21 @@ pub(crate) fn create_topic(
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
         if stream.topic_index.contains_key(&name_arc)
-            || shadow.is_some_and(|(topic_id, _)| stream.topics.contains(topic_id))
+            || fixed.is_some_and(|fixed| stream.topics.contains(fixed.topic_id()))
         {
             return ApplyReply::err(CreateTopicResult::NameAlreadyExists);
         }
+        // Revisions only rise, and the reconcilers read the partition changes
+        // after the revision they last saw.
+        if let Some(FixedTopic::Restored {
+            created_revision, ..
+        }) = fixed
+            && created_revision <= state.revision
+        {
+            return ApplyReply::err(ShadowTopicResult::InvalidTopicId);
+        }
         // Topic slabs are per stream, so this caps topics WITHIN one stream.
-        let topic_id = shadow.map_or_else(|| stream.topics.vacant_key(), |(topic_id, _)| topic_id);
+        let topic_id = fixed.map_or_else(|| stream.topics.vacant_key(), FixedTopic::topic_id);
         if !admits_slab_key(topic_id, MAX_TOPICS) {
             return ApplyReply::err(CreateTopicResult::TooManyTopics);
         }
@@ -3744,7 +3785,12 @@ pub(crate) fn create_topic(
 
     // Past validation: this commit adds partitions, so bump the
     // monotonic revision and stamp every new partition with it.
-    let new_revision = state.revision.wrapping_add(1);
+    let new_revision = match fixed {
+        Some(FixedTopic::Restored {
+            created_revision, ..
+        }) => created_revision,
+        _ => state.revision.wrapping_add(1),
+    };
     state.revision = new_revision;
     state.namespace_revision = state.revision;
 
@@ -3781,10 +3827,10 @@ pub(crate) fn create_topic(
         next_consumer_group_id: 0,
         consumer_group_catalog_op: 0,
         created_op: state.apply_context.metadata_op,
-        shadow: shadow.map(|(_, shadow)| shadow),
+        shadow: fixed.and_then(FixedTopic::shadow),
     };
 
-    let inserted = if shadow.is_some() {
+    let inserted = if fixed.is_some() {
         // Validation found the key free.
         stream.topics.insert_at(topic_id, topic);
         topic_id

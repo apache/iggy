@@ -36,6 +36,11 @@
 //! topic after a grace period, and a shadow stream once it holds no topic.
 //! Whether a peer's store answers is the primary's own view, which it does
 //! not replicate.
+//!
+//! The same operation takes back the geo topics of a cluster that lost every
+//! disk, from its store, into the cluster rebuilt in its place: a restored
+//! stream and topic are this cluster's own, with the ids and the revision
+//! that the lost cluster gave them, so their objects keep their keys.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{
@@ -53,7 +58,7 @@ use std::sync::Arc;
 use crate::change_log::{AppliedChange, change_actor, stream_body};
 use crate::stm::StateHandler;
 use crate::stm::result::{ApplyReply, ShadowTopicResult};
-use crate::stm::stream::{Stream, StreamsInner, admits_slab_key, create_topic};
+use crate::stm::stream::{FixedTopic, Stream, StreamsInner, admits_slab_key, create_topic};
 use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChange;
 use server_common::sharding::MAX_STREAMS;
 
@@ -150,6 +155,19 @@ pub enum ShadowTopicRequest {
     },
     /// Remove the shadow topic and its partitions.
     RemoveTopic { target: ShadowTopicTarget },
+    /// Create the stream `name` of this cluster at `source.stream_id`, the
+    /// id the retired cluster `source.cluster_uid` gave it.
+    RestoreStream {
+        source: ShadowStream,
+        name: WireName,
+    },
+    /// Create a geo topic of this cluster in the restored stream, at the
+    /// topic id and with the partitions' revision of the retired cluster.
+    /// `create` names the topic and carries its options and partitions.
+    RestoreTopic {
+        target: ShadowTopicTarget,
+        create: Box<CreateTopicWithAssignmentsRequest>,
+    },
 }
 
 const CREATE_STREAM: u8 = 1;
@@ -158,6 +176,8 @@ const REMOVE_STREAM: u8 = 3;
 const ADOPT_TOPIC: u8 = 4;
 const DETACH_TOPIC: u8 = 5;
 const REMOVE_TOPIC: u8 = 6;
+const RESTORE_STREAM: u8 = 7;
+const RESTORE_TOPIC: u8 = 8;
 
 impl ShadowTopicRequest {
     const fn kind(&self) -> u8 {
@@ -168,6 +188,8 @@ impl ShadowTopicRequest {
             Self::AdoptTopic { .. } => ADOPT_TOPIC,
             Self::DetachTopic { .. } => DETACH_TOPIC,
             Self::RemoveTopic { .. } => REMOVE_TOPIC,
+            Self::RestoreStream { .. } => RESTORE_STREAM,
+            Self::RestoreTopic { .. } => RESTORE_TOPIC,
         }
     }
 
@@ -175,10 +197,12 @@ impl ShadowTopicRequest {
         match self {
             Self::CreateStream { source, .. }
             | Self::RenameStream { source, .. }
-            | Self::RemoveStream { source, .. } => source,
+            | Self::RemoveStream { source, .. }
+            | Self::RestoreStream { source, .. } => source,
             Self::AdoptTopic { target, .. }
             | Self::DetachTopic { target, .. }
-            | Self::RemoveTopic { target } => &target.source,
+            | Self::RemoveTopic { target }
+            | Self::RestoreTopic { target, .. } => &target.source,
         }
     }
 }
@@ -195,6 +219,12 @@ impl ShadowTopicRequest {
 //   detach topic:  stream_id u32 | topic_id u32 | created_revision u64
 //                  | deleted_at u64
 //   remove topic:  stream_id u32 | topic_id u32 | created_revision u64
+//   restore stream: name
+//   restore topic: stream_id u32 | topic_id u32 | created_revision u64
+//                  | create length u32 | create
+//
+// A restore carries this cluster's origin, the retired cluster's
+// cluster_uid and the stream's id there.
 
 const TARGET_LEN: usize = 4 + 4 + 8;
 
@@ -203,10 +233,14 @@ impl WireEncode for ShadowTopicRequest {
         let source = self.source();
         let head = 1 + 1 + source.origin.len() + 16 + 8;
         head + match self {
-            Self::CreateStream { name, .. } => name.encoded_size(),
+            Self::CreateStream { name, .. } | Self::RestoreStream { name, .. } => {
+                name.encoded_size()
+            }
             Self::RenameStream { name, .. } => 4 + name.encoded_size(),
             Self::RemoveStream { .. } => 4,
-            Self::AdoptTopic { create, .. } => TARGET_LEN + 4 + create.encoded_size(),
+            Self::AdoptTopic { create, .. } | Self::RestoreTopic { create, .. } => {
+                TARGET_LEN + 4 + create.encoded_size()
+            }
             Self::DetachTopic { .. } => TARGET_LEN + 8,
             Self::RemoveTopic { .. } => TARGET_LEN,
         }
@@ -221,7 +255,7 @@ impl WireEncode for ShadowTopicRequest {
         buf.put_u128_le(source.cluster_uid);
         buf.put_u64_le(source.stream_id);
         match self {
-            Self::CreateStream { name, .. } => name.encode(buf),
+            Self::CreateStream { name, .. } | Self::RestoreStream { name, .. } => name.encode(buf),
             Self::RenameStream {
                 stream_id, name, ..
             } => {
@@ -229,7 +263,7 @@ impl WireEncode for ShadowTopicRequest {
                 name.encode(buf);
             }
             Self::RemoveStream { stream_id, .. } => buf.put_u32_le(*stream_id),
-            Self::AdoptTopic { target, create } => {
+            Self::AdoptTopic { target, create } | Self::RestoreTopic { target, create } => {
                 encode_target(target, buf);
                 let length = u32::try_from(create.encoded_size()).expect("a create fits u32");
                 buf.put_u32_le(length);
@@ -265,10 +299,14 @@ impl WireDecode for ShadowTopicRequest {
             stream_id,
         };
         let request = match kind {
-            CREATE_STREAM => {
+            CREATE_STREAM | RESTORE_STREAM => {
                 let (name, consumed) = WireName::decode(slice_from(buf, position)?)?;
                 position += consumed;
-                Self::CreateStream { source, name }
+                if kind == CREATE_STREAM {
+                    Self::CreateStream { source, name }
+                } else {
+                    Self::RestoreStream { source, name }
+                }
             }
             RENAME_STREAM => {
                 let stream_id = read_u32_le(buf, position)?;
@@ -285,7 +323,7 @@ impl WireDecode for ShadowTopicRequest {
                 position += 4;
                 Self::RemoveStream { stream_id, source }
             }
-            ADOPT_TOPIC | DETACH_TOPIC | REMOVE_TOPIC => {
+            ADOPT_TOPIC | DETACH_TOPIC | REMOVE_TOPIC | RESTORE_TOPIC => {
                 let target = ShadowTopicTarget {
                     stream_id: read_u32_le(buf, position)?,
                     source,
@@ -294,14 +332,16 @@ impl WireDecode for ShadowTopicRequest {
                 };
                 position += TARGET_LEN;
                 match kind {
-                    ADOPT_TOPIC => {
+                    ADOPT_TOPIC | RESTORE_TOPIC => {
                         let length = read_u32_le(buf, position)? as usize;
                         let bytes = read_bytes(buf, position + 4, length)?;
-                        let create = CreateTopicWithAssignmentsRequest::decode_from(bytes)?;
+                        let create =
+                            Box::new(CreateTopicWithAssignmentsRequest::decode_from(bytes)?);
                         position += 4 + length;
-                        Self::AdoptTopic {
-                            target,
-                            create: Box::new(create),
+                        if kind == ADOPT_TOPIC {
+                            Self::AdoptTopic { target, create }
+                        } else {
+                            Self::RestoreTopic { target, create }
                         }
                     }
                     DETACH_TOPIC => {
@@ -348,6 +388,10 @@ impl StateHandler for ShadowTopicRequest {
             Self::AdoptTopic { target, create } => adopt_topic(state, target, create, timestamp),
             Self::DetachTopic { target, deleted_at } => detach_topic(state, target, *deleted_at),
             Self::RemoveTopic { target } => remove_topic(state, target, timestamp),
+            Self::RestoreStream { source, name } => restore_stream(state, source, name, timestamp),
+            Self::RestoreTopic { target, create } => {
+                restore_topic(state, target, create, timestamp)
+            }
         };
         state.shadow_write = false;
         reply
@@ -509,7 +553,10 @@ fn adopt_topic(
     create_topic(
         state,
         stream_id,
-        Some((target.topic_id as usize, shadow)),
+        Some(FixedTopic::Shadow {
+            topic_id: target.topic_id as usize,
+            shadow,
+        }),
         create,
         timestamp,
     )
@@ -550,6 +597,103 @@ fn remove_topic(
         topic_id: WireIdentifier::numeric(topic_id),
     }
     .apply(state, timestamp)
+}
+
+/// Create the stream `name` of this cluster at the id the retired cluster
+/// gave it. A stream that holds the id already with that name and no peer
+/// is the one an earlier attempt restored.
+fn restore_stream(
+    state: &mut StreamsInner,
+    source: &ShadowStream,
+    name: &WireName,
+    timestamp: IggyTimestamp,
+) -> ApplyReply {
+    if is_shadow_stream_name(name.as_str()) {
+        return ApplyReply::err(ShadowTopicResult::InvalidStreamName);
+    }
+    let Some(id) = usize::try_from(source.stream_id)
+        .ok()
+        .filter(|id| admits_slab_key(*id, MAX_STREAMS))
+    else {
+        return ApplyReply::err(ShadowTopicResult::InvalidStreamId);
+    };
+    let name: Arc<str> = Arc::from(name.as_str());
+    if let Some(stream) = state.items.get(id) {
+        return if stream.name == name && stream.shadow.is_none() {
+            ApplyReply::ok(Bytes::new())
+        } else {
+            ApplyReply::err(ShadowTopicResult::InvalidStreamId)
+        };
+    }
+    if state.index.contains_key(&name) {
+        return ApplyReply::err(ShadowTopicResult::StreamNameAlreadyExists);
+    }
+    let mut stream = Stream::with_stats(name.clone(), timestamp, state.stats_registry.stream(id));
+    stream.id = id;
+    stream.created_op = state.apply_context.metadata_op;
+    if !state.items.insert_at(id, stream) {
+        return ApplyReply::err(ShadowTopicResult::InvalidStreamId);
+    }
+    state.index.insert(name, id);
+    state.created_index.insert((timestamp.as_micros(), id));
+    let changes = state
+        .items
+        .get(id)
+        .and_then(stream_body)
+        .map(|body| {
+            AppliedChange::new(
+                &WireMetadataChange::StreamCreated(body),
+                change_actor(&state.apply_context),
+            )
+        })
+        .into_iter()
+        .collect();
+    ApplyReply {
+        changes,
+        ..ApplyReply::ok(Bytes::new())
+    }
+}
+
+/// Create the geo topic `target` names in its restored stream. A topic that
+/// holds its id already with its revision is the one an earlier attempt
+/// restored.
+fn restore_topic(
+    state: &mut StreamsInner,
+    target: &ShadowTopicTarget,
+    create: &CreateTopicWithAssignmentsRequest,
+    timestamp: IggyTimestamp,
+) -> ApplyReply {
+    let stream_id = target.stream_id as usize;
+    let topic_id = target.topic_id as usize;
+    let Some(stream) = state
+        .items
+        .get(stream_id)
+        .filter(|stream| stream.shadow.is_none() && stream.id as u64 == target.source.stream_id)
+    else {
+        return ApplyReply::err(ShadowTopicResult::StreamNotFound);
+    };
+    if let Some(topic) = stream.topics.get(topic_id) {
+        let restored = topic.shadow.is_none()
+            && topic
+                .partitions
+                .first()
+                .is_some_and(|partition| partition.created_revision == target.created_revision);
+        return if restored {
+            ApplyReply::ok(Bytes::new())
+        } else {
+            ApplyReply::err(ShadowTopicResult::InvalidTopicId)
+        };
+    }
+    create_topic(
+        state,
+        stream_id,
+        Some(FixedTopic::Restored {
+            topic_id,
+            created_revision: target.created_revision,
+        }),
+        create,
+        timestamp,
+    )
 }
 
 #[cfg(test)]
@@ -658,6 +802,187 @@ mod tests {
         (inner, stream_id)
     }
 
+    const ORIGIN: &str = "dc-a";
+    const RETIRED_CLUSTER: u128 = 0x0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a;
+    const RETIRED_STREAM: u32 = 5;
+    const RETIRED_TOPIC: u32 = 2;
+    const RETIRED_REVISION: u64 = 30;
+
+    /// A stream of the retired cluster, which this cluster takes back.
+    fn retired_source() -> ShadowStream {
+        ShadowStream {
+            origin: ORIGIN.to_owned(),
+            cluster_uid: RETIRED_CLUSTER,
+            stream_id: u64::from(RETIRED_STREAM),
+        }
+    }
+
+    fn restoration(created_revision: u64, partitions: u32) -> ShadowTopicRequest {
+        ShadowTopicRequest::RestoreTopic {
+            target: ShadowTopicTarget {
+                stream_id: RETIRED_STREAM,
+                source: retired_source(),
+                topic_id: RETIRED_TOPIC,
+                created_revision,
+            },
+            create: Box::new(CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(RETIRED_STREAM),
+                    partitions_count: partitions,
+                    name: name("payments"),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: assignments(partitions),
+            }),
+        }
+    }
+
+    /// The stream `orders` of the retired cluster restored after a stream
+    /// of this cluster at id 0.
+    fn restored_stream() -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        let local = CreateStreamRequest {
+            name: name("local"),
+            options: WireOptions::empty(),
+        };
+        assert_eq!(apply(&mut inner, 1, &local).code, 0);
+        let restore = ShadowTopicRequest::RestoreStream {
+            source: retired_source(),
+            name: name("orders"),
+        };
+        assert_eq!(apply(&mut inner, 2, &restore).code, 0);
+        inner
+    }
+
+    #[test]
+    fn given_a_stream_and_topic_of_a_retired_cluster_when_restored_should_keep_their_ids_and_revision()
+     {
+        let mut inner = restored_stream();
+
+        assert_eq!(
+            apply(&mut inner, 3, &restoration(RETIRED_REVISION, 2)).code,
+            0
+        );
+
+        let stream = &inner.items[RETIRED_STREAM as usize];
+        assert_eq!(&*stream.name, "orders");
+        assert_eq!(stream.shadow, None);
+        assert_eq!(inner.index["orders"], RETIRED_STREAM as usize);
+        let topic = stream.topics.get(RETIRED_TOPIC as usize).unwrap();
+        assert_eq!(topic.shadow, None);
+        assert_eq!(&*topic.name, "payments");
+        let revisions: Vec<_> = topic
+            .partitions
+            .iter()
+            .map(|partition| (partition.id, partition.created_revision))
+            .collect();
+        assert_eq!(revisions, [(0, RETIRED_REVISION), (1, RETIRED_REVISION)]);
+        assert_eq!(inner.revision, RETIRED_REVISION);
+        // A client's create after the restore goes on above its revision.
+        let next = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: wire_id(RETIRED_STREAM),
+                partitions_count: 1,
+                name: name("later"),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: assignments(1),
+        };
+        assert_eq!(apply(&mut inner, 4, &next).code, 0);
+        assert_eq!(inner.revision, RETIRED_REVISION + 1);
+    }
+
+    #[test]
+    fn given_a_restore_that_committed_when_proposed_again_should_change_nothing() {
+        let mut inner = restored_stream();
+        assert_eq!(
+            apply(&mut inner, 3, &restoration(RETIRED_REVISION, 2)).code,
+            0
+        );
+        let again = ShadowTopicRequest::RestoreStream {
+            source: retired_source(),
+            name: name("orders"),
+        };
+
+        assert_eq!(apply(&mut inner, 4, &again).code, 0);
+        assert_eq!(
+            apply(&mut inner, 5, &restoration(RETIRED_REVISION, 2)).code,
+            0
+        );
+
+        assert_eq!(inner.revision, RETIRED_REVISION);
+        assert_eq!(inner.items[RETIRED_STREAM as usize].topics.len(), 1);
+    }
+
+    #[test]
+    fn given_ids_or_a_revision_this_cluster_holds_when_restoring_should_refuse() {
+        let mut inner = restored_stream();
+        let taken_id = ShadowTopicRequest::RestoreStream {
+            source: ShadowStream {
+                stream_id: 0,
+                ..retired_source()
+            },
+            name: name("orders-elsewhere"),
+        };
+        let taken_name = ShadowTopicRequest::RestoreStream {
+            source: ShadowStream {
+                stream_id: 9,
+                ..retired_source()
+            },
+            name: name("local"),
+        };
+        let shadow_name = ShadowTopicRequest::RestoreStream {
+            source: ShadowStream {
+                stream_id: 9,
+                ..retired_source()
+            },
+            name: name(SHADOW_NAME),
+        };
+        assert_eq!(
+            apply(&mut inner, 3, &taken_id).code,
+            u32::from(ShadowTopicResult::InvalidStreamId)
+        );
+        assert_eq!(
+            apply(&mut inner, 4, &taken_name).code,
+            u32::from(ShadowTopicResult::StreamNameAlreadyExists)
+        );
+        assert_eq!(
+            apply(&mut inner, 5, &shadow_name).code,
+            u32::from(ShadowTopicResult::InvalidStreamName)
+        );
+        assert_eq!(
+            apply(&mut inner, 6, &restoration(RETIRED_REVISION, 1)).code,
+            0
+        );
+
+        // The topic id holds another incarnation.
+        assert_eq!(
+            apply(&mut inner, 7, &restoration(RETIRED_REVISION + 1, 1)).code,
+            u32::from(ShadowTopicResult::InvalidTopicId)
+        );
+        let ShadowTopicRequest::RestoreTopic { mut target, create } =
+            restoration(RETIRED_REVISION, 1)
+        else {
+            unreachable!()
+        };
+        // A free topic id, at a revision this cluster passed.
+        target.topic_id += 1;
+        let mut create = create;
+        create.request.name = name("payments-2");
+        assert_eq!(
+            apply(
+                &mut inner,
+                8,
+                &ShadowTopicRequest::RestoreTopic { target, create }
+            )
+            .code,
+            u32::from(ShadowTopicResult::InvalidTopicId)
+        );
+        assert_eq!(inner.revision, RETIRED_REVISION);
+    }
+
     fn wire_id(id: u32) -> WireIdentifier {
         WireIdentifier::numeric(id)
     }
@@ -688,6 +1013,11 @@ mod tests {
                 deleted_at: 1_700_000_000_000_000,
             },
             ShadowTopicRequest::RemoveTopic { target: target(4) },
+            ShadowTopicRequest::RestoreStream {
+                source: retired_source(),
+                name: name("orders"),
+            },
+            restoration(RETIRED_REVISION, 2),
         ];
         for request in requests {
             let bytes = request.to_bytes();
