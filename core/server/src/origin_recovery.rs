@@ -61,7 +61,7 @@ use iggy_common::{
 use iggy_object_store::{
     KeyLayout, ManifestError, ObjectPrefix, ObjectStore, ObjectStoreError, PartitionManifest,
     PutBody, PutMode, PutOptions, RecoveredCutover, RecoveryRead, RecoveryRecord, StoreIdentity,
-    TopicCompression, TopicGeoMode, TopicKey, TopicObject, TopicRead, UserMetadata,
+    TopicCompression, TopicGeoMode, TopicKey, TopicObject, TopicRead, TopicState, UserMetadata,
 };
 use metadata::impls::metadata::{MetadataSubmitError, StreamsFrontend};
 use metadata::stm::shadow::{ShadowStream, ShadowTopicRequest, ShadowTopicTarget};
@@ -239,38 +239,35 @@ impl OriginRecovery {
         Ok(report)
     }
 
-    /// The retired cluster's live geo topic objects, in the order of their
+    /// The retired cluster's live geo topics, in the order of their
     /// revisions.
     async fn live_topics<S: ObjectStore>(
         &self,
         store: &S,
         layout: &KeyLayout,
-    ) -> Result<Vec<TopicObject>, OriginRecoveryError> {
+    ) -> Result<Vec<RetiredTopic>, OriginRecoveryError> {
         let mut topics = Vec::new();
-        for key in list_topic_keys(store, layout).await? {
-            let TopicRead::Found(object) = TopicObject::read(store, layout, &key).await? else {
-                continue;
-            };
-            if !object.is_live() || object.cluster_uid != self.retired_cluster_uid {
+        for topic in read_retired_topics(store, layout, self.retired_cluster_uid).await? {
+            if topic.deleted_at.is_some() {
                 continue;
             }
-            if object.origin != self.origin {
+            if topic.origin != self.origin {
                 return Err(OriginRecoveryError::OtherOrigin {
-                    key,
+                    key: topic.key,
                     expected: self.origin.clone(),
-                    found: object.origin,
+                    found: topic.origin,
                 });
             }
-            if object.geo_mode != TopicGeoMode::Geo {
-                return Err(OriginRecoveryError::GeoMode(key));
+            if topic.geo_mode != TopicGeoMode::Geo {
+                return Err(OriginRecoveryError::GeoMode(topic.key));
             }
-            topics.push(object);
+            topics.push(topic);
         }
-        topics.sort_by_key(|object| {
+        topics.sort_by_key(|topic| {
             (
-                object.key.created_revision,
-                object.key.stream_id,
-                object.key.topic_id,
+                topic.key.created_revision,
+                topic.key.stream_id,
+                topic.key.topic_id,
             )
         });
         Ok(topics)
@@ -396,6 +393,75 @@ fn skip_reason(reason: &SkipReason) -> String {
     }
 }
 
+/// One geo topic of the retired cluster, as the recovery restores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredTopic {
+    /// The stream and topic ids and the revision of the topic's partitions.
+    pub key: TopicKey,
+    pub stream_name: String,
+    pub topic_name: String,
+    pub partition_count: u32,
+    /// The `[geo] origin` of the retired cluster.
+    pub origin: String,
+    pub geo_mode: TopicGeoMode,
+    pub compression: TopicCompression,
+    /// How long a message lives, in microseconds, `u64::MAX` for ever.
+    pub message_expiry: u64,
+    /// The most bytes the topic holds, `u64::MAX` without a limit.
+    pub max_topic_size: u64,
+    /// When the retired cluster deleted the topic, `None` while it held it.
+    pub deleted_at: Option<u64>,
+    /// When the retired cluster described the topic, so that the newest
+    /// description names its stream.
+    pub described_at: u64,
+}
+
+/// Every geo topic that the retired cluster `retired_cluster_uid` described
+/// in the store under `layout`, deleted ones too. The one place that knows
+/// where the descriptions are: the object of each topic under
+/// [`KeyLayout::topics_prefix`]. Objects of another cluster and objects that
+/// do not decode describe nothing.
+///
+/// # Errors
+/// The store's error for a listing or a read that failed.
+pub async fn read_retired_topics<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    retired_cluster_uid: u128,
+) -> Result<Vec<RetiredTopic>, ObjectStoreError> {
+    let mut topics = Vec::new();
+    for key in list_topic_keys(store, layout).await? {
+        let TopicRead::Found(object) = TopicObject::read(store, layout, &key).await? else {
+            continue;
+        };
+        if object.cluster_uid == retired_cluster_uid {
+            topics.push(RetiredTopic::from(object));
+        }
+    }
+    Ok(topics)
+}
+
+impl From<TopicObject> for RetiredTopic {
+    fn from(object: TopicObject) -> Self {
+        Self {
+            key: object.key,
+            stream_name: object.stream_name,
+            topic_name: object.topic_name,
+            partition_count: object.partition_count,
+            origin: object.origin,
+            geo_mode: object.geo_mode,
+            compression: object.compression,
+            message_expiry: object.message_expiry,
+            max_topic_size: object.max_topic_size,
+            deleted_at: match object.state {
+                TopicState::Live => None,
+                TopicState::Tombstone { deleted_at } => Some(deleted_at),
+            },
+            described_at: object.published_at,
+        }
+    }
+}
+
 /// Whether replica 0 recovers now: only when the operator named the retired
 /// cluster, the store names exactly that cluster, and this node is the
 /// claimer and the caught-up metadata primary.
@@ -414,11 +480,11 @@ pub const fn may_recover(
 
 /// The name of each stream the topics name, by its id there, from the
 /// newest object of the stream.
-fn streams_of(topics: &[TopicObject]) -> BTreeMap<u64, String> {
-    let mut newest: BTreeMap<u64, &TopicObject> = BTreeMap::new();
+fn streams_of(topics: &[RetiredTopic]) -> BTreeMap<u64, String> {
+    let mut newest: BTreeMap<u64, &RetiredTopic> = BTreeMap::new();
     for topic in topics {
         let entry = newest.entry(topic.key.stream_id).or_insert(topic);
-        if topic.published_at > entry.published_at {
+        if topic.described_at > entry.described_at {
             *entry = topic;
         }
     }
@@ -501,7 +567,7 @@ async fn restore_metadata(
     retired_cluster_uid: u128,
     origin: &str,
     streams: &BTreeMap<u64, String>,
-    topics: &[TopicObject],
+    topics: &[RetiredTopic],
 ) -> Result<(), OriginRecoveryError> {
     let source = |stream_id: u64| ShadowStream {
         origin: origin.to_owned(),
@@ -569,7 +635,7 @@ async fn submit(
 /// primary fills in.
 fn restored_topic(
     stream_id: u32,
-    object: &TopicObject,
+    object: &RetiredTopic,
 ) -> Option<CreateTopicWithAssignmentsRequest> {
     let options = TopicCreateOptions {
         compression_algorithm: Some(match object.compression {
@@ -639,6 +705,8 @@ fn log_report(report: &RecoveryReport, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+    use iggy_object_store::MemoryStore;
 
     const RETIRED: u128 = 0x0a0a;
 
@@ -705,27 +773,67 @@ mod tests {
         }
     }
 
-    fn object(stream_id: u64, stream_name: &str, published_at: u64) -> TopicObject {
-        TopicObject {
+    fn object(stream_id: u64, stream_name: &str, described_at: u64) -> RetiredTopic {
+        RetiredTopic {
             key: TopicKey {
                 stream_id,
                 topic_id: 1,
-                created_revision: published_at,
+                created_revision: described_at,
             },
-            origin: "dc-a".to_owned(),
-            cluster_uid: RETIRED,
             stream_name: stream_name.to_owned(),
             topic_name: "payments".to_owned(),
             partition_count: 2,
+            origin: "dc-a".to_owned(),
+            geo_mode: TopicGeoMode::Geo,
             compression: TopicCompression::Gzip,
-            max_message_size: 1024,
             message_expiry: 60_000_000,
             max_topic_size: u64::MAX,
+            deleted_at: None,
+            described_at,
+        }
+    }
+
+    #[test]
+    fn given_topic_objects_of_two_clusters_when_reading_the_retired_topics_should_describe_the_retired_ones_deleted_too()
+     {
+        let store = MemoryStore::new();
+        let layout = KeyLayout::new("iggy").unwrap();
+        let described = |stream_id: u64, cluster_uid: u128| TopicObject {
+            key: TopicKey {
+                stream_id,
+                topic_id: 1,
+                created_revision: 9,
+            },
+            origin: "dc-a".to_owned(),
+            cluster_uid,
+            stream_name: format!("stream-{stream_id}"),
+            topic_name: "payments".to_owned(),
+            partition_count: 2,
+            compression: TopicCompression::None,
+            max_message_size: 1024,
+            message_expiry: u64::MAX,
+            max_topic_size: 4096,
             geo_mode: TopicGeoMode::Geo,
             created_at: 1,
-            published_at,
-            state: iggy_object_store::TopicState::Live,
+            published_at: 2,
+            state: TopicState::Live,
+        };
+        for object in [
+            described(1, RETIRED),
+            described(2, RETIRED).into_tombstone(77),
+            described(3, 7),
+        ] {
+            block_on(object.put(&store, &layout)).unwrap();
         }
+
+        let topics = block_on(read_retired_topics(&store, &layout, RETIRED)).unwrap();
+
+        let found: Vec<_> = topics
+            .iter()
+            .map(|topic| (topic.key.stream_id, topic.deleted_at, topic.max_topic_size))
+            .collect();
+        assert_eq!(found, [(1, None, 4096), (2, Some(77), 4096)]);
+        assert_eq!(topics[0], RetiredTopic::from(described(1, RETIRED)));
     }
 
     #[test]
