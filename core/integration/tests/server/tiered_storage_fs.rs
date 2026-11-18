@@ -26,8 +26,8 @@ use iggy_object_store::{FsStore, ObjectStore, PartitionManifest};
 use integration::harness::{TestHarness, TestServerConfig};
 use tokio::time::{Instant, sleep};
 
-const STREAM: &str = "tiered-stream";
-const TOPIC: &str = "tiered-topic";
+pub(crate) const STREAM: &str = "tiered-stream";
+pub(crate) const TOPIC: &str = "tiered-topic";
 const PARTITION_ID: u32 = 0;
 const SEGMENT_BYTES: u64 = 1024 * 1024;
 const MESSAGE_BYTES: usize = 100 * 1024;
@@ -37,8 +37,8 @@ const MESSAGES: u64 = 50;
 const READY_DEADLINE: Duration = Duration::from_secs(60);
 /// How long the uploads and the local eviction of the test's segments may
 /// take.
-const TIERING_DEADLINE: Duration = Duration::from_secs(60);
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const TIERING_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[tokio::test]
 async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_back_from_the_store()
@@ -55,23 +55,7 @@ async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_
         .expect("create stream");
     create_tiered_topic(&client, &stream).await;
 
-    for index in 0..MESSAGES {
-        let mut messages = vec![
-            IggyMessage::builder()
-                .payload(payload(index).into())
-                .build()
-                .expect("build message"),
-        ];
-        client
-            .send_messages(
-                &stream,
-                &topic,
-                &Partitioning::partition_id(PARTITION_ID),
-                &mut messages,
-            )
-            .await
-            .expect("send messages");
-    }
+    send_every_message(&client, &stream, &topic).await;
     let data_path = harness.server().data_path();
     let uploaded = wait_for_eviction(store.path(), &data_path).await;
 
@@ -90,7 +74,20 @@ async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_
 }
 
 fn server_with_fs_store(store: &Path) -> TestHarness {
-    let extra_envs = HashMap::from([
+    TestHarness::builder()
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(fs_store_envs(store))
+                .build(),
+        )
+        .build()
+        .expect("the harness")
+}
+
+/// The settings of a server that tiers to the `fs` store at `store` and runs
+/// its message cleaner often enough for a test.
+pub(crate) fn fs_store_envs(store: &Path) -> HashMap<String, String> {
+    HashMap::from([
         ("IGGY_TIERED_STORAGE_BACKEND".to_owned(), "fs".to_owned()),
         (
             "IGGY_TIERED_STORAGE_PATH".to_owned(),
@@ -104,16 +101,11 @@ fn server_with_fs_store(store: &Path) -> TestHarness {
             "IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL".to_owned(),
             "100ms".to_owned(),
         ),
-    ]);
-    TestHarness::builder()
-        .server(TestServerConfig::builder().extra_envs(extra_envs).build())
-        .build()
-        .expect("the harness")
+    ])
 }
 
-/// Creates the topic once the cluster accepts `tiered_storage`.
-async fn create_tiered_topic(client: &IggyClient, stream: &Identifier) {
-    let options = TopicCreateOptions {
+pub(crate) fn tiered_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
         partitions_count: Some(1),
         segment_size: Some(IggyByteSize::from(SEGMENT_BYTES)),
         tiered_storage: Some(true),
@@ -122,7 +114,12 @@ async fn create_tiered_topic(client: &IggyClient, stream: &Identifier) {
             Duration::from_secs(1),
         ))),
         ..TopicCreateOptions::default()
-    };
+    }
+}
+
+/// Creates the topic once the cluster accepts `tiered_storage`.
+pub(crate) async fn create_tiered_topic(client: &IggyClient, stream: &Identifier) {
+    let options = tiered_topic_options();
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
         match client.create_topic(stream, TOPIC, &options).await {
@@ -137,7 +134,7 @@ async fn create_tiered_topic(client: &IggyClient, stream: &Identifier) {
 
 /// Waits until the store holds segments that the data directory no longer
 /// does, and returns how many the store holds.
-async fn wait_for_eviction(store: &Path, data_path: &Path) -> usize {
+pub(crate) async fn wait_for_eviction(store: &Path, data_path: &Path) -> usize {
     let deadline = Instant::now() + TIERING_DEADLINE;
     loop {
         let uploaded = segment_logs(store);
@@ -155,7 +152,46 @@ async fn wait_for_eviction(store: &Path, data_path: &Path) -> usize {
     }
 }
 
-async fn assert_reads_every_message(client: &IggyClient, stream: &Identifier, topic: &Identifier) {
+pub(crate) async fn send_every_message(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+) {
+    for index in 0..MESSAGES {
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload(payload(index).into())
+                .build()
+                .expect("build message"),
+        ];
+        client
+            .send_messages(
+                stream,
+                topic,
+                &Partitioning::partition_id(PARTITION_ID),
+                &mut messages,
+            )
+            .await
+            .expect("send messages");
+    }
+}
+
+pub(crate) async fn assert_reads_every_message(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+) {
+    if let Err(error) = read_every_message(client, stream, topic).await {
+        panic!("{error}");
+    }
+}
+
+/// Reads every message the test sent and compares it with what was sent.
+pub(crate) async fn read_every_message(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+) -> Result<(), String> {
     let mut offset = 0;
     while offset < MESSAGES {
         let polled = client
@@ -171,27 +207,30 @@ async fn assert_reads_every_message(client: &IggyClient, stream: &Identifier, to
                 },
             )
             .await
-            .unwrap_or_else(|error| panic!("poll from offset {offset}: {error}"));
-        assert!(
-            !polled.messages.is_empty(),
-            "the poll from offset {offset} returned no message"
-        );
+            .map_err(|error| format!("poll from offset {offset}: {error}"))?;
+        if polled.messages.is_empty() {
+            return Err(format!("the poll from offset {offset} returned no message"));
+        }
         for message in &polled.messages {
-            assert_eq!(message.header.offset, offset);
-            assert_eq!(
-                message.payload.as_ref(),
-                payload(offset).as_slice(),
-                "the payload at offset {offset}"
-            );
+            if message.header.offset != offset {
+                return Err(format!(
+                    "the poll returned offset {} where {offset} was due",
+                    message.header.offset
+                ));
+            }
+            if message.payload.as_ref() != payload(offset).as_slice() {
+                return Err(format!("the payload at offset {offset} differs"));
+            }
             offset += 1;
         }
     }
+    Ok(())
 }
 
 /// Waits for a manifest that lists a segment, then checks it against the
 /// objects in the store: a reader with the bucket alone finds every segment
 /// the manifest names, and they cover the offsets from 0 to its floor.
-async fn assert_manifest_lists_stored_segments(store: &Path) {
+pub(crate) async fn assert_manifest_lists_stored_segments(store: &Path) {
     let deadline = Instant::now() + TIERING_DEADLINE;
     let manifest = loop {
         match read_manifest(store.to_owned()).await {
@@ -253,7 +292,7 @@ fn payload(index: u64) -> Vec<u8> {
 }
 
 /// The file names of the segment logs under `root`, at any depth.
-fn segment_logs(root: &Path) -> Vec<String> {
+pub(crate) fn segment_logs(root: &Path) -> Vec<String> {
     let mut logs: Vec<String> = files(root)
         .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
