@@ -21,6 +21,9 @@ package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.system.Page;
+import org.apache.iggy.system.PageQuery;
 
 public interface PartitionsClient {
 
@@ -35,4 +38,7 @@ public interface PartitionsClient {
     }
 
     void deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount);
+
+    /** Gets one page of partitions. A query that breaks the page rules fails with an invalid command error. */
+    Page<Partition> getPartitionsPage(StreamId streamId, TopicId topicId, PageQuery query);
 }

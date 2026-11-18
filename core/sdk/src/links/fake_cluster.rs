@@ -36,7 +36,7 @@ use iggy_binary_protocol::consensus::{
 use iggy_binary_protocol::requests::messages::FetchMessagesRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
-use iggy_binary_protocol::responses::streams::get_stream::TopicHeader;
+use iggy_binary_protocol::responses::streams::get_stream::TopicResponse;
 use iggy_binary_protocol::responses::system::{ClusterMetadataResponse, ClusterNodeResponse};
 use iggy_binary_protocol::responses::topics::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -522,7 +522,7 @@ impl Drop for OpenDial {
 
 pub(crate) fn topic_body(partitions_count: u32) -> Vec<u8> {
     GetTopicResponse {
-        topic: TopicHeader {
+        topic: TopicResponse {
             id: 1,
             created_at: 0,
             partitions_count,

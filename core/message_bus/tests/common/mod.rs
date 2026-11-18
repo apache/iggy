@@ -100,6 +100,7 @@ pub fn set_replica_ctx(
         cluster_id,
         self_id,
         replica_count,
+        heartbeat: message_bus::replica::auth::HeartbeatTimings::default(),
         auth: auth.map(Rc::new),
         tls: None,
     });
@@ -119,6 +120,7 @@ pub fn set_replica_ctx_with_tls(
         cluster_id,
         self_id,
         replica_count,
+        heartbeat: message_bus::replica::auth::HeartbeatTimings::default(),
         auth: auth.map(Rc::new),
         tls: Some(tls),
     });

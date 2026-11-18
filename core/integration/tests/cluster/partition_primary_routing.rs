@@ -146,7 +146,7 @@ const METADATA_CHECKPOINT_REQUESTS: usize = 256;
 // Keep handcrafted requests distinct from the parent SDK session's low IDs.
 const RAW_REQUEST_START: u64 = 1 << 63;
 
-/// Long enough for the backups to miss `cluster.heartbeat_timeout` (5s by
+/// Long enough for the backups to miss `cluster.commit_busy_heartbeat_timeout` (5s by
 /// default) and conclude an election.
 const ELECTION_SETTLE: Duration = Duration::from_secs(15);
 /// Long enough for the restarted node 0 to rejoin at the new view.
@@ -160,7 +160,7 @@ const SEND_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_POLL: Duration = Duration::from_millis(500);
 const REBALANCE_BUDGET: Duration = Duration::from_secs(120);
-/// `cluster.heartbeat_timeout` at its default.
+/// `cluster.commit_busy_heartbeat_timeout` at its default.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long quorum evidence keeps partition admission open past
 /// `HEARTBEAT_TIMEOUT`, as the server sets it.
@@ -367,6 +367,83 @@ async fn assert_initial_spread(
         vec![total / u32::try_from(replicas).unwrap(); replicas],
         "create batches and growth must count already admitted assignments"
     );
+}
+
+/// A node that stops gracefully gives its partition primaries to the nodes
+/// that stay, so no partition waits for a heartbeat timeout to get a primary.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_spread_primaries_when_a_node_stops_gracefully_should_hand_off_its_primaries(
+    harness: &mut TestHarness,
+) {
+    const TOPIC_COUNT: usize = 6;
+    /// A metadata backup, so the session of the client on node 0 stays.
+    const LEAVING_NODE: usize = 2;
+    const PHASES: [&str; 2] = ["before-stop", "after-stop"];
+    /// Logged by each shard of a node that ended its handoff.
+    const HANDOFF_MARKER: &str = "ended the primary handoff of this shard before shutdown";
+    const ROUTE_POLL: Duration = Duration::from_millis(20);
+
+    let client = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    client
+        .create_stream(STREAM_NAME, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        durability: Durability::Persisted,
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    let mut topics = Vec::with_capacity(TOPIC_COUNT);
+    for index in 0..TOPIC_COUNT {
+        let name = format!("handoff-{index}");
+        client.create_topic(&stream, &name, &options).await.unwrap();
+        topics.push(Identifier::named(&name).unwrap());
+    }
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES[..1]).await;
+    let mut led = Vec::new();
+    for topic in &topics {
+        let route = partition_route(&client, &stream, topic, PARTITION_ID).await;
+        if usize::from(route.primary_replica) == LEAVING_NODE {
+            led.push(topic);
+        }
+    }
+    assert!(
+        !led.is_empty(),
+        "node {LEAVING_NODE} must lead a partition before it stops"
+    );
+
+    let stop_started = Instant::now();
+    harness.stop_node(LEAVING_NODE).unwrap();
+    let stop = harness.node(LEAVING_NODE).last_stop().unwrap();
+    assert!(
+        !stop.killed_after_timeout,
+        "the handoff must end inside the stop grace: {stop:?}"
+    );
+    assert!(harness.node(LEAVING_NODE).stdout_contains(HANDOFF_MARKER));
+    for topic in led {
+        loop {
+            let route = partition_route(&client, &stream, topic, PARTITION_ID).await;
+            if usize::from(route.primary_replica) != LEAVING_NODE {
+                break;
+            }
+            assert!(
+                stop_started.elapsed() < HEARTBEAT_TIMEOUT,
+                "{topic} still names the stopped node its primary, so only an election can move it"
+            );
+            sleep(ROUTE_POLL).await;
+        }
+    }
+    assert!(
+        stop_started.elapsed() < HEARTBEAT_TIMEOUT,
+        "the primaries moved only after a heartbeat timeout"
+    );
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES).await;
 }
 
 #[iggy_harness(
@@ -1222,7 +1299,7 @@ async fn given_a_partition_primary_backing_up_metadata_when_its_quorum_freezes_s
 /// A partition primary whose quorum peers are frozen gets no fresh metadata
 /// quorum evidence, whether it credits answered probes as the metadata primary
 /// or probes as a backup. It must refuse partition writes with 58 once that
-/// evidence is `heartbeat_timeout + 3s` old, admit nothing it refused, and
+/// evidence is `commit_busy_heartbeat_timeout + 3s` old, admit nothing it refused, and
 /// serve the partition again after the peers resume.
 async fn assert_isolated_primary_fence(harness: &TestHarness, leads_metadata: bool) {
     const ADMITTED: [&str; 2] = ["before-isolation", "after-resume"];

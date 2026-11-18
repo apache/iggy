@@ -190,6 +190,13 @@ enabled = true
 # exported only to users with the read_servers or manage_servers permission.
 endpoint = "/metrics"
 
+# Export the per-topic series (`topic_size_bytes`, `topic_messages` and
+# `topic_max_size_bytes`). Each scrape walks every topic to build them, which
+# costs time and memory on a node with many topics.
+# `true` exports them to users who may read the server stats.
+# `false` exports only the node totals.
+topic_gauges = true
+
 # TLS (Transport Layer Security) configuration for HTTP.
 [http.tls]
 # Controls the use of TLS for encrypted HTTP connections.
@@ -338,7 +345,7 @@ enabled = true
 # The consumer groups of an ended session rebalance, and its client must log
 # in again. Each new primary grants a fresh timeout. Incomplete client lists
 # defer expiry across the cluster until a full timeout has passed without an
-# incomplete report. 1.2 x interval must exceed cluster.heartbeat_timeout when
+# incomplete report. 1.2 x interval must exceed cluster.commit_busy_heartbeat_timeout when
 # clustering is enabled, and three consumer_group.heartbeat_interval periods
 # plus two gather (3s) and send (100ms) deadlines, allowing one missed report.
 # So interval must exceed (3 x consumer_group.heartbeat_interval + 6.2s) / 1.2:
@@ -497,24 +504,43 @@ name = "iggy-cluster"
 # whole ticks: values are rounded down to a multiple of 10ms, and anything under
 # 10ms is raised to a single tick rather than firing sooner.
 
-# Liveness window for a consensus primary and its replication quorum (duration).
-# Backups vote after primary silence. A primary without heartbeat replies from
-# a quorum relinquishes leadership. Heartbeat replies require a coordinated
-# node upgrade; mixed versions cannot sustain a primary's quorum checks.
-# Raise it on oversubscribed hosts where scheduling stalls fake primary
-# death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
-# primary signals liveness through its commit broadcast, and the window must
-# span several broadcasts so one delayed broadcast never trips an election.
-# On Linux it is also the TCP_USER_TIMEOUT of every replica link: sent data
-# or keepalive probes that stay unacknowledged this long close the link.
-heartbeat_timeout = "5s"
+# The primary of each consensus group sends Commit heartbeats to its backups,
+# batched per peer node. All nodes of a cluster must use the same five values
+# below, or the replica handshake rejects the link. The node does not boot
+# unless these rules hold:
+#   commit_heartbeat_grid is a whole multiple of the 10ms shard tick.
+#   commit_busy_heartbeat_interval is a whole multiple of commit_heartbeat_grid.
+#   commit_busy_heartbeat_timeout >= max(2s, 4x commit_busy_heartbeat_interval).
+#   commit_idle_heartbeat_interval is a whole multiple of
+#   commit_busy_heartbeat_interval.
+#   max(commit_idle_heartbeat_timeout, commit_busy_heartbeat_timeout) >= 4x
+#   commit_idle_heartbeat_interval.
+#   commit_busy_heartbeat_timeout >= 4x commit_idle_heartbeat_interval.
+#   commit_busy_heartbeat_timeout and commit_idle_heartbeat_timeout are at most
+#   4294967295ms (about 49.7 days).
 
-# How often the primary broadcasts its commit point to every backup (duration).
-# This is the cluster's liveness signal: each broadcast resets every backup's
-# heartbeat_timeout window and carries the latest commit point forward. Must be
-# nonzero and, with heartbeat_timeout, satisfy heartbeat_timeout >= 4x this
-# value. Drives the consensus CommitMessage timer.
-commit_broadcast_interval = "500ms"
+# Interval between grid ticks (duration). Heartbeats join a batch only on grid
+# ticks.
+commit_heartbeat_grid = "100ms"
+
+# Interval between the heartbeats of a busy group (duration). A group is busy
+# while its commit point moves.
+commit_busy_heartbeat_interval = "500ms"
+
+# How long the backups of a busy group wait for a heartbeat before they vote
+# for a new primary (duration). It is also the quiet time before a group turns
+# idle, and the quorum window of a busy primary: a primary without heartbeat
+# replies from a quorum in this window steps down. On Linux it is also the
+# TCP_USER_TIMEOUT of every replica link.
+commit_busy_heartbeat_timeout = "5s"
+
+# Interval between the heartbeats of an idle group (duration). The metadata
+# group never turns idle.
+commit_idle_heartbeat_interval = "1s"
+
+# How long the backups of an idle group wait for a heartbeat (duration). They
+# wait the larger of this value and commit_busy_heartbeat_timeout.
+commit_idle_heartbeat_timeout = "12s"
 
 # How often the primary retransmits prepares that backups have not yet acked
 # (duration). Lower values recover faster from a dropped prepare at the cost of
@@ -528,8 +554,10 @@ prepare_retransmit_interval = "250ms"
 view_change_retransmit_interval = "500ms"
 
 # Backstop for a stalled view change (duration): one that does not conclude
-# within this window escalates to a fresh cluster-wide election. Must be nonzero
-# and at least 4x view_change_retransmit_interval, so a few dropped view-change
+# within this window escalates to a fresh cluster-wide election. The window
+# starts once the replica wrote the new view to disk, and each view change in a
+# row doubles it, up to 16x, until a view works again. Must be nonzero and at
+# least 4x view_change_retransmit_interval, so a few dropped view-change
 # messages retransmit rather than prematurely escalate.
 view_change_status_timeout = "5s"
 
@@ -862,6 +890,14 @@ shutdown_drain_timeout = "10 s"
 # scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
 shutdown_poll_interval = "50 ms"
 
+# Longest time a node of a cluster spends on handing off the partitions it
+# leads before it shuts down. Without the handoff, each of those partitions
+# waits for a heartbeat timeout to elect a new primary. The handoff ends early
+# when no partition is left to hand off, or on a second stop signal. "0 s"
+# skips it, and so do "disabled", "none" and "unlimited", which also read as
+# zero. A single node never hands off.
+shutdown_primary_handoff_timeout = "15 s"
+
 # Hard wall-clock deadline for joining shard threads at process exit. A
 # shard whose pump or listener wedges past this budget is abandoned with
 # an error log instead of blocking exit forever. Must be at least
@@ -1004,7 +1040,8 @@ change_log_activity_capacity = 16384
 # Persistence barriers can also persist co-batched messages.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
-# After a crash, a "replicated" partition recovers up to the last WAL frontier it published: at checkpoints, durable operations and graceful shutdown.
+# A "replicated" partition publishes its WAL frontier at checkpoints, durable operations and graceful shutdown.
+# After a crash it recovers up to that frontier, and past it the writes that the OS still holds complete.
 # "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
 # A singleton quorum is one replica. Its persisted completion follows recoverable local persistence.
 # Poll auto-commit remains asynchronous. A successful poll does not confirm that its submitted offset operation committed or became durable.
@@ -1156,12 +1193,70 @@ evicted_ring_capacity = 65536
 # ops go, but the newest entry stays even if it alone exceeds this budget. Must
 # be > 0 and <= "256 MiB". The ops whose batches left memory take up to
 # 4.5 MiB more. Allocation capacity, alignment and index overhead are
-# additional memory, especially for small offset commits. There is no node-wide
-# budget.
+# additional memory, especially for small offset commits.
+# journal_memory_node_bytes_max bounds the sum across all partitions.
 # partition_repair_ring_bytes reports these bytes plus 288 bytes for each
 # released op, summed across a shard's partitions, not their allocated memory
 # or RSS.
 evicted_ring_bytes_max = "64 MiB"
+
+# Node-wide budget for the journal memory of all partitions. Three holders
+# charge it. The resident journal charges the buffer of each op that waits
+# for its flush, and its index entries. The evicted rings charge the buffer of
+# each batch they hold in memory, and 288 bytes for each slot of the ops whose
+# batch they released to its segment. The held state machine commands charge
+# their buffers, about 4 KiB each. A buffer counts for its whole allocation,
+# which is a multiple of 4 KiB, so a small op costs far more here than its
+# length. The count leaves out the map overhead of the rings, so it is a
+# lower bound. Each shard gets an equal share, because a shard can shed only
+# its own partitions. Must be > 0, and the share must be at least 1 byte.
+# Past its share, a shard sheds in three steps on each tick:
+# 1. The rings that grew earliest release batches to their segments, until
+#    the shard is one eighth under the share.
+# 2. The partitions whose committed ops waited longest get a flush through
+#    their commit point. The flush moves those ops to the ring, where step 1
+#    releases their batches. A flush that cannot start, for example in a view
+#    change, counts as coming for 1,000 shard ticks (10 seconds).
+# 3. For the excess that no such flush covers, the rings drop their oldest
+#    entries. Then the partitions release the commands that a WAL checkpoint
+#    covers, and queue a checkpoint for the others. A dropped entry or command
+#    sends a lagging replica to state transfer.
+# Every ring keeps its newest entry. When those entries alone exceed the
+# share, every ring holds that entry only, and the server logs a warning.
+# partition_repair_ring_budget_bytes reports the share of a shard.
+# partition_repair_ring_charged_bytes, partition_journal_resident_bytes and
+# partition_journal_command_bytes report what each holder charges to it, and
+# partition_repair_ring_floor_bytes what the newest ring entries take of it.
+journal_memory_node_bytes_max = "8 GiB"
+
+# WAL checkpoint policy. A partition with an op above its WAL checkpoint comes
+# due for a checkpoint checkpoint_idle_delay after its last op, or
+# checkpoint_max_delay after its first op since its last checkpoint, whichever
+# comes first. A boot loads only the ops above the checkpoint, so these
+# delays bound what a restart loads again. Each shard queues the due
+# partitions and keeps at most 64 of their checkpoints requested or running
+# at a time. A graceful
+# stop checkpoints the partitions it can reach in half of
+# sharding.shutdown_drain_timeout.
+# partition_checkpoint_queue_length, partition_checkpoints_queued_in_flight,
+# partition_wal_checkpoint_starts_total (by trigger) and
+# partition_stop_checkpoints_missed_total report the queue.
+# Both must be > 0, and checkpoint_idle_delay must not exceed
+# checkpoint_max_delay.
+checkpoint_idle_delay = "30 s"
+checkpoint_max_delay = "5 min"
+
+# Node-wide cap on the partition WAL bytes above the checkpoints. A boot loads
+# these bytes into memory again, so this bounds what a restart reloads. Each
+# shard gets an equal share. Past its share, a shard queues checkpoints for
+# the partitions whose first op since their checkpoint is oldest, until the
+# queued bytes cover the excess. The queue paces these checkpoints like the
+# others. A boot reloads at most the share plus what the partitions write
+# while they wait in the queue. Must be > 0, and the share must be at least
+# 1 byte. partition_wal_reload_bytes reports the bytes of a shard,
+# partition_wal_reload_budget_bytes its share, and
+# partition_wal_checkpoint_starts_total{trigger="reload"} the checkpoints.
+wal_reload_node_bytes_max = "4 GiB"
 
 # Byte budget for segment payloads a SERVING shard keeps resident to answer
 # state-transfer chunk requests. PER SHARD, and shard count defaults to core
@@ -1213,7 +1308,8 @@ transfer_artifact_bytes_max = "1088 MiB"
 max_batch = 256
 
 # Wire-level cap on a single framed message. Must fit a consumer session report
-# (at least 280 B). Boot refuses a value above the frozen 256 MiB ceiling:
+# and a Commit batch of one entry (at least 296 B). Boot refuses a value above
+# the frozen 256 MiB ceiling:
 # segment recovery derives fixed scan and allocation
 # limits from the widest LEGAL record, so batches admitted above the ceiling
 # would be refused as implausible on a later boot. Raising it past 64 MiB

@@ -28,10 +28,39 @@ public interface IIggyTopic
     /// <summary>
     ///     Retrieves information about all topics in a specified stream.
     /// </summary>
+    /// <remarks>
+    ///     Over TCP the client reads the list in pages of 1000 in id order, so the result is not one consistent read:
+    ///     a topic that someone creates or deletes during the read can be in it or not. Every page keeps the sign-in
+    ///     and the call deadline that the read started with. Over HTTP the server returns the whole list in one reply,
+    ///     but it builds that reply from pages of 1000, so it is not one consistent read either.
+    /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topics (numeric ID or name).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns a read-only collection of topic information.</returns>
+    /// <exception cref="Exceptions.MalformedResponseException">
+    ///     Over TCP, when the server answers a page with the same cursor that the client sent.
+    /// </exception>
     Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId, CancellationToken token = default);
+
+    /// <summary>
+    ///     Reads one page of the topics of a stream. For a stream that does not exist, a read without a cursor returns
+    ///     an empty last page.
+    /// </summary>
+    /// <remarks>
+    ///     The query is checked before anything is sent. To read the next page, send the same query with the
+    ///     <see cref="Page{T}.Next" /> of this page as its cursor.
+    /// </remarks>
+    /// <param name="streamId">The identifier of the stream containing the topics (numeric ID or name).</param>
+    /// <param name="query">The order, the page size, the cursor and the name filter of the read.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the page.</returns>
+    /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
+    ///     Invalid command (code 3) for a query the page rules refuse, or for a cursor the server cannot use. Stream
+    ///     not found (code 1009) for a read with a cursor when the stream does not exist: the stream was deleted
+    ///     during the walk.
+    /// </exception>
+    Task<Page<TopicResponse>> GetTopicsPageAsync(Identifier streamId, NamedPageQuery query,
+        CancellationToken token = default);
 
     /// <summary>
     ///     Retrieves detailed information about a specific topic by its identifier.

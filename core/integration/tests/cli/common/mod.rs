@@ -19,6 +19,7 @@ pub(crate) mod command;
 pub(crate) mod help;
 pub(crate) mod json_output;
 pub(crate) mod keyring;
+pub(crate) mod list_runs;
 pub(crate) use crate::cli::common::command::IggyCmdCommand;
 pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX};
 pub(crate) use crate::cli::common::keyring::clear_session_entry;

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::args::common::ListMode;
+use crate::args::common::{ListMode, NamedPageArgs};
 use crate::args::permissions::UserStatusArg;
 use crate::args::permissions::stream::StreamPermissionsArg;
 use clap::{Args, Subcommand};
@@ -56,6 +56,7 @@ pub(crate) enum UserAction {
     ///  iggy user list
     ///  iggy user list --list-mode table
     ///  iggy user list -l table
+    ///  iggy user list --sort created --desc --limit 20
     #[clap(verbatim_doc_comment, visible_alias = "l")]
     List(UserListArgs),
     /// Change username for user with given ID
@@ -197,6 +198,9 @@ pub(crate) struct UserListArgs {
     /// List mode (table or list)
     #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
     pub(crate) list_mode: ListMode,
+
+    #[command(flatten)]
+    pub(crate) page: NamedPageArgs,
 }
 
 #[derive(Debug, Clone, Args)]

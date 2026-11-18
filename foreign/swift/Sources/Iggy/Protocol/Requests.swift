@@ -452,6 +452,40 @@ enum Requests {
         writer.write(token)
         return writer.bytes
     }
+
+    // MARK: List pages
+
+    /// A list request: the parent identifiers, then the page block
+    /// `[order:u8][descending:u8][limit:u32][cursor_len:u8][cursor][name_len:u8][name]`,
+    /// where a length of 0 means no cursor or no name. A ``PageQuery`` sends a
+    /// name length of 0. A query that breaks a page rule fails with
+    /// ``IggyErrorCode/invalidCommand``, so both lengths fit their byte.
+    static func listPage(_ parents: Identifier..., query: PageQuery) throws -> [UInt8] {
+        try query.validate()
+        return try listPage(parents, query, name: nil)
+    }
+
+    static func listPage(_ parents: Identifier..., query: NamedPageQuery) throws -> [UInt8] {
+        try query.validate()
+        return try listPage(parents, query.page, name: query.name)
+    }
+
+    private static func listPage(_ parents: [Identifier], _ page: PageQuery, name: String?) throws -> [UInt8] {
+        var writer = ByteWriter()
+        for parent in parents {
+            try parent.encode(into: &writer)
+        }
+        writer.write(page.order.rawValue)
+        writer.write(page.descending)
+        writer.write(page.limit)
+        let cursor = page.cursor?.bytes ?? []
+        writer.write(UInt8(cursor.count))
+        writer.write(cursor)
+        let name = name ?? ""
+        writer.write(UInt8(name.utf8.count))
+        writer.write(name)
+        return writer.bytes
+    }
 }
 
 /// Validates a wire name and returns it, so the length prefix can never

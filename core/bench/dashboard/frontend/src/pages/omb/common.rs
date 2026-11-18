@@ -48,10 +48,8 @@ pub const NOT_RECORDED: &str = "not recorded";
 pub const NO_VALUE: &str = "-";
 /// The breadcrumb and eyebrow of the OMB pages.
 pub const OMB_CRUMB: &str = "OMB";
-/// The labels of [`percentile_values`], in its order. The average isn't a percentile, so it isn't
-/// among them.
-pub const PERCENTILE_LABELS: [&str; 7] = ["P50", "P75", "P95", "P99", "P99.9", "P99.99", "Max"];
-/// Where [`PERCENTILE_LABELS`] has P99, the percentile that the headlines use.
+/// Where [`bench_dashboard_shared::omb::chart::PERCENTILE_LABELS`] has P99, the percentile that the
+/// headlines use.
 pub const P99_INDEX: usize = 3;
 pub const PUBLISH_THROUGHPUT_HINT: &str = "The mean publish rate over the 10 second windows, times \
                                            the message size. 1 MiB is 1,048,576 bytes.";
@@ -416,29 +414,6 @@ pub fn microseconds(value: f64) -> String {
     }
 }
 
-/// The values of `latency` in the order of [`PERCENTILE_LABELS`].
-pub const fn percentile_values(latency: &OmbPercentiles) -> [f64; 7] {
-    [
-        latency.p50,
-        latency.p75,
-        latency.p95,
-        latency.p99,
-        latency.p999,
-        latency.p9999,
-        latency.max,
-    ]
-}
-
-/// One `[seconds since the test started, value]` point per window, for a chart with a time axis.
-/// `window_ends` comes from the series of the run detail.
-pub fn window_points(window_ends: &[u64], values: &[f64]) -> Vec<Vec<f64>> {
-    window_ends
-        .iter()
-        .zip(values)
-        .map(|(end, value)| vec![*end as f64, *value])
-        .collect()
-}
-
 fn machine_time(time: &OmbRunTime) -> String {
     match time.source {
         OmbTimeSource::FileName => time.instant.format(LOCAL_TIME_FORMAT).to_string(),
@@ -459,6 +434,7 @@ mod tests {
         OMB_ALL, OMB_EDGE8_100_PARTITIONS, OMB_EDGE8_DEFAULT, OMB_NO_CONSUMERS, OMB_PUBLISH_ERRORS,
         OMB_RC1_DEFAULT, OMB_RC1_PERSISTED, omb_rerun, omb_run_list,
     };
+    use bench_dashboard_shared::omb::chart::{PERCENTILE_LABELS, percentile_values};
 
     fn ids(runs: &[&OmbRunSummary]) -> Vec<OmbRunId> {
         runs.iter().map(|run| run.id).collect()
@@ -629,21 +605,6 @@ mod tests {
 
         assert_eq!(ids(&tray), [older.id, newer.id]);
         assert_eq!(ids(&oldest_first([&newer, &older])), [older.id, newer.id]);
-    }
-
-    #[test]
-    fn given_fixture_detail_when_charted_should_give_one_point_per_window() {
-        let detail = OMB_RC1_DEFAULT.detail();
-        let series = &detail.series;
-
-        let points = window_points(&series.window_ends(), &series.publish_mebibytes_per_second);
-
-        assert_eq!(points.len(), detail.summary.windows);
-        assert_eq!(points[0][0], 10.0);
-        assert_eq!(
-            points.last().map(|point| point[0]),
-            Some(detail.summary.length_seconds as f64)
-        );
     }
 
     #[test]

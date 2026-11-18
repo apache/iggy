@@ -69,12 +69,13 @@ FROM debian:trixie-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies. The PNG renderer draws text only with a system font.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     openssl \
     curl \
     libssl3 \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the built binary and frontend files
