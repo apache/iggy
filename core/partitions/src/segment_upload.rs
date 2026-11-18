@@ -213,7 +213,37 @@ pub async fn upload_segment_under<S: ObjectStore>(
     if index_len == 0 || !index.is_whole() {
         return Err(fault("its index does not describe it"));
     }
+    store_segment(
+        store,
+        record,
+        log_key,
+        index_key,
+        file_body(&upload.log_path, record.size),
+        file_body(&upload.index_path, index_len),
+        index.crc32c,
+    )
+    .await
+}
 
+/// Put the `.log` of the segment of `record` under `log_key` and then its
+/// `.index` under `index_key`, whose bytes the caller has checked. Each body
+/// is asked for when its put starts.
+///
+/// An object that is there already counts as stored when it is the same
+/// one, as [`upload_segment_under`] says.
+pub async fn store_segment<S: ObjectStore>(
+    store: &S,
+    record: &SegmentRecord,
+    log_key: String,
+    index_key: &str,
+    log: impl Future<Output = Result<PutBody, ObjectStoreError>>,
+    index: impl Future<Output = Result<PutBody, ObjectStoreError>>,
+    index_crc32c: u32,
+) -> Result<(), UploadError> {
+    let fault = |reason| UploadError::MediaFault {
+        start_offset: record.start_offset,
+        reason,
+    };
     let metadata = UserMetadata::from(&SegmentMetadata {
         start_offset: record.start_offset,
         end_offset: record.end_offset,
@@ -223,15 +253,7 @@ pub async fn upload_segment_under<S: ObjectStore>(
         size: record.size,
         hash: record.hash,
     });
-    let stored = put_file(
-        store,
-        &log_key,
-        &upload.log_path,
-        record.size,
-        metadata,
-        record.crc32c,
-    )
-    .await;
+    let stored = put_if_absent(store, &log_key, log, metadata, record.crc32c).await;
     match stored {
         Ok(()) => {}
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
@@ -254,15 +276,7 @@ pub async fn upload_segment_under<S: ObjectStore>(
         Err(error) => return Err(UploadError::Store(error)),
     }
 
-    let stored = put_file(
-        store,
-        index_key,
-        &upload.index_path,
-        index_len,
-        UserMetadata::new(),
-        index.crc32c,
-    )
-    .await;
+    let stored = put_if_absent(store, index_key, index, UserMetadata::new(), index_crc32c).await;
     match stored {
         Ok(()) => Ok(()),
         // Sparse indexes differ between replicas, so an index another primary
@@ -280,27 +294,38 @@ pub async fn upload_segment_under<S: ObjectStore>(
     }
 }
 
-/// Put the first `len` bytes of the file at `path` under `key`, unless an
-/// object is there already.
-async fn put_file<S: ObjectStore>(
+/// Put `body` under `key`, unless an object is there already.
+async fn put_if_absent<S: ObjectStore>(
     store: &S,
     key: &str,
-    path: &str,
-    len: u64,
+    body: impl Future<Output = Result<PutBody, ObjectStoreError>>,
     metadata: UserMetadata,
     crc32c: u32,
 ) -> Result<(), ObjectStoreError> {
-    let file = compio::fs::File::open(path)
-        .await
-        .map_err(ObjectStoreError::Body)?;
     let options = PutOptions {
         mode: PutMode::IfAbsent,
         metadata,
         crc32c: Some(crc32c),
     };
-    store
-        .put(key, PutBody::from_stream(len, pieces(file, len)), &options)
+    store.put(key, body.await?, &options).await
+}
+
+/// The first `len` bytes of the file at `path` as a put body.
+async fn file_body(path: &str, len: u64) -> Result<PutBody, ObjectStoreError> {
+    let file = compio::fs::File::open(path)
         .await
+        .map_err(ObjectStoreError::Body)?;
+    Ok(PutBody::from_stream(len, pieces(file, len)))
+}
+
+/// `bytes` as a put body that hands them over a piece at a time, so a
+/// provider that sums or copies what it sends does so in steps.
+pub fn memory_body(bytes: &Bytes) -> PutBody {
+    let pieces: Vec<io::Result<Bytes>> = (0..bytes.len())
+        .step_by(UPLOAD_PIECE_LEN)
+        .map(|start| Ok(bytes.slice(start..bytes.len().min(start + UPLOAD_PIECE_LEN))))
+        .collect();
+    PutBody::from_stream(bytes.len() as u64, futures::stream::iter(pieces))
 }
 
 /// The first `len` bytes of `file`, a piece at a time.

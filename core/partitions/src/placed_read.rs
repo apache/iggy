@@ -34,23 +34,28 @@
 //! both hold is taken once, from the long-term segment.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Instant;
 
+use bytes::Bytes;
 use compio::fs::File;
 use compio::io::AsyncReadAtExt;
+use futures::{StreamExt, stream};
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
 use iggy_object_store::{LongTermKey, ManifestSegment, ObjectPrefix, SegmentObject};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trusted};
+use server_common::yield_to_reactor;
 
 use crate::RemoteSegments;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
 use crate::poll_plan::{DiskFault, PartitionDirResolution};
+use crate::remote_segments::{FRESH_READ_BYTES_MAX, FRESH_READ_GAP_BYTES, FreshReads};
 
 const PREPARE_HEADER_SIZE: usize = size_of::<PrepareHeader>();
 
@@ -68,6 +73,24 @@ const LONG_TERM_READ_BYTES: u64 = 1024 * 1024;
 /// The most a read of a long-term segment's index asks for. The index of a
 /// segment is a small fraction of this.
 pub const LONG_TERM_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Reads of fresh objects one rewrite has in flight at once.
+pub const REWRITE_FETCHES: usize = 4;
+
+/// Bytes of batches a rewrite takes between two yields to the shard's other
+/// tasks. Copying and summing this many takes a fraction of a millisecond,
+/// against about 12 us for a yield.
+pub const REWRITE_YIELD_BYTES: usize = 1024 * 1024;
+
+/// A piece of a batch as [`PlacedReadPlan::read_blobs`] hands it over: the
+/// header first, then the messages in order, in as many pieces as it takes.
+#[derive(Clone, Copy)]
+pub enum BatchPiece<'a> {
+    /// The header of the whole batch, with the batch checksum over its
+    /// messages.
+    Header(&'a BatchHeader),
+    Messages(&'a [u8]),
+}
 
 /// A local segment of placed batches as a poll plan snapshots it.
 #[derive(Debug, Clone, Copy)]
@@ -126,8 +149,126 @@ impl PlacedReadPlan {
             }
             wanted.skip_through(floor);
         }
+        let placed = self.collect_placed(&mut wanted).await?;
+        let same_object = |one: &PlacedBatch, other: &PlacedBatch| {
+            one.placement.object_id == other.placement.object_id
+        };
+        batches.reserve(placed.len());
+        for run in placed.chunk_by(same_object) {
+            let fetched = self.fetch_blobs(run).await?;
+            for placed in run {
+                batches.push(self.assemble(placed, &fetched).await?);
+            }
+        }
+        Ok(batches)
+    }
+
+    /// The placed batches that answer `query`, in offset order and without
+    /// their messages: what the segments hold, then what the journal does.
+    /// They stop as [`Self::read`] does. The long-term segments are not
+    /// read, so this is for a read that starts above the long-term floor.
+    pub(crate) async fn placed_batches(
+        &self,
+        query: MessageLookup,
+        max_bytes: usize,
+    ) -> Result<Vec<PlacedBatch>, DiskFault> {
+        self.collect_placed(&mut Wanted::new(query, max_bytes))
+            .await
+    }
+
+    /// Hand `take` each batch of `placed` in order, as [`BatchPiece`]s: its
+    /// header with the batch checksum it has over its messages, and the
+    /// messages, checked against the placement that names them.
+    ///
+    /// The messages this shard holds in memory come from there. The others
+    /// come from the store: the batches that follow each other closely in
+    /// one fresh object in one read, and up to [`REWRITE_FETCHES`] reads at
+    /// a time. Nothing read here is kept for the polls. No deadline ends
+    /// the reads: the caller is a background job that its scope cancels.
+    ///
+    /// The loop gives way to the other tasks of the shard every
+    /// [`REWRITE_YIELD_BYTES`], inside a batch too, since a segment's worth
+    /// of messages takes tens of milliseconds to copy and sum.
+    pub(crate) async fn read_blobs(
+        &self,
+        placed: &[PlacedBatch],
+        mut take: impl FnMut(BatchPiece<'_>),
+    ) -> Result<(), DiskFault> {
+        // A shard that has not connected its store yet cannot read the
+        // messages now, and can once it has.
+        let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
+        let reads = BlobReads {
+            remote,
+            placed,
+            next: 0,
+        };
+        let mut fetched = stream::iter(reads)
+            .map(|read| read.fetch(remote))
+            .buffered(REWRITE_FETCHES);
+        let mut since_yield = 0;
+        while let Some(read) = fetched.next().await {
+            let (batches, start, bytes) = read?;
+            for placed in &placed[batches] {
+                let blob = placed
+                    .placement
+                    .position
+                    .checked_sub(start)
+                    .and_then(|at| usize::try_from(at).ok())
+                    .zip(usize::try_from(placed.placement.length).ok())
+                    .and_then(|(at, len)| bytes.get(at..at.checked_add(len)?))
+                    .ok_or(DiskFault::Tiered)?;
+                take(BatchPiece::Header(&whole_header(placed, blob)?));
+                since_yield += BATCH_HEADER_SIZE;
+                let mut messages = blob;
+                loop {
+                    if since_yield >= REWRITE_YIELD_BYTES {
+                        since_yield = 0;
+                        yield_to_reactor().await;
+                    }
+                    if messages.is_empty() {
+                        break;
+                    }
+                    let (piece, rest) =
+                        messages.split_at(messages.len().min(REWRITE_YIELD_BYTES - since_yield));
+                    take(BatchPiece::Messages(piece));
+                    since_yield += piece.len();
+                    messages = rest;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes of the whole batches whose first offset is from `from` to
+    /// `up_to`, as their headers state them, read from the segments and the
+    /// journal without their messages. A batch that both hold counts once.
+    pub(crate) async fn batch_bytes(&self, from: u64, up_to: u64) -> Result<u64, DiskFault> {
+        let mut counted = CountedBatches {
+            next_offset: from,
+            up_to,
+            bytes: 0,
+        };
+        match &self.partition_dir {
+            PartitionDirResolution::Resolved(directory) => {
+                self.count_in_segments(directory, &mut counted).await?;
+            }
+            PartitionDirResolution::NoFiles => {}
+            PartitionDirResolution::Unresolvable => return Err(DiskFault::Retryable),
+        }
+        for entry in &self.resident {
+            if let Ok(batch) = decode_prepare_batch_trusted(entry.as_slice())
+                && batch.placement.is_some()
+            {
+                counted.take(&batch.header);
+            }
+        }
+        Ok(counted.bytes)
+    }
+
+    /// The placed batches `wanted` takes from the segments and the journal.
+    async fn collect_placed(&self, wanted: &mut Wanted) -> Result<Vec<PlacedBatch>, DiskFault> {
         let mut placed = Vec::new();
-        self.collect_from_segments(&mut wanted, &mut placed).await?;
+        self.collect_from_segments(wanted, &mut placed).await?;
         for entry in &self.resident {
             if wanted.is_full() {
                 break;
@@ -139,12 +280,7 @@ impl PlacedReadPlan {
                 wanted.take(PlacedBatch::new(batch.header, placement), &mut placed);
             }
         }
-        self.fetch_blobs(&placed).await?;
-        batches.reserve(placed.len());
-        for placed in &placed {
-            batches.push(self.assemble(placed).await?);
-        }
-        Ok(batches)
+        Ok(placed)
     }
 
     /// The batches the poll wants from the long-term segments, whole as the
@@ -296,35 +432,69 @@ impl PlacedReadPlan {
         Ok(objects)
     }
 
-    /// Fetch the blobs of `placed` object by object, so the batches that
-    /// follow each other in one fresh object cost one read of the store and
-    /// not one each. A batch alone in its object is left to
-    /// [`Self::assemble`], which reads it the same way.
-    async fn fetch_blobs(&self, placed: &[PlacedBatch]) -> Result<(), DiskFault> {
-        let Some(remote) = self.remote.as_deref() else {
-            return Ok(());
-        };
-        let same_object = |one: &PlacedBatch, other: &PlacedBatch| {
-            one.placement.object_id == other.placement.object_id
-        };
-        for run in placed.chunk_by(same_object).filter(|run| run.len() > 1) {
-            let blobs: Vec<_> = run
-                .iter()
-                .filter_map(|placed| {
-                    let placement = placed.placement;
-                    let end = placement.position.checked_add(placement.length)?;
-                    Some(placement.position..end)
-                })
-                .collect();
-            self.wait(remote.fetch_fresh(run[0].placement.object_id, &blobs))
-                .await?;
+    /// Add to `counted` the batches of the segments in `directory`.
+    async fn count_in_segments(
+        &self,
+        directory: &str,
+        counted: &mut CountedBatches,
+    ) -> Result<(), DiskFault> {
+        let (from, up_to) = (counted.next_offset, counted.up_to);
+        let start = Wanted::new(
+            MessageLookup::Offset {
+                offset: from,
+                count: u32::MAX,
+                ceiling: up_to,
+            },
+            usize::MAX,
+        );
+        let segments = self
+            .segments
+            .iter()
+            .filter(|segment| segment.end_offset >= from && segment.start_offset <= up_to);
+        for segment in segments {
+            let path = format!("{directory}/{:0>20}.log", segment.start_offset);
+            let file = File::open(&path).await.map_err(|_| DiskFault::Retryable)?;
+            let count = segment.size / PLACED_BATCH_SIZE as u64;
+            let mut index = start.first_index(&file, count).await?;
+            while index < count {
+                let batches = PLACED_PER_READ.min(count - index);
+                for batch in read_placed(&file, index, batches).await? {
+                    counted.take(&batch.header);
+                }
+                index += batches;
+            }
         }
         Ok(())
     }
 
+    /// Fetch the blobs of `run`, batches of one fresh object, so the batches
+    /// that follow each other in it cost one read of the store and not one
+    /// each. A batch alone in its object is left to [`Self::assemble`], which
+    /// reads it the same way.
+    async fn fetch_blobs(&self, run: &[PlacedBatch]) -> Result<FreshReads, DiskFault> {
+        let (Some(remote), [first, _, ..]) = (self.remote.as_deref(), run) else {
+            return Ok(FreshReads::default());
+        };
+        let blobs: Vec<_> = run
+            .iter()
+            .filter_map(|placed| {
+                let placement = placed.placement;
+                let end = placement.position.checked_add(placement.length)?;
+                Some(placement.position..end)
+            })
+            .collect();
+        self.wait(remote.fetch_fresh(first.placement.object_id, &blobs))
+            .await
+    }
+
     /// The whole batch of `placed`: its header with the batch checksum it
-    /// has over its messages, and the messages its placement names.
-    async fn assemble(&self, placed: &PlacedBatch) -> Result<Frozen<4096>, DiskFault> {
+    /// has over its messages, and the messages its placement names, out of
+    /// `fetched` when they are there.
+    async fn assemble(
+        &self,
+        placed: &PlacedBatch,
+        fetched: &FreshReads,
+    ) -> Result<Frozen<4096>, DiskFault> {
         // A shard that has not connected its store yet cannot read the
         // messages now, and can once it has.
         let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
@@ -333,15 +503,14 @@ impl PlacedReadPlan {
             .position
             .checked_add(placement.length)
             .ok_or(DiskFault::Unreadable)?;
-        let blob = self
-            .wait(remote.read_fresh(placement.object_id, placement.position..end))
-            .await?;
-        if !placement.matches(&blob) {
-            return Err(DiskFault::Tiered);
-        }
-        let mut header = placed.header;
-        header.batch_checksum = header.checksum_for_blob(&blob);
-        whole_prepare(&header, &blob)
+        let range = placement.position..end;
+        let blob = if let Some(blob) = fetched.get(placement.object_id, &range) {
+            blob
+        } else {
+            self.wait(remote.read_fresh(placement.object_id, range))
+                .await?
+        };
+        whole_prepare(&whole_header(placed, &blob)?, &blob)
     }
 
     /// One wait on the object store, which ends at the poll's deadline.
@@ -365,6 +534,107 @@ impl PlacedReadPlan {
                 .unwrap_or(Err(DiskFault::Retryable)),
         }
     }
+}
+
+/// One read of a rewrite: the batches of `placed` it covers, and where
+/// their messages are.
+struct BlobRead {
+    batches: Range<usize>,
+    object_id: u128,
+    range: Range<u64>,
+    /// The bytes at `range`, when this shard held them as the read was
+    /// planned.
+    cached: Option<Bytes>,
+}
+
+impl BlobRead {
+    /// The batches the read covers, where its bytes start in the object,
+    /// and the bytes.
+    async fn fetch(self, remote: &RemoteSegments) -> Result<(Range<usize>, u64, Bytes), DiskFault> {
+        let bytes = match self.cached {
+            Some(bytes) => bytes,
+            None => {
+                remote
+                    .read_fresh_from_store(self.object_id, self.range.clone())
+                    .await?
+            }
+        };
+        Ok((self.batches, self.range.start, bytes))
+    }
+}
+
+/// The reads that cover `placed` in order, planned as they are asked for.
+struct BlobReads<'a> {
+    remote: &'a RemoteSegments,
+    placed: &'a [PlacedBatch],
+    next: usize,
+}
+
+impl BlobReads<'_> {
+    /// Where the messages of the batch at `index` are, and the messages
+    /// when this shard holds them. `None` past the last batch, and for a
+    /// placement that names no range.
+    fn blob(&self, index: usize) -> Option<(u128, Range<u64>, Option<Bytes>)> {
+        let placement = self.placed.get(index)?.placement;
+        let range = placement.position..placement.position.checked_add(placement.length)?;
+        let cached = if range.is_empty() {
+            Some(Bytes::new())
+        } else {
+            self.remote.cached_fresh(placement.object_id, &range)
+        };
+        Some((placement.object_id, range, cached))
+    }
+}
+
+impl Iterator for BlobReads<'_> {
+    type Item = BlobRead;
+
+    fn next(&mut self) -> Option<BlobRead> {
+        let first = self.next;
+        let placement = self.placed.get(first)?.placement;
+        // A placement that names no range reads as an empty one, which the
+        // batch then fails to match.
+        let (object_id, mut range, cached) =
+            self.blob(first)
+                .unwrap_or((placement.object_id, 0..0, Some(Bytes::new())));
+        self.next += 1;
+        if cached.is_none() {
+            while let Some((next_object, next, next_cached)) = self.blob(self.next) {
+                let close = next
+                    .start
+                    .checked_sub(range.end)
+                    .is_some_and(|gap| gap <= FRESH_READ_GAP_BYTES);
+                let follows = next_object == object_id
+                    && close
+                    && next.end - range.start <= FRESH_READ_BYTES_MAX;
+                if !follows || next_cached.is_some() {
+                    break;
+                }
+                range.end = next.end;
+                self.next += 1;
+            }
+        }
+        Some(BlobRead {
+            batches: first..self.next,
+            object_id,
+            range,
+            cached,
+        })
+    }
+}
+
+/// The header of the whole batch of `placed`, whose messages are `blob`:
+/// the one it has, with the batch checksum over the messages.
+///
+/// This is the one place that checks the messages of a placed batch
+/// against what its producer sent, so every read of one goes through it.
+fn whole_header(placed: &PlacedBatch, blob: &[u8]) -> Result<BatchHeader, DiskFault> {
+    if !placed.placement.matches(blob) {
+        return Err(DiskFault::Tiered);
+    }
+    let mut header = placed.header;
+    header.batch_checksum = header.checksum_for_blob(blob);
+    Ok(header)
 }
 
 /// The prepare a partition of whole batches would hold for the batch of
@@ -595,6 +865,28 @@ async fn first_reaching(file: &File, count: u64, first: u64) -> Result<u64, Disk
     Ok(low)
 }
 
+/// The bytes of the batches a count of [`PlacedReadPlan::batch_bytes`] took
+/// so far.
+struct CountedBatches {
+    /// The offset after the last batch counted, so a batch that two sources
+    /// hold counts once.
+    next_offset: u64,
+    up_to: u64,
+    bytes: u64,
+}
+
+impl CountedBatches {
+    fn take(&mut self, header: &BatchHeader) {
+        if header.base_offset < self.next_offset || header.base_offset > self.up_to {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(header.batch_length);
+        self.next_offset = header
+            .base_offset
+            .saturating_add(u64::from(header.message_count.max(1)));
+    }
+}
+
 /// `count` placed batches of `file`, from the `index`-th one on. Each one
 /// passes its own checksum, or the read fails.
 async fn read_placed(file: &File, index: u64, count: u64) -> Result<Vec<PlacedBatch>, DiskFault> {
@@ -613,4 +905,381 @@ async fn read_placed(file: &File, index: u64, count: u64) -> Result<Vec<PlacedBa
         .iter()
         .map(|placed| PlacedBatch::decode(placed).map_err(|_| DiskFault::Unreadable))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RemoteObjects;
+    use futures::FutureExt;
+    use futures::future::LocalBoxFuture;
+    use iggy_binary_protocol::placement::Placement;
+    use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError};
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    /// Fresh objects by key. Every read waits one turn before it answers,
+    /// so reads that run at the same time are seen to.
+    #[derive(Default)]
+    struct Objects {
+        held: RefCell<HashMap<String, Bytes>>,
+        asked: RefCell<Vec<(String, Range<u64>)>>,
+        in_flight: Cell<usize>,
+        most_in_flight: Cell<usize>,
+    }
+
+    impl RemoteObjects for Objects {
+        fn get_range<'a>(
+            &'a self,
+            key: &'a str,
+            range: Range<u64>,
+        ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+            self.asked
+                .borrow_mut()
+                .push((key.to_owned(), range.clone()));
+            self.in_flight.set(self.in_flight.get() + 1);
+            self.most_in_flight
+                .set(self.most_in_flight.get().max(self.in_flight.get()));
+            async move {
+                yield_to_reactor().await;
+                self.in_flight.set(self.in_flight.get() - 1);
+                let object = self.held.borrow().get(key).cloned().ok_or_else(|| {
+                    ObjectStoreError::NotFound {
+                        key: key.to_owned(),
+                    }
+                })?;
+                let end = usize::try_from(range.end).unwrap().min(object.len());
+                Ok(ObjectRange {
+                    bytes: object.slice(usize::try_from(range.start).unwrap()..end),
+                    etag: String::new(),
+                    size: object.len() as u64,
+                })
+            }
+            .boxed_local()
+        }
+    }
+
+    fn layout() -> KeyLayout {
+        KeyLayout::new("iggy").unwrap()
+    }
+
+    /// A plan that reads nothing from the disk and its fresh objects from
+    /// `objects`.
+    fn plan(objects: &Rc<Objects>) -> PlacedReadPlan {
+        PlacedReadPlan {
+            partition_dir: PartitionDirResolution::NoFiles,
+            segments: Vec::new(),
+            resident: Vec::new(),
+            remote: Some(Rc::new(RemoteSegments::new(
+                Rc::clone(objects) as Rc<dyn RemoteObjects>,
+                layout(),
+            ))),
+            deadline: None,
+            prefix: ObjectPrefix {
+                stream_id: 1,
+                topic_id: 1,
+                partition_id: 0,
+                created_revision: 0,
+            },
+            long_term: Vec::new(),
+            long_term_floor: None,
+        }
+    }
+
+    /// The fresh object `object_id` with one blob of `blob_len` bytes for
+    /// each of `count` batches from `base_offset` on, `gap` bytes apart,
+    /// and the placed batches that name them.
+    fn object_of(
+        object_id: u128,
+        base_offset: u64,
+        count: u64,
+        blob_len: usize,
+        gap: usize,
+    ) -> (Bytes, Vec<PlacedBatch>) {
+        let mut object = Vec::new();
+        let placed = (0..count)
+            .map(|batch| {
+                object.resize(object.len() + gap, 0xEE);
+                let position = object.len() as u64;
+                let fill = u8::try_from((base_offset + batch) % 251).unwrap();
+                object.resize(object.len() + blob_len, fill);
+                let blob = &object[object.len() - blob_len..];
+                let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + blob_len) as u64, 1);
+                header.base_offset = base_offset + batch;
+                PlacedBatch::new(header, Placement::of(object_id, position, blob))
+            })
+            .collect();
+        (Bytes::from(object), placed)
+    }
+
+    /// The offsets and the messages [`PlacedReadPlan::read_blobs`] hands
+    /// over for `placed`.
+    async fn blobs_of(
+        plan: &PlacedReadPlan,
+        placed: &[PlacedBatch],
+    ) -> Result<Vec<(u64, Vec<u8>)>, DiskFault> {
+        let mut taken: Vec<(BatchHeader, Vec<u8>)> = Vec::new();
+        plan.read_blobs(placed, |piece| match piece {
+            BatchPiece::Header(header) => taken.push((*header, Vec::new())),
+            BatchPiece::Messages(messages) => taken.last_mut().unwrap().1.extend(messages),
+        })
+        .await?;
+        Ok(taken
+            .into_iter()
+            .map(|(header, blob)| {
+                assert_eq!(header.batch_checksum, header.checksum_for_blob(&blob));
+                (header.base_offset, blob)
+            })
+            .collect())
+    }
+
+    /// The bytes [`PlacedReadPlan::read_blobs`] hands over between two of
+    /// its yields while it reads `placed`, and after the last one.
+    async fn stretches_of(plan: &PlacedReadPlan, placed: &[PlacedBatch]) -> Vec<usize> {
+        let handed = Cell::new(0);
+        let mut reading = std::pin::pin!(plan.read_blobs(placed, |piece| {
+            let len = match piece {
+                BatchPiece::Header(_) => BATCH_HEADER_SIZE,
+                BatchPiece::Messages(messages) => messages.len(),
+            };
+            handed.set(handed.get() + len);
+        }));
+        let mut stretches = Vec::new();
+        loop {
+            let polled = futures::poll!(reading.as_mut());
+            stretches.push(handed.replace(0));
+            if let Poll::Ready(read) = polled {
+                read.unwrap();
+                return stretches;
+            }
+            // Long enough for the timer of the yield to have fired.
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn expected(objects: &[(Bytes, Vec<PlacedBatch>)]) -> Vec<(u64, Vec<u8>)> {
+        objects
+            .iter()
+            .flat_map(|(object, placed)| {
+                placed.iter().map(|placed| {
+                    let start = usize::try_from(placed.placement.position).unwrap();
+                    let len = usize::try_from(placed.placement.length).unwrap();
+                    (
+                        placed.header.base_offset,
+                        object[start..start + len].to_vec(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Six objects: three batches in each of the first five, and one alone
+    /// in the last.
+    fn cold_objects(store: &Objects) -> Vec<(Bytes, Vec<PlacedBatch>)> {
+        let objects: Vec<_> = (0..6_u64)
+            .map(|object| {
+                let count = if object == 5 { 1 } else { 3 };
+                object_of(u128::from(object) + 1, object * 3, count, 100, 10)
+            })
+            .collect();
+        for (id, (bytes, _)) in (1_u128..).zip(&objects) {
+            store
+                .held
+                .borrow_mut()
+                .insert(layout().fresh_key(id), bytes.clone());
+        }
+        objects
+    }
+
+    #[compio::test]
+    async fn given_batches_the_shard_does_not_hold_when_reading_their_blobs_should_ask_once_an_object_and_several_at_a_time()
+     {
+        let store = Rc::new(Objects::default());
+        let objects = cold_objects(&store);
+        let placed: Vec<_> = objects
+            .iter()
+            .flat_map(|(_, placed)| placed.clone())
+            .collect();
+        let plan = plan(&store);
+
+        let taken = blobs_of(&plan, &placed).await.unwrap();
+
+        assert_eq!(taken, expected(&objects));
+        let asked = store.asked.borrow();
+        assert_eq!(asked.len(), objects.len(), "one read an object");
+        assert_eq!(asked[0], (layout().fresh_key(1), 10..330));
+        assert_eq!(asked[5], (layout().fresh_key(6), 10..110));
+        assert_eq!(store.most_in_flight.get(), REWRITE_FETCHES);
+    }
+
+    #[compio::test]
+    async fn given_blobs_far_apart_in_one_object_when_reading_them_should_ask_for_each_run() {
+        let store = Rc::new(Objects::default());
+        let gap = usize::try_from(FRESH_READ_GAP_BYTES).unwrap() + 1;
+        let (object, placed) = object_of(1, 0, 2, 100, gap);
+        store
+            .held
+            .borrow_mut()
+            .insert(layout().fresh_key(1), object.clone());
+        let plan = plan(&store);
+
+        let taken = blobs_of(&plan, &placed).await.unwrap();
+
+        assert_eq!(taken, expected(&[(object, placed)]));
+        assert_eq!(store.asked.borrow().len(), 2);
+    }
+
+    #[compio::test]
+    async fn given_batches_the_shard_does_not_hold_when_reading_their_blobs_should_keep_none_for_the_polls()
+     {
+        let store = Rc::new(Objects::default());
+        let objects = cold_objects(&store);
+        let placed: Vec<_> = objects
+            .iter()
+            .flat_map(|(_, placed)| placed.clone())
+            .collect();
+        let plan = plan(&store);
+        let remote = plan.remote.clone().unwrap();
+
+        blobs_of(&plan, &placed).await.unwrap();
+
+        for placed in &placed {
+            let placement = placed.placement;
+            let range = placement.position..placement.position + placement.length;
+            assert_eq!(remote.cached_fresh(placement.object_id, &range), None);
+        }
+    }
+
+    #[compio::test]
+    async fn given_blobs_the_shard_holds_when_reading_them_should_not_ask_the_store() {
+        let store = Rc::new(Objects::default());
+        let (object, placed) = object_of(1, 0, 3, 100, 10);
+        let plan = plan(&store);
+        plan.remote
+            .as_ref()
+            .unwrap()
+            .cache_fresh_object(1, object.clone());
+
+        let taken = blobs_of(&plan, &placed).await.unwrap();
+
+        assert_eq!(taken, expected(&[(object, placed)]));
+        assert!(store.asked.borrow().is_empty());
+    }
+
+    #[compio::test]
+    async fn given_a_blob_other_than_the_one_its_placement_names_when_reading_should_fail() {
+        let store = Rc::new(Objects::default());
+        let (object, placed) = object_of(1, 0, 3, 100, 10);
+        let mut changed = object.to_vec();
+        let last = changed.len() - 1;
+        changed[last] ^= 1;
+        let plan = plan(&store);
+        plan.remote
+            .as_ref()
+            .unwrap()
+            .cache_fresh_object(1, Bytes::from(changed));
+
+        assert_eq!(blobs_of(&plan, &placed).await, Err(DiskFault::Tiered));
+    }
+
+    /// Every batch is in memory, so nothing but the yields returns control
+    /// while a segment is put together.
+    #[compio::test]
+    async fn given_more_bytes_than_a_stride_in_memory_when_reading_the_blobs_should_yield_once_a_stride()
+     {
+        let store = Rc::new(Objects::default());
+        let blob_len = REWRITE_YIELD_BYTES / 4 - BATCH_HEADER_SIZE;
+        let (object, placed) = object_of(1, 0, 8, blob_len, 0);
+        let plan = plan(&store);
+        plan.remote.as_ref().unwrap().cache_fresh_object(1, object);
+
+        let stretches = stretches_of(&plan, &placed).await;
+
+        assert_eq!(stretches, [REWRITE_YIELD_BYTES, REWRITE_YIELD_BYTES, 0]);
+    }
+
+    #[compio::test]
+    async fn given_a_batch_larger_than_a_stride_when_reading_its_blob_should_yield_inside_it() {
+        let store = Rc::new(Objects::default());
+        let blob_len = 2 * REWRITE_YIELD_BYTES + REWRITE_YIELD_BYTES / 2 - BATCH_HEADER_SIZE;
+        let (object, placed) = object_of(1, 0, 1, blob_len, 0);
+        let plan = plan(&store);
+        plan.remote
+            .as_ref()
+            .unwrap()
+            .cache_fresh_object(1, object.clone());
+
+        let stretches = stretches_of(&plan, &placed).await;
+
+        assert_eq!(
+            stretches,
+            [
+                REWRITE_YIELD_BYTES,
+                REWRITE_YIELD_BYTES,
+                REWRITE_YIELD_BYTES / 2
+            ]
+        );
+        assert_eq!(
+            blobs_of(&plan, &placed).await.unwrap(),
+            expected(&[(object, placed)])
+        );
+    }
+
+    /// The journal entry of `placed`.
+    fn journal_entry(placed: &PlacedBatch) -> Frozen<4096> {
+        let total = PREPARE_HEADER_SIZE + PLACED_BATCH_SIZE;
+        let mut prepare = Owned::<4096>::zeroed(total);
+        let bytes = prepare.as_mut_slice();
+        placed.encode_into(&mut bytes[PREPARE_HEADER_SIZE..]);
+        let header =
+            bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut bytes[..PREPARE_HEADER_SIZE]);
+        header.command = Command::Prepare;
+        header.operation = Operation::SendMessages;
+        header.size = u32::try_from(total).unwrap();
+        prepare.into()
+    }
+
+    /// Six batches of one message each, of different lengths: offsets 0 to
+    /// 3 in a segment file, and 3 to 5 in the journal, which the segment
+    /// has yet to drop. Only the lengths of 1 to 4 count.
+    #[compio::test]
+    async fn given_batches_in_a_segment_and_in_the_journal_when_counting_their_bytes_should_count_each_one_once()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let placed: Vec<_> = (0..6_u64)
+            .map(|offset| {
+                let length = 10 * (offset + 1);
+                let mut header = BatchHeader::new(0, 0, BATCH_HEADER_SIZE as u64 + length, 1);
+                header.base_offset = offset;
+                let blob = vec![0; usize::try_from(length).unwrap()];
+                PlacedBatch::new(header, Placement::of(1, 0, &blob))
+            })
+            .collect();
+        let mut log = vec![0; 4 * PLACED_BATCH_SIZE];
+        for (record, placed) in log.chunks_mut(PLACED_BATCH_SIZE).zip(&placed) {
+            placed.encode_into(record);
+        }
+        std::fs::write(directory.path().join(format!("{:020}.log", 0)), &log).unwrap();
+        let store = Rc::new(Objects::default());
+        let plan = PlacedReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(
+                directory.path().to_string_lossy().into_owned(),
+            ),
+            segments: vec![PlacedSegment {
+                start_offset: 0,
+                end_offset: 3,
+                max_timestamp: 0,
+                size: log.len() as u64,
+            }],
+            resident: placed[3..].iter().map(journal_entry).collect(),
+            ..plan(&store)
+        };
+        let lengths: u64 = placed[1..5]
+            .iter()
+            .map(|placed| placed.header.batch_length)
+            .sum();
+
+        assert_eq!(plan.batch_bytes(1, 4).await, Ok(lengths));
+    }
 }

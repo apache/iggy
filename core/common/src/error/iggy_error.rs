@@ -226,6 +226,13 @@ pub enum IggyError {
     /// Clients must not send the request again.
     #[error("Tiered data cannot be read from the object store; a retry does not help")]
     TieredReadFailed = 96,
+    /// The reply frame of `GetClients` or of a metadata read is larger than
+    /// the reply cap of a client, so the server sent this error in its place.
+    /// The metadata reads are those of streams, topics, partitions, consumer
+    /// groups, users, options, stats and cluster metadata. The connection
+    /// stays open. A paged read returns the same data in smaller replies.
+    #[error("The reply is larger than the reply size limit")]
+    ReplyTooLarge = 97,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]

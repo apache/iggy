@@ -165,7 +165,6 @@ mod tests {
                     max_wait_us: 250_000,
                     min_count: 10,
                     max_bytes: Some(2_097_152),
-                    read_amplification: Some(1.05),
                 }),
                 client: BenchmarkClientOptions {
                     warmup_time_us: 5_000_000,
@@ -184,7 +183,6 @@ mod tests {
             ..BenchmarkParams::default()
         };
 
-        // Reports are written as text, which keeps `1.05_f32` exact, unlike `to_value`.
         let text = serde_json::to_string(&params).unwrap();
         let json: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
@@ -201,8 +199,7 @@ mod tests {
                     "consumer_offset_durability": "persisted",
                     "max_wait_us": 250_000,
                     "min_count": 10,
-                    "max_bytes": 2_097_152,
-                    "read_amplification": 1.05
+                    "max_bytes": 2_097_152
                 },
                 "client": {"warmup_time_us": 5_000_000, "high_level_api": true, "reuse_streams": true},
                 "tcp": {"nodelay": true, "tls": true}

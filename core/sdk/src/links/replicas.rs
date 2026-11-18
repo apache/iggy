@@ -61,7 +61,7 @@ const MAX_CONCURRENT_DIALS: usize = 4;
 
 /// A replica holds a bind for at most two metadata read budgets, one for its
 /// frontier and one for the forward to shard 0: 6 s at the default
-/// `commit_broadcast_interval`. A bind without a reply by this deadline means
+/// `commit_busy_heartbeat_interval`. A bind without a reply by this deadline means
 /// a dead link, so the client drops it and dials again.
 const BIND_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -1569,7 +1569,7 @@ fn group_retired(sim: &Simulator, namespace: IggyNamespace, group_id: u64) -> bo
             .partition_shard(namespace)
             .plane
             .partitions()
-            .get_by_ns(&namespace)
+            .peek_by_ns(&namespace)
             .is_some_and(|partition| partition.consumer_group_retired(group_id))
     })
 }

@@ -94,6 +94,11 @@ The server provides the following HTTP endpoints:
 
 ### Embedded Charts
 
+The subtext of an embedded chart gives each actor group's throughput as the dashboard pages do: the user data
+of the group divided by the run time of its slowest actor. `Avg Per Producer` (or consumer) is that rate divided
+by the number of actors in the group. The `iggy-bench` HTML charts and console output still add up the actors'
+own rates.
+
 - `GET /embed/{uuid}?type={type}&theme={theme}&action={action}`
   - Get a page with the interactive chart of a run, for an iframe
   - Parameters:
@@ -112,7 +117,8 @@ The server provides the following HTTP endpoints:
     - `width`, `height`: image size in pixels, from 1 to 4096 (default 1600 x 1200)
     - `legend`: `true` (default) or `false`
   - Response: PNG image. At the default size it is built on the first request and then served from
-    `--cache-dir`. Other sizes are built on every request.
+    `--cache-dir`. Other sizes are built on every request, one at a time on one thread. To show the PNG on a
+    page, ask for the default size. Then set the display size with the `width` of the `img` tag.
 
 ### OMB Runs
 
@@ -146,6 +152,52 @@ hexadecimal characters. A UUID of an `iggy-bench` run is not an OMB run id, so i
     `Content-Disposition: attachment`. The file name is the name of the result file with `.setup.toml` in place
     of `.json`, so the downloads of several runs do not overwrite each other. 404 for a run without a sidecar,
     and for a sidecar that does not parse or has a key that looks like a secret.
+
+### OMB Embedded Charts
+
+These endpoints draw the charts of one OMB run in the units of OMB: MiB/s, 10 s windows and the latency of each
+message. No chart shows an `iggy-bench` number. The first subtext line names the machines from the sidecar, the
+OMB driver and the Iggy version. The driver name, for example `Iggy-persisted`, is the only label of the driver
+configuration.
+
+- `GET /embed/omb/{id}?type={type}&theme={theme}&action={action}`
+  - Get a page with the interactive chart of an OMB run, for an iframe
+  - Parameters:
+    - `id`: OMB run id
+    - `type`: an OMB chart type from the list below. The default is `latency`
+    - `theme`: `dark` (default) or `light`. Any other value gets 400, `dark_nobg` and `light_nobg` too
+    - `action`: optional, `download` gives a page that saves the chart as a PNG file in the browser. Any other
+      value gets 400
+  - Response: HTML page
+
+- `GET /embed/omb/{id}/chart.png?type={type}&theme={theme}&width={width}&height={height}&legend={legend}`
+  - Get the chart of an OMB run as an image, rendered on the server
+  - Parameters:
+    - `id`: OMB run id
+    - `type`: an OMB chart type from the list below. The default is `latency`
+    - `theme`, `width`, `height`, `legend`: as for `/embed/{uuid}/chart.png`
+  - Response: PNG image. The default size is cached in `--cache-dir`, as for the `iggy-bench` charts. If the
+    sidecar changes the machines or the Iggy version, the next request renders the PNG again
+
+The OMB chart types:
+
+- `latency`: the publish latency P50, P99 and P99.9 of each window, in ms
+- `end_to_end_latency`: the end-to-end latency P50, P99 and P99.9 of each window, in ms. A run without
+  consumers did not measure it, so it gets 404
+- `throughput`: the publish and consume throughput of each window, in MiB/s. A run without consumers has no
+  consume line
+- `ladder`: the publish and end-to-end latency of the whole run at P50, P75, P95, P99, P99.9, P99.99 and the
+  maximum, on a log axis
+- `quantiles`: the publish and end-to-end latency at every percentile of the merged histograms, on a log axis,
+  against a percentile axis that counts nines
+
+An OMB run id is a hash of the result file. If the file changes, the run gets a new id, and the URLs with the
+old id get 404. The embed pages of both frameworks send no `X-Frame-Options` header and no `frame-ancestors`
+policy, so other sites can frame them.
+
+The embed pages and the PNG files of both frameworks send `Cache-Control: public, max-age=3600`, so a browser or a
+proxy can keep them for an hour. A sidecar change reaches a cached OMB page or PNG within that hour. Error
+answers send no `Cache-Control`.
 
 `/health` and the `/api` endpoints return JSON, with three exceptions. `/api/artifacts/{uuid}` returns a ZIP file,
 and the two OMB downloads return the original files. The embed endpoints return HTML or PNG. All of them use
@@ -363,7 +415,8 @@ Options:
 ```
 
 The server only reads `--results-dir` and `--omb-results-dir`. It writes the files it generates to
-`--cache-dir`: chart PNG files of the default size for `/embed/{uuid}/chart.png` under `embed/` and artifact
+`--cache-dir`: chart PNG files of the default size for `/embed/{uuid}/chart.png` and `/embed/omb/{id}/chart.png`
+under `embed/` and artifact
 zips for `/api/artifacts/{uuid}` under `artifacts/`. Each file is built on the first request and reused later. When a file in a run directory
 changes or is removed, the server rebuilds that run's artifact zip. To rebuild the PNG files, delete the
 directory. The default is `iggy-bench-dashboard` in the system temp directory (`$TMPDIR`, usually `/tmp`). If

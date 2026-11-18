@@ -263,11 +263,6 @@ pub fn dvc_count(array: &DvcQuorumArray) -> usize {
     array.iter().filter(|m| m.is_some()).count()
 }
 
-/// Reset the DVC quorum array.
-pub fn dvc_reset(array: &mut DvcQuorumArray) {
-    *array = dvc_quorum_array_empty();
-}
-
 /// Iterator over all stored DVCs.
 pub fn dvc_iter(array: &DvcQuorumArray) -> impl Iterator<Item = &StoredDvc> {
     array.iter().filter_map(|m| m.as_ref())

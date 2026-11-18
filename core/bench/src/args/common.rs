@@ -472,10 +472,6 @@ impl IggyBenchArgs {
         self.benchmark_kind.inner().message_expiry()
     }
 
-    pub fn read_amplification(&self) -> Option<f32> {
-        self.benchmark_kind.inner().read_amplification()
-    }
-
     pub const fn high_level_api(&self) -> bool {
         self.high_level_api
     }

@@ -214,7 +214,7 @@ where
     // the op's frame with an empty body and a nonzero `status` the SDK peeks.
     //
     // Authorization uses this node's committed metadata. Admission requires
-    // quorum evidence younger than heartbeat_timeout + 3s, on a backup too,
+    // quorum evidence younger than commit_busy_heartbeat_timeout + 3s, on a backup too,
     // because it ages the evidence from its previous probe. This limits stale
     // grants while keeping partition traffic independent of metadata consensus.
     let scope = IggyNamespace::from_raw(namespace);

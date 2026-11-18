@@ -25,6 +25,8 @@ import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.stream.StreamOptions;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 
 import java.util.List;
 import java.util.Map;
@@ -84,12 +86,26 @@ public interface StreamsClient {
      * Gets a list of all streams on the server.
      *
      * <p>Returns basic information about each stream without topic details. Use
-     * {@link #getStream(StreamId)} for full details about a specific stream.
+     * {@link #getStream(StreamId)} for full details about a specific stream. The
+     * client reads the list in pages of up to 1000 streams, so the list is not one
+     * consistent read. All pages share the sign-in and the request timeout of the
+     * call, so a new sign-in during the read fails it. The call fails with
+     * {@link org.apache.iggy.exception.IggyMalformedResponseException} when
+     * the server answers the page cursor it was sent.
      *
      * @return a {@link CompletableFuture} that completes with a list of {@link StreamBase}
      *         objects for all streams
      */
     CompletableFuture<List<StreamBase>> getStreams();
+
+    /**
+     * Gets one page of streams.
+     *
+     * @param query the order, limit, cursor and name filter of the page
+     * @return a {@link CompletableFuture} that completes with the page, or fails with an
+     *         invalid command error when the query breaks the page rules
+     */
+    CompletableFuture<Page<StreamBase>> getStreamsPage(NamedPageQuery query);
 
     /**
      * Creates a new stream with the given name and no options.

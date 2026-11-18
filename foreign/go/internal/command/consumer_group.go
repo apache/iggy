@@ -64,9 +64,11 @@ func (g *GetConsumerGroup) MarshalBinary() ([]byte, error) {
 	return iggcon.MarshalIdentifiers(g.StreamId, g.TopicId, g.GroupId)
 }
 
+// GetConsumerGroups asks for one page of the consumer groups of a topic.
 type GetConsumerGroups struct {
 	StreamId iggcon.Identifier
 	TopicId  iggcon.Identifier
+	Query    iggcon.NamedPageQuery
 }
 
 func (g *GetConsumerGroups) Code() Code {
@@ -74,7 +76,11 @@ func (g *GetConsumerGroups) Code() Code {
 }
 
 func (g *GetConsumerGroups) MarshalBinary() ([]byte, error) {
-	return iggcon.MarshalIdentifiers(g.StreamId, g.TopicId)
+	identifiers, err := iggcon.MarshalIdentifiers(g.StreamId, g.TopicId)
+	if err != nil {
+		return nil, err
+	}
+	return g.Query.AppendBinary(identifiers)
 }
 
 type JoinConsumerGroup struct {

@@ -364,7 +364,7 @@ async fn given_queued_capacity_denial_when_promoting_should_use_the_slot_for_nex
     let (mut partition, _) = recording_partition_at(0, 3);
     partition.set_consumer_offsets_max(1);
     partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         7,
         ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new()),
     );
@@ -509,7 +509,7 @@ async fn given_promotion_denial_budget_when_no_more_commits_arrive_should_resume
     let (mut partition, sent) = recording_partition_at(0, 3);
     partition.set_consumer_offsets_max(1);
     partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         7,
         ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new()),
     );
@@ -582,7 +582,7 @@ async fn given_covered_store_with_dirty_directory_when_sync_fails_should_fence_i
 #[compio::test]
 async fn given_repeated_admitted_deletes_when_committed_should_be_idempotent() {
     let (mut partition, _) = recording_partition();
-    partition.consumer_offsets.pin().insert(
+    partition.consumer_offsets.borrow_mut().insert(
         7,
         ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new()),
     );
@@ -829,7 +829,7 @@ async fn given_group_offset_updates_when_key_already_exists_should_keep_reconcil
         .await
         .unwrap();
     assert!(dirty.borrow().is_empty());
-    partition.consumer_group_offsets.pin().insert(
+    partition.consumer_group_offsets.borrow_mut().insert(
         ConsumerGroupId(8),
         ConsumerOffset::new(ConsumerKind::ConsumerGroup, 8, 3, String::new()),
     );
@@ -862,19 +862,19 @@ async fn given_primary_view_change_when_map_pressure_arrives_should_reclaim_only
         .reserve_provisional(9, &partition.durable_consumer_offsets)
         .unwrap();
     for id in 7..=10 {
-        partition.consumer_offsets.pin().insert(
+        partition.consumer_offsets.borrow_mut().insert(
             id as usize,
             ConsumerOffset::new(ConsumerKind::Consumer, id, 0, String::new()),
         );
     }
     partition.consensus.set_view(3);
     partition.resynchronize_consumer_offset_reservations();
-    assert_eq!(partition.consumer_offsets.len(), 4);
+    assert_eq!(partition.consumer_offsets.borrow().len(), 4);
     partition.reclaim_phantom_offsets(ConsumerKind::Consumer, 4);
-    assert_eq!(partition.consumer_offsets.len(), 3);
-    assert!(!partition.consumer_offsets.pin().contains_key(&10));
+    assert_eq!(partition.consumer_offsets.borrow().len(), 3);
+    assert!(!partition.consumer_offsets.borrow().contains_key(&10));
     for id in 7..=9 {
-        assert!(partition.consumer_offsets.pin().contains_key(&id));
+        assert!(partition.consumer_offsets.borrow().contains_key(&id));
     }
     drop(held);
 }
@@ -1198,7 +1198,7 @@ async fn shutdown_flushes_committed_messages_with_an_unacknowledged_pipeline_tai
                 &replies[0].1.as_slice()[..size_of::<ReplyHeader>()],
             );
             assert_eq!(reply.status, IggyError::TransientNotAccepted.as_code());
-            assert!(partition.consumer_offsets.pin().is_empty());
+            assert!(partition.consumer_offsets.borrow().is_empty());
             assert_eq!(
                 partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
                 0

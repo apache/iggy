@@ -86,6 +86,12 @@ public enum IggyErrorCode {
      * request again.
      */
     TIERED_READ_FAILED(96),
+    /**
+     * The server sent this error in place of a reply above the reply size limit: a GetClients reply, or a reply to a
+     * read of streams, topics, partitions, consumer groups, users, tokens, options, stats or cluster metadata. The
+     * connection stays open. For a list, the page methods return the same items in smaller replies.
+     */
+    REPLY_TOO_LARGE(97),
 
     // Client errors
     CLIENT_NOT_FOUND(100),

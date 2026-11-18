@@ -21,6 +21,8 @@ package org.apache.iggy.client.blocking.tcp;
 
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
@@ -48,6 +50,11 @@ final class UsersTcpClient implements UsersClient {
     @Override
     public List<UserInfo> getUsers() {
         return FutureUtil.resolve(delegate.getUsers());
+    }
+
+    @Override
+    public Page<UserInfo> getUsersPage(NamedPageQuery query) {
+        return FutureUtil.resolve(delegate.getUsersPage(query));
     }
 
     @Override

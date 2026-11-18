@@ -306,27 +306,6 @@ export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
   return { bytesRead: pos - start, data: { ...data, partitions } };
 };
 
-
-/**
- * Deserializes a GetTopics response: `[topics_count:u32_le]` prefix followed
- * by count-driven topic headers (no partition details).
- *
- * @param p - Buffer containing serialized topics data
- * @param pos - Starting position in the buffer
- * @returns Array of deserialized topics
- */
-export const deserializeTopics = (p: Buffer, pos = 0): Topic[] => {
-  const topicsCount = p.readUInt32LE(pos);
-  pos += 4;
-  const topics = [];
-  for (let i = 0; i < topicsCount; i++) {
-    const { bytesRead, data } = deserializeBaseTopic(p, pos);
-    topics.push({ ...data, partitions: [] });
-    pos += bytesRead;
-  }
-  return topics;
-};
-
 export const Durability = {
   Replicated: 'replicated',
   Persisted: 'persisted'
