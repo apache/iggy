@@ -446,6 +446,7 @@ async fn given_a_dropped_session_when_its_prefix_read_runs_should_stop_without_f
             len: prefix_len as u64,
         }),
         pulled_len: 0,
+        slot: crate::state_transfer::TransferSlot::new(&Rc::default()),
     }));
     assert!(
         partition.drive_prefix_seed(),
@@ -514,6 +515,7 @@ fn fetching_with_a_landed_prefix_read() -> IggyPartition<RecordingBus> {
             },
         }),
         pulled_len: 0,
+        slot: crate::state_transfer::TransferSlot::new(&Rc::default()),
     }));
     partition
 }

@@ -225,4 +225,4 @@ pub use replica_set::{ReplicaSet, ReplicaSetError};
 mod vsr_state;
 pub use vsr_state::{AdoptedView, HistoryCertificate, HistoryRecovery, VsrState, VsrStateError};
 mod vsr_timeout;
-pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};
+pub use vsr_timeout::{TICK_INTERVAL, TickClock, TimeoutManager};
