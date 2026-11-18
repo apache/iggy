@@ -222,6 +222,10 @@ where
     /// The rewrite of this partition's placed batches into long-term
     /// segments, while this replica is the primary.
     pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
+    /// Number of the last long-term rewrite this partition started. It
+    /// outlives the view, so the late result of an earlier view's rewrite is
+    /// never taken for the one in flight.
+    pub(crate) long_term_rewrite_jobs: u64,
     /// What this partition committed above its long-term floor.
     pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
     /// The fetches of remote segments' indexes that polls have in flight.
@@ -1160,6 +1164,7 @@ where
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
+            long_term_rewrite_jobs: 0,
             long_term_backlog: Box::default(),
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,

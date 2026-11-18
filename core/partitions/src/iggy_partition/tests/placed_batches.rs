@@ -1900,6 +1900,28 @@ async fn given_a_rewrite_in_flight_when_primacy_moves_should_drop_its_result_and
     assert_eq!(long_term_logs(&store), 1);
 }
 
+/// A rewrite that outlives its view reports back after the replica leads
+/// again. Taken as the new view's rewrite, it would end the one in flight.
+#[compio::test]
+async fn given_a_rewrite_of_an_earlier_view_when_its_result_arrives_during_the_next_views_rewrite_should_change_nothing()
+ {
+    let (_whole, placed, object) = whole_and_placed(3);
+    let store = Box::pin(store_with(object)).await;
+    let (_directory, mut partition) = Box::pin(placing_leader_of_three_with(&placed, &store)).await;
+    let (earlier, _rewrite, _scope) = partition.begin_segment_rewrite().unwrap();
+    lose_primacy(&mut partition);
+    regain_primacy(&mut partition);
+    let (_id, _rewrite, scope) = partition.begin_segment_rewrite().unwrap();
+
+    let result =
+        partition.finish_segment_rewrite(earlier, Err(iggy_object_store::TierJobCancelled));
+
+    assert_eq!(result, None);
+    assert!(!scope.is_cancelled());
+    assert!(partition.segment_rewrite_running());
+    assert!(partition.begin_segment_rewrite().is_none());
+}
+
 /// Primacy moves after the segment is stored and before its command
 /// commits. The replica does not send the command of an earlier view again:
 /// it rewrites from the floor, finds the segment in the store, and commits
