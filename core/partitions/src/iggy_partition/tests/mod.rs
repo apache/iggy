@@ -2036,6 +2036,7 @@ mod empty_offsets;
 mod eviction;
 mod floor_eviction;
 mod free_space;
+mod fresh_proofs;
 mod history;
 mod journal_budget;
 mod long_term_delete;

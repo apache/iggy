@@ -822,7 +822,7 @@ where
 
     /// A command applied to the long-term log, which ended at `floor`
     /// before it. When the floor moved, the bytes of the segment it moved
-    /// past leave the backlog.
+    /// past leave the backlog, and so do the proof rows of its batches.
     pub(crate) fn note_long_term_advance(&mut self, floor: Option<u64>) {
         if self.long_term_floor() <= floor {
             return;
@@ -830,6 +830,7 @@ where
         if let Some(size) = self.long_term_segments().last().map(|segment| segment.size) {
             self.long_term_backlog.take(size);
         }
+        self.prune_proof_rows();
     }
 
     /// The rewrite state of the current view. What an earlier view left is

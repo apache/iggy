@@ -63,6 +63,8 @@ pub use object_delete::{
     delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
     sweep_long_term, sweep_segments, sweepable,
 };
+mod fresh_proofs;
+pub use fresh_proofs::FreshProofs;
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
 mod fresh_sweep;

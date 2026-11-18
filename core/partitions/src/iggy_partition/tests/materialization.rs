@@ -288,6 +288,7 @@ async fn wal_backpressure_preserves_replay_outcomes() {
                         base_offset: 0,
                         message_count: 1,
                         size_bytes: 0,
+                        placed: None,
                     }),
                 ),
             );

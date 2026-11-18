@@ -568,7 +568,9 @@ fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<Prepare
 const PLACED_PER_SEGMENT: u64 = 2;
 
 /// A backup that places its batches, with a prepare WAL under `root`.
-async fn placing_backup_with_wal(root: &Path) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
+pub(super) async fn placing_backup_with_wal(
+    root: &Path,
+) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
     let mut config = repair_config();
     config.path_layout.streams_root = root.to_string_lossy().into_owned();
     let directory = config.get_partition_path(1, 1, 0);
@@ -592,7 +594,7 @@ async fn placing_backup_with_wal(root: &Path) -> (PartitionsConfig, IggyPartitio
 
 /// Replicate and commit one placed batch per offset, each as op
 /// `offset + 1`. Returns the checksum the next prepare chains to.
-async fn replicate_placed(
+pub(super) async fn replicate_placed(
     partition: &mut IggyPartition<RecordingBus>,
     config: &PartitionsConfig,
     offsets: std::ops::RangeInclusive<u64>,
@@ -754,7 +756,7 @@ fn placed_client_request(
 }
 
 /// A primary alone in its group, so a request commits without a backup.
-async fn placing_primary() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+pub(super) async fn placing_primary() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
     let config = repair_config();
     let (directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 1)).await;
     partition.set_places_batches(true);

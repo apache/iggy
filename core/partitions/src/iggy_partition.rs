@@ -62,7 +62,7 @@ use consensus::{
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::batch::BatchProducer;
-use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch, stored_header};
+use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch, Placement, stored_header};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_offsets::{
@@ -84,7 +84,7 @@ use iggy_common::{
     ConsumerGroupId, ConsumerKind, ConsumerOffset, EncryptorKind, IggyByteSize, IggyError,
     IggyExpiry, IggyTimestamp, PartitionStats, PollingKind, TopicRuntimeOptions,
 };
-use iggy_object_store::{SegmentKey, SegmentObject};
+use iggy_object_store::{FreshObjectId, FreshProofRow, SegmentKey, SegmentObject};
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
 use journal::superblock::{
@@ -244,6 +244,9 @@ where
     pub(crate) long_term_rewrite_jobs: u64,
     /// What this partition committed above its long-term floor.
     pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
+    /// The proof rows of the placed batches it committed, `None` until it
+    /// commits one.
+    fresh_proofs: Option<Box<crate::fresh_proofs::FreshProofs>>,
     /// Number of the last manifest publish this partition started. It
     /// outlives the view, so the late result of an earlier view's publish is
     /// never taken for the one in flight.
@@ -1190,6 +1193,7 @@ where
             long_term_merges: Box::default(),
             long_term_rewrite_jobs: 0,
             long_term_backlog: Box::default(),
+            fresh_proofs: None,
             manifest_publish_jobs: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
@@ -8273,6 +8277,55 @@ where
         self.places_batches() && !self.refuses_requests() && self.takes_messages_of_its_topic()
     }
 
+    /// Whether this replica proves the placed batches its partition
+    /// committed: it places them, and it is a primary in normal status that
+    /// is not on its way out.
+    #[must_use]
+    pub fn proves_placed_batches(&self) -> bool {
+        self.places_batches() && !self.refuses_requests()
+    }
+
+    /// The proof rows of the placed batches this replica committed, `None`
+    /// before it committed one.
+    #[must_use]
+    pub fn fresh_proofs(&self) -> Option<&crate::FreshProofs> {
+        self.fresh_proofs.as_deref()
+    }
+
+    /// Whether proof rows wait for this replica's shard since the last call.
+    /// Only a replica that [proves](Self::proves_placed_batches) them has
+    /// any to give.
+    pub fn take_proofs_wanted(&self) -> bool {
+        let Some(proofs) = self.fresh_proofs.as_deref() else {
+            return false;
+        };
+        if !self.proves_placed_batches() {
+            proofs.unwant();
+            return false;
+        }
+        proofs.take_wanted(self.consensus.view())
+    }
+
+    /// The `proven_below` of an object that a writer seals now, which holds
+    /// every row below `unstored_from` in a stored object. See
+    /// [`crate::FreshProofs::proven_below`].
+    #[must_use]
+    pub fn proven_below(&self, unstored_from: u64) -> u64 {
+        let long_term_floor = self.long_term_floor();
+        self.fresh_proofs.as_deref().map_or_else(
+            || long_term_floor.map_or(0, |floor| floor.saturating_add(1)),
+            |proofs| proofs.proven_below(unstored_from, long_term_floor),
+        )
+    }
+
+    /// Drop the proof rows that the long-term log now holds.
+    pub(crate) fn prune_proof_rows(&mut self) {
+        let long_term_floor = self.long_term_floor();
+        if let Some(proofs) = self.fresh_proofs.as_deref_mut() {
+            proofs.prune(long_term_floor);
+        }
+    }
+
     /// Whether [`Self::on_placed_request`] has room for one more request. A
     /// request handed over without room is answered as not accepted.
     #[must_use]
@@ -13050,6 +13103,9 @@ where
         }
         self.widest_batch_bytes
             .set(self.widest_batch_bytes.get().max(batch_stats.size_bytes));
+        if let Some((placement, placed_checksum)) = batch_stats.placed {
+            self.take_proof_row(&batch_stats, placement, placed_checksum);
+        }
         let end_offset = batch_stats.end_offset();
         // The committed counter now names data, which is what makes
         // it pollable and persistable. Outside the recovered-offset
@@ -13076,6 +13132,34 @@ where
             self.stats
                 .increment_messages_count(u64::from(batch_stats.message_count));
             self.stats.increment_size_bytes(batch_stats.size_bytes);
+        }
+    }
+
+    /// Keep the proof row of a placed batch that committed here, on every
+    /// replica. The primary's shard is told that one waits.
+    fn take_proof_row(
+        &mut self,
+        batch_stats: &CommittedBatchStats,
+        placement: Placement,
+        placed_checksum: u64,
+    ) {
+        let long_term_floor = self.long_term_floor();
+        let primary = self.consensus.is_primary();
+        let proofs = self.fresh_proofs.get_or_insert_default();
+        proofs.commit(
+            FreshProofRow {
+                object_id: FreshObjectId::from_raw(placement.object_id),
+                position: placement.position,
+                base_offset: batch_stats.base_offset,
+                base_timestamp: batch_stats.timestamp,
+                message_count: batch_stats.message_count,
+                placed_checksum,
+            },
+            placement.proven_below,
+            long_term_floor,
+        );
+        if primary {
+            proofs.want();
         }
     }
 
@@ -13127,6 +13211,9 @@ where
             size_bytes: batch.header.total_size() as u64,
             producer: batch.header.producer,
             timestamp: batch.header.base_timestamp,
+            placed: batch
+                .placement
+                .map(|placement| (placement, batch.body_checksum)),
         }))
     }
 
@@ -16558,6 +16645,8 @@ struct CommittedBatchStats {
     size_bytes: u64,
     producer: Option<BatchProducer>,
     timestamp: u64,
+    /// The placement of a placed batch, with the placed batch's checksum.
+    placed: Option<(Placement, u64)>,
 }
 
 struct JournaledMessages {
