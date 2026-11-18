@@ -414,13 +414,27 @@ async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_witho
     assert_eq!(polled.last_matching_offset(), Some(1));
 }
 
+/// Whether the shard paces the rewrites of `partition`.
+fn paced(owner: &IoTestShard, partition: IggyNamespace) -> bool {
+    let revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&partition)
+        .unwrap()
+        .created_revision();
+    owner.rewrite_pacing.borrow().paces(&(partition, revision))
+}
+
 /// The whole write path on one shard: a producer's sends are stored and
-/// committed as placed batches, the rewrite pass stores them again as a
-/// long-term segment, and the partition's long-term log names it.
+/// committed as placed batches, the rewrite passes store them again as
+/// long-term segments, and the partition's long-term log names them. Nothing
+/// stages a pass here: the shard starts them for the partition it leads. A
+/// primary beside it that keeps its batches whole gets no pass.
 #[compio::test]
-async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish_a_long_term_segment()
+async fn given_committed_sends_when_nothing_stages_a_pass_should_store_and_publish_them_as_long_term_segments()
  {
     use super::object_deletes::Shared;
+    use crate::rewrite_pacing::REWRITE_INTERVAL_MAX;
     use iggy_object_store::{SegmentKey, SegmentObject};
     use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
 
@@ -453,15 +467,28 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
             .long_term_floor()
     };
 
-    pumped(&owner, async {
+    let whole = IggyNamespace::new(0, 0, 1);
+    partitions
+        .get_mut_by_ns(&whole)
+        .unwrap()
+        .set_offset_space_used(true);
+
+    // A shard that got its writer looks over all its partitions once. That
+    // look must not be what finds the sends below.
+    assert!(owner.rewrite_pacing.borrow_mut().take_sweep_wanted());
+
+    let published_in = pumped(&owner, async {
         let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
         until(&owner, |owner| committed_sends(owner) == 2).await;
-        assert_eq!(floor(&owner), None);
-        owner.request_rewrite_segments(namespace(), revision);
+        let committed = std::time::Instant::now();
         until(&owner, |owner| floor(owner) == Some(1)).await;
+        committed.elapsed()
     })
     .await;
 
+    assert!(published_in < REWRITE_INTERVAL_MAX, "{published_in:?}");
+    assert!(paced(&owner, namespace()));
+    assert!(!paced(&owner, whole));
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     let segments = partition.long_term_segments();
     assert_eq!(segments.len(), 1);
@@ -479,6 +506,163 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
         4,
         "a fresh object per send, the log and its index"
     );
+}
+
+/// A replica of the headless group that places its batches and holds a
+/// committed message above its long-term floor, on a shard whose writer ends
+/// no rewrite.
+#[allow(clippy::future_not_send)]
+async fn placing_headless(replica: u8) -> HeadlessReplica {
+    let replica = Box::pin(HeadlessReplica::journaled(replica, namespace(), &[], None)).await;
+    place_partition(&replica.owner, namespace());
+    replica
+        .owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_offset_space_used(true);
+    replica
+        .owner
+        .set_long_term_writer(Some(Rc::new(HeldWriter)));
+    replica
+}
+
+/// Step `replica` until `done`.
+#[allow(clippy::future_not_send)]
+async fn stepped(replica: &HeadlessReplica, what: &str, done: impl Fn() -> bool) {
+    let mut scratch = Vec::new();
+    let stepping = async {
+        while !done() {
+            replica.step(&mut scratch).await;
+        }
+    };
+    compio::time::timeout(REPLY_DEADLINE, Box::pin(stepping))
+        .await
+        .unwrap_or_else(|_| panic!("the replica did not get to {what}"));
+}
+
+/// The primary of the group is down. The two replicas left elect the
+/// candidate, which is the only one whose shard then runs rewrite passes,
+/// and only from the moment its view is a normal one. Nothing stages a pass.
+#[compio::test]
+async fn given_a_placing_backup_when_it_becomes_the_primary_should_start_its_passes_and_no_backup_should()
+ {
+    use crate::rewrite_pacing::REWRITE_INTERVAL_START;
+    const NEXT_VIEW: u32 = REPAIR_VIEW + 1;
+    let backup = Box::pin(placing_headless(HEADLESS_BACKUP)).await;
+    let candidate = Box::pin(placing_headless(HEADLESS_CANDIDATE)).await;
+    let consensus = |replica: &HeadlessReplica| {
+        let partition = replica.partition(namespace());
+        (
+            partition.consensus().is_primary(),
+            partition.consensus().is_normal(),
+        )
+    };
+    let mut scratch = Vec::new();
+
+    candidate.step(&mut scratch).await;
+    candidate.owner.tick_long_term_rewrites().await;
+    assert_eq!(consensus(&candidate), (false, true));
+    assert!(!paced(&candidate.owner, namespace()), "a backup");
+
+    // Each one misses the heartbeats of the primary and votes to leave its
+    // view.
+    for (replica, peer) in [(&candidate, HEADLESS_BACKUP), (&backup, HEADLESS_CANDIDATE)] {
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if replica.sent_to(peer, Command::StartViewChange, NEXT_VIEW) {
+                break;
+            }
+            assert!(replica.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+    }
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+        .await;
+    candidate.step(&mut scratch).await;
+    assert_eq!(consensus(&candidate), (true, false));
+    assert!(
+        !paced(&candidate.owner, namespace()),
+        "its view has not started"
+    );
+
+    backup
+        .owner
+        .on_message(candidate.take(HEADLESS_BACKUP, Command::StartViewChange))
+        .await;
+    stepped(&backup, "its view change", || {
+        backup.sent_to(HEADLESS_CANDIDATE, Command::DoViewChange, NEXT_VIEW)
+    })
+    .await;
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::DoViewChange))
+        .await;
+    stepped(&candidate, "its view", || {
+        consensus(&candidate) == (true, true)
+    })
+    .await;
+    candidate.step(&mut scratch).await;
+
+    assert!(paced(&candidate.owner, namespace()));
+    compio::time::sleep(REWRITE_INTERVAL_START).await;
+    candidate.owner.tick_long_term_rewrites().await;
+    assert!(
+        candidate.partition(namespace()).segment_rewrite_running(),
+        "its first pass started a rewrite"
+    );
+
+    backup
+        .owner
+        .on_message(candidate.take(HEADLESS_BACKUP, Command::StartView))
+        .await;
+    stepped(&backup, "the new view", || {
+        consensus(&backup) == (false, true)
+    })
+    .await;
+    backup.step(&mut scratch).await;
+    assert!(!paced(&backup.owner, namespace()));
+    compio::time::sleep(REWRITE_INTERVAL_START).await;
+    backup.owner.tick_long_term_rewrites().await;
+    assert!(!backup.partition(namespace()).segment_rewrite_running());
+}
+
+/// A shard gets its writer after its node proved the store is its own. A
+/// partition that committed before then sleeps, so no tick visits it: the
+/// shard looks over all its partitions once. A tombstoned one is left out.
+#[compio::test]
+async fn given_a_primary_that_committed_without_a_writer_when_the_shard_gets_one_should_start_its_passes()
+ {
+    use crate::rewrite_pacing::REWRITE_INTERVAL_START;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    owner.set_fresh_uploader(Some(TestUploader::new()));
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+    })
+    .await;
+    let partitions = owner.plane.partitions();
+    let mut scratch = Vec::new();
+    assert!(owner.tick_partitions(&mut scratch).await.is_none());
+    assert!(!paced(&owner, namespace()), "the shard cannot rewrite");
+
+    partitions.tombstone(namespace());
+    owner.set_long_term_writer(Some(Rc::new(HeldWriter)));
+    assert!(owner.tick_partitions(&mut scratch).await.is_none());
+    owner.tick_long_term_rewrites().await;
+    partitions.untombstone(&namespace());
+    assert!(!paced(&owner, namespace()), "tombstoned");
+
+    owner.set_long_term_writer(Some(Rc::new(HeldWriter)));
+    owner.tick_long_term_rewrites().await;
+
+    assert!(paced(&owner, namespace()));
+    compio::time::sleep(REWRITE_INTERVAL_START).await;
+    owner.tick_long_term_rewrites().await;
+    let partition = partitions.get_by_ns(&namespace()).unwrap();
+    assert!(partition.segment_rewrite_running());
 }
 
 /// A reader of the bucket finds a long-term segment through the manifest,
