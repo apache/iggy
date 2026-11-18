@@ -427,6 +427,7 @@ mod tests {
     use super::super::tiered_storage::TieredStorageBackend;
     use super::*;
     use figment::Figment;
+    use iggy_common::IggyByteSize;
 
     /// The embedded default TOML deserializes into a fully populated
     /// [`ServerConfig`] and passes validation. Exercises the
@@ -484,6 +485,62 @@ mod tests {
         unsafe { env::remove_var(NAME) };
         let cfg = cfg.expect("config with the env override deserializes");
         assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
+    }
+
+    /// The config file documents `retention = "0"` as turning deletion by age
+    /// off, so the same text from the environment has to load the same way.
+    #[test]
+    #[serial_test::serial]
+    fn given_a_bare_zero_for_a_duration_env_var_when_loading_should_read_zero() {
+        let cfg = load_with_env_vars(&[("IGGY_LOGGING_RETENTION", "0")])
+            .expect("config with a bare 0 duration from the environment deserializes");
+
+        assert!(cfg.logging.retention.is_zero());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_bare_byte_count_for_a_size_env_var_when_loading_should_read_bytes() {
+        let cfg = load_with_env_vars(&[("IGGY_WEBSOCKET_READ_BUFFER_SIZE", "131072")])
+            .expect("config with a bare byte count from the environment deserializes");
+
+        assert_eq!(
+            cfg.websocket.read_buffer_size,
+            Some(IggyByteSize::from(131_072_u64))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_number_for_a_string_env_var_when_loading_should_keep_the_text() {
+        let cfg = load_with_env_vars(&[("IGGY_CLUSTER_NAME", "2026")])
+            .expect("config with a numeric cluster name from the environment deserializes");
+
+        assert_eq!(cfg.cluster.name, "2026");
+    }
+
+    /// Loads the embedded config with `vars` set. Callers must be
+    /// `serial_test::serial`.
+    fn load_with_env_vars(vars: &[(&str, &str)]) -> Result<ServerConfig, Box<figment::Error>> {
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(name), "{name}");
+            // SAFETY: `serial_test::serial` on every caller keeps other tests
+            // off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract()
+            .map_err(Box::new);
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        cfg
     }
 
     /// The shipped file, like every file written before tiered storage, has

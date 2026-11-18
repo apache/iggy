@@ -16,9 +16,10 @@
 // under the License.
 
 use darling::{FromDeriveInput, FromField, FromVariant};
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
-use syn::{DeriveInput, Generics, Ident, Type};
+use proc_macro2::{TokenStream as TokenStream2, TokenTree};
+use quote::{ToTokens, format_ident, quote};
+use syn::ext::IdentExt;
+use syn::{Attribute, DeriveInput, Generics, Ident, LitStr, Token, Type};
 
 /// Default number of array elements to generate env var mappings for.
 ///
@@ -70,10 +71,12 @@ struct VariantOpts {
 
 /// Field-level attributes for `#[config_env(...)]`
 #[derive(Debug, FromField)]
-#[darling(attributes(config_env))]
+#[darling(attributes(config_env), forward_attrs(serde_as))]
 struct FieldOpts {
     ident: Option<Ident>,
     ty: Type,
+    /// The field's `#[serde_as(...)]` attributes.
+    attrs: Vec<Attribute>,
 
     /// Explicit env var segment name (overrides field name conversion)
     #[darling(default)]
@@ -105,7 +108,27 @@ struct EnvMapping {
     /// Relative config path (e.g., "enabled" not "http.enabled")
     config_path: String,
     is_secret: bool,
+    value_kind: ValueKind,
     builder_method_name: Ident,
+}
+
+/// Mirrors `configs::EnvValueKind`.
+#[derive(Debug, Clone, Copy)]
+enum ValueKind {
+    Inferred,
+    Text,
+    TextArray,
+}
+
+impl ToTokens for ValueKind {
+    fn to_tokens(&self, tokens: &mut TokenStream2) {
+        let variant = match self {
+            Self::Inferred => format_ident!("Inferred"),
+            Self::Text => format_ident!("Text"),
+            Self::TextArray => format_ident!("TextArray"),
+        };
+        tokens.extend(quote! { configs::EnvValueKind::#variant });
+    }
 }
 
 /// Information about a nested field for mapping collection
@@ -208,6 +231,7 @@ fn generate_enum_impl(
                 config_path: #tag_name,
                 is_secret: false,
                 max_elements: &[],
+                value_kind: configs::EnvValueKind::Inferred,
             });
         }
     });
@@ -266,12 +290,14 @@ fn generate_struct_impl(
         let env_name = format!("{}{}", prefix_str, mapping.env_suffix);
         let config_path = &mapping.config_path;
         let is_secret = mapping.is_secret;
+        let value_kind = mapping.value_kind;
         quote! {
             configs::EnvVarTemplate {
                 env_name: #env_name,
                 config_path: #config_path,
                 is_secret: #is_secret,
                 max_elements: &[],
+                value_kind: #value_kind,
             }
         }
     });
@@ -308,6 +334,7 @@ fn generate_struct_impl(
                     config_path,
                     is_secret: template.is_secret,
                     max_elements,
+                    value_kind: template.value_kind,
                 });
             }
         }
@@ -499,6 +526,7 @@ fn collect_mappings(fields: &[FieldOpts]) -> (Vec<EnvMapping>, Vec<NestedFieldIn
                 env_suffix,
                 config_path: field_name,
                 is_secret: field.secret,
+                value_kind: leaf_value_kind(&field.attrs, &inner_type, is_vec),
                 builder_method_name,
             });
         } else {
@@ -551,4 +579,60 @@ fn generate_builder_methods(mappings: &[EnvMapping], prefix: &str) -> Vec<TokenS
             }
         })
         .collect()
+}
+
+/// A leaf that deserializes only from a string fails on a number or a bool,
+/// so its variable keeps the text instead of a guessed type. Every other leaf
+/// keeps the guess: its type may take a number, as an enum does for a
+/// variant index.
+fn leaf_value_kind(serde_as_attrs: &[Attribute], inner_type: &Type, is_vec: bool) -> ValueKind {
+    if !is_string_type(inner_type) && !deserializes_from_str(serde_as_attrs) {
+        return ValueKind::Inferred;
+    }
+    if is_vec {
+        ValueKind::TextArray
+    } else {
+        ValueKind::Text
+    }
+}
+
+fn is_string_type(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "String")
+}
+
+/// Whether `#[serde_as(as = "...")]` reads the field through `DisplayFromStr`,
+/// which accepts only a string.
+fn deserializes_from_str(serde_as_attrs: &[Attribute]) -> bool {
+    let mut found = false;
+    for attr in serde_as_attrs {
+        // A malformed attribute is reported by `serde_as` itself.
+        let _ = attr.parse_nested_meta(|meta| {
+            if !meta.input.peek(Token![=]) {
+                return Ok(());
+            }
+            let adapter: LitStr = meta.value()?.parse()?;
+            // `serde_as` runs first and turns the `as` keyword into `r#as`.
+            let key = meta.path.get_ident().map(IdentExt::unraw);
+            if key.is_some_and(|key| key == "as" || key == "deserialize_as") {
+                found |= mentions_ident(adapter.parse()?, "DisplayFromStr");
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+fn mentions_ident(tokens: TokenStream2, ident: &str) -> bool {
+    tokens.into_iter().any(|token| match token {
+        TokenTree::Ident(found) => found == ident,
+        TokenTree::Group(group) => mentions_ident(group.stream(), ident),
+        _ => false,
+    })
 }

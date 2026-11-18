@@ -17,16 +17,31 @@
 
 //! Environment variable value parsing utilities.
 
+use super::env_mapping::EnvValueKind;
 use figment::value::Value as FigmentValue;
 
-/// Parse an environment variable value into a FigmentValue with type inference.
-pub(crate) fn parse_env_value(value: &str) -> FigmentValue {
-    // Handle array syntax [a, b, c]
-    if value.starts_with('[') && value.ends_with(']') {
-        let inner = value.trim_start_matches('[').trim_end_matches(']');
-        let elements: Vec<FigmentValue> = split_array_elements(inner)
+/// Parse an environment variable value into a FigmentValue of the given kind.
+pub(crate) fn parse_env_value(value: &str, kind: EnvValueKind) -> FigmentValue {
+    match kind {
+        EnvValueKind::Inferred => infer_env_value(value),
+        EnvValueKind::Text => FigmentValue::from(value),
+        EnvValueKind::TextArray => match array_elements(value) {
+            Some(elements) => FigmentValue::from(
+                elements
+                    .into_iter()
+                    .map(|element| FigmentValue::from(strip_quotes(element)))
+                    .collect::<Vec<_>>(),
+            ),
+            None => FigmentValue::from(value),
+        },
+    }
+}
+
+fn infer_env_value(value: &str) -> FigmentValue {
+    if let Some(elements) = array_elements(value) {
+        let elements: Vec<FigmentValue> = elements
             .into_iter()
-            .map(|s| parse_env_value(strip_quotes(s)))
+            .map(|s| infer_env_value(strip_quotes(s)))
             .collect();
         return FigmentValue::from(elements);
     }
@@ -83,6 +98,15 @@ pub fn parse_env_value_to_json(value: &str) -> serde_json::Value {
     }
 
     serde_json::Value::String(value.to_owned())
+}
+
+/// The elements of `[a, b, c]` array syntax, or `None` for any other text.
+fn array_elements(value: &str) -> Option<Vec<&str>> {
+    if !(value.starts_with('[') && value.ends_with(']')) {
+        return None;
+    }
+    let inner = value.trim_start_matches('[').trim_end_matches(']');
+    Some(split_array_elements(inner))
 }
 
 pub(crate) fn split_array_elements(s: &str) -> Vec<&str> {

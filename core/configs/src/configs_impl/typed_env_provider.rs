@@ -196,7 +196,7 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
                 env_name, display_value
             );
 
-            let parsed_value = parse_env_value(&env_value);
+            let parsed_value = parse_env_value(&env_value, mapping.value_kind);
             Self::insert_at_path(&mut root_dict, mapping.config_path, parsed_value);
         }
 
@@ -466,6 +466,21 @@ mod tests {
         flag: bool,
     }
 
+    const VALUES_PREFIX: &str = "IGGY_ENV_VALUES_TEST_";
+
+    #[derive(Debug, Default, Deserialize, ConfigEnv)]
+    #[config_env(prefix = "IGGY_ENV_VALUES_TEST_")]
+    #[serde(default)]
+    struct ValuesConfig {
+        count: u32,
+        offset: i64,
+        ratio: f64,
+        enabled: bool,
+        ports: Vec<u16>,
+        hosts: Vec<String>,
+        label: String,
+    }
+
     #[test]
     fn levenshtein_distance_identical_strings() {
         assert_eq!(
@@ -621,6 +636,100 @@ mod tests {
         } else {
             panic!("count should be u64");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_number_for_a_numeric_field_when_loading_should_read_the_number() {
+        let config = extract_values(&[("COUNT", "42")]).expect("a number loads into u32");
+
+        assert_eq!(config.count, 42);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_negative_number_for_a_signed_field_when_loading_should_read_it() {
+        let config = extract_values(&[("OFFSET", "-7")]).expect("a negative number loads into i64");
+
+        assert_eq!(config.offset, -7);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_float_for_a_float_field_when_loading_should_read_it() {
+        let config = extract_values(&[("RATIO", "0.25")]).expect("a float loads into f64");
+
+        assert_eq!(config.ratio, 0.25);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_boolean_in_any_case_when_loading_should_read_the_bool() {
+        let config = extract_values(&[("ENABLED", "TRUE")]).expect("a bool loads into bool");
+        assert!(config.enabled);
+
+        let config = extract_values(&[("ENABLED", "false")]).expect("a bool loads into bool");
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_arrays_when_loading_should_read_each_element() {
+        let config = extract_values(&[("PORTS", "[8090, 8091]"), ("HOSTS", r#"["a, b", c]"#)])
+            .expect("arrays load into Vec fields");
+
+        assert_eq!(config.ports, vec![8090, 8091]);
+        assert_eq!(config.hosts, vec!["a, b", "c"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_numbers_and_bools_in_a_string_array_when_loading_should_keep_the_text() {
+        let config = extract_values(&[("HOSTS", r#"[2026, "7", true]"#)])
+            .expect("numeric-looking elements load into Vec<String>");
+
+        assert_eq!(config.hosts, vec!["2026", "7", "true"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_number_for_a_string_field_when_loading_should_keep_the_text() {
+        let config = extract_values(&[("LABEL", "0042")]).expect("a number loads into String");
+
+        assert_eq!(config.label, "0042");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_brackets_around_a_string_field_when_loading_should_keep_the_text() {
+        let config = extract_values(&[("LABEL", "[::1]")]).expect("brackets load into String");
+
+        assert_eq!(config.label, "[::1]");
+    }
+
+    /// Extracts [`ValuesConfig`] with each `(suffix, value)` set under
+    /// [`VALUES_PREFIX`]. Callers must be `serial_test::serial`.
+    fn extract_values(vars: &[(&str, &str)]) -> Result<ValuesConfig, Box<figment::Error>> {
+        let names: Vec<String> = vars
+            .iter()
+            .map(|(suffix, _)| format!("{VALUES_PREFIX}{suffix}"))
+            .collect();
+        for (name, (_, value)) in names.iter().zip(vars) {
+            // SAFETY: `serial_test::serial` on every caller keeps other tests
+            // off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let config = figment::Figment::new()
+            .merge(TypedEnvProvider::<ValuesConfig>::from_config(VALUES_PREFIX))
+            .extract()
+            .map_err(Box::new);
+
+        for name in &names {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        config
     }
 
     /// Only the connectors runtime in apache/iggy-connectors calls
