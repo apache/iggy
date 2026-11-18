@@ -31,11 +31,19 @@
 //! The pass for them starts when the segment's command commits, since a
 //! rewrite continues where the long-term log ends.
 //!
+//! Nothing ties the sends to a partition to its rewrites, so producers that
+//! outrun them grow its backlog: the bytes it committed that no long-term
+//! segment holds, and the fresh objects that hold them. Past a limit, the
+//! shard delays each send to that partition by [`backlog_delay`], and its
+//! next pass starts at once.
+//!
 //! Every decision takes the time it is made at, so nothing here reads a
 //! clock.
 
 use server_common::sharding::IggyNamespace;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 /// The shortest wait between two rewrites of one partition.
@@ -62,9 +70,52 @@ pub const REWRITE_SPEEDUP_PERMILLE: u64 = 900;
 /// small segment in a burst does not let the long-term log fall behind.
 pub const REWRITE_SLOWDOWN_PERMILLE: u64 = 400;
 
+/// The backlog of a partition past which a shard that was given no limit
+/// delays the sends to it, in bytes of messages it committed that no
+/// long-term segment holds.
+pub const LONG_TERM_BACKLOG_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// How long a send waits just past the backlog limit.
+pub const BACKLOG_DELAY_MIN: Duration = Duration::from_millis(10);
+
+/// How long a send waits at most, from twice the backlog limit on. Long
+/// enough to slow a producer that waits for each answer, and far below the
+/// time after which a client gives a request up.
+pub const BACKLOG_DELAY_MAX: Duration = Duration::from_millis(250);
+
+/// How long a send to a partition with `backlog` bytes to rewrite waits
+/// before the shard takes it, when sends are delayed past `limit`.
+///
+/// From [`BACKLOG_DELAY_MIN`] just past the limit, growing with the bytes
+/// past it, to [`BACKLOG_DELAY_MAX`] at twice the limit. `None` at or below
+/// the limit, and for a limit of zero, which turns the delay off.
+#[must_use]
+pub fn backlog_delay(backlog: u64, limit: u64) -> Option<Duration> {
+    if limit == 0 || backlog <= limit {
+        return None;
+    }
+    let past = u128::from((backlog - limit).min(limit));
+    let (min, max) = (BACKLOG_DELAY_MIN.as_micros(), BACKLOG_DELAY_MAX.as_micros());
+    let delay = min + (max - min) * past / u128::from(limit);
+    Some(Duration::from_micros(
+        u64::try_from(delay).unwrap_or(u64::MAX),
+    ))
+}
+
 /// A partition incarnation: slab ids are reused after a delete, so the
 /// namespace alone can name a later partition.
 pub type RewriteKey = (IggyNamespace, u64);
+
+/// What a walk of a partition's log counted of its backlog, for the
+/// pump's next tick to hand to the partition.
+#[derive(Debug)]
+pub struct BacklogCount {
+    pub key: RewriteKey,
+    /// The number the partition gave the walk.
+    pub walk: u64,
+    /// The bytes, `None` when the walk could not read the log.
+    pub bytes: Option<u64>,
+}
 
 /// What a rewrite pass over a partition ended as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,12 +148,31 @@ struct Pace {
     /// Whether the next pass waits for the command of a stored segment that
     /// left committed messages behind.
     awaits_commit: bool,
+    /// When the last pass was settled, in the caller's microseconds.
+    settled_at: u64,
+    /// Whether the last pass failed.
+    failed: bool,
 }
 
 /// The waits of the partitions of one shard.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RewritePacing {
     partitions: HashMap<RewriteKey, Pace>,
+    /// The backlog past which the sends to a partition are delayed, zero
+    /// when they are not.
+    backlog_limit: u64,
+    /// Counts of backlogs that walks handed back since the last tick.
+    backlog_counts: Rc<RefCell<Vec<BacklogCount>>>,
+}
+
+impl Default for RewritePacing {
+    fn default() -> Self {
+        Self {
+            partitions: HashMap::new(),
+            backlog_limit: LONG_TERM_BACKLOG_LIMIT,
+            backlog_counts: Rc::default(),
+        }
+    }
 }
 
 fn micros(duration: Duration) -> u64 {
@@ -170,6 +240,8 @@ impl RewritePacing {
     /// command that got lost.
     pub fn settle(&mut self, key: RewriteKey, result: RewriteResult, now: u64) {
         let pace = self.pace(key);
+        pace.settled_at = now;
+        pace.failed = result == RewriteResult::Unchanged;
         let wait = match result {
             RewriteResult::Stored {
                 bytes,
@@ -206,6 +278,47 @@ impl RewritePacing {
         {
             pace.due_at = Some(now);
         }
+    }
+
+    /// The backlog of `key` is past the limit at `now`: its next pass is
+    /// due at once, and no sooner than [`REWRITE_INTERVAL_MIN`] after the
+    /// last one. A pass that runs, waits for a command, or follows one that
+    /// failed keeps its time, so a store that refuses is not asked in a
+    /// loop.
+    pub fn hurry(&mut self, key: &RewriteKey, now: u64) {
+        if let Some(pace) = self.partitions.get_mut(key)
+            && !pace.awaits_commit
+            && !pace.failed
+            && let Some(due_at) = pace.due_at
+        {
+            let soonest = pace.settled_at.saturating_add(micros(REWRITE_INTERVAL_MIN));
+            pace.due_at = Some(due_at.min(now.max(soonest)));
+        }
+    }
+
+    /// Set the backlog past which the sends to a partition are delayed.
+    /// Zero turns the delay off.
+    pub const fn set_backlog_limit(&mut self, bytes: u64) {
+        self.backlog_limit = bytes;
+    }
+
+    /// See [`Self::set_backlog_limit`].
+    #[must_use]
+    pub const fn backlog_limit(&self) -> u64 {
+        self.backlog_limit
+    }
+
+    /// Where a walk of a partition's log leaves its count, from a task
+    /// apart from the pump.
+    #[must_use]
+    pub fn backlog_counts(&self) -> Rc<RefCell<Vec<BacklogCount>>> {
+        Rc::clone(&self.backlog_counts)
+    }
+
+    /// The counts the walks left since the last call.
+    #[must_use]
+    pub fn take_backlog_counts(&self) -> Vec<BacklogCount> {
+        std::mem::take(&mut *self.backlog_counts.borrow_mut())
     }
 
     /// The partitions that have a wait here.
@@ -249,6 +362,8 @@ impl RewritePacing {
             due_at: None,
             lag: 0,
             awaits_commit: false,
+            settled_at: 0,
+            failed: false,
         })
     }
 }
@@ -511,6 +626,93 @@ mod tests {
 
         assert_eq!(pacing.take_due(5_999_999), []);
         assert_eq!(pacing.take_due(6_000_000), [key()]);
+    }
+
+    #[test]
+    fn given_a_backlog_at_or_below_the_limit_or_no_limit_when_delaying_a_send_should_not_delay_it()
+    {
+        assert_eq!(backlog_delay(0, 1_000), None);
+        assert_eq!(backlog_delay(1_000, 1_000), None);
+        assert_eq!(backlog_delay(u64::MAX, 0), None, "zero turns the delay off");
+    }
+
+    #[test]
+    fn given_a_backlog_past_the_limit_when_delaying_a_send_should_grow_with_it_up_to_the_most() {
+        let limit = 1_000_000;
+
+        let delays: Vec<_> = (1..=40)
+            .map(|step| backlog_delay(limit + step * limit / 20, limit).unwrap())
+            .collect();
+
+        assert_eq!(backlog_delay(limit + 1, limit), Some(BACKLOG_DELAY_MIN));
+        assert_eq!(
+            backlog_delay(limit + limit / 2, limit),
+            Some(Duration::from_millis(130))
+        );
+        assert!(delays.is_sorted());
+        assert_eq!(delays[19], BACKLOG_DELAY_MAX, "twice the limit");
+        assert!(delays[20..].iter().all(|delay| *delay == BACKLOG_DELAY_MAX));
+        assert_eq!(backlog_delay(u64::MAX, limit), Some(BACKLOG_DELAY_MAX));
+        assert_eq!(
+            backlog_delay(u64::MAX, u64::MAX - 1),
+            Some(BACKLOG_DELAY_MIN)
+        );
+    }
+
+    #[test]
+    fn given_a_backlog_past_the_limit_when_its_partition_waits_out_its_interval_should_make_the_pass_due_at_once()
+     {
+        let mut pacing = RewritePacing::default();
+        pacing.settle(key(), stored(1), 1_000);
+        assert_eq!(pacing.interval(&key()), Some(REWRITE_INTERVAL_MAX));
+        assert_eq!(pacing.take_due(2_000_000), []);
+
+        pacing.hurry(&key(), 2_000_000);
+
+        assert_eq!(pacing.take_due(2_000_000), [key()]);
+    }
+
+    #[test]
+    fn given_a_pass_that_settled_a_moment_ago_when_hurried_should_wait_the_shortest_interval() {
+        let mut pacing = RewritePacing::default();
+        let soonest = 1_000 + micros(REWRITE_INTERVAL_MIN);
+        pacing.settle(key(), stored(1), 1_000);
+
+        pacing.hurry(&key(), 2_000);
+
+        assert_eq!(pacing.take_due(soonest - 1), []);
+        assert_eq!(pacing.take_due(soonest), [key()]);
+    }
+
+    #[test]
+    fn given_a_failed_pass_or_one_that_waits_for_its_command_or_runs_when_hurried_should_keep_its_time()
+     {
+        let other = (IggyNamespace::new(1, 1, 1), 7);
+        let running = (IggyNamespace::new(1, 1, 2), 7);
+        let mut pacing = RewritePacing::default();
+        pacing.settle(key(), RewriteResult::Unchanged, 0);
+        pacing.settle(other, cut_at_the_cap(), 0);
+        pacing.started(running, 10);
+        let now = 2 * micros(REWRITE_INTERVAL_MIN);
+
+        for key in [key(), other, running] {
+            pacing.hurry(&key, now);
+        }
+
+        assert_eq!(pacing.take_due(now), []);
+        let unpaced = (IggyNamespace::new(1, 1, 3), 7);
+        pacing.hurry(&unpaced, now);
+        assert!(!pacing.paces(&unpaced));
+    }
+
+    #[test]
+    fn given_no_limit_set_when_asking_for_it_should_give_the_default() {
+        let mut pacing = RewritePacing::default();
+        assert_eq!(pacing.backlog_limit(), LONG_TERM_BACKLOG_LIMIT);
+
+        pacing.set_backlog_limit(0);
+
+        assert_eq!(pacing.backlog_limit(), 0);
     }
 
     #[test]

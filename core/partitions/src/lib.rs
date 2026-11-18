@@ -97,8 +97,8 @@ pub use long_term_merge::{
 };
 mod long_term_rewrite;
 pub use long_term_rewrite::{
-    ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError, RewriteOutcome,
-    SegmentRewrite,
+    BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError,
+    RewriteOutcome, SegmentRewrite,
 };
 pub use topic_object::{
     ExecutorTopicObjects, TOPIC_OBJECT_RETRY, TopicObjectOutcome, TopicObjects, delete_topic,

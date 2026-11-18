@@ -1452,6 +1452,7 @@ mod tests {
             b"IGGY-DURABLE-SESSIONS-3\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
             b"IGGY-METADATA-CHANGE-LOG-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-2\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();
@@ -1513,6 +1514,7 @@ mod tests {
             b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
             b"IGGY-METADATA-CHANGE-LOG-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-2\n",
         ] {
             assert_ne!(
                 message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),

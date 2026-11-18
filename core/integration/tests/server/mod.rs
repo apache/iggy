@@ -52,7 +52,7 @@ mod geo_peers;
 // every client write, goes stale with the peer's store, and leaves after its
 // delete.
 mod geo_shadow_fs;
-mod tiered_storage_fs;
+pub(crate) mod tiered_storage_fs;
 mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.
 mod topic_metrics_vsr;

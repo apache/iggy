@@ -511,10 +511,13 @@ Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
 It lists the segments that the store holds, with their offsets, timestamps,
 sizes and checksums, so a reader that has only the bucket can read the
-partition. The partition's primary writes it on each run of the message
-cleaner, when a segment was uploaded or removed since the last one. The
-cluster never reads its own manifests back. The objects of a removed segment
-are deleted only once the manifest no longer lists it.
+partition. Such a reader takes only the segments that the manifest lists. Any
+other object under the partition's prefix can belong to an upload that never
+committed, or to a segment that retention removed. The partition's primary
+writes it on each run of the message cleaner, when a segment was uploaded or
+removed since the last one. The cluster never reads its own manifests back.
+The objects of a removed segment are deleted only once the manifest no longer
+lists it.
 
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With

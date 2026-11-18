@@ -238,6 +238,7 @@ where
             .flatten();
         let long_term_before = self.long_term_progress();
         let long_term_at_stake = self.long_term_segments_at_stake(command);
+        let long_term_floor = self.long_term_floor();
         match self.state_machines.apply(header.op, command) {
             Ok(Applied::Changed) => {
                 if let Some(advance) = advance {
@@ -245,6 +246,7 @@ where
                 }
                 self.note_long_term_command(long_term_before);
                 self.queue_dead_long_term_objects(&long_term_at_stake);
+                self.note_long_term_advance(long_term_floor);
                 true
             }
             Ok(Applied::Refused) => {
@@ -318,6 +320,8 @@ where
         snapshot: Option<&StateMachineSnapshot>,
         op: u64,
     ) -> Result<(), StateMachineError> {
+        // The long-term floor and the log under it may both change here.
+        self.long_term_backlog.forget();
         let Some(snapshot) = snapshot else {
             self.state_machines.reset();
             self.state_machines.advance_applied(op);

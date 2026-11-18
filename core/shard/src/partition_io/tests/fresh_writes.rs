@@ -18,9 +18,10 @@
 //! The upload-first produce path on a shard that hosts a primary which
 //! places its batches.
 
-use super::segment_uploads::{namespace, pumped, until};
+use super::segment_uploads::{namespace, pumped, staged_revision, until};
 use super::*;
 use crate::fresh_writes::{FRESH_PARTITION_PENDING_BYTES_MAX, FRESH_UPLOAD_DEADLINE};
+use crate::rewrite_pacing::{BACKLOG_DELAY_MAX, LONG_TERM_BACKLOG_LIMIT};
 use crate::{FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX};
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
@@ -3151,4 +3152,233 @@ async fn given_a_merge_that_commits_when_its_sources_are_deleted_should_report_t
         1,
         "the merged segment is the one long-term log left"
     );
+}
+
+/// Starts every rewrite and ends none, so the long-term floor stays where
+/// it is and the backlog only grows.
+struct HeldWriter;
+
+impl partitions::LongTermWriter for HeldWriter {
+    fn write(
+        &self,
+        _rewrite: partitions::SegmentRewrite,
+        _scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, partitions::RewriteOutcome> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// [`placing_owner`] with an uploader and a rewrite that never ends, whose
+/// sends wait past a backlog of `limit` bytes.
+#[allow(clippy::future_not_send)]
+async fn backlog_owner(directory: &Path, limit: u64) -> IoTestShard {
+    let owner = Box::pin(placing_owner(directory)).await;
+    owner.set_fresh_uploader(Some(TestUploader::new()));
+    owner.set_long_term_writer(Some(Rc::new(HeldWriter)));
+    owner.set_long_term_backlog_limit(limit);
+    owner
+}
+
+/// The backlog `partition` counted, if it did.
+fn backlog_of(owner: &IoTestShard, partition: IggyNamespace) -> Option<u64> {
+    owner
+        .plane
+        .partitions()
+        .get_by_ns(&partition)
+        .unwrap()
+        .long_term_backlog()
+}
+
+fn delayed_sends(owner: &IoTestShard) -> u64 {
+    owner.metrics().long_term_backlog_value().1
+}
+
+/// Commit a send to [`namespace`], and have a pass count the partition's
+/// backlog, which is then the bytes of that send.
+#[allow(clippy::future_not_send)]
+async fn commit_and_count_a_backlog(owner: &IoTestShard) -> u64 {
+    let _first = submit_send(owner, 1, 100);
+    until(owner, |owner| committed_sends(owner) == 1).await;
+    owner.request_rewrite_segments(namespace(), staged_revision(owner));
+    until(owner, |owner| backlog_of(owner, namespace()).is_some()).await;
+    backlog_of(owner, namespace()).unwrap()
+}
+
+/// Past the limit, each send to the partition waits the longest delay
+/// before the shard takes it, and a later send waits behind it even once
+/// the limit is off. A partition below the limit is not slowed.
+#[compio::test]
+async fn given_a_backlog_past_the_limit_when_sends_arrive_should_delay_the_sends_to_that_partition_only()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(backlog_owner(directory.path(), 1)).await;
+    let other = place_other_partition(&owner);
+    let other_revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&other)
+        .unwrap()
+        .created_revision();
+
+    let (backlog, waited) = pumped(&owner, async {
+        let backlog = commit_and_count_a_backlog(&owner).await;
+        owner.request_rewrite_segments(other, other_revision);
+        until(&owner, |owner| backlog_of(owner, other) == Some(0)).await;
+        until(&owner, |owner| {
+            owner.metrics().long_term_backlog_value().0 == i64::try_from(backlog).unwrap()
+        })
+        .await;
+
+        let sent = owner.bus.monotonic_micros();
+        let _held = submit_send(&owner, 2, 100);
+        until(&owner, |owner| delayed_sends(owner) == 1).await;
+        assert_eq!(committed_sends(&owner), 1, "held, not taken");
+        let due_in = owner
+            .fresh_uploads_deadline()
+            .unwrap()
+            .saturating_sub(owner.bus.monotonic_micros());
+        assert!(
+            Duration::from_micros(due_in) <= BACKLOG_DELAY_MAX,
+            "the delay is capped: {due_in}"
+        );
+        owner.set_long_term_backlog_limit(0);
+        let _behind = submit_send(&owner, 3, 300);
+        until(&owner, |owner| {
+            delayed_sends(owner) == 2 || committed_sends(owner) > 1
+        })
+        .await;
+        owner.set_long_term_backlog_limit(1);
+        let _other = submit_send_to(&owner, other, 4, 100);
+        until(&owner, |owner| committed(owner, other) == 1).await;
+        until(&owner, |owner| committed_sends(owner) == 3).await;
+        (
+            backlog,
+            Duration::from_micros(owner.bus.monotonic_micros() - sent),
+        )
+    })
+    .await;
+
+    assert!(backlog > 1);
+    assert_eq!(
+        delayed_sends(&owner),
+        2,
+        "the held send and the one behind it"
+    );
+    assert!(waited >= BACKLOG_DELAY_MAX, "{waited:?}");
+    let placed = stored_placed_batches(directory.path());
+    assert_eq!(placed.len(), 3);
+    assert!(
+        placed[1].placement.length < placed[2].placement.length,
+        "the held send committed before the one behind it"
+    );
+}
+
+/// Below the limit, or with no limit, a send is taken at once, however
+/// large the backlog.
+#[compio::test]
+async fn given_a_backlog_below_the_limit_or_no_limit_when_a_send_arrives_should_take_it_at_once() {
+    for limit in [LONG_TERM_BACKLOG_LIMIT, 0] {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = Box::pin(backlog_owner(directory.path(), limit)).await;
+
+        pumped(&owner, async {
+            let backlog = commit_and_count_a_backlog(&owner).await;
+            assert!(backlog > 0);
+            let _second = submit_send(&owner, 2, 100);
+            until(&owner, |owner| committed_sends(owner) == 2).await;
+        })
+        .await;
+
+        assert_eq!(delayed_sends(&owner), 0, "limit {limit}");
+    }
+}
+
+/// A held send counts in neither the share of its partition nor the cap of
+/// the shard while it waits, so sends held together are not turned away
+/// for the room they would take. The shard checks it against both when it
+/// takes it, as it checks a send that has just arrived.
+#[compio::test]
+async fn given_sends_held_for_the_backlog_when_they_wait_should_count_in_neither_the_share_nor_the_cap()
+ {
+    let send_bytes = usize::try_from(FRESH_PARTITION_PENDING_BYTES_MAX / 2).unwrap() - 64 * 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(backlog_owner(directory.path(), 1)).await;
+
+    pumped(&owner, async {
+        commit_and_count_a_backlog(&owner).await;
+        let mut held = Vec::new();
+        for request in 2..=4 {
+            held.push(submit_send_when_room(&owner, request, send_bytes).await);
+        }
+        until(&owner, |owner| delayed_sends(owner) == 3).await;
+
+        assert_eq!(owner.fresh_pending_bytes(namespace()), (0, 0));
+        assert!(held.iter().all(|answer| answer.is_empty()));
+        assert_eq!(owner.metrics().fresh_load_value().1, 0, "none denied");
+        assert_eq!(owner.metrics().fresh_cap_denials_value(), (0, 0));
+
+        until(&owner, |owner| committed_sends(owner) >= 2).await;
+    })
+    .await;
+}
+
+/// A small segment lengthens the wait between passes to its longest. Once
+/// the backlog is past the limit, the next pass runs without waiting it out.
+#[compio::test]
+async fn given_a_backlog_past_the_limit_when_the_partition_waits_out_its_interval_should_rewrite_it_at_once()
+ {
+    use super::object_deletes::Shared;
+    use crate::rewrite_pacing::REWRITE_INTERVAL_MAX;
+    use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(executor.clone())),
+            layout(),
+        )));
+    owner.set_long_term_backlog_limit(1);
+    let revision = staged_revision(&owner);
+    let floor = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+    };
+
+    let rewritten_in = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| floor(owner) == Some(0)).await;
+        assert_eq!(
+            owner
+                .rewrite_pacing
+                .borrow()
+                .interval(&(namespace(), revision)),
+            Some(REWRITE_INTERVAL_MAX)
+        );
+
+        let sent = std::time::Instant::now();
+        let _second = submit_send(&owner, 2, 100);
+        until(&owner, |owner| floor(owner) == Some(1)).await;
+        sent.elapsed()
+    })
+    .await;
+
+    assert!(rewritten_in < REWRITE_INTERVAL_MAX / 4, "{rewritten_in:?}");
 }
