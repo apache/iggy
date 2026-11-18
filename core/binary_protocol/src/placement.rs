@@ -93,7 +93,8 @@ pub struct Placement {
     /// XXH3 of the blob.
     pub blob_checksum: u64,
     /// Every committed batch of the partition whose base offset is below
-    /// this one has a proof in a fresh object that the store holds. So a
+    /// this one has a proof in a fresh object that the store holds, or is
+    /// held by a long-term segment that the partition committed. So a
     /// replica that becomes primary resumes proving from here without
     /// reading the store. Zero claims nothing.
     pub proven_below: u64,

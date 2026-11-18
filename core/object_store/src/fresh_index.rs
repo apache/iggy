@@ -197,7 +197,8 @@ pub struct FreshDirectoryRow {
     /// where a batch committed.
     pub claimed_first_offset: u64,
     /// As the placements of its batches say: every committed batch of the
-    /// partition below it has a proof row in a stored object.
+    /// partition below it has a proof row in a stored object, or is held by
+    /// a long-term segment that the partition committed.
     pub proven_below: u64,
 }
 
