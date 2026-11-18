@@ -95,8 +95,19 @@ impl FreshObjectUploader for TestUploader {
 /// that places its batches.
 #[allow(clippy::future_not_send)]
 async fn placing_owner(directory: &Path) -> IoTestShard {
+    Box::pin(placing_owner_of_topic(
+        directory,
+        TopicRuntimeOptions::default(),
+    ))
+    .await
+}
+
+/// [`placing_owner`] whose committed topic resolves to the options
+/// `committed`.
+#[allow(clippy::future_not_send)]
+async fn placing_owner_of_topic(directory: &Path, committed: TopicRuntimeOptions) -> IoTestShard {
     let bus = Rc::new(IggyMessageBus::new(0));
-    let (owner, _sender) = test_owner(&bus, None);
+    let (owner, _sender) = test_owner_of_topic(&bus, None, None, None, committed);
     let partitions = owner.plane.partitions();
     partitions.set_io_notifier(
         owner.partition_io.notifier(),
@@ -418,13 +429,27 @@ async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_witho
     assert_eq!(polled.last_matching_offset(), Some(1));
 }
 
+/// Whether the shard paces the rewrites of `partition`.
+fn paced(owner: &IoTestShard, partition: IggyNamespace) -> bool {
+    let revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&partition)
+        .unwrap()
+        .created_revision();
+    owner.rewrite_pacing.borrow().paces(&(partition, revision))
+}
+
 /// The whole write path on one shard: a producer's sends are stored and
-/// committed as placed batches, the rewrite pass stores them again as a
-/// long-term segment, and the partition's long-term log names it.
+/// committed as placed batches, the rewrite passes store them again as
+/// long-term segments, and the partition's long-term log names them. Nothing
+/// stages a pass here: the shard starts them for the partition it leads. A
+/// primary beside it that keeps its batches whole gets no pass.
 #[compio::test]
-async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish_a_long_term_segment()
+async fn given_committed_sends_when_nothing_stages_a_pass_should_store_and_publish_them_as_long_term_segments()
  {
     use super::object_deletes::Shared;
+    use crate::rewrite_pacing::REWRITE_INTERVAL_MAX;
     use iggy_object_store::{LongTermKey, SegmentObject};
     use partitions::{ExecutorLongTermWriter, ExecutorObjects, RemoteSegments};
 
@@ -457,15 +482,28 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
             .long_term_floor()
     };
 
-    pumped(&owner, async {
+    let whole = IggyNamespace::new(0, 0, 1);
+    partitions
+        .get_mut_by_ns(&whole)
+        .unwrap()
+        .set_offset_space_used(true);
+
+    // A shard that got its writer looks over all its partitions once. That
+    // look must not be what finds the sends below.
+    assert!(owner.rewrite_pacing.borrow_mut().take_sweep_wanted());
+
+    let published_in = pumped(&owner, async {
         let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
         until(&owner, |owner| committed_sends(owner) == 2).await;
-        assert_eq!(floor(&owner), None);
-        owner.request_rewrite_segments(namespace(), revision);
+        let committed = std::time::Instant::now();
         until(&owner, |owner| floor(owner) == Some(1)).await;
+        committed.elapsed()
     })
     .await;
 
+    assert!(published_in < REWRITE_INTERVAL_MAX, "{published_in:?}");
+    assert!(paced(&owner, namespace()));
+    assert!(!paced(&owner, whole));
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     let segments = partition.long_term_segments();
     assert_eq!(segments.len(), 1);
@@ -490,12 +528,29 @@ async fn given_committed_sends_when_a_rewrite_pass_runs_should_store_and_publish
 /// and the sweeps, all through one executor.
 #[allow(clippy::future_not_send)]
 async fn swept_owner(directory: &Path) -> (IoTestShard, super::object_deletes::Shared) {
+    with_swept_store(Box::pin(placing_owner(directory)).await)
+}
+
+/// [`swept_owner`] whose committed topic places its batches, as the topic
+/// of a placing partition does outside these fixtures.
+#[allow(clippy::future_not_send)]
+async fn swept_owner_of_placing_topic(
+    directory: &Path,
+) -> (IoTestShard, super::object_deletes::Shared) {
+    let committed = TopicRuntimeOptions {
+        places_batches: true,
+        ..Default::default()
+    };
+    with_swept_store(Box::pin(placing_owner_of_topic(directory, committed)).await)
+}
+
+/// Give `owner` the one store of [`swept_owner`].
+fn with_swept_store(owner: IoTestShard) -> (IoTestShard, super::object_deletes::Shared) {
     use super::object_deletes::Shared;
     use partitions::{
         ExecutorFreshSweeper, ExecutorLongTermWriter, ExecutorObjects, RemoteSegments,
     };
 
-    let owner = Box::pin(placing_owner(directory)).await;
     let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
     owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
         executor.clone(),
@@ -551,22 +606,73 @@ fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
 /// Rewrite the committed sends of the partition up to `floor`.
 #[allow(clippy::future_not_send)]
 async fn rewrite_up_to(owner: &IoTestShard, floor: u64) {
+    rewrite_partition_up_to(owner, namespace(), floor).await;
+}
+
+/// [`rewrite_up_to`] for `partition`.
+#[allow(clippy::future_not_send)]
+async fn rewrite_partition_up_to(owner: &IoTestShard, partition: IggyNamespace, floor: u64) {
     let partitions = owner.plane.partitions();
-    let revision = partitions
-        .get_by_ns(&namespace())
-        .unwrap()
-        .created_revision();
-    owner.request_rewrite_segments(namespace(), revision);
+    let revision = partitions.get_by_ns(&partition).unwrap().created_revision();
+    owner.request_rewrite_segments(partition, revision);
     until(owner, |owner| {
-        owner
-            .plane
-            .partitions()
-            .get_by_ns(&namespace())
-            .unwrap()
-            .long_term_floor()
-            == Some(floor)
+        long_term_floor(owner, partition) == Some(floor)
     })
     .await;
+}
+
+/// The long-term floor of `partition`.
+fn long_term_floor(owner: &IoTestShard, partition: IggyNamespace) -> Option<u64> {
+    owner
+        .plane
+        .partitions()
+        .get_by_ns(&partition)
+        .unwrap()
+        .long_term_floor()
+}
+
+/// Make the partition beside [`namespace`] place its batches and keep them
+/// in a segment file under `directory`, as [`placing_owner`] does for its
+/// own.
+#[allow(clippy::future_not_send)]
+async fn place_other_partition_on_disk(owner: &IoTestShard, directory: &Path) -> IggyNamespace {
+    let other = IggyNamespace::new(0, 0, 1);
+    let placing = owner.plane.partitions().get_mut_by_ns(&other).unwrap();
+    placing.set_runtime_options(TopicRuntimeOptions {
+        messages_required_to_save: Some(1),
+        places_batches: true,
+        ..Default::default()
+    });
+    attach_segment_files(placing, directory, false).await;
+    placing.register_builtin_state_machines().unwrap();
+    other
+}
+
+/// Take `partition` off the shard the way a delete of it does: the
+/// reconciler fences the namespace, and the pump drops the partition once
+/// its files are gone.
+#[allow(clippy::future_not_send)]
+async fn delete_partition(owner: &IoTestShard, partition: IggyNamespace) {
+    owner.plane.partitions().tombstone(partition);
+    owner.enqueue_reconcile_op(ReconcileOp::ConfirmRemove {
+        namespace: partition,
+    });
+    until(owner, |owner| {
+        owner.plane.partitions().get_io_owner(&partition).is_none()
+    })
+    .await;
+    // The marker of the op leaves the inbox a frame later, and a sweep
+    // asked for while the inbox is full is dropped.
+    compio::time::sleep(TASK_POLL_INTERVAL).await;
+}
+
+/// The object each placed batch of the segment under `directory` names, in
+/// the order of the offsets.
+fn named_objects(directory: &Path) -> Vec<u128> {
+    stored_placed_batches(directory)
+        .iter()
+        .map(|placed| placed.placement.object_id)
+        .collect()
 }
 
 /// Once the rewrite caught up, nothing reads the fresh objects again, and
@@ -608,6 +714,28 @@ async fn given_sends_in_long_term_segments_when_sweeps_run_past_the_grace_should
     assert_eq!(owner.metrics().fresh_objects_deleted_value(), 2);
 }
 
+/// Rewrites through the owner's writer, and ends every segment at `up_to` at
+/// the latest, the way the size cap of a segment ends one before the commit
+/// point. Past `up_to` it rewrites nothing.
+struct CappedWriter {
+    writer: Rc<dyn partitions::LongTermWriter>,
+    up_to: u64,
+}
+
+impl partitions::LongTermWriter for CappedWriter {
+    fn write(
+        &self,
+        mut rewrite: partitions::SegmentRewrite,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, partitions::RewriteOutcome> {
+        if rewrite.start_offset > self.up_to {
+            return Box::pin(std::future::ready(Err(iggy_object_store::TierJobCancelled)));
+        }
+        rewrite.up_to = rewrite.up_to.min(self.up_to);
+        self.writer.write(rewrite, scope)
+    }
+}
+
 /// One object can hold sends that are rewritten and sends that are not. It
 /// stays for as long as one placed batch above the floor names it.
 #[compio::test]
@@ -615,19 +743,28 @@ async fn given_a_send_above_the_long_term_floor_when_sweeps_run_should_keep_its_
     let directory = tempfile::tempdir().unwrap();
     let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
     let store = executor.0.store();
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+    owner.set_long_term_writer(Some(Rc::new(CappedWriter {
+        writer: owner.long_term_writer().unwrap(),
+        up_to: 1,
+    })));
     let now = IggyTimestamp::now();
 
-    let kept = pumped(&owner, async {
-        let _first = submit_send(&owner, 1, 100);
+    let shared = pumped(&owner, async {
+        // Stored at once, so the two sends after it share the next object.
+        let _alone = submit_send(&owner, 1, 100);
         until(&owner, |owner| committed_sends(owner) == 1).await;
-        rewrite_up_to(&owner, 0).await;
-        // The second send stays above the floor: no pass rewrites it.
-        owner.set_long_term_writer(None);
-        let _second = submit_send(&owner, 2, 100);
-        until(&owner, |owner| committed_sends(owner) == 2).await;
+        let _shared = [submit_send(&owner, 2, 100), submit_send(&owner, 3, 100)];
+        until(&owner, |owner| committed_sends(owner) == 3).await;
         let objects = fresh_objects(store);
         assert_eq!(objects.len(), 2);
+        assert_eq!(
+            named_objects(directory.path()),
+            [objects[0], objects[1], objects[1]]
+        );
 
+        // The segment ends between the two sends of the second object.
+        rewrite_up_to(&owner, 1).await;
         sweep(&owner, now).await;
         sweep(&owner, past_grace(now)).await;
         sweep(&owner, past_grace(past_grace(now))).await;
@@ -635,7 +772,130 @@ async fn given_a_send_above_the_long_term_floor_when_sweeps_run_should_keep_its_
     })
     .await;
 
-    assert_eq!(fresh_objects(store), vec![kept]);
+    assert_eq!(long_term_floor(&owner, namespace()), Some(1));
+    assert_eq!(fresh_objects(store), vec![shared]);
+}
+
+/// A delete of a partition takes its placed batches with it, so nothing
+/// names the objects only it named. An object it shared with a partition
+/// that is still there stays, until the topic goes with every partition.
+#[compio::test]
+async fn given_a_deleted_partition_when_sweeps_run_past_the_grace_should_delete_the_fresh_objects_only_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let other_directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let other = Box::pin(place_other_partition_on_disk(
+        &owner,
+        other_directory.path(),
+    ))
+    .await;
+    let store = executor.0.store();
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+    let now = IggyTimestamp::now();
+    let unnamed_since = past_grace(now);
+    let topic_deleted_at = past_grace(unnamed_since);
+
+    let shared = pumped(&owner, async {
+        // Stored at once, so the two sends after it share the next object.
+        let _alone = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let _first = submit_send(&owner, 2, 100);
+        let _second = submit_send_to(&owner, other, 3, 100);
+        until(&owner, |owner| {
+            committed_sends(owner) == 2 && committed(owner, other) == 1
+        })
+        .await;
+        let objects = fresh_objects(store);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(named_objects(directory.path()), objects);
+        assert_eq!(named_objects(other_directory.path()), [objects[1]]);
+        sweep(&owner, now).await;
+
+        delete_partition(&owner, namespace()).await;
+        sweep(&owner, unnamed_since).await;
+        assert_eq!(
+            fresh_objects(store),
+            objects,
+            "the objects of a deleted partition wait out the grace period too"
+        );
+        sweep(&owner, topic_deleted_at).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[1]],
+            "the other partition still names the object they share"
+        );
+
+        for partition in 1..TEST_PARTITIONS {
+            delete_partition(&owner, IggyNamespace::new(0, 0, partition)).await;
+        }
+        sweep(&owner, topic_deleted_at).await;
+        assert_eq!(fresh_objects(store), [objects[1]]);
+        sweep(&owner, past_grace(topic_deleted_at)).await;
+        objects[1]
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new(), "{shared:032x}");
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 2);
+}
+
+/// An object holds the sends of every placing partition of its window, and
+/// each partition's rewrite moves its floor alone. The object stays while
+/// one of them still names it above its floor.
+#[compio::test]
+async fn given_an_object_two_partitions_share_when_one_is_rewritten_should_keep_it_until_both_are()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let other_directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let other = Box::pin(place_other_partition_on_disk(
+        &owner,
+        other_directory.path(),
+    ))
+    .await;
+    let store = executor.0.store();
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+    let now = IggyTimestamp::now();
+    let rewritten_at = past_grace(now);
+
+    pumped(&owner, async {
+        // Stored at once, so the two sends after it share the next object.
+        let _alone = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let _first = submit_send(&owner, 2, 100);
+        let _second = submit_send_to(&owner, other, 3, 100);
+        until(&owner, |owner| {
+            committed_sends(owner) == 2 && committed(owner, other) == 1
+        })
+        .await;
+        let objects = fresh_objects(store);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(named_objects(directory.path()), objects);
+        assert_eq!(named_objects(other_directory.path()), [objects[1]]);
+
+        rewrite_up_to(&owner, 1).await;
+        assert_eq!(long_term_floor(&owner, other), None);
+        sweep(&owner, now).await;
+        sweep(&owner, rewritten_at).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[1]],
+            "the partition that is not rewritten still names the object"
+        );
+
+        rewrite_partition_up_to(&owner, other, 0).await;
+        sweep(&owner, rewritten_at).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[1]],
+            "the grace period starts when the last partition stops naming the object"
+        );
+        sweep(&owner, past_grace(rewritten_at)).await;
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
 }
 
 /// An object whose sends never committed is named by no placed batch. So is
@@ -737,9 +997,269 @@ async fn given_an_object_whose_sends_wait_when_sweeps_run_past_the_grace_should_
     assert_eq!(fresh_objects(store).len(), 1);
 }
 
+/// A replica of the headless group that places its batches and holds a
+/// committed message above its long-term floor, on a shard whose writer ends
+/// no rewrite.
+#[allow(clippy::future_not_send)]
+async fn placing_headless(replica: u8) -> HeadlessReplica {
+    let replica = Box::pin(HeadlessReplica::journaled(replica, namespace(), &[], None)).await;
+    place_partition(&replica.owner, namespace());
+    replica
+        .owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_offset_space_used(true);
+    replica
+        .owner
+        .set_long_term_writer(Some(Rc::new(HeldWriter)));
+    replica
+}
+
+/// Step `replica` until `done`.
+#[allow(clippy::future_not_send)]
+async fn stepped(replica: &HeadlessReplica, what: &str, done: impl Fn() -> bool) {
+    let mut scratch = Vec::new();
+    let stepping = async {
+        while !done() {
+            replica.step(&mut scratch).await;
+        }
+    };
+    compio::time::timeout(REPLY_DEADLINE, Box::pin(stepping))
+        .await
+        .unwrap_or_else(|_| panic!("the replica did not get to {what}"));
+}
+
+/// The primary of the group is down. The two replicas left elect the
+/// candidate, which is the only one whose shard then runs rewrite passes,
+/// and only from the moment its view is a normal one. Nothing stages a pass.
+#[compio::test]
+async fn given_a_placing_backup_when_it_becomes_the_primary_should_start_its_passes_and_no_backup_should()
+ {
+    use crate::rewrite_pacing::REWRITE_INTERVAL_START;
+    const NEXT_VIEW: u32 = REPAIR_VIEW + 1;
+    let backup = Box::pin(placing_headless(HEADLESS_BACKUP)).await;
+    let candidate = Box::pin(placing_headless(HEADLESS_CANDIDATE)).await;
+    let consensus = |replica: &HeadlessReplica| {
+        let partition = replica.partition(namespace());
+        (
+            partition.consensus().is_primary(),
+            partition.consensus().is_normal(),
+        )
+    };
+    let mut scratch = Vec::new();
+
+    candidate.step(&mut scratch).await;
+    candidate.owner.tick_long_term_rewrites().await;
+    assert_eq!(consensus(&candidate), (false, true));
+    assert!(!paced(&candidate.owner, namespace()), "a backup");
+
+    // Each one misses the heartbeats of the primary and votes to leave its
+    // view.
+    for (replica, peer) in [(&candidate, HEADLESS_BACKUP), (&backup, HEADLESS_CANDIDATE)] {
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if replica.sent_to(peer, Command::StartViewChange, NEXT_VIEW) {
+                break;
+            }
+            assert!(replica.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+    }
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+        .await;
+    candidate.step(&mut scratch).await;
+    assert_eq!(consensus(&candidate), (true, false));
+    assert!(
+        !paced(&candidate.owner, namespace()),
+        "its view has not started"
+    );
+
+    backup
+        .owner
+        .on_message(candidate.take(HEADLESS_BACKUP, Command::StartViewChange))
+        .await;
+    stepped(&backup, "its view change", || {
+        backup.sent_to(HEADLESS_CANDIDATE, Command::DoViewChange, NEXT_VIEW)
+    })
+    .await;
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::DoViewChange))
+        .await;
+    stepped(&candidate, "its view", || {
+        consensus(&candidate) == (true, true)
+    })
+    .await;
+    candidate.step(&mut scratch).await;
+
+    assert!(paced(&candidate.owner, namespace()));
+    compio::time::sleep(REWRITE_INTERVAL_START).await;
+    candidate.owner.tick_long_term_rewrites().await;
+    let reported = candidate.owner.metrics().long_term_lags();
+    assert_eq!(
+        reported
+            .iter()
+            .map(|lag| (lag.namespace, lag.messages))
+            .collect::<Vec<_>>(),
+        [(namespace(), 1)]
+    );
+    assert!(
+        candidate.partition(namespace()).segment_rewrite_running(),
+        "its first pass started a rewrite"
+    );
+
+    backup
+        .owner
+        .on_message(candidate.take(HEADLESS_BACKUP, Command::StartView))
+        .await;
+    stepped(&backup, "the new view", || {
+        consensus(&backup) == (false, true)
+    })
+    .await;
+    backup.step(&mut scratch).await;
+    assert!(!paced(&backup.owner, namespace()));
+    // The pass the segment cleaner stages gives a backup a wait too. It is
+    // not the one that reports the partition.
+    backup
+        .owner
+        .on_rewrite_segments(namespace(), staged_revision(&backup.owner))
+        .await;
+    assert!(paced(&backup.owner, namespace()));
+    compio::time::sleep(REWRITE_INTERVAL_START).await;
+    backup.owner.tick_long_term_rewrites().await;
+    assert_eq!(backup.owner.metrics().long_term_lags(), []);
+    assert!(!backup.partition(namespace()).segment_rewrite_running());
+}
+
+/// The store may hold a manifest the primary before wrote, which lags what
+/// is committed. The candidate that wins the view stores its own once its
+/// view is a normal one, with no segment left to commit, and nothing stages
+/// a pass here.
+#[compio::test]
+async fn given_a_placing_backup_when_it_becomes_the_primary_should_store_the_manifest_of_its_long_term_log()
+ {
+    use super::object_deletes::Shared;
+    use iggy_object_store::PartitionManifest;
+    use partitions::ExecutorManifestPublisher;
+    const NEXT_VIEW: u32 = REPAIR_VIEW + 1;
+    let backup = Box::pin(placing_headless(HEADLESS_BACKUP)).await;
+    let candidate = Box::pin(placing_headless(HEADLESS_CANDIDATE)).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    candidate
+        .owner
+        .set_manifest_publisher(Some(Rc::new(ExecutorManifestPublisher::new(
+            executor.clone(),
+            layout(),
+        ))));
+    let store = executor.0.store();
+    let consensus = |replica: &HeadlessReplica| {
+        let partition = replica.partition(namespace());
+        (
+            partition.consensus().is_primary(),
+            partition.consensus().is_normal(),
+        )
+    };
+    let awaits_pass =
+        |replica: &HeadlessReplica| replica.partition(namespace()).manifest_awaits_first_pass();
+    let mut scratch = Vec::new();
+
+    candidate.step(&mut scratch).await;
+    assert_eq!(consensus(&candidate), (false, true));
+    assert!(!awaits_pass(&candidate), "a backup");
+
+    for (replica, peer) in [(&candidate, HEADLESS_BACKUP), (&backup, HEADLESS_CANDIDATE)] {
+        for _ in 0..2 * TimeoutManager::NORMAL_HEARTBEAT_TICKS {
+            if replica.sent_to(peer, Command::StartViewChange, NEXT_VIEW) {
+                break;
+            }
+            assert!(replica.owner.tick_partitions(&mut scratch).await.is_none());
+        }
+    }
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::StartViewChange))
+        .await;
+    candidate.step(&mut scratch).await;
+    assert_eq!(consensus(&candidate), (true, false));
+    assert!(!awaits_pass(&candidate), "its view has not started");
+    backup
+        .owner
+        .on_message(candidate.take(HEADLESS_BACKUP, Command::StartViewChange))
+        .await;
+    stepped(&backup, "its view change", || {
+        backup.sent_to(HEADLESS_CANDIDATE, Command::DoViewChange, NEXT_VIEW)
+    })
+    .await;
+    candidate
+        .owner
+        .on_message(backup.take(HEADLESS_CANDIDATE, Command::DoViewChange))
+        .await;
+    stepped(&candidate, "its view", || {
+        consensus(&candidate) == (true, true)
+    })
+    .await;
+    candidate.step(&mut scratch).await;
+
+    let revision = candidate.partition(namespace()).created_revision();
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
+    assert_eq!(store.keys(), Vec::<String>::new());
+    pumped(&candidate.owner, async {
+        until(&candidate.owner, |_| store.keys().contains(&manifest_key)).await;
+    })
+    .await;
+
+    let size = store.head(&manifest_key).await.unwrap().size;
+    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    let partition = candidate.partition(namespace());
+    assert_eq!(manifest.segments, partition.long_term_segments());
+    assert_eq!(manifest.floor, partition.long_term_floor());
+    assert!(!partition.manifest_awaits_first_pass());
+}
+
+/// A shard gets its writer after its node proved the store is its own. A
+/// partition that committed before then sleeps, so no tick visits it: the
+/// shard looks over all its partitions once. A tombstoned one is left out.
+#[compio::test]
+async fn given_a_primary_that_committed_without_a_writer_when_the_shard_gets_one_should_start_its_passes()
+ {
+    use crate::rewrite_pacing::REWRITE_INTERVAL_START;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    owner.set_fresh_uploader(Some(TestUploader::new()));
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+    })
+    .await;
+    let partitions = owner.plane.partitions();
+    let mut scratch = Vec::new();
+    assert!(owner.tick_partitions(&mut scratch).await.is_none());
+    assert!(!paced(&owner, namespace()), "the shard cannot rewrite");
+
+    partitions.tombstone(namespace());
+    owner.set_long_term_writer(Some(Rc::new(HeldWriter)));
+    assert!(owner.tick_partitions(&mut scratch).await.is_none());
+    owner.tick_long_term_rewrites().await;
+    partitions.untombstone(&namespace());
+    assert!(!paced(&owner, namespace()), "tombstoned");
+
+    owner.set_long_term_writer(Some(Rc::new(HeldWriter)));
+    owner.tick_long_term_rewrites().await;
+
+    assert!(paced(&owner, namespace()));
+    compio::time::sleep(REWRITE_INTERVAL_START).await;
+    owner.tick_long_term_rewrites().await;
+    let partition = partitions.get_by_ns(&namespace()).unwrap();
+    assert!(partition.segment_rewrite_running());
+}
+
 /// A reader of the bucket finds a long-term segment through the manifest,
 /// so the commit of the segment's command is what asks for the manifest.
-/// Nothing else asks for one here.
+/// The one this primary stored when its view began lists nothing, and
+/// nothing else asks for one here.
 #[compio::test]
 async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publish_the_manifest() {
     use super::object_deletes::Shared;
@@ -775,17 +1295,29 @@ async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publ
     let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
     let store = executor.0.store();
 
+    let stored = async || {
+        let size = store.head(&manifest_key).await.unwrap().size;
+        let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+        PartitionManifest::decode(&object.bytes).unwrap()
+    };
+
     pumped(&owner, async {
         let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
         until(&owner, |owner| committed_sends(owner) == 2).await;
         owner.request_rewrite_segments(namespace(), revision);
         until(&owner, |_| store.keys().contains(&manifest_key)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stored().await.floor != Some(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no manifest lists the segment"
+            );
+            compio::time::sleep(crate::CONSENSUS_TICK_INTERVAL).await;
+        }
     })
     .await;
 
-    let size = store.head(&manifest_key).await.unwrap().size;
-    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
-    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    let manifest = stored().await;
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     assert_eq!(manifest.floor, Some(1));
     assert_eq!(manifest.segments, partition.long_term_segments());
@@ -1201,6 +1733,99 @@ async fn given_sends_to_two_placing_partitions_in_one_window_when_it_closes_shou
 
     assert_eq!(uploader.store().keys().len(), 2);
     assert_eq!(owner.metrics().fresh_uploads_value().0, 2);
+}
+
+/// Make the shard lead `count` partitions that place their batches: the
+/// fixture's own, and single-replica primaries in memory beside them.
+fn place_partitions(owner: &IoTestShard, count: usize) -> Vec<IggyNamespace> {
+    let partitions = owner.plane.partitions();
+    (0..count)
+        .map(|partition_id| {
+            let partition = IggyNamespace::new(0, 0, partition_id);
+            if partition == namespace() {
+                return partition;
+            }
+            if partitions.get_by_ns(&partition).is_none() {
+                let consensus = VsrConsensus::new(
+                    1,
+                    0,
+                    1,
+                    partition.inner(),
+                    Rc::clone(&owner.bus),
+                    LocalPipeline::new(),
+                );
+                consensus.init();
+                partitions.insert(
+                    partition,
+                    IggyPartition::with_in_memory_storage(
+                        Arc::new(PartitionStats::default()),
+                        consensus,
+                        IggyByteSize::from(SEGMENT_BYTES),
+                    ),
+                );
+            }
+            place_partition(owner, partition)
+        })
+        .collect()
+}
+
+/// Every placing partition of the shard writes into the same window, so the
+/// store gets one object per upload interval however many partitions send
+/// within it.
+#[compio::test]
+async fn given_sends_to_many_placing_partitions_when_they_arrive_within_an_interval_should_store_objects_by_window_and_not_by_partition()
+ {
+    const PARTITIONS: usize = 64;
+    const ROUNDS: u64 = 3;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let placing = place_partitions(&owner, PARTITIONS);
+    assert_eq!(placing.len(), PARTITIONS);
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    // Free slots throughout, so only the interval holds an upload back.
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 4);
+
+    pumped(&owner, async {
+        let mut request = 0;
+        for round in 1..=ROUNDS {
+            for partition in &placing {
+                request += 1;
+                // Offered as the pump offers a send it routed. The pump
+                // itself refuses a partition that the fixture's metadata
+                // does not list.
+                owner.offer_fresh_send(sized_send_request(*partition, request, 100), channel(1).0);
+            }
+            until(&owner, |owner| {
+                placing
+                    .iter()
+                    .all(|partition| committed(owner, *partition) == round)
+            })
+            .await;
+        }
+    })
+    .await;
+
+    let objects = uploader.store().keys().len();
+    // The sends of a round arrive together. The first is stored alone when
+    // the shard is idle by then, and the window of the others is one object.
+    let windows = 2 * usize::try_from(ROUNDS).unwrap();
+    assert!(
+        (1..=windows).contains(&objects),
+        "{objects} objects for {PARTITIONS} partitions in {ROUNDS} rounds"
+    );
+    let (stored, refused, bytes) = owner.metrics().fresh_uploads_value();
+    assert_eq!((stored, refused), (objects as u64, 0));
+    let scrape = owner.metrics.scrape();
+    for series in [
+        format!("fresh_object_size_bytes_count {objects}"),
+        format!("fresh_object_size_bytes_sum {bytes}.0"),
+    ] {
+        assert!(
+            scrape.lines().any(|line| line == series),
+            "{series} is not in the scrape:\n{scrape}"
+        );
+    }
 }
 
 /// Holds every attempt at an upload until the test settles it, so the test
@@ -2562,6 +3187,288 @@ async fn given_a_placing_partition_that_is_not_normal_when_a_sweep_runs_past_the
     assert_eq!(fresh_objects(store).len(), 1);
 }
 
+/// Ask for a sweep at `now` that a shard which cannot tell ends, and give it
+/// the time a sweep takes to settle and delete.
+#[allow(clippy::future_not_send)]
+async fn sweep_that_cannot_settle(owner: &IoTestShard, now: IggyTimestamp) {
+    owner.request_sweep_fresh_objects(now);
+    compio::time::sleep(Duration::from_millis(200)).await;
+}
+
+/// Commit one send to the partition and run the sweep that first finds its
+/// object named. Returns the object.
+#[allow(clippy::future_not_send)]
+async fn commit_a_named_object(
+    owner: &IoTestShard,
+    store: &MemoryStore,
+    now: IggyTimestamp,
+) -> u128 {
+    let _send = submit_send(owner, 1, 100);
+    until(owner, |owner| committed_sends(owner) == 1).await;
+    let objects = fresh_objects(store);
+    assert_eq!(objects.len(), 1);
+    sweep(owner, now).await;
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+    objects[0]
+}
+
+/// A partition fenced for a rebuild keeps its slot behind the tombstone
+/// until its files are quarantined. Its group still holds the placed batches
+/// that name this replica's objects, and the copy that comes back reads them
+/// again, so the shard cannot tell and the sweep deletes nothing.
+#[compio::test]
+async fn given_a_placing_partition_fenced_for_a_rebuild_when_sweeps_run_past_the_grace_should_keep_the_objects_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let object = pumped(&owner, async {
+        let object = commit_a_named_object(&owner, store, now).await;
+
+        owner.plane.partitions().tombstone(namespace());
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        let kept = fresh_objects(store);
+        // The pump does not stop while it holds a partition tombstoned
+        // without a teardown.
+        drop_fenced_partition(&owner, namespace()).await;
+        assert_eq!(kept, vec![object]);
+        object
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![object]);
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// The rebuild drops the fenced partition before the reconciler builds the
+/// next copy, and a build that fails leaves the namespace without one for
+/// as long as it keeps failing. The committed topic still places its
+/// batches there, so the shard cannot tell until a copy is back.
+#[compio::test]
+async fn given_a_committed_placing_partition_this_shard_does_not_hold_when_sweeps_run_past_the_grace_should_keep_the_objects_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let object = pumped(&owner, async {
+        let object = commit_a_named_object(&owner, store, now).await;
+
+        drop_for_a_rebuild(&owner).await;
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        object
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![object]);
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// The copy that a rebuild builds holds no placed batch until a state
+/// transfer installs those of its group, and its status is normal while it
+/// waits.
+#[compio::test]
+async fn given_a_rebuilt_placing_partition_awaiting_a_state_transfer_when_sweeps_run_past_the_grace_should_keep_the_objects_its_group_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let object = pumped(&owner, async {
+        let object = commit_a_named_object(&owner, store, now).await;
+
+        drop_for_a_rebuild(&owner).await;
+        insert_copy_awaiting_a_state_transfer(&owner).await;
+        let partitions = owner.plane.partitions();
+        let consensus = partitions.get_by_ns(&namespace()).unwrap().consensus();
+        assert!(consensus.is_normal() && consensus.is_transferring());
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        object
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), vec![object]);
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
+    assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// Fence the partition for a rebuild, as a replica does when its copy
+/// diverged from the view, and wait for the pump to drop the fenced copy.
+#[allow(clippy::future_not_send)]
+async fn drop_for_a_rebuild(owner: &IoTestShard) {
+    let partitions = owner.plane.partitions();
+    let partition = partitions.get_mut_by_ns(&namespace()).unwrap();
+    owner.fence_partition_for_rebuild(namespace(), partition, partition.offset_frontier());
+    until(owner, |owner| {
+        let partitions = owner.plane.partitions();
+        !partitions.contains(&namespace()) && !partitions.is_tombstoned(&namespace())
+    })
+    .await;
+}
+
+/// Hand the pump the next copy of the partition, as the reconciler does
+/// after a rebuild: it places its batches, holds none, and waits for a state
+/// transfer.
+#[allow(clippy::future_not_send)]
+async fn insert_copy_awaiting_a_state_transfer(owner: &IoTestShard) {
+    use consensus::MetadataHandle;
+    use metadata::impls::metadata::StreamsFrontend;
+
+    let consensus = VsrConsensus::new(
+        1,
+        0,
+        1,
+        namespace().inner(),
+        Rc::clone(&owner.bus),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    let mut copy = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        IggyByteSize::from(SEGMENT_BYTES),
+    );
+    copy.set_runtime_options(TopicRuntimeOptions {
+        places_batches: true,
+        ..Default::default()
+    });
+    copy.register_builtin_state_machines().unwrap();
+    copy.consensus().begin_state_transfer_await();
+    let epoch = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .created_revision_for_namespace(namespace())
+        .unwrap();
+    owner.enqueue_reconcile_op(ReconcileOp::InsertOwned {
+        namespace: namespace(),
+        partition: Box::new(copy),
+        epoch,
+    });
+    until(owner, |owner| {
+        owner.plane.partitions().contains(&namespace())
+    })
+    .await;
+}
+
+/// A delete commits the removal of the partition before the reconciler
+/// fences its copy. No committed partition is left to read the placed
+/// batches of that copy, so it holds back no sweep, fenced or not.
+#[compio::test]
+async fn given_a_fenced_placing_partition_that_committed_metadata_dropped_when_sweeps_run_past_the_grace_should_delete_the_objects_it_named()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+    let unnamed_since = past_grace(now);
+
+    pumped(&owner, async {
+        commit_a_named_object(&owner, store, now).await;
+
+        delete_committed_topic(&owner);
+        owner.plane.partitions().tombstone(namespace());
+        sweep(&owner, unnamed_since).await;
+        assert_eq!(fresh_objects(store).len(), 1);
+        sweep(&owner, past_grace(unnamed_since)).await;
+        let left = fresh_objects(store);
+        drop_fenced_partition(&owner, namespace()).await;
+        assert_eq!(left, Vec::<u128>::new());
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
+    assert_eq!(owner.metrics().fresh_objects_deleted_value(), 1);
+}
+
+/// Drop the fenced `partition` from the shard, as the pump does once the
+/// files of the copy are gone or quarantined.
+#[allow(clippy::future_not_send)]
+async fn drop_fenced_partition(owner: &IoTestShard, partition: IggyNamespace) {
+    owner.enqueue_reconcile_op(ReconcileOp::ConfirmRemove {
+        namespace: partition,
+    });
+    until(owner, |owner| {
+        !owner.plane.partitions().contains(&partition)
+    })
+    .await;
+}
+
+/// Commit the delete of the fixture's topic in the shard's metadata, with
+/// the fence every partition of it installs before the topic goes.
+fn delete_committed_topic(owner: &IoTestShard) {
+    use consensus::MetadataHandle;
+    use iggy_binary_protocol::WireIdentifier;
+    use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
+    use metadata::impls::metadata::StreamsFrontend;
+    use metadata::stm::StateMachine;
+    use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+
+    let body = DeleteTopicRequest {
+        stream_id: WireIdentifier::numeric(0),
+        topic_id: WireIdentifier::numeric(0),
+    }
+    .to_bytes();
+    let message = metadata_prepare(100, Operation::DeleteTopic, &body);
+    let metadata = &owner.plane.metadata().mux_stm;
+    assert_eq!(metadata.update(message).unwrap().code, 0);
+    for intent in metadata.streams().pending_lifecycles() {
+        for target in intent.partitions {
+            let completion = CompleteLifecycleRequest::new(
+                intent.context.metadata_op,
+                intent.stream_id,
+                vec![LifecycleCompletion {
+                    topic_id: target.topic_id,
+                    partition_id: target.partition_id,
+                    partition_op: 1,
+                }],
+            )
+            .unwrap();
+            metadata
+                .update(metadata_prepare(
+                    intent.context.metadata_op,
+                    Operation::CompleteLifecycle,
+                    &completion.to_bytes(),
+                ))
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        owner
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace()),
+        None
+    );
+}
+
+/// The prepare of the metadata op `op` that carries `body`.
+fn metadata_prepare(op: u64, operation: Operation, body: &[u8]) -> Message<PrepareHeader> {
+    let size = size_of::<PrepareHeader>() + body.len();
+    let mut message = Message::<PrepareHeader>::new(size);
+    let header = PrepareHeader {
+        command: Command::Prepare,
+        op,
+        operation,
+        size: u32::try_from(size).unwrap(),
+        ..Default::default()
+    };
+    message.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(body);
+    message.transmute_header::<PrepareHeader>(|_, target| *target = header)
+}
+
 /// One sweep at a time: a sweep asked for while a listing or a delete of
 /// another runs starts nothing, however often it is asked for.
 #[compio::test]
@@ -3271,6 +4178,56 @@ async fn given_a_backlog_past_the_limit_when_sends_arrive_should_delay_the_sends
         placed[1].placement.length < placed[2].placement.length,
         "the held send committed before the one behind it"
     );
+}
+
+/// An operator sees which partition lags: the shard leaves the messages and
+/// the bytes each placing partition it leads has yet to rewrite where a
+/// scrape reads them. A partition whose rewrites keep up reports zero.
+#[compio::test]
+async fn given_placing_partitions_this_shard_leads_when_the_tick_runs_should_report_the_lag_of_each()
+ {
+    use crate::metrics::LongTermLag;
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(backlog_owner(directory.path(), 0)).await;
+    let other = place_other_partition(&owner);
+    let other_revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&other)
+        .unwrap()
+        .created_revision();
+    let lags = |owner: &IoTestShard| {
+        let mut lags = owner.metrics().long_term_lags();
+        lags.sort_by_key(|lag| lag.namespace.inner());
+        lags
+    };
+    assert_eq!(lags(&owner), []);
+
+    let backlog = pumped(&owner, async {
+        let backlog = commit_and_count_a_backlog(&owner).await;
+        owner.request_rewrite_segments(other, other_revision);
+        until(&owner, |owner| backlog_of(owner, other) == Some(0)).await;
+        until(&owner, |owner| lags(owner).len() == 2).await;
+        let _second = submit_send(&owner, 2, 300);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        until(&owner, |owner| lags(owner)[0].messages == 2).await;
+        backlog
+    })
+    .await;
+
+    let lags = lags(&owner);
+    assert_eq!(
+        lags[1],
+        LongTermLag {
+            namespace: other,
+            messages: 0,
+            bytes: Some(0),
+        }
+    );
+    assert_eq!((lags[0].namespace, lags[0].messages), (namespace(), 2));
+    assert!(lags[0].bytes > Some(backlog), "both sends: {lags:?}");
+    assert_eq!(lags[0].bytes, backlog_of(&owner, namespace()));
 }
 
 /// Below the limit, or with no limit, a send is taken at once, however
