@@ -21,7 +21,7 @@ mod schema;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use iggy_binary_protocol::requests::system::DescribeOptionsRequest;
-use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse, TopicHeader};
+use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::topics::GetTopicResponse;
 use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
@@ -841,7 +841,7 @@ fn topic_response_vectors() -> GeneratorResult<Vec<TopicResponseVector>> {
     let (options, derived_options) =
         resource_options_to_wire_split(&public_options(OptionsScope::Topic, &stored)?)?;
     let bytes = GetTopicResponse {
-        topic: TopicHeader {
+        topic: TopicResponse {
             id: 4,
             created_at: CREATED_AT_MICROS,
             partitions_count: 0,

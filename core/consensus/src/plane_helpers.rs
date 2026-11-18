@@ -1094,6 +1094,7 @@ pub fn repaired_prepare_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_bus::advance_and_tick;
     use crate::{Consensus, ConsensusClock, LocalPipeline, ReplicaSet, VsrAction};
     use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
@@ -2511,7 +2512,7 @@ mod tests {
         // which can still start the view once repair covers it.
         let next_view = parked_view + 1;
         let voted = (0..crate::TimeoutManager::VIEW_CHANGE_STATUS_TICKS)
-            .flat_map(|_| consensus.tick(PlaneKind::Metadata))
+            .flat_map(|_| advance_and_tick(&consensus, PlaneKind::Metadata))
             .any(|action| {
                 matches!(action, VsrAction::SendStartViewChange { view, .. } if view == next_view)
             });

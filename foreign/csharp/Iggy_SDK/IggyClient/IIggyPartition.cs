@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
+
 namespace Apache.Iggy.IggyClient;
 
 /// <summary>
@@ -43,5 +45,25 @@ public interface IIggyPartition
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
     Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
+        CancellationToken token = default);
+
+    /// <summary>
+    ///     Reads one page of the partitions of a topic.
+    /// </summary>
+    /// <remarks>
+    ///     The query is checked before anything is sent. To read the next page, send the same query with the
+    ///     <see cref="Page{T}.Next" /> of this page as its cursor. Partitions get their ids in creation order, so both
+    ///     orders read them by id.
+    /// </remarks>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="query">The order, the page size and the cursor of the read.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the page.</returns>
+    /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
+    ///     Invalid command (code 3) for a query the page rules refuse, or for a cursor the server cannot use. The
+    ///     stream or topic not found error when one of them does not exist.
+    /// </exception>
+    Task<Page<PartitionResponse>> GetPartitionsPageAsync(Identifier streamId, Identifier topicId, PageQuery query,
         CancellationToken token = default);
 }

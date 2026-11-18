@@ -23,7 +23,8 @@ use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::{
-    OptionInputMap, Stream, StreamClient, StreamCreateOptions, StreamDetails, StreamUpdateOptions,
+    NamedPageQuery, OptionInputMap, Page, Stream, StreamClient, StreamCreateOptions, StreamDetails,
+    StreamUpdateOptions,
 };
 
 const PATH: &str = "/streams";
@@ -54,6 +55,15 @@ impl StreamClient for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidJsonResponse)?;
         Ok(streams)
+    }
+
+    async fn get_streams_page(&self, query: &NamedPageQuery) -> Result<Page<Stream>, IggyError> {
+        query.validate()?;
+        let response = self.get_with_query(PATH, &query.http_query_pairs()).await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
     }
 
     async fn create_stream(

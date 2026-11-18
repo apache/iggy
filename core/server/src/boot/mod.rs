@@ -51,15 +51,19 @@ use crate::boot::recovery::{
     RecoveredOwnerState, ShardBuild, build_shard_for_thread, restore_metadata_consensus,
 };
 use crate::boot::threads::{
-    PeerExitCountdown, PeerExitWait, ShutdownDeadline, StopSignals, await_pump_drain,
-    install_panic_hook, join_partial_shard_survivors, resolve_shard_assignments, run_shard_thread,
-    spawn_shutdown_watchdog, validate_sharding_runtime_knobs,
+    PeerExitCountdown, PeerExitWait, PrimaryHandoffGate, ShutdownDeadline, StopSignals,
+    await_pump_drain, install_panic_hook, join_partial_shard_survivors, resolve_shard_assignments,
+    run_shard_thread, spawn_primary_handoff, spawn_shutdown_watchdog,
+    validate_sharding_runtime_knobs,
 };
 use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::server_error::ServerError;
-use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
+use crate::shell::{
+    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
+};
+use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::Operation;
@@ -345,6 +349,12 @@ pub fn bootstrap(
             .get_duration()
             .saturating_add(config.sharding.shutdown_poll_interval.get_duration()),
     ));
+    let primary_handoff = Arc::new(PrimaryHandoffGate::new(
+        config
+            .sharding
+            .shutdown_primary_handoff_timeout
+            .get_duration(),
+    ));
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
     // shard's installer / disconnect path writes.
@@ -352,6 +362,8 @@ pub fn bootstrap(
         &config,
         total_shards,
     )?));
+    check_repair_ring_share(&config.partition, total_shards)?;
+    check_wal_reload_share(&config.partition, total_shards)?;
     let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
         usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
             ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
@@ -395,7 +407,7 @@ pub fn bootstrap(
     if config.cluster.enabled && config.cluster.nodes.len() > 1 {
         metadata_applied_frontier = metadata_applied_frontier.with_partition_freshness(
             std::time::Instant::now(),
-            config.cluster.heartbeat_timeout.get_duration(),
+            config.cluster.commit_busy_heartbeat_timeout.get_duration(),
         );
     }
     let metadata_applied_frontier = Arc::new(metadata_applied_frontier);
@@ -454,6 +466,7 @@ pub fn bootstrap(
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
         let tiered_credentials_for_shard = tiered_credentials.clone();
+        let primary_handoff_for_shard = Arc::clone(&primary_handoff);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -477,6 +490,7 @@ pub fn bootstrap(
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
                     tiered_credentials_for_shard,
+                    primary_handoff_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -526,6 +540,7 @@ pub fn bootstrap(
         shard_threads,
         deadline: shutdown_deadline,
         first_panic,
+        primary_handoff,
     })
 }
 
@@ -553,6 +568,7 @@ async fn shard_main(
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
     tiered_credentials: Option<SharedCredentials>,
+    primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -573,6 +589,7 @@ async fn shard_main(
         replica_count: topology.replica_count,
         auth: load_replica_auth(config).map(Rc::new),
         tls: load_replica_tls_ctx(config, &topology)?.map(Rc::new),
+        heartbeat: heartbeat_timings(config),
     });
 
     let drain_timeout = config.sharding.shutdown_drain_timeout.get_duration();
@@ -1197,6 +1214,16 @@ async fn shard_main(
         stop_signals.sysinfo_printer = Some(stop_tx);
     }
 
+    // Only here, so a stop during boot starts the shutdown at once.
+    let _primary_handoff = primary_handoff.runs_on(topology.replica_count).then(|| {
+        spawn_primary_handoff(
+            Rc::clone(&shard),
+            primary_handoff,
+            Arc::clone(&shutdown_flag_for_handoff),
+            poll_interval,
+        )
+    });
+
     bus.token().wait().await;
     #[cfg(feature = "systemd")]
     if shard_id == 0 {
@@ -1227,6 +1254,52 @@ async fn shard_main(
 /// and dropped (the periodic tick recovers). Installed via
 /// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
 /// sole writer of the metadata state machine.
+/// Every shard sheds its repair rings against an equal share of the node
+/// budget, so the shard count decides what the budget is worth.
+fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
+    let share = config.journal_memory_shard_bytes_max(total_shards);
+    let ring = config.evicted_ring_bytes_max.as_bytes_u64();
+    if share == 0 {
+        error!(
+            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
+            config.journal_memory_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    if share < ring {
+        warn!(
+            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
+             less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
+        );
+    } else {
+        info!(
+            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max"
+        );
+    }
+    Ok(())
+}
+
+/// A share of nothing queues a checkpoint for every op, so the node refuses
+/// to start with it.
+fn check_wal_reload_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
+    let share = config.wal_reload_shard_bytes_max(total_shards);
+    if share == 0 {
+        error!(
+            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
+            config.wal_reload_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    info!(
+        "each of {total_shards} shards gets {share} bytes of partition.wal_reload_node_bytes_max"
+    );
+    Ok(())
+}
+
 fn make_metadata_commit_notifier(
     senders: Vec<TaggedSender>,
     metrics: ShardMetrics,
@@ -1364,6 +1437,7 @@ mod tests {
             b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-1\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();
@@ -1391,6 +1465,32 @@ mod tests {
         assert!(validate_storage_format(directory.path()).unwrap());
     }
 
+    /// A share of nothing sheds every ring to its newest entry from the
+    /// first tick, so the node refuses to start with it.
+    #[test]
+    fn given_a_ring_budget_below_one_byte_per_shard_when_booting_should_refuse() {
+        const SHARDS: u16 = 32;
+        let config = |bytes: u64| PartitionConfig {
+            journal_memory_node_bytes_max: iggy_common::IggyByteSize::from(bytes),
+            ..PartitionConfig::default()
+        };
+        assert!(check_repair_ring_share(&config(u64::from(SHARDS) - 1), SHARDS).is_err());
+        assert!(check_repair_ring_share(&config(u64::from(SHARDS)), SHARDS).is_ok());
+        assert!(check_repair_ring_share(&PartitionConfig::default(), SHARDS).is_ok());
+    }
+
+    #[test]
+    fn given_a_reload_budget_below_one_byte_per_shard_when_booting_should_refuse() {
+        const SHARDS: u16 = 32;
+        let config = |bytes: u64| PartitionConfig {
+            wal_reload_node_bytes_max: iggy_common::IggyByteSize::from(bytes),
+            ..PartitionConfig::default()
+        };
+        assert!(check_wal_reload_share(&config(u64::from(SHARDS) - 1), SHARDS).is_err());
+        assert!(check_wal_reload_share(&config(u64::from(SHARDS)), SHARDS).is_ok());
+        assert!(check_wal_reload_share(&PartitionConfig::default(), SHARDS).is_ok());
+    }
+
     #[test]
     fn given_different_storage_formats_when_identifying_replicas_should_reject_mixing() {
         for older_format in [
@@ -1398,6 +1498,7 @@ mod tests {
             b"IGGY-BOUND-GRANTS-4\n",
             b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-1\n",
         ] {
             assert_ne!(
                 message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),

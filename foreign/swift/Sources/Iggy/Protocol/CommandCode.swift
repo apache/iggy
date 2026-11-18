@@ -70,6 +70,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     // 304 was update_topic and 305 purge_topic. The server keeps both retired.
     case createPartitions = 402
     case deletePartitions = 403
+    case getPartitions = 404
     case deleteSegments = 503
     case getConsumerGroup = 600
     case getConsumerGroups = 601
@@ -126,6 +127,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .deleteTopic: "topic.delete"
         case .createPartitions: "partition.create"
         case .deletePartitions: "partition.delete"
+        case .getPartitions: "partition.list"
         case .deleteSegments: "segment.delete"
         case .getConsumerGroup: "consumer_group.get"
         case .getConsumerGroups: "consumer_group.list"
