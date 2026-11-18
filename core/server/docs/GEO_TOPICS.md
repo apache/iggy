@@ -566,6 +566,7 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 | `fresh_window_wait_seconds`          | histogram | How long an upload window stayed open after its first send.                          |
 | `fresh_upload_seconds`               | histogram | How long the upload of a fresh object took.                                          |
 | `fresh_commit_seconds`               | histogram | How long a send waited for its answer after its fresh object was stored.             |
+| `fresh_object_size_bytes`            | histogram | Size of each fresh object the shard stored, in bytes.                                |
 
 ### Fresh objects
 
@@ -581,6 +582,10 @@ The first shard of each node sweeps the fresh objects that this replica wrote.
 | `fresh_listings_truncated`        | gauge   | Listings of the last sweep that stopped at their share of keys. `fresh_objects` is then low. |
 | `fresh_objects_deleted`           | counter | Fresh objects this replica deleted.                                                          |
 
+A sweep deletes nothing while a placing partition of this node is rebuilt or waits for a state
+transfer, since the rebuilt copy still reads those objects. `fresh_objects` and
+`fresh_object_oldest_age_seconds` then grow until the partition is back.
+
 ### Long-term segments
 
 These cover the partitions that the shard leads.
@@ -589,6 +594,8 @@ These cover the partitions that the shard leads.
 | ------------------------------------------ | ------- | ----------------------------------------------------------------------------------- |
 | `partition_long_term_rewrite_lag_messages` | gauge   | Most committed messages of one partition that no long-term segment holds yet.       |
 | `partition_long_term_backlog_bytes`        | gauge   | Most bytes of messages one partition committed that no long-term segment holds yet. |
+| `topic_partition_long_term_lag_messages`   | gauge   | Per partition this node leads: committed messages no long-term segment holds yet.   |
+| `topic_partition_long_term_lag_bytes`      | gauge   | Their bytes, absent until the partition counted them.                               |
 | `partition_long_term_delayed_sends`        | counter | Sends held back because their partition's backlog passed `long_term_backlog_limit`. |
 | `partition_long_term_segments`             | gauge   | Most segments in the long-term log of one partition, of the 65,536 a log takes.     |
 | `partition_long_term_merges`               | counter | Merges of small segments that committed.                                            |
@@ -597,6 +604,9 @@ These cover the partitions that the shard leads.
 | `partition_long_term_dead_objects`         | gauge   | Objects the log no longer lists, which wait to be deleted.                          |
 | `partition_long_term_deleted_objects`      | counter | Long-term objects deleted, the log and the index of a segment counted as one.       |
 | `partition_long_term_unannounced_objects`  | gauge   | Objects in the bucket that the log does not list and may still list later.          |
+
+The two `topic_partition_long_term_lag_*` series carry the labels `stream`,
+`topic` and `partition`, so one slow partition shows by name.
 
 Alert on these first:
 
