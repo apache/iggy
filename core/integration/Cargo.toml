@@ -52,6 +52,8 @@ iggy_object_store = { workspace = true }
 # (`SLOT_FILE_NAMES`, `decode_slots`).
 journal = { workspace = true }
 libc = { workspace = true }
+# Watches a stopped cluster's bucket for writes from its geo peer.
+notify = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }

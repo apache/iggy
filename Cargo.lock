@@ -6190,6 +6190,7 @@ dependencies = [
  "jsonwebtoken",
  "keyring-core",
  "libc",
+ "notify",
  "predicates",
  "rand 0.10.3",
  "rcgen",
