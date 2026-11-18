@@ -124,19 +124,32 @@ pub struct PlacedReadPlan {
     pub(crate) long_term_floor: Option<u64>,
 }
 
-impl PlacedReadPlan {
-    /// The batches that answer `query`, each put back together as the
+/// What [`PlacedReadPlan::read`] returns.
+pub struct PlacedRead {
+    /// The batches that answer the query, each put back together as the
     /// prepare a partition of whole batches would hold, in offset order.
+    pub(crate) batches: Vec<Frozen<4096>>,
+    /// A byte limit, or the end of the long-term segments the plan carries,
+    /// stopped the read ahead of a batch the query asks for.
+    pub(crate) truncated: bool,
+}
+
+impl PlacedReadPlan {
+    /// The batches that answer `query`.
     ///
-    /// Reads stop once the batches hold the messages the query counts, or
-    /// `max_bytes` of them, whichever comes first. The batch that holds the
-    /// first match is read whatever its size.
+    /// The read takes whole batches, and stops once they hold the messages
+    /// the query counts. It also stops ahead of a batch that would take the
+    /// batches it holds past `max_bytes`, or that follows a selection of
+    /// `max_selected_bytes`, and is then [`PlacedRead::truncated`]. Until a
+    /// batch holds a message of the query, no limit applies: that batch is
+    /// read whatever its size, so a poll always makes progress.
     pub(crate) async fn read(
         &self,
         query: MessageLookup,
         max_bytes: usize,
-    ) -> Result<Vec<Frozen<4096>>, DiskFault> {
-        let mut wanted = Wanted::new(query, max_bytes);
+        max_selected_bytes: usize,
+    ) -> Result<PlacedRead, DiskFault> {
+        let mut wanted = Wanted::new(query, max_bytes, max_selected_bytes);
         let mut batches = Vec::new();
         self.collect_from_long_term(&mut wanted, &mut batches)
             .await?;
@@ -145,7 +158,10 @@ impl PlacedReadPlan {
             // ran out of them below the floor ends there: going on above the
             // floor would leave a gap.
             if !self.long_term.is_empty() && !wanted.is_past(floor) {
-                return Ok(batches);
+                return Ok(PlacedRead {
+                    batches,
+                    truncated: wanted.limited || !wanted.is_full(),
+                });
             }
             wanted.skip_through(floor);
         }
@@ -160,7 +176,10 @@ impl PlacedReadPlan {
                 batches.push(self.assemble(placed, &fetched).await?);
             }
         }
-        Ok(batches)
+        Ok(PlacedRead {
+            batches,
+            truncated: wanted.limited,
+        })
     }
 
     /// The placed batches that answer `query`, in offset order and without
@@ -172,7 +191,7 @@ impl PlacedReadPlan {
         query: MessageLookup,
         max_bytes: usize,
     ) -> Result<Vec<PlacedBatch>, DiskFault> {
-        self.collect_placed(&mut Wanted::new(query, max_bytes))
+        self.collect_placed(&mut Wanted::new(query, usize::MAX, max_bytes))
             .await
     }
 
@@ -446,6 +465,7 @@ impl PlacedReadPlan {
                 ceiling: up_to,
             },
             usize::MAX,
+            usize::MAX,
         );
         let segments = self
             .segments
@@ -683,7 +703,7 @@ fn take_whole_batches(
             break;
         }
         let batch = decode_batch_slice(&rest[..total]).map_err(|_| DiskFault::Tiered)?;
-        if wanted.admit(&batch.header) {
+        if wanted.admit(&batch.header, PREPARE_HEADER_SIZE + total) {
             batches.push(whole_prepare(&batch.header, batch.blob())?);
         }
         at += total;
@@ -703,24 +723,42 @@ struct Wanted {
     /// hold is taken once.
     next_offset: u64,
     messages: u64,
-    bytes: usize,
+    /// Bytes of the batches taken, as a reply counts them.
+    selected_bytes: usize,
+    max_selected_bytes: usize,
+    /// Bytes of the batches taken, as the read holds them once they are put
+    /// back together.
+    held_bytes: usize,
     max_bytes: usize,
+    /// A byte limit turned away a batch the poll would have taken. Nothing
+    /// is taken after it, or the poll would skip its messages.
+    limited: bool,
 }
 
 impl Wanted {
-    const fn new(query: MessageLookup, max_bytes: usize) -> Self {
+    const fn new(query: MessageLookup, max_bytes: usize, max_selected_bytes: usize) -> Self {
         Self {
             query,
             next_offset: 0,
             messages: 0,
-            bytes: 0,
+            selected_bytes: 0,
+            max_selected_bytes,
+            held_bytes: 0,
             max_bytes,
+            limited: false,
         }
     }
 
     fn is_full(&self) -> bool {
-        self.messages >= u64::from(self.query.count())
-            || (self.messages > 0 && self.bytes >= self.max_bytes)
+        self.limited || self.messages >= u64::from(self.query.count())
+    }
+
+    /// Whether taking a batch that the read holds as `held` bytes would pass
+    /// a byte limit. Never before a batch counted a message of the poll.
+    const fn over_limit(&self, held: usize) -> bool {
+        self.messages > 0
+            && (self.selected_bytes >= self.max_selected_bytes
+                || self.held_bytes.saturating_add(held) > self.max_bytes)
     }
 
     /// Whether the batches taken so far reach past `offset`.
@@ -761,14 +799,15 @@ impl Wanted {
 
     /// Take `batch` when the poll has not passed it and may still use it.
     fn take(&mut self, batch: PlacedBatch, placed: &mut Vec<PlacedBatch>) {
-        if self.admit(&batch.header) {
+        if self.admit(&batch.header, held_bytes(&batch)) {
             placed.push(batch);
         }
     }
 
-    /// Count the batch of `header` towards what the poll takes, when the
-    /// poll has not passed it and may still use it. Returns whether it did.
-    fn admit(&mut self, header: &BatchHeader) -> bool {
+    /// Count the batch of `header`, which the read holds as `held` bytes,
+    /// towards what the poll takes, when the poll has not passed it and may
+    /// still use it. Returns whether it did.
+    fn admit(&mut self, header: &BatchHeader, held: usize) -> bool {
         if self.is_full()
             || header.base_offset < self.next_offset
             || header.base_offset > self.query.ceiling()
@@ -776,11 +815,16 @@ impl Wanted {
         {
             return false;
         }
+        if self.over_limit(held) {
+            self.limited = true;
+            return false;
+        }
         self.next_offset = header.base_offset + u64::from(header.message_count);
         self.messages += self.counted_messages(header);
-        self.bytes = self
-            .bytes
+        self.selected_bytes = self
+            .selected_bytes
             .saturating_add(usize::try_from(header.batch_length).unwrap_or(usize::MAX));
+        self.held_bytes = self.held_bytes.saturating_add(held);
         true
     }
 
@@ -885,6 +929,14 @@ impl CountedBatches {
             .base_offset
             .saturating_add(u64::from(header.message_count.max(1)));
     }
+}
+
+/// Bytes of the buffer that holds `batch` once [`PlacedReadPlan::assemble`]
+/// put it back together.
+fn held_bytes(batch: &PlacedBatch) -> usize {
+    usize::try_from(batch.placement.length)
+        .unwrap_or(usize::MAX)
+        .saturating_add(PREPARE_HEADER_SIZE + BATCH_HEADER_SIZE)
 }
 
 /// `count` placed batches of `file`, from the `index`-th one on. Each one

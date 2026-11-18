@@ -2085,16 +2085,20 @@ impl Streams {
         })
     }
 
-    /// Whether any topic is tiered. A node claims the object store's root for
-    /// this cluster only while no topic is tiered.
+    /// Whether any topic keeps data in the object store: a tiered topic keeps
+    /// its segments there, and a topic that places its batches keeps their
+    /// messages there. A node claims the object store's root for this cluster
+    /// only while no topic does.
     #[must_use]
-    pub fn has_tiered_topic(&self) -> bool {
+    pub fn has_topic_with_store_data(&self) -> bool {
         self.inner.read(|inner| {
             inner
                 .items
                 .iter()
                 .flat_map(|(_, stream)| stream.topics.iter())
-                .any(|(_, topic)| topic.resolved.tiered_storage)
+                .any(|(_, topic)| {
+                    topic.resolved.tiered_storage || topic.resolved.runtime.places_batches
+                })
         })
     }
 
@@ -6613,11 +6617,24 @@ mod tests {
     }
 
     #[test]
-    fn given_topic_turned_tiered_when_checking_should_report_tiered_topic() {
+    fn given_topic_that_places_batches_when_checking_should_report_store_data() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         create_topic_with_partitions(&mut inner, 1);
-        assert!(!Streams::from(inner.clone()).has_tiered_topic());
+        assert!(!Streams::from(inner.clone()).has_topic_with_store_data());
+
+        inner.items[0].topics[0].resolved.runtime.places_batches = true;
+
+        assert!(!inner.items[0].topics[0].resolved.tiered_storage);
+        assert!(Streams::from(inner).has_topic_with_store_data());
+    }
+
+    #[test]
+    fn given_topic_turned_tiered_when_checking_should_report_store_data() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        create_topic_with_partitions(&mut inner, 1);
+        assert!(!Streams::from(inner.clone()).has_topic_with_store_data());
         let mut explicit = ResourceOptions::new();
         explicit.insert(
             HeaderKey::from(OptionKey::TieredStorage),
@@ -6635,7 +6652,7 @@ mod tests {
             StateHandler::apply(&enable, &mut inner, IggyTimestamp::now()).code,
             0
         );
-        assert!(Streams::from(inner).has_tiered_topic());
+        assert!(Streams::from(inner).has_topic_with_store_data());
     }
 
     /// Every replica of every partition starts its chain file when the topic

@@ -552,8 +552,10 @@ starts with the `object_store_unreachable` gauge at 1. The store identity check
 judges any other answer.
 
 The store identity object claims the prefix for one cluster. While replica 0 is
-the caught-up metadata primary and no topic is tiered, it writes the object. If
-the key already holds an object, the write fails. Each node reads the object
+the caught-up metadata primary and no topic keeps data in the store, it writes
+the object. A tiered topic keeps data in the store, and so does a topic whose
+partitions place their batches. If the key already holds an object, the write
+fails. Each node reads the object
 back through its own store every minute, or every 5 seconds while the object is
 missing or the store does not answer. While the object names the node's own
 cluster, the node runs uploads and object deletes.
@@ -583,7 +585,7 @@ cluster_uid 0123456789abcdef0011223344556677
 
 `cluster_uid` is 32 lowercase hexadecimal digits. When the result of its check
 changes, each node logs its own `cluster_uid`. No node writes the object again
-once a topic is tiered.
+once a topic keeps data in the store.
 
 With the `fs` backend, the object is the file `<path>/<prefix>/meta/identity`.
 Copy it once a node logs that the object store root belongs to this cluster. If
@@ -609,9 +611,9 @@ A node logs that the object names another cluster when:
 Give every node the same store and the same prefix. The check cannot tell every
 pair of stores apart. For example, replica 0 reaches an empty store, and the
 other nodes reach a store with an earlier claim of the same cluster. Then every
-node passes its check. Until a topic is tiered, replica 0 also claims again
-after any check that did not pass, so if its `fs` mount drops, it claims the
-empty mount point.
+node passes its check. Until a topic keeps data in the store, replica 0 also
+claims again after any check that did not pass, so if its `fs` mount drops, it
+claims the empty mount point.
 
 ### Geo peers
 

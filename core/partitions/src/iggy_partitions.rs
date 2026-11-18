@@ -1122,6 +1122,15 @@ where
         self.slots().iter().flatten().map(Slot::partition)
     }
 
+    /// Every partition on this shard with its namespace, in slot order,
+    /// tombstoned ones too. Does not wake them.
+    pub(crate) fn stored(&self) -> impl Iterator<Item = (&IggyNamespace, &IggyPartition<B, SB>)> {
+        self.slots()
+            .iter()
+            .flatten()
+            .map(|slot| (&slot.namespace, slot.partition()))
+    }
+
     pub const fn shard_id(&self) -> ShardId {
         self.shard_id
     }
