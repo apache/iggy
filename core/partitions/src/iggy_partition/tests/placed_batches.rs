@@ -242,7 +242,7 @@ async fn placing_partition_on_disk(
     (config, partition)
 }
 
-fn placed_segment_size() -> IggyByteSize {
+pub(super) fn placed_segment_size() -> IggyByteSize {
     IggyByteSize::from(2 * PLACED_BATCH_SIZE as u64)
 }
 
@@ -547,7 +547,7 @@ async fn given_a_damaged_placed_batch_in_a_transferred_segment_when_spilling_sho
 
 /// A prepare a primary replicates for a one-message batch it placed in the
 /// object store, chained to `parent`.
-fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
+pub(super) fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
     let whole = checksummed_segment_prepare(op, parent, offset, b"payload");
     let header_size = size_of::<PrepareHeader>();
     let batch = BatchHeader::decode(&whole.as_slice()[header_size..]).unwrap();
@@ -568,7 +568,9 @@ fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<Prepare
 const PLACED_PER_SEGMENT: u64 = 2;
 
 /// A backup that places its batches, with a prepare WAL under `root`.
-async fn placing_backup_with_wal(root: &Path) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
+pub(super) async fn placing_backup_with_wal(
+    root: &Path,
+) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
     let mut config = repair_config();
     config.path_layout.streams_root = root.to_string_lossy().into_owned();
     let directory = config.get_partition_path(1, 1, 0);
@@ -612,7 +614,7 @@ async fn replicate_placed(
     parent
 }
 
-fn stored_offsets(directory: &str) -> Vec<u64> {
+pub(super) fn stored_offsets(directory: &str) -> Vec<u64> {
     segment_file_bytes(Path::new(directory))
         .iter()
         .flat_map(|bytes| placed_batches_in(bytes))

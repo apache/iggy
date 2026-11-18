@@ -111,7 +111,6 @@ impl StateMachineSnapshot {
     }
 
     /// A snapshot of `parts` at `op`, in the given order.
-    #[cfg(test)]
     pub(crate) fn from_parts(op: u64, parts: &[(MachineId, &[u8])]) -> Self {
         let mut writer = SnapshotWriter::new(op);
         for (id, state) in parts {
