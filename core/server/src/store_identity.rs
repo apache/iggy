@@ -73,7 +73,6 @@ use shard::Receiver;
 use shard::metrics::ShardMetrics;
 use tracing::{debug, error, info, warn};
 
-use crate::geo_peers::own_cluster_uid;
 use crate::origin_recovery::{OriginRecovery, may_recover};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 
@@ -181,6 +180,16 @@ pub async fn run<S: ObjectStore>(
             return;
         }
     }
+}
+
+/// This cluster's `cluster_uid`: the id of its metadata change log.
+pub fn own_cluster_uid(shard: &ServerShard) -> Option<u128> {
+    shard
+        .plane
+        .metadata()
+        .change_log()
+        .read(ChangeLog::log_id)
+        .flatten()
 }
 
 impl<S: ObjectStore> IdentityChecker<S> {

@@ -37,7 +37,6 @@ use std::time::{Duration, Instant};
 
 use configs::geo::{GeoConfig, GeoPeerConfig};
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
-use consensus::MetadataHandle;
 use futures::future::{Either, join_all, select};
 use iggy_object_store::s3::{Credentials, S3Store};
 use iggy_object_store::{
@@ -45,7 +44,6 @@ use iggy_object_store::{
     ReadOnlyStore, StoreIdentity,
 };
 use message_bus::{IggyMessageBus, MessageBus};
-use metadata::change_log::ChangeLog;
 use shard::metrics::ShardMetrics;
 use shard::peers::{PeerIdentity, PeerRead, PeerStatus, PeerStore, PeerStores, SharedPeerStatus};
 use shard::{Receiver, Sender, channel};
@@ -53,6 +51,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::server_error::ServerError;
 use crate::shell::ServerShard;
+use crate::store_identity::own_cluster_uid;
 use crate::tiered_storage::{S3Location, identity_timeout, service_config};
 
 /// How long shard 0 waits before it checks a peer again, once the node reads
@@ -219,16 +218,6 @@ async fn run<S: ObjectStore>(
             return;
         }
     }
-}
-
-/// This cluster's `cluster_uid`: the id of its metadata change log.
-pub fn own_cluster_uid(shard: &ServerShard) -> Option<u128> {
-    shard
-        .plane
-        .metadata()
-        .change_log()
-        .read(ChangeLog::log_id)
-        .flatten()
 }
 
 /// The identity check of one peer, which shard 0 runs for the node.
